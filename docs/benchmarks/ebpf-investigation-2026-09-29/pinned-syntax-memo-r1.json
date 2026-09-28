@@ -1,0 +1,170 @@
+[
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-syntax-memo",
+    "requests": 35617,
+    "seconds": 6.099958,
+    "rps": 5838.892661228159,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 168812544,
+    "user_us_per_request": 16.00359378948255,
+    "system_us_per_request": 71.5950248476851,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35406,
+    "seconds": 6.099834,
+    "rps": 5804.420251436351,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158531584,
+    "user_us_per_request": 16.94628029147602,
+    "system_us_per_request": 71.73925323391515,
+    "minor_faults_per_request": 0.00022595040388634694
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35322,
+    "seconds": 6.099771,
+    "rps": 5790.709192197543,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158498816,
+    "user_us_per_request": 17.55279995470245,
+    "system_us_per_request": 71.3436385255648,
+    "minor_faults_per_request": 0.00022648774135099938
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-syntax-memo",
+    "requests": 35837,
+    "seconds": 6.09994,
+    "rps": 5874.975819434289,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 168730624,
+    "user_us_per_request": 16.184390434467172,
+    "system_us_per_request": 70.59742724000336,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-syntax-memo",
+    "requests": 45572,
+    "seconds": 6.099833,
+    "rps": 7471.0242067282825,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 168812544,
+    "user_us_per_request": 13.824278065478802,
+    "system_us_per_request": 61.88010181690512,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46086,
+    "seconds": 6.099663,
+    "rps": 7555.499377588566,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158453760,
+    "user_us_per_request": 14.538037581912077,
+    "system_us_per_request": 61.623920496463136,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46334,
+    "seconds": 6.100006,
+    "rps": 7595.730233707967,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158339072,
+    "user_us_per_request": 15.107696292139682,
+    "system_us_per_request": 60.86243363404843,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-syntax-memo",
+    "requests": 45352,
+    "seconds": 6.099873,
+    "rps": 7434.908890726086,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 168759296,
+    "user_us_per_request": 13.670841418239549,
+    "system_us_per_request": 62.62127359322632,
+    "minor_faults_per_request": 0.0
+  }
+]

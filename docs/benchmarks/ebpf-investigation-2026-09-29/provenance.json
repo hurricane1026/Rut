@@ -1,0 +1,68 @@
+{
+  "runtime_base_commit": "c108b5f3",
+  "tool_commit": "7000af87",
+  "raw_root": "/tmp/rut-bounded-followup-20260928",
+  "binaries": {
+    "gap/rut-parser-count": {
+      "sha256": "8a30d07949c4a99e6d6d32e1b1f1633858587ec30b7841b1d738079dcc5f4d8a",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-direct-send": {
+      "sha256": "9fff653f00121e6aba060372bbd293462234c644a08970fee23b0e0c4bc82cf1",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-bulk64-cache64m": {
+      "sha256": "7cdeb125c2e3515542eb7568a4ff9bfb30da1b18d4a8f2450bc50b4630ac69a8",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-direct-recv-send": {
+      "sha256": "b5ef918e3d31806605083e6bbbb1adfdc810a1fa63ecebe657a6b530ccb4750a",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-batch16": {
+      "sha256": "f171d28552ec8a77a0819438fedc9201b1cd7b36aa8a33cdf30539ef8e894129",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-coalesce128": {
+      "sha256": "f1a5b0dd49658cd6c37d33c9f008f80bd1e13c0ecba6cd81dadf292ec7a45c45",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-owner-policy-once": {
+      "sha256": "a025bac74485a7a8af8f969a341f3bd261eac26ea79a1a6ee9332c99ed865b5e",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-pinned-header-memo": {
+      "sha256": "5c0e8d6962ecbf0936a903c0fd911eda40c4d0f2d2cd0b767f9575304e398a5f",
+      "size": 19127232
+    },
+    "ebpf-tools/rut-pinned-syntax-memo": {
+      "sha256": "f16b1ae5fd396df364d5d5fd2a6423e522f6d55a2c1882c0511a3d48f0ae1000",
+      "size": 19127184
+    },
+    "ebpf-tools/rut-header-poll-first": {
+      "sha256": "9bba663d9c10a2328b2d295f5eefb94f391ff742d284f21d7993f116ecbb6639",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-large-ring256": {
+      "sha256": "bd279f0fdfe6470ebd9e9247a38dc64ed99ffc3a90b0a585626c61a85b3f9c04",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-window128-bulk128": {
+      "sha256": "27162ef92b97bf4ca730c818f11d2220b0e7c840bd2e88e89c5e1603f2bb5fe1",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-bulk-first": {
+      "sha256": "8e28ae6c8e7cfd5847a7bd779026a9da2b4a1fdb9c6712013e7d623c0b014b99",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-bulk-first-final": {
+      "sha256": "8e28ae6c8e7cfd5847a7bd779026a9da2b4a1fdb9c6712013e7d623c0b014b99",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-bulk-always": {
+      "sha256": "7c6099cba6ef5df5ded35e9fe4a5877a34ad47e1e662db4b4beef7e028fd720e",
+      "size": 19127072
+    }
+  },
+  "bulk_first_commit": "83e5d8a1"
+}

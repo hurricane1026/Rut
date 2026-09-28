@@ -1,0 +1,170 @@
+[
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-header-memo",
+    "requests": 35707,
+    "seconds": 6.09975,
+    "rps": 5853.846469117587,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 167510016,
+    "user_us_per_request": 15.403142241017168,
+    "system_us_per_request": 70.57439717702411,
+    "minor_faults_per_request": 0.00022404570532388608
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35160,
+    "seconds": 6.099944,
+    "rps": 5763.987341523136,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158380032,
+    "user_us_per_request": 16.78043230944255,
+    "system_us_per_request": 71.38794084186576,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35156,
+    "seconds": 6.100009,
+    "rps": 5763.270185339071,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158449664,
+    "user_us_per_request": 17.06678803049266,
+    "system_us_per_request": 71.68050972806918,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-header-memo",
+    "requests": 35628,
+    "seconds": 6.099963,
+    "rps": 5840.691164848049,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 167567360,
+    "user_us_per_request": 15.156618390030314,
+    "system_us_per_request": 71.01156393847536,
+    "minor_faults_per_request": 0.00022454249466711575
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-header-memo",
+    "requests": 46803,
+    "seconds": 6.099646,
+    "rps": 7673.06824035362,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 167624704,
+    "user_us_per_request": 12.178706493173515,
+    "system_us_per_request": 60.89353246586757,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 47386,
+    "seconds": 6.100022,
+    "rps": 7768.1687049653265,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158498816,
+    "user_us_per_request": 14.983328409234796,
+    "system_us_per_request": 59.08918245895412,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46992,
+    "seconds": 6.100094,
+    "rps": 7703.487847892179,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158265344,
+    "user_us_per_request": 15.108954715696289,
+    "system_us_per_request": 59.371807967313586,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-header-memo",
+    "requests": 46815,
+    "seconds": 6.100025,
+    "rps": 7674.5587108249565,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 167682048,
+    "user_us_per_request": 12.60279824842465,
+    "system_us_per_request": 60.87792374239026,
+    "minor_faults_per_request": 0.0
+  }
+]

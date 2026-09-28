@@ -1,0 +1,37 @@
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index d6c853e4..a9276bf8 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -557,6 +557,15 @@ bool IoUringBackend::add_recv_upstream_direct(
+     sqe->fd = fd;
+     sqe->addr = reinterpret_cast<u64>(dst);
+     sqe->len = len;
++    // Experimental probe: keep immediately available reads near their sends.
++    if (nop_inject_result) {
++        const ssize_t received = ::recv(fd, dst, len, MSG_DONTWAIT);
++        if (received > 0) {
++            sqe->opcode = IORING_OP_NOP;
++            sqe->rw_flags = IORING_NOP_INJECT_RESULT;
++            sqe->len = static_cast<u32>(received);
++        }
++    }
+     // msg_flags stays 0 (memset above): no MSG_WAITALL, see the declaration.
+     // No IOSQE_BUFFER_SELECT / buf_group: the kernel writes straight into
+     // dst, so this CQE never carries IORING_CQE_F_BUFFER. wait() recognizes
+@@ -635,6 +644,16 @@ bool IoUringBackend::add_send(
+     if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE
+     const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
+ 
++    // Experimental locality probe: write large ready buffers before batching
++    // another round of socket I/O, but keep the normal asynchronous completion.
++    if (len >= 16384 && extra_flags == 0 && nop_inject_result) {
++        const ssize_t written = ::send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
++        if (written > 0) {
++            return add_send_after_direct_write(
++                fd, conn_id, buf, len, static_cast<u32>(written), generation);
++        }
++    }
++
+     // Record send state only after acquiring SQE — if kernel returns partial,
+     // wait() re-submits the remainder.
+     if (conn_id < connection_capacity) {

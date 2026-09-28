@@ -1,0 +1,13 @@
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index add54bd6..542d5767 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -5187,7 +5187,7 @@ public:
+         // unconditionally so the caller's read-ahead pause always has a
+         // future recv completion left to resume it.
+         if (defer_for_pending_socket_data &&
+-            received - c.response_read_deadline_bounded_released < kBoundedReadAheadBytes)
++            received - c.response_read_deadline_bounded_released < 128u * 1024u)
+             return true;
+         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
+         const u32 target = bounded_response_release_bytes(header, received, /*complete=*/false);

@@ -1,0 +1,13 @@
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index add54bd6..1b340fed 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -527,7 +527,7 @@ public:
+ 
+         while (is_running()) {
+             retry_strict_upstream_retirement_cancels();
+-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
++            u32 n = backend.wait(events, 16, conns, connection_capacity);
+             if (backend.failure_code() != 0) {
+                 // A zero-event wait is valid; a sticky backend error is not. Stop
+                 // this shard so an io_uring_enter failure cannot become a silent

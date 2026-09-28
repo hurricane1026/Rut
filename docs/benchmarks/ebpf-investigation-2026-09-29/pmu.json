@@ -1,0 +1,88 @@
+[
+  {
+    "case": "1m-c32-close-rut",
+    "requests": 16462,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "events": {
+      "cycles": {
+        "scaled_total": 36102999583,
+        "per_request": 2193111.3827602966,
+        "running_percent": 66.0
+      },
+      "instructions": {
+        "scaled_total": 25294130884,
+        "per_request": 1536516.272870854,
+        "running_percent": 83.0
+      },
+      "cache-references": {
+        "scaled_total": 4264680576,
+        "per_request": 259062.11736119547,
+        "running_percent": 83.0
+      },
+      "cache-misses": {
+        "scaled_total": 1051952764,
+        "per_request": 63901.88093791763,
+        "running_percent": 83.0
+      },
+      "branch-misses": {
+        "scaled_total": 63780243,
+        "per_request": 3874.3921151743407,
+        "running_percent": 83.0
+      },
+      "dTLB-load-misses": {
+        "scaled_total": 7662854,
+        "per_request": 465.4874255861985,
+        "running_percent": 83.0
+      }
+    }
+  },
+  {
+    "case": "1m-c32-close-nginx",
+    "requests": 18155,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "events": {
+      "cycles": {
+        "scaled_total": 36150455954,
+        "per_request": 1991212.1153401267,
+        "running_percent": 66.0
+      },
+      "instructions": {
+        "scaled_total": 27378768810,
+        "per_request": 1508056.6681354998,
+        "running_percent": 83.0
+      },
+      "cache-references": {
+        "scaled_total": 5501419846,
+        "per_request": 303025.05348388874,
+        "running_percent": 83.0
+      },
+      "cache-misses": {
+        "scaled_total": 66598282,
+        "per_request": 3668.316276507849,
+        "running_percent": 83.0
+      },
+      "branch-misses": {
+        "scaled_total": 96219474,
+        "per_request": 5299.888405397962,
+        "running_percent": 83.0
+      },
+      "dTLB-load-misses": {
+        "scaled_total": 982298,
+        "per_request": 54.10619664004407,
+        "running_percent": 83.0
+      }
+    }
+  }
+]

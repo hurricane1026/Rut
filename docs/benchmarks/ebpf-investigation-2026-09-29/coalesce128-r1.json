@@ -1,0 +1,338 @@
+[
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-coalesce128",
+    "requests": 12546,
+    "seconds": 6.000392,
+    "rps": 2090.8633969247344,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 175304704,
+    "user_us_per_request": 23.91200382592061,
+    "system_us_per_request": 316.4355172963494,
+    "minor_faults_per_request": 0.01498485573091025
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12650,
+    "seconds": 6.000329,
+    "rps": 2108.2177327276554,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 176324608,
+    "user_us_per_request": 23.715415019762847,
+    "system_us_per_request": 316.20553359683794,
+    "minor_faults_per_request": 0.006956521739130435
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12605,
+    "seconds": 6.000446,
+    "rps": 2100.677182996064,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 176918528,
+    "user_us_per_request": 24.593415311384373,
+    "system_us_per_request": 315.7477191590639,
+    "minor_faults_per_request": 0.008250694168980563
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-coalesce128",
+    "requests": 12534,
+    "seconds": 6.000506,
+    "rps": 2088.823842522614,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 175452160,
+    "user_us_per_request": 24.732726982607307,
+    "system_us_per_request": 315.94064145524175,
+    "minor_faults_per_request": 0.009254826870911122
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-coalesce128",
+    "requests": 11959,
+    "seconds": 6.018423,
+    "rps": 1987.0653824099768,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 226508800,
+    "user_us_per_request": 25.0857095074839,
+    "system_us_per_request": 327.786604231123,
+    "minor_faults_per_request": 0.03378208880341166
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12108,
+    "seconds": 6.027583,
+    "rps": 2008.7653707962213,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 237281280,
+    "user_us_per_request": 28.906508093822268,
+    "system_us_per_request": 323.7528906508094,
+    "minor_faults_per_request": 0.12851007598282127
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 11946,
+    "seconds": 6.026903,
+    "rps": 1982.1125377328954,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 236879872,
+    "user_us_per_request": 25.113008538422903,
+    "system_us_per_request": 331.49171270718233,
+    "minor_faults_per_request": 0.1272392432613427
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-coalesce128",
+    "requests": 11714,
+    "seconds": 6.024401,
+    "rps": 1944.4256781711576,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 227753984,
+    "user_us_per_request": 29.025098173126175,
+    "system_us_per_request": 330.3739115588185,
+    "minor_faults_per_request": 0.10722212736896022
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-coalesce128",
+    "requests": 35448,
+    "seconds": 6.099826,
+    "rps": 5811.313306313983,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158515200,
+    "user_us_per_request": 16.926201760324982,
+    "system_us_per_request": 71.09004739336493,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35495,
+    "seconds": 6.099982,
+    "rps": 5818.869629451366,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158396416,
+    "user_us_per_request": 17.748978729398505,
+    "system_us_per_request": 69.86899563318778,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35680,
+    "seconds": 6.100054,
+    "rps": 5849.128548698093,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158318592,
+    "user_us_per_request": 17.09641255605381,
+    "system_us_per_request": 70.347533632287,
+    "minor_faults_per_request": 0.0002242152466367713
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-coalesce128",
+    "requests": 35555,
+    "seconds": 6.099793,
+    "rps": 5828.8863245031425,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158384128,
+    "user_us_per_request": 16.312754886795105,
+    "system_us_per_request": 70.87610743917874,
+    "minor_faults_per_request": 0.0002250035156799325
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-coalesce128",
+    "requests": 46859,
+    "seconds": 6.09998,
+    "rps": 7681.82846501136,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158392320,
+    "user_us_per_request": 14.298213790307091,
+    "system_us_per_request": 60.18054162487462,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46952,
+    "seconds": 6.099992,
+    "rps": 7697.059274831836,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158351360,
+    "user_us_per_request": 15.12182654626001,
+    "system_us_per_request": 59.6353722951099,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46909,
+    "seconds": 6.099444,
+    "rps": 7690.700988483541,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158351360,
+    "user_us_per_request": 14.496152124325823,
+    "system_us_per_request": 59.90321686669935,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-coalesce128",
+    "requests": 46815,
+    "seconds": 6.099686,
+    "rps": 7674.985236944984,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158420992,
+    "user_us_per_request": 14.098045498237743,
+    "system_us_per_request": 60.45071024244366,
+    "minor_faults_per_request": 0.0
+  }
+]

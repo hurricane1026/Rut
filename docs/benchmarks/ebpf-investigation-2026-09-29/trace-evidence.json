@@ -1,0 +1,4303 @@
+{
+  "64k-c1-keepalive-rut": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790620709.7394345,
+      "program_sha256": "e1e921254bada4ac44c95556477080b6abe4a8d16050b1bf51e5080f78b991b0",
+      "targets_before": [
+        {
+          "pid": 2634333,
+          "start_ticks": 90663772,
+          "state": "S",
+          "comm": "rut-parser-coun",
+          "exe": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-compare-r2/64k-c1-keepalive-rut/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2634333,
+          "start_ticks": 90663772,
+          "state": "S",
+          "comm": "rut-parser-coun",
+          "exe": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790620724.0506766
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2634333,1,1": 54452,
+          "2634333,1,2": 169300
+        },
+        "@copy_elapsed_ns": {
+          "2634333,1,1": 19622835,
+          "2634333,1,2": 196556633
+        },
+        "@copy_latency_us": {
+          "2634333,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 54425
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 16
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 7
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 1
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 2
+            }
+          ],
+          "2634333,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 60124
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 108884
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 47
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 171
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 40
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 34
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2634333,1,1": 2450340,
+          "2634333,1,2": 3576516264
+        },
+        "@offcpu_ns": {
+          "2634333": 16594789619
+        },
+        "@offcpu_samples": {
+          "2634333": 109376
+        },
+        "@offcpu_us": {
+          "2634333": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 76
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 228
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 172
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 104334
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 4171
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 257
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 8
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 4
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 3
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 1
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2634333": 104493841
+        },
+        "@runqueue_samples": {
+          "2634333": 109378
+        },
+        "@runqueue_us": {
+          "2634333": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 108246
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 604
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 193
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 175
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 76
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 65
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 9
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 1
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 3
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 1
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 1
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 3
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2634333,1,0": 1,
+          "2634333,2,2": 54452,
+          "2634333,1,1": 54453,
+          "2634333,2,1": 163356,
+          "2634333,1,2": 217663
+        },
+        "@tcp_completed_calls": {
+          "2634333,1,0": 1,
+          "2634333,2,2": 54452,
+          "2634333,1,1": 54453,
+          "2634333,2,1": 163356,
+          "2634333,1,2": 217663
+        },
+        "@tcp_elapsed_ns": {
+          "2634333,1,0": 2047,
+          "2634333,1,1": 76029832,
+          "2634333,2,2": 416455847,
+          "2634333,1,2": 983312293,
+          "2634333,2,1": 1070567856
+        },
+        "@tcp_errors": {
+          "2634333,1,0,-104": 1,
+          "2634333,1,2,-11": 54450
+        },
+        "@tcp_latency_us": {
+          "2634333,1,0": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            }
+          ],
+          "2634333,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 50755
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 3548
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 128
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 21
+            }
+          ],
+          "2634333,1,1": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 54248
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 104
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 64
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 16
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 21
+            }
+          ],
+          "2634333,2,1": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 108311
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 54627
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 352
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 64
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            }
+          ],
+          "2634333,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 54418
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 192
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 54565
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 104344
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 3857
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 248
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 39
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2634333,1,0": 4096,
+          "2634333,2,2": 2450340,
+          "2634333,1,1": 223039488,
+          "2634333,2,1": 3576788524,
+          "2634333,1,2": 6248238760
+        },
+        "@tcp_returned_bytes": {
+          "2634333,2,2": 2450340,
+          "2634333,1,1": 2450340,
+          "2634333,1,2": 3576516264,
+          "2634333,2,1": 3576788524
+        },
+        "@tcp_zero_returns": {
+          "2634333,1,1": 1
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2634333,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 54453,
+          "returned_bytes": 2450340,
+          "inclusive_elapsed_ns": 76029832,
+          "mean_elapsed_us": 1.3962468918149598
+        },
+        {
+          "pid": 2634333,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 163356,
+          "returned_bytes": 3576788524,
+          "inclusive_elapsed_ns": 1070567856,
+          "mean_elapsed_us": 6.553587600088151
+        },
+        {
+          "pid": 2634333,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 1,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 2047,
+          "mean_elapsed_us": 2.047
+        },
+        {
+          "pid": 2634333,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 217663,
+          "returned_bytes": 3576516264,
+          "inclusive_elapsed_ns": 983312293,
+          "mean_elapsed_us": 4.517590463239044
+        },
+        {
+          "pid": 2634333,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 54452,
+          "returned_bytes": 2450340,
+          "inclusive_elapsed_ns": 416455847,
+          "mean_elapsed_us": 7.648127653713362
+        }
+      ]
+    },
+    "stack_sample_count": 641,
+    "kernel_stacks_retained_in_raw_artifact": true
+  },
+  "64k-c1-keepalive-nginx": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790620693.050857,
+      "program_sha256": "0f1c5ca516b2f8042c1a1b928ccce9f602fd0bcc0f83fb1e4a1d78b51679ca03",
+      "targets_before": [
+        {
+          "pid": 2634072,
+          "start_ticks": 90662114,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-compare-r2/64k-c1-keepalive-nginx/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2634072,
+          "start_ticks": 90662114,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790620707.3939612
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2634072,1,1": 51812,
+          "2634072,1,2": 558992
+        },
+        "@copy_elapsed_ns": {
+          "2634072,1,1": 20013189,
+          "2634072,1,2": 252934174
+        },
+        "@copy_latency_us": {
+          "2634072,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 51797
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 6
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 4
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 3
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 2
+            }
+          ],
+          "2634072,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 506935
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 51725
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 118
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 137
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 33
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 43
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2634072,1,1": 2331540,
+          "2634072,1,2": 3403115784
+        },
+        "@offcpu_ns": {
+          "2634072": 1056880213
+        },
+        "@offcpu_samples": {
+          "2634072": 100038
+        },
+        "@offcpu_us": {
+          "2634072": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 187
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 47513
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 334
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 314
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 51464
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 211
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 9
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 4
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 2
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2634072": 176899832
+        },
+        "@runqueue_samples": {
+          "2634072": 100039
+        },
+        "@runqueue_us": {
+          "2634072": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 97641
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 469
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 182
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 165
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 84
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 14
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 44
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1435
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 2
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 3
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2634072,1,0": 1,
+          "2634072,2,2": 51812,
+          "2634072,1,1": 51813,
+          "2634072,2,1": 310338,
+          "2634072,1,2": 569507
+        },
+        "@tcp_completed_calls": {
+          "2634072,1,0": 1,
+          "2634072,2,2": 51812,
+          "2634072,1,1": 51813,
+          "2634072,2,1": 310338,
+          "2634072,1,2": 569507
+        },
+        "@tcp_elapsed_ns": {
+          "2634072,1,0": 1755,
+          "2634072,1,1": 67368526,
+          "2634072,2,2": 402913737,
+          "2634072,1,2": 1026653798,
+          "2634072,2,1": 1574267839
+        },
+        "@tcp_errors": {
+          "2634072,1,0,-104": 1
+        },
+        "@tcp_latency_us": {
+          "2634072,1,0": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            }
+          ],
+          "2634072,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 41438
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 10249
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 105
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 20
+            }
+          ],
+          "2634072,1,1": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 51691
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 44
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 51
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 7
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 19
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2634072,2,1": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 102493
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 205138
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 2267
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 388
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 48
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 3
+            }
+          ],
+          "2634072,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 283101
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 170453
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 63324
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 20577
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 31806
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 213
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 33
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2634072,1,0": 1024,
+          "2634072,2,2": 2331540,
+          "2634072,1,1": 53056512,
+          "2634072,2,1": 3403374589,
+          "2634072,1,2": 4232922318
+        },
+        "@tcp_returned_bytes": {
+          "2634072,2,2": 2331540,
+          "2634072,1,1": 2331540,
+          "2634072,1,2": 3403115784,
+          "2634072,2,1": 3403374589
+        },
+        "@tcp_zero_returns": {
+          "2634072,1,1": 1,
+          "2634072,1,2": 51810
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2634072,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 51813,
+          "returned_bytes": 2331540,
+          "inclusive_elapsed_ns": 67368526,
+          "mean_elapsed_us": 1.3002243838418928
+        },
+        {
+          "pid": 2634072,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 310338,
+          "returned_bytes": 3403374589,
+          "inclusive_elapsed_ns": 1574267839,
+          "mean_elapsed_us": 5.072752415108688
+        },
+        {
+          "pid": 2634072,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 1,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 1755,
+          "mean_elapsed_us": 1.755
+        },
+        {
+          "pid": 2634072,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 569507,
+          "returned_bytes": 3403115784,
+          "inclusive_elapsed_ns": 1026653798,
+          "mean_elapsed_us": 1.8027061967631652
+        },
+        {
+          "pid": 2634072,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 51812,
+          "returned_bytes": 2331540,
+          "inclusive_elapsed_ns": 402913737,
+          "mean_elapsed_us": 7.776455975449704
+        }
+      ]
+    },
+    "stack_sample_count": 676,
+    "kernel_stacks_retained_in_raw_artifact": true
+  },
+  "64k-c1-close-rut": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790620676.1594102,
+      "program_sha256": "e42548e6b83aa29eb02255d30ef004fed3c360bc225590f473e05559b045500b",
+      "targets_before": [
+        {
+          "pid": 2633658,
+          "start_ticks": 90660414,
+          "state": "S",
+          "comm": "rut-parser-coun",
+          "exe": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-compare-r2/64k-c1-close-rut/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2633658,
+          "start_ticks": 90660414,
+          "state": "S",
+          "comm": "rut-parser-coun",
+          "exe": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790620690.4648376
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2633658,1,1": 41859,
+          "2633658,1,2": 128866
+        },
+        "@copy_elapsed_ns": {
+          "2633658,1,1": 15607959,
+          "2633658,1,2": 153399864
+        },
+        "@copy_latency_us": {
+          "2633658,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 41814
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 8
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 24
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 6
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 3
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 4
+            }
+          ],
+          "2633658,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 44791
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 83685
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 108
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 181
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 61
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 39
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2633658,1,1": 2678976,
+          "2633658,1,2": 2749382838
+        },
+        "@offcpu_ns": {
+          "2633658": 17250069585
+        },
+        "@offcpu_samples": {
+          "2633658": 85031
+        },
+        "@offcpu_us": {
+          "2633658": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 388
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 612
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 260
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 39487
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 32314
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 11688
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 108
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 36
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 14
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 1
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 1
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2633658": 75879677
+        },
+        "@runqueue_samples": {
+          "2633658": 85033
+        },
+        "@runqueue_us": {
+          "2633658": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 83108
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1237
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 192
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 274
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 119
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 76
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 13
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 13
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2633658,1,0": 133,
+          "2633658,2,2": 41859,
+          "2633658,1,1": 42517,
+          "2633658,2,1": 125577,
+          "2633658,1,2": 167120
+        },
+        "@tcp_completed_calls": {
+          "2633658,1,0": 133,
+          "2633658,2,2": 41859,
+          "2633658,1,1": 42517,
+          "2633658,2,1": 125577,
+          "2633658,1,2": 167120
+        },
+        "@tcp_elapsed_ns": {
+          "2633658,1,0": 110309,
+          "2633658,1,1": 85183560,
+          "2633658,2,2": 327848033,
+          "2633658,1,2": 770033884,
+          "2633658,2,1": 1075254416
+        },
+        "@tcp_errors": {
+          "2633658,1,1,-11": 638,
+          "2633658,1,2,-11": 41851
+        },
+        "@tcp_latency_us": {
+          "2633658,1,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 124
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 8
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 0
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 1
+            }
+          ],
+          "2633658,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 38657
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 2995
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 148
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 57
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 2
+            }
+          ],
+          "2633658,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 585
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 20625
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 21085
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 152
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 29
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 40
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2633658,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 80856
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 43944
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 587
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 172
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 18
+            }
+          ],
+          "2633658,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 41800
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 77
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 41944
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 77087
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 5773
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 349
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 82
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 8
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2633658,1,0": 544768,
+          "2633658,2,2": 1883655,
+          "2633658,1,1": 174149632,
+          "2633658,2,1": 2749382838,
+          "2633658,1,2": 4796612790
+        },
+        "@tcp_returned_bytes": {
+          "2633658,2,2": 1883655,
+          "2633658,1,1": 2678976,
+          "2633658,2,1": 2749382838,
+          "2633658,1,2": 2749382838
+        },
+        "@tcp_zero_returns": {
+          "2633658,1,1": 20,
+          "2633658,1,0": 133
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2633658,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 42517,
+          "returned_bytes": 2678976,
+          "inclusive_elapsed_ns": 85183560,
+          "mean_elapsed_us": 2.003517651762824
+        },
+        {
+          "pid": 2633658,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 125577,
+          "returned_bytes": 2749382838,
+          "inclusive_elapsed_ns": 1075254416,
+          "mean_elapsed_us": 8.56251077824761
+        },
+        {
+          "pid": 2633658,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 133,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 110309,
+          "mean_elapsed_us": 0.829390977443609
+        },
+        {
+          "pid": 2633658,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 167120,
+          "returned_bytes": 2749382838,
+          "inclusive_elapsed_ns": 770033884,
+          "mean_elapsed_us": 4.6076704404021065
+        },
+        {
+          "pid": 2633658,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 41859,
+          "returned_bytes": 1883655,
+          "inclusive_elapsed_ns": 327848033,
+          "mean_elapsed_us": 7.83219935975537
+        }
+      ]
+    },
+    "stack_sample_count": 601,
+    "kernel_stacks_retained_in_raw_artifact": true
+  },
+  "64k-c1-close-nginx": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790620659.4095576,
+      "program_sha256": "daf9c3064b3649d42c5dee9591d9cf814437bbc82016cb799a5fa9df23ebee19",
+      "targets_before": [
+        {
+          "pid": 2633421,
+          "start_ticks": 90658750,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-compare-r2/64k-c1-close-nginx/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2633421,
+          "start_ticks": 90658750,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790620673.7682962
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2633421,1,1": 40714,
+          "2633421,1,2": 433175
+        },
+        "@copy_elapsed_ns": {
+          "2633421,1,1": 14768640,
+          "2633421,1,2": 195449454
+        },
+        "@copy_latency_us": {
+          "2633421,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 40694
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 5
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 5
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 6
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 3
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2633421,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 392292
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 40637
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 64
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 90
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 53
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 37
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 2
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2633421,1,1": 2605696,
+          "2633421,1,2": 2674176948
+        },
+        "@offcpu_ns": {
+          "2633421": 1394853375
+        },
+        "@offcpu_samples": {
+          "2633421": 115264
+        },
+        "@offcpu_us": {
+          "2633421": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 32285
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1277
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 345
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 38184
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 42245
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 911
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 16
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 1
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2633421": 243969499
+        },
+        "@runqueue_samples": {
+          "2633421": 115265
+        },
+        "@runqueue_us": {
+          "2633421": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 111888
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 476
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 124
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 126
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 57
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 30
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1110
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1454
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2633421,2,2": 40714,
+          "2633421,1,1": 40715,
+          "2633421,2,1": 243465,
+          "2633421,1,2": 447121
+        },
+        "@tcp_completed_calls": {
+          "2633421,2,2": 40714,
+          "2633421,1,1": 40715,
+          "2633421,2,1": 243465,
+          "2633421,1,2": 447121
+        },
+        "@tcp_elapsed_ns": {
+          "2633421,1,1": 54151285,
+          "2633421,2,2": 320299678,
+          "2633421,1,2": 810762026,
+          "2633421,2,1": 1678891078
+        },
+        "@tcp_latency_us": {
+          "2633421,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 31721
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 8811
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 157
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 25
+            }
+          ],
+          "2633421,1,1": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 40611
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 26
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 44
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 14
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 19
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            }
+          ],
+          "2633421,2,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 1
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 5
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 8
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 194525
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 48001
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 816
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 108
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            }
+          ],
+          "2633421,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 238838
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 111903
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 54987
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 7968
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 33075
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 319
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 31
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2633421,2,2": 1832130,
+          "2633421,1,1": 41692160,
+          "2633421,2,1": 2674176948,
+          "2633421,1,2": 3322960704
+        },
+        "@tcp_returned_bytes": {
+          "2633421,2,2": 1832130,
+          "2633421,1,1": 2605696,
+          "2633421,2,1": 2674176948,
+          "2633421,1,2": 2674176948
+        },
+        "@tcp_zero_returns": {
+          "2633421,1,1": 1,
+          "2633421,1,2": 40710
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2633421,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 40715,
+          "returned_bytes": 2605696,
+          "inclusive_elapsed_ns": 54151285,
+          "mean_elapsed_us": 1.3300082279258258
+        },
+        {
+          "pid": 2633421,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 243465,
+          "returned_bytes": 2674176948,
+          "inclusive_elapsed_ns": 1678891078,
+          "mean_elapsed_us": 6.895821074897829
+        },
+        {
+          "pid": 2633421,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 447121,
+          "returned_bytes": 2674176948,
+          "inclusive_elapsed_ns": 810762026,
+          "mean_elapsed_us": 1.8132944460224414
+        },
+        {
+          "pid": 2633421,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 40714,
+          "returned_bytes": 1832130,
+          "inclusive_elapsed_ns": 320299678,
+          "mean_elapsed_us": 7.867064842560299
+        }
+      ]
+    },
+    "stack_sample_count": 660,
+    "kernel_stacks_retained_in_raw_artifact": true
+  },
+  "1m-c128-close-rut": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790620642.6036327,
+      "program_sha256": "f786e7ccc0f1e217200f285f423e400b56bbb412caaff9c01858311de589213d",
+      "targets_before": [
+        {
+          "pid": 2632997,
+          "start_ticks": 90657066,
+          "state": "S",
+          "comm": "rut-parser-coun",
+          "exe": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-compare-r2/1m-c128-close-rut/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2632997,
+          "start_ticks": 90657066,
+          "state": "S",
+          "comm": "rut-parser-coun",
+          "exe": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790620656.849291
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2632997,1,1": 15496,
+          "2632997,1,2": 208199
+        },
+        "@copy_elapsed_ns": {
+          "2632997,1,1": 5828436,
+          "2632997,1,2": 1726488055
+        },
+        "@copy_latency_us": {
+          "2632997,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 15445
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 43
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 0
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 2
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 2
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 3
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            }
+          ],
+          "2632997,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 30890
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 24254
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 35785
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 42309
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 42004
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 31239
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1344
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 356
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 18
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2632997,1,1": 991744,
+          "2632997,1,2": 16166261004
+        },
+        "@minor_faults": {
+          "2632997": 1444
+        },
+        "@offcpu_ns": {
+          "2632997": 15391860093
+        },
+        "@offcpu_samples": {
+          "2632997": 458
+        },
+        "@offcpu_us": {
+          "2632997": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 6
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 72
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 135
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 51
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 24
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 39
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 5
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 1
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 1
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 1
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 1
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 3
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2632997": 38439184
+        },
+        "@runqueue_samples": {
+          "2632997": 460
+        },
+        "@runqueue_us": {
+          "2632997": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 70
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 86
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 60
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 88
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 64
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 28
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 10
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 10
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 9
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 33
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2632997,1,0": 46,
+          "2632997,2,0": 50,
+          "2632997,2,2": 15496,
+          "2632997,1,1": 31073,
+          "2632997,2,1": 123087,
+          "2632997,1,2": 124118
+        },
+        "@tcp_completed_calls": {
+          "2632997,1,0": 46,
+          "2632997,2,0": 50,
+          "2632997,2,2": 15496,
+          "2632997,1,1": 31073,
+          "2632997,2,1": 123087,
+          "2632997,1,2": 124118
+        },
+        "@tcp_elapsed_ns": {
+          "2632997,1,0": 14657,
+          "2632997,2,0": 18203,
+          "2632997,1,1": 29850425,
+          "2632997,2,2": 95490475,
+          "2632997,1,2": 3028138303,
+          "2632997,2,1": 3186878805
+        },
+        "@tcp_errors": {
+          "2632997,1,0,-104": 4,
+          "2632997,2,0,-32": 8,
+          "2632997,2,0,-104": 42,
+          "2632997,1,1,-11": 127,
+          "2632997,1,2,-11": 209
+        },
+        "@tcp_latency_us": {
+          "2632997,1,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 45
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            }
+          ],
+          "2632997,2,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 49
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            }
+          ],
+          "2632997,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 14617
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 762
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 83
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 27
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 5
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 2
+            }
+          ],
+          "2632997,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 21766
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 7080
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 2169
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 15
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 14
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 26
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 2
+            }
+          ],
+          "2632997,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 46334
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 14780
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 1041
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 59286
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1557
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 89
+            }
+          ],
+          "2632997,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 208
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 5
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 51
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 20556
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 24556
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 57234
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 19521
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1662
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 325
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2632997,1,0": 188416,
+          "2632997,2,2": 697320,
+          "2632997,2,0": 5451540,
+          "2632997,1,1": 127275008,
+          "2632997,2,1": 16123913880,
+          "2632997,1,2": 19875836744
+        },
+        "@tcp_returned_bytes": {
+          "2632997,2,2": 697320,
+          "2632997,1,1": 991744,
+          "2632997,2,1": 16123913880,
+          "2632997,1,2": 16166261004
+        },
+        "@tcp_zero_returns": {
+          "2632997,1,0": 42,
+          "2632997,1,1": 15450
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2632997,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 31073,
+          "returned_bytes": 991744,
+          "inclusive_elapsed_ns": 29850425,
+          "mean_elapsed_us": 0.9606547484954784
+        },
+        {
+          "pid": 2632997,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 123087,
+          "returned_bytes": 16123913880,
+          "inclusive_elapsed_ns": 3186878805,
+          "mean_elapsed_us": 25.89127044285749
+        },
+        {
+          "pid": 2632997,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 46,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 14657,
+          "mean_elapsed_us": 0.31863043478260866
+        },
+        {
+          "pid": 2632997,
+          "direction": "send",
+          "side": "other",
+          "completed_calls": 50,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 18203,
+          "mean_elapsed_us": 0.36406
+        },
+        {
+          "pid": 2632997,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 124118,
+          "returned_bytes": 16166261004,
+          "inclusive_elapsed_ns": 3028138303,
+          "mean_elapsed_us": 24.397253444303
+        },
+        {
+          "pid": 2632997,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 15496,
+          "returned_bytes": 697320,
+          "inclusive_elapsed_ns": 95490475,
+          "mean_elapsed_us": 6.1622660686628805
+        }
+      ]
+    },
+    "stack_sample_count": 794,
+    "kernel_stacks_retained_in_raw_artifact": true
+  },
+  "1m-c128-close-nginx": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790620626.0295508,
+      "program_sha256": "1c8e9defb6dfc7f8d15730492f599268858c49912c02097001caaf593e60f880",
+      "targets_before": [
+        {
+          "pid": 2632740,
+          "start_ticks": 90655418,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-compare-r2/1m-c128-close-nginx/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2632740,
+          "start_ticks": 90655418,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790620640.30086
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2632740,1,1": 16376,
+          "2632740,1,2": 308944
+        },
+        "@copy_elapsed_ns": {
+          "2632740,1,1": 7012669,
+          "2632740,1,2": 803362326
+        },
+        "@copy_latency_us": {
+          "2632740,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 16359
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 2
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 3
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 5
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 4
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 3
+            }
+          ],
+          "2632740,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 147813
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 26115
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 60753
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 71369
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 2252
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 574
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 67
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2632740,1,1": 1048064,
+          "2632740,1,2": 17045421784
+        },
+        "@minor_faults": {
+          "2632740": 3308
+        },
+        "@offcpu_ns": {
+          "2632740": 16678847
+        },
+        "@offcpu_samples": {
+          "2632740": 301
+        },
+        "@offcpu_us": {
+          "2632740": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 14
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 92
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 153
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 27
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 7
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 5
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 1
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 1
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 1
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2632740": 2377114
+        },
+        "@runqueue_samples": {
+          "2632740": 302
+        },
+        "@runqueue_us": {
+          "2632740": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 123
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 25
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 69
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 60
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 17
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 2
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 4
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2632740,2,0": 6,
+          "2632740,2,2": 16257,
+          "2632740,1,1": 16378,
+          "2632740,1,2": 292303,
+          "2632740,2,1": 568394
+        },
+        "@tcp_completed_calls": {
+          "2632740,2,0": 6,
+          "2632740,2,2": 16257,
+          "2632740,1,1": 16378,
+          "2632740,1,2": 292303,
+          "2632740,2,1": 568394
+        },
+        "@tcp_elapsed_ns": {
+          "2632740,2,0": 5585,
+          "2632740,1,1": 25396822,
+          "2632740,2,2": 131950498,
+          "2632740,1,2": 2269067336,
+          "2632740,2,1": 3269764371
+        },
+        "@tcp_errors": {
+          "2632740,2,0,-32": 1,
+          "2632740,2,0,-104": 5
+        },
+        "@tcp_latency_us": {
+          "2632740,2,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 5
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            }
+          ],
+          "2632740,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 10040
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 6080
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 111
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 26
+            }
+          ],
+          "2632740,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 1
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 16227
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 93
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 26
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 7
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 24
+            }
+          ],
+          "2632740,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 16122
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 88589
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 23991
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 46862
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 67395
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 48027
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1243
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 74
+            }
+          ],
+          "2632740,2,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 11418
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 16710
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 210150
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 200053
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 125629
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 3829
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 592
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 13
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2632740,2,0": 196756,
+          "2632740,2,2": 731565,
+          "2632740,1,1": 16771072,
+          "2632740,2,1": 17044189832,
+          "2632740,1,2": 22438360030
+        },
+        "@tcp_returned_bytes": {
+          "2632740,2,2": 731565,
+          "2632740,1,1": 1048064,
+          "2632740,2,1": 17044189832,
+          "2632740,1,2": 17045421784
+        },
+        "@tcp_zero_returns": {
+          "2632740,1,1": 2,
+          "2632740,1,2": 16124
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2632740,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 16378,
+          "returned_bytes": 1048064,
+          "inclusive_elapsed_ns": 25396822,
+          "mean_elapsed_us": 1.5506668701917206
+        },
+        {
+          "pid": 2632740,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 568394,
+          "returned_bytes": 17044189832,
+          "inclusive_elapsed_ns": 3269764371,
+          "mean_elapsed_us": 5.752637028188194
+        },
+        {
+          "pid": 2632740,
+          "direction": "send",
+          "side": "other",
+          "completed_calls": 6,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 5585,
+          "mean_elapsed_us": 0.9308333333333334
+        },
+        {
+          "pid": 2632740,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 292303,
+          "returned_bytes": 17045421784,
+          "inclusive_elapsed_ns": 2269067336,
+          "mean_elapsed_us": 7.762723393191312
+        },
+        {
+          "pid": 2632740,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 16257,
+          "returned_bytes": 731565,
+          "inclusive_elapsed_ns": 131950498,
+          "mean_elapsed_us": 8.116534292919972
+        }
+      ]
+    },
+    "stack_sample_count": 793,
+    "kernel_stacks_retained_in_raw_artifact": true
+  },
+  "1m-c32-close-rut": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790620609.194464,
+      "program_sha256": "d5f740f9fabe1d823db0f1c5001248e33a8777c6fb83d1b88f3423ae91f1e10b",
+      "targets_before": [
+        {
+          "pid": 2632314,
+          "start_ticks": 90653728,
+          "state": "S",
+          "comm": "rut-parser-coun",
+          "exe": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-compare-r2/1m-c32-close-rut/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2632314,
+          "start_ticks": 90653728,
+          "state": "S",
+          "comm": "rut-parser-coun",
+          "exe": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790620623.4890895
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2632314,1,1": 15530,
+          "2632314,1,2": 188864
+        },
+        "@copy_elapsed_ns": {
+          "2632314,1,1": 6325669,
+          "2632314,1,2": 1611151179
+        },
+        "@copy_latency_us": {
+          "2632314,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 15496
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 17
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 2
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 5
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 2
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 8
+            }
+          ],
+          "2632314,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 32301
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 34549
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 14636
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 35561
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 33301
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 37394
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1053
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 69
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2632314,1,1": 993920,
+          "2632314,1,2": 16270293612
+        },
+        "@offcpu_ns": {
+          "2632314": 15463153567
+        },
+        "@offcpu_samples": {
+          "2632314": 352
+        },
+        "@offcpu_us": {
+          "2632314": [
+            {
+              "min": 2,
+              "max": 3,
+              "count": 2
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 18
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 169
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 35
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 4
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 0
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 0
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 0
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 0
+            },
+            {
+              "min": 2048,
+              "max": 4095,
+              "count": 0
+            },
+            {
+              "min": 4096,
+              "max": 8191,
+              "count": 0
+            },
+            {
+              "min": 8192,
+              "max": 16383,
+              "count": 0
+            },
+            {
+              "min": 16384,
+              "max": 32767,
+              "count": 0
+            },
+            {
+              "min": 32768,
+              "max": 65535,
+              "count": 0
+            },
+            {
+              "min": 65536,
+              "max": 131071,
+              "count": 119
+            },
+            {
+              "min": 131072,
+              "max": 262143,
+              "count": 0
+            },
+            {
+              "min": 262144,
+              "max": 524287,
+              "count": 0
+            },
+            {
+              "min": 524288,
+              "max": 1048575,
+              "count": 4
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2632314": 19861251
+        },
+        "@runqueue_samples": {
+          "2632314": 354
+        },
+        "@runqueue_us": {
+          "2632314": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 18
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 19
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 68
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 125
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 58
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 11
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 14
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 15
+            },
+            {
+              "min": 256,
+              "max": 511,
+              "count": 18
+            },
+            {
+              "min": 512,
+              "max": 1023,
+              "count": 6
+            },
+            {
+              "min": 1024,
+              "max": 2047,
+              "count": 1
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2632314,2,0": 16,
+          "2632314,1,0": 42,
+          "2632314,2,2": 15530,
+          "2632314,1,1": 31049,
+          "2632314,2,1": 124060,
+          "2632314,1,2": 127526
+        },
+        "@tcp_completed_calls": {
+          "2632314,2,0": 16,
+          "2632314,1,0": 42,
+          "2632314,2,2": 15530,
+          "2632314,1,1": 31049,
+          "2632314,2,1": 124060,
+          "2632314,1,2": 127526
+        },
+        "@tcp_elapsed_ns": {
+          "2632314,2,0": 7516,
+          "2632314,1,0": 31455,
+          "2632314,1,1": 32666312,
+          "2632314,2,2": 95801514,
+          "2632314,1,2": 2920685154,
+          "2632314,2,1": 3253911205
+        },
+        "@tcp_errors": {
+          "2632314,1,0,-104": 11,
+          "2632314,2,0,-32": 16,
+          "2632314,1,1,-11": 30,
+          "2632314,1,2,-11": 244
+        },
+        "@tcp_latency_us": {
+          "2632314,2,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 15
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 0
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            }
+          ],
+          "2632314,1,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 36
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 6
+            }
+          ],
+          "2632314,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 14517
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 911
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 87
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 15
+            }
+          ],
+          "2632314,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 18524
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 11299
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1158
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 31
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 9
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 28
+            }
+          ],
+          "2632314,2,1": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 45383
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 16136
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 870
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 59771
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 1884
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 16
+            }
+          ],
+          "2632314,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 244
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 9
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 88
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 20773
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 27503
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 42004
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 36177
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 725
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 3
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2632314,1,0": 172032,
+          "2632314,2,2": 698850,
+          "2632314,2,0": 1658300,
+          "2632314,1,1": 127176704,
+          "2632314,2,1": 16259523320,
+          "2632314,1,2": 20249092370
+        },
+        "@tcp_returned_bytes": {
+          "2632314,2,2": 698850,
+          "2632314,1,1": 993920,
+          "2632314,2,1": 16259523320,
+          "2632314,1,2": 16270293612
+        },
+        "@tcp_zero_returns": {
+          "2632314,1,0": 31,
+          "2632314,1,1": 15489
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2632314,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 31049,
+          "returned_bytes": 993920,
+          "inclusive_elapsed_ns": 32666312,
+          "mean_elapsed_us": 1.052089020580373
+        },
+        {
+          "pid": 2632314,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 124060,
+          "returned_bytes": 16259523320,
+          "inclusive_elapsed_ns": 3253911205,
+          "mean_elapsed_us": 26.22852817185233
+        },
+        {
+          "pid": 2632314,
+          "direction": "recv",
+          "side": "other",
+          "completed_calls": 42,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 31455,
+          "mean_elapsed_us": 0.7489285714285715
+        },
+        {
+          "pid": 2632314,
+          "direction": "send",
+          "side": "other",
+          "completed_calls": 16,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 7516,
+          "mean_elapsed_us": 0.46975
+        },
+        {
+          "pid": 2632314,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 127526,
+          "returned_bytes": 16270293612,
+          "inclusive_elapsed_ns": 2920685154,
+          "mean_elapsed_us": 22.90266419396829
+        },
+        {
+          "pid": 2632314,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 15530,
+          "returned_bytes": 698850,
+          "inclusive_elapsed_ns": 95801514,
+          "mean_elapsed_us": 6.1688032195750155
+        }
+      ]
+    },
+    "stack_sample_count": 792,
+    "kernel_stacks_retained_in_raw_artifact": true
+  },
+  "1m-c32-close-nginx": {
+    "status": {
+      "completed": true,
+      "usable": true,
+      "mode": "trace",
+      "kernel": "6.19.10-300.fc44.x86_64",
+      "machine": "x86_64",
+      "groups": [
+        "fault",
+        "rx-copy",
+        "sched",
+        "stacks",
+        "tcp"
+      ],
+      "duration_seconds": 12,
+      "front_port": 8987,
+      "origin_port": 9987,
+      "started_at": 1790620592.665263,
+      "program_sha256": "acb75270edc0859532eb4be5ad69c5fb1d006ee2c87a7009296ed2f7620b99cf",
+      "targets_before": [
+        {
+          "pid": 2632054,
+          "start_ticks": 90652075,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "bpftrace_version": "bpftrace v0.27.0",
+      "command": [
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+        "-f",
+        "json",
+        "-B",
+        "line",
+        "/tmp/rut-bounded-followup-20260928/ebpf-compare-r2/1m-c32-close-nginx/trace/program.bt"
+      ],
+      "returncode": 0,
+      "targets_after": [
+        {
+          "pid": 2632054,
+          "start_ticks": 90652075,
+          "state": "S",
+          "comm": "nginx",
+          "exe": "/usr/sbin/nginx"
+        }
+      ],
+      "targets_unchanged": true,
+      "diagnostic_warnings": false,
+      "finished_at": 1790620606.910317
+    },
+    "summary": {
+      "maps": {
+        "@copy_calls": {
+          "2632054,1,1": 16575,
+          "2632054,1,2": 314759
+        },
+        "@copy_elapsed_ns": {
+          "2632054,1,1": 7031227,
+          "2632054,1,2": 823710910
+        },
+        "@copy_latency_us": {
+          "2632054,1,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 16556
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 7
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 1
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 1
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 9
+            }
+          ],
+          "2632054,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 150457
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 26802
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 61326
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 73049
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 2230
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 837
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 58
+            }
+          ]
+        },
+        "@copy_success_bytes": {
+          "2632054,1,1": 1060800,
+          "2632054,1,2": 17370909807
+        },
+        "@minor_faults": {
+          "2632054": 910
+        },
+        "@offcpu_ns": {
+          "2632054": 1454709
+        },
+        "@offcpu_samples": {
+          "2632054": 80
+        },
+        "@offcpu_us": {
+          "2632054": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 7
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 28
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 21
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 17
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 4
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 2
+            }
+          ]
+        },
+        "@runqueue_ns": {
+          "2632054": 948455
+        },
+        "@runqueue_samples": {
+          "2632054": 81
+        },
+        "@runqueue_us": {
+          "2632054": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 19
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 30
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 14
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 11
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 1
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 0
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 3
+            },
+            {
+              "min": 128,
+              "max": 255,
+              "count": 2
+            }
+          ]
+        },
+        "@tcp_calls": {
+          "2632054,2,0": 4,
+          "2632054,2,2": 16566,
+          "2632054,1,1": 16576,
+          "2632054,1,2": 297956,
+          "2632054,2,1": 579392
+        },
+        "@tcp_completed_calls": {
+          "2632054,2,0": 4,
+          "2632054,2,2": 16566,
+          "2632054,1,1": 16576,
+          "2632054,1,2": 297956,
+          "2632054,2,1": 579392
+        },
+        "@tcp_elapsed_ns": {
+          "2632054,2,0": 3911,
+          "2632054,1,1": 25360697,
+          "2632054,2,2": 135791670,
+          "2632054,1,2": 2321646022,
+          "2632054,2,1": 3305281093
+        },
+        "@tcp_errors": {
+          "2632054,2,0,-32": 1,
+          "2632054,2,0,-104": 3
+        },
+        "@tcp_latency_us": {
+          "2632054,2,0": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 2
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 1
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 1
+            }
+          ],
+          "2632054,2,2": [
+            {
+              "min": 4,
+              "max": 7,
+              "count": 9351
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 7035
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 148
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 32
+            }
+          ],
+          "2632054,1,1": [
+            {
+              "min": 1,
+              "max": 1,
+              "count": 16426
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 88
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 20
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 6
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 36
+            }
+          ],
+          "2632054,1,2": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 16448
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 89727
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 25465
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 46700
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 68975
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 49229
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 1350
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 62
+            }
+          ],
+          "2632054,2,1": [
+            {
+              "min": 0,
+              "max": 0,
+              "count": 10000
+            },
+            {
+              "min": 1,
+              "max": 1,
+              "count": 17510
+            },
+            {
+              "min": 2,
+              "max": 3,
+              "count": 220399
+            },
+            {
+              "min": 4,
+              "max": 7,
+              "count": 203150
+            },
+            {
+              "min": 8,
+              "max": 15,
+              "count": 123373
+            },
+            {
+              "min": 16,
+              "max": 31,
+              "count": 4320
+            },
+            {
+              "min": 32,
+              "max": 63,
+              "count": 632
+            },
+            {
+              "min": 64,
+              "max": 127,
+              "count": 8
+            }
+          ]
+        },
+        "@tcp_requested_bytes": {
+          "2632054,2,0": 131072,
+          "2632054,2,2": 745470,
+          "2632054,1,1": 16973824,
+          "2632054,2,1": 17369900776,
+          "2632054,1,2": 22878513841
+        },
+        "@tcp_returned_bytes": {
+          "2632054,2,2": 745470,
+          "2632054,1,1": 1060800,
+          "2632054,2,1": 17369900776,
+          "2632054,1,2": 17370909807
+        },
+        "@tcp_zero_returns": {
+          "2632054,1,1": 1,
+          "2632054,1,2": 16459
+        }
+      },
+      "loss_or_errors": [],
+      "ready": true,
+      "ended": true,
+      "stdout_diagnostics": [],
+      "tcp": [
+        {
+          "pid": 2632054,
+          "direction": "recv",
+          "side": "downstream",
+          "completed_calls": 16576,
+          "returned_bytes": 1060800,
+          "inclusive_elapsed_ns": 25360697,
+          "mean_elapsed_us": 1.5299648286679537
+        },
+        {
+          "pid": 2632054,
+          "direction": "send",
+          "side": "downstream",
+          "completed_calls": 579392,
+          "returned_bytes": 17369900776,
+          "inclusive_elapsed_ns": 3305281093,
+          "mean_elapsed_us": 5.704740647092124
+        },
+        {
+          "pid": 2632054,
+          "direction": "send",
+          "side": "other",
+          "completed_calls": 4,
+          "returned_bytes": 0,
+          "inclusive_elapsed_ns": 3911,
+          "mean_elapsed_us": 0.97775
+        },
+        {
+          "pid": 2632054,
+          "direction": "recv",
+          "side": "upstream",
+          "completed_calls": 297956,
+          "returned_bytes": 17370909807,
+          "inclusive_elapsed_ns": 2321646022,
+          "mean_elapsed_us": 7.791908946287371
+        },
+        {
+          "pid": 2632054,
+          "direction": "send",
+          "side": "upstream",
+          "completed_calls": 16566,
+          "returned_bytes": 745470,
+          "inclusive_elapsed_ns": 135791670,
+          "mean_elapsed_us": 8.19701014125317
+        }
+      ]
+    },
+    "stack_sample_count": 802,
+    "kernel_stacks_retained_in_raw_artifact": true
+  }
+}

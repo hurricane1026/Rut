@@ -1,0 +1,34 @@
+diff --git a/include/rut/runtime/response_read_deadline.h b/include/rut/runtime/response_read_deadline.h
+index 860b974a..7302dc63 100644
+--- a/include/rut/runtime/response_read_deadline.h
++++ b/include/rut/runtime/response_read_deadline.h
+@@ -65,7 +65,7 @@ inline u32 bounded_response_release_bytes(u32 header, u32 received, bool complet
+ // unreleased body bytes reach this many bytes (2 bulk 256 KiB chain nodes —
+ // see ResponseBodyChain), and resumes at half that. This, not the declared
+ // Content-Length, is what bounds a Bounded response's memory.
+-static constexpr u32 kBoundedReadAheadBytes = 512u * 1024u;
++static constexpr u32 kBoundedReadAheadBytes = 128u * 1024u;
+ 
+ // Bounded release hold-back: a release this small (releasable body bytes,
+ // below one TLS record) is held briefly instead of sent immediately, so a
+diff --git a/include/rut/runtime/slice_pool.h b/include/rut/runtime/slice_pool.h
+index aca9996c..f9715732 100644
+--- a/include/rut/runtime/slice_pool.h
++++ b/include/rut/runtime/slice_pool.h
+@@ -50,14 +50,14 @@ struct SlicePool {
+     // Separate VA region, faulted in on first use; free() routes a bulk
+     // pointer here by address, so release sites need not know which kind
+     // they hold. Exhaustion is not an error: callers keep slices.
+-    static constexpr u32 kBulkSliceSize = 256 * 1024;
++    static constexpr u32 kBulkSliceSize = 128 * 1024;
+     static constexpr u32 kBulkPerConnection = 4;  // bulk buffers reserved per connection
+     static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 1 GiB VA per pool
+     // Keep at most 64 MiB of idle bulk storage per shard. A 64-buffer cache
+     // repeatedly discarded and faulted relay pages at 128 active responses;
+     // 256 buffers cover two bulk nodes per response at that concurrency.
+     // Returns beyond this bound still use MADV_DONTNEED to shed burst memory.
+-    static constexpr u32 kMaxCachedBulk = 256;
++    static constexpr u32 kMaxCachedBulk = 512;
+ 
+     static constexpr u32 capacity_for_connections(u32 connections) {
+         constexpr u32 kMaxU32 = 0xFFFFFFFFu;

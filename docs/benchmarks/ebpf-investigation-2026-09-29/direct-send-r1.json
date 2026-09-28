@@ -1,0 +1,338 @@
+[
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-send",
+    "requests": 12520,
+    "seconds": 6.000461,
+    "rps": 2086.506353428512,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 177987584,
+    "user_us_per_request": 25.559105431309906,
+    "system_us_per_request": 317.8913738019169,
+    "minor_faults_per_request": 0.016613418530351438
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12822,
+    "seconds": 6.099511,
+    "rps": 2102.1357285854556,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 177209344,
+    "user_us_per_request": 22.617376384339416,
+    "system_us_per_request": 317.4231789112463,
+    "minor_faults_per_request": 0.009826860084230228
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12597,
+    "seconds": 6.000237,
+    "rps": 2099.4170730256155,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 177401856,
+    "user_us_per_request": 24.609033896959595,
+    "system_us_per_request": 315.15440184170836,
+    "minor_faults_per_request": 0.0073033261887751055
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-send",
+    "requests": 12511,
+    "seconds": 6.000193,
+    "rps": 2085.0995959629963,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 176689152,
+    "user_us_per_request": 25.577491807209654,
+    "system_us_per_request": 316.5214611142195,
+    "minor_faults_per_request": 0.004156342418671569
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-send",
+    "requests": 12010,
+    "seconds": 6.017799,
+    "rps": 1995.7462853112906,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 235704320,
+    "user_us_per_request": 24.979184013322232,
+    "system_us_per_request": 329.72522897585344,
+    "minor_faults_per_request": 0.09159034138218151
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 11965,
+    "seconds": 6.024729,
+    "rps": 1985.9814441446247,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 234672128,
+    "user_us_per_request": 26.744671959882993,
+    "system_us_per_request": 328.458002507313,
+    "minor_faults_per_request": 0.14007521938988718
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 11973,
+    "seconds": 6.026493,
+    "rps": 1986.727604263375,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 231251968,
+    "user_us_per_request": 25.891589409504718,
+    "system_us_per_request": 328.23853670759206,
+    "minor_faults_per_request": 0.10857763300760044
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-send",
+    "requests": 12018,
+    "seconds": 6.024313,
+    "rps": 1994.9162668008782,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 233619456,
+    "user_us_per_request": 25.79464137127642,
+    "system_us_per_request": 328.6736561823931,
+    "minor_faults_per_request": 0.10817107671825595
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-send",
+    "requests": 35556,
+    "seconds": 6.100022,
+    "rps": 5828.831437001375,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158408704,
+    "user_us_per_request": 17.71852851839352,
+    "system_us_per_request": 70.03037462031725,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35695,
+    "seconds": 6.09986,
+    "rps": 5851.773647264036,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158343168,
+    "user_us_per_request": 17.369379464911052,
+    "system_us_per_request": 70.03782042302844,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35876,
+    "seconds": 6.099775,
+    "rps": 5881.5284170317755,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158306304,
+    "user_us_per_request": 16.724272494146504,
+    "system_us_per_request": 70.7994202252202,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-send",
+    "requests": 35566,
+    "seconds": 6.100007,
+    "rps": 5830.485112558068,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158429184,
+    "user_us_per_request": 17.713546645672835,
+    "system_us_per_request": 70.85418658269134,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-send",
+    "requests": 46756,
+    "seconds": 6.099654,
+    "rps": 7665.352821651851,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158339072,
+    "user_us_per_request": 14.543587988707332,
+    "system_us_per_request": 60.52699118829669,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 47300,
+    "seconds": 6.099905,
+    "rps": 7754.219123084704,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158388224,
+    "user_us_per_request": 14.799154334038056,
+    "system_us_per_request": 58.985200845665965,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 47253,
+    "seconds": 6.099955,
+    "rps": 7746.450588569916,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158371840,
+    "user_us_per_request": 15.237127801409434,
+    "system_us_per_request": 59.04387023046156,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-send",
+    "requests": 46538,
+    "seconds": 6.099849,
+    "rps": 7629.369186024113,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158355456,
+    "user_us_per_request": 14.82659332158666,
+    "system_us_per_request": 60.595642270832435,
+    "minor_faults_per_request": 0.0
+  }
+]

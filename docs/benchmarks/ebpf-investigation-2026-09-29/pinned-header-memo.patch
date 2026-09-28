@@ -1,0 +1,111 @@
+diff --git a/include/rut/runtime/connection_base.h b/include/rut/runtime/connection_base.h
+index 9694a980..7c4224c6 100644
+--- a/include/rut/runtime/connection_base.h
++++ b/include/rut/runtime/connection_base.h
+@@ -432,6 +432,26 @@ struct ConnectionBase {
+     u8* response_header_slice;
+     Buffer response_header_buf;
+ 
++    // Exact-byte memo of a short, fully validated pinned response header.
++    // Mutable request/policy facts are still checked on every lookup. Larger
++    // headers keep the full parser path; no extra buffer allocation is needed.
++    struct PinnedHeaderMemo {
++        static constexpr u32 kCapacity = 512;
++        u32 length = 0;
++        u32 declared_body;
++        u64 range_first;
++        u64 range_last;
++        u64 range_total;
++        u16 status;
++        u16 server_offset;
++        u16 server_length;
++        CompleteContentLengthResponseClass response_class;
++        bool content_type_present;
++        bool downstream_close;
++        u8 bytes[kCapacity];
++    };
++    mutable PinnedHeaderMemo pinned_header_memo;
++
+     void reanchor_request_overrides(const u8* old_base, u32 old_len, const u8* new_base) {
+         auto reanchor = [&](Str& value) {
+             if (value.ptr == nullptr) return;
+@@ -1866,6 +1886,7 @@ struct ConnectionBase {
+         resp_header_mutation_overflow = false;
+         response_header_slice = nullptr;
+         response_header_buf.bind(nullptr, 0);
++        pinned_header_memo.length = 0;
+         upstream_slot_held = false;
+         upstream_slot_uid = 0;
+         throttle_down_bps = 0;
+diff --git a/include/rut/runtime/response_read_deadline.h b/include/rut/runtime/response_read_deadline.h
+index 860b974a..be6b17b9 100644
+--- a/include/rut/runtime/response_read_deadline.h
++++ b/include/rut/runtime/response_read_deadline.h
+@@ -376,7 +376,29 @@ inline bool complete_content_length_pinned_header_matches(
+     const Connection& c,
+     u32 declared_body,
+     CompleteContentLengthResponseClassification* out_classification = nullptr) {
+-    if (c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0) return false;
++    const u8* bytes = c.response_header_buf.data();
++    const u32 length = c.response_header_buf.len();
++    if (bytes == nullptr || length == 0 || length > c.response_header_buf.capacity()) return false;
++    auto& memo = c.pinned_header_memo;
++    if (length == memo.length && length <= Connection::PinnedHeaderMemo::kCapacity &&
++        __builtin_memcmp(bytes, memo.bytes, length) == 0) {
++        if (c.request_config == nullptr ||
++            !c.request_config->response_policy_id_is_valid(c.response_policy_id) ||
++            memo.status != c.resp_status || memo.declared_body != declared_body ||
++            memo.downstream_close != c.response_read_deadline_upload.downstream_close)
++            return false;
++        const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
++        static constexpr Str kContentTypeName{"Content-Type", 12};
++        if ((memo.content_type_present && response_policy_hides_header(policy, kContentTypeName)) ||
++            memo.server_length != policy.server.len ||
++            (policy.server.len != 0 &&
++             __builtin_memcmp(bytes + memo.server_offset, policy.server.ptr, policy.server.len) != 0))
++            return false;
++        if (out_classification != nullptr)
++            *out_classification = {memo.response_class, memo.range_first, memo.range_last,
++                                   memo.range_total};
++        return true;
++    }
+     HttpResponseParser parser;
+     ParsedResponse parsed;
+     parser.reset();
+@@ -385,8 +407,34 @@ inline bool complete_content_length_pinned_header_matches(
+             ParseStatus::Complete ||
+         parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11)
+         return false;
+-    return complete_content_length_parsed_header_matches(
+-        c, parsed, declared_body, out_classification);
++    CompleteContentLengthResponseClassification classification{};
++    if (!complete_content_length_parsed_header_matches(c, parsed, declared_body, &classification))
++        return false;
++    if (length <= Connection::PinnedHeaderMemo::kCapacity) {
++        memo.length = 0;
++        memo.declared_body = declared_body;
++        memo.status = parsed.status_code;
++        memo.response_class = classification.response_class;
++        memo.range_first = classification.first;
++        memo.range_last = classification.last;
++        memo.range_total = classification.total;
++        memo.downstream_close = c.response_read_deadline_upload.downstream_close;
++        memo.content_type_present = false;
++        for (u32 i = 0; i < parsed.header_count; ++i) {
++            const Header& header = parsed.headers[i];
++            if (http_header_name_eq_ci(header.name.ptr, header.name.len, "server", 6)) {
++                memo.server_offset = static_cast<u16>(
++                    reinterpret_cast<const u8*>(header.value.ptr) - bytes);
++                memo.server_length = static_cast<u16>(header.value.len);
++            }
++            if (http_header_name_eq_ci(header.name.ptr, header.name.len, "content-type", 12))
++                memo.content_type_present = true;
++        }
++        __builtin_memcpy(memo.bytes, bytes, length);
++        memo.length = length;
++    }
++    if (out_classification != nullptr) *out_classification = classification;
++    return true;
+ }
+ 
+ inline bool complete_content_length_raw_origin_matches_pinned(

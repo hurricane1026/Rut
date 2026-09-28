@@ -1,0 +1,338 @@
+[
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-recv-send",
+    "requests": 12396,
+    "seconds": 6.000789,
+    "rps": 2065.728356721091,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 179163136,
+    "user_us_per_request": 25.0080671184253,
+    "system_us_per_request": 318.6511777992901,
+    "minor_faults_per_request": 0.003872216844143272
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12797,
+    "seconds": 6.099859,
+    "rps": 2097.9173453025714,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 177283072,
+    "user_us_per_request": 23.442994451824646,
+    "system_us_per_request": 318.8247245448152,
+    "minor_faults_per_request": 0.01750410252402907
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12610,
+    "seconds": 6.000525,
+    "rps": 2101.482786922811,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 177270784,
+    "user_us_per_request": 24.583663758921492,
+    "system_us_per_request": 315.62252180808883,
+    "minor_faults_per_request": 0.015463917525773196
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-recv-send",
+    "requests": 12383,
+    "seconds": 6.000437,
+    "rps": 2063.6830284194302,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 179347456,
+    "user_us_per_request": 25.03432124687071,
+    "system_us_per_request": 319.79326496002585,
+    "minor_faults_per_request": 0.03101025599612372
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-recv-send",
+    "requests": 11730,
+    "seconds": 6.029534,
+    "rps": 1945.4239747217612,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 240435200,
+    "user_us_per_request": 31.54305200341006,
+    "system_us_per_request": 329.0707587382779,
+    "minor_faults_per_request": 0.1875532821824382
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12030,
+    "seconds": 6.023784,
+    "rps": 1997.083560765127,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 236208128,
+    "user_us_per_request": 26.60016625103907,
+    "system_us_per_request": 327.51454696591856,
+    "minor_faults_per_request": 0.09343308395677473
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 11873,
+    "seconds": 6.024794,
+    "rps": 1970.6897862399942,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 232181760,
+    "user_us_per_request": 26.109660574412533,
+    "system_us_per_request": 332.6876105449339,
+    "minor_faults_per_request": 0.06182093826328645
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-recv-send",
+    "requests": 11453,
+    "seconds": 6.026745,
+    "rps": 1900.3624676338554,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 239583232,
+    "user_us_per_request": 32.305946040338775,
+    "system_us_per_request": 336.15646555487643,
+    "minor_faults_per_request": 0.17253121452894438
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-recv-send",
+    "requests": 34617,
+    "seconds": 6.099935,
+    "rps": 5674.9785038693035,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158453760,
+    "user_us_per_request": 16.754773666117803,
+    "system_us_per_request": 73.37435364127452,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35636,
+    "seconds": 6.099961,
+    "rps": 5842.0045636357345,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158433280,
+    "user_us_per_request": 16.83690649904591,
+    "system_us_per_request": 70.99562240431025,
+    "minor_faults_per_request": 0.00022449208665394546
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35455,
+    "seconds": 6.09998,
+    "rps": 5812.3141387348805,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158232576,
+    "user_us_per_request": 16.64081229727824,
+    "system_us_per_request": 71.35805951205754,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-recv-send",
+    "requests": 34623,
+    "seconds": 6.099918,
+    "rps": 5675.977939375579,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158445568,
+    "user_us_per_request": 17.90717153337377,
+    "system_us_per_request": 72.20633682812003,
+    "minor_faults_per_request": 0.00023106027784998412
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-recv-send",
+    "requests": 45961,
+    "seconds": 6.099918,
+    "rps": 7534.691449950639,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158466048,
+    "user_us_per_request": 14.795152411827418,
+    "system_us_per_request": 60.92121581340702,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46888,
+    "seconds": 6.099888,
+    "rps": 7686.69850987428,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158449664,
+    "user_us_per_request": 14.502644599897629,
+    "system_us_per_request": 59.930046067224026,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46948,
+    "seconds": 6.100044,
+    "rps": 7696.33792805429,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158384128,
+    "user_us_per_request": 14.484110079236602,
+    "system_us_per_request": 59.85345488625713,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-recv-send",
+    "requests": 46014,
+    "seconds": 6.100001,
+    "rps": 7543.277451921729,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158347264,
+    "user_us_per_request": 14.343460685878211,
+    "system_us_per_request": 61.28569565784326,
+    "minor_faults_per_request": 0.0
+  }
+]

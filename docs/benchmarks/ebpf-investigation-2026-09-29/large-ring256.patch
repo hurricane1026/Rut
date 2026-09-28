@@ -1,0 +1,13 @@
+diff --git a/include/rut/runtime/io_backend.h b/include/rut/runtime/io_backend.h
+index 1d919ba5..55e6a2f6 100644
+--- a/include/rut/runtime/io_backend.h
++++ b/include/rut/runtime/io_backend.h
+@@ -46,7 +46,7 @@ static constexpr u16 kBufGroupId = 0;
+ // buffer matches one upstream receive slice, so a response body moves in
+ // slice-sized steps instead of 4 KiB steps. Buffer ids continue after the
+ // ordinary ring's ids: a CQE's buffer id alone identifies the owning ring.
+-static constexpr u32 kLargeProvidedBufCount = 1024;
++static constexpr u32 kLargeProvidedBufCount = 256;
+ static constexpr u32 kLargeProvidedBufSize = 16384;
+ static constexpr u16 kLargeBufGroupId = 1;
+ static constexpr u32 kLargeProvidedBufIdBase = kProvidedBufCount;

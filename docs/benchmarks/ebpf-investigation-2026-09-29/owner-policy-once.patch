@@ -1,0 +1,30 @@
+diff --git a/include/rut/runtime/response_read_deadline.h b/include/rut/runtime/response_read_deadline.h
+index 860b974a..48d69304 100644
+--- a/include/rut/runtime/response_read_deadline.h
++++ b/include/rut/runtime/response_read_deadline.h
+@@ -1818,9 +1818,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
+         bundle.response_policy_id != c.response_policy_id ||
+         bundle.failure_policy_id != c.failure_policy_id ||
+         bundle.timeout_failure_policy_id != c.timeout_failure_policy_id ||
+-        !cfg->response_policy_id_is_valid(bundle.response_policy_id) ||
+-        !cfg->failure_policy_id_is_valid(bundle.failure_policy_id) ||
+-        !cfg->timeout_failure_policy_id_is_valid(bundle.timeout_failure_policy_id))
++        bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
++        bundle.timeout_failure_policy_id == 0)
+         return false;
+     if (!complete_content_length_request_policy_owner_is_stable(c, c.response_read_deadline_upload))
+         return false;
+@@ -1849,10 +1848,9 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
+     const auto& response = cfg->response_policies[bundle.response_policy_id - 1];
+     const auto& failure = cfg->failure_policies[bundle.failure_policy_id - 1];
+     const auto& timeout = cfg->failure_policies[bundle.timeout_failure_policy_id - 1];
+-    if (!admitted_response_policy_valid(response) ||
+-        !admitted_forward_failure_policy_valid(failure) ||
+-        !admitted_forward_timeout_failure_policy_valid(timeout) ||
+-        response.version != ResponsePolicyVersion::Http11 ||
++    // The same-call bundle validation already checked all nonzero policy IDs
++    // and their admitted shapes. This owner adds its stricter deadline role.
++    if (response.version != ResponsePolicyVersion::Http11 ||
+         response.framing != ResponsePolicyFraming::ContentLength ||
+         response.connection != ResponsePolicyConnection::Request ||
+         failure.version != ForwardFailurePolicyVersion::Http11 || failure.status_code != 502 ||

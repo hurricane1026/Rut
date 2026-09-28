@@ -1,0 +1,284 @@
+diff --git a/include/rut/runtime/connection_base.h b/include/rut/runtime/connection_base.h
+index 9694a980..65bca524 100644
+--- a/include/rut/runtime/connection_base.h
++++ b/include/rut/runtime/connection_base.h
+@@ -432,6 +432,31 @@ struct ConnectionBase {
+     u8* response_header_slice;
+     Buffer response_header_buf;
+ 
++    // Bounded syntax memo for an unchanged pinned response header. Views are
++    // offsets, so rebinding the same bytes does not retain stale pointers.
++    // Policy, framing and request-identity checks still run on every use.
++    struct PinnedHeaderMemo {
++        static constexpr u32 kCapacity = 512;
++        static constexpr u32 kHeaders = 8;
++        struct View { u16 offset; u16 length; };
++        struct Fields { View name; View value; View raw_value; };
++        u32 length = 0;
++        u32 content_length;
++        u16 status;
++        HttpVersion version;
++        u8 header_count;
++        u8 content_length_count;
++        bool has_content_length;
++        bool chunked;
++        bool keep_alive;
++        bool connection_close;
++        bool headers_truncated;
++        View reason;
++        Fields headers[kHeaders];
++        u8 bytes[kCapacity];
++    };
++    mutable PinnedHeaderMemo pinned_header_memo;
++
+     void reanchor_request_overrides(const u8* old_base, u32 old_len, const u8* new_base) {
+         auto reanchor = [&](Str& value) {
+             if (value.ptr == nullptr) return;
+@@ -1866,6 +1891,7 @@ struct ConnectionBase {
+         resp_header_mutation_overflow = false;
+         response_header_slice = nullptr;
+         response_header_buf.bind(nullptr, 0);
++        pinned_header_memo.length = 0;
+         upstream_slot_held = false;
+         upstream_slot_uid = 0;
+         throttle_down_bps = 0;
+diff --git a/include/rut/runtime/response_read_deadline.h b/include/rut/runtime/response_read_deadline.h
+index 860b974a..2b5cd26b 100644
+--- a/include/rut/runtime/response_read_deadline.h
++++ b/include/rut/runtime/response_read_deadline.h
+@@ -372,21 +372,77 @@ inline bool complete_content_length_parsed_header_matches(
+     return true;
+ }
+ 
++// Cache only parsing, never a policy or ownership verdict. Exact bytes and
++// length are checked every time; oversized headers use the ordinary parser.
++inline bool parse_pinned_response_header(const Connection& c, ParsedResponse& parsed) {
++    const u8* bytes = c.response_header_buf.data();
++    const u32 length = c.response_header_buf.len();
++    if (bytes == nullptr || length == 0 || length > c.response_header_buf.capacity()) return false;
++    auto& memo = c.pinned_header_memo;
++    if (length == memo.length && length <= Connection::PinnedHeaderMemo::kCapacity &&
++        __builtin_memcmp(bytes, memo.bytes, length) == 0) {
++        auto view = [&](Connection::PinnedHeaderMemo::View v) -> Str {
++            return {reinterpret_cast<const char*>(bytes + v.offset), v.length};
++        };
++        parsed.version = memo.version;
++        parsed.reason = view(memo.reason);
++        parsed.status_code = memo.status;
++        parsed.header_count = memo.header_count;
++        parsed.content_length = memo.content_length;
++        parsed.content_length_count = memo.content_length_count;
++        parsed.has_content_length = memo.has_content_length;
++        parsed.chunked = memo.chunked;
++        parsed.keep_alive = memo.keep_alive;
++        parsed.connection_close = memo.connection_close;
++        parsed.headers_truncated = memo.headers_truncated;
++        for (u32 i = 0; i < memo.header_count; ++i) {
++            parsed.headers[i].name = view(memo.headers[i].name);
++            parsed.headers[i].value = view(memo.headers[i].value);
++            parsed.headers[i].raw_value = view(memo.headers[i].raw_value);
++        }
++        return true;
++    }
++    HttpResponseParser parser;
++    parser.reset();
++    parsed.reset();
++    if (parser.parse(bytes, length, &parsed) != ParseStatus::Complete ||
++        parser.header_end != length || parsed.version != HttpVersion::Http11)
++        return false;
++    if (length <= Connection::PinnedHeaderMemo::kCapacity &&
++        parsed.header_count <= Connection::PinnedHeaderMemo::kHeaders) {
++        auto offset = [&](Str v) -> Connection::PinnedHeaderMemo::View {
++            return {static_cast<u16>(reinterpret_cast<const u8*>(v.ptr) - bytes),
++                    static_cast<u16>(v.len)};
++        };
++        memo.length = 0;
++        memo.version = parsed.version;
++        memo.reason = offset(parsed.reason);
++        memo.status = parsed.status_code;
++        memo.header_count = static_cast<u8>(parsed.header_count);
++        memo.content_length = parsed.content_length;
++        memo.content_length_count = parsed.content_length_count;
++        memo.has_content_length = parsed.has_content_length;
++        memo.chunked = parsed.chunked;
++        memo.keep_alive = parsed.keep_alive;
++        memo.connection_close = parsed.connection_close;
++        memo.headers_truncated = parsed.headers_truncated;
++        for (u32 i = 0; i < parsed.header_count; ++i) {
++            memo.headers[i] = {offset(parsed.headers[i].name), offset(parsed.headers[i].value),
++                               offset(parsed.headers[i].raw_value)};
++        }
++        __builtin_memcpy(memo.bytes, bytes, length);
++        memo.length = length;
++    }
++    return true;
++}
++
+ inline bool complete_content_length_pinned_header_matches(
+     const Connection& c,
+     u32 declared_body,
+     CompleteContentLengthResponseClassification* out_classification = nullptr) {
+-    if (c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0) return false;
+-    HttpResponseParser parser;
+     ParsedResponse parsed;
+-    parser.reset();
+-    parsed.reset();
+-    if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
+-            ParseStatus::Complete ||
+-        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11)
+-        return false;
+-    return complete_content_length_parsed_header_matches(
+-        c, parsed, declared_body, out_classification);
++    return parse_pinned_response_header(c, parsed) &&
++           complete_content_length_parsed_header_matches(c, parsed, declared_body, out_classification);
+ }
+ 
+ inline bool complete_content_length_raw_origin_matches_pinned(
+@@ -410,14 +466,8 @@ inline bool complete_content_length_raw_origin_matches_pinned(
+         raw.content_length != declared_body)
+         return false;
+ 
+-    HttpResponseParser pinned_parser;
+     ParsedResponse pinned;
+-    pinned_parser.reset();
+-    pinned.reset();
+-    if (pinned_parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &pinned) !=
+-            ParseStatus::Complete ||
+-        pinned_parser.header_end != c.response_header_buf.len() ||
+-        pinned.version != HttpVersion::Http11 ||
++    if (!parse_pinned_response_header(c, pinned) ||
+         !complete_content_length_parsed_header_matches(c, pinned, declared_body) ||
+         raw.status_code != pinned.status_code || raw.reason.len != pinned.reason.len ||
+         (raw.reason.len != 0 &&
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index ba70ae71..19b4cb36 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -77627,6 +77627,127 @@ TEST(iouring_body_pump_ready_set, rejects_foreign_slots_and_rolls_back_bitmap_al
+ }
+ #endif  // __linux__
+ 
++#ifdef __linux__
++TEST(pinned_header_memo, parsing_matches_fresh_parser_after_rebind_and_byte_mutations) {
++    const char* headers[] = {
++        "HTTP/1.1 200 OK\r\nServer: rut\r\nContent-Length: 3\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n",
++        "HTTP/1.1 206 Partial Content\r\nServer: rut\r\nContent-Length: 3\r\nConnection: close\r\nContent-Range: bytes 4294967300-4294967302/8589934592\r\n\r\n",
++        "HTTP/1.1 200 \r\nX-Empty:\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
++        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Test: \t value \t\r\n\r\n",
++        "HTTP/1.1 200 OK\r\nX-1: a\r\nX-2: b\r\nX-3: c\r\nX-4: d\r\nX-5: e\r\nX-6: f\r\nX-7: g\r\nX-8: h\r\nX-9: i\r\n\r\n",
++    };
++    Connection conn{};
++    conn.reset();
++    u8 storage[2048];
++    u8 relocated[2048];
++    auto check = [&]() {
++        HttpResponseParser parser;
++        ParsedResponse expected;
++        parser.reset();
++        expected.reset();
++        const bool valid = parser.parse(conn.response_header_buf.data(),
++                                       conn.response_header_buf.len(), &expected) == ParseStatus::Complete &&
++                           parser.header_end == conn.response_header_buf.len() &&
++                           expected.version == HttpVersion::Http11;
++        ParsedResponse actual;
++        const bool cached = parse_pinned_response_header(conn, actual);
++        CHECK_EQ(cached, valid);
++        if (!cached || !valid) return;
++        CHECK_EQ(actual.version, expected.version);
++        CHECK(actual.reason.eq(expected.reason));
++        CHECK_EQ(actual.status_code, expected.status_code);
++        CHECK_EQ(actual.header_count, expected.header_count);
++        CHECK_EQ(actual.content_length, expected.content_length);
++        CHECK_EQ(actual.content_length_count, expected.content_length_count);
++        CHECK_EQ(actual.has_content_length, expected.has_content_length);
++        CHECK_EQ(actual.chunked, expected.chunked);
++        CHECK_EQ(actual.keep_alive, expected.keep_alive);
++        CHECK_EQ(actual.connection_close, expected.connection_close);
++        CHECK_EQ(actual.headers_truncated, expected.headers_truncated);
++        for (u32 i = 0; i < actual.header_count; ++i) {
++            CHECK(actual.headers[i].name.eq(expected.headers[i].name));
++            CHECK(actual.headers[i].value.eq(expected.headers[i].value));
++            CHECK(actual.headers[i].raw_value.eq(expected.headers[i].raw_value));
++            CHECK(actual.headers[i].name.ptr == expected.headers[i].name.ptr);
++            CHECK(actual.headers[i].value.ptr == expected.headers[i].value.ptr);
++        }
++    };
++    for (const char* header : headers) {
++        const u32 len = static_cast<u32>(strlen(header));
++        conn.response_header_buf.bind(storage, sizeof(storage));
++        REQUIRE_EQ(conn.response_header_buf.write(reinterpret_cast<const u8*>(header), len), len);
++        check();
++        check();
++        for (u32 i = 0; i < len; ++i) {
++            storage[i] ^= 1;
++            check();
++            storage[i] ^= 1;
++            check();
++        }
++        conn.response_header_buf.bind(relocated, sizeof(relocated));
++        REQUIRE_EQ(conn.response_header_buf.write(storage, len), len);
++        check();
++        check();
++    }
++    const std::string long_header = "HTTP/1.1 200 OK\r\nX-Long: " + std::string(600, 'x') + "\r\n\r\n";
++    conn.response_header_buf.bind(storage, sizeof(storage));
++    REQUIRE_EQ(conn.response_header_buf.write(reinterpret_cast<const u8*>(long_header.data()),
++                                              static_cast<u32>(long_header.size())), long_header.size());
++    check();
++    check();
++}
++
++TEST(pinned_header_memo, policy_and_request_mutations_still_reject_warm_header) {
++    RouteConfig config{};
++    ForwardResponsePolicySpec policy{};
++    policy.version = ResponsePolicyVersion::Http11;
++    policy.framing = ResponsePolicyFraming::ContentLength;
++    policy.connection = ResponsePolicyConnection::Request;
++    policy.date = ResponsePolicyDate::Current;
++    policy.server = {"rut", 3};
++    REQUIRE_EQ(config.add_response_policy(policy), 1u);
++    Connection conn{};
++    conn.reset();
++    conn.request_config = &config;
++    conn.response_policy_id = 1;
++    conn.resp_status = 206;
++    conn.response_read_deadline_upload.downstream_close = true;
++    u8 storage[512];
++    const u8 header[] = "HTTP/1.1 206 Partial Content\r\nServer: rut\r\nContent-Length: 3\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Range: bytes 4294967300-4294967302/8589934592\r\n\r\n";
++    conn.response_header_buf.bind(storage, sizeof(storage));
++    REQUIRE_EQ(conn.response_header_buf.write(header, sizeof(header) - 1), sizeof(header) - 1);
++    CompleteContentLengthResponseClassification classification{};
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 3, &classification));
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 3, &classification));
++    CHECK_EQ(classification.first, 4294967300ull);
++    CHECK_EQ(classification.total, 8589934592ull);
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 4));
++    conn.resp_status = 200;
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 3));
++    conn.resp_status = 206;
++    conn.response_read_deadline_upload.downstream_close = false;
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 3));
++    conn.response_read_deadline_upload.downstream_close = true;
++    conn.response_policy_id = 0;
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 3));
++    conn.response_policy_id = 1;
++    conn.request_config = nullptr;
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 3));
++    conn.request_config = &config;
++    const auto saved = config.response_policies[0];
++    config.response_policies[0].server = {"foo", 3};
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 3));
++    config.response_policies[0] = saved;
++    config.response_policies[0].hide_header_count = 1;
++    config.response_policies[0].hide_headers[0] = {"Content-Type", 12};
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 3));
++    config.response_policies[0] = saved;
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 3));
++    conn.reset();
++    CHECK_EQ(conn.pinned_header_memo.length, 0u);
++}
++#endif
++
+ int main(int argc, char** argv) {
+     return rut::test::run_all(argc, argv);
+ }

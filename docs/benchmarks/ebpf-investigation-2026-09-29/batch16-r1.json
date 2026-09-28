@@ -1,0 +1,338 @@
+[
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-batch16",
+    "requests": 12713,
+    "seconds": 6.000641,
+    "rps": 2118.606995485982,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 179736576,
+    "user_us_per_request": 24.3844883190435,
+    "system_us_per_request": 313.065366160623,
+    "minor_faults_per_request": 0.0012585542358216
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12801,
+    "seconds": 6.099524,
+    "rps": 2098.6883566652086,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 176963584,
+    "user_us_per_request": 24.21685805796422,
+    "system_us_per_request": 316.38153269275836,
+    "minor_faults_per_request": 0.01593625498007968
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12770,
+    "seconds": 6.099485,
+    "rps": 2093.619379341043,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 176660480,
+    "user_us_per_request": 22.709475332811277,
+    "system_us_per_request": 319.49882537196555,
+    "minor_faults_per_request": 0.0031323414252153485
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-batch16",
+    "requests": 12691,
+    "seconds": 6.00041,
+    "rps": 2115.0221401537565,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 179154944,
+    "user_us_per_request": 25.214719092270112,
+    "system_us_per_request": 313.60806871010954,
+    "minor_faults_per_request": 0.005358127807107399
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-batch16",
+    "requests": 11665,
+    "seconds": 6.030966,
+    "rps": 1934.1843412813137,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 233230336,
+    "user_us_per_request": 28.28975567938277,
+    "system_us_per_request": 335.1907415345049,
+    "minor_faults_per_request": 0.16699528504072012
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12132,
+    "seconds": 6.025436,
+    "rps": 2013.4642538730807,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 235761664,
+    "user_us_per_request": 23.079459281239696,
+    "system_us_per_request": 328.8822947576657,
+    "minor_faults_per_request": 0.06033630069238378
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 12107,
+    "seconds": 6.027423,
+    "rps": 2008.6527857759445,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 232980480,
+    "user_us_per_request": 28.08292723217973,
+    "system_us_per_request": 324.6056000660775,
+    "minor_faults_per_request": 0.08259684480052862
+  },
+  {
+    "case": "1m-c128-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-batch16",
+    "requests": 11849,
+    "seconds": 6.028463,
+    "rps": 1965.509284870787,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 237518848,
+    "user_us_per_request": 27.85045151489577,
+    "system_us_per_request": 331.67355895012236,
+    "minor_faults_per_request": 0.2656764283905815
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-batch16",
+    "requests": 35282,
+    "seconds": 6.09993,
+    "rps": 5784.000800009181,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158396416,
+    "user_us_per_request": 17.289269315798425,
+    "system_us_per_request": 70.8576611303214,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35449,
+    "seconds": 6.100028,
+    "rps": 5811.2848006599315,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158351360,
+    "user_us_per_request": 17.207819684617338,
+    "system_us_per_request": 70.5238511664645,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 35246,
+    "seconds": 6.099947,
+    "rps": 5778.082989901387,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158388224,
+    "user_us_per_request": 17.874368722691937,
+    "system_us_per_request": 70.07887419849061,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-close",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-batch16",
+    "requests": 35440,
+    "seconds": 6.099875,
+    "rps": 5809.95512203119,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158265344,
+    "user_us_per_request": 17.776523702031604,
+    "system_us_per_request": 70.25959367945823,
+    "minor_faults_per_request": 0.0002257336343115124
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-batch16",
+    "requests": 46953,
+    "seconds": 6.100035,
+    "rps": 7697.168950669955,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158396416,
+    "user_us_per_request": 15.12150448320661,
+    "system_us_per_request": 59.63410218729368,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46995,
+    "seconds": 6.100005,
+    "rps": 7704.092045826192,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158355456,
+    "user_us_per_request": 14.682413022661985,
+    "system_us_per_request": 60.00638365783594,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "baseline",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/gap/rut-parser-count",
+    "requests": 46726,
+    "seconds": 6.100007,
+    "rps": 7659.991209846153,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158363648,
+    "user_us_per_request": 14.766939177331679,
+    "system_us_per_request": 60.351838376920774,
+    "minor_faults_per_request": 0.0
+  },
+  {
+    "case": "64k-c1-keepalive",
+    "engine": "candidate",
+    "rep": 3,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-batch16",
+    "requests": 47236,
+    "seconds": 6.10004,
+    "rps": 7743.555779962098,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158355456,
+    "user_us_per_request": 15.877720382758913,
+    "system_us_per_request": 58.64171394698958,
+    "minor_faults_per_request": 0.0
+  }
+]

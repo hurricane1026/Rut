@@ -1,0 +1,21 @@
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index d6c853e4..62463599 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -635,6 +635,16 @@ bool IoUringBackend::add_send(
+     if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE
+     const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
+ 
++    // Experimental locality probe: write large ready buffers before batching
++    // another round of socket I/O, but keep the normal asynchronous completion.
++    if (len >= 16384 && extra_flags == 0 && nop_inject_result) {
++        const ssize_t written = ::send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
++        if (written > 0) {
++            return add_send_after_direct_write(
++                fd, conn_id, buf, len, static_cast<u32>(written), generation);
++        }
++    }
++
+     // Record send state only after acquiring SQE — if kernel returns partial,
+     // wait() re-submits the remainder.
+     if (conn_id < connection_capacity) {

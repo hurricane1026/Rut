@@ -1,0 +1,7 @@
+=== pinned_header_memo ===
+RUN: pinned_header_memo.parsing_matches_fresh_parser_after_rebind_and_byte_mutations
+  PASS: parsing_matches_fresh_parser_after_rebind_and_byte_mutations
+RUN: pinned_header_memo.policy_and_request_mutations_still_reject_warm_header
+  PASS: policy_and_request_mutations_still_reject_warm_header
+
+2 passed, 0 failed, 27136 checks, 0 failed checks, 1423 skipped
