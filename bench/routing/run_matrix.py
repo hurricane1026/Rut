@@ -21,7 +21,12 @@ for profile in g.PROFILES:
         print(profile.name, size, len(asserted), len(case['traces']), int(params))
         for r in case['routes']:
             print(METHODS[r['method']], r['id'], g.canonical(r['path']) or '~')
-        order = sorted(case['routes'], key=lambda r: (tuple(0 if p.startswith(':') else 1 for p in g.parts(r['path'])), r['method'] != g.Method.ANY, -r['id']), reverse=True)
+        order = sorted(enumerate(case['routes']),
+                       key=lambda item: g.route_precedence(
+                           item[1],
+                           tuple(0 if p.startswith(':') else 1 for p in g.parts(item[1]['path'])),
+                           None, item[0]), reverse=True)
+        order = [r for _, r in order]
         print(*(r['id'] for r in order))
         for _, p in asserted:
             print(METHODS[p['method']], p['expected']['route_id'] if p['expected'] else 65535, p['canonical_path'] or '~')

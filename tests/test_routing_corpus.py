@@ -41,6 +41,19 @@ class RoutingCorpusTests(unittest.TestCase):
             self.assertEqual(corpus.reference_match(routes, "GET", "/api", contract)["route_id"], 1)
             self.assertEqual(corpus.reference_match(routes, "HEAD", "/api", contract)["route_id"], 0)
 
+    def test_precedence_is_depth_then_literal_specificity(self):
+        routes = [{"id": 0, "method": "GET", "path": "/api/:id"},
+                  {"id": 1, "method": "GET", "path": "/api/v1/users"}]
+        self.assertEqual(corpus.reference_match(routes, "GET", "/api/v1/users", corpus.Contract.EXACT)["route_id"], 1)
+
+        routes = [{"id": 90, "method": "GET", "path": "/api/:id"},
+                  {"id": 3, "method": "GET", "path": "/api/v1"}]
+        self.assertEqual(corpus.reference_match(routes, "GET", "/api/v1", corpus.Contract.EXACT)["route_id"], 3)
+
+        routes = [{"id": 99, "method": "GET", "path": "/api/:id"},
+                  {"id": 4, "method": "GET", "path": "/api/v1"}]
+        self.assertEqual(corpus.reference_match(routes, "GET", "/api/v1", corpus.Contract.SEGMENT_PREFIX)["route_id"], 4)
+
     def test_contracts_do_not_conflate_exact_and_prefix(self):
         routes = [{"id": 0, "method": "GET", "path": "/projects/:id"}]
         self.assertIsNone(corpus.reference_match(routes, "GET", "/projects/42/extra",
@@ -148,6 +161,23 @@ class ComparisonGateTests(unittest.TestCase):
         rows = [dict(r, execution_mode="local_static") for r in self.evidence()]
         self.assertTrue(comparison.validate(matrix, rows))
         rows[-1].update(state="unsupported", reason="Linkerd needs a backend for static content")
+        self.assertEqual(comparison.validate(matrix, rows), [])
+
+    def test_rut_over_capacity_is_explicitly_unsupported(self):
+        matrix = comparison.plan({"cases": [{"file": "large.json", "sha256": "abc", "routes": 129,
+                                              "asserted_probes": 10, "execution_modes": ["proxy"], "response_bytes": [16]}]})
+        rows = []
+        for required in matrix["rows"]:
+            row = dict(required, state="passed", asserted_probes=10, failed_probes=0)
+            for field in ("binary_or_image_digest", "config_sha256", "probe_evidence_sha256",
+                          "upstream_evidence_sha256", "environment_sha256",
+                          "control_plane_digest", "route_status_evidence_sha256", "topology"):
+                row[field] = "test-fixture-only"
+            rows.append(row)
+        self.assertTrue(comparison.validate(matrix, rows))
+        for row in rows:
+            if row["engine"] == "rut":
+                row.update(state="unsupported", reason="Rut currently supports at most 128 routes")
         self.assertEqual(comparison.validate(matrix, rows), [])
 
     def test_duplicate_and_unlisted_results_fail(self):

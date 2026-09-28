@@ -124,6 +124,18 @@ def parts(path):
     return value.split("/") if value else []
 
 
+def route_precedence(route, specificity, method, declaration_index):
+    """Return the corpus dispatch precedence for one matching route.
+
+    A deeper match wins before literal segments are compared.  The final
+    tie-break uses the route's declaration position; route IDs are payload
+    identifiers and do not define dispatch order.
+    """
+    return (len(parts(route["path"])), tuple(specificity),
+            route["method"] == method if method is not None else route["method"] != Method.ANY,
+            -declaration_index)
+
+
 def reference_match(routes, method, target, contract):
     """Deliberately simple oracle, never used to time a candidate implementation.
 
@@ -133,7 +145,7 @@ def reference_match(routes, method, target, contract):
     """
     request = parts(target)
     best_key, best = None, None
-    for route in routes:
+    for declaration_index, route in enumerate(routes):
         if route["method"] not in (method, Method.ANY):
             continue
         pattern = parts(route["path"])
@@ -153,7 +165,7 @@ def reference_match(routes, method, target, contract):
             else:
                 break
         else:
-            key = (tuple(specificity), route["method"] == method, -route["id"])
+            key = route_precedence(route, specificity, method, declaration_index)
             if best_key is None or key > best_key:
                 best_key = key
                 best = {"route_id": route["id"], "captures": captures}

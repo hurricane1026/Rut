@@ -17705,7 +17705,8 @@ TEST(route, configure_route_dispatch_selects_segment_trie_for_boundary_overlap) 
 
     RouteConfig cfg;
     CHECK(configure_route_dispatch(cfg, mod));
-    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::SegmentTrie);
+    // Scalar and JIT ART enforce segment boundaries for literal routes too.
+    CHECK_EQ(cfg.dispatch_kind(), RouteConfig::DispatchKind::ArtJit);
 }
 
 TEST(route, configure_route_dispatch_refuses_after_route_add) {

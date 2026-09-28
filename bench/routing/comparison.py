@@ -69,6 +69,10 @@ def validate(matrix, results):
             if row.get("state") != "unsupported" or not row.get("reason"):
                 errors.append(f"must explicitly report unsupported local response: {key}")
             continue
+        if required["prerequisite"] == "exceeds_current_128_route_capacity":
+            if row.get("state") != "unsupported" or not row.get("reason"):
+                errors.append(f"must explicitly report unsupported route capacity: {key}")
+            continue
         if row.get("state") != "passed":
             errors.append(f"not passed: {key}: {row.get('state')}")
         for field in ("binary_or_image_digest", "config_sha256", "probe_evidence_sha256",
