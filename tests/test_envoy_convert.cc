@@ -3015,9 +3015,10 @@ TEST(envoy_convert, root_omitted_without_catch_all_or_exact_arms) {
 }
 
 // A two-route bootstrap is lowered (not rejected) by this PR, so with the
-// shipped (all-false) capabilities it still fails closed, but now on the
-// same capability diagnostic the single-route milestone-S bootstrap hits
-// (check 4, `request_envoy_h1`) rather than a "multiple routes" rejection.
+// shipped capabilities it still fails closed, but on the same capability
+// diagnostic the single-route milestone-S bootstrap hits rather than a
+// "multiple routes" rejection. PR3 shipped `request_envoy_h1`, so that is
+// now check 5 (response header order), located at the HCM span.
 TEST(envoy_convert, cli_two_routes_blocked_by_first_capability) {
     const TempDir temp_dir;
     REQUIRE(temp_dir.ok());
@@ -3030,9 +3031,7 @@ TEST(envoy_convert, cli_two_routes_blocked_by_first_capability) {
     auto parsed = envoy::parse_bootstrap_json(str(text), doc);
     REQUIRE(parsed);
     REQUIRE_EQ(parsed.value().listener.filter_chain.hcm.route_config.virtual_host.routes.len, 2u);
-    const Span span = parsed.value()
-                          .listener.filter_chain.hcm.route_config.virtual_host.routes[0]
-                          .action.cluster_span;
+    const Span span = parsed.value().listener.filter_chain.hcm.span;
 
     const RunResult result = run_converter(g_executable, path);
     REQUIRE(WIFEXITED(result.status));
@@ -3040,7 +3039,8 @@ TEST(envoy_convert, cli_two_routes_blocked_by_first_capability) {
     CHECK(result.out.empty());
     const std::string expected_prefix = expected_location(path, span);
     CHECK_EQ(result.err.compare(0, expected_prefix.size(), expected_prefix), 0);
-    CHECK(result.err.find("RUT request_policy lacks host: \"preserve\"") != std::string::npos);
+    CHECK(result.err.find("RUT response_policy lacks header_order: \"upstream\"") !=
+          std::string::npos);
 }
 
 // Brute-force equivalence: for a route list rich enough to exercise exact
