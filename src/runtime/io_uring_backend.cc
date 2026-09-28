@@ -8,8 +8,10 @@
 
 #include <errno.h>
 #include <linux/io_uring.h>
+#include <poll.h>
 #include <string.h>  // memset
 #include <sys/mman.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>  // SOCK_NONBLOCK, SOCK_CLOEXEC
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -642,6 +644,70 @@ bool IoUringBackend::add_send(
     sqe->len = len;
     sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
 
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+bool IoUringBackend::add_send_file(i32 fd,
+                                   u32 conn_id,
+                                   i32 file_fd,
+                                   u32 file_off,
+                                   u32 len,
+                                   u32 generation,
+                                   bool shutdown_when_done,
+                                   bool* wrote_all,
+                                   bool allow_sync_completion) {
+    if (wrote_all) *wrote_all = false;
+    if (conn_id >= connection_capacity || connection_capacity == 0 || fd < 0 || file_fd < 0 ||
+        len == 0 || len > static_cast<u32>(INT32_MAX))
+        return false;
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;  // the completion must stay accountable
+    off_t pos = static_cast<off_t>(file_off);
+    const ssize_t n = ::sendfile(fd, file_fd, &pos, len);
+    // get_sqe() only reserves the slot; leaving it unsubmitted needs no undo.
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
+    const u32 written = n > 0 ? static_cast<u32>(n) : 0;
+    if (written == len) {
+        if (shutdown_when_done) (void)::shutdown(fd, SHUT_WR);
+        if (wrote_all) *wrote_all = true;
+        if (!shutdown_when_done && allow_sync_completion) {
+            // A keep-alive continuation that finished in this one call needs
+            // no completion round trip through the ring: every byte is
+            // already on the wire (n == len) and the caller can account the
+            // response synchronously — the caller decided this is safe to
+            // offer (not already inside another synchronous completion), so
+            // this no longer depends on nop_inject_result at all. The
+            // reserved SQE is left untouched — get_sqe() only peeked at the
+            // tail, so the next real submission reuses the same slot.
+            return true;
+        }
+    }
+    memset(sqe, 0, sizeof(*sqe));
+    if (written == len && nop_inject_result) {
+        // Complete through the ordinary proactor path, like a direct write.
+        send_state[conn_id] = {nullptr, fd, 0, len, IoEventType::Send, 0, generation};
+        sqe->opcode = IORING_OP_NOP;
+        sqe->rw_flags = static_cast<decltype(sqe->rw_flags)>(IORING_NOP_INJECT_RESULT);
+        sqe->len = len;
+    } else {
+        send_state[conn_id] = {nullptr,
+                               fd,
+                               written,
+                               len - written,
+                               IoEventType::Send,
+                               0,
+                               generation,
+                               0,
+                               file_fd,
+                               file_off,
+                               shutdown_when_done && written != len};
+        sqe->opcode = IORING_OP_POLL_ADD;
+        sqe->fd = fd;
+        sqe->poll32_events = POLLOUT;
+    }
+    sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
     sqe_advance_tail(sq_tail);
     pending++;
     return true;
@@ -1580,6 +1646,73 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     count++;
                     continue;
                 }
+            }
+            if (type == IoEventType::Send && ss.file_fd >= 0) {
+                // File-backed send: this CQE is POLLOUT readiness (a mask) or
+                // a poll error, never a byte count. ss.remaining can already
+                // be 0 here — add_send_file's sendfile(2) call wrote the
+                // whole length synchronously (a closing chunk, or a
+                // keep-alive one with a synchronous completion the caller
+                // declined) and still queued this POLL_ADD (e.g. no
+                // IORING_NOP_INJECT_RESULT to complete a closing chunk
+                // through instead). This CQE is then just cleanup for an SQE
+                // that was never really waiting on more bytes: own it here
+                // rather than falling through to the generic byte-count path
+                // below, which would misreport the poll mask as the send
+                // result.
+                i32 result = cqe->res < 0 ? cqe->res : 0;
+                // Unlike IORING_OP_SEND, sendfile(2) below names the socket by
+                // number, and no kernel reference keeps that number ours: a
+                // POLLOUT that became ready before close_conn's cancel still
+                // lands here after the fd was closed, and the number may by
+                // now belong to another connection. Continue only while this
+                // connection still owns the exact descriptor; its slot cannot
+                // be reused before this terminal CQE (pending_ops holds it).
+                if (result == 0 && ss.remaining > 0 &&
+                    (conns == nullptr || conn_id >= max_conns || conns[conn_id].fd < 0 ||
+                     conns[conn_id].fd != ss.fd))
+                    result = -ECANCELED;
+                if (result == 0 && ss.remaining > 0) {
+                    off_t pos = static_cast<off_t>(ss.file_base) + ss.offset;
+                    const ssize_t n = ::sendfile(ss.fd, ss.file_fd, &pos, ss.remaining);
+                    if (n > 0) {
+                        ss.offset += static_cast<u32>(n);
+                        ss.remaining -= static_cast<u32>(n);
+                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        result = -errno;
+                    }
+                }
+                if (result == 0 && ss.remaining > 0) {
+                    io_uring_sqe* sqe = get_sqe();
+                    if (sqe) {
+                        memset(sqe, 0, sizeof(*sqe));
+                        sqe->opcode = IORING_OP_POLL_ADD;
+                        sqe->fd = ss.fd;
+                        sqe->poll32_events = POLLOUT;
+                        sqe->user_data = encode_user_data(conn_id, type, ss.generation);
+                        sqe_advance_tail(sq_tail);
+                        pending++;
+                        head++;
+                        continue;  // don't emit event yet
+                    }
+                    result = -ENOSPC;  // SQ full: fail rather than stall
+                }
+                if (result == 0 && ss.shutdown_when_done) (void)::shutdown(ss.fd, SHUT_WR);
+                ss.remaining = 0;
+                ss.file_fd = -1;
+                ss.shutdown_when_done = false;
+                events[count].conn_id = conn_id;
+                events[count].type = type;
+                events[count].result = result < 0 ? result : static_cast<i32>(ss.offset);
+                events[count].buf_id = 0;
+                events[count].has_buf = 0;
+                events[count].more = 0;
+                events[count].aux = 0;
+                events[count].upstream_episode = upstream_episode;
+                events[count].non_upstream_generation = ss.generation;
+                head++;
+                count++;
+                continue;
             }
             if (cqe->res > 0 && ss.remaining > 0) {
                 u32 nw = static_cast<u32>(cqe->res);

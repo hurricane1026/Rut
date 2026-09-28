@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -207,6 +208,43 @@ TEST(serve_loader, large_response_body_borrows_the_pinned_module_storage) {
     CHECK_EQ(memcmp(program.config.response_bodies[0].data, body.data(), body.size()), 0);
     program.destroy();
     CHECK_EQ(program.config.response_body_count, 0u);
+}
+
+TEST(serve_loader, large_response_body_gets_a_sealed_file_closed_on_destroy) {
+    const std::string big(RouteConfig::kFileBodyMinLen, 'q');
+    const std::string small(RouteConfig::kFileBodyMinLen - 1u, 's');
+    const std::string source = "route GET \"/big\" { return response(200, body: \"" + big +
+                               "\") }\nroute GET \"/small\" { return response(200, body: \"" +
+                               small + "\") }\n";
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_body_files", "app.rut", source.c_str());
+    LoadedProgram program;
+    LoadError err;
+    REQUIRE(load_rut_program(path.c_str(), program, err));
+    REQUIRE_EQ(program.config.response_body_count, 2u);
+    const auto& big_body = program.config.response_bodies[0].len == big.size()
+                               ? program.config.response_bodies[0]
+                               : program.config.response_bodies[1];
+    const auto& small_body = &big_body == &program.config.response_bodies[0]
+                                 ? program.config.response_bodies[1]
+                                 : program.config.response_bodies[0];
+#ifdef __linux__
+    const int fd = big_body.file_fd();
+    REQUIRE_GE(fd, 0);
+    std::string file_bytes(big.size(), '\0');
+    REQUIRE_EQ(pread(fd, file_bytes.data(), file_bytes.size(), 0),
+               static_cast<ssize_t>(big.size()));
+    CHECK(file_bytes == big);
+    // Sealed: the bytes the runtime sends can never change underneath it.
+    CHECK_EQ(write(fd, "x", 1), -1);
+    CHECK_EQ(small_body.file_ref, 0u);  // below the threshold: memory sends
+    program.destroy();
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);  // closed with the program
+#else
+    CHECK_EQ(big_body.file_ref, 0u);
+    CHECK_EQ(small_body.file_ref, 0u);
+    program.destroy();
+#endif
 }
 
 TEST(serve_loader, all_response_body_literals_borrow_pinned_module_storage) {

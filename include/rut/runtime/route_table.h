@@ -492,6 +492,11 @@ struct RouteConfig {
     struct ResponseBody {
         const char* data;
         u32 len;
+        // Sealed memfd holding the same bytes, stored as fd + 1 (0 = none, so
+        // zeroed configs never name fd 0). Set by the loader for large bodies
+        // so plaintext responses can sendfile() them instead of copying.
+        u32 file_ref = 0;
+        [[nodiscard]] i32 file_fd() const { return static_cast<i32>(file_ref) - 1; }
     };
     ResponseBody response_bodies[kMaxResponseBodies];
     u32 response_body_count = 0;
@@ -1617,6 +1622,9 @@ public:
 
     // For loaders that retain the source/RIR for the entire config lifetime.
     // No copy or allocation; ordinary callers continue to use add_response_body.
+    // Bodies at least this large get a sealed memfd (attach_response_body_files).
+    static constexpr u32 kFileBodyMinLen = 64 * 1024;
+
     u16 add_response_body_view(const char* data, u32 len) {
         if (response_body_count >= kMaxResponseBodies || len > (1u << 20) ||
             (len != 0 && data == nullptr))
