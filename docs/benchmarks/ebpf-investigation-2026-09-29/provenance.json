@@ -70,8 +70,13 @@
     "ebpf-tools/rut-bulk512": {
       "sha256": "15f139bf51bf1c601c3fbe693a1adb265314d539a846768ec8ca30b72ec6177d",
       "size": 19127072
+    },
+    "ebpf-tools/rut-buffered-more": {
+      "sha256": "a6893782982a4dcedeeb62535a6537db71eeaa8cd67059ad3829d59282fcef1a",
+      "size": 19127072
     }
   },
   "bulk_first_commit": "83e5d8a1",
-  "bulk512_commit": "641a4872"
+  "bulk512_commit": "641a4872",
+  "buffered_more_base_commit": "641a4872"
 }

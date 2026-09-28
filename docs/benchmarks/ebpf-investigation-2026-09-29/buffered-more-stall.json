@@ -1,0 +1,98 @@
+[
+  {
+    "binary": "rut-bulk512",
+    "burst": 16384,
+    "connection": "close",
+    "eligible_prefix_bytes": 16281,
+    "prefix_ms": 0.7509690476581454,
+    "body_check": true
+  },
+  {
+    "binary": "rut-bulk512",
+    "burst": 16384,
+    "connection": "keep-alive",
+    "eligible_prefix_bytes": 16281,
+    "prefix_ms": 1.4829380670562387,
+    "body_check": true
+  },
+  {
+    "binary": "rut-bulk512",
+    "burst": 65536,
+    "connection": "close",
+    "eligible_prefix_bytes": 65433,
+    "prefix_ms": 0.39455597288906574,
+    "body_check": true
+  },
+  {
+    "binary": "rut-bulk512",
+    "burst": 65536,
+    "connection": "keep-alive",
+    "eligible_prefix_bytes": 65433,
+    "prefix_ms": 0.3544669598340988,
+    "body_check": true
+  },
+  {
+    "binary": "rut-bulk512",
+    "burst": 524288,
+    "connection": "close",
+    "eligible_prefix_bytes": 524185,
+    "prefix_ms": 0.3956540022045374,
+    "body_check": true
+  },
+  {
+    "binary": "rut-bulk512",
+    "burst": 524288,
+    "connection": "keep-alive",
+    "eligible_prefix_bytes": 524185,
+    "prefix_ms": 0.5420229863375425,
+    "body_check": true
+  },
+  {
+    "binary": "rut-buffered-more",
+    "burst": 16384,
+    "connection": "close",
+    "eligible_prefix_bytes": 16281,
+    "prefix_ms": 0.7868990069255233,
+    "body_check": true
+  },
+  {
+    "binary": "rut-buffered-more",
+    "burst": 16384,
+    "connection": "keep-alive",
+    "eligible_prefix_bytes": 16281,
+    "prefix_ms": 0.6255919579416513,
+    "body_check": true
+  },
+  {
+    "binary": "rut-buffered-more",
+    "burst": 65536,
+    "connection": "close",
+    "eligible_prefix_bytes": 65433,
+    "prefix_ms": 1.5468389028683305,
+    "body_check": true
+  },
+  {
+    "binary": "rut-buffered-more",
+    "burst": 65536,
+    "connection": "keep-alive",
+    "eligible_prefix_bytes": 65433,
+    "prefix_ms": 1.6287110047414899,
+    "body_check": true
+  },
+  {
+    "binary": "rut-buffered-more",
+    "burst": 524288,
+    "connection": "close",
+    "eligible_prefix_bytes": 524185,
+    "prefix_ms": 2.043797983787954,
+    "body_check": true
+  },
+  {
+    "binary": "rut-buffered-more",
+    "burst": 524288,
+    "connection": "keep-alive",
+    "eligible_prefix_bytes": 524185,
+    "prefix_ms": 2.0065089920535684,
+    "body_check": true
+  }
+]

@@ -259,3 +259,48 @@ repeatable 4–6.6% large-plaintext improvement, with the measured memory cost
 explicitly recorded. These gates do not prove no regressions across the full
 matrix, which remains outstanding. No huge-page advice or kernel tuning was
 introduced. Final source differs from the measured prototype only in comments.
+
+## Pending: MSG_MORE for already-buffered response continuations
+
+The experimental buffered-more variant sets MSG_MORE only when the selected
+complete-body pump or bounded release boundary has more bytes to send after
+the current operation. It never uses declared-but-unreceived body bytes as
+the hint. The experiment is not retained or accepted yet.
+
+Initial large-body samples suggested about 5% improvement, but a parallel
+PR #733 checkout build began during the first probe. Recorded host snapshots
+show many clang++ processes during the falling 64 KiB throughput. The reversed
+run also overlapped that build and was interrupted; scheduled acceptance and
+tracing jobs were cancelled before starting. The interfered results are
+retained for diagnosis only, not used to accept or reject this candidate.
+Fresh idle-host measurements and full functional validation are outstanding.
+
+The candidate passed all 1,423 network tests (338,996 checks). An additional
+real-socket control uses a custom origin that sends 16, 64 or 512 KiB, pauses
+for 300 ms, then finishes its 1 MiB body. Both close and implicit keepalive
+requests received the entire eligible prefix before the 100 ms timeout and
+then verified the exact full body. Candidate prefix times were 0.6–2.1 ms;
+these are functional liveness observations under concurrent external tests,
+not latency acceptance measurements. The first attempt added an explicit
+Connection: keep-alive header and failed baseline preflight. The corrected
+control uses the benchmark's implicit keepalive request form.
+
+Guarded clean-r1/r2 probes were rejected before measurement because the
+external integration test was still live. Clean-r3/r4 now wait for the
+identified external ninja process to exit, then retain per-sample host guards.
+
+## Completion scope audit
+
+The full existing runtime acceptance scope remains 96 coordinates:
+HTTP/HTTPS × static-close/static-keepalive/proxy-close/proxy-keepalive ×
+16/1024/65536/1048576 bytes × concurrency 1/32/128. As in the complete
+2026-09-24 archive, static uses `native-body` (the separate converter-return
+profile cannot represent the two largest bodies); proxy remains
+`converter-strict`. No coordinates may be dropped. The harness requires
+three valid, error-free samples of at least five seconds per engine and
+median Rut/nginx >= 1.10 in every cell, with completed cleanup evidence.
+
+The focused results above neither cover that scope nor pass that gate. The
+latest archived full run predates these runtime changes and is not current
+completion evidence. A fresh full matrix remains required after selecting
+the candidate. The no-huge-pages constraint also remains in force.

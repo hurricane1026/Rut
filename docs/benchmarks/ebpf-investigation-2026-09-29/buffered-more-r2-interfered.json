@@ -1,0 +1,74 @@
+[
+  {
+    "case": "1m-c32-close",
+    "engine": "baseline",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-bulk512",
+    "requests": 5153,
+    "seconds": 6.027123,
+    "rps": 854.9684484620607,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 189415424,
+    "user_us_per_request": 52.39666213856006,
+    "system_us_per_request": 551.1352610130022,
+    "minor_faults_per_request": 0.05103823015718999,
+    "runqueue_us_per_request": 301.1177589753541,
+    "voluntary_per_request": 0.013196196390452164,
+    "involuntary_per_request": 0.11372016301183777
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 1,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more",
+    "requests": 4462,
+    "seconds": 6.032561,
+    "rps": 739.6526947676119,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 185950208,
+    "user_us_per_request": 49.30524428507396,
+    "system_us_per_request": 531.1519497982968,
+    "minor_faults_per_request": 0.0031376064545047063,
+    "runqueue_us_per_request": 532.9693384132676,
+    "voluntary_per_request": 0.01523980277902286,
+    "involuntary_per_request": 0.18960107575078441
+  },
+  {
+    "case": "1m-c32-close",
+    "engine": "candidate",
+    "rep": 2,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-buffered-more",
+    "requests": 5608,
+    "seconds": 6.054538,
+    "rps": 926.2473866709565,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 186011648,
+    "user_us_per_request": 53.49500713266762,
+    "system_us_per_request": 554.5649072753209,
+    "minor_faults_per_request": 0.099679029957204,
+    "runqueue_us_per_request": 235.49144079885878,
+    "voluntary_per_request": 0.0112339514978602,
+    "involuntary_per_request": 0.11269614835948645
+  }
+]
