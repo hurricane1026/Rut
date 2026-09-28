@@ -3284,12 +3284,18 @@ public:
                     buffered_follow_up = target > released && len < target - released;
             }
         }
+        // Large file tails benefit from pushing the initial header/prefix
+        // before sendfile starts. Small file tails still coalesce: clearing
+        // MSG_MORE there regressed the concurrent 64 KiB keepalive probe.
+        const bool large_file_body_follows =
+            !c.tls_active && c.local_body_file_fd >= 0 && c.local_body_remaining > 64u * 1024u;
         if (backend.add_send(c.fd,
                              c.id,
                              buf,
                              len,
                              generation,
-                             c.plaintext_send_has_follow_up() || buffered_follow_up)) {
+                             (c.plaintext_send_has_follow_up() && !large_file_body_follows) ||
+                                 buffered_follow_up)) {
             c.pending_ops++;
             c.send_armed = true;
             return true;
