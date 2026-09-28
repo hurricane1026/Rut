@@ -14414,6 +14414,9 @@ TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
     CHECK_EQ(pool.bulk_available(), kTestBulk);
     CHECK_EQ(pool.bulk_cached_count, SlicePool::kMaxCachedBulk);
 
+#ifdef __linux__
+    // Only Linux discards with MADV_DONTNEED; elsewhere a discarded buffer is
+    // zeroed in place and stays resident.
     const u64 page = static_cast<u64>(sysconf(_SC_PAGESIZE));
     const u64 pages = SlicePool::kBulkSliceSize / page;
     unsigned char residency[SlicePool::kBulkSliceSize / 4096]{};
@@ -14434,6 +14437,7 @@ TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
             released += n == 0 ? 1u : 0u;
     }
     CHECK_EQ(released, kTestBulk - SlicePool::kMaxCachedBulk);
+#endif
 
     // Reuse drains the resident set first, and every reused buffer reads zero.
     u8* again[kTestBulk]{};
