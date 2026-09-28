@@ -1,0 +1,8 @@
+{
+  "archive": "poll-first-matrix-quick-r1-evidence.tar.gz",
+  "sha256": "a13a4ea6fda6a641d77a6806bcf1a7f2381acb809cb133d870a0beadd48f8cbb",
+  "source": "/tmp/rut-bounded-followup-20260928/poll-first-matrix-quick-r1",
+  "binary": "ebpf-tools/rut-small-poll-first",
+  "runtime_commit": "06cdea9d",
+  "note": "Quick diagnosis only: one 2-second sample per engine per coordinate; no final acceptance claim."
+}

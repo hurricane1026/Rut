@@ -641,3 +641,37 @@ Against the accepted POLL_FIRST/dirty-buffer binary, removing the copied initial
 All preflight and warmup/load counters pass, but both c32 modes regress materially. Revert the prototype; it has no full-network test gate and is not retained runtime code. The result shows that the initial body prefix matters even with the earlier corking change, without proving a specific window-growth mechanism. The accepted frozen POLL_FIRST binary is now running the complete 96-coordinate quick diagnostic matrix.
 
 A larger-prefix control is queued after the 96-cell scan: for plaintext memfd responses >=128 KiB, borrow a bulk slice but bind only 64 KiB of send capacity, copy the already-built header before returning its old slice, and preserve the normal sendfile remainder. It declines on an armed send, absent pool support, or allocation failure. This may consume an additional bulk lease and touch more memory per active connection; the diagnostic captures RSS. It is an unbuilt/unvalidated hypothesis at this checkpoint, not retained production code. No huge-page advice or kernel setting is changed.
+
+## Accepted-runtime full quick matrix after POLL_FIRST
+
+The complete HTTP/HTTPS × four scenarios × four sizes × three concurrency levels matrix has 96 valid diagnostic coordinates. 92 ratios are >=1.00, and 71 are >=1.10. Every coordinate is performance-ineligible because this is one two-second sample per engine. Do not combine these with older formal results to claim acceptance for the current binary. The remaining ratios below 1.10 are:
+
+| Transport | Bytes | Scenario | Concurrency | Rut/nginx |
+|---|---:|---|---:|---:|
+| http | 16 | proxy-close | 1 | 0.9917 |
+| http | 16 | proxy-close | 32 | 1.0345 |
+| http | 16 | proxy-close | 128 | 1.0543 |
+| http | 16 | proxy-keepalive | 1 | 1.0102 |
+| http | 1024 | proxy-close | 1 | 0.9939 |
+| http | 1024 | proxy-close | 32 | 1.0491 |
+| http | 1024 | proxy-close | 128 | 1.0542 |
+| http | 1024 | proxy-keepalive | 1 | 1.0137 |
+| http | 65536 | static-close | 1 | 1.0284 |
+| http | 65536 | static-close | 32 | 1.0994 |
+| http | 65536 | static-close | 128 | 1.0947 |
+| http | 65536 | static-keepalive | 1 | 1.0664 |
+| http | 65536 | proxy-close | 1 | 0.9856 |
+| http | 65536 | proxy-keepalive | 1 | 0.9578 |
+| http | 1048576 | static-close | 1 | 1.0707 |
+| http | 1048576 | static-keepalive | 32 | 1.0381 |
+| http | 1048576 | static-keepalive | 128 | 1.0269 |
+| http | 1048576 | proxy-close | 1 | 1.0711 |
+| http | 1048576 | proxy-close | 32 | 1.0479 |
+| http | 1048576 | proxy-close | 128 | 1.0023 |
+| https | 16 | proxy-keepalive | 1 | 1.0654 |
+| https | 1024 | proxy-keepalive | 1 | 1.0592 |
+| https | 65536 | proxy-keepalive | 1 | 1.0283 |
+| https | 1048576 | static-close | 128 | 1.0378 |
+| https | 1048576 | proxy-close | 128 | 1.0076 |
+
+All four ratios below 1.00 are HTTP/c1 proxy: 16 B close, 1024 B close, 64 KiB close, and 64 KiB keepalive. The other 21 listed coordinates lead nginx in this scan but miss the 1.10 target. Prior 1 MiB/static/keepalive c1 formal measurements were effectively tied, so its favorable single sample here is not proof that it is solved. Complete raw logs, host snapshots, configurations and per-group statuses are archived with a hash; TLS private keys and payload binaries are excluded.
