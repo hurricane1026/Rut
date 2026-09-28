@@ -2,7 +2,7 @@
 
 // ART — Adaptive Radix Tree.
 //
-// Drop-in semantic replacement for ByteRadixTrie: same byte-level
+// In default BytePrefix mode, a replacement for ByteRadixTrie: same byte-level
 // longest-prefix matching, same '?' / '#' / trailing-'/' handling, same
 // per-method terminal slot model, same atomic-insert contract. The
 // difference is internal layout — instead of a single homogeneous node
@@ -63,10 +63,10 @@
 // terminal slot is set only if currently kInvalidRoute, matching
 // ByteRadixTrie and the trie/hash family.
 //
-// What's intentionally NOT supported (matches ByteRadix):
-//   - `:param` dynamic segment routing/capture — that's SegmentTrie's contract.
-//   - Segment-boundary-aware matching — selector won't pick this
-//     dispatch when boundary semantics are needed.
+// Matching mode is fixed at construction: BytePrefix preserves the low-level
+// ByteRadix contract; SegmentPrefix requires a segment boundary at each
+// terminal and is used by production RouteConfig (including its JIT).
+// `:param` dynamic segment routing/capture remains SegmentTrie's contract.
 
 #include "rut/common/types.h"
 #include "rut/runtime/route_trie.h"  // for kMethodSlots, method_slot, TrieNode::kInvalidRoute
@@ -163,6 +163,8 @@ struct ArtNode256 {
     }
 };
 
+enum class ArtMatchMode : u8 { BytePrefix, SegmentPrefix };
+
 class ArtTrie {
 public:
     // Pool caps, sized so the worst-case route shape (1 + 2N nodes
@@ -193,7 +195,9 @@ public:
     static constexpr u32 kMaxN48 = 32;
     static constexpr u32 kMaxN256 = 8;
 
-    ArtTrie() { clear(); }
+    explicit ArtTrie(ArtMatchMode mode = ArtMatchMode::BytePrefix) : match_mode_(mode) { clear(); }
+
+    ArtMatchMode match_mode() const { return match_mode_; }
 
     // Wipe and re-seed with the empty root node (a Node4 at idx 0).
     void clear();
@@ -265,6 +269,7 @@ public:
     ArtChildRef root_ref_ = 0;
 
 private:
+    ArtMatchMode match_mode_;  // retained by clear(); baked into JIT specialization
     // True iff every node in the trie is a Node4 (no Node16/48/256
     // has ever been allocated). Set on clear(), cleared the first
     // time alloc_n16/48/256 succeeds. match() checks this flag and

@@ -86,8 +86,7 @@ TEST(route_art, byte_match_crosses_segment_boundaries) {
     ArtTrie t;
     REQUIRE(t.insert(S("/api"), 0, 1));
     // "/apix" and "/apij" both byte-prefix-match /api — same as
-    // ByteRadix, NOT the same as SegmentTrie. The selector is
-    // responsible for not picking ART when boundary semantics matter.
+    // ByteRadix. Production RouteConfig opts into SegmentPrefix instead.
     CHECK_EQ(t.match(S("/apix"), 0), 1u);
     CHECK_EQ(t.match(S("/apij"), 0), 1u);
 }
@@ -1309,4 +1308,43 @@ TEST(route_config, no_content204_owned_install_normalizes_empty_views_and_dedupl
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(route_art, segment_prefix_boundaries_and_fallback) {
+    ArtTrie t(ArtMatchMode::SegmentPrefix);
+    REQUIRE(t.insert(S("/api"), 0, 1));
+    CHECK_EQ(t.match(S("/apifoo"), 'G'), TrieNode::kInvalidRoute);
+    REQUIRE(t.insert(S("/"), 0, 0));
+    REQUIRE(t.insert(S("/api/v1"), 0, 2));
+    REQUIRE(t.insert(S("/apix"), 0, 3));
+    REQUIRE(t.insert(S("/api"), 'G', 4));
+    CHECK_EQ(t.match(S("/apifoo"), 'G'), 0u);
+    CHECK_EQ(t.match(S("/api"), 'G'), 4u);
+    CHECK_EQ(t.match(S("/api/child?x=1"), 'G'), 4u);
+    CHECK_EQ(t.match(S("/api/v1x"), 'G'), 4u);
+    CHECK_EQ(t.match(S("/api/v1/child"), 'G'), 2u);
+    CHECK_EQ(t.match(S("/apix"), 'G'), 3u);
+    CHECK_EQ(t.match(S("/apixyz"), 'G'), 0u);
+    CHECK_EQ(t.match(S("/api"), 'P'), 1u);
+    t.clear();
+    REQUIRE(t.insert(S("/api"), 0, 1));
+    CHECK_EQ(t.match(S("/apifoo"), 'G'), TrieNode::kInvalidRoute);
+}
+
+TEST(route_art, segment_prefix_promoted_nodes) {
+    // Exercise the heterogeneous matcher after each node promotion.
+    for (u32 count : {5u, 17u, 49u}) {
+        ArtTrie t(ArtMatchMode::SegmentPrefix);
+        char paths[49][4]{};
+        REQUIRE(t.insert(S("/"), 0, 0));
+        for (u32 i = 0; i < count; ++i) {
+            paths[i][0] = '/';
+            paths[i][1] = 'a';
+            paths[i][2] = static_cast<char>(0x40 + i);
+            REQUIRE(t.insert({paths[i], 3}, 0, static_cast<u16>(i + 1)));
+        }
+        CHECK_EQ(t.match(S("/a@"), 'G'), 1u);
+        CHECK_EQ(t.match(S("/a@/child"), 'G'), 1u);
+        CHECK_EQ(t.match(S("/a@child"), 'G'), 0u);
+    }
 }

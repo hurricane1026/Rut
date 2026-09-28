@@ -204,8 +204,32 @@ void emit_child_descent(EmitCtx& c, ArtChildRef child_ref, u32 depth) {
         emit_check_or_break(c, eq, "edge_byte_ok");
     }
 
-    // Edge fully matched. Update best from child's terminal slots.
-    emit_terminal_pickup(c, hdr);
+    // A terminal inside a request segment is not a route match. Keep descending:
+    // /api can be skipped here while a longer /apix terminal still matches.
+    bool has_terminal = false;
+    for (u32 slot = 0; slot < kMethodSlots; ++slot)
+        has_terminal |= hdr.route_idx_by_method[slot] != TrieNode::kInvalidRoute;
+    if (c.trie->match_mode() == ArtMatchMode::SegmentPrefix && has_terminal) {
+        auto pickup = LLVMAppendBasicBlockInContext(c.ctx, c.fn, "segment_terminal");
+        auto next_byte = LLVMAppendBasicBlockInContext(c.ctx, c.fn, "segment_next_byte");
+        auto descend = LLVMAppendBasicBlockInContext(c.ctx, c.fn, "segment_descend");
+        auto at_end = LLVMBuildICmp(c.builder, LLVMIntEQ, end, c.eff_len, "segment_at_end");
+        LLVMBuildCondBr(c.builder, at_end, pickup, next_byte);
+        LLVMPositionBuilderAtEnd(c.builder, next_byte);
+        // edge_fits above and !at_end prove end < eff_len before this load.
+        auto slash = LLVMBuildICmp(c.builder,
+                                   LLVMIntEQ,
+                                   emit_load_byte(c, end),
+                                   LLVMConstInt(c.i8_ty, '/', 0),
+                                   "segment_slash");
+        LLVMBuildCondBr(c.builder, slash, pickup, descend);
+        LLVMPositionBuilderAtEnd(c.builder, pickup);
+        emit_terminal_pickup(c, hdr);
+        LLVMBuildBr(c.builder, descend);
+        LLVMPositionBuilderAtEnd(c.builder, descend);
+    } else {
+        emit_terminal_pickup(c, hdr);
+    }
 
     // Recurse: emit dispatch for child's own children.
     emit_node_dispatch(c, child_ref, depth + edge.len);

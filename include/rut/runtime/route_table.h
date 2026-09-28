@@ -227,12 +227,9 @@ struct RouteConfig {
     // For SegmentTrie configs no install step is needed; trie.match
     // runs as soon as add_* finishes populating the trie.
     enum class DispatchKind : u8 {
-        ArtJit,       // ART byte-prefix trie, optionally JIT-specialized
-        SegmentTrie,  // segment-aware trie (boundary-sensitive overlap;
-                      //   the only correct choice when
-                      //   needs_segment_aware() returns true).
-                      //   `:param` route paths are supported here for
-                      //   dynamic segments and request-time capture.
+        ArtJit,       // ART with segment-boundary terminals, optionally JIT-specialized
+        SegmentTrie,  // selected for overlapping literals and required for
+                      // `:param` dynamic segments and request-time capture.
     };
 
     DispatchKind dispatch_kind() const { return dispatch_kind_; }
@@ -267,14 +264,14 @@ struct RouteConfig {
                   "RouteConfig::kMaxRoutes must equal TrieNode::kMaxChildren so a config "
                   "whose routes all share a single parent fits the trie's per-node fan-out.");
 
-    // Adaptive Radix Tree — byte-prefix matching with adaptive node
+    // Adaptive Radix Tree — segment-prefix matching with adaptive node
     // sizing (Node4/16/48/256). ~35 KB inline at the current pool
     // caps — see route_art.h's pool-cap comment for the breakdown.
     // Populated by add_*
     // when dispatch_kind_ == ArtJit. After population, caller can
     // JIT-specialize match() via install_art_jit_fn for a ~5x
     // speedup on saas-shaped configs (PR #50 round 2 bench).
-    ArtTrie art_state;
+    ArtTrie art_state{ArtMatchMode::SegmentPrefix};
 
     UpstreamTarget upstreams[kMaxUpstreams];
     u32 upstream_count = 0;
