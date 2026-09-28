@@ -81,11 +81,7 @@ HTTP close case. The eight 16 KiB response buffers plus separate 16 KiB header
 buffer passed a three-repeat close diagnostic without a timeout and do not
 hold an entire response in memory.
 The converter source is unchanged; the generated nginx config records the
-comparison setting. This non-default 16 KiB buffer size is outside the
-`response_buffering: "bounded"` mode's fixed 4 KiB release unit
-(`kBoundedResponseBufferBytes`), so this scenario is not comparable to the
-converter's default/explicit-`on` mapping below; it exists only to avoid the
-wrk close-case timeout at 1 MiB.
+comparison setting.
 
 The native preflight first delays reading a complete 256 KiB response, then
 reads a successor response on that same downstream socket. It saves the exact
@@ -213,13 +209,7 @@ Strict io_uring proxy responses retain complete Content-Length buffering through
 1 MiB using on-demand slices from the existing pool. Input bounds and async
 reclamation remain enforced. Large responses use the existing separate receive
 ring to avoid starving downstream TLS input; no ring or per-connection buffer
-capacity is increased. The converter's default and explicit-`on` mapping now
-emits `response_buffering: "bounded"` instead of `"complete_content_length"`,
-which releases the body downstream in whole 4 KiB units of raw upstream bytes
-like nginx's own `proxy_buffering on` default, instead of serializing the
-entire response behind one commit; this is expected to close the large-body
-gap this profile measures. `"complete_content_length"` is unaffected for
-bodies below 4 KiB and remains available for hand-written sources.
+capacity is increased.
 
 Preflight performs `max(3, min(100, 1 MiB / body_size))` requests per connection
 mode, with exact full-body comparisons. This avoids repeatedly comparing 100 MiB
