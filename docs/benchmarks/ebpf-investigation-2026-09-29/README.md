@@ -1002,3 +1002,19 @@ The c32 gains do not repeat and reverse into regressions; c1 effects remain near
 The initial validated header owner can receive directly into its pinned upstream_recv_buf, capped at the existing one-shot ring limit and using POLL_FIRST. It records destination, length, episode and deadline generation. The backend does not release that ownership for a foreign episode; the matching terminal CQE checks destination, bound, generation and pre-header phase before committing. Subsequent fragmented-header reads keep the existing provided-buffer path. Body and TLS recv selection are unchanged.
 
 All existing 1425 network tests / 371796 checks pass. An additional target-ownership test (foreign episode followed by correct completion, pointer/generation drift, cancellation) is queued for build; it was not included in the preceding full run. The first causal benchmark compares against the accepted FIN runtime. No retention or performance claim yet.
+
+## Direct header first causal order: large-response regression
+
+All 28 exact-body/warm/load controls pass.
+
+| Case | Mean RPS change |
+|---|---:|
+| 1024-c1-close | +0.07% |
+| 1024-c32-close | +0.01% |
+| 16-c1-close | +0.30% |
+| 16-c1-keepalive | +0.52% |
+| 16-c32-close | +0.83% |
+| 65536-c1-close | -3.23% |
+| 65536-c1-keepalive | -3.87% |
+
+Both the provided-buffer ring and ordinary destination have a 16 KiB capacity, confirmed by their constants and static assertion. A smaller nominal receive limit therefore does not explain the 64 KiB regression. Small-response effects do not justify retaining a universal change with both 64 KiB controls down over 3%. The additional ownership test is compiling; after its result the prototype will be reverted. No nginx acceptance is claimed for this experiment.
