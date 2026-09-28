@@ -152,7 +152,7 @@ index fb5132ee..8ab64ea5 100644
                      // at arm time and is pinned until this CQE; the kernel can never
                      // legitimately report more bytes than it was asked to read.
 diff --git a/tests/test_network.cc b/tests/test_network.cc
-index 668d5d92..ffbb2517 100644
+index 668d5d92..f39e7cb9 100644
 --- a/tests/test_network.cc
 +++ b/tests/test_network.cc
 @@ -36371,6 +36371,68 @@ TEST(iouring_upstream_recv, direct_recv_commits_bytes_and_rejects_stale_episode)
@@ -191,8 +191,8 @@ index 668d5d92..ffbb2517 100644
 +        auto complete = [&](i32 result, u32 episode, IoEvent* ev) {
 +            const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
 +            auto& cqe = backend.cq_entries[tail & *backend.cq_ring_mask];
-+            cqe.user_data = encode_upstream_event_token(
-+                {conn.id, IoEventType::UpstreamRecv, episode, 0});
++            cqe.user_data =
++                encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, episode, 0});
 +            cqe.res = result;
 +            cqe.flags = 0;
 +            __atomic_store_n(backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);

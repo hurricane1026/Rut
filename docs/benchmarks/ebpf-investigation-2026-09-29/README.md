@@ -1018,3 +1018,5 @@ All 28 exact-body/warm/load controls pass.
 | 65536-c1-keepalive | -3.87% |
 
 Both the provided-buffer ring and ordinary destination have a 16 KiB capacity, confirmed by their constants and static assertion. A smaller nominal receive limit therefore does not explain the 64 KiB regression. Small-response effects do not justify retaining a universal change with both 64 KiB controls down over 3%. The additional ownership test is compiling; after its result the prototype will be reverted. No nginx acceptance is claimed for this experiment.
+
+The additional direct-header ownership test passes all 96 checks (foreign episode preservation, exact completion, pointer/generation drift and cancellation). The prototype and added test are now reverted because of the measured 64 KiB regressions; the formatted patch and passing focused log are retained. Accepted runtime remains 271cd98c.

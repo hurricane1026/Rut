@@ -1,0 +1,5 @@
+=== iouring_upstream_recv ===
+RUN: iouring_upstream_recv.direct_header_target_survives_stale_episode_and_rejects_drift
+  PASS: direct_header_target_survives_stale_episode_and_rejects_drift
+
+1 passed, 0 failed, 96 checks, 0 failed checks, 1425 skipped
