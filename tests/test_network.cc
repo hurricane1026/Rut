@@ -61590,6 +61590,58 @@ TEST(response_buffering_runtime,
     }
 }
 
+// Regression test for issue #3: lifting Bounded's declared-body cap must not
+// let (header + declared_body) — a u32 raw-stream position elsewhere, e.g.
+// bounded_response_release_bytes and response_header_buf.len() + released —
+// overflow. The boundary is UINT32_MAX - SlicePool::kSliceSize: the largest
+// possible raw header is upstream_recv_buf's fixed SlicePool::kSliceSize
+// capacity (enforced by the raw_header_end <= upstream_recv_buf.capacity()
+// admission check alongside this cap), so that much headroom below
+// UINT32_MAX guarantees no admitted response can overflow it.
+TEST(response_buffering_runtime,
+     bounded_declared_body_cap_leaves_header_headroom_and_rejects_the_next_value) {
+    static constexpr u32 kCap = UINT32_MAX - SlicePool::kSliceSize;
+    REQUIRE_EQ(kCap,
+               complete_content_length_declared_body_cap(ForwardResponseBufferingMode::Bounded));
+    for (const u32 declared : {kCap, kCap + 1u}) {
+        const bool overflow = declared > kCap;
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::Bounded));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        char header[64];
+        const int n = snprintf(
+            header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", declared);
+        REQUIRE_GT(n, 0);
+        REQUIRE_LT(static_cast<u32>(n), sizeof(header));
+        const u32 len = static_cast<u32>(n);
+        REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(header), len), len);
+        const IoEvent response = response_read_copy_event(conn, len, true, 0, len);
+        const u32 id = conn.id;
+        loop->dispatch_batch(&response, 1);
+        if (overflow) {
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+            release_closed_response_read_fixture(fixture);
+        } else {
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::Buffering);
+            CHECK_EQ(conn.response_read_deadline_post_commit_declared_body, declared);
+            CHECK_EQ(conn.response_body_tail.size, 0u);  // no eager body allocation
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
 TEST(response_buffering_runtime,
      buffered_header_and_body_send_faults_close_without_publishing_failure_bytes) {
     enum class Fault : u8 { HeaderShort, HeaderError, BodyShort, BodyError };

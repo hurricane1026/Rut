@@ -87,8 +87,18 @@ static constexpr u32 kBoundedHoldTimeoutMicros = 200u;
 // releases whole buffers as they arrive and pauses the upstream recv at
 // kBoundedReadAheadBytes, so memory stays bounded regardless of how large the
 // declared Content-Length is — lift the cap for it.
+//
+// Lifting it to UINT32_MAX outright would be unsafe: raw-stream positions
+// such as (header + bounded_released) and (response_header_buf.len() +
+// released) are u32 and must never wrap. header is bounded by
+// upstream_recv_buf's fixed SlicePool::kSliceSize capacity (see
+// strict_positive_complete_buffering's raw_header_end <=
+// upstream_recv_buf.capacity() admission check), so leaving exactly that
+// much headroom below UINT32_MAX guarantees header + declared_body can never
+// exceed UINT32_MAX for any admitted response — the simplest correct fix,
+// versus widening every raw-stream offset to u64/i64.
 inline u32 complete_content_length_declared_body_cap(ForwardResponseBufferingMode mode) {
-    return mode == ForwardResponseBufferingMode::Bounded ? 0xFFFFFFFFu
+    return mode == ForwardResponseBufferingMode::Bounded ? UINT32_MAX - SlicePool::kSliceSize
                                                          : ResponseBodyChain::kMaxBody;
 }
 
