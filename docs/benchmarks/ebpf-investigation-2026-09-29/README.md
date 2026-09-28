@@ -1042,3 +1042,19 @@ All 28 samples finish with clean exact-body/warm/load checks.
 Small c1 system CPU savings require reverse-order confirmation; throughput is essentially flat. eBPF shutdown counting is in progress. A separate accepted-runtime/nginx 64 KiB recv-attempt trace is queued to distinguish header and body request lengths and EAGAIN outcomes before considering body POLL_FIRST.
 
 The four shutdown traces are usable with zero warm/load errors. At c1, process-wide shutdown syscall count falls from 119106 / 59553 front sends (2.0/send) to 60723 / 60723 (1.0/send). At c32 it falls from 261806 / 130903 to 132066 / 132049. Occasional unsuccessful shutdowns can still retry, as intended. This confirms the mechanism; instrumented throughput is not acceptance evidence. Reverse-order uninstrumented controls remain in progress.
+
+## Shutdown deduplication reverse control
+
+All 28 reverse samples finish with exact-body and zero warm/load errors.
+
+| Case | Mean RPS change | Baseline system us/request | Candidate system us/request |
+|---|---:|---:|---:|
+| 1024-c1-close | +0.40% | 53.64 | 51.94 |
+| 1024-c32-close | +0.06% | 31.69 | 31.83 |
+| 16-c1-close | -1.29% | 54.33 | 52.68 |
+| 16-c1-keepalive | +0.67% | 41.89 | 41.39 |
+| 16-c32-close | -0.48% | 32.02 | 32.11 |
+| 65536-c1-close | +0.24% | 70.18 | 70.56 |
+| 65536-c1-keepalive | +0.07% | 57.89 | 57.44 |
+
+The small c1 system CPU saving repeats, but throughput remains uncertain: the 16-byte close candidate includes a 7543.7 RPS sample versus the other samples around 7730–7750. This sample is retained, not discarded. Static close controls are queued because the same code serves that path. No retention decision yet.
