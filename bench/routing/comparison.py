@@ -19,9 +19,18 @@ class Engine(str, Enum):
     LINKERD = "linkerd"
 
 
+def _valid_reason(row):
+    reason = row.get("reason")
+    return isinstance(reason, str) and bool(reason.strip())
+
+
 def plan(manifest):
+    if manifest.get("schema_version") != 2:
+        raise ValueError("unsupported manifest schema; expected schema_version 2")
     rows = []
     for case in manifest["cases"]:
+        if case.get("contract") not in ("exact", "segment_prefix"):
+            raise ValueError(f"invalid or missing case contract: {case.get('file')}")
         for mode in case["execution_modes"]:
             for response_bytes in case["response_bytes"]:
                 for engine in Engine:
@@ -38,7 +47,7 @@ def plan(manifest):
                                  "routing_correctness_required": True,
                                  "required_asserted_probes": case["asserted_probes"],
                                  "performance_allowed_only_after_correctness": True})
-    return {"schema_version": 1, "engines": list(Engine), "rows": rows}
+    return {"schema_version": 2, "engines": list(Engine), "rows": rows}
 
 
 def validate(matrix, results):
@@ -67,15 +76,15 @@ def validate(matrix, results):
         if row.get("case_sha256") != required["case_sha256"]:
             errors.append(f"input hash mismatch: {key}")
         if required["prerequisite"] == "no_equivalent_local_static_responder":
-            if row.get("state") != "unsupported" or not isinstance(row.get("reason"), str) or not row["reason"].strip():
+            if row.get("state") != "unsupported" or not _valid_reason(row):
                 errors.append(f"must explicitly report unsupported local response: {key}")
             continue
         if required["prerequisite"] == "exceeds_current_128_route_capacity":
-            if row.get("state") != "unsupported" or not isinstance(row.get("reason"), str) or not row["reason"].strip():
+            if row.get("state") != "unsupported" or not _valid_reason(row):
                 errors.append(f"must explicitly report unsupported route capacity: {key}")
             continue
         if required["prerequisite"] == "rut_exact_contract":
-            if row.get("state") != "unsupported" or not isinstance(row.get("reason"), str) or not row["reason"].strip():
+            if row.get("state") != "unsupported" or not _valid_reason(row):
                 errors.append(f"must explicitly report unsupported exact contract: {key}")
             continue
         if row.get("state") != "passed":

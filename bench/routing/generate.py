@@ -331,7 +331,7 @@ def main():
                         "contract": contract.value,
                         "execution_modes": ["proxy"], "response_bytes": [16],
                         "asserted_probes": len(data["probes"])})
-    manifest = {"schema_version": 1, "seed": args.seed, "cases": entries,
+    manifest = {"schema_version": 2, "seed": args.seed, "cases": entries,
                 "excluded_sizes": excluded_sizes,
                 "note": "Synthetic workload corpus, not runtime benchmark results."}
     (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

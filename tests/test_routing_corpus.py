@@ -131,7 +131,7 @@ class RoutingCorpusTests(unittest.TestCase):
 
 class ComparisonGateTests(unittest.TestCase):
     def setUp(self):
-        self.matrix = comparison.plan({"cases": [{"file": "tiny.json", "sha256": "abc", "routes": 2, "asserted_probes": 10, "execution_modes": ["proxy"], "response_bytes": [16]}]})
+        self.matrix = comparison.plan({"schema_version": 2, "cases": [{"file": "tiny.json", "sha256": "abc", "routes": 2, "contract": "segment_prefix", "asserted_probes": 10, "execution_modes": ["proxy"], "response_bytes": [16]}]})
 
     def evidence(self):
         rows = []
@@ -163,7 +163,7 @@ class ComparisonGateTests(unittest.TestCase):
         self.assertTrue(comparison.validate(self.matrix, rows))
 
     def test_linkerd_local_response_is_explicitly_unsupported(self):
-        matrix = comparison.plan({"cases": [{"file": "tiny.json", "sha256": "abc", "routes": 1,
+        matrix = comparison.plan({"schema_version": 2, "cases": [{"file": "tiny.json", "sha256": "abc", "routes": 1, "contract": "segment_prefix",
                                               "asserted_probes": 10, "execution_modes": ["local_static"], "response_bytes": [16]}]})
         rows = [dict(r, execution_mode="local_static") for r in self.evidence()]
         self.assertTrue(comparison.validate(matrix, rows))
@@ -171,7 +171,7 @@ class ComparisonGateTests(unittest.TestCase):
         self.assertEqual(comparison.validate(matrix, rows), [])
 
     def test_rut_over_capacity_is_explicitly_unsupported(self):
-        matrix = comparison.plan({"cases": [{"file": "large.json", "sha256": "abc", "routes": 129,
+        matrix = comparison.plan({"schema_version": 2, "cases": [{"file": "large.json", "sha256": "abc", "routes": 129, "contract": "segment_prefix",
                                               "asserted_probes": 10, "execution_modes": ["proxy"], "response_bytes": [16]}]})
         rows = []
         for required in matrix["rows"]:
@@ -188,7 +188,7 @@ class ComparisonGateTests(unittest.TestCase):
         self.assertEqual(comparison.validate(matrix, rows), [])
 
     def test_rut_exact_contract_is_explicitly_unsupported(self):
-        manifest = {"cases": [{"file": "exact.json", "sha256": "abc", "routes": 2,
+        manifest = {"schema_version": 2, "cases": [{"file": "exact.json", "sha256": "abc", "routes": 2,
                                 "contract": "exact", "asserted_probes": 10,
                                 "execution_modes": ["proxy"], "response_bytes": [16]}]}
         matrix = comparison.plan(manifest)
@@ -208,7 +208,7 @@ class ComparisonGateTests(unittest.TestCase):
         self.assertEqual(comparison.validate(matrix, rows), [])
 
     def test_unsupported_reason_must_be_nonempty_string(self):
-        matrix = comparison.plan({"cases": [{"file": "large.json", "sha256": "abc", "routes": 129,
+        matrix = comparison.plan({"schema_version": 2, "cases": [{"file": "large.json", "sha256": "abc", "routes": 129, "contract": "segment_prefix",
                                               "asserted_probes": 10, "execution_modes": ["proxy"], "response_bytes": [16]}]})
         rows = []
         for required in matrix["rows"]:
@@ -253,6 +253,12 @@ class ComparisonGateTests(unittest.TestCase):
             summarize = ROOT / "bench/routing/summarize_matrix.py"
             subprocess.run([sys.executable, str(summarize), str(root)], check=True,
                            capture_output=True, cwd=ROOT / "bench/routing")
+            raw = (root / "raw.csv").read_text()
+            (root / "raw.csv").write_text("\n".join(
+                line for line in raw.splitlines() if ",jit_art," not in line) + "\n")
+            self.assertNotEqual(subprocess.run([sys.executable, str(summarize), str(root)],
+                                               capture_output=True, cwd=ROOT / "bench/routing").returncode, 0)
+            (root / "raw.csv").write_text(raw)
             with (root / "raw.csv").open("a", newline="") as stream:
                 writer = csv.writer(stream)
                 profile, size, case = cases[0]
@@ -261,6 +267,79 @@ class ComparisonGateTests(unittest.TestCase):
                         writer.writerow([profile.name, size, trace, "extra", repeat, 1])
             self.assertNotEqual(subprocess.run([sys.executable, str(summarize), str(root)],
                                                capture_output=True, cwd=ROOT / "bench/routing").returncode, 0)
+
+    def test_manifest_schema_and_contract_are_strict(self):
+        base = {"cases": [{"file": "case.json", "sha256": "abc", "routes": 1,
+                            "contract": "segment_prefix", "asserted_probes": 1,
+                            "execution_modes": ["proxy"], "response_bytes": [16]}]}
+        with self.assertRaises(ValueError):
+            comparison.plan(base)
+        for contract in (None, "", "unknown"):
+            manifest = dict(base, schema_version=2)
+            manifest["cases"] = [dict(base["cases"][0], contract=contract)]
+            with self.assertRaises(ValueError):
+                comparison.plan(manifest)
+
+    def test_unsupported_reason_type_is_checked_for_all_prerequisites(self):
+        manifests = (
+            {"file": "local.json", "routes": 1, "contract": "segment_prefix",
+             "execution_modes": ["local_static"]},
+            {"file": "capacity.json", "routes": 129, "contract": "segment_prefix",
+             "execution_modes": ["proxy"]},
+            {"file": "exact.json", "routes": 1, "contract": "exact",
+             "execution_modes": ["proxy"]},
+        )
+        for case in manifests:
+            manifest = {"schema_version": 2, "cases": [dict(case, sha256="abc",
+                                                               asserted_probes=1,
+                                                               response_bytes=[16])]}
+            matrix = comparison.plan(manifest)
+            rows = self.evidence_for(matrix)
+            target = next(row for row in rows if row["prerequisite"] in {
+                "no_equivalent_local_static_responder", "exceeds_current_128_route_capacity",
+                "rut_exact_contract"})
+            for reason in (True, "   "):
+                target.update(state="unsupported", reason=reason)
+                self.assertTrue(comparison.validate(matrix, rows))
+
+    def test_cli_counts_all_unsupported_prerequisites(self):
+        manifest = {"schema_version": 2, "cases": [
+            {"file": "local.json", "sha256": "a", "routes": 1, "contract": "segment_prefix",
+             "asserted_probes": 1, "execution_modes": ["local_static"], "response_bytes": [16]},
+            {"file": "capacity.json", "sha256": "b", "routes": 129, "contract": "segment_prefix",
+             "asserted_probes": 1, "execution_modes": ["proxy"], "response_bytes": [16]},
+            {"file": "exact.json", "sha256": "c", "routes": 1, "contract": "exact",
+             "asserted_probes": 1, "execution_modes": ["proxy"], "response_bytes": [16]},
+        ]}
+        matrix = comparison.plan(manifest)
+        rows = self.evidence_for(matrix)
+        for row in rows:
+            if row["prerequisite"] in {"no_equivalent_local_static_responder",
+                                        "exceeds_current_128_route_capacity",
+                                        "rut_exact_contract"}:
+                row.update(state="unsupported", reason="fixture unsupported")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "manifest.json"
+            results_path = root / "results.json"
+            manifest_path.write_text(json.dumps(manifest))
+            results_path.write_text(json.dumps(rows))
+            result = subprocess.run([sys.executable, str(ROOT / "bench/routing/comparison.py"),
+                                     str(manifest_path), "--results", str(results_path)],
+                                    check=True, capture_output=True, text=True)
+            self.assertIn("3 explicitly unsupported rows", result.stdout)
+
+    def evidence_for(self, matrix):
+        rows = []
+        for required in matrix["rows"]:
+            row = dict(required, state="passed", asserted_probes=required["required_asserted_probes"],
+                       failed_probes=0)
+            for field in ("binary_or_image_digest", "config_sha256", "probe_evidence_sha256",
+                          "upstream_evidence_sha256", "environment_sha256",
+                          "control_plane_digest", "route_status_evidence_sha256", "topology"):
+                row[field] = "test-fixture-only"
+            rows.append(row)
+        return rows
 
     def test_duplicate_and_unlisted_results_fail(self):
         rows = self.evidence()
