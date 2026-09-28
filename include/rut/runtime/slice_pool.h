@@ -53,11 +53,11 @@ struct SlicePool {
     static constexpr u32 kBulkSliceSize = 256 * 1024;
     static constexpr u32 kBulkPerConnection = 4;  // bulk buffers reserved per connection
     static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 1 GiB VA per pool
-    // Returned bulk buffers kept resident for reuse: at most 16 MiB of idle
-    // retention per pool, the size of the former fixed bulk set. Returns past
-    // this are discarded (MADV_DONTNEED), so a burst that touched many bulk
-    // buffers does not keep their pages resident afterwards.
-    static constexpr u32 kMaxCachedBulk = 64;
+    // Keep at most 64 MiB of idle bulk storage per shard. A 64-buffer cache
+    // repeatedly discarded and faulted relay pages at 128 active responses;
+    // 256 buffers cover two bulk nodes per response at that concurrency.
+    // Returns beyond this bound still use MADV_DONTNEED to shed burst memory.
+    static constexpr u32 kMaxCachedBulk = 256;
 
     static constexpr u32 capacity_for_connections(u32 connections) {
         constexpr u32 kMaxU32 = 0xFFFFFFFFu;

@@ -1,0 +1,116 @@
+{
+  "cache256-c128": {
+    "samples": 2982,
+    "period_total": 25299208609,
+    "top_self_percent": {
+      "rep_movs_alternative": 36.75636961502395,
+      "clear_page_erms": 7.270544369303517,
+      "nft_do_chain": 4.701847300380905,
+      "check_heap_object": 1.16904032284546,
+      "__nf_conntrack_find_get": 1.0445070637742968,
+      "__tcp_transmit_skb": 1.0071338591569934,
+      "__inet_lookup_established": 0.9364662810666656,
+      "skb_release_data": 0.9059565282941852,
+      "kmem_cache_free": 0.704145116763166,
+      "__raw_spin_lock_irqsave": 0.6746648902656985,
+      "nf_hook_slow": 0.6345093693677603,
+      "nft_immediate_eval": 0.6026895756168354
+    },
+    "io_named_self_percent": 1.2422803252754506
+  },
+  "rut-c128": {
+    "samples": 2981,
+    "period_total": 25481238238,
+    "top_self_percent": {
+      "rep_movs_alternative": 30.936952801783228,
+      "clear_page_erms": 7.323874525127777,
+      "nft_do_chain": 4.368452237693803,
+      "asm_exc_page_fault": 2.795177688570222,
+      "__list_del_entry_valid_or_report": 1.9152262007119185,
+      "zap_present_ptes.constprop.0": 1.1073907569342196,
+      "skb_release_data": 0.9064584257744029,
+      "kmem_cache_free": 0.9045877356786244,
+      "__inet_lookup_established": 0.8764589417281363,
+      "tcp_sendmsg_locked": 0.7786161847665858,
+      "__tcp_transmit_skb": 0.7713104919167626,
+      "__nf_conntrack_find_get": 0.7392523206312797
+    },
+    "io_named_self_percent": 1.0745560025088134
+  },
+  "nginx-c128": {
+    "samples": 3001,
+    "period_total": 25167149618,
+    "top_self_percent": {
+      "rep_movs_alternative": 17.352827500482974,
+      "clear_page_erms": 7.253721425386728,
+      "nft_do_chain": 6.259162423675309,
+      "__tcp_transmit_skb": 1.1793158403116226,
+      "kmem_cache_free": 0.9065515819750232,
+      "__raw_spin_lock_irqsave": 0.9058776359677301,
+      "mod_memcg_state": 0.8744376591721822,
+      "skb_release_data": 0.8406620384561978,
+      "nft_do_chain_ipv4": 0.8066928558917744,
+      "__inet_lookup_established": 0.8053512975304791,
+      "tcp_sendmsg_locked": 0.7738805067567187,
+      "__netif_receive_skb_core.constprop.0": 0.7732022813613488
+    },
+    "io_named_self_percent": 0
+  },
+  "cache256-c32": {
+    "samples": 3039,
+    "period_total": 25800971591,
+    "top_self_percent": {
+      "rep_movs_alternative": 35.11896252062348,
+      "clear_page_erms": 6.629324213498375,
+      "nft_do_chain": 4.897340011182992,
+      "__tcp_transmit_skb": 1.2203808987946574,
+      "__raw_spin_lock_irqsave": 1.1549244258070623,
+      "skb_release_data": 0.9526674649947682,
+      "tcp_sendmsg_locked": 0.8249723319498848,
+      "__inet_lookup_established": 0.7928391776973063,
+      "check_heap_object": 0.7915235256924864,
+      "kmem_cache_free": 0.7261121246509573,
+      "nft_meta_store_ifname": 0.6889147580085795,
+      "kmem_cache_alloc_node_noprof": 0.6618793730216312
+    },
+    "io_named_self_percent": 0.9900620218856626
+  },
+  "rut-c32": {
+    "samples": 2991,
+    "period_total": 25384187072,
+    "top_self_percent": {
+      "rep_movs_alternative": 33.87585746437096,
+      "clear_page_erms": 7.539968806451128,
+      "nft_do_chain": 4.497056150595328,
+      "kmem_cache_free": 1.272100607689691,
+      "__tcp_transmit_skb": 1.2380164356204442,
+      "skb_release_data": 0.837643795315944,
+      "__inet_lookup_established": 0.7673352408234253,
+      "__rcu_read_unlock": 0.7386477198114466,
+      "nft_immediate_eval": 0.7367748806354211,
+      "memset_orig": 0.670511395607162,
+      "__nf_conntrack_find_get": 0.669422280563943,
+      "nft_rhash_lookup": 0.6372676128692533
+    },
+    "io_named_self_percent": 1.4392135543429705
+  },
+  "nginx-c32": {
+    "samples": 2996,
+    "period_total": 25147989364,
+    "top_self_percent": {
+      "rep_movs_alternative": 17.06605561931635,
+      "clear_page_erms": 7.730411226366065,
+      "nft_do_chain": 7.261213195095576,
+      "__tcp_transmit_skb": 1.3438537813435987,
+      "kmem_cache_free": 1.2369468608305556,
+      "__raw_spin_lock_irqsave": 1.070166239155723,
+      "memset_orig": 0.9701152703255136,
+      "tcp_sendmsg_locked": 0.9387438159885171,
+      "nft_immediate_eval": 0.9049966409075979,
+      "__inet_lookup_established": 0.8711520266252964,
+      "_copy_to_iter": 0.7364625231833704,
+      "nf_hook_slow": 0.7035167441786262
+    },
+    "io_named_self_percent": 0
+  }
+}
