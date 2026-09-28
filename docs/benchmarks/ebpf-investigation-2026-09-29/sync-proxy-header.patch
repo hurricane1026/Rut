@@ -1,0 +1,46 @@
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index 2512a758..ea1b2557 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -3219,6 +3219,41 @@ public:
+             c.response_read_deadline_send_kind = kind;
+             c.response_read_deadline_send_owner_active = true;
+         }
++        // Complete a small, already-owned plaintext header inline. Its nonempty
++        // body still follows through the ordinary async pump and bounds reentry.
++        if (phase == ResponseReadDeadlinePostCommitPhase::HeaderSend && !c.tls_active &&
++            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
++            c.response_read_deadline_post_commit_send_body > 0 && !in_sync_send_completion &&
++            !c.send_armed && c.id < backend.connection_capacity && backend.failure_code() == 0 &&
++            backend.send_state[c.id].remaining == 0 && backend.sq_has_room() &&
++            buf == c.response_header_buf.data() && len == c.response_header_buf.len() &&
++            len > 0 && len <= 512 && c.on_send == &on_response_header_sent<Self>) {
++            const ssize_t n = ::send(c.fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL | MSG_MORE);
++            if (n == static_cast<ssize_t>(len)) {
++                backend.send_state[c.id] = {buf, c.fd, len, 0, IoEventType::Send, 0, generation};
++                c.pending_ops++;
++                c.send_armed = true;
++                IoEvent completion{};
++                completion.conn_id = c.id;
++                completion.type = IoEventType::Send;
++                completion.result = static_cast<i32>(len);
++                completion.non_upstream_generation = generation;
++                in_sync_send_completion = true;
++                dispatch(completion);
++                in_sync_send_completion = false;
++                return true;
++            }
++            if (n > 0) {
++                if (!backend.add_send_after_direct_write(
++                        c.fd, c.id, buf, len, static_cast<u32>(n), generation)) {
++                    c.clear_response_read_deadline_send_owner();
++                    return false;
++                }
++                c.pending_ops++;
++                c.send_armed = true;
++                return true;
++            }
++        }
+         // The completion SQE is reserved first: once written, the bytes and
+         // FIN cannot be withdrawn, so the send must stay accountable.
+         if (!deadline_send && final_local_response_send(c, buf, len) && backend.sq_has_room()) {

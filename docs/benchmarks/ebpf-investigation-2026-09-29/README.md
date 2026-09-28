@@ -799,3 +799,17 @@ All four traces usable with exact-body preflight and zero warm/load errors. Kern
 | 65536-c1-keepalive-rut-base | 3.0009 |
 
 Rut uses approximately three calls: a 128–255 byte rewritten header, an 8–16 KiB first body fragment, and a 32–64 KiB remainder. nginx uses about five. Thus excess Rut send-call count is not supported; Rut still pays serial completion/pump transitions between its three fragments. Different probe counts bias instrumented throughput, so no throughput conclusion is drawn. A small-header synchronous-completion prototype is being tested separately; it preserves the existing owned Send generation, exact-frame checks and ordinary asynchronous body completion.
+
+## Rejected synchronous terminal proxy header
+
+A complete small plaintext Bounded header was dispatched synchronously with the same owned generation and exact send-frame checks, while body sends remained asynchronous. Partial header writes used the existing remainder proactor. All preflight and warm/load checks passed; no full network suite was run.
+
+| Case | Mean RPS change |
+|---|---:|
+| 16-c1-close | -0.93% |
+| 16-c1-keepalive | -0.63% |
+| 16-c32-close | -0.76% |
+| 65536-c1-close | -0.18% |
+| 65536-c1-keepalive | +0.48% |
+
+The roughly 0.5% 64 KiB keepalive signal is insufficient to retain a new synchronous completion path, especially with flat close results and noisy negative control cases. Reverted.
