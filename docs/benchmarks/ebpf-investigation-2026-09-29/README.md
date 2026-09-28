@@ -639,3 +639,5 @@ Against the accepted POLL_FIRST/dirty-buffer binary, removing the copied initial
 | 1m-c32-keepalive | -10.88% |
 
 All preflight and warmup/load counters pass, but both c32 modes regress materially. Revert the prototype; it has no full-network test gate and is not retained runtime code. The result shows that the initial body prefix matters even with the earlier corking change, without proving a specific window-growth mechanism. The accepted frozen POLL_FIRST binary is now running the complete 96-coordinate quick diagnostic matrix.
+
+A larger-prefix control is queued after the 96-cell scan: for plaintext memfd responses >=128 KiB, borrow a bulk slice but bind only 64 KiB of send capacity, copy the already-built header before returning its old slice, and preserve the normal sendfile remainder. It declines on an armed send, absent pool support, or allocation failure. This may consume an additional bulk lease and touch more memory per active connection; the diagnostic captures RSS. It is an unbuilt/unvalidated hypothesis at this checkpoint, not retained production code. No huge-page advice or kernel setting is changed.
