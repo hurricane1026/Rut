@@ -22,6 +22,76 @@ inline u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns
     return remaining_ms > UINT32_MAX ? UINT32_MAX : static_cast<u32>(remaining_ms);
 }
 
+// Bounded read-ahead pause suspends the response_read_timeout: nginx does not
+// time out reads it isn't performing. A natural precise-timer fire while
+// paused is not a real inactivity signal — refresh last_progress_ns (so a
+// rearm computed from `now_ns` afterward gives a full fresh interval) instead
+// of expiring; try_advance_bounded_release refreshes it again the moment the
+// recv actually resumes. Returns whether the connection is genuinely due.
+inline bool response_read_timer_due_honoring_read_ahead_pause(Connection& c,
+                                                              u64 now_ns,
+                                                              u64 timeout_ns) {
+    const bool due = response_read_timer_remaining_ms(
+                         c.response_read_timer_last_progress_ns, timeout_ns, now_ns) == 0;
+    if (due && c.response_read_deadline_bounded_read_ahead_paused) {
+        c.response_read_timer_last_progress_ns = now_ns;
+        return false;
+    }
+    return due;
+}
+
+// Bounded-mode release rule (nginx `proxy_buffering on`, byte-exact): downstream
+// release happens in whole kBoundedResponseBufferBytes units of RAW upstream
+// bytes (response header + body). `header` is the raw response-header length
+// (bytes up to and including the blank line); `received` is raw body bytes
+// received so far. `complete` forces the entire received prefix out (the
+// response finished, or the origin closed cleanly, or the inactivity deadline
+// fired after at least one release — see start_complete_content_length_send).
+// Returns the BODY-relative release boundary: bytes of body eligible for
+// publication, monotonically non-decreasing in `received`. Below one whole
+// buffer (header + received < kBoundedResponseBufferBytes) this is always 0,
+// making Bounded byte-identical to CompleteContentLength for small bodies.
+inline u32 bounded_response_release_bytes(u32 header, u32 received, bool complete) {
+    if (complete) return received;
+    const u64 total = static_cast<u64>(header) + static_cast<u64>(received);
+    const u64 released_total =
+        (total / kBoundedResponseBufferBytes) * static_cast<u64>(kBoundedResponseBufferBytes);
+    if (released_total <= header) return 0;
+    const u64 releasable_body = released_total - header;
+    return releasable_body > received ? received : static_cast<u32>(releasable_body);
+}
+
+// Bounded read-ahead window: the upstream recv pauses once received-but-
+// unreleased body bytes reach this many bytes (2 bulk 256 KiB chain nodes —
+// see ResponseBodyChain), and resumes at half that. This, not the declared
+// Content-Length, is what bounds a Bounded response's memory.
+static constexpr u32 kBoundedReadAheadBytes = 512u * 1024u;
+
+// Bounded release hold-back: a release this small (releasable body bytes,
+// below one TLS record) is held briefly instead of sent immediately, so a
+// fast/bursty origin's next chunk can coalesce into the same Send — over TLS,
+// the same record — rather than paying a separate small Send (and TLS
+// record) per recv completion. See try_advance_bounded_release. Measured at
+// 16/32/64 KiB; 16 KiB (one TLS record) won on the probe without costing the
+// 1 MiB case.
+static constexpr u32 kBoundedMinReleaseBytes = 16u * 1024u;
+
+// How long a too-small release is held (see kBoundedMinReleaseBytes) before
+// flushing it anyway via Connection::response_read_deadline_bounded_hold_timer_*
+// / IoEventType::BoundedHoldTimer — bounds the extra latency a client can
+// observe. Measured in the 100-500us range the reviewer suggested; 200us won.
+static constexpr u32 kBoundedHoldTimeoutMicros = 200u;
+
+// CompleteContentLength buffers the whole body before sending a byte, so its
+// admission keeps the existing 1 MiB ResponseBodyChain::kMaxBody cap. Bounded
+// releases whole buffers as they arrive and pauses the upstream recv at
+// kBoundedReadAheadBytes, so memory stays bounded regardless of how large the
+// declared Content-Length is — lift the cap for it.
+inline u32 complete_content_length_declared_body_cap(ForwardResponseBufferingMode mode) {
+    return mode == ForwardResponseBufferingMode::Bounded ? 0xFFFFFFFFu
+                                                         : ResponseBodyChain::kMaxBody;
+}
+
 inline bool response_read_deadline_http_date_is_normalized(Str value) {
     if (value.ptr == nullptr || value.len != 29 || value.ptr[3] != ',' || value.ptr[4] != ' ' ||
         value.ptr[7] != ' ' || value.ptr[11] != ' ' || value.ptr[16] != ' ' ||
@@ -2246,9 +2316,10 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.response_read_deadline_post_commit_declared_body == 0 ||
         c.response_read_deadline_post_commit_raw_header_end > c.upstream_recv_buf.capacity() ||
         c.response_read_deadline_post_commit_declared_body >
-            (complete_buffering ? ResponseBodyChain::kMaxBody
-                                : c.upstream_recv_buf.capacity() -
-                                      c.response_read_deadline_post_commit_raw_header_end) ||
+            (complete_buffering
+                 ? complete_content_length_declared_body_cap(c.response_read_deadline_buffering)
+                 : c.upstream_recv_buf.capacity() -
+                       c.response_read_deadline_post_commit_raw_header_end) ||
         c.response_read_deadline_post_commit_origin_received >
             c.response_read_deadline_post_commit_declared_body ||
         c.response_read_deadline_post_commit_downstream_completed >

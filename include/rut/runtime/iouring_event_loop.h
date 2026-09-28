@@ -279,6 +279,26 @@ public:
         u32 first_copy_begin = 0;
         u32 expected_copy_end = 0;
         u32 positive_bytes = 0;
+        // Bounded only: sock_nonempty carried by the last positive UpstreamRecv
+        // CQE folded into this owner (program order within the batch — see
+        // prepare_response_read_deadline_batch). True means the kernel still
+        // had more bytes queued in the upstream socket when that recv drained
+        // it, so try_advance_bounded_release defers starting a new release
+        // Send: the imminent re-arm will very likely pick those bytes up
+        // without the client ever observing the wait, and coalescing them
+        // into one Send avoids the extra small sends a bursty/fast origin
+        // would otherwise cause. False (including "no positive CQE this
+        // batch") releases immediately, matching today's behavior.
+        bool last_positive_sock_nonempty = false;
+        // Bounded only: (header consumed ? raw_header_end : 0) + bounded_released,
+        // snapshotted at the exact moment first_copy_begin was captured (before
+        // this batch's own dispatch can run any release-Send completion that
+        // would advance bounded_released/bounded_header_sent further). Pairs
+        // with first_copy_begin/expected_copy_end, which are themselves
+        // pre-dispatch physical buffer snapshots — see the identical-batch
+        // release race this fixes at its use in
+        // settle_precise_complete_content_length_buffering.
+        u32 removed_at_first_copy = 0;
         bool valid = false;
         bool saw_relevant = false;
         bool saw_positive = false;
@@ -1472,7 +1492,27 @@ public:
 
     // Use the existing separate receive ring so a large buffered origin
     // cannot consume all buffers needed by downstream TLS requests.
+    //
+    // Bounded never arms a multishot recv, header or body: a cancelled
+    // multishot can still have CQEs already queued in the kernel from data
+    // that arrived before the cancel took effect, and the copy-eligibility
+    // witness (response_deadline_copy_owner) correctly refuses to copy those
+    // once a pause/cancel is pending — so those origin bytes are read out of
+    // the socket into a provided buffer and then discarded (synthesized
+    // -ENOBUFS), never retried. One-shot recvs never have a second SQE in
+    // flight to race a cancel against, so this class of loss is structurally
+    // impossible. The one-shot recv still selects from the same large
+    // provided-buffer ring as the multishot header recv (see
+    // upstream_once_max_len()); only the body ever grows large, and that
+    // path switches to a direct recv into the chain tail immediately after
+    // the header commits (see arm_response_read_direct_body_recv and its
+    // call sites) rather than looping through this provided-buffer recv
+    // again. CompleteContentLength keeps the original multishot header recv
+    // unchanged.
     bool add_response_read_recv(Connection& c) {
+        if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded)
+            return backend.add_recv_upstream_once(
+                c.upstream_fd, c.id, c.upstream_episode, backend.upstream_once_max_len());
         return backend.add_first_response_recv(
             c.upstream_fd,
             c.id,
@@ -1504,7 +1544,21 @@ public:
         const u32 remaining = declared - received;
         const u32 bulk_after = c.tls_active ? ResponseBodyChain::kBulkAfterTls
                                             : ResponseBodyChain::kBulkAfterPlaintext;
-        if (!c.response_body_tail.reserve_tail(pool, bulk_after)) return false;
+        // Bounded only, first node of this response's chain only: when the
+        // whole declared body fits in one bulk node, skip the ordinary "prove
+        // it's large first" ramp (one or more slice-sized nodes before ever
+        // reaching bulk_after) and reserve a single bulk node for it up
+        // front. CompleteContentLength never calls this function; the
+        // explicit buffering check keeps the fast path Bounded-only by
+        // construction. Measured (RUT_DEBUG_SEND_TRACE): for a 64 KiB body this
+        // alone brings Bounded's downstream Send count and sizes to match
+        // CompleteContentLength's exactly, both plain and over TLS — see the
+        // final report.
+        const bool bounded_fresh_chain_fits_one_bulk_node =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            c.response_body_tail.head == nullptr && declared <= ResponseBodyChain::kBulkPayload;
+        const u32 effective_bulk_after = bounded_fresh_chain_fits_one_bulk_node ? 0 : bulk_after;
+        if (!c.response_body_tail.reserve_tail(pool, effective_bulk_after)) return false;
         const u32 avail = c.response_body_tail.write_avail(pool);
         if (avail == 0) return false;
         const u32 len = remaining < avail ? remaining : avail;
@@ -4100,6 +4154,7 @@ public:
 
             if (ev.result > 0) {
                 owner.last_positive = i;
+                owner.last_positive_sock_nonempty = ev.sock_nonempty != 0;
                 if (owner.saw_terminal && !owner.terminal_fault) owner.valid = false;
                 if (ev.copy_witness != IoEventCopyWitness::Full ||
                     ev.copy_deadline_generation != owner.deadline_generation ||
@@ -4111,6 +4166,28 @@ public:
                     if (!owner.saw_positive) {
                         owner.first_copy_begin = ev.copy_begin;
                         owner.expected_copy_end = ev.copy_begin;
+                        // See the field comment: snapshot now, before this
+                        // batch's own dispatch loop can run a release-Send
+                        // completion (also part of this batch) that would
+                        // advance bounded_released/bounded_header_sent past
+                        // what ev.copy_begin (captured at wait()-copy time,
+                        // strictly before any dispatch of this batch) saw.
+                        const Connection& owner_conn = conns[ev.conn_id];
+                        const bool bounded_buffering =
+                            owner_conn.response_read_deadline_buffering ==
+                                ForwardResponseBufferingMode::Bounded &&
+                            (owner_conn.response_read_deadline_post_commit_phase ==
+                                 ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                             owner_conn.response_read_deadline_post_commit_phase ==
+                                 ResponseReadDeadlinePostCommitPhase::Buffering);
+                        owner.removed_at_first_copy =
+                            bounded_buffering
+                                ? (owner_conn.response_read_deadline_bounded_header_sent
+                                       ? owner_conn
+                                             .response_read_deadline_post_commit_raw_header_end
+                                       : 0) +
+                                      owner_conn.response_read_deadline_bounded_released
+                                : 0;
                     }
                     if (ev.copy_begin != owner.expected_copy_end) owner.valid = false;
                     owner.expected_copy_end = ev.copy_end;
@@ -4169,15 +4246,42 @@ public:
             if (owner.post_commit_at_start) {
                 const u32 unsent = c.response_read_deadline_post_commit_origin_received -
                                    c.response_read_deadline_post_commit_downstream_completed;
+                const bool header_phase = c.response_read_deadline_post_commit_phase ==
+                                              ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                                          c.response_read_deadline_post_commit_phase ==
+                                              ResponseReadDeadlinePostCommitPhase::Buffering;
                 const u32 header_prefix =
-                    c.response_read_deadline_post_commit_phase ==
-                                ResponseReadDeadlinePostCommitPhase::HeaderSend ||
-                            c.response_read_deadline_post_commit_phase ==
-                                ResponseReadDeadlinePostCommitPhase::Buffering
-                        ? c.response_read_deadline_post_commit_raw_header_end
+                    header_phase ? c.response_read_deadline_post_commit_raw_header_end : 0;
+                // Bounded early releases consume() the front of
+                // upstream_recv_buf/response_body_tail as each one completes
+                // (see on_bounded_release_header_sent/
+                // on_bounded_release_body_sent), so pre_batch_bytes — taken
+                // from buffered_response_len() at CQE-copy time — no longer
+                // equals "header + every body byte ever received" once a
+                // release has actually been consumed, the way it does for
+                // CompleteContentLength (which never consumes before the
+                // terminal disposition). `removed` restates already-
+                // consumed bytes so this witness keeps its exact original
+                // meaning — mirrors
+                // settle_precise_complete_content_length_buffering's
+                // identical fixup, which this generic path lacked: a
+                // release Send that completes (and is dispatched, i.e.
+                // actually consumed) in the same or an earlier batch than a
+                // still-outstanding body recv's own completion previously
+                // invalidated that recv's owner and closed the connection
+                // — reproducible with a fast, local origin where a Send and
+                // the next recv CQE routinely land close together.
+                const bool bounded_buffering =
+                    header_phase &&
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded;
+                const u32 removed =
+                    bounded_buffering
+                        ? (c.response_read_deadline_bounded_header_sent ? header_prefix : 0) +
+                              c.response_read_deadline_bounded_released
                         : 0;
                 if (header_prefix > 0xFFFFFFFFu - unsent ||
-                    pre_batch_bytes != header_prefix + unsent ||
+                    pre_batch_bytes > 0xFFFFFFFFu - removed ||
+                    pre_batch_bytes + removed != header_prefix + unsent ||
                     c.response_read_deadline_progress_generation != owner.deadline_generation ||
                     c.response_read_deadline_progress_episode != owner.upstream_episode ||
                     c.response_read_deadline_progress_bytes !=
@@ -4213,6 +4317,29 @@ public:
                  c.response_read_deadline_state == ResponseReadDeadlineState::ExpiryPending ||
                  c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete);
             if (!owner.valid || !key_stable) {
+                // A Bounded connection's terminal disposition can be
+                // legitimately deferred (response_read_deadline_bounded_pending_complete
+                // / _clean_eof) while an early-release Send is still
+                // draining: state intentionally stays BatchPending/
+                // RefreshPending across that window (see
+                // try_advance_bounded_release's callers and the "Leave
+                // state alone while deferred" comments in the settle
+                // branches below), not the Armed/ExpiryPending/BodyComplete
+                // set this promotion normally requires between batches. A
+                // stray event for this same connection landing in that
+                // window — its own custody has nothing to do with the
+                // deferred disposition, which owns this connection and will
+                // resolve it once its Send completes — must not
+                // manufacture a spurious close here; same reasoning as the
+                // precise-timer-outlive-owner skip just above.
+                const bool deferred_bounded_completion_pending =
+                    c.id == owner.conn_id &&
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    (c.response_read_deadline_bounded_pending_complete ||
+                     c.response_read_deadline_bounded_pending_clean_eof) &&
+                    (c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
+                     c.response_read_deadline_state == ResponseReadDeadlineState::RefreshPending);
+                if (deferred_bounded_completion_pending) continue;
                 owner.valid = false;
                 if (c.fd >= 0) close_conn(c);
                 continue;
@@ -4420,7 +4547,8 @@ public:
                                                          c.response_read_deadline_route_method) ||
             declared_body == 0 || raw_header_end == 0 ||
             raw_header_end > c.buffered_response_len() ||
-            declared_body > ResponseBodyChain::kMaxBody ||
+            declared_body >
+                complete_content_length_declared_body_cap(c.response_read_deadline_buffering) ||
             c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0 ||
             c.response_header_buf.len() > c.response_header_buf.capacity() ||
             !complete_content_length_raw_origin_matches_pinned(
@@ -4491,9 +4619,19 @@ public:
             if (!c.upstream_recv_armed) return false;
         } else {
             if (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
-                c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-                !add_response_read_recv(c))
+                c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight)
                 return false;
+            // Bounded goes straight to a direct one-shot recv into the chain
+            // tail from the very first body byte after the header commits —
+            // it never arms a provided-buffer recv for the body at all (see
+            // add_response_read_recv). Phase is already Buffering and the
+            // declared/received fields above are already set, so
+            // arm_response_read_direct_body_recv's preconditions hold here.
+            const bool bounded =
+                c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded;
+            const bool direct = bounded && arm_response_read_direct_body_recv(c);
+            if (!direct && !add_response_read_recv(c)) return false;
+            c.upstream_recv_direct_armed = direct;
             c.pending_ops++;
             c.upstream_recv_armed = true;
         }
@@ -4524,20 +4662,49 @@ public:
 
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
+        // Bounded early releases consume() the front of upstream_recv_buf as
+        // each one completes (on_bounded_release_header_sent/body_sent), so
+        // buffered_response_len() no longer equals "header + every body byte
+        // ever received" once any release has landed — see the identical
+        // `removed` restatement (and its rationale) in
+        // settle_precise_complete_content_length_buffering. first_copy_begin/
+        // expected_copy_end/header/received below are the backend copy
+        // witness's logical-stream positions, independent of consumption, so
+        // only this buffered_response_len() comparison needs the adjustment.
+        const bool bounded =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded;
+        const u32 removed = bounded ? (c.response_read_deadline_bounded_header_sent ? header : 0) +
+                                          c.response_read_deadline_bounded_released
+                                    : 0;
         if (header == 0 || header > 0xFFFFFFFFu - received ||
-            header + received != c.buffered_response_len())
+            header + received != c.buffered_response_len() + removed)
             return false;
-        CompleteContentLengthResponseClassification raw_classification{};
-        if (!complete_content_length_raw_origin_matches_pinned(
-                c, header, c.response_read_deadline_post_commit_declared_body, &raw_classification))
-            return false;
-        const CompleteContentLengthResponseClassification saved{
-            c.response_read_deadline_post_commit_response_class,
-            c.response_read_deadline_post_commit_range_first,
-            c.response_read_deadline_post_commit_range_last,
-            c.response_read_deadline_post_commit_range_total};
-        if (!complete_content_length_response_classification_equal(raw_classification, saved))
-            return false;
+        // Once a Bounded early release has sent the header,
+        // on_bounded_release_header_sent has already consume()d it out of
+        // upstream_recv_buf, so it no longer sits at the buffer's front —
+        // there is nothing left in the raw byte stream for
+        // complete_content_length_raw_origin_matches_pinned to re-derive and
+        // compare against (it would parse body bytes as a header and always
+        // fail). That comparison already happened once, before this
+        // connection ever committed to releasing (begin_complete_content_length_buffering
+        // pinned response_class/etc. from genuinely-verified raw bytes), so
+        // it is skipped here rather than re-run against bytes that are gone.
+        if (!(bounded && c.response_read_deadline_bounded_header_sent)) {
+            CompleteContentLengthResponseClassification raw_classification{};
+            if (!complete_content_length_raw_origin_matches_pinned(
+                    c,
+                    header,
+                    c.response_read_deadline_post_commit_declared_body,
+                    &raw_classification))
+                return false;
+            const CompleteContentLengthResponseClassification saved{
+                c.response_read_deadline_post_commit_response_class,
+                c.response_read_deadline_post_commit_range_first,
+                c.response_read_deadline_post_commit_range_last,
+                c.response_read_deadline_post_commit_range_total};
+            if (!complete_content_length_response_classification_equal(raw_classification, saved))
+                return false;
+        }
         // prepare_response_read_deadline_batch authenticated any retained
         // pre-batch header prefix before begin_complete_content_length_buffering
         // consumed that progress identity. The genuine active owner therefore
@@ -4651,7 +4818,8 @@ public:
     [[nodiscard]] bool start_complete_content_length_send(
         Connection& c,
         CompleteContentLengthTerminalDisposition disposition,
-        const ResponseReadBatchOwner* terminal_owner = nullptr) {
+        const ResponseReadBatchOwner* terminal_owner = nullptr,
+        bool clean_eof_pre_authenticated = false) {
         if (!forward_response_buffering_uses_content_length_machinery(
                 c.response_read_deadline_buffering) ||
             c.response_read_deadline_post_commit_phase !=
@@ -4673,12 +4841,22 @@ public:
                 close_after_drain = c.response_read_deadline_upload.downstream_close;
                 break;
             case CompleteContentLengthTerminalDisposition::CleanUpstreamEof:
-                if (terminal_owner == nullptr || received >= declared ||
+                if (received >= declared ||
                     (received == 0 &&
                      c.response_read_deadline_post_commit_response_class ==
                          CompleteContentLengthResponseClass::CoherentSingleRange206) ||
-                    !complete_content_length_clean_eof_owner_is_valid(c, *terminal_owner))
+                    (!clean_eof_pre_authenticated &&
+                     (terminal_owner == nullptr ||
+                      !complete_content_length_clean_eof_owner_is_valid(c, *terminal_owner))))
                     return false;
+                // clean_eof_pre_authenticated means a batch already ran this
+                // exact check (against its own, now-reused
+                // ResponseReadBatchOwner) and found a genuine clean EOF, but
+                // had to defer committing it because a Bounded early-release
+                // Send was still in flight — see
+                // response_read_deadline_bounded_pending_clean_eof. Never set
+                // by any other caller.
+                if (clean_eof_pre_authenticated && terminal_owner != nullptr) return false;
                 body_to_send = received;
                 break;
             case CompleteContentLengthTerminalDisposition::InactivityExpiry:
@@ -4816,6 +4994,52 @@ public:
             return submit_send(c, c.response_header_buf.data(), header_len + body_to_send);
         }
 
+        // Bounded only, and only for the ordinary positive-body response class
+        // (a coherent 206 range keeps the untouched header-then-body path
+        // below — see the comment on response_read_deadline_bounded_released):
+        // early releases (try_advance_bounded_release) already published the
+        // header and a prefix of the body while phase stayed Buffering, none
+        // of which touched send_body/downstream_submitted/downstream_completed
+        // above, so the "collecting" shape those fields formed for the
+        // witnesses is still exactly the pre-release one. Fast-forward that
+        // bookkeeping now to reflect the bytes already on the wire — never
+        // resend the header or re-select a different prefix — and hand off to
+        // the ordinary WaitingBody/BodySend pump for whatever remains (zero or
+        // more bytes). InactivityExpiry after at least one release must not
+        // flush the newly-buffered-but-unreleased tail (nginx does not
+        // publish a partial buffer on timeout): select exactly what already
+        // went out.
+        if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            c.response_read_deadline_bounded_released > 0 &&
+            c.response_read_deadline_post_commit_response_class ==
+                CompleteContentLengthResponseClass::BoundedPositiveBody) {
+            const u32 released = c.response_read_deadline_bounded_released;
+            const u32 selected =
+                disposition == CompleteContentLengthTerminalDisposition::InactivityExpiry
+                    ? released
+                    : body_to_send;
+            if (selected < released || !c.response_read_deadline_bounded_header_sent) return false;
+            c.response_read_deadline_post_commit_send_body = selected;
+            c.response_read_deadline_post_commit_downstream_submitted = released;
+            c.response_read_deadline_post_commit_downstream_completed = released;
+            c.response_read_deadline_post_commit_inflight_body = 0;
+            c.resp_body_sent = c.response_header_buf.len() + released;
+            c.resp_body_remaining = selected - released;
+            c.response_read_deadline_post_commit_phase =
+                ResponseReadDeadlinePostCommitPhase::WaitingBody;
+            // This branch returns before the common tail below (line ~4729)
+            // would otherwise persist close_after_drain onto the connection —
+            // do it here too, or the field keeps whatever begin_complete_content_length_buffering
+            // reset it to at commit time (always false), silently forcing
+            // keep-alive on every Bounded terminal disposition regardless of
+            // what was actually decided above (explicit Connection: close on
+            // CompleteBody, or the always-close CleanUpstreamEof/InactivityExpiry
+            // default).
+            c.response_read_deadline_post_commit_close_after_drain = close_after_drain;
+            defer_response_read_deadline_body_pump(c);
+            return true;
+        }
+
         c.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::HeaderSend;
         c.resp_body_remaining = body_to_send;
@@ -4823,6 +5047,170 @@ public:
         c.upstream_send_len = c.response_read_deadline_post_commit_raw_header_end;
         c.transition_to_sending(&on_response_header_sent<Self>);
         return submit_send(c, c.response_header_buf.data(), c.response_header_buf.len());
+    }
+
+    // Bounded only: send whatever newly became releasable (see
+    // bounded_response_release_bytes), keeping response_read_deadline_post_commit_phase
+    // at Buffering throughout, so the "collecting" shape start_complete_content_length_send
+    // and response_read_deadline_post_commit_is_stable both expect
+    // (downstream_submitted/downstream_completed/send_body/close_after_drain all
+    // still zero/false) is never disturbed by an in-flight release — see
+    // on_bounded_release_header_sent/on_bounded_release_body_sent. A stale or
+    // foreign Send completion is rejected by those callbacks, not here. Also
+    // resumes a read-ahead-paused upstream recv once unreleased bytes drop to
+    // the resume threshold. Excludes CoherentSingleRange206 (the 206 Content-
+    // Range class): that keeps the untouched, complete-buffered-only path.
+    //
+    // `defer_for_pending_socket_data`: the caller just folded in a batch whose
+    // last positive UpstreamRecv CQE reported IORING_CQE_F_SOCK_NONEMPTY (see
+    // ResponseReadBatchOwner::last_positive_sock_nonempty) — more bytes were
+    // already sitting in the upstream socket when that recv drained it. Skip
+    // starting a new release Send this round and let the caller's own re-arm
+    // pick those bytes up; the next recv either drains the socket (no
+    // SOCK_NONEMPTY — releases everything then-eligible in one Send) or is
+    // itself SOCK_NONEMPTY again (keeps coalescing). This only ever changes
+    // *when within a burst* a release starts, never *how much* — a genuinely
+    // stalling origin always ends in a drained read, so a paused/idle
+    // connection still releases exactly as before. Only the two batch-settle
+    // call sites (a new recv just landed) pass true; the release-Send
+    // completion callbacks (on_bounded_release_header_sent/body_sent) always
+    // pass the default false so a drained backlog keeps flushing immediately.
+    // Never honored once unreleased bytes would reach the read-ahead cap:
+    // that path must release before pausing the recv, or nothing would ever
+    // trigger the deferred release again (see the caller's read-ahead-pause
+    // branch, which runs strictly after this call returns).
+    // Bounded hold-back only: arm the short (kBoundedHoldTimeoutMicros)
+    // one-shot timer that bounds how long a too-small release is held. False
+    // means "couldn't hold" (SQ full, generation space exhausted, or a hold
+    // is already outstanding for this connection) — the caller falls back to
+    // releasing normally rather than silently sitting on eligible bytes.
+    [[nodiscard]] bool arm_bounded_hold_timer(Connection& c) {
+        if (c.response_read_deadline_bounded_hold_timer_armed &&
+            c.response_read_deadline_bounded_hold_timer_upstream_episode == c.upstream_episode)
+            return true;  // only one flush timer per hold
+        return backend.add_bounded_hold_timer(
+            c.id, c, kBoundedHoldTimeoutMicros, c.upstream_episode);
+    }
+
+    [[nodiscard]] bool try_advance_bounded_release(Connection& c,
+                                                   bool defer_for_pending_socket_data = false) {
+        if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::Buffering ||
+            c.response_read_deadline_post_commit_response_class !=
+                CompleteContentLengthResponseClass::BoundedPositiveBody)
+            return true;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        if (c.response_read_deadline_bounded_read_ahead_paused && !c.upstream_recv_armed &&
+            received - c.response_read_deadline_bounded_released <= kBoundedReadAheadBytes / 2) {
+            if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
+                c.upstream_recv_cancel_inflight)
+                return true;  // still settling the pause; retried on the next advance
+            // Always a direct one-shot recv into the chain tail: Bounded
+            // never re-arms a provided-buffer recv here (see
+            // add_response_read_recv) — only fall back to one if the chain
+            // itself is out of memory.
+            const bool direct = arm_response_read_direct_body_recv(c);
+            if (!direct && !add_response_read_recv(c)) return false;
+            c.upstream_recv_direct_armed = direct;
+            c.pending_ops++;
+            c.upstream_recv_armed = true;
+            c.response_read_deadline_bounded_read_ahead_paused = false;
+            // Re-arm with a fresh full timeout on resume. The precise timer
+            // (if that is this connection's mechanism) cannot be rearmed
+            // here directly — add_response_read_timer refuses to arm over
+            // an already-armed owner — but its own due-check picks up this
+            // refreshed last_progress_ns the next time it fires (see
+            // settle_precise_complete_content_length_buffering); the wheel
+            // timer, suspended by an explicit remove() when this paused, is
+            // added back immediately.
+            c.response_read_timer_last_progress_ns = monotonic_ns();
+            if (!response_read_deadline_uses_precise_timer(c))
+                timer.refresh(&c, c.response_read_deadline_seconds);
+        }
+        if (c.send_armed || c.on_send != nullptr)
+            return true;  // a release send is already in flight
+        // Coalesce: more bytes are already queued upstream, and releasing now
+        // would still leave the read-ahead cap with headroom, so wait for a
+        // drained read (or the cap itself) before starting a Send. Forcing
+        // this only below the cap keeps the pause-before-release invariant:
+        // once received-released would reach kBoundedReadAheadBytes, release
+        // unconditionally so the caller's read-ahead pause always has a
+        // future recv completion left to resume it.
+        if (defer_for_pending_socket_data &&
+            received - c.response_read_deadline_bounded_released < kBoundedReadAheadBytes)
+            return true;
+        const u32 header = c.response_read_deadline_post_commit_raw_header_end;
+        const u32 target = bounded_response_release_bytes(header, received, /*complete=*/false);
+        if (target <= c.response_read_deadline_bounded_released) return true;
+        // Hold-back: the hold timer's own -ETIME completion forces this
+        // release through regardless of size (see
+        // Connection::response_read_deadline_bounded_hold_timer_fired and
+        // dispatch()'s BoundedHoldTimer case) — consume that flag first so a
+        // forced release is never re-held. Otherwise, a releasable amount
+        // still under kBoundedMinReleaseBytes (below one TLS record) is held
+        // for a short, bounded time instead of paid for immediately: a
+        // fast/bursty origin's next chunk very often arrives before the
+        // timer fires and gets coalesced into the same eventual Send. A
+        // genuinely stalling origin still releases within
+        // kBoundedHoldTimeoutMicros either way, so diff.py's "first byte
+        // within 50ms" guarantee is unaffected (200us << 50ms).
+        const bool hold_forced = c.response_read_deadline_bounded_hold_timer_fired;
+        c.response_read_deadline_bounded_hold_timer_fired = false;
+        const u32 releasable = target - c.response_read_deadline_bounded_released;
+        if (!hold_forced && releasable < kBoundedMinReleaseBytes && arm_bounded_hold_timer(c))
+            return true;
+        if (!c.response_read_deadline_bounded_header_sent) {
+            if (c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0)
+                return false;
+            // The raw origin header sits at the front of upstream_recv_buf
+            // (begin_complete_content_length_buffering never strips it, since
+            // CompleteContentLength only ever discards it as a side effect of
+            // its own single header Send). on_bounded_release_header_sent
+            // consumes exactly these raw_header_end bytes once this send
+            // completes, so the first body release reads pure body bytes.
+            c.upstream_send_len = header;
+            c.transition_to_sending(&on_bounded_release_header_sent<Self>);
+            return submit_send(c, c.response_header_buf.data(), c.response_header_buf.len());
+        }
+        const u32 remaining_release = target - c.response_read_deadline_bounded_released;
+        const u32 front = c.buffered_response_front_size();
+        const u32 avail = remaining_release < front ? remaining_release : front;
+        if (avail == 0) return true;  // buffered bytes haven't caught up with `received` yet
+        // Trimming a large release down to a whole TLS-record multiple (and
+        // holding the fractional remainder under the hold-back rule above)
+        // was tried here and measured with the probe: no change in segments
+        // or rps at either 64 KiB or 1 MiB over TLS (see the final report).
+        // kTlsDrainChunk already caps each raw send to one record's worth
+        // regardless of how much plaintext this call hands it, so there was
+        // no partial-record tail to avoid in the first place — dropped.
+        c.upstream_send_len = avail;
+        c.transition_to_sending(&on_bounded_release_body_sent<Self>);
+        return submit_send(c, c.buffered_response_data(), avail);
+    }
+
+    // Bounded only: the response proved complete (origin_received==declared)
+    // while an early-release Send was still draining, so
+    // settle_response_read_deadline_batch deferred the CompleteBody
+    // disposition via response_read_deadline_bounded_pending_complete. Called
+    // once that send's completion callback sees the connection idle again.
+    [[nodiscard]] bool finish_bounded_release_as_complete(Connection& c) {
+        return start_complete_content_length_send(
+            c, CompleteContentLengthTerminalDisposition::CompleteBody);
+    }
+
+    // Bounded only: a batch's clean-EOF witness was already authenticated
+    // while an early-release Send was still draining, so it deferred via
+    // response_read_deadline_bounded_pending_clean_eof instead of committing
+    // immediately (the owner proof itself cannot be deferred — see the field
+    // comment). Called once that send's completion callback sees the
+    // connection idle again.
+    [[nodiscard]] bool finish_bounded_release_as_clean_eof(Connection& c) {
+        return start_complete_content_length_send(
+            c,
+            CompleteContentLengthTerminalDisposition::CleanUpstreamEof,
+            nullptr,
+            /*clean_eof_pre_authenticated=*/true);
     }
 
     void defer_response_read_deadline_body_pump(Connection& c) {
@@ -4905,19 +5293,68 @@ public:
         const u32 header = c.response_read_deadline_post_commit_raw_header_end;
         const u32 declared = c.response_read_deadline_post_commit_declared_body;
         u32 received = c.response_read_deadline_post_commit_origin_received;
-        if (header == 0 || header > c.buffered_response_len() || received > declared) return false;
+        const bool bounded =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded;
+        // Bounded early releases consume() the front of upstream_recv_buf/
+        // response_body_tail as each one completes (see
+        // on_bounded_release_header_sent/on_bounded_release_body_sent), so
+        // buffered_response_len() no longer equals "header + every body byte
+        // ever received" the way it does for CompleteContentLength, which
+        // never consumes before the terminal disposition. `removed` restates
+        // it in that original, always-append-only coordinate space; it is
+        // live/post-dispatch (correct for the plain sanity check right
+        // below), but the witnesses further down pair it with the matching
+        // pre-dispatch snapshot (owner.removed_at_first_copy) instead — see
+        // their own comments.
+        const u32 removed = bounded ? (c.response_read_deadline_bounded_header_sent ? header : 0) +
+                                          c.response_read_deadline_bounded_released
+                                    : 0;
+        if (header == 0 || header > c.buffered_response_len() + removed || received > declared)
+            return false;
         if (owner.saw_positive) {
-            if (owner.terminal_error || owner.expected_copy_end != c.buffered_response_len() ||
+            // expected_copy_end/first_copy_begin are pre-dispatch physical
+            // snapshots (captured in prepare_response_read_deadline_batch,
+            // strictly before this batch's own dispatch loop runs); so is
+            // owner.removed_at_first_copy, captured at the same instant.
+            // `removed` above is live/post-dispatch: if a release Send's own
+            // completion is *also* part of this batch, its dispatch (which
+            // already ran, since settle runs after the whole per-event
+            // dispatch loop) already advanced bounded_released/
+            // bounded_header_sent — and hence shrank buffered_response_len() —
+            // beyond what was true when the copy happened. The conserved
+            // quantity is pre-dispatch buffered length, i.e.
+            // expected_copy_end + removed_at_first_copy (bytes still counted
+            // in the buffer, plus bytes already removed, at copy time) must
+            // equal buffered_response_len() + removed now (same total, split
+            // differently after any release this batch's own dispatch
+            // consumed) — comparing live buffered_response_len() against only
+            // the pre-dispatch removed snapshot (or only the live one) is
+            // off by exactly however much this batch's dispatch released, so
+            // a fast, local origin racing a release Send against the next
+            // body recv's completion in the same wait() batch spuriously
+            // invalidated the owner and closed the connection.
+            if (owner.terminal_error ||
+                owner.expected_copy_end > 0xFFFFFFFFu - owner.removed_at_first_copy ||
+                c.buffered_response_len() > 0xFFFFFFFFu - removed ||
+                owner.expected_copy_end + owner.removed_at_first_copy !=
+                    c.buffered_response_len() + removed ||
                 owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
                 owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)
                 return false;
             if (owner.post_commit_at_start) {
+                // Same pre-dispatch-vs-logical-total reconciliation as
+                // above: header+received is the logical total ever received
+                // (never decremented by a release), so it must be compared
+                // against the pre-dispatch physical first_copy_begin *plus*
+                // however much had already been removed as of that same
+                // pre-dispatch instant.
                 if (owner.positive_bytes > declared - received || header > 0xFFFFFFFFu - received ||
-                    owner.first_copy_begin != header + received)
+                    owner.first_copy_begin > 0xFFFFFFFFu - owner.removed_at_first_copy ||
+                    owner.first_copy_begin + owner.removed_at_first_copy != header + received)
                     return false;
                 received += owner.positive_bytes;
                 c.response_read_deadline_post_commit_origin_received = received;
-            } else if (received != c.buffered_response_len() - header) {
+            } else if (received != c.buffered_response_len() + removed - header) {
                 return false;
             }
             c.response_read_deadline_progress_generation = owner.deadline_generation;
@@ -4929,30 +5366,76 @@ public:
         }
 
         if (received == declared) {
+            // See the identical race in settle_response_read_deadline_batch:
+            // an early-release Send may still be draining. Leave state alone
+            // while deferred, as a defensive invariant: the general branch's
+            // own entry gate keys off response_read_deadline_state being
+            // BatchPending/RefreshPending, so committing to BodyComplete
+            // before the deferred disposition has actually run risks that
+            // branch silently skipping this connection's remaining
+            // completions until the in-flight Send drains.
+            // on_bounded_release_body_sent/header_sent set BodyComplete once
+            // they actually commit, matching the non-deferred path below.
+            if (bounded && (c.send_armed || c.on_send != nullptr)) {
+                c.response_read_deadline_bounded_pending_complete = true;
+                return true;
+            }
             c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
             return start_complete_content_length_send(
                 c, CompleteContentLengthTerminalDisposition::CompleteBody);
         }
         if (owner.clean_eof) {
+            // A release Send may still be draining. Unlike CompleteBody, the
+            // clean-EOF proof itself (complete_content_length_clean_eof_owner_is_valid
+            // against `owner`) cannot be re-run later — response_read_batch_owners
+            // is reused next batch — so authenticate it now (below) and defer
+            // only the commit.
+            if (bounded && (c.send_armed || c.on_send != nullptr)) {
+                if (!complete_content_length_clean_eof_owner_is_valid(c, owner)) return false;
+                c.response_read_deadline_bounded_pending_clean_eof = true;
+                return true;
+            }
             c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
             return start_complete_content_length_send(
                 c, CompleteContentLengthTerminalDisposition::CleanUpstreamEof, &owner);
         }
         if (owner.terminal_fault) return false;
+        if (bounded && !try_advance_bounded_release(
+                           c, owner.saw_positive && owner.last_positive_sock_nonempty))
+            return false;
+        // Bounded read-ahead: same accounting as settle_response_read_deadline_batch's
+        // general branch, without the bulk/direct-recv switch this narrow
+        // precise-timer profile never grows into.
+        const bool bounded_read_ahead_full =
+            bounded && c.response_read_deadline_post_commit_origin_received -
+                               c.response_read_deadline_bounded_released >=
+                           kBoundedReadAheadBytes;
         if (owner.saw_terminal && !c.upstream_recv_armed) {
-            if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
-                c.upstream_recv_cancel_inflight || !add_response_read_recv(c))
-                return false;
-            c.pending_ops++;
-            c.upstream_recv_armed = true;
+            if (bounded_read_ahead_full) {
+                c.response_read_deadline_bounded_read_ahead_paused = true;
+            } else {
+                if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
+                    c.upstream_recv_cancel_inflight)
+                    return false;
+                // Bounded: always a direct recv straight into the chain tail
+                // (see add_response_read_recv / arm_response_read_direct_body_recv);
+                // fall back to the ordinary one-shot deadline recv only if
+                // the chain itself is out of memory.
+                const bool direct = bounded && arm_response_read_direct_body_recv(c);
+                if (!direct && !add_response_read_recv(c)) return false;
+                c.upstream_recv_direct_armed = direct;
+                c.pending_ops++;
+                c.upstream_recv_armed = true;
+            }
         }
 
         if (saw_timer_target) {
             const u64 now_ns = monotonic_ns();
             const u64 timeout_ns =
                 static_cast<u64>(c.response_read_deadline_seconds) * 1'000'000'000ull;
-            if (response_read_timer_remaining_ms(
-                    c.response_read_timer_last_progress_ns, timeout_ns, now_ns) == 0) {
+            const bool due =
+                response_read_timer_due_honoring_read_ahead_pause(c, now_ns, timeout_ns);
+            if (due) {
                 c.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
                 // Keep the authenticated active-batch owner in scope while
                 // selecting the generic expiry disposition.  Deferring this
@@ -5213,33 +5696,107 @@ public:
                     close_conn(c);
                     continue;
                 }
+                const bool bounded =
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded;
                 if (c.response_read_deadline_post_commit_origin_received == declared) {
+                    // A release Send may still be draining from an earlier
+                    // batch (start_complete_content_length_send requires an
+                    // idle send owner). "The body is complete" is a plain,
+                    // persistent fact — safe to defer to
+                    // on_bounded_release_body_sent/header_sent, which check
+                    // this flag once idle. Leave state alone (still
+                    // BatchPending/RefreshPending) while deferred, as a
+                    // defensive invariant: this function's own entry gate
+                    // (above) keys off that state, so committing to
+                    // BodyComplete before the deferred disposition has
+                    // actually run risks skipping this connection's
+                    // remaining completions until the in-flight Send drains
+                    // (see the identical reasoning in
+                    // settle_precise_complete_content_length_buffering).
+                    if (bounded && (c.send_armed || c.on_send != nullptr)) {
+                        c.response_read_deadline_bounded_pending_complete = true;
+                        continue;
+                    }
                     c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
                     if (!start_complete_content_length_send(
-                            c, CompleteContentLengthTerminalDisposition::CompleteBody))
+                            c, CompleteContentLengthTerminalDisposition::CompleteBody)) {
                         close_conn(c);
+                    }
                     continue;
                 }
                 if (owner.clean_eof) {
+                    // Unlike CompleteBody, the clean-EOF proof itself
+                    // (complete_content_length_clean_eof_owner_is_valid against
+                    // `owner`) cannot be re-run later — response_read_batch_owners
+                    // is reused next batch — so authenticate it now and defer
+                    // only the commit (state left alone, same reasoning as
+                    // CompleteBody above).
+                    if (bounded && (c.send_armed || c.on_send != nullptr)) {
+                        if (!complete_content_length_clean_eof_owner_is_valid(c, owner)) {
+                            close_conn(c);
+                            continue;
+                        }
+                        c.response_read_deadline_bounded_pending_clean_eof = true;
+                        continue;
+                    }
                     c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
                     if (!start_complete_content_length_send(
                             c, CompleteContentLengthTerminalDisposition::CleanUpstreamEof, &owner))
                         close_conn(c);
                     continue;
                 }
-                // The body keeps arriving through the provided-buffer recv.
-                // A mid-body cancel-and-switch to a direct recv into the
-                // chain tail dropped the connection whenever the origin was
-                // still sending, so this path never switches.
+                if (bounded && !try_advance_bounded_release(
+                                   c, owner.saw_positive && owner.last_positive_sock_nonempty)) {
+                    close_conn(c);
+                    continue;
+                }
+                // Bounded read-ahead: once unreleased body bytes reach
+                // kBoundedReadAheadBytes, leave the upstream recv unarmed
+                // instead of re-arming it (memory, not the declared
+                // Content-Length, is what bounds a Bounded body — see
+                // try_advance_bounded_release, which resumes this once
+                // releases catch back up). The inactivity timer is suspended
+                // for the duration too — nginx does not time out reads it
+                // isn't performing — and re-armed with a fresh full timeout
+                // on resume.
+                const bool bounded_read_ahead_full =
+                    bounded && c.response_read_deadline_post_commit_origin_received -
+                                       c.response_read_deadline_bounded_released >=
+                                   kBoundedReadAheadBytes;
                 if (owner.saw_terminal && !c.upstream_recv_armed) {
-                    if (c.upstream_recv_pause_cancel_pending ||
-                        c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-                        !add_response_read_recv(c)) {
-                        close_conn(c);
-                        continue;
+                    if (bounded_read_ahead_full) {
+                        c.response_read_deadline_bounded_read_ahead_paused = true;
+                        // Wheel timer only: the precise timer (if that is
+                        // this connection's mechanism) is suspended instead
+                        // at its own due-check in
+                        // settle_precise_complete_content_length_buffering,
+                        // since add_response_read_timer refuses to arm over
+                        // an already-armed owner and cancelling it here would
+                        // trip the cancel-completion's clear_response_read_deadline.
+                        timer.remove(&c);
+                    } else {
+                        if (c.upstream_recv_pause_cancel_pending ||
+                            c.upstream_recv_pause_rearm_pending ||
+                            c.upstream_recv_cancel_inflight) {
+                            close_conn(c);
+                            continue;
+                        }
+                        // Bounded: always a direct recv straight into the
+                        // chain tail — it never re-arms a provided-buffer
+                        // recv for the body (see add_response_read_recv).
+                        // CompleteContentLength keeps its provided-buffer
+                        // recv for the whole body: it never switches to a
+                        // direct recv mid-body. Either falls back to the
+                        // ordinary deadline recv on failure.
+                        const bool direct = bounded && arm_response_read_direct_body_recv(c);
+                        if (!direct && !add_response_read_recv(c)) {
+                            close_conn(c);
+                            continue;
+                        }
+                        c.upstream_recv_direct_armed = direct;
+                        c.pending_ops++;
+                        c.upstream_recv_armed = true;
                     }
-                    c.pending_ops++;
-                    c.upstream_recv_armed = true;
                 }
                 const bool streaming_timer =
                     c.response_read_deadline_profile ==
@@ -5252,7 +5809,8 @@ public:
                         close_conn(c);
                         continue;
                     }
-                } else if (!response_read_deadline_uses_precise_timer(c)) {
+                } else if (!response_read_deadline_uses_precise_timer(c) &&
+                           !c.response_read_deadline_bounded_read_ahead_paused) {
                     timer.refresh(&c, c.response_read_deadline_seconds);
                 }
                 c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
@@ -5959,6 +6517,37 @@ public:
                         // Stale CQE for an already-closed slot; safe to
                         // reclaim now that the last in-flight op has drained.
                         reclaim_slot(ev.conn_id);
+                    }
+                }
+                break;
+            case IoEventType::BoundedHoldTimer:
+                // Bounded release hold-back timer fired. Consume ownership
+                // first and unconditionally on a generation match — this
+                // timer is never explicitly cancelled, so its one target CQE
+                // is the only chance to ever clear it; not consuming it here
+                // (e.g. because of an unexpected result) would permanently
+                // poison this slot's ability to arm another one (see
+                // next_bounded_hold_timer_generation's neutrality
+                // requirement). Only *acting* on it (forcing a release) is
+                // gated on the full transport shape plus still being in
+                // exactly the phase/episode this timer was armed for —
+                // anything else (a stale/foreign CQE, or one that arrives
+                // after the response moved on) is a harmless no-op; see the
+                // field comment for why that's always safe.
+                if (ev.conn_id < connection_capacity) {
+                    Connection& c = conns[ev.conn_id];
+                    const u32 captured_episode =
+                        c.response_read_deadline_bounded_hold_timer_upstream_episode;
+                    const bool consumed =
+                        c.consume_bounded_hold_timer_completion(ev.non_upstream_generation);
+                    if (consumed && valid_bounded_hold_timer_transport_event(ev) &&
+                        c.response_read_deadline_buffering ==
+                            ForwardResponseBufferingMode::Bounded &&
+                        c.response_read_deadline_post_commit_phase ==
+                            ResponseReadDeadlinePostCommitPhase::Buffering &&
+                        c.upstream_episode == captured_episode) {
+                        c.response_read_deadline_bounded_hold_timer_fired = true;
+                        if (!try_advance_bounded_release(c)) close_conn(c);
                     }
                 }
                 break;
