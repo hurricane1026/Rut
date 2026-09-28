@@ -980,3 +980,19 @@ All 28 samples complete with exact-body and zero warm/load errors. These small e
 | 16-c32-close | +0.34% |
 | 65536-c1-close | +0.52% |
 | 65536-c1-keepalive | -0.31% |
+
+## Reject vector token validation after reverse control
+
+All 28 reverse-order samples are valid with clean warm/load checks.
+
+| Case | Mean RPS change |
+|---|---:|
+| 1024-c1-close | -0.00% |
+| 1024-c32-close | -1.45% |
+| 16-c1-close | +0.20% |
+| 16-c1-keepalive | -0.03% |
+| 16-c32-close | -0.79% |
+| 65536-c1-close | +0.10% |
+| 65536-c1-keepalive | +0.05% |
+
+The c32 gains do not repeat and reverse into regressions; c1 effects remain near noise. Revert the runtime prototype and its added differential test, preserving the complete patch, passing parser tests and both causal orders. No full network test or retention is claimed. The frozen vector binary is diagnostic only; the accepted runtime remains 271cd98c / rut-combined-fin-ordered.
