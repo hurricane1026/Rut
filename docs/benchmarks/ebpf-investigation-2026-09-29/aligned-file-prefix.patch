@@ -1,0 +1,18 @@
+diff --git a/include/rut/runtime/callbacks_impl.h b/include/rut/runtime/callbacks_impl.h
+index 96510220..4aece1af 100644
+--- a/include/rut/runtime/callbacks_impl.h
++++ b/include/rut/runtime/callbacks_impl.h
+@@ -3393,8 +3393,12 @@ void handle_jit_outcome(Loop* loop,
+             }
+             if (segmented_body && response_formatted) {
+                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+-                const u32 n =
++                u32 n =
+                     body.len < conn.send_buf.write_avail() ? body.len : conn.send_buf.write_avail();
++                // Keep the remaining large-file send at a 4 KiB boundary.
++                if (!conn.tls_active && body.file_fd() >= 0 && body.len >= 128u * 1024u &&
++                    n >= 4096u)
++                    n &= ~4095u;
+                 conn.local_response_size = conn.send_buf.len() + body.len;
+                 conn.send_buf.write(reinterpret_cast<const u8*>(body.data), n);
+                 conn.local_body_cursor = reinterpret_cast<const u8*>(body.data) + n;

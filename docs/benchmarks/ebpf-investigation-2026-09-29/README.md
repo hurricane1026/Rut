@@ -813,3 +813,15 @@ A complete small plaintext Bounded header was dispatched synchronously with the 
 | 65536-c1-keepalive | +0.48% |
 
 The roughly 0.5% 64 KiB keepalive signal is insufficient to retain a new synchronous completion path, especially with flat close results and noisy negative control cases. Reverted.
+
+## Rejected 12 KiB page-aligned file prefix
+
+For plaintext memfd bodies >=128 KiB, round the copied initial body prefix down to a 4 KiB multiple. This keeps the ordinary 16 KiB send slice, usually copying 12 KiB of body before sendfile. Exact-body preflight and warm/load checks passed; no full network suite.
+
+| Case | Mean RPS change |
+|---|---:|
+| 1m-c1-keepalive | +12.34% |
+| 1m-c32-close | +0.12% |
+| 1m-c32-keepalive | -3.41% |
+
+The c1 baseline is bimodal again (5666.5/4742.8 RPS), so the mean gain is not a stable expected speedup; candidate samples are 5819.5/5873.8. The c32 keepalive regression prevents retaining this variant. The test changes both alignment and initial burst length. The next prototype keeps 16 KiB body bytes in the prefix using a wider staging buffer; that introduces a separate allocation/layout change and must be measured, not assumed beneficial.
