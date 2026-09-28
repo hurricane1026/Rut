@@ -712,3 +712,17 @@ Accepted runtime versus pinned nginx, HTTP 1 MiB static keepalive. Four traces p
 | 1048576-c32-keepalive-rut | 269850 | 1.41% | 93.00% |
 
 These are call-weighted observations of whole SKBs at copy-helper entry, not bytes-weighted distributions or the number of fragments traversed by each partial copy. Both engines predominantly present SKBs with 16+ fragments; this does not support a simple explanation that Rut alone suffers highly fragmented receive buffers. Differences in smaller SKBs remain correlational. No page-size or kernel setting was changed. The first diagnostic run was rejected for a signed division warning; the corrected run has no diagnostic warnings.
+
+## Rejected early upstream request send
+
+For requests up to 4096 bytes, reserve an SQE before a nonblocking send; full writes use a result-injected NOP, partial writes retain offset and queue the remainder. Upstream episode and CQE accounting remain in the existing path. Two alternating 6-second samples per engine versus accepted POLL_FIRST runtime:
+
+| Case | Mean RPS change |
+|---|---:|
+| 16-c1-close | -0.06% |
+| 16-c1-keepalive | +0.32% |
+| 16-c32-close | -3.36% |
+| 65536-c1-close | +0.25% |
+| 65536-c1-keepalive | +1.03% |
+
+All preflight and warm/load checks passed. The c32 small-response regression outweighs the roughly 1% 64 KiB keepalive improvement; reverted before full network regression. A diagnostic phase trace is being collected separately; no instrumented RPS is used for acceptance.

@@ -1,0 +1,5 @@
+{
+  "base_commit": "09a594ac1a68bb7d6d39fb1a50d291391949364c",
+  "binary_sha256": "d6cb840d1feae017d75a8eadcd225c196c528f084e4f7b35c41f376606db1c78",
+  "status": "prototype, no full network regression yet"
+}

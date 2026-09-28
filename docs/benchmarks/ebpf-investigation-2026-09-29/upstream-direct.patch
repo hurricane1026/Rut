@@ -1,0 +1,26 @@
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index fb5132ee..a8051e8c 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -807,6 +807,21 @@ bool IoUringBackend::add_send_upstream(
+     sqe->fd = fd;
+     sqe->addr = reinterpret_cast<u64>(buf);
+     sqe->len = len;
++    // Reserve the SQE first: every successful direct write still receives an
++    // ordinary completion carrying the upstream episode and total byte count.
++    if (nop_inject_result && len > 0 && len <= 4096) {
++        const ssize_t written = ::send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
++        if (written == static_cast<ssize_t>(len)) {
++            sqe->opcode = IORING_OP_NOP;
++            sqe->rw_flags = static_cast<decltype(sqe->rw_flags)>(IORING_NOP_INJECT_RESULT);
++        } else if (written > 0) {
++            const u32 n = static_cast<u32>(written);
++            upstream_send_state[conn_id].offset = n;
++            upstream_send_state[conn_id].remaining = len - n;
++            sqe->addr = reinterpret_cast<u64>(buf + n);
++            sqe->len = len - n;
++        }
++    }
+     sqe->user_data =
+         encode_upstream_user_data(conn_id, IoEventType::UpstreamSend, upstream_episode);
+ 
