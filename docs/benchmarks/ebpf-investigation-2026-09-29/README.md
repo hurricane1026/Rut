@@ -568,3 +568,5 @@ The 64 KiB/c1 proxy controls completed with three valid five-second samples per 
 | keepalive | 8031 | 7722 | 0.9616 |
 
 Both remain below the 1.10 goal; this is not proof that the candidate beats the accepted Rut baseline. Raw evidence and its hash are retained. The separate 12-cell 16 B acceptance process is live.
+
+A one-line POLL_FIRST follow-up is queued behind the 16 B acceptance matrix. It changes only `add_recv_upstream_once` and compares against the frozen uninitialized-connection candidate, isolating receive submission timing from buffer clearing. The earlier POLL_FIRST probes covered 64 KiB, while the retained tiny-response eBPF return counters now justify checking 16 B/c1 and c32 explicitly, with 64 KiB controls. Its build and load remain serialized; no POLL_FIRST runtime change has yet been accepted.
