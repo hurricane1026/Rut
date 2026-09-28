@@ -79,7 +79,7 @@ struct SlicePool {
 
     u8* base = nullptr;         // mmap'd region: max_count * kSliceSize bytes
     u32* free_stack = nullptr;  // mmap'd: free slice indices
-    u8* in_use_map = nullptr;   // mmap'd: 1 byte per slice (0=free, 1=in-use)
+    u8* in_use_map = nullptr;   // bit 0: in use; bit 1: uninitialized lease/dirty free slice
     u32 free_top = 0;
     // Cached indices occupy the top cached_count entries of free_stack.
     // Untouched/discarded indices remain below them, so reuse prefers hot pages.
@@ -231,14 +231,22 @@ struct SlicePool {
         return {};
     }
 
-    // Allocate one 16KB slice. Grows committed region if empty.
-    // Returns pointer to slice, or nullptr if at max capacity.
-    u8* alloc() {
+    // Ordinary allocations retain their zero-filled contract, even after an
+    // uninitialized borrower. Only explicit byte buffers may skip clearing.
+    u8* alloc() { return alloc_impl(true); }
+    // The caller initializes metadata and publishes only bytes actually written.
+    // Like alloc(), grows the committed region as needed; null means exhausted.
+    u8* alloc_uninitialized() { return alloc_impl(false); }
+
+    u8* alloc_impl(bool clear) {
         if (free_top == 0 && !grow()) return nullptr;
         u32 idx = free_stack[--free_top];
         u8* ptr = base + static_cast<u64>(idx) * kSliceSize;
         if (cached_count != 0) --cached_count;
-        if (in_use_map) in_use_map[idx] = 1;
+        if (in_use_map) {
+            if (clear && (in_use_map[idx] & 2u)) __builtin_memset(ptr, 0, kSliceSize);
+            in_use_map[idx] = clear ? 1u : 3u;
+        }
         return ptr;
     }
 
@@ -287,12 +295,16 @@ struct SlicePool {
         if (offset % kSliceSize != 0) return;  // not slice-aligned
         if (free_top >= max_count) return;     // overflow guard
         u32 idx = static_cast<u32>(offset / kSliceSize);
-        if (in_use_map && !in_use_map[idx]) return;  // double-free detection
+        if (in_use_map && !(in_use_map[idx] & 1u)) return;  // double-free detection
+        const bool uninitialized = in_use_map && (in_use_map[idx] & 2u);
         if (in_use_map) in_use_map[idx] = 0;
         if (cached_count < cache_limit) {
-            // Preserve zero-filled reuse and clear the previous owner's bytes
-            // even while the slice is idle, including bytes beyond buffer length.
-            __builtin_memset(ptr, 0, kSliceSize);
+            // Record dirty bytes so a later ordinary allocation still clears
+            // them. An uninitialized byte-buffer lease can reuse them directly.
+            if (uninitialized)
+                in_use_map[idx] = 2u;
+            else
+                __builtin_memset(ptr, 0, kSliceSize);
             free_stack[free_top++] = idx;
             ++cached_count;
             return;

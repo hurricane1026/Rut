@@ -79,7 +79,7 @@ struct ResponseBodyChain {
             // has proven: once it outgrew `bulk_after` (or this append alone
             // needs more than one slice), prefer one bulk node over slices.
             u8* raw = (missing > kPayload || size >= bulk_after) ? pool.alloc_bulk() : nullptr;
-            if (!raw) raw = pool.alloc();
+            if (!raw) raw = pool.alloc_uninitialized();
             auto* node = reinterpret_cast<Node*>(raw);
             if (!node) {
                 while (first) {
@@ -178,7 +178,7 @@ struct ResponseBodyChain {
         if (tail && payload_capacity(pool, tail) > tail->len) return true;
         if (owner && owner != &pool) return false;
         u8* raw = size >= bulk_after ? pool.alloc_bulk() : nullptr;
-        if (!raw) raw = pool.alloc();
+        if (!raw) raw = pool.alloc_uninitialized();
         auto* node = reinterpret_cast<Node*>(raw);
         if (!node) return false;
         node->next = nullptr;
@@ -210,7 +210,7 @@ struct ResponseBodyChain {
     }
 
 private:
-    // Bulk payload stays uninitialized between owners. append/reserve_tail
+    // Payload stays uninitialized between owners. append/reserve_tail
     // reset node metadata, and only append/commit publish received bytes.
     void release_node(Node* node) { owner->free(reinterpret_cast<u8*>(node)); }
 };
