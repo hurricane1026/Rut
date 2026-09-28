@@ -483,3 +483,29 @@ per-flow averages. They support a receive-window/send-timing explanation;
 they do not isolate ACK behavior or prove one receive-autotuning mechanism.
 The trace covers the all-file prototype, whose 1 MiB send flags match the
 narrowed candidate; it is not an uninstrumented throughput comparison.
+
+The narrowed large-file candidate subsequently passed all 1,423 network
+tests (338,996 checks), and its formatted patch passes `git diff --check`.
+The final candidate binary hash and exact patch are retained. The affected
+12-cell acceptance matrix has started; its outcome is still pending.
+
+## Narrowed large-file header push: formal result
+
+All 12 affected HTTP static coordinates completed with three valid 5-second samples per engine, clean warmups/load and cleanup. The matrix exits 2 because the 1.10 target is not met, not because measurements failed.
+
+| Bytes | Mode | Concurrency | nginx median RPS | Rut median RPS | Ratio |
+|---:|---|---:|---:|---:|---:|
+| 65536 | static-close | 1 | 12928 | 13531 | 1.0467 |
+| 65536 | static-close | 32 | 29176 | 31602 | 1.0832 |
+| 65536 | static-close | 128 | 29139 | 32344 | 1.1100 |
+| 65536 | static-keepalive | 1 | 28444 | 30331 | 1.0664 |
+| 65536 | static-keepalive | 32 | 62887 | 89228 | 1.4189 |
+| 65536 | static-keepalive | 128 | 62967 | 89585 | 1.4227 |
+| 1048576 | static-close | 1 | 3413 | 3568 | 1.0453 |
+| 1048576 | static-close | 32 | 6614 | 7774 | 1.1753 |
+| 1048576 | static-close | 128 | 6487 | 7540 | 1.1623 |
+| 1048576 | static-keepalive | 1 | 5496 | 5486 | 0.9983 |
+| 1048576 | static-keepalive | 32 | 9874 | 10273 | 1.0404 |
+| 1048576 | static-keepalive | 128 | 9784 | 10054 | 1.0276 |
+
+The 1 MiB keepalive regression is largely removed: c1 is approximately equal, and c32/c128 lead by 4.0%/2.8%. The previous formal ratios were 0.8187/0.8770/0.8813; these are separate runs on an unreserved host, while the alternating same-host causal probes establish the direction of benefit. Five of these twelve coordinates reach 1.10; this is not full-matrix acceptance. Preserve the narrowed change and continue investigating. Raw evidence is archived with SHA-256.

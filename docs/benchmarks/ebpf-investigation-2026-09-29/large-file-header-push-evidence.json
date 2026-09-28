@@ -1,0 +1,6 @@
+{
+  "archive": "large-file-header-push-evidence.tar.gz",
+  "sha256": "3783b50215b7be6b931d97c5f8609f750cd80db9da46142d67c0210f1f18cf9d",
+  "source": "/tmp/rut-bounded-followup-20260928/large-file-header-push-acceptance",
+  "note": "Raw logs, host snapshots and configuration; payloads and TLS private keys excluded."
+}
