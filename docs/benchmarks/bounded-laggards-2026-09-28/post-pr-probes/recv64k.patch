@@ -1,0 +1,13 @@
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index d6c853e4..4ae7ca77 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -556,7 +556,7 @@ bool IoUringBackend::add_recv_upstream_direct(
+     sqe->opcode = IORING_OP_RECV;
+     sqe->fd = fd;
+     sqe->addr = reinterpret_cast<u64>(dst);
+-    sqe->len = len;
++    sqe->len = len > 64 * 1024 ? 64 * 1024 : len;
+     // msg_flags stays 0 (memset above): no MSG_WAITALL, see the declaration.
+     // No IOSQE_BUFFER_SELECT / buf_group: the kernel writes straight into
+     // dst, so this CQE never carries IORING_CQE_F_BUFFER. wait() recognizes

@@ -1,0 +1,14 @@
+diff --git a/include/rut/runtime/slice_pool.h b/include/rut/runtime/slice_pool.h
+index aca9996c..d8103d45 100644
+--- a/include/rut/runtime/slice_pool.h
++++ b/include/rut/runtime/slice_pool.h
+@@ -374,6 +374,9 @@ private:
+             bulk_map_failed = true;
+             return false;
+         }
++#ifdef MADV_HUGEPAGE
++        (void)madvise(mem, static_cast<u64>(bulk_max_count) * kBulkSliceSize, MADV_HUGEPAGE);
++#endif
+         bulk_base = static_cast<u8*>(mem);
+         bulk_free_top = 0;
+         bulk_cached_count = 0;
