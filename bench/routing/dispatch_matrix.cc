@@ -1,12 +1,13 @@
 // Canonical segment-prefix dispatch only. Input is emitted by run_matrix.py.
 #include "rut/jit/art_jit_codegen.h"
 #include "rut/jit/jit_engine.h"
-#include "rut/runtime/access_log.h"
 #include "rut/runtime/route_art.h"
 #include "rut/runtime/route_select.h"
 #include "rut/runtime/route_trie.h"
 #include <cstdio>
 #include <cstring>
+
+#include <time.h>
 using namespace rut;
 namespace {
 struct Entry {
@@ -22,6 +23,12 @@ bool dynamic_paths;
 RouteTrie trie;
 ArtTrie art(ArtMatchMode::SegmentPrefix);
 jit::ArtJitMatchFn compiled;
+bool monotonic_now_ns(u64* result) {
+    timespec now{};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return false;
+    *result = static_cast<u64>(now.tv_sec) * 1000000000ULL + static_cast<u64>(now.tv_nsec);
+    return true;
+}
 bool pattern(const Entry& r, const Entry& p) {
     if (!dynamic_paths)
         return p.len >= r.len && (!r.len || !memcmp(r.path, p.path, r.len)) &&
@@ -123,10 +130,19 @@ int main(int argc, char**) {
                     u64 checksum = 0;
                     for (unsigned i = 0; i < (f == 1 ? 1024u : 8192u); ++i)
                         checksum += fns[f](probes[trace[(i + rep * 128) % 1024]]);
-                    const u64 start = monotonic_ns();
+                    u64 start = 0;
+                    if (!monotonic_now_ns(&start)) {
+                        if (!params) engine.shutdown();
+                        return 8;
+                    }
                     for (unsigned i = 0; i < (f == 1 ? 8192u : 131072u); ++i)
                         checksum += fns[f](probes[trace[(i + rep * 128) % 1024]]);
-                    const u64 elapsed = monotonic_ns() - start;
+                    u64 end = 0;
+                    if (!monotonic_now_ns(&end) || end < start) {
+                        if (!params) engine.shutdown();
+                        return 8;
+                    }
+                    const u64 elapsed = end - start;
                     double ns = static_cast<double>(elapsed) / (f == 1 ? 8192.0 : 131072.0);
                     printf("%s,%u,%s,%s,%u,%.4f,%llu\n",
                            profile,

@@ -34,17 +34,22 @@ class RoutingCorpusTests(unittest.TestCase):
             self.assertEqual(probes[7]["expected"]["captures"], {"id": "42"})
 
     def test_same_terminal_specific_method_and_first_declaration(self):
-        routes = [{"id": 0, "method": "ANY", "path": "/api"},
-                  {"id": 1, "method": "GET", "path": "/api"},
-                  {"id": 2, "method": "GET", "path": "/api"}]
+        routes = [{"id": 90, "method": "ANY", "path": "/api"},
+                  {"id": 3, "method": "GET", "path": "/api"},
+                  {"id": 4, "method": "GET", "path": "/api"}]
         for contract in corpus.Contract:
-            self.assertEqual(corpus.reference_match(routes, "GET", "/api", contract)["route_id"], 1)
-            self.assertEqual(corpus.reference_match(routes, "HEAD", "/api", contract)["route_id"], 0)
+            self.assertEqual(corpus.reference_match(routes, "GET", "/api", contract)["route_id"], 3)
+            self.assertEqual(corpus.reference_match(routes, "HEAD", "/api", contract)["route_id"], 90)
+
+    def test_same_method_and_path_uses_declaration_order(self):
+        routes = [{"id": 90, "method": "GET", "path": "/api"},
+                  {"id": 3, "method": "GET", "path": "/api"}]
+        self.assertEqual(corpus.reference_match(routes, "GET", "/api", corpus.Contract.EXACT)["route_id"], 90)
 
     def test_precedence_is_depth_then_literal_specificity(self):
-        routes = [{"id": 0, "method": "GET", "path": "/api/:id"},
-                  {"id": 1, "method": "GET", "path": "/api/v1/users"}]
-        self.assertEqual(corpus.reference_match(routes, "GET", "/api/v1/users", corpus.Contract.EXACT)["route_id"], 1)
+        routes = [{"id": 0, "method": "GET", "path": "/users/me"},
+                  {"id": 1, "method": "GET", "path": "/users/:name/settings"}]
+        self.assertEqual(corpus.reference_match(routes, "GET", "/users/me/settings", corpus.Contract.SEGMENT_PREFIX)["route_id"], 1)
 
         routes = [{"id": 90, "method": "GET", "path": "/api/:id"},
                   {"id": 3, "method": "GET", "path": "/api/v1"}]
