@@ -9,7 +9,7 @@ namespace rut {
 // Nodes are sent in place and reclaimed after their send completion, one node
 // per send. A node is an ordinary slice or, once the body has proven larger
 // than one slice and the pool has one, a bulk relay buffer: a large body then
-// leaves in 256 KiB sends instead of 16 KiB ones.
+// leaves in bulk-sized sends instead of 16 KiB ones.
 struct ResponseBodyChain {
     static constexpr u32 kMaxBody = SlicePool::kMaxBufferedResponseBody;
     struct Node {
