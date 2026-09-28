@@ -1,0 +1,7 @@
+{
+  "runtime_base": "271cd98c",
+  "candidate_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "parser_tests": 217,
+  "parser_checks": 724747,
+  "performance": "first causal order running; no retention claim"
+}

@@ -960,3 +960,9 @@ The matching keepalive user-cycle capture has also completed with exact-body and
 All four shutdown traces are usable with clean warm/load checks. nginx records no front tcp_shutdown calls (its ordinary close path sends FIN). Corrected Rut records 89,275 calls / 61,635 front sends at c1, and 134,702 / 134,684 at c32. Total inclusive tcp_shutdown time is 196,793,000 ns and 421,026,106 ns, respectively. This is a kernel-function measurement, not total shutdown syscall overhead; calls returning before tcp_shutdown are invisible. The excess c1 calls warrant a separate guarded experiment, but do not explain all remaining latency.
 
 Formatting now passes for the two changed runtime/test files, with whitespace-only adjustments after the tested binary was frozen. Retain the corrected CombinedSend early-FIN implementation and lifecycle test based on both causal orders, full network regression, and the formal 12-cell comparison. Remaining 96-cell target failures remain open.
+
+## AVX2 header-name token validation prototype
+
+The current small-proxy profile identifies header-name scanning among the remaining userspace hotspots. Its AVX2 implementation finds the colon in parallel but validates preceding bytes with a scalar table loop. This prototype replaces that loop with low/high-nibble shuffle tables derived at compile time from the existing token table; only bytes before the first colon participate, and the scalar tail is unchanged. No parser policy is relaxed.
+
+A scalar-oracle differential test covers all 256 byte values, 32 starting alignments, lengths around 16/32/64-byte boundaries, mutation before/at/after the delimiter, and both short and full scan bounds. All 217 parser tests / 724747 checks pass. The first uninstrumented causal order compares against the accepted CombinedSend FIN binary; full network regression and retention depend on its results.
