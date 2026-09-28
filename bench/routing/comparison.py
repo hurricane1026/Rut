@@ -27,6 +27,7 @@ def plan(manifest):
                 for engine in Engine:
                     prerequisite = (
                         "exceeds_current_128_route_capacity" if engine == Engine.RUT and case["routes"] > 128
+                        else "rut_exact_contract" if engine == Engine.RUT and case.get("contract") == "exact"
                         else "no_equivalent_local_static_responder" if engine == Engine.LINKERD and mode == "local_static"
                         else "pinned_proxy_and_control_plane_with_accepted_outbound_routes"
                         if engine == Engine.LINKERD else "pinned_proxy_and_verified_config")
@@ -66,12 +67,16 @@ def validate(matrix, results):
         if row.get("case_sha256") != required["case_sha256"]:
             errors.append(f"input hash mismatch: {key}")
         if required["prerequisite"] == "no_equivalent_local_static_responder":
-            if row.get("state") != "unsupported" or not row.get("reason"):
+            if row.get("state") != "unsupported" or not isinstance(row.get("reason"), str) or not row["reason"].strip():
                 errors.append(f"must explicitly report unsupported local response: {key}")
             continue
         if required["prerequisite"] == "exceeds_current_128_route_capacity":
-            if row.get("state") != "unsupported" or not row.get("reason"):
+            if row.get("state") != "unsupported" or not isinstance(row.get("reason"), str) or not row["reason"].strip():
                 errors.append(f"must explicitly report unsupported route capacity: {key}")
+            continue
+        if required["prerequisite"] == "rut_exact_contract":
+            if row.get("state") != "unsupported" or not isinstance(row.get("reason"), str) or not row["reason"].strip():
+                errors.append(f"must explicitly report unsupported exact contract: {key}")
             continue
         if row.get("state") != "passed":
             errors.append(f"not passed: {key}: {row.get('state')}")
@@ -106,7 +111,10 @@ def main():
         for error in errors:
             print(error)
         if not errors:
-            unsupported = sum(r["prerequisite"] == "no_equivalent_local_static_responder"
+            unsupported = sum(r["prerequisite"] in {
+                                  "no_equivalent_local_static_responder",
+                                  "exceeds_current_128_route_capacity",
+                                  "rut_exact_contract"}
                               for r in matrix["rows"])
             print(f"Result index complete; {unsupported} explicitly unsupported rows (not passes).")
         return 1 if errors else 0

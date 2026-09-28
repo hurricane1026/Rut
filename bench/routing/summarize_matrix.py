@@ -26,10 +26,18 @@ for profile in g.PROFILES:
 assert set(samples) == expected, f"Incomplete matrix: {len(samples)}/{len(expected)}"
 result = []
 for (profile, size, trace), candidates in samples.items():
+    case = g.case_for(g.PROFILE_BY_NAME[profile], int(size), g.Contract.SEGMENT_PREFIX, 729)
+    expected_candidates = {"linear", "segment_trie"}
+    if not any(":" in route["path"] for route in case["routes"]):
+        expected_candidates |= {"scalar_art", "jit_art"}
+    assert set(candidates) == expected_candidates, (
+        f"Unexpected candidates for {(profile, size, trace)}: "
+        f"got {set(candidates)}, expected {expected_candidates}")
     assert all(len(values) == 8 for values in candidates.values())
     medians = {name: statistics.median(values) for name, values in candidates.items()}
     winner = min(medians, key=medians.get)
     pick = selected[(profile, size)]
+    assert pick in expected_candidates, f"Selected candidate {pick!r} is unavailable for {(profile, size)}"
     result.append(dict(profile=profile, routes=int(size), trace=trace, selected=pick,
                        fastest=winner, ratio=medians[pick]/medians[winner], median_ns=medians,
                        min_max_ns={name: [min(v), max(v)] for name, v in candidates.items()}))

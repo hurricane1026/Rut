@@ -317,6 +317,7 @@ def main():
                 (args.output / filename).write_bytes(raw)
                 entries.append({"file": filename, "sha256": hashlib.sha256(raw).hexdigest(),
                                 "routes": count, "probes": len(data["probes"]),
+                                "contract": contract.value,
                                 "execution_modes": data["execution_modes"],
                                 "response_bytes": data["static_response_bytes"] or [16],
                                 "asserted_probes": sum(p["check"] == "assert" for p in data["probes"])})
@@ -327,6 +328,7 @@ def main():
         (args.output / filename).write_bytes(raw)
         entries.append({"file": filename, "sha256": hashlib.sha256(raw).hexdigest(),
                         "routes": len(data["routes"]), "probes": len(data["probes"]),
+                        "contract": contract.value,
                         "execution_modes": ["proxy"], "response_bytes": [16],
                         "asserted_probes": len(data["probes"])})
     manifest = {"schema_version": 1, "seed": args.seed, "cases": entries,

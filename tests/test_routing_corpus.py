@@ -2,6 +2,7 @@
 """Validate workload oracles and reproducibility, without timing Python routing."""
 
 import importlib.util
+import csv
 import json
 from pathlib import Path
 import subprocess
@@ -124,6 +125,7 @@ class RoutingCorpusTests(unittest.TestCase):
             manifest = json.loads(first["manifest.json"])
             self.assertEqual(len(manifest["cases"]), 10)
             for entry in manifest["cases"]:
+                self.assertIn(entry["contract"], {"exact", "segment_prefix"})
                 self.assertEqual(corpus.hashlib.sha256(first[entry["file"]]).hexdigest(), entry["sha256"])
 
 
@@ -184,6 +186,81 @@ class ComparisonGateTests(unittest.TestCase):
             if row["engine"] == "rut":
                 row.update(state="unsupported", reason="Rut currently supports at most 128 routes")
         self.assertEqual(comparison.validate(matrix, rows), [])
+
+    def test_rut_exact_contract_is_explicitly_unsupported(self):
+        manifest = {"cases": [{"file": "exact.json", "sha256": "abc", "routes": 2,
+                                "contract": "exact", "asserted_probes": 10,
+                                "execution_modes": ["proxy"], "response_bytes": [16]}]}
+        matrix = comparison.plan(manifest)
+        rut = next(row for row in matrix["rows"] if row["engine"] == comparison.Engine.RUT)
+        self.assertEqual(rut["prerequisite"], "rut_exact_contract")
+        rows = [dict(row, state="passed", asserted_probes=10, failed_probes=0)
+                for row in matrix["rows"]]
+        for row in rows:
+            for field in ("binary_or_image_digest", "config_sha256", "probe_evidence_sha256",
+                          "upstream_evidence_sha256", "environment_sha256",
+                          "control_plane_digest", "route_status_evidence_sha256", "topology"):
+                row[field] = "test-fixture-only"
+        self.assertTrue(comparison.validate(matrix, rows))
+        for row in rows:
+            if row["engine"] == "rut":
+                row.update(state="unsupported", reason="Rut dispatch uses segment-prefix contract")
+        self.assertEqual(comparison.validate(matrix, rows), [])
+
+    def test_unsupported_reason_must_be_nonempty_string(self):
+        matrix = comparison.plan({"cases": [{"file": "large.json", "sha256": "abc", "routes": 129,
+                                              "asserted_probes": 10, "execution_modes": ["proxy"], "response_bytes": [16]}]})
+        rows = []
+        for required in matrix["rows"]:
+            row = dict(required, state="passed", asserted_probes=10, failed_probes=0)
+            for field in ("binary_or_image_digest", "config_sha256", "probe_evidence_sha256",
+                          "upstream_evidence_sha256", "environment_sha256",
+                          "control_plane_digest", "route_status_evidence_sha256", "topology"):
+                row[field] = "test-fixture-only"
+            rows.append(row)
+        rut = next(row for row in rows if row["engine"] == "rut")
+        for reason in (True, 1, "   "):
+            rut.update(state="unsupported", reason=reason)
+            self.assertTrue(comparison.validate(matrix, rows))
+
+    def test_summary_requires_complete_candidate_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cases = []
+            for profile in corpus.PROFILES:
+                for size in corpus.SIZES:
+                    if size <= profile.max_routes:
+                        cases.append((profile, size, corpus.case_for(
+                            profile, size, corpus.Contract.SEGMENT_PREFIX, 729)))
+            (root / "validation.log").write_text("".join(
+                f"SELECT {profile.name} {size} "
+                f"{'segment_trie' if any(':' in route['path'] for route in case['routes']) else 'jit_art'}\n"
+                for profile, size, case in cases))
+            with (root / "raw.csv").open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=("profile", "routes", "trace",
+                                                             "candidate", "repeat", "ns_per_lookup"))
+                writer.writeheader()
+                for profile, size, case in cases:
+                    candidates = ("linear", "segment_trie")
+                    if not any(":" in route["path"] for route in case["routes"]):
+                        candidates += ("scalar_art", "jit_art")
+                    for trace in case["traces"]:
+                        for candidate in candidates:
+                            for repeat in range(8):
+                                writer.writerow({"profile": profile.name, "routes": size,
+                                                 "trace": trace, "candidate": candidate,
+                                                 "repeat": repeat, "ns_per_lookup": 1})
+            summarize = ROOT / "bench/routing/summarize_matrix.py"
+            subprocess.run([sys.executable, str(summarize), str(root)], check=True,
+                           capture_output=True, cwd=ROOT / "bench/routing")
+            with (root / "raw.csv").open("a", newline="") as stream:
+                writer = csv.writer(stream)
+                profile, size, case = cases[0]
+                for trace in case["traces"]:
+                    for repeat in range(8):
+                        writer.writerow([profile.name, size, trace, "extra", repeat, 1])
+            self.assertNotEqual(subprocess.run([sys.executable, str(summarize), str(root)],
+                                               capture_output=True, cwd=ROOT / "bench/routing").returncode, 0)
 
     def test_duplicate_and_unlisted_results_fail(self):
         rows = self.evidence()
