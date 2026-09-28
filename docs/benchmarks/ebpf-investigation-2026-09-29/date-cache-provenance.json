@@ -1,0 +1,7 @@
+{
+  "base": "808ef4cd37e5272c2dc2996b5967897f1b7deeb4",
+  "binary_sha256": "5ea8a7c83f33b291f64b96435291e1f88a325fc0939fcc3f34c3aca1ab989b15",
+  "focused_test": "1 passed, 24 checks",
+  "full_regression": "1425 passed, 371799 checks",
+  "disposition": "reverted: no consistent throughput benefit, 64 KiB keepalive regressed both orders"
+}

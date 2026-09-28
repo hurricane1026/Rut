@@ -1,0 +1,72 @@
+diff --git a/include/rut/runtime/callbacks_impl.h b/include/rut/runtime/callbacks_impl.h
+index 96510220..81230c15 100644
+--- a/include/rut/runtime/callbacks_impl.h
++++ b/include/rut/runtime/callbacks_impl.h
+@@ -11541,7 +11541,18 @@ inline u32 strict_response_date(char* out, u64 now_us) {
+     static constexpr const char* kWeek[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+     static constexpr const char* kMonth[] = {
+         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+-    time_t t = static_cast<time_t>(now_us / 1000000ULL);
++    struct DateCache {
++        u64 second = 0;
++        char bytes[29]{};
++        bool valid = false;
++    };
++    static thread_local DateCache cache{};
++    const u64 second = now_us / 1000000ULL;
++    if (cache.valid && cache.second == second) {
++        __builtin_memcpy(out, cache.bytes, sizeof(cache.bytes));
++        return sizeof(cache.bytes);
++    }
++    time_t t = static_cast<time_t>(second);
+     struct tm tm;
+     if (gmtime_r(&t, &tm) == nullptr) return 0;
+     char* p = out;
+@@ -11571,7 +11582,13 @@ inline u32 strict_response_date(char* out, u64 now_us) {
+     *p++ = 'G';
+     *p++ = 'M';
+     *p++ = 'T';
+-    return static_cast<u32>(p - out);
++    const u32 len = static_cast<u32>(p - out);
++    if (len == sizeof(cache.bytes)) {
++        __builtin_memcpy(cache.bytes, out, len);
++        cache.second = second;
++        cache.valid = true;
++    }
++    return len;
+ }
+ 
+ struct RedirectAuthorityView {
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index e06c6eee..867a354f 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -66148,6 +66148,28 @@ TEST(timeout_policy, explicit_policy_epoll_remains_zero_byte_fail_closed) {
+     loop->shutdown();
+ }
+ 
++TEST(strict_response, date_cache_tracks_seconds_and_clock_reversal) {
++    const struct {
++        u64 time_us;
++        const char* expected;
++    } cases[] = {
++        {0, "Thu, 01 Jan 1970 00:00:00 GMT"},
++        {999999, "Thu, 01 Jan 1970 00:00:00 GMT"},
++        {1000000, "Thu, 01 Jan 1970 00:00:01 GMT"},
++        {1893456000000000ULL, "Tue, 01 Jan 2030 00:00:00 GMT"},
++        {1893456000999999ULL, "Tue, 01 Jan 2030 00:00:00 GMT"},
++        {0, "Thu, 01 Jan 1970 00:00:00 GMT"},
++    };
++    for (const auto& c : cases) {
++        char out[31];
++        __builtin_memset(out, '!', sizeof(out));
++        CHECK_EQ(strict_response_date(out + 1, c.time_us), 29u);
++        CHECK_EQ(__builtin_memcmp(out + 1, c.expected, 29), 0);
++        CHECK_EQ(out[0], '!');
++        CHECK_EQ(out[30], '!');
++    }
++}
++
+ TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
+     IoUringBackend backend{};
+     auto initialized = backend.init(0, -1);

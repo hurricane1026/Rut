@@ -1,0 +1,5 @@
+=== strict_response ===
+RUN: strict_response.date_cache_tracks_seconds_and_clock_reversal
+  PASS: date_cache_tracks_seconds_and_clock_reversal
+
+1 passed, 0 failed, 24 checks, 0 failed checks, 1424 skipped

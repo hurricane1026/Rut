@@ -753,3 +753,22 @@ The three stage means should sum closely to the full interval; probe execution b
 ## Upstream TCP close timing control
 
 HTTP 16 B c1 close, both traces usable with exact-body and zero warm/load error checks. Mean inclusive upstream tcp_close elapsed time is 11.227 us for nginx and 10.955 us for Rut. Front read→send is 76.831/78.617 us and upstream read→front send is 18.811/21.024 us respectively. These traces do not support slower upstream close as the cause of Rut’s response-stage gap. Close time is an inclusive kernel interval, not CPU time; asynchronous close could also run outside the response-stage interval, so subtraction is not a proof of userspace overhead. Runtime retirement ordering remains unchanged.
+
+## Rejected per-thread second-level Date cache
+
+A thread-local 29-byte cache keyed by exact realtime second avoids repeated gmtime_r and formatting within the second. Epoch-zero, same-second, rollover and backward-clock output/guard tests passed (24 checks); the full network suite passed all 1425 tests / 371799 checks. Forward and reverse benchmark order:
+
+| Run | Case | Mean RPS change |
+|---|---|---:|
+| date-cache-r1 | 16-c1-close | -0.03% |
+| date-cache-r1 | 16-c1-keepalive | +0.05% |
+| date-cache-r1 | 16-c32-close | +1.86% |
+| date-cache-r1 | 65536-c1-close | -0.18% |
+| date-cache-r1 | 65536-c1-keepalive | -0.73% |
+| date-cache-r2 | 16-c1-close | -0.35% |
+| date-cache-r2 | 16-c1-keepalive | -0.50% |
+| date-cache-r2 | 16-c32-close | -1.13% |
+| date-cache-r2 | 65536-c1-close | -0.35% |
+| date-cache-r2 | 65536-c1-keepalive | -1.03% |
+
+The throughput improvement is not repeatable; 64 KiB keepalive regresses in both orders. Reverted runtime and test changes, retaining patch and raw evidence. Build-rel still contains the rejected candidate until rebuilt; rut-small-poll-first remains the accepted frozen binary. An independent accepted-source build with the existing RUT_ENABLE_IPO option is queued to test code-generation effects without changing runtime semantics.
