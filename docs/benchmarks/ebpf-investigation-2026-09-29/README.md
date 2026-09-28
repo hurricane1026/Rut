@@ -600,3 +600,19 @@ The alternating static control confirms the connection-buffer change against the
 | 16-c32-close | -0.02% |
 
 Both c1 candidate samples exceed both baseline samples. At c32 user CPU drops but throughput is flat. Retain the explicit uninitialized network-buffer leases based on the c1 static gain, the positive proxy c32 controls, the passing full tests, and formal nginx comparisons. The ordinary allocator still returns zero-filled memory, and dirty leases remain bounded by the existing cache budget and completion ownership. This is not across-matrix acceptance. POLL_FIRST remains a separate pending prototype.
+
+## POLL_FIRST: measured empty-read removal
+
+Both focused TCP-only eBPF traces are complete/usable with matching target identities and clean warmup/load counters. At 16 B/c1 close, upstream recv calls/request drop from 1.9992 to 1.0000, and upstream EAGAIN/request from 0.9992 to zero. Upstream recv elapsed time falls from 1.1063 to 0.8530 us/request. These inclusive elapsed times are instrumented diagnostics, not pure CPU time or acceptance throughput. The corresponding uninstrumented 16 B/c1 close change is -0.04%, so removing this empty read is not enough to close the main throughput gap.
+
+| Probe | Case | Mean RPS change |
+|---|---|---:|
+| small-poll-first-r1 | 16-c1-close | -0.04% |
+| small-poll-first-r1 | 16-c1-keepalive | +0.38% |
+| small-poll-first-r1 | 16-c32-close | -0.58% |
+| small-poll-first-r1 | 65536-c1-close | +0.90% |
+| small-poll-first-r1 | 65536-c1-keepalive | +1.90% |
+| small-poll-first-64k-r2 | 65536-c1-close | +1.09% |
+| small-poll-first-64k-r2 | 65536-c1-keepalive | +0.93% |
+
+The 64 KiB changes are positive in both process orders, around 1–2%; no material gain appears for 16 B. The full network suite and formal 64 KiB nginx controls are running before deciding whether to retain the one-line change.
