@@ -3234,7 +3234,37 @@ public:
                 return false;
             }
         }
-        if (backend.add_send(c.fd, c.id, buf, len, generation, c.plaintext_send_has_follow_up())) {
+        // Coalesce only bytes the response pump can already publish. A
+        // declared but unread suffix must not cork a stalled origin's last
+        // eligible release. BodySend has already counted this send in
+        // downstream_submitted; early releases instead use their fixed
+        // publication boundary and the current send length.
+        bool buffered_follow_up = false;
+        if (!c.tls_active &&
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded) {
+            if (phase == ResponseReadDeadlinePostCommitPhase::HeaderSend) {
+                buffered_follow_up = c.response_read_deadline_post_commit_send_body != 0;
+            } else if (phase == ResponseReadDeadlinePostCommitPhase::BodySend) {
+                buffered_follow_up = c.response_read_deadline_post_commit_downstream_submitted <
+                                     c.response_read_deadline_post_commit_send_body;
+            } else if (phase == ResponseReadDeadlinePostCommitPhase::Buffering) {
+                const u32 target = bounded_response_release_bytes(
+                    c.response_read_deadline_post_commit_raw_header_end,
+                    c.response_read_deadline_post_commit_origin_received,
+                    false);
+                const u32 released = c.response_read_deadline_bounded_released;
+                if (c.on_send == &on_bounded_release_header_sent<Self>)
+                    buffered_follow_up = target > released;
+                else if (c.on_send == &on_bounded_release_body_sent<Self>)
+                    buffered_follow_up = target > released && len < target - released;
+            }
+        }
+        if (backend.add_send(c.fd,
+                             c.id,
+                             buf,
+                             len,
+                             generation,
+                             c.plaintext_send_has_follow_up() || buffered_follow_up)) {
             c.pending_ops++;
             c.send_armed = true;
             return true;
