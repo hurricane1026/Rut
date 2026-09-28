@@ -1,0 +1,10 @@
+{
+  "base": "932b9c56ec886d03c39e7f5635eb4b3d1400a1a3",
+  "binary_sha256": {
+    "rut-cache256-final": "de0ba69caf88cbe88789d81621d5ea90561cf6dda42a45b46730360f76ad18b6",
+    "rut-recviov": "c5fb033412f224edaa66affbbe33397ee0387540fafc8d62706dcd4fc0e0ce95",
+    "rut-recviov16": "c66b612fb15b6389a6012360ab4f9c75122cefae0cefd9ba806469ef6b5576bf",
+    "rut-align64": "cf56693e7dbf03d87357765032c3c273db7a192e6dc1b96d7e9e8affec341fc4"
+  },
+  "retained_parser_binary_sha256": "8a30d07949c4a99e6d6d32e1b1f1633858587ec30b7841b1d738079dcc5f4d8a"
+}
