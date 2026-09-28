@@ -5,6 +5,10 @@ one physical core each, with separate cores for the client and origin. This is
 an opt-in local experiment, not a performance CI gate or an expansion of the
 nginx compatibility matrix. The harness does not modify production source.
 
+For kernel diagnostics, see [eBPF tracing](../ebpf_trace/README.md). Run traces
+separately from acceptance throughput measurements; tracing adds overhead and
+has its own privilege/tool requirements.
+
 ## Requirements
 
 - Linux, Python 3.11+, `taskset`, `lscpu`, GNU `/usr/bin/time`, Git.
