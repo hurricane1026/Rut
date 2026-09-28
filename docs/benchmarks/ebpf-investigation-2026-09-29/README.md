@@ -559,3 +559,12 @@ Only 16 B/c32 close shows a material positive signal (+6.72%); 64 KiB/c1 keepali
 The expanded candidate subsequently passes all 1,424 network tests (371,775 checks) and 71 arena tests (1,139,070 checks). This includes a dirty connection-buffer reuse test, parser valid-length bounds, preserved zero-filled TLS-listener allocations, and unchanged deferred body ownership assertions using the in-use bit. Reverse-order performance validation is still running; test success alone does not establish a throughput benefit.
 
 The reverse-order 16 B/c32 close probe returns baseline 14,845/14,145 RPS and candidate 14,861/14,883 RPS, a +2.60% mean change. Both directions are positive, but one baseline sample matches the candidate and the baseline varies, so +6.72% is not a stable expected gain. A 12-cell 16 B HTTP static/proxy acceptance matrix and the two 64 KiB/c1 proxy acceptance controls are now running serially. The first matrix invocation exited at argument parsing because the driver requires TLS credential paths even for HTTP-only selection; no load ran from that invocation. The corrected invocation is queued after the 64 KiB controls.
+
+The 64 KiB/c1 proxy controls completed with three valid five-second samples per engine and complete cleanup.
+
+| Mode | nginx median RPS | Rut median RPS | Ratio |
+|---|---:|---:|---:|
+| close | 6058 | 5919 | 0.9771 |
+| keepalive | 8031 | 7722 | 0.9616 |
+
+Both remain below the 1.10 goal; this is not proof that the candidate beats the accepted Rut baseline. Raw evidence and its hash are retained. The separate 12-cell 16 B acceptance process is live.
