@@ -2064,16 +2064,22 @@ verified against. A parallel, separately-closed `response_policy` exists for
 response-side rewriting; see `docs/language-card.md`.
 
 **Response read timeout and response buffering.** A `forward(...)` carrying a
-`response_policy` may add `response_read_timeout: <1..63s>`. This is an
-inactivity deadline: every positive read from the origin refreshes it, so an
-origin that keeps sending never expires, however long the whole response
-takes. It may also add `response_buffering:`, which applies only to a single
-final HTTP/1.1 response framed by exactly one `Content-Length`:
+`response_policy` may add `response_read_timeout: <1..63s>`. The deadline
+first bounds the wait for the complete response header. Incomplete header
+fragments do not refresh it, so a header that trickles in slower than the
+timeout expires on the initial deadline (the pinned exact-profile rows in
+`docs/nginx-compatibility.md`). Once the header has been received, the
+deadline is an inactivity deadline for the body: every positive body read
+refreshes it, so an origin that keeps sending the body never expires,
+however long the whole body takes. The forward may also add
+`response_buffering:`, which applies only to a single final HTTP/1.1
+response framed by exactly one `Content-Length`:
 
 - `"complete_content_length"`: the whole response (header and body) is
   buffered before any downstream byte is sent.
-- `"bounded"`: nginx's `proxy_buffering on` release rule, which the nginx
-  converter emits for `proxy_buffering on` (nginx's default). With raw
+- `"bounded"`: nginx's `proxy_buffering on` (nginx's default) release rule.
+  ⏳ pending: the mode is accepted, but the runtime still serves it exactly as
+  `"complete_content_length"`. With raw
   upstream header length `H`, after `n` body bytes have arrived the released
   body is `n` once the response is complete, and otherwise
   `max(0, floor((H + n) / 4096) * 4096 - H)`. That is, whole 4 KiB buffers of
