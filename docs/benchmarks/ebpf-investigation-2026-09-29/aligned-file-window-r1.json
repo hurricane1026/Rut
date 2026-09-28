@@ -1,0 +1,26 @@
+[
+  {
+    "case": "1048576-c1-keepalive-rut-aligned",
+    "usable": true,
+    "@send_peer_window_ge_1048576_percent": 99.83392497841295,
+    "@send_notsent_ge_65536_percent": 0.048376613285731465
+  },
+  {
+    "case": "1048576-c1-keepalive-rut-base",
+    "usable": true,
+    "@send_peer_window_ge_1048576_percent": 0.0,
+    "@send_notsent_ge_65536_percent": 50.376651945391345
+  },
+  {
+    "case": "1048576-c32-keepalive-rut-aligned",
+    "usable": true,
+    "@send_peer_window_ge_1048576_percent": 0.0,
+    "@send_notsent_ge_65536_percent": 64.84591694531075
+  },
+  {
+    "case": "1048576-c32-keepalive-rut-base",
+    "usable": true,
+    "@send_peer_window_ge_1048576_percent": 2.1254194246227103,
+    "@send_notsent_ge_65536_percent": 39.10767725271099
+  }
+]

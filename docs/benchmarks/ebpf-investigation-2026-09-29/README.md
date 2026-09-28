@@ -840,3 +840,17 @@ A wider (32 KiB bound) staging view backed by an existing bulk lease allows copy
 | file-prefix16-aligned-r2 | 1m-c32-keepalive | -4.64% |
 
 All benchmark preflight and warm/load checks passed. Three pipelined nonuniform 1 MiB responses on one real socket matched exactly; this is not a full regression. c1 candidates stay around 5855–5913 RPS while baseline varies around 4623–5360. c32 keepalive regresses across both orderings; c32 close is effectively flat. Thus this cannot be retained as a universal improvement. c1 close and c2/4/8/16 keepalive probes are queued to determine whether a repeatable concurrency crossover exists before considering a workload-dependent strategy. No such strategy is implemented.
+
+## Aligned prefix follow-up: reject universal 16 KiB staging
+
+Additional uninstrumented controls, all exact-body and warm/load checks passing:
+
+| Case | Mean RPS change |
+|---|---:|
+| 1m-c1-close | +1.95% |
+| 1m-c16-keepalive | -14.04% |
+| 1m-c2-keepalive | -1.98% |
+| 1m-c4-keepalive | -4.79% |
+| 1m-c8-keepalive | -5.91% |
+
+All tested keepalive concurrency levels above one regress. Do not retain this as a universal change or introduce a benchmark-coordinate branch. Four usable TCP window traces show a strong correlated reversal: for c1, peer window >=1 MiB rises from 0% to 99.83% and notsent >=64 KiB falls from 50.38% to 0.05%; at c32, notsent >=64 KiB rises from 39.11% to 64.85%. These are call-weighted observations, not time fractions, and do not isolate alignment from allocation or initial-burst size. A 32 KiB page-aligned body prefix is the next independent control; the previous rejected 64 KiB staging experiment had an unaligned body offset. No huge pages or global TCP settings are changed.
