@@ -1,0 +1,6 @@
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:61454 -> (loop->pool.in_use_map[index]) == (0u)
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:61446 -> (loop->pool.in_use_map[index]) == (1u)
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:61450 -> (loop->pool.in_use_map[index]) == (1u)
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:61454 -> (loop->pool.in_use_map[index]) == (0u)
+  FAIL: body_slices_remain_owned_until_deferred_send_reclamation (/home/hurricane/private/code/Rut-s1/tests/test_network.cc:61454: (loop->pool.in_use_map[index]) == (0u))
+1422 passed, 1 failed, 338996 checks, 4 failed checks

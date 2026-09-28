@@ -539,3 +539,19 @@ The first scoped ordinary-slice prototype changes only plaintext upstream/header
 | 65536-c1-keepalive | +0.05% |
 
 All preflight and warmup/load checks pass, but none of these changes establish a gain. The pool is shared: connection teardown pushes dirty upstream/header buffers after the ordinary request/send buffers, so the following connection can clear them during its ordinary allocations. This is a source-level explanation to test, not a measured allocation census. The next experiment will include the plaintext connection request/send byte buffers and preserve zero-filled allocation for other callers.
+
+Re-examining the retained eBPF return counters clarifies the apparent extra tiny upstream receive: at 16 B/c1 close, Rut has 58,682 upstream EAGAIN returns for 58,744 completed requests; nginx has none. Keepalive likewise has 81,443 EAGAIN returns for 81,462 Rut requests. Both perform one successful upstream copy per request. Thus the extra calls are predominantly speculative empty reads, not split payload copies. At c32 Rut EAGAIN falls to 1,218/106,622 requests; nginx instead has 100,779 upstream zero returns (EOF). These are workload/timing-dependent observations, not a universal backend ordering. Earlier POLL_FIRST trials covered 64 KiB and were inconclusive; the tiny c1 response is a distinct follow-up candidate.
+
+The scoped uninitialized prototype passed all 71 arena tests (1,139,070 checks). Its network run reports 1,422 pass/1 fail: four checks in the deferred-body-slice reclamation test assumed `in_use_map` contained exactly 0/1. The dirty state adds bit 1, so the ownership checks are being updated to inspect bit 0 without weakening the before/after-completion lifetime assertion. The expanded candidate includes plaintext io_uring connection request/send buffers and a poisoned reuse/parser/TLS-listener control; its full suite and reverse-order performance check remain pending.
+
+Expanded plaintext connection-buffer diagnostic, two samples per engine:
+
+| Case | Mean RPS change |
+|---|---:|
+| 16-c1-close | -0.49% |
+| 16-c1-keepalive | +0.05% |
+| 16-c32-close | +6.72% |
+| 65536-c1-close | -0.42% |
+| 65536-c1-keepalive | -1.02% |
+
+Only 16 B/c32 close shows a material positive signal (+6.72%); 64 KiB/c1 keepalive is about 1% lower. All body/warmup/load checks passed. The expanded source is experimental and uncommitted; full network tests and the reverse-order c32 run are queued/running. No improvement has yet been accepted from this prototype.

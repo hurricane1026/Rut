@@ -1,0 +1,303 @@
+diff --git a/include/rut/runtime/event_loop.h b/include/rut/runtime/event_loop.h
+index ee9ec20b..9343a86f 100644
+--- a/include/rut/runtime/event_loop.h
++++ b/include/rut/runtime/event_loop.h
+@@ -770,7 +770,7 @@ public:
+     // never pay the cost. Returns false if SlicePool is exhausted.
+     bool alloc_upstream_buf(ConnectionBase& c) {
+         if (c.upstream_recv_slice) return true;  // already allocated
+-        u8* s = pool.alloc();
++        u8* s = c.tls_active ? pool.alloc() : pool.alloc_uninitialized();
+         if (!s) return false;
+         c.upstream_recv_slice = s;
+         c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
+@@ -779,7 +779,7 @@ public:
+ 
+     bool alloc_response_header_buf(ConnectionBase& c) {
+         if (c.response_header_slice) return true;
+-        u8* s = pool.alloc();
++        u8* s = c.tls_active ? pool.alloc() : pool.alloc_uninitialized();
+         if (!s) return false;
+         c.response_header_slice = s;
+         c.response_header_buf.bind(s, SlicePool::kSliceSize);
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index dfab16fb..2512a758 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -2678,7 +2678,7 @@ public:
+     // never pay the cost. Returns false if SlicePool is exhausted.
+     bool alloc_upstream_buf(ConnectionBase& c) {
+         if (c.upstream_recv_slice) return true;  // already allocated
+-        u8* s = pool.alloc();
++        u8* s = c.tls_active ? pool.alloc() : pool.alloc_uninitialized();
+         if (!s) return false;
+         c.upstream_recv_slice = s;
+         c.upstream_recv_buf.bind(s, SlicePool::kSliceSize);
+@@ -2687,7 +2687,7 @@ public:
+ 
+     bool alloc_response_header_buf(ConnectionBase& c) {
+         if (c.response_header_slice) return true;
+-        u8* s = pool.alloc();
++        u8* s = c.tls_active ? pool.alloc() : pool.alloc_uninitialized();
+         if (!s) return false;
+         c.response_header_slice = s;
+         c.response_header_buf.bind(s, SlicePool::kSliceSize);
+@@ -2866,8 +2866,13 @@ public:
+ 
+     Connection* alloc_conn_impl() {
+         if (free_top == 0) return nullptr;
+-        u8* rs = pool.alloc();
+-        u8* ss = pool.alloc();
++        // These buffers publish only their bound valid lengths. Include both
++        // in dirty reuse so the shared pool does not merely move proxy buffer
++        // clearing to the following connection's allocation.
++        const bool uninitialized =
++            !tls_server && listener_context.transport == ListenerTransport::Cleartext;
++        u8* rs = uninitialized ? pool.alloc_uninitialized() : pool.alloc();
++        u8* ss = uninitialized ? pool.alloc_uninitialized() : pool.alloc();
+         if (!rs || !ss) {
+             if (rs) pool.free(rs);
+             if (ss) pool.free(ss);
+diff --git a/include/rut/runtime/response_body_chain.h b/include/rut/runtime/response_body_chain.h
+index 93a93418..8f89b3c5 100644
+--- a/include/rut/runtime/response_body_chain.h
++++ b/include/rut/runtime/response_body_chain.h
+@@ -79,7 +79,7 @@ struct ResponseBodyChain {
+             // has proven: once it outgrew `bulk_after` (or this append alone
+             // needs more than one slice), prefer one bulk node over slices.
+             u8* raw = (missing > kPayload || size >= bulk_after) ? pool.alloc_bulk() : nullptr;
+-            if (!raw) raw = pool.alloc();
++            if (!raw) raw = pool.alloc_uninitialized();
+             auto* node = reinterpret_cast<Node*>(raw);
+             if (!node) {
+                 while (first) {
+@@ -178,7 +178,7 @@ struct ResponseBodyChain {
+         if (tail && payload_capacity(pool, tail) > tail->len) return true;
+         if (owner && owner != &pool) return false;
+         u8* raw = size >= bulk_after ? pool.alloc_bulk() : nullptr;
+-        if (!raw) raw = pool.alloc();
++        if (!raw) raw = pool.alloc_uninitialized();
+         auto* node = reinterpret_cast<Node*>(raw);
+         if (!node) return false;
+         node->next = nullptr;
+diff --git a/include/rut/runtime/slice_pool.h b/include/rut/runtime/slice_pool.h
+index 78b81d19..eeb6a298 100644
+--- a/include/rut/runtime/slice_pool.h
++++ b/include/rut/runtime/slice_pool.h
+@@ -79,7 +79,7 @@ struct SlicePool {
+ 
+     u8* base = nullptr;         // mmap'd region: max_count * kSliceSize bytes
+     u32* free_stack = nullptr;  // mmap'd: free slice indices
+-    u8* in_use_map = nullptr;   // mmap'd: 1 byte per slice (0=free, 1=in-use)
++    u8* in_use_map = nullptr;   // bit 0: in use; bit 1: uninitialized lease/dirty free slice
+     u32 free_top = 0;
+     // Cached indices occupy the top cached_count entries of free_stack.
+     // Untouched/discarded indices remain below them, so reuse prefers hot pages.
+@@ -231,14 +231,20 @@ struct SlicePool {
+         return {};
+     }
+ 
+-    // Allocate one 16KB slice. Grows committed region if empty.
+-    // Returns pointer to slice, or nullptr if at max capacity.
+-    u8* alloc() {
++    // Ordinary allocations retain their zero-filled contract, even after an
++    // uninitialized borrower. Only explicit byte buffers may skip clearing.
++    u8* alloc() { return alloc_impl(true); }
++    u8* alloc_uninitialized() { return alloc_impl(false); }
++
++    u8* alloc_impl(bool clear) {
+         if (free_top == 0 && !grow()) return nullptr;
+         u32 idx = free_stack[--free_top];
+         u8* ptr = base + static_cast<u64>(idx) * kSliceSize;
+         if (cached_count != 0) --cached_count;
+-        if (in_use_map) in_use_map[idx] = 1;
++        if (in_use_map) {
++            if (clear && (in_use_map[idx] & 2u)) __builtin_memset(ptr, 0, kSliceSize);
++            in_use_map[idx] = clear ? 1u : 3u;
++        }
+         return ptr;
+     }
+ 
+@@ -287,12 +293,16 @@ struct SlicePool {
+         if (offset % kSliceSize != 0) return;  // not slice-aligned
+         if (free_top >= max_count) return;     // overflow guard
+         u32 idx = static_cast<u32>(offset / kSliceSize);
+-        if (in_use_map && !in_use_map[idx]) return;  // double-free detection
++        if (in_use_map && !(in_use_map[idx] & 1u)) return;  // double-free detection
++        const bool uninitialized = in_use_map && (in_use_map[idx] & 2u);
+         if (in_use_map) in_use_map[idx] = 0;
+         if (cached_count < cache_limit) {
+-            // Preserve zero-filled reuse and clear the previous owner's bytes
+-            // even while the slice is idle, including bytes beyond buffer length.
+-            __builtin_memset(ptr, 0, kSliceSize);
++            // Record dirty bytes so a later ordinary allocation still clears
++            // them. An uninitialized byte-buffer lease can reuse them directly.
++            if (uninitialized)
++                in_use_map[idx] = 2u;
++            else
++                __builtin_memset(ptr, 0, kSliceSize);
+             free_stack[free_top++] = idx;
+             ++cached_count;
+             return;
+diff --git a/tests/test_arena.cc b/tests/test_arena.cc
+index 7e03a93f..1d7f6d21 100644
+--- a/tests/test_arena.cc
++++ b/tests/test_arena.cc
+@@ -1075,3 +1075,77 @@ TEST(response_body_chain, dirty_bulk_append_replaces_metadata_and_bounds_payload
+     CHECK_EQ(pool.bulk_available(), 1u);
+     pool.destroy();
+ }
++
++TEST(slice_pool, uninitialized_reuse_preserves_ordinary_zero_contract) {
++    SlicePool pool;
++    REQUIRE(pool.init(2, 0, 2, 0).has_value());
++    u8* dirty = pool.alloc_uninitialized();
++    REQUIRE(dirty != nullptr);
++    __builtin_memset(dirty, 0xa5, SlicePool::kSliceSize);
++    pool.free(dirty);
++    const u32 available = pool.available();
++    pool.free(dirty);  // dirty-free state is still free, not a live lease
++    CHECK_EQ(pool.available(), available);
++    u8* reused = pool.alloc_uninitialized();
++    REQUIRE(reused == dirty);
++    CHECK_EQ(reused[0], 0xa5u);
++    CHECK_EQ(reused[SlicePool::kSliceSize - 1], 0xa5u);
++    pool.free(reused);
++    u8* clean = pool.alloc();
++    REQUIRE(clean == dirty);
++    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(clean[i], 0u);
++    __builtin_memset(clean, 0x5a, SlicePool::kSliceSize);
++    pool.free(clean);
++    // Ordinary leases still clear on return, even for an uninitialized borrower.
++    reused = pool.alloc_uninitialized();
++    REQUIRE(reused == clean);
++    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(reused[i], 0u);
++    pool.free(reused);
++    pool.destroy();
++}
++
++TEST(slice_pool, uninitialized_discard_returns_clean_storage) {
++    SlicePool pool;
++    REQUIRE(pool.init(1, 0, 0, 0).has_value());
++    u8* dirty = pool.alloc_uninitialized();
++    REQUIRE(dirty != nullptr);
++    __builtin_memset(dirty, 0xa5, SlicePool::kSliceSize);
++    pool.free(dirty);
++    u8* clean = pool.alloc();
++    REQUIRE(clean == dirty);
++    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(clean[i], 0u);
++    pool.free(clean);
++    pool.destroy();
++}
++
++TEST(response_body_chain, dirty_ordinary_recv_publishes_only_committed_bytes) {
++    SlicePool pool;
++    REQUIRE(pool.init(1, 0, 1, 0).has_value());
++    u8* dirty = pool.alloc_uninitialized();
++    REQUIRE(dirty != nullptr);
++    __builtin_memset(dirty, 0xa5, SlicePool::kSliceSize);
++    pool.free(dirty);
++    ResponseBodyChain chain;
++    REQUIRE(chain.reserve_tail(pool));
++    CHECK_EQ(reinterpret_cast<u8*>(chain.head), dirty);
++    CHECK_EQ(chain.head->next, nullptr);
++    CHECK_EQ(chain.head->offset, 0u);
++    CHECK_EQ(chain.front_size(), 0u);
++    CHECK_EQ(chain.write_ptr(pool)[100], 0xa5u);
++    __builtin_memcpy(chain.write_ptr(pool), "abc", 3);
++    chain.commit(3);
++    CHECK_EQ(chain.front_size(), 3u);
++    CHECK_EQ(__builtin_memcmp(chain.data(), "abc", 3), 0);
++    chain.consume(3, true);
++    CHECK_EQ(chain.front_size(), 0u);
++    chain.write_ptr(pool)[0] = 'z';
++    chain.commit(1);
++    CHECK_EQ(chain.front_size(), 1u);
++    CHECK_EQ(chain.data()[0], static_cast<u8>('z'));
++    chain.release();
++    u8* clean = pool.alloc();
++    REQUIRE(clean != nullptr);
++    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) CHECK_EQ(clean[i], 0u);
++    pool.free(clean);
++    pool.destroy();
++}
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index ba70ae71..e06c6eee 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -34866,6 +34866,45 @@ struct ScopedIoUringLoopForRetirement {
+     }
+ };
+ 
++TEST(iouring_byte_buffers, dirty_connection_reuse_resets_valid_lengths) {
++    ScopedIoUringLoopForRetirement guard;
++    if (!guard.init()) SKIP("io_uring unavailable");
++    auto* loop = guard.loop;
++    Connection* first = loop->alloc_conn();
++    REQUIRE(first != nullptr);
++    __builtin_memset(first->recv_slice, 0xa5, SlicePool::kSliceSize);
++    __builtin_memset(first->send_slice, 0xa5, SlicePool::kSliceSize);
++    first->recv_buf.commit(7);
++    first->send_buf.commit(9);
++    loop->free_conn(*first);
++    Connection* next = loop->alloc_conn();
++    REQUIRE(next != nullptr);
++    CHECK_EQ(next->recv_buf.len(), 0u);
++    CHECK_EQ(next->send_buf.len(), 0u);
++    CHECK_EQ(next->recv_slice[100], 0xa5u);
++    CHECK_EQ(next->send_slice[100], 0xa5u);
++    static constexpr u8 request[] = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
++    REQUIRE_EQ(next->recv_buf.write(request, sizeof(request) - 1u), sizeof(request) - 1u);
++    ParsedRequest parsed;
++    HttpParser parser;
++    parser.reset();
++    parsed.reset();
++    CHECK_EQ(parser.parse(next->recv_buf.data(), next->recv_buf.len(), &parsed),
++             ParseStatus::Complete);
++    CHECK_EQ(parser.header_end, sizeof(request) - 1u);
++    CHECK_EQ(parsed.header_count, 1u);
++    loop->free_conn(*next);
++    // A declared TLS listener keeps ordinary zero-filled request/send leases.
++    loop->listener_context.transport = ListenerTransport::Tls;
++    Connection* tls = loop->alloc_conn();
++    REQUIRE(tls != nullptr);
++    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) {
++        CHECK_EQ(tls->recv_slice[i], 0u);
++        CHECK_EQ(tls->send_slice[i], 0u);
++    }
++    loop->free_conn(*tls);
++}
++
+ TEST(iouring_local_body_epoch, close_defers_leave_until_send_slot_reclaims) {
+     ScopedIoUringLoopForRetirement guard;
+     if (!guard.init()) SKIP("io_uring unavailable");
+@@ -38864,8 +38903,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
+     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
+                         : downstream_close ? kCloseRequest
+                                            : kKeepAliveRequest;
+-    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+-                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
++    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
++                                                             : sizeof(kGetKeepAliveRequest) - 1u)
+                             : downstream_close ? sizeof(kCloseRequest) - 1u
+                                                : sizeof(kKeepAliveRequest) - 1u;
+     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
+@@ -61443,15 +61482,15 @@ TEST(response_buffering_runtime, body_slices_remain_owned_until_deferred_send_re
+         loop->free_conn_impl(*conn);
+         if (pending) {
+             CHECK_EQ(loop->free_top, free_before);
+-            CHECK_EQ(loop->pool.in_use_map[index], 1u);
++            CHECK_EQ(loop->pool.in_use_map[index] & 1u, 1u);
+             CHECK_EQ(loop->conns[id].response_body_tail.data(), bytes);
+             CHECK_EQ(memcmp(bytes, body, sizeof(body)), 0);
+             loop->reclaim_pending();
+-            CHECK_EQ(loop->pool.in_use_map[index], 1u);
++            CHECK_EQ(loop->pool.in_use_map[index] & 1u, 1u);
+             loop->conns[id].pending_ops = 0;
+             loop->reclaim_pending();
+         }
+-        CHECK_EQ(loop->pool.in_use_map[index], 0u);
++        CHECK_EQ(loop->pool.in_use_map[index] & 1u, 0u);
+         CHECK_EQ(loop->conns[id].response_body_tail.size, 0u);
+         CHECK_EQ(loop->free_top, free_before + 1u);
+         loop->reclaim_pending();

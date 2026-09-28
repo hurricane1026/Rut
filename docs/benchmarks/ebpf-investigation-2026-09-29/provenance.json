@@ -98,6 +98,10 @@
     "ebpf-tools/rut-small-uninit": {
       "sha256": "891496dfaa900615da634a75628a9b75e4e6c1aec2af341fab8f8314d347b311",
       "size": 19127184
+    },
+    "ebpf-tools/rut-connection-uninit": {
+      "sha256": "ada2683eb139733fd07da12688489e47d3c204bfc6035be4f393fcb15c8fa0a5",
+      "size": 19127184
     }
   },
   "bulk_first_commit": "83e5d8a1",
