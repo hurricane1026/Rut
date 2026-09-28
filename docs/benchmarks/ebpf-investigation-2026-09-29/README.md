@@ -373,3 +373,16 @@ pinning the matrix driver to CPU 6 hid CPUs 2–5 from its available-CPU check.
 The corrected r2 leaves driver affinity unrestricted while retaining the
 harness's explicit server/origin/client pinning and per-sample host guards.
 Results are pending; no matrix pass is claimed.
+
+The in-progress quick matrix exposed a larger static gap: HTTP 1 MiB
+static-keepalive ratios were 0.813/0.826/0.842 at c1/32/128. Rut server CPU
+was about 23/34/34%, versus nginx 43/41/38%. This single-repeat diagnostic
+does not establish a CPU-copy bottleneck or a stable regression; server
+underutilization makes send/wait behavior worth tracing as well. Small 16 B
+proxy-close ratios were about 0.99–1.06. Separate eBPF comparisons for these
+small proxy cells and large static keepalive cells are queued after the matrix.
+
+The HTTP 1 MiB proxy-close group was rejected by a newly observed clang++
+process at the host guard, before Rut's load. Its three coordinates remain
+invalid and need a fresh run; the successful nginx-only partials are not a
+comparison. This interruption is preserved in the matrix evidence.
