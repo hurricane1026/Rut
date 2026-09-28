@@ -1,0 +1,273 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 17K of event 'cycles:u'
+# Event count (approx.): 13497442074
+#
+# Children      Self  Command          Shared Object               Symbol                                                                                                                                                                                                                                                                                                                                                                      
+# ........  ........  ...............  ..........................  ............................................................................................................................................................................................................................................................................................................................................................................
+#
+     6.51%     4.74%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+            |
+            ---rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+               |          
+               |--0.85%--__memmove_avx_unaligned_erms
+               |          
+                --0.78%--syscall
+
+     5.22%     5.22%  rut-large-file-  rut-large-file-header-push  [.] rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)
+            |          
+             --4.98%--rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)
+
+     3.90%     3.90%  rut-large-file-  rut-large-file-header-push  [.] rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)
+            |
+            ---rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)
+
+     3.29%     0.00%  rut-large-file-  [unknown]                   [.] 0xffffffffffffffff
+            |
+            ---0xffffffffffffffff
+
+     3.12%     0.00%  rut-large-file-  [unknown]                   [.] 0x0000000003ffffff
+            |
+            ---0x3ffffff
+               |          
+                --0.84%--void rut::on_upstream_response<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+
+     2.87%     2.43%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+            |
+            ---rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+
+     2.86%     2.86%  rut-large-file-  rut-large-file-header-push  [.] rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)
+            |          
+             --2.59%--rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)
+
+     2.85%     2.85%  rut-large-file-  rut-large-file-header-push  [.] rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const
+            |          
+             --2.51%--rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const
+
+     2.79%     2.79%  rut-large-file-  rut-large-file-header-push  [.] rut::simd::scan_header_value(unsigned char const*, unsigned int, unsigned int)
+            |
+            ---rut::simd::scan_header_value(unsigned char const*, unsigned int, unsigned int)
+
+     2.74%     0.00%  rut-large-file-  libc.so.6                   [.] __clock_gettime (inlined)
+            |
+            ---__clock_gettime (inlined)
+               |          
+                --0.88%--0x7fdd15181932
+
+     2.71%     2.71%  rut-large-file-  rut-large-file-header-push  [.] rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)
+            |
+            ---rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)
+
+     2.62%     2.37%  rut-large-file-  rut-large-file-header-push  [.] void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
+            |          
+             --2.42%--void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
+
+     2.62%     2.62%  rut-large-file-  libc.so.6                   [.] __memcmp_avx2_movbe
+            |          
+            |--0.68%--rut::RouteConfig::has_exact_strict_local_response_inventory() const
+            |          __memcmp_avx2_movbe
+            |          
+            |--0.66%--rut::response_read_deadline_combined_send_frame_is_stable(rut::ConnectionBase const&)
+            |          __memcmp_avx2_movbe
+            |          
+             --0.53%--rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+                       __memcmp_avx2_movbe
+
+     2.50%     1.93%  rut-large-file-  rut-large-file-header-push  [.] rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+            |
+            ---rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+               |          
+                --0.53%--__memcmp_avx2_movbe
+
+     2.47%     2.47%  rut-large-file-  rut-large-file-header-push  [.] rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)
+            |          
+             --2.32%--rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)
+
+     2.46%     2.46%  rut-large-file-  rut-large-file-header-push  [.] rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)
+            |
+            ---rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)
+
+     2.45%     2.45%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
+            |
+            ---rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
+
+     2.44%     2.28%  rut-large-file-  rut-large-file-header-push  [.] rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)
+            |
+            ---rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)
+
+     2.44%     0.67%  rut-large-file-  rut-large-file-header-push  [.] rut::monotonic_us()
+            |          
+             --2.34%--rut::monotonic_us()
+                       |          
+                        --1.62%--__clock_gettime (inlined)
+
+     2.29%     1.90%  rut-large-file-  rut-large-file-header-push  [.] rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)
+            |
+            ---rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)
+
+     2.23%     2.23%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)
+            |
+            ---rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)
+
+     1.79%     1.79%  rut-large-file-  libc.so.6                   [.] __memmove_avx_unaligned_erms
+            |          
+             --0.85%--rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+                       __memmove_avx_unaligned_erms
+
+     1.74%     0.73%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringEventLoop::start_complete_content_length_send(rut::ConnectionBase&, rut::IoUringEventLoop::CompleteContentLengthTerminalDisposition, rut::IoUringEventLoop::ResponseReadBatchOwner const*, bool)
+            |
+            ---rut::IoUringEventLoop::start_complete_content_length_send(rut::ConnectionBase&, rut::IoUringEventLoop::CompleteContentLengthTerminalDisposition, rut::IoUringEventLoop::ResponseReadBatchOwner const*, bool)
+               |          
+                --0.85%--__close
+                          |          
+                           --0.60%--__syscall_cancel
+
+     1.39%     1.19%  rut-large-file-  rut-large-file-header-push  [.] void rut::on_header_received<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+            |          
+             --0.98%--void rut::on_header_received<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+
+     1.38%     1.38%  rut-large-file-  rut-large-file-header-push  [.] rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)
+            |
+            ---rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)
+
+     1.32%     0.22%  rut-large-file-  rut-large-file-header-push  [.] rut::strict_response_date(char*, unsigned long)
+            |
+            ---rut::strict_response_date(char*, unsigned long)
+               |          
+                --0.87%--__tz_convert
+
+     1.28%     0.21%  rut-large-file-  rut-large-file-header-push  [.] rut::build_strict_response_headers(rut::ConnectionBase&, rut::RouteConfig const&, rut::ParsedResponse const&, rut::Http1PrebuiltResponsePurpose)::{lambda(char const*)#1}::operator()(char const*) const
+            |
+            ---rut::build_strict_response_headers(rut::ConnectionBase&, rut::RouteConfig const&, rut::ParsedResponse const&, rut::Http1PrebuiltResponsePurpose)::{lambda(char const*)#1}::operator()(char const*) const
+               |          
+                --0.83%--__strlen_avx2
+
+     1.14%     0.83%  rut-large-file-  rut-large-file-header-push  [.] rut::RouteConfig::strict_local_response_table_is_valid() const
+            |
+            ---rut::RouteConfig::strict_local_response_table_is_valid() const
+
+     1.13%     0.08%  rut-large-file-  rut-large-file-header-push  [.] rut::monotonic_ns()
+            |
+            ---rut::monotonic_ns()
+               |          
+                --1.02%--__clock_gettime (inlined)
+
+     1.13%     1.13%  rut-large-file-  libc.so.6                   [.] clock_gettime@@GLIBC_2.17
+            |          
+             --0.62%--rut::monotonic_us()
+                       __clock_gettime (inlined)
+
+     1.12%     0.98%  rut-large-file-  rut-large-file-header-push  [.] rut::build_strict_response_headers(rut::ConnectionBase&, rut::RouteConfig const&, rut::ParsedResponse const&, rut::Http1PrebuiltResponsePurpose)
+            |          
+             --0.81%--rut::build_strict_response_headers(rut::ConnectionBase&, rut::RouteConfig const&, rut::ParsedResponse const&, rut::Http1PrebuiltResponsePurpose)
+
+     1.06%     0.35%  rut-large-file-  rut-large-file-header-push  [.] rut::response_read_deadline_combined_send_frame_is_stable(rut::ConnectionBase const&)
+            |
+            ---rut::response_read_deadline_combined_send_frame_is_stable(rut::ConnectionBase const&)
+               |          
+                --0.66%--__memcmp_avx2_movbe
+
+     1.02%     1.02%  rut-large-file-  libc.so.6                   [.] __memset_avx2_unaligned_erms
+     1.01%     1.01%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringEventLoop::settle_response_read_deadline_batch()
+            |          
+             --0.66%--rut::IoUringEventLoop::settle_response_read_deadline_batch()
+
+     0.97%     0.97%  rut-large-file-  rut-large-file-header-push  [.] rut::RouteConfig::timeout_failure_policy_id_is_valid(unsigned short) const
+            |          
+             --0.91%--rut::RouteConfig::timeout_failure_policy_id_is_valid(unsigned short) const
+
+     0.96%     0.96%  rut-large-file-  rut-large-file-header-push  [.] rut::strict_local_response_policy_profile(rut::StrictLocalResponsePolicySpec const&)
+            |
+            ---rut::strict_local_response_policy_profile(rut::StrictLocalResponsePolicySpec const&)
+
+     0.96%     0.96%  rut-large-file-  rut-large-file-header-push  [.] rut::classify_complete_content_length_response(rut::ParsedResponse const&)
+            |          
+             --0.81%--rut::classify_complete_content_length_response(rut::ParsedResponse const&)
+
+     0.90%     0.59%  rut-large-file-  rut-large-file-header-push  [.] void rut::on_upstream_response<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+            |          
+             --0.53%--0x3ffffff
+                       void rut::on_upstream_response<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+
+     0.88%     0.88%  rut-large-file-  [vdso]                      [.] 0x0000000000000932
+     0.88%     0.00%  rut-large-file-  [vdso]                      [.] 0x00007fdd15181932
+            |
+            ---0x7fdd15181932
+
+     0.88%     0.88%  rut-large-file-  rut-large-file-header-push  [.] rut::capture_request_metadata(rut::ConnectionBase&)
+            |
+            ---rut::capture_request_metadata(rut::ConnectionBase&)
+
+     0.87%     0.87%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringEventLoop::poll_command()
+            |
+            ---rut::IoUringEventLoop::poll_command()
+
+     0.87%     0.53%  rut-large-file-  libc.so.6                   [.] __tz_convert
+            |          
+             --0.53%--rut::strict_response_date(char*, unsigned long)
+                       __tz_convert
+
+     0.85%     0.24%  rut-large-file-  libc.so.6                   [.] __close
+            |          
+             --0.61%--__close
+                       __syscall_cancel
+
+     0.83%     0.83%  rut-large-file-  rut-large-file-header-push  [.] rut::response_policy_name_eq(rut::Str, char const*, unsigned int)
+            |
+            ---rut::response_policy_name_eq(rut::Str, char const*, unsigned int)
+
+     0.83%     0.83%  rut-large-file-  libc.so.6                   [.] __strlen_avx2
+            |
+            ---rut::build_strict_response_headers(rut::ConnectionBase&, rut::RouteConfig const&, rut::ParsedResponse const&, rut::Http1PrebuiltResponsePurpose)::{lambda(char const*)#1}::operator()(char const*) const
+               __strlen_avx2
+
+     0.82%     0.39%  rut-large-file-  rut-large-file-header-push  [.] rut::bodyless_get_keep_alive_precise_arm_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, rut::RouteConfig const*, unsigned short, rut::ResponseReadDeadlineOwnerPhase, void (*)(void*, rut::ConnectionBase&, rut::IoEvent))
+            |
+            ---rut::bodyless_get_keep_alive_precise_arm_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, rut::RouteConfig const*, unsigned short, rut::ResponseReadDeadlineOwnerPhase, void (*)(void*, rut::ConnectionBase&, rut::IoEvent))
+
+     0.78%     0.57%  rut-large-file-  libc.so.6                   [.] syscall
+            |          
+             --0.57%--rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+                       syscall
+
+     0.75%     0.06%  rut-large-file-  rut-large-file-header-push  [.] rut::RouteConfig::has_exact_strict_local_response_inventory() const
+            |
+            ---rut::RouteConfig::has_exact_strict_local_response_inventory() const
+               |          
+                --0.68%--__memcmp_avx2_movbe
+
+     0.72%     0.72%  rut-large-file-  rut-large-file-header-push  [.] rut::classify_response_read_deadline_profile(rut::ConnectionBase const&, rut::ForwardResponsePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardResponseBufferingMode, unsigned short)
+            |
+            ---rut::classify_response_read_deadline_profile(rut::ConnectionBase const&, rut::ForwardResponsePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardResponseBufferingMode, unsigned short)
+
+     0.67%     0.67%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringEventLoop::response_read_deadline_identity_is_stable(rut::ConnectionBase const&) const
+            |
+            ---rut::IoUringEventLoop::response_read_deadline_identity_is_stable(rut::ConnectionBase const&) const
+
+     0.63%     0.63%  rut-large-file-  rut-large-file-header-push  [.] rut::IoUringEventLoop::run()
+            |
+            ---rut::IoUringEventLoop::run()
+
+     0.62%     0.14%  rut-large-file-  libc.so.6                   [.] __syscall_cancel
+     0.60%     0.60%  rut-large-file-  rut-large-file-header-push  [.] rut::complete_content_length_pinned_header_is_stable(rut::ConnectionBase const&)
+            |
+            ---rut::complete_content_length_pinned_header_is_stable(rut::ConnectionBase const&)
+
+     0.59%     0.59%  rut-large-file-  rut-large-file-header-push  [.] bool rut::prepare_response_read_deadline_preflight_for_mode<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::RouteEntry const*, rut::RouteConfig const*, rut::ForwardPreflightMode)
+            |
+            ---bool rut::prepare_response_read_deadline_preflight_for_mode<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::RouteEntry const*, rut::RouteConfig const*, rut::ForwardPreflightMode)
+
+     0.57%     0.38%  rut-large-file-  rut-large-file-header-push  [.] rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)::{lambda(unsigned char const*, unsigned int)#1}::operator()(unsigned char const*, unsigned int) const
+            |
+            ---rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)::{lambda(unsigned char const*, unsigned int)#1}::operator()(unsigned char const*, unsigned int) const
+
+     0.54%     0.54%  rut-large-file-  rut-large-file-header-push  [.] rut::response_read_deadline_route_method_matches(unsigned char, unsigned char)
+     0.51%     0.45%  rut-large-file-  libc.so.6                   [.] __internal_syscall_cancel
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

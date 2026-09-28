@@ -521,3 +521,21 @@ The nonblocking prefix send dispatched a complete write immediately under the ex
 | 1m-c32-keepalive | -3.35% |
 
 All body/warmup/load checks passed, but concurrent keepalive regressed and other changes were negligible relative to variation. The candidate is reverted; it did not receive the full network suite and is not retained runtime code. This does not support removing the header completion wait as a throughput optimization.
+
+## Small proxy userspace attribution
+
+The existing eBPF small-response trace puts the receive-copy helpers below 1 us/request while Rut spends more time in userspace. A complementary `perf record -e cycles:u -F 997 --call-graph dwarf,8192` sample of the accepted large-file-header-push binary covers 16 B proxy c1 close and keepalive (20 s load each). Body preflight, warmup/load error checks and host guards passed; no lost samples were reported. This is diagnostic data, not acceptance throughput.
+
+For close, memset accounts for 7.74% of sampled user cycles, with 6.63% directly attributed to `SlicePool::free`. For keepalive, total memset falls to 1.02%. The 8 KiB captured stacks do not establish complete root-to-leaf call chains through the large runtime frames. Ordinary slices still zero on return; bulk slices alone currently skip clearing. This provides a new scoped hypothesis: allow explicit byte-buffer leases to reuse dirty ordinary slices while keeping ordinary allocation zero-filled. The prototype and poisoned-storage tests are pending validation.
+
+The first scoped ordinary-slice prototype changes only plaintext upstream/header byte buffers and response body chain nodes; connection request/send buffers still use ordinary cleared allocations. Its two-sample alternating diagnostic results against the accepted header-push binary are:
+
+| Case | Mean RPS change |
+|---|---:|
+| 16-c1-close | +0.22% |
+| 16-c1-keepalive | -0.00% |
+| 16-c32-close | -0.42% |
+| 65536-c1-close | +0.42% |
+| 65536-c1-keepalive | +0.05% |
+
+All preflight and warmup/load checks pass, but none of these changes establish a gain. The pool is shared: connection teardown pushes dirty upstream/header buffers after the ordinary request/send buffers, so the following connection can clear them during its ordinary allocations. This is a source-level explanation to test, not a measured allocation census. The next experiment will include the plaintext connection request/send byte buffers and preserve zero-filled allocation for other callers.

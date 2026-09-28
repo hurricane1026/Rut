@@ -1,0 +1,50 @@
+[
+  {
+    "case": "16-c1-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-large-file-header-push",
+    "requests": 149879,
+    "seconds": 20.099363,
+    "rps": 7456.902987423035,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 145612800,
+    "user_us_per_request": 13.54425903562207,
+    "system_us_per_request": 54.51063858178931,
+    "minor_faults_per_request": 0.0,
+    "runqueue_us_per_request": 0.19952331547448274,
+    "voluntary_per_request": 2.0181346286004045,
+    "involuntary_per_request": 0.013590963377124213
+  },
+  {
+    "case": "16-c1-keepalive",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-large-file-header-push",
+    "requests": 210029,
+    "seconds": 20.099535,
+    "rps": 10449.445721007974,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 145682432,
+    "user_us_per_request": 10.427131491365477,
+    "system_us_per_request": 44.75572420951392,
+    "minor_faults_per_request": 0.0,
+    "runqueue_us_per_request": 0.09698562579453314,
+    "voluntary_per_request": 1.9996381452085188,
+    "involuntary_per_request": 0.00851787134157664
+  }
+]
