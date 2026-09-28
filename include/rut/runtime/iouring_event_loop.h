@@ -3221,7 +3221,17 @@ public:
         }
         // The completion SQE is reserved first: once written, the bytes and
         // FIN cannot be withdrawn, so the send must stay accountable.
-        if (!deadline_send && final_local_response_send(c, buf, len) && backend.sq_has_room()) {
+        const bool final_combined_proxy_send =
+            deadline_send && phase == ResponseReadDeadlinePostCommitPhase::CombinedSend &&
+            backend.nop_inject_result && !c.tls_active && !c.keep_alive && c.fd >= 0 &&
+            !c.send_armed && c.send_progress == 0 && len > 0 && len <= 4096 && c.upstream_fd < 0 &&
+            c.throttle_down_bps == 0 &&
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            c.on_send == &on_complete_response_sent<Self> && buf == c.response_header_buf.data() &&
+            response_read_deadline_combined_send_frame_is_stable(c);
+        if (((!deadline_send && final_local_response_send(c, buf, len)) ||
+             final_combined_proxy_send) &&
+            backend.sq_has_room()) {
             // The last response on a closing plaintext connection: write it
             // directly and end the stream at once, as nginx does, so the FIN
             // follows the data before the client can close first.
@@ -3233,7 +3243,8 @@ public:
                         c.fd, c.id, buf, len, written, generation)) {
                     c.pending_ops++;
                     c.send_armed = true;
-                    c.direct_write_completion_pending = true;
+                    c.direct_write_completion_pending =
+                        !final_combined_proxy_send || written == len;
                     return true;
                 }
                 return false;
@@ -4149,6 +4160,27 @@ public:
         return static_cast<u16>(++response_read_batch_owner_count);
     }
 
+    bool final_combined_write_awaits_completion(const Connection& c) const {
+        if (!c.direct_write_completion_pending || !c.send_armed || c.pending_ops == 0 ||
+            c.keep_alive || c.tls_active || c.upstream_fd >= 0 || c.id >= connection_capacity ||
+            !c.response_read_deadline_send_owner_active ||
+            c.on_send != &on_complete_response_sent<Self> ||
+            c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            c.response_read_deadline_send_len > 4096 ||
+            !response_read_deadline_combined_send_frame_is_stable(c))
+            return false;
+        const auto& send = backend.send_state[c.id];
+        const u32 len = c.response_read_deadline_send_len;
+        // The full direct write queues a result-injected NOP. Before wait()
+        // consumes it the whole length remains; afterward the whole length
+        // is credited. No partial write is eligible for this EOF deferral.
+        return send.src == c.response_read_deadline_send_src && send.fd == c.fd &&
+               send.type == IoEventType::Send &&
+               send.generation == c.response_read_deadline_send_owner_generation &&
+               ((send.offset == 0 && send.remaining == len) ||
+                (send.offset == len && send.remaining == 0));
+    }
+
     void prepare_response_read_deadline_batch(const IoEvent* events, u32 count) {
         response_read_batch_events = events;
         response_read_batch_owner_count = 0;
@@ -4166,7 +4198,11 @@ public:
             const Connection& c = conns[ev.conn_id];
             const bool current_upstream =
                 ev.type == IoEventType::UpstreamRecv && ev.upstream_episode == c.upstream_episode;
-            const bool downstream_terminal = ev.type == IoEventType::Recv && ev.result <= 0;
+            const bool completed_write_terminal = ev.type == IoEventType::Recv && ev.result <= 0 &&
+                                                  !ev.more && ev.aux == 0 &&
+                                                  final_combined_write_awaits_completion(c);
+            const bool downstream_terminal =
+                ev.type == IoEventType::Recv && ev.result <= 0 && !completed_write_terminal;
             if (current_upstream || downstream_terminal)
                 (void)find_or_add_response_read_batch_owner(ev.conn_id);
             if (ev.type == IoEventType::ResponseReadTimer)
@@ -4204,7 +4240,9 @@ public:
                 continue;
             }
             if (ev.type == IoEventType::Recv && ev.result <= 0) {
-                owner.valid = false;
+                if (ev.more || ev.aux != 0 ||
+                    !final_combined_write_awaits_completion(conns[ev.conn_id]))
+                    owner.valid = false;
                 continue;
             }
             if (ev.type != IoEventType::UpstreamRecv ||

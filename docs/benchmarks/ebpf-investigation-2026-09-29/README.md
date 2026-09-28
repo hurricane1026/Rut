@@ -952,3 +952,11 @@ Both causal orders and the full 1425-test network regression support retaining t
 ## Corrected FIN current user-cycle profile: small proxy close
 
 The 20-second HTTP 16-byte c1 close profile has 16,964 cycles:u samples with zero lost samples and clean warm/load errors. Self shares: io_uring wait 5.59%, response parser 4.36%, coalesced GET phase-1 proof 3.56%, header-name scan 2.99%, policy-bundle validity 2.71%, and memset 1.07%. These percentages describe sampled userspace cycles, not total request latency or a direct nginx comparison. Some DWARF call stacks are incomplete/unknown; use self attribution and do not infer reliable complete call chains. Raw perf.data remains in the lab directory; textual reports and collector/workload logs are retained here. Keepalive profiling and kernel shutdown-cost comparison are still running/queued.
+
+The matching keepalive user-cycle capture has also completed with exact-body and clean warm/load checks. io_uring wait self share is 5.18% and response-parser self share is 5.11%. Its instrumented throughput is diagnostic only. The two workload reports and metrics are archived; the same incomplete-call-stack limitation applies.
+
+## Front TCP shutdown cost and FIN retention
+
+All four shutdown traces are usable with clean warm/load checks. nginx records no front tcp_shutdown calls (its ordinary close path sends FIN). Corrected Rut records 89,275 calls / 61,635 front sends at c1, and 134,702 / 134,684 at c32. Total inclusive tcp_shutdown time is 196,793,000 ns and 421,026,106 ns, respectively. This is a kernel-function measurement, not total shutdown syscall overhead; calls returning before tcp_shutdown are invisible. The excess c1 calls warrant a separate guarded experiment, but do not explain all remaining latency.
+
+Formatting now passes for the two changed runtime/test files, with whitespace-only adjustments after the tested binary was frozen. Retain the corrected CombinedSend early-FIN implementation and lifecycle test based on both causal orders, full network regression, and the formal 12-cell comparison. Remaining 96-cell target failures remain open.

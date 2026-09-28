@@ -1,5 +1,5 @@
 diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
-index 2512a758..b564599c 100644
+index 2512a758..e5d2680c 100644
 --- a/include/rut/runtime/iouring_event_loop.h
 +++ b/include/rut/runtime/iouring_event_loop.h
 @@ -3221,7 +3221,17 @@ public:
@@ -64,9 +64,9 @@ index 2512a758..b564599c 100644
              const bool current_upstream =
                  ev.type == IoEventType::UpstreamRecv && ev.upstream_episode == c.upstream_episode;
 -            const bool downstream_terminal = ev.type == IoEventType::Recv && ev.result <= 0;
-+            const bool completed_write_terminal =
-+                ev.type == IoEventType::Recv && ev.result <= 0 && !ev.more && ev.aux == 0 &&
-+                final_combined_write_awaits_completion(c);
++            const bool completed_write_terminal = ev.type == IoEventType::Recv && ev.result <= 0 &&
++                                                  !ev.more && ev.aux == 0 &&
++                                                  final_combined_write_awaits_completion(c);
 +            const bool downstream_terminal =
 +                ev.type == IoEventType::Recv && ev.result <= 0 && !completed_write_terminal;
              if (current_upstream || downstream_terminal)
