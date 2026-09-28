@@ -2180,7 +2180,7 @@ TEST(RirVerifier, NoContent204PublicAndInternalVerificationRequireExactTuple) {
     forged.reserved0 = 1;
     rejects(forged);
     forged = policy;
-    forged.reserved1 = 1;
+    forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
     rejects(forged);
 
     auto bad_id = module_with(policy);
@@ -2267,6 +2267,212 @@ TEST(RirPrinter, StrictLocalResponseForgedMetadataPrintsOneSafeMarker) {
     empty_forgery = std::make_unique<Module>();
     empty_forgery->pre_route_policy_ids[kRouteMethodTrace] = 0xffffu;
     check_marker(*empty_forgery);
+}
+
+// Codex round-3 review: a synthesized policy and an Envoy-layout policy with
+// otherwise identical values must produce distinguishable RIR output, since
+// they generate different header casing, ordering, and connection headers at
+// runtime (build_strict_local_response_bytes,
+// include/rut/runtime/callbacks_impl.h).
+TEST(RirPrinter, StrictLocalResponsePrintsHeaderOrder) {
+    static constexpr char kReason[] = "Bad Request";
+    static constexpr char kType[] = "text/plain";
+    static constexpr char kServer[] = "rut";
+    static constexpr char kBody[] = "x";
+    StrictLocalResponsePolicySpec policy{};
+    policy.version = StrictLocalResponseVersion::Http11;
+    policy.status_code = 400;
+    policy.date = StrictLocalResponseDate::Current;
+    policy.connection = StrictLocalResponseConnection::Request;
+    policy.head_mode = StrictLocalResponseHeadMode::Reject;
+    policy.reason = {kReason, sizeof(kReason) - 1};
+    policy.content_type = {kType, sizeof(kType) - 1};
+    policy.server = {kServer, sizeof(kServer) - 1};
+    policy.body = {kBody, sizeof(kBody) - 1};
+
+    Module mod{};
+    mod.strict_local_response_policies[0] = policy;
+    mod.strict_local_response_policies[0].header_order =
+        StrictLocalResponseHeaderOrder::Synthesized;
+    mod.strict_local_response_policies[1] = policy;
+    mod.strict_local_response_policies[1].header_order =
+        StrictLocalResponseHeaderOrder::LengthTypeDateServer;
+    mod.strict_local_response_policy_count = 2;
+    mod.unmatched_policy_ids[kRouteMethodGet] = 1;
+    mod.unmatched_policy_ids[kRouteMethodPost] = 2;
+    REQUIRE(verify_module(mod).ok);
+
+    char data[1024];
+    PrintBuf buf;
+    buf.init(data, sizeof(data), -1);
+    print_module(buf, mod);
+    CHECK_FALSE(buf.overflow);
+    const Str output{buf.data, buf.len};
+
+    auto contains = [&](const char* needle) {
+        const Str expected = lit(needle);
+        for (u32 i = 0; i + expected.len <= output.len; i++) {
+            if (output.slice(i, i + expected.len).eq(expected)) return true;
+        }
+        return false;
+    };
+    CHECK(
+        contains("local_response#1: version=HTTP/1.1, status=400, reason=\"Bad Request\", "
+                 "server=\"rut\", content_type=\"text/plain\", date=current, "
+                 "connection=request, head_mode=reject, header_order=synthesized"));
+    CHECK(
+        contains("local_response#2: version=HTTP/1.1, status=400, reason=\"Bad Request\", "
+                 "server=\"rut\", content_type=\"text/plain\", date=current, "
+                 "connection=request, head_mode=reject, header_order=length_type_date_server"));
+}
+
+// Codex round-4 review: prepare_response_read_deadline_preflight_for_mode
+// (include/rut/runtime/callbacks_impl.h) hard-requires the default failure
+// policy's status to be 502 and closes the downstream connection on
+// mismatch, so a policy bundle pairing the Envoy 503/length_type_date_server
+// failure policy with a nonzero response_read_timeout_seconds must never
+// verify -- the three-layer guard from the round-3 review (analyze.cc,
+// compile_to_config.h, route_table.h) already rejects this combination, but
+// verify_module (the fourth layer a hand-built or non-analyze-produced RIR
+// module goes through) did not, so a module could verify and even codegen
+// successfully only to be refused later by populate_verified_route_config.
+TEST(RirVerifier, PolicyBundleRejects503LengthTypeDateServerWithResponseReadTimeout) {
+    ForwardFailurePolicySpec failure_503{};
+    failure_503.version = ForwardFailurePolicyVersion::Http11;
+    failure_503.status_code = 503;
+    failure_503.date = ForwardFailurePolicyDate::Current;
+    failure_503.connection = ForwardFailurePolicyConnection::Request;
+    failure_503.head_mode = FailurePolicyHeadMode::Reject;
+    failure_503.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure_503.reason = {"Service Unavailable", 19};
+    failure_503.content_type = {"text/plain", 10};
+    failure_503.server = {"envoy", 5};
+    failure_503.body = {"connect failure", 15};
+
+    auto module_with = [&](u8 response_read_timeout_seconds) {
+        Module mod{};
+        mod.failure_policies[0] = failure_503;
+        mod.failure_policy_count = 1;
+        mod.policy_bundles[0] = {
+            0, 1, 0, response_read_timeout_seconds, ForwardResponseBufferingMode::None};
+        mod.policy_bundle_count = 1;
+        return mod;
+    };
+
+    // Ordinary connect-failure-only usage (no read timeout) is unaffected --
+    // this is the feature the 503 layout exists for.
+    REQUIRE(verify_module(module_with(0)).ok);
+
+    // The offending combination must fail verification with the same
+    // InvalidForwardPreflight diagnostic the other three layers use.
+    const auto verified = verify_module(module_with(5));
+    CHECK_FALSE(verified.ok);
+    CHECK_EQ(verified.issue.code, VerifyIssueCode::InvalidForwardPreflight);
+}
+
+// Codex round-11 review: the failure-policy printer covered only head_mode,
+// so a synthesized 502 and a LengthTypeDateServer 503 with the same
+// head_mode printed identical RIR even though they serialize different
+// statuses, casing, ordering, and bodies at runtime
+// (build_bounded_local_response_bytes, include/rut/runtime/callbacks_impl.h).
+TEST(RirPrinter, FailurePolicyPrintsHeaderOrder) {
+    ForwardFailurePolicySpec failure_502{};
+    failure_502.version = ForwardFailurePolicyVersion::Http11;
+    failure_502.status_code = 502;
+    failure_502.date = ForwardFailurePolicyDate::Current;
+    failure_502.connection = ForwardFailurePolicyConnection::Request;
+    failure_502.head_mode = FailurePolicyHeadMode::Reject;
+    failure_502.header_order = FailurePolicyHeaderOrder::Synthesized;
+    failure_502.reason = {"Bad Gateway", 11};
+    failure_502.content_type = {"text/plain", 10};
+    failure_502.server = {"rut", 3};
+    failure_502.body = {"upstream error", 14};
+
+    ForwardFailurePolicySpec failure_503{};
+    failure_503.version = ForwardFailurePolicyVersion::Http11;
+    failure_503.status_code = 503;
+    failure_503.date = ForwardFailurePolicyDate::Current;
+    failure_503.connection = ForwardFailurePolicyConnection::Request;
+    failure_503.head_mode = FailurePolicyHeadMode::Reject;
+    failure_503.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure_503.reason = {"Service Unavailable", 19};
+    failure_503.content_type = {"text/plain", 10};
+    failure_503.server = {"envoy", 5};
+    failure_503.body = {"connect failure", 15};
+
+    Module mod{};
+    mod.failure_policies[0] = failure_502;
+    mod.failure_policies[1] = failure_503;
+    mod.failure_policy_count = 2;
+    mod.policy_bundles[0] = {0, 1, 0, 0, ForwardResponseBufferingMode::None};
+    mod.policy_bundles[1] = {0, 2, 0, 0, ForwardResponseBufferingMode::None};
+    mod.policy_bundle_count = 2;
+    REQUIRE(verify_module(mod).ok);
+
+    char data[1024];
+    PrintBuf buf;
+    buf.init(data, sizeof(data), -1);
+    print_module(buf, mod);
+    CHECK_FALSE(buf.overflow);
+    const Str output{buf.data, buf.len};
+
+    auto contains = [&](const char* needle) {
+        const Str expected = lit(needle);
+        for (u32 i = 0; i + expected.len <= output.len; i++) {
+            if (output.slice(i, i + expected.len).eq(expected)) return true;
+        }
+        return false;
+    };
+    CHECK(
+        contains("failure_policy#1: version=HTTP/1.1, status=502, reason=\"Bad Gateway\", "
+                 "server=\"rut\", content_type=\"text/plain\", date=current, "
+                 "connection=request, head_mode=reject, header_order=synthesized"));
+    CHECK(
+        contains("failure_policy#2: version=HTTP/1.1, status=503, reason=\"Service Unavailable\", "
+                 "server=\"envoy\", content_type=\"text/plain\", date=current, "
+                 "connection=request, head_mode=reject, header_order=length_type_date_server"));
+}
+
+// Codex round-13 review: a hand-built or verifier-rejected module can carry a
+// forged failure-policy table (an out-of-range count, or a non-owning string
+// view like `reason = {nullptr, 1}`); print_module must never dereference
+// those views, and instead prints one safe `<invalid>` marker, mirroring
+// StrictLocalResponseForgedMetadataPrintsOneSafeMarker above.
+TEST(RirPrinter, FailurePolicyForgedMetadataPrintsOneSafeMarker) {
+    ForwardFailurePolicySpec policy{};
+    policy.version = ForwardFailurePolicyVersion::Http11;
+    policy.status_code = 502;
+    policy.date = ForwardFailurePolicyDate::Current;
+    policy.connection = ForwardFailurePolicyConnection::Request;
+    policy.head_mode = FailurePolicyHeadMode::Reject;
+    policy.header_order = FailurePolicyHeaderOrder::Synthesized;
+    policy.reason = {"Bad Gateway", 11};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"upstream error", 14};
+
+    auto check_marker = [&](const Module& mod) {
+        char data[256];
+        PrintBuf buf;
+        buf.init(data, sizeof(data), -1);
+        print_module(buf, mod);
+        CHECK_FALSE(buf.overflow);
+        const Str printed{buf.data, buf.len};
+        CHECK(printed.eq(lit("failure_policy_table: <invalid>\n")));
+    };
+    auto valid_module = [&]() {
+        Module mod{};
+        mod.failure_policies[0] = policy;
+        mod.failure_policy_count = 1;
+        return mod;
+    };
+
+    Module mod = valid_module();
+    mod.failure_policy_count = kMaxForwardFailurePolicies + 1;
+    check_marker(mod);
+    mod = valid_module();
+    mod.failure_policies[0].reason = {nullptr, 1};
+    check_marker(mod);
 }
 
 int main(int argc, char** argv) {

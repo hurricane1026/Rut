@@ -627,6 +627,72 @@ teardown, and reload retirement. This form does not imply a general mutable
 runtime response-body buffer: dynamic `resp.body` mutation remains a separate,
 resumable runtime feature.
 
+#### 3.3.5.1 Local Response and Forward Failure Policies (Envoy H1)
+
+`local_response({...})` is a compiler-validated builtin for a strict, fully
+specified local response — every header and the body are literal, closed
+vocabulary; there is no fallback shape and no implicit header. It shares one
+block grammar across three route forms:
+
+```swift
+unmatched { return local_response({
+    version: .http11, status: 404, reason: "Not Found",
+    content_type: "text/plain", server: "rut", date: .current,
+    connection: .request, head_mode: .suppressBody, body: b"Not Found"
+}) }
+
+unmatched get { return local_response({ ... }) }        // per-method no-route
+pre_route options { return local_response({ ... }) }    // pre-routing strict reply
+route exact GET "/healthz" { return local_response({ ... }) }  // exact-path bypass
+```
+
+`version` (`"HTTP/1.1"` only), `status`, `reason`, `server`, `date`
+(`"current"` only), `connection` (`"request"` only), `head_mode` (`"reject"`
+or `"suppress_body"` — HEAD and ANY-method `unmatched`/`pre_route` policies
+must suppress the body), `content_type`, and `body` (a `b"..."` byte-string
+literal, ≤ 4 KiB) are each required exactly once — except `content_type`,
+which the `"date_server_length"` layout below requires to be *absent*
+instead (`src/compiler/parser.cc:5117-5135` drops it from the required-field
+mask precisely for that layout) — subject to the per-status
+closed vocabulary in `docs/language-card.md` (e.g. `status: 204` forces an
+empty `content_type`/`body`).
+
+`header_names`, `connection_header`, and `header_order` are an optional
+**closed trio** added for Envoy H1 compatibility: any one present requires all
+three. `header_names` accepts only `"lowercase"`; `connection_header` only
+`"close_only"` (append `connection: close` immediately after `server`, and
+only when the downstream connection is actually closing — unlike the default
+fixed-order layout, which always sends one Connection header or the other).
+Where `connection: close` falls in the overall wire order is layout-specific:
+last for `"length_type_date_server"`, but followed by a trailing
+`content-length: 0` for `"date_server_length"` (see the two bullets below).
+`header_order` selects the wire layout:
+
+- *(trio omitted)* — `Synthesized`, today's fixed nginx-compatible order; the
+  only layout `status: 200`/`status: 204` admit.
+- `"date_server_length"` — Envoy's empty-body no-route shape
+  (`date, server, [connection: close,] content-length: 0`): 4xx/5xx status
+  only, requires `body: b""` and `content_type` absent.
+- `"length_type_date_server"` — Envoy's bodied shape
+  (`content-length, content-type, date, server, [connection: close]`): 4xx/5xx
+  status only, with the same `content_type`/`body` rules as the default
+  layout.
+
+`forward(..., failure_policy: {...})` and `forward(..., timeout_failure_policy:
+{...})` reuse this grammar for the 502/503 response synthesized when a proxied
+request never gets an upstream reply. `failure_policy` additionally admits the
+same trio, but only `header_order: .lengthTypeDateServer`, and only paired
+with `status: 503` and a non-empty `body` — Envoy's upstream connect-failure
+representation (`docs/envoy-converter.md`). `status: 502` stays closed to the
+trio-omitted `Synthesized` shape, so the pre-existing nginx-compatible 502
+contract is unchanged. `timeout_failure_policy` stays `Synthesized`-only
+across the full 400..599 range: no timeout shape has a recorded Envoy oracle
+yet.
+
+See `docs/language-card.md` for the exhaustive per-field/per-status grammar
+and `docs/envoy-converter.md` for the byte-level Envoy oracle these layouts
+reproduce.
+
 #### 3.3.6 State Types
 
 > **Revised 2026-07 (decisions in docs/state-types.md):** the taxonomy is
@@ -2081,8 +2147,75 @@ analyzer is independently rejected by the same runtime preflight that
 enforces every other ID4 admission rule. See `docs/language-card.md` for the
 exact field grammar and
 `docs/envoy-converter.md` for the byte-level Envoy oracle this profile is
-verified against. A parallel, separately-closed `response_policy` exists for
-response-side rewriting; see `docs/language-card.md`.
+verified against.
+
+**Response rewrite policy (`response_policy`)**
+
+`forward(upstream, response_policy: { ... })` is `request_policy`'s
+response-side counterpart: a fixed, closed byte-for-byte serialization of the
+upstream response instead of the transparent zero-copy default. Admission is
+bounded to a cleartext HTTP/1.1, origin-form, bodyless non-HEAD request and
+one final upstream HTTP/1.1 response framed by exactly one `Content-Length`
+(chunking, trailers, close-delimited framing, and 1xx/204/304/no-body
+responses all fail closed), with two explicit, narrowly bounded exceptions:
+a HEAD request is admitted only when both `response_policy` and any paired
+`failure_policy` select `head_mode: .suppressBody` (headers only, upstream's
+declared `Content-Length` kept but no body emitted; see
+`response_policy_suppress_head_admitted` in `callbacks_impl.h`); and a
+fixed-`Content-Length` body-bearing request is admitted alongside a
+`response_policy` when paired with `host: .preserve` (ID4) or the plain
+`host: .upstream` strip (ID1) on `request_policy` -- fully buffered,
+unchunked, with no pipelined successor bytes, and never served from a reused
+idle upstream socket (see `request_policy_body_response_admitted` in
+`callbacks_impl.h`). Two closed profiles exist:
+
+```swift
+// Fixed-order profile (nginx-compatible default): synthesizes the response
+// in a fixed field order, replacing Server/Date and applying hide_headers.
+return forward(users, response_policy: {
+    version: .http11, framing: .contentLength, connection: .request,
+    server: "nginx/1.29.7", date: .current, hide_headers: ["Date", "Server", "X-Pad"]
+})
+
+// Envoy-compatible H1 profile (`header_order: .upstream`): preserves the
+// upstream's header order instead of the fixed layout above.
+return forward(users, response_policy: {
+    version: .http11, framing: .contentLength, connection: .request,
+    header_order: .upstream, header_names: .lowercase,
+    connection_header: .closeOnly, status_reason: .canonical,
+    server: "envoy", date: .preserveOrCurrent, hide_headers: []
+})
+```
+
+`header_order: .upstream` lowercases every forwarded header name, preserves
+upstream header order, keeps an upstream `date` in place or appends one when
+absent (`date: .preserveOrCurrent`), replaces the first `server` value in
+place (or appends when absent), appends `connection: close` last only when
+the downstream connection is closing, and always substitutes the canonical
+reason phrase for the status code -- including when the upstream sent an
+empty reason phrase, since it is never forwarded. `hide_headers` cannot
+suppress `Content-Length`: it is the sole framing field this profile admits
+(exactly one, required by the preconditions above), so a hide-list entry
+naming it is not honored, mirroring how the fixed-order profile never routes
+`Content-Length` through its own hide check either. A response carrying
+`Transfer-Encoding` is rejected outright regardless of its value (not merely
+stripped): Envoy treats any Transfer-Encoding value other than exactly
+`chunked` as a protocol error
+(`ConnectionImpl::onHeadersCompleteImpl`, `source/common/http/http1/codec_impl.cc`),
+and forwarding the coded bytes as an ordinary fixed-length body would
+silently corrupt them.
+
+`header_order: .upstream`'s five governing fields (`header_order`,
+`header_names`, `connection_header`, `status_reason`, `date`) are required
+together at these exact values; the fixed-order profile (all five at their
+default) rejects any of them being set to anything else. Like
+`request_policy`'s `host: .preserve`, this is an ordinary-forward-only
+combination: `response_read_timeout`, `response_buffering`, and
+`timeout_failure_policy` are rejected alongside it, enforced at analyze
+(`src/compiler/analyze.cc`), `compile_to_config.h`, and the `route_table.h`
+bundle-admission trust boundary. See `docs/language-card.md` for the exact
+field grammar and `docs/envoy-converter.md` for the byte-level Envoy oracle
+this profile is verified against.
 
 **Response read timeout and response buffering.** A `forward(...)` carrying a
 `response_policy` may add `response_read_timeout: <1..63s>`. The deadline
@@ -7434,3 +7567,14 @@ fallback.
 | 22 | Security as language-level code, not runtime features | Built-in WAF/DDoS modules | WAF rules, bot detection, flood protection are all expressible in the DSL; no hardcoded security logic in runtime; users can customize everything |
 | 23 | Response middleware via parameter signature | Separate `onResponse` keyword | `func f(req, resp)` = response middleware; compiler auto-detects; no new syntax needed |
 | 24 | Connection-level protection in `listen` config | Runtime-only config | headerTimeout, maxConnsPerIP, minRecvRate, strictParsing are declared in .rut files; compile-time validated; visible alongside routing logic |
+
+### Envoy helper boundary
+
+Envoy bootstrap parsing and lowering live in `helpers/envoy/`, with a separate
+`rut-envoy-convert` executable and a standalone CMake build. Neither the `rut`
+executable nor `rut_compiler`, `rut_runtime`, or `rut_jit` depends on that helper.
+It emits ordinary `.rut`; response header order, name casing, Date preservation,
+connection headers, canonical status reasons, and local/failure reply layouts
+are typed Rut policy fields available equally to handwritten programs.
+The helper never interprets a request or selects a runtime compatibility flag.
+Unsupported source configuration is rejected at conversion time.

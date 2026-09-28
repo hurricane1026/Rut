@@ -1,3 +1,8 @@
+> Architecture: the independently buildable helper lives in `helpers/envoy/`
+> and emits ordinary `.rut`. The Rut executable, compiler, JIT and runtime
+> do not depend on the Envoy parser. HTTP behavior belongs to typed Rut
+> policies, equally available in handwritten programs.
+
 # Envoy converter architecture
 
 ## Goal
@@ -60,7 +65,7 @@ Input is one regular file no larger than 1 MiB, kept alive through parsing and
 lowering. The converter does not read stdin, resolve `$ref`-style includes,
 execute generated RUT, open listeners, or infer the format from file contents.
 
-Read consistency (`read_input`, `src/envoy/main.cc`): the converter `fstat`s
+Read consistency (`read_input`, `helpers/envoy/main.cc`): the converter `fstat`s
 the open file, reads it whole, `fstat`s again and requires identical device,
 inode, size, mtime and ctime, then reads it whole a second time and requires
 the two reads to be byte-identical. Any change that lands between the first
@@ -218,8 +223,8 @@ Envoy bootstrap JSON
   -> existing RUT lexer -> AST -> HIR -> MIR -> RIR -> JIT/runtime
 ```
 
-The frontend lives in a separate `rut_envoy` library under `src/envoy/` with
-headers in `include/rut/envoy/`, mirroring `src/nginx/`. It must not be added
+The frontend lives in a separate `rut_envoy` library under `helpers/envoy/` with
+headers in `helpers/envoy/include/rut/envoy/`, mirroring `src/nginx/`. It must not be added
 to the RUT parser. Lowering happens only after the whole accepted document has
 passed capability validation, and the converter never constructs `RouteConfig`
 directly. If a model value cannot be expressed in RUT source, the feature is
@@ -309,16 +314,21 @@ folded into the golden below and into the parser/converter implementation:
    dependency, see "milestone-S" below), and
    `x-envoy-expected-rq-timeout-ms` has no RUT equivalent at all (it is
    removed by `suppress_envoy_headers: true`, also below).
-4. `failure_policy.status` must be exactly 502
+4. `failure_policy.status` was exactly 502
    (`forward_failure_policy_spec_valid`, `admitted_forward_failure_policy_valid`)
-   until the `local_reply_envoy_h1` capability admits 503 with the Envoy
-   connect-failure layout. Envoy's connect failure is a 503, not a 502, so
-   the milestone's `failure_policy` is a capability dependency, not a
-   same-shape substitution.
-5. `local_response(...)` requires all 9 fields, including a non-empty
+   until the `local_reply_envoy_h1` capability (landed, PR5) admitted 503
+   with the Envoy connect-failure layout
+   (`header_order: .lengthTypeDateServer`): `content-length,
+   content-type, date, server, [connection: close]`, plus the oracle's
+   exact 98-byte body. 502 stays exactly the prior Synthesized-only
+   contract, so nginx's behavior is untouched.
+5. `local_response(...)` required all 9 fields, including a non-empty
    `content_type` for 4xx/5xx statuses. Envoy's no-route 404 has no
-   `content-type`, so the unmatched 404 is also a capability dependency
-   rather than an emittable `local_response` today.
+   `content-type`; `local_reply_envoy_h1` (landed, PR5) added the optional
+   `header_names`/`connection_header`/`header_order` trio, and
+   `header_order: .dateServerLength` inverts the `content_type`
+   requirement (it must be absent) for the empty-body no-route shape:
+   `date, server, [connection: close,] content-length: 0`.
 
 ## milestone-S: the first fully specified shape
 
@@ -340,28 +350,31 @@ explicitly:
   implicit 15s route timeout default and makes `response_read_timeout`
   unnecessary for this milestone.
 
-Milestone-S is still capability-gated on everything else (request header
+Milestone-S was capability-gated on everything else (request header
 casing/host preservation, response header order, and the local-reply
-layouts); it only removes the two defaults that would otherwise make no
-input convertible before those capabilities land. Bootstraps that omit
-either field, or that set a non-zero `timeout`, remain `BLOCKED_BY_RUT` with
+layouts) until PR3 (`request_envoy_h1`), PR4 (`response_envoy_h1`) and PR5
+(`local_reply_envoy_h1`) landed; `rut::envoy::kShippedRutCapabilities` is now
+all `true`, and `rut-envoy-convert` converts the milestone-S bootstrap end to
+end. Bootstraps that omit `suppress_envoy_headers: true` or a `timeout: "0s"`
+route action, or that set a non-zero `timeout`, remain `BLOCKED_BY_RUT` with
 a diagnostic naming exactly what to change (see "Capability validation"
-below).
+below); those two defaults are Envoy-real knobs the bootstrap itself must set
+(see D1), not a Rut-side gap.
 
 ## Lowering shape
 
 The milestone-S bootstrap (the accepted-JSON milestone above, plus
-`suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below
-once every capability in `rut::envoy::RutCapabilities` is available. The
-shipped converter (`rut::envoy::kShippedRutCapabilities`: `request_envoy_h1`
-`true` since PR3, `response_envoy_h1` and `local_reply_envoy_h1` still
-`false`) fails closed with a `BLOCKED_BY_RUT` diagnostic (at the
-`response_envoy_h1` check) instead of emitting this text; the
-exact bytes are pinned in `tests/fixtures/envoy_milestone_s.inc` and checked
-byte for byte by `tests/test_envoy_convert.cc`
-(`api_all_capabilities_matches_golden`). Values shown here (the connect-failure
-body, in particular) are provisional pending the pinned Envoy oracle (PR2)
-and are marked `// PROVISIONAL: reconcile with oracle` at their source.
+`suppress_envoy_headers: true` and `timeout: "0s"`) lowers to the RUT below.
+`rut::envoy::kShippedRutCapabilities` is now all `true` (PR5), so the shipped
+`rut-envoy-convert` CLI emits exactly this text for the milestone-S bootstrap
+(`cli_milestone_s_converts`) instead of failing closed. The exact bytes are
+pinned in `tests/fixtures/envoy_milestone_s.inc` and checked byte for byte by
+`tests/test_envoy_convert.cc` (`api_all_capabilities_matches_golden`,
+`cli_milestone_s_converts`); `golden_compiles` additionally proves the golden
+lexes, parses, analyzes, and lowers to RIR. The connect-failure body below is
+the pinned Envoy oracle's exact 98 bytes
+(`tests/fixtures/envoy_oracle_milestone_s.inc`,
+`kEnvoyOracle_connect_failure_downstream`), not a placeholder.
 
 ```rut
 listen :8080
@@ -406,7 +419,7 @@ route HEAD "/" {
             header_names: .lowercase,
             header_order: .lengthTypeDateServer,
             head_mode: .suppressBody,
-            body: b"<kEnvoyConnectFailureBody, PROVISIONAL>"
+            body: b"upstream connect error or disconnect/reset before headers. reset reason: remote connection failure"
         }
     )
 }
@@ -440,8 +453,13 @@ existing value. The six checks, in order (first failure wins), are:
    must be available.
 
 Each of 1-3 is a plain modeling gap (the bootstrap can be edited to satisfy
-it); each of 4-6 is a Rut-side capability gap tracked as a separate PR (see
-the project plan) and cannot be worked around from the bootstrap.
+it); each of 4-6 was a Rut-side capability gap tracked as a separate PR (see
+the project plan) and could not be worked around from the bootstrap. All
+three (PR3, PR4, PR5) have landed and `kShippedRutCapabilities` sets all
+three fields `true`, so checks 4-6 pass unconditionally in the shipped
+binary; the six-check gate itself, and the `RutCapabilities` override used by
+tests to pin the golden ahead of a capability landing, remain in place for
+future capability additions.
 
 Not every Envoy-vs-Rut behavioral difference belongs in this list. This gate
 is about configuration semantics: whether the bootstrap can be lowered at all.
@@ -463,9 +481,9 @@ are recorded from the pinned Envoy build, not assumed.
   Rut's route trie is segment-aware, so only `prefix: "/"` had a
   segment-equivalent meaning before ordered-list lowering (PR 8 / PR #695)
   landed. Now every prefix ending in `/` (e.g. `"/api/"`) lowers too:
-  `parse_route_match` (`src/envoy/parser.cc`) accepts `"/"` or any prefix
+  `parse_route_match` (`helpers/envoy/parser.cc`) accepts `"/"` or any prefix
   that both starts and ends with `/`, and `build_lowering_plan`
-  (`src/envoy/converter.cc`) strips the trailing slash to get the node's own
+  (`helpers/envoy/converter.cc`) strips the trailing slash to get the node's own
   text, then guards that node's own bare literal (e.g. `/api`, which Envoy's
   raw byte-prefix match for `/api/` never matches on its own) with a
   `req.pathOnly` comparison instead of folding it into the segment match —
@@ -550,11 +568,11 @@ are recorded from the pinned Envoy build, not assumed.
   `route "/"` is simply omitted, since Rut's `unmatched` policy answers every
   method (including TRACE) via its own per-method policy table with an
   ANY-slot fallback, unlike `route exact`. The full algorithm, worked through
-  node by node, is a doc comment on `src/envoy/converter.cc`'s
+  node by node, is a doc comment on `helpers/envoy/converter.cc`'s
   ordered-route-list section.
 - **Emitted program size is separately capped by the compiler frontend's
   lexer, not just `RutSource::kCapacity`.** Codex round-6 review (P1):
-  `RutSource::kCapacity` (128 KiB, `include/rut/envoy/converter.h`) only
+  `RutSource::kCapacity` (128 KiB, `helpers/envoy/include/rut/envoy/converter.h`) only
   bounds the emitted program's byte count. `rut`'s own frontend lexer
   separately bounds every program's token count at
   `LexedTokens::kMaxTokens` (`include/rut/compiler/lexer.h`) — **4096 today**
@@ -567,7 +585,7 @@ are recorded from the pinned Envoy build, not assumed.
   contributes its own conditional prefix arm plus one unconditional
   nearest-ancestor terminal arm (see `RutSource::
   kWorstCaseOrderedRouteListBytes`'s doc comment,
-  `include/rut/envoy/converter.h`). Measured against the real lexer
+  `helpers/envoy/include/rut/envoy/converter.h`). Measured against the real lexer
   (`rut::lex`, `tests/test_envoy_convert.cc`'s
   `token_budget_goldens_match_the_real_lexer`, which links `rut_compiler`
   test-only): golden (c) — a genuine two-node, single-arm-per-node shape —
@@ -888,13 +906,23 @@ emitted text, since that still doesn't compile on this branch.
    `proxy-connection`, `te` (unless `trailers`), `upgrade` outside an upgrade,
    and `transfer-encoding` on reframe; ordinary headers like a redirect's
    `Location` or a cache validator's `Last-Modified` pass through unchanged.
-   Rut's `strict_response_forbidden` unconditionally rejects `location`,
-   `refresh`, and `last-modified` (`include/rut/runtime/callbacks_impl.h:9856-9868`)
-   regardless of the route's `hide_headers` list — this milestone's route
-   already requests `hide_headers: []` (hide nothing), so there is no policy
-   value that admits these headers even once `response_envoy_h1` lands. Live:
+   Rut's legacy fixed-order (`Synthesized`) `response_policy` profile still
+   rejects these headers unconditionally via `strict_response_forbidden`
+   (`include/rut/runtime/callbacks_impl.h:9856-9868`) regardless of
+   `hide_headers`, but this is no longer a hard capability gap: the
+   `header_order: .upstream` (Envoy H1) profile added on
+   `envoy/rut-response-envoy-h1` never routes headers through
+   `strict_response_forbidden` — it only removes the fixed hop-by-hop set and
+   policy-`hide_headers` names, so `Location`/`Refresh`/`Last-Modified` pass
+   through unchanged once the converter emits that profile
+   (`build_upstream_order_response_headers`,
+   `include/rut/runtime/callbacks_impl.h:10666-10685`;
+   `tests/test_integration.cc: route.forward_response_policy_upstream_order_wire`,
+   the Last-Modified pass-through case). Live (legacy `Synthesized` profile):
    an upstream `302 Found` with `Location: /login` got the upstream contacted
-   but the client connection closed with no response bytes.
+   but the client connection closed with no response bytes; the
+   `header_order: .upstream` profile instead forwards a lowercased
+   `Last-Modified` header downstream unchanged (integration-tested).
 6. **Undifferentiated (and sometimes absent) failure replies.** Envoy maps
    `LocalConnectionFailure`/`RemoteConnectionFailure`/`ConnectionTimeout` (a
    refused or timed-out connect attempt) to one local-reply text and
@@ -966,7 +994,7 @@ emitted text, since that still doesn't compile on this branch.
 Five findings from the round-4 Codex review of PR #692:
 
 1. **Router filter identity was not revalidated.** `validate()`
-   (`src/envoy/converter.cc`) checked `router.suppress_envoy_headers` but
+   (`helpers/envoy/converter.cc`) checked `router.suppress_envoy_headers` but
    never `router.name`/`has_typed_config` themselves, so a caller of the
    public `lower_to_rut(model, capabilities)` overload could retarget
    `router.name` at a non-router filter (or clear `has_typed_config`) and
@@ -1007,7 +1035,7 @@ Three findings from the round-6 Codex review of PR #692:
    field defaults to `true` in real Envoy, which then adds a random
    `x-request-id` this emitted RUT program never generates). Fixed by
    checking the span the same way as `type_url_span`, immediately after it in
-   `validate()` (`src/envoy/converter.cc`); covered by a new
+   `validate()` (`helpers/envoy/converter.cc`); covered by a new
    `cleared_hcm_generate_request_id` case in
    `envoy_convert.api_forged_model_rejected` (`tests/test_envoy_convert.cc`).
 2. **Downstream HTTP/1.0 rejection differs in mechanism and status, not just
@@ -1019,7 +1047,7 @@ Three findings from the round-6 Codex review of PR #692:
    `source/common/http/http1/codec_impl.cc:1176-1189`). Rut's listener
    accepts the connection at any version and only rejects once the emitted
    route's `request_policy` (which already pins `version: .http11`,
-   `src/envoy/converter.cc:165`) is evaluated: `inspect_request_policy_body`
+   `helpers/envoy/converter.cc:165`) is evaluated: `inspect_request_policy_body`
    (`include/rut/runtime/callbacks_impl.h:5406`) returns `Invalid` because
    `conn.req_http_version != HttpVersion::Http11`, and
    `reject_request_policy` (`callbacks_impl.h:5767`) sends a generic `400 Bad
@@ -1053,7 +1081,7 @@ Three findings from the round-6 Codex review of PR #692:
    `x-envoy-hedge-on-per-try-timeout` (literal names from
    `source/common/http/headers.h:153-208`, default `x-envoy` prefix). The
    emitted route's `request_policy.strip_headers`
-   (`src/envoy/converter.cc:171`) is the fixed closed list `["Connection",
+   (`helpers/envoy/converter.cc:171`) is the fixed closed list `["Connection",
    "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]` — none of
    the 15 names above are in it, and #696's planned
    `apply_preserve_host_lowercase_request_policy` (Host preservation, header
@@ -1196,10 +1224,6 @@ Each needs its own issue before the corresponding row can leave
   duplicates into one value and this profile does not replicate that
   coalescing. See `tests/fixtures/envoy_oracle_milestone_s.inc` and
   `docs/envoy-compatibility.md`.
-- Header-name casing selector on the response policy: Envoy emits lowercase
-  names over HTTP/1.1. The request side landed with `request_envoy_h1`
-  (PR3, `header_names: .lowercase` in `request_policy`); the response side
-  is still `response_envoy_h1`.
 - Dynamic `Connection`-nominated header stripping on the upstream request:
   Envoy parses the client's `Connection` header value and removes every
   header it names (e.g. `Connection: X-Secret` also removes `X-Secret`). This
@@ -1242,10 +1266,31 @@ Each needs its own issue before the corresponding row can leave
   not add interim-response support and this request shape (a genuinely
   non-empty `Expect` value) stays outside its advertised capability until
   a `100 Continue` primitive exists.
-- `response_policy.date: .preserveOrCurrent`: add `date` only when absent.
-- `response_policy.server: "envoy"` with overwrite semantics, and an explicit
-  "pass through upstream `server`" mode for `server_header_transformation:
-  PASS_THROUGH`.
+- `response_policy.header_order: .upstream` (`response_envoy_h1`, PR4):
+  landed. `header_names: .lowercase`, `connection_header: .closeOnly`,
+  `status_reason: .canonical`, and `date: .preserveOrCurrent` are admitted
+  only together with it (nginx's fixed-order `Synthesized` layout is
+  unchanged). The runtime serializer keeps upstream header order, lowercases
+  every forwarded name, replaces the first `server` value in place (a later
+  duplicate is dropped) or appends `server: envoy` when absent, keeps an
+  upstream `date` in place or appends `date: <now>` when absent (`date` then
+  `server` when both are absent), appends `connection: close` last only when
+  the downstream connection is closing, and looks up the canonical reason
+  phrase from a table mirroring Envoy's `CodeUtility::toString`
+  (`source/common/http/codes.cc`, v1.39.1) byte for byte, covering every
+  status this profile admits (200..599 minus the no-body exclusions
+  204/205/304): an admitted status Envoy's own table does not name (e.g.
+  299) gets `Unknown`, matching `CodeUtility::toString`'s own fallthrough,
+  rather than being rejected (Codex round-11 review of #698). The upstream's
+  own reason phrase is never forwarded — the canonical phrase always
+  replaces it — so an empty upstream reason phrase (`HTTP/1.1 200 \r\n`,
+  which `parse_response` accepts per RFC 7230 §3.1.2) needs no special case
+  and is accepted like any other. `hide_headers` can never suppress
+  `Content-Length`, the sole framing field this profile admits. Verified
+  byte for byte against
+  `tests/fixtures/envoy_oracle_milestone_s.inc`; see
+  `docs/envoy-compatibility.md`. An explicit "pass through upstream `server`"
+  mode for `server_header_transformation: PASS_THROUGH` is not modeled.
 - Route-level `set_header` on the upstream request is available for literal
   values; `x-envoy-upstream-service-time` on the response needs a runtime
   measured value, which no policy exposes. Until then only the
@@ -1253,7 +1298,7 @@ Each needs its own issue before the corresponding row can leave
 - Raw (non-segment) prefix match for `prefix` values not ending in `/`.
 - ~~Explicit route-list ordering~~: resolved by construction (owner decision
   D3, PR 8) rather than a capability gap — see "Routing" above and the
-  algorithm doc comment in `src/envoy/converter.cc`. Not a `BLOCKED_BY_RUT`
+  algorithm doc comment in `helpers/envoy/converter.cc`. Not a `BLOCKED_BY_RUT`
   row any more; a genuinely unrepresentable shape (root with exact arms and
   no catch-all) is its own fail-closed diagnostic instead.
 - Path normalization / `merge_slashes` / percent-decoding: Rut's route trie

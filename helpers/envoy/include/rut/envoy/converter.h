@@ -69,32 +69,32 @@ struct RutSource {
 // One flag per RUT surface the lowering needs beyond today's grammar. Each
 // flag is flipped only by the PR that lands the corresponding runtime
 // capability (docs/envoy-converter.md, "Known capability dependencies"); the
-// converter itself never flips one on its own. The shipped table
-// (`kShippedRutCapabilities` below) is partially enabled: `request_envoy_h1`
-// is true (PR3 landed the ID4 `Http11PreserveHostLowercase` request policy,
-// so lowering clears that check), while `response_envoy_h1` and
-// `local_reply_envoy_h1` are still false, so `lower_to_rut(model)` still
-// fails closed with a `BLOCKED_BY_RUT` diagnostic -- now at the
-// `response_envoy_h1` check (`src/envoy/converter.cc`) -- until PR4 and PR5
-// flip their flags.
+// converter itself never flips one on its own. All three PRs (PR3/PR4/PR5)
+// have landed, so the shipped table below is all-true and the default
+// `lower_to_rut(model)` overload performs a live conversion; a model that
+// still needs a RUT surface beyond these three still fails closed with a
+// source-located `BLOCKED_BY_RUT` diagnostic.
 struct RutCapabilities {
     bool request_envoy_h1 = false;      // PR3: host preserve + lowercase request headers
     bool response_envoy_h1 = false;     // PR4: upstream header order + lowercase + preserved date
     bool local_reply_envoy_h1 = false;  // PR5: lowercase local_response / failure_policy layout
 };
 
-inline constexpr RutCapabilities kShippedRutCapabilities{.request_envoy_h1 = true};
+inline constexpr RutCapabilities kShippedRutCapabilities{
+    .request_envoy_h1 = true, .response_envoy_h1 = true, .local_reply_envoy_h1 = true};
 
 // Lower the milestone Envoy semantic model to deterministic RUT source using
-// the capabilities this binary actually ships. Fails closed with a
-// source-located `BLOCKED_BY_RUT` diagnostic whenever the model needs a RUT
-// surface `capabilities` does not have.
+// the capabilities this binary actually ships (all of PR3/PR4/PR5 today, see
+// `kShippedRutCapabilities` above). Fails closed with a source-located
+// `BLOCKED_BY_RUT` diagnostic whenever the model needs a RUT surface
+// `capabilities` does not have.
 FrontendResult<RutSource> lower_to_rut(const Bootstrap& model);
 
-// Same lowering with an explicit capability set. Used by tests to pin the
-// target RUT text (all capabilities true) ahead of the runtime PRs that make
-// it real; production code must not construct a non-default
-// `RutCapabilities`.
+// Same lowering with an explicit capability set. The default overload above
+// already converts live with every shipped capability true
+// (`kShippedRutCapabilities`); this overload exists for tests that need to
+// pin the target RUT text against a specific (possibly narrower) capability
+// set. Production code must not construct a non-default `RutCapabilities`.
 FrontendResult<RutSource> lower_to_rut(const Bootstrap& model, const RutCapabilities& capabilities);
 
 // Test-only: the same validation and emission as `lower_to_rut` above, but
@@ -123,9 +123,11 @@ FrontendResult<RutSource> lower_to_rut_ignoring_token_budget_for_test(
 // explicit predicate rather than an unconditional print so a future codec
 // type (or a listener-protocol capability, if one is ever added) has
 // somewhere to change the answer, and so tests can assert the condition
-// without needing the shipped `RutCapabilities` (`request_envoy_h1 = true`
-// as of PR3; `response_envoy_h1`/`local_reply_envoy_h1` still false) to be
-// true.
+// independently of `RutCapabilities` -- the shipped table
+// (`kShippedRutCapabilities` above) now has `request_envoy_h1`,
+// `response_envoy_h1`, and `local_reply_envoy_h1` all true (PR3/PR4/PR5 have
+// all landed), so this predicate no longer needs to stand in for a
+// still-false capability.
 //
 // This is deliberately NOT a `RutCapabilities` gate: Rut's cleartext `listen`
 // has no knob to disable h2c-preface detection at all

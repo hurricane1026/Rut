@@ -1,5 +1,6 @@
 // Real-socket integration tests. Ported from libuv/libevent2 scenarios.
 #include "epoll_tls_test_hooks.h"
+#include "fixtures/envoy_milestone_s.inc"
 #include "fixtures/envoy_oracle_milestone_s.inc"
 #include "framing_selection_preflight_fixture.h"
 #include "rut/compiler/analyze.h"
@@ -20683,6 +20684,63 @@ static bool normalize_public_date(char* data, u32 length) {
     for (u32 i = 0; i < 29; i++) data[date_start + i] = 'X';
     return true;
 }
+
+// Envoy H1 profile variant of `normalize_public_date` above: the serializer
+// lowercases every forwarded header name, so the synthesized field reads
+// "date: " rather than "Date: ". Used only to mask a Rut-synthesized date
+// value before a wire comparison; a preserved upstream date is compared byte
+// for byte instead (see `forward_response_policy_upstream_order_wire`).
+static bool normalize_lowercase_date(char* data, u32 length) {
+    u32 count = 0;
+    u32 date_start = 0;
+    for (u32 i = 0; i < length;) {
+        if (length - i < 6) break;
+        if (memcmp(data + i, "date: ", 6) != 0) {
+            i++;
+            continue;
+        }
+        count++;
+        if (count != 1) return false;
+        if (i < 2 || length - i < 37 || data[i - 2] != '\r' || data[i + 35] != '\r' ||
+            data[i + 36] != '\n')
+            return false;
+        date_start = i + 6;
+        i += 35;
+    }
+    if (count != 1) return false;
+
+    const char* date = data + date_start;
+    const auto token_is_one_of = [](const char* value, const char* const* tokens, u32 count) {
+        for (u32 i = 0; i < count; i++)
+            if (memcmp(value, tokens[i], 3) == 0) return true;
+        return false;
+    };
+    static const char* const kWeekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+    static const char* const kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    const auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    const auto two_digits = [&](u32 offset) {
+        return is_digit(date[offset]) && is_digit(date[offset + 1])
+                   ? static_cast<u32>((date[offset] - '0') * 10 + (date[offset + 1] - '0'))
+                   : 100u;
+    };
+    if (!token_is_one_of(date, kWeekdays, sizeof(kWeekdays) / sizeof(kWeekdays[0])) ||
+        date[3] != ',' || date[4] != ' ' || date[7] != ' ' ||
+        !token_is_one_of(date + 8, kMonths, sizeof(kMonths) / sizeof(kMonths[0])) ||
+        date[11] != ' ' || date[16] != ' ' || date[19] != ':' || date[22] != ':' ||
+        date[25] != ' ' || memcmp(date + 26, "GMT", 3) != 0)
+        return false;
+    const u32 day = two_digits(5);
+    const u32 hour = two_digits(17);
+    const u32 minute = two_digits(20);
+    const u32 second = two_digits(23);
+    if (day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return false;
+    for (u32 i = 12; i < 16; i++)
+        if (!is_digit(date[i])) return false;
+
+    for (u32 i = 0; i < 29; i++) data[date_start + i] = 'X';
+    return true;
+}
 #endif
 
 #if RUT_ENABLE_JIT_TESTS
@@ -25477,6 +25535,463 @@ TEST(route, forward_request_policy_preserve_host_lowercase_post_fixed_never_reus
              0);
 }
 
+// Milestone-S forward path end to end (PR4, envoy-pr-plan.md "PR 4"): request
+// policy 4 (host preserve + lowercase, PR3) paired with `response_policy
+// header_order: .upstream` on every route. Downstream bytes must equal the
+// oracle downstream bytes byte for byte; only the value of a Rut-synthesized
+// `date:` line is normalized (a preserved upstream date is compared exactly).
+TEST(route, forward_response_policy_upstream_order_wire) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+    // One upstream per route: each case's upstream reply shape differs, and a
+    // shared upstream target across routes risks RUT's own connection reuse
+    // pairing a pooled socket with the wrong route's in-flight response.
+    RecordingUpstream smoke_backend, date_backend, close_backend, head_backend, upload_backend,
+        lastmod_backend, chunked_backend;
+    REQUIRE(smoke_backend.setup());
+    REQUIRE(date_backend.setup());
+    REQUIRE(close_backend.setup());
+    REQUIRE(head_backend.setup());
+    REQUIRE(upload_backend.setup());
+    REQUIRE(lastmod_backend.setup());
+    REQUIRE(chunked_backend.setup());
+
+    // Request policy 4 (host preserve + lowercase, PR3) on every route,
+    // including the body-bearing POST /upload route:
+    // `request_policy_body_response_admitted` (callbacks_impl.h) now admits
+    // ID4 on the ordinary strict-response body path exactly like ID1.
+    auto route_block =
+        [](const char* method, const char* path, const char* upstream_name, bool suppress_body) {
+            return std::string("route ") + method + " \"" + path + "\" {\n" +
+                   "    return forward(" + upstream_name +
+                   ", request_policy: {\n"
+                   "        version: .http11, host: .preserve, connection: .omit,\n"
+                   "        header_names: .lowercase, forwarded_proto: .http,\n"
+                   "        strip_headers: [.connection, .keepAlive, .te, .expect, "
+                   ".upgrade, .proxyConnection]\n"
+                   "    }, response_policy: {\n"
+                   "        version: .http11, framing: .contentLength, connection: "
+                   ".request,\n" +
+                   std::string(suppress_body ? "        head_mode: .suppressBody,\n" : "") +
+                   "        header_order: .upstream, header_names: .lowercase,\n"
+                   "        connection_header: .closeOnly, status_reason: .canonical,\n"
+                   "        server: \"envoy\", date: .preserveOrCurrent, hide_headers: []\n"
+                   "    }" +
+                   std::string(suppress_body ? ", failure_policy: {\n"
+                                               "        version: .http11, status: 502, "
+                                               "reason: \"Bad Gateway\",\n"
+                                               "        content_type: \"text/plain\", server: "
+                                               "\"envoy\", date: .current,\n"
+                                               "        connection: .request, head_mode: "
+                                               ".suppressBody, body: b\"x\"\n"
+                                               "    }"
+                                             : "") +
+                   ")\n"
+                   "}\n";
+        };
+    auto upstream_line = [](const char* name, u16 port) {
+        char buf[64];
+        const int len = snprintf(buf, sizeof(buf), "upstream %s at \"127.0.0.1:%u\"\n", name, port);
+        return std::string(buf, len > 0 ? static_cast<u32>(len) : 0);
+    };
+    std::string source = upstream_line("smoke_backend", smoke_backend.port) +
+                         upstream_line("date_backend", date_backend.port) +
+                         upstream_line("close_backend", close_backend.port) +
+                         upstream_line("head_backend", head_backend.port) +
+                         upstream_line("upload_backend", upload_backend.port) +
+                         upstream_line("lastmod_backend", lastmod_backend.port) +
+                         upstream_line("chunked_backend", chunked_backend.port);
+    source += route_block("GET", "/smoke", "smoke_backend", false);
+    source += route_block("GET", "/date", "date_backend", false);
+    source += route_block("GET", "/close", "close_backend", false);
+    source += route_block("HEAD", "/head", "head_backend", true);
+    source += route_block("POST", "/upload", "upload_backend", false);
+    source += route_block("GET", "/lastmod", "lastmod_backend", false);
+    source += route_block("GET", "/chunked", "chunked_backend", false);
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    auto recv_exact = [](i32 fd, char* buf, u32 want) {
+        u32 total = 0;
+        while (total < want) {
+            const i32 got = recv_timeout(fd, buf + total, want - total, 2000);
+            if (got <= 0) return false;
+            total += static_cast<u32>(got);
+        }
+        return true;
+    };
+
+    auto run_case = [&](RecordingUpstream& upstream,
+                        const char* client_bytes,
+                        u32 client_len,
+                        const char* upstream_reply,
+                        u32 upstream_reply_len,
+                        const char* expected_downstream,
+                        u32 expected_downstream_len,
+                        bool mask_date,
+                        bool expect_downstream_close,
+                        const char* expected_upstream_request,
+                        u32 expected_upstream_request_len) {
+        upstream.response = upstream_reply;
+        upstream.response_len = upstream_reply_len;
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, client_bytes, client_len));
+        char response[1024];
+        char expected[1024];
+        REQUIRE_LE(expected_downstream_len, static_cast<u32>(sizeof(response)));
+        memcpy(expected, expected_downstream, expected_downstream_len);
+        REQUIRE(recv_exact(client, response, expected_downstream_len));
+        // No trailing bytes: a suppress-body HEAD response must not also
+        // carry the upstream's declared-but-withheld representation. A
+        // closing response (client sent `Connection: close`) sees EOF
+        // instead of a further idle timeout.
+        char extra[16];
+        const i32 tail = recv_timeout(client, extra, sizeof(extra), 150);
+        close(client);
+        CHECK_EQ(tail, expect_downstream_close ? 0 : -EAGAIN);
+        if (mask_date) {
+            REQUIRE(normalize_lowercase_date(response, expected_downstream_len));
+            REQUIRE(normalize_lowercase_date(expected, expected_downstream_len));
+        }
+        CHECK_EQ(memcmp(response, expected, expected_downstream_len), 0);
+
+        for (u32 i = 0; i < 400 && upstream.request_count.load(std::memory_order_acquire) == 0; i++)
+            usleep(5000);
+        REQUIRE_GT(upstream.request_count.load(std::memory_order_acquire), 0u);
+        if (expected_upstream_request != nullptr) {
+            REQUIRE_EQ(upstream.request_history_len[0], expected_upstream_request_len);
+            CHECK_EQ(memcmp(upstream.request_history[0],
+                            expected_upstream_request,
+                            expected_upstream_request_len),
+                     0);
+        }
+    };
+
+    // get_smoke: upstream sent neither `date` nor `server`, so both are
+    // appended; the canonical reason phrase overrides upstream's "Fine".
+    static constexpr char kSmokeUpstream[] =
+        "HTTP/1.1 200 Fine\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 5\r\n"
+        "X-Upstream-Case: Yes\r\n"
+        "\r\n"
+        "hello";
+    run_case(smoke_backend,
+             kEnvoyOracle_get_smoke_client,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_client) - 1),
+             kSmokeUpstream,
+             static_cast<u32>(sizeof(kSmokeUpstream) - 1),
+             kEnvoyOracle_get_smoke_downstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_downstream) - 1),
+             /*mask_date=*/true,
+             /*expect_downstream_close=*/false,
+             kEnvoyOracle_get_smoke_upstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_smoke_upstream) - 1));
+
+    // get_upstream_date_server: upstream's own `date` is preserved byte for
+    // byte in place; its `server` value is replaced in place by "envoy".
+    static constexpr char kDateServerUpstream[] =
+        "HTTP/1.1 200 OK\r\n"
+        "X-First: 1\r\n"
+        "Date: Mon, 01 Jan 2024 00:00:00 GMT\r\n"
+        "Server: custom-origin\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "ok";
+    run_case(date_backend,
+             kEnvoyOracle_get_upstream_date_server_client,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_upstream_date_server_client) - 1),
+             kDateServerUpstream,
+             static_cast<u32>(sizeof(kDateServerUpstream) - 1),
+             kEnvoyOracle_get_upstream_date_server_downstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_upstream_date_server_downstream) - 1),
+             /*mask_date=*/false,
+             /*expect_downstream_close=*/false,
+             kEnvoyOracle_get_upstream_date_server_upstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_upstream_date_server_upstream) - 1));
+
+    // get_client_close: the client's `Connection: close` closes the
+    // downstream connection, so `connection: close` is appended last.
+    run_case(close_backend,
+             kEnvoyOracle_get_client_close_client,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_client_close_client) - 1),
+             kSmokeUpstream,
+             static_cast<u32>(sizeof(kSmokeUpstream) - 1),
+             kEnvoyOracle_get_client_close_downstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_client_close_downstream) - 1),
+             /*mask_date=*/true,
+             /*expect_downstream_close=*/true,
+             kEnvoyOracle_get_client_close_upstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_get_client_close_upstream) - 1));
+
+    // head_smoke: `head_mode: .suppressBody` commits headers only; the
+    // upstream's declared Content-Length: 5 is kept but no body is sent.
+    static constexpr char kHeadUpstream[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+    run_case(head_backend,
+             kEnvoyOracle_head_smoke_client,
+             static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_client) - 1),
+             kHeadUpstream,
+             static_cast<u32>(sizeof(kHeadUpstream) - 1),
+             kEnvoyOracle_head_smoke_downstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_downstream) - 1),
+             /*mask_date=*/true,
+             /*expect_downstream_close=*/false,
+             kEnvoyOracle_head_smoke_upstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_head_smoke_upstream) - 1));
+
+    // post_fixed: 201 Created, Content-Length: 0, no content-type. Request
+    // policy 4 end to end -- both the forwarded upstream request and the
+    // downstream response are asserted byte for byte against the oracle.
+    static constexpr char kUploadUpstream[] = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
+    run_case(upload_backend,
+             kEnvoyOracle_post_fixed_client,
+             static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_client) - 1),
+             kUploadUpstream,
+             static_cast<u32>(sizeof(kUploadUpstream) - 1),
+             kEnvoyOracle_post_fixed_downstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_downstream) - 1),
+             /*mask_date=*/true,
+             /*expect_downstream_close=*/false,
+             kEnvoyOracle_post_fixed_upstream,
+             static_cast<u32>(sizeof(kEnvoyOracle_post_fixed_upstream) - 1));
+
+    // Last-Modified pass-through: not one of `build_strict_response_headers`'s
+    // forbidden names, so the Upstream-order serializer must carry it through
+    // (unlike the Synthesized/nginx layout, which rejects it outright).
+    static constexpr char kLastModUpstream[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n"
+        "Content-Length: 2\r\n"
+        "\r\n"
+        "hi";
+    static constexpr char kLastModExpected[] =
+        "HTTP/1.1 200 OK\r\n"
+        "last-modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n"
+        "content-length: 2\r\n"
+        "date: Thu, 24 Sep 2026 18:18:42 GMT\r\n"
+        "server: envoy\r\n"
+        "\r\n"
+        "hi";
+    static constexpr char kLastModClient[] =
+        "GET /lastmod HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    run_case(lastmod_backend,
+             kLastModClient,
+             static_cast<u32>(sizeof(kLastModClient) - 1),
+             kLastModUpstream,
+             static_cast<u32>(sizeof(kLastModUpstream) - 1),
+             kLastModExpected,
+             static_cast<u32>(sizeof(kLastModExpected) - 1),
+             /*mask_date=*/true,
+             /*expect_downstream_close=*/false,
+             nullptr,
+             0);
+
+    // A chunked upstream response is never admitted by this framing-strict
+    // serializer (exactly one Content-Length, not chunked): the request
+    // fails closed with the shared 502 fallback, never exposing chunked
+    // framing downstream.
+    {
+        static constexpr char kChunkedUpstream[] =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "5\r\nhello\r\n0\r\n\r\n";
+        chunked_backend.response = kChunkedUpstream;
+        chunked_backend.response_len = sizeof(kChunkedUpstream) - 1;
+        static constexpr char kChunkedClient[] =
+            "GET /chunked HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kChunkedClient, sizeof(kChunkedClient) - 1));
+        char response[512];
+        const i32 response_read = recv_timeout(client, response, sizeof(response), 2000);
+        close(client);
+        CHECK_GT(response_read, 0);
+        CHECK(buf_contains(response, static_cast<u32>(response_read), "502", 3));
+        CHECK_FALSE(buf_contains(response, static_cast<u32>(response_read), "hello", 5));
+    }
+}
+
+// End-to-end Envoy local-reply layouts (envoy-pr-plan.md PR5, oracle
+// overrides): the milestone-S golden itself (`kEnvoyMilestoneSGolden`,
+// docs/envoy-converter.md) compiled and run through the real gateway, with
+// its upstream repointed at a dead endpoint so every forward connect fails
+// and exercises the 503 `failure_policy`. `unmatched` (404) is exercised by
+// request shapes the route table can never match: `OPTIONS *` and a CONNECT
+// authority-form target.
+TEST(route, envoy_milestone_s_local_replies_match_oracle) {
+    using namespace rut;
+    struct JitResources {
+        FrontendRirModule rir{};
+        jit::JitEngine engine{};
+        ~JitResources() {
+            engine.shutdown();
+            rir.destroy();
+        }
+    } resources;
+
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+
+    std::string source(kEnvoyMilestoneSGolden);
+    const std::string needle = "127.0.0.1:9000";
+    const auto pos = source.find(needle);
+    REQUIRE_NE(pos, std::string::npos);
+    source.replace(pos, needle.size(), "127.0.0.1:" + std::to_string(dead.port));
+
+    auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    auto& rir = resources.rir;
+    REQUIRE(lower_to_rir(*mir_owned, rir));
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    auto& engine = resources.engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE(register_jit_routes(cfg, rir.module, engine));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+
+    auto recv_all_until_idle = [](i32 fd, char* buf, u32 cap) {
+        u32 total = 0;
+        while (total < cap) {
+            const i32 got = recv_timeout(fd, buf + total, cap - total, 200);
+            if (got <= 0) break;
+            total += static_cast<u32>(got);
+        }
+        return total;
+    };
+
+    // connect_failure: GET to "/" (the route table always tries to forward
+    // to the dead endpoint), keep-alive request -> the 503 Envoy failure
+    // layout, byte for byte against the oracle after date normalization.
+    {
+        const char kReq[] = "GET / HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+        char response[512];
+        const u32 got = recv_all_until_idle(client, response, sizeof(response));
+        close(client);
+        const u32 expected_len =
+            static_cast<u32>(sizeof(kEnvoyOracle_connect_failure_downstream) - 1);
+        REQUIRE_EQ(got, expected_len);
+        char expected[512];
+        memcpy(expected, kEnvoyOracle_connect_failure_downstream, expected_len);
+        REQUIRE(normalize_lowercase_date(response, expected_len));
+        REQUIRE(normalize_lowercase_date(expected, expected_len));
+        CHECK_EQ(memcmp(response, expected, expected_len), 0);
+    }
+
+    // connect_failure + HEAD: the failure_policy's `head_mode:
+    // "suppressBody"` on the HEAD route withholds the 98-byte body even
+    // though `content-length: 98` is still declared.
+    {
+        const char kReq[] = "HEAD / HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+        char response[512];
+        const u32 got = recv_all_until_idle(client, response, sizeof(response));
+        close(client);
+        REQUIRE(normalize_lowercase_date(response, got));
+        const std::string head(response, got);
+        CHECK_NE(head.find("HTTP/1.1 503 Service Unavailable\r\n"), std::string::npos);
+        CHECK_NE(head.find("content-length: 98\r\n"), std::string::npos);
+        CHECK_NE(head.find("content-type: text/plain\r\n"), std::string::npos);
+        CHECK(head.ends_with("\r\n\r\n"));  // body suppressed
+    }
+
+    // unmatched -> 404: `OPTIONS *` never reaches route dispatch (the route
+    // table refuses non-origin-form targets), so the generic unmatched
+    // policy answers with the Envoy no-route 404 layout.
+    {
+        const char kReq[] = "OPTIONS * HTTP/1.1\r\nHost: client.example\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+        char response[256];
+        const u32 got = recv_all_until_idle(client, response, sizeof(response));
+        close(client);
+        const u32 expected_len = static_cast<u32>(sizeof(kEnvoyOracle_options_star_downstream) - 1);
+        REQUIRE_EQ(got, expected_len);
+        char expected[256];
+        memcpy(expected, kEnvoyOracle_options_star_downstream, expected_len);
+        REQUIRE(normalize_lowercase_date(response, expected_len));
+        REQUIRE(normalize_lowercase_date(expected, expected_len));
+        CHECK_EQ(memcmp(response, expected, expected_len), 0);
+    }
+
+    // unmatched -> 404: a CONNECT authority-form target also misses the
+    // route table (same non-origin-form refusal) and reaches the same
+    // unmatched policy. NOTE: Envoy's oracle closes this connection
+    // (`connection: close`); Rut's unmatched responder decides persistence
+    // from the parsed request alone (no method-specific override for
+    // CONNECT), so a well-formed keep-alive CONNECT request stays
+    // keep-alive here. This one header is a documented deviation from
+    // `kEnvoyOracle_connect_authority_downstream`
+    // (docs/envoy-compatibility.md); the rest of the layout (date, server,
+    // content-length: 0 order) matches.
+    {
+        const char kReq[] = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        i32 client = connect_to(proxy.port);
+        REQUIRE_GE(client, 0);
+        REQUIRE(send_all(client, kReq, sizeof(kReq) - 1));
+        char response[256];
+        const u32 got = recv_all_until_idle(client, response, sizeof(response));
+        close(client);
+        REQUIRE(normalize_lowercase_date(response, got));
+        const std::string body(response, got);
+        CHECK_NE(body.find("HTTP/1.1 404 Not Found\r\n"), std::string::npos);
+        CHECK_NE(body.find("date: "), std::string::npos);
+        CHECK_NE(body.find("\r\nserver: envoy\r\n"), std::string::npos);
+        CHECK(body.ends_with("content-length: 0\r\n\r\n"));
+    }
+}
+
 TEST(route, request_policy_buffers_fixed_content_length_body) {
     using namespace rut;
     RecordingUpstream backend;
@@ -26023,6 +26538,74 @@ TEST(route, failure_policy_connect_error_serializes_binary_body_and_releases_slo
     CHECK_GT(response_len, 0);
     CHECK(buf_contains(response, static_cast<u32>(response_len), "HTTP/1.1 502", 12));
     close(client);
+}
+
+// Regression for the PR #699 Codex review: `respond_upstream_connect_failure`
+// used to unconditionally record `conn.resp_status = kStatusBadGateway`
+// (502), even when the selected failure_policy serialized a different status
+// on the wire (e.g. Envoy's 503 connect-failure layout). That mismatch would
+// have on_request_complete, access logging, traffic capture, and status-based
+// metrics disagree with what the client actually received. Assert the
+// recorded status matches the wire response.
+TEST(route, failure_policy_connect_error_envoy_503_records_matching_resp_status) {
+    DeadEndpoint dead;
+    REQUIRE(dead.reserve());
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, dead.port).has_value());
+    cfg.upstreams[0].max_inflight = 1;
+    ForwardFailurePolicySpec failure{};
+    failure.version = ForwardFailurePolicyVersion::Http11;
+    failure.status_code = 503;
+    failure.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    failure.date = ForwardFailurePolicyDate::Current;
+    failure.connection = ForwardFailurePolicyConnection::Request;
+    failure.head_mode = FailurePolicyHeadMode::Reject;
+    failure.reason = {"Service Unavailable", 19};
+    failure.content_type = {"text/plain", 10};
+    failure.server = {"envoy", 5};
+    failure.body = {"upstream connect error", 23};
+    REQUIRE_EQ(cfg.add_failure_policy(failure), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(0, 1), 1u);
+    REQUIRE_EQ(cfg.add_response_policy(test_response_policy_spec()), 1u);
+    REQUIRE_EQ(cfg.add_policy_bundle(1, 1), 2u);
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_failure_bundle_two_handler));
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 1000));
+    auto ring = std::make_unique<AccessLogRing>();
+    ring->init();
+    proxy.loop->access_log = ring.get();
+
+    i32 client = connect_to(proxy.port);
+    REQUIRE_GE(client, 0);
+    set_socket_timeouts(client, 2);
+    static constexpr char kRequest[] = "GET /api HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    REQUIRE(send_all(client, kRequest, sizeof(kRequest) - 1));
+    char response[512];
+    u32 total = 0;
+    while (total < sizeof(response)) {
+        const i32 n = recv_timeout(client, response + total, sizeof(response) - total, 2000);
+        if (n <= 0) break;
+        total += static_cast<u32>(n);
+    }
+    close(client);
+    REQUIRE_GT(total, 0u);
+    CHECK(buf_contains(response, total, "HTTP/1.1 503 Service Unavailable\r\n", 34));
+
+    // The access-log entry is published from on_request_complete, which runs
+    // just after the send completion the client already observed above; poll
+    // briefly for the shard thread to publish it.
+    AccessLogEntry access{};
+    bool popped = false;
+    for (int i = 0; i < 200 && !popped; i++) {
+        if (ring->pop(access)) {
+            popped = true;
+            break;
+        }
+        usleep(1000);
+    }
+    REQUIRE(popped);
+    CHECK_EQ(access.status, 503u);
 }
 
 TEST(route, failure_policy_close_intent_emits_close_and_eof) {

@@ -40,7 +40,7 @@ jobs:
 
       - name: Check formatting
         run: |
-          find include src testing tests bench -name '*.h' -o -name '*.cc' | \
+          find include src helpers testing tests bench -name '*.h' -o -name '*.cc' | \
             xargs $CF --dry-run --Werror
 
   lint:
@@ -66,7 +66,7 @@ jobs:
         run: |
           # Exclude all arch-specific SIMD backends — only lint scalar
           # and main parser code (arch-independent).
-          find src -name '*.cc' \
+          find src helpers -name '*.cc' \
             ! -name 'kqueue_backend.cc' \
             ! -path '*/simd/sse2.cc' \
             ! -path '*/simd/avx2.cc' \
@@ -260,8 +260,13 @@ jobs:
             -DRUT_ENABLE_JIT=ON \
             -DLLVM_DIR=/usr/lib/llvm-21/lib/cmake/llvm
 
+      - name: Build standalone Envoy helper
+        run: |
+          cmake -S helpers/envoy -B build-envoy-helper -G Ninja
+          cmake --build build-envoy-helper
+
       - name: Build Envoy differential targets
-        run: ninja -C build rut-envoy-convert test_envoy_parser test_envoy_convert test_envoy_differential
+        run: ninja -C build rut rut-envoy-convert test_envoy_parser test_envoy_convert test_envoy_differential
 
       - name: Test required Envoy differentials
         run: |
@@ -274,6 +279,13 @@ jobs:
         with:
           name: envoy-oracle-transcript
           path: build/envoy_oracle_milestone_s.inc
+
+      - name: Upload Envoy-vs-RUT pair transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: envoy-pair-transcript
+          path: build/envoy_pair_milestone_s.inc
 
   docker-launch-diagnostic:
     name: Docker launch diagnostic — not acceptance

@@ -324,9 +324,14 @@ members allowed for the field. There are no legacy string aliases.
 | Request `host` | `.upstream`, `.preserve` |
 | `connection` | Request: `.omit`; response: `.keepAlive`, `.request`; local/failure: `.request`; redirect: `.close` |
 | `framing` | `.contentLength` |
-| `date` | `.current` |
+| `date` | `.current`; response also `.preserveOrCurrent` |
 | `head_mode` | `.reject`, `.suppressBody` |
-| Request `header_names`, `forwarded_proto` | `.lowercase`, `.http`, respectively |
+| `header_names` | `.lowercase` |
+| Request `forwarded_proto` | `.http` |
+| Response `header_order`, `status_reason` | `.upstream`, `.canonical`, respectively |
+| Response/local/failure `connection_header` | `.closeOnly` |
+| Local `header_order` | `.dateServerLength`, `.lengthTypeDateServer` |
+| Failure `header_order` | `.lengthTypeDateServer` |
 | `content_length_position` | `.afterHost` |
 | `retained_header_value` | `.trimSpPreserveHtab` |
 | `response_buffering` | `.completeContentLength`, `.bounded` |
@@ -501,6 +506,69 @@ return forward(users,
 // Connection: close. The strict response-domain limits above remain unchanged.
 // Valid downstream Upgrade requests are rejected by this policy; Upgrade
 // passthrough remains PARTIAL in the first slice.
+// header_order: .upstream is a separate closed combination (Envoy-compatible
+// H1): preserves upstream header order and lowercases every forwarded name,
+// keeps an upstream `date` in place (or appends one when absent), replaces
+// the first `server` value in place (a later duplicate is dropped, or
+// appends when absent), appends `connection: close` last only when the
+// downstream connection is closing, and uses the canonical reason phrase
+// instead of the upstream's — including when the upstream sent an empty
+// reason phrase, since it is never forwarded. `hide_headers` cannot suppress
+// `Content-Length`: it is the sole framing field this profile admits, so a
+// hide-list entry naming it is not honored (the fixed-order profile above is
+// immune the same way, by never routing Content-Length through its own hide
+// check). All five fields below are required together;
+// `response_read_timeout` / `response_buffering` / `timeout_failure_policy`
+// are rejected with it (ordinary-forward-only, like request_policy
+// host: .preserve). The fixed-order layout above (`header_order` omitted)
+// is unchanged.
+return forward(users, request_policy: {
+    version: .http11, host: .preserve, connection: .omit,
+    header_names: .lowercase, forwarded_proto: .http,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
+}, response_policy: {
+    version: .http11, framing: .contentLength, connection: .request,
+    header_order: .upstream, header_names: .lowercase,
+    connection_header: .closeOnly, status_reason: .canonical,
+    server: "envoy", date: .preserveOrCurrent, hide_headers: []
+})
+// local_response and failure_policy each accept an Envoy-compatible H1
+// header-order combination too: `header_names: .lowercase`,
+// `connection_header: .closeOnly`, and `header_order` are optional as a
+// closed trio (any one present requires all three); the fixed-order layout
+// above (all three omitted) is unchanged. `connection_header: .closeOnly`
+// means `connection: close` is appended immediately after `server` only when
+// the downstream connection is closing; it is omitted entirely otherwise
+// (unlike the fixed-order layout, which always sends one or the other). Its
+// place in the overall wire order is layout-specific: last for
+// length_type_date_server, but followed by a trailing `content-length: 0` for
+// date_server_length below.
+//
+// local_response header_order: .dateServerLength is the empty-body
+// no-route shape (`date, server, [connection: close,] content-length: 0`):
+// requires `body: b""` and `content_type` absent, 4xx/5xx status only.
+unmatched { return local_response({
+    version: .http11, status: 404, reason: "Not Found", server: "envoy",
+    date: .current, connection: .request, connection_header: .closeOnly,
+    header_names: .lowercase, header_order: .dateServerLength,
+    head_mode: .suppressBody, body: b""
+}) }
+// local_response header_order: .lengthTypeDateServer is the bodied
+// shape (`content-length, content-type, date, server, [connection: close]`):
+// follows the fixed-order layout's content_type/body rules on a 4xx/5xx
+// status (content_type required, body may be non-empty).
+//
+// failure_policy accepts the same `length_type_date_server` layout, and only
+// it: status 503 is admitted paired with it and a non-empty body (Envoy's
+// connect-failure representation); 502 stays exactly the fixed-order-only
+// contract above. timeout_failure_policy stays fixed-order-only (400..599).
+return forward(users, failure_policy: {
+    version: .http11, status: 503, reason: "Service Unavailable",
+    content_type: "text/plain", server: "envoy", date: .current,
+    connection: .request, connection_header: .closeOnly,
+    header_names: .lowercase, header_order: .lengthTypeDateServer,
+    body: b"upstream connect error or disconnect/reset before headers. reset reason: remote connection failure"
+})
 
 // Explicit request-derived redirects are fully specified (no defaults). The
 // first source slice accepts the generic Redirect terminator in the existing
