@@ -12682,7 +12682,9 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                        response_read_deadline_route_method_matches(explicit_method,
                                                                    explicit_route_method)) &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
-            resp.content_length <= complete_content_length_declared_body_cap(explicit_buffering) &&
+            resp.content_length <=
+                complete_content_length_declared_body_cap(
+                    explicit_buffering, complete_content_length_classification.response_class) &&
             raw_total - raw_header_end <= resp.content_length;
         const bool strict_positive_streaming_get =
             strict_common && resp.status_code == 200 && !fixed_upload &&

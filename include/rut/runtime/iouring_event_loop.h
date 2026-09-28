@@ -4572,13 +4572,20 @@ public:
             !response_read_deadline_route_method_matches(c.req_method,
                                                          c.response_read_deadline_route_method) ||
             declared_body == 0 || raw_header_end == 0 ||
-            raw_header_end > c.buffered_response_len() ||
-            declared_body >
-                complete_content_length_declared_body_cap(c.response_read_deadline_buffering) ||
-            c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0 ||
+            raw_header_end > c.buffered_response_len() || c.response_header_buf.data() == nullptr ||
+            c.response_header_buf.len() == 0 ||
             c.response_header_buf.len() > c.response_header_buf.capacity() ||
             !complete_content_length_raw_origin_matches_pinned(
-                c, raw_header_end, declared_body, &classification))
+                c, raw_header_end, declared_body, &classification) ||
+            // The lifted Bounded cap only applies to the one class Bounded can
+            // ever actually release early (BoundedPositiveBody) — see the cap's
+            // own comment. A coherent 206 range keeps CompleteContentLength's
+            // 1 MiB cap even under Bounded, matching try_advance_bounded_release
+            // (which is a no-op for it) and the read-ahead pause exclusion
+            // below: it is never releasable, so it must stay bounded exactly
+            // like CompleteContentLength, not admit up to ~4 GiB.
+            declared_body > complete_content_length_declared_body_cap(
+                                c.response_read_deadline_buffering, classification.response_class))
             return false;
         const u32 initial_body = c.buffered_response_len() - raw_header_end;
         if (initial_body > declared_body) return false;
@@ -5447,11 +5454,18 @@ public:
             return false;
         // Bounded read-ahead: same accounting as settle_response_read_deadline_batch's
         // general branch, without the bulk/direct-recv switch this narrow
-        // precise-timer profile never grows into.
+        // precise-timer profile never grows into. Excludes CoherentSingleRange206,
+        // exactly like try_advance_bounded_release above: bounded_released never
+        // advances for that class (it is never releasable), so this condition
+        // would otherwise eventually go true and pause the recv with no release
+        // ever able to bring it back down — a permanent hang, not a pause.
         const bool bounded_read_ahead_full =
-            bounded && c.response_read_deadline_post_commit_origin_received -
-                               c.response_read_deadline_bounded_released >=
-                           kBoundedReadAheadBytes;
+            bounded &&
+            c.response_read_deadline_post_commit_response_class ==
+                CompleteContentLengthResponseClass::BoundedPositiveBody &&
+            c.response_read_deadline_post_commit_origin_received -
+                    c.response_read_deadline_bounded_released >=
+                kBoundedReadAheadBytes;
         if (owner.saw_terminal && !c.upstream_recv_armed) {
             if (bounded_read_ahead_full) {
                 c.response_read_deadline_bounded_read_ahead_paused = true;
@@ -5800,11 +5814,19 @@ public:
                 // releases catch back up). The inactivity timer is suspended
                 // for the duration too — nginx does not time out reads it
                 // isn't performing — and re-armed with a fresh full timeout
-                // on resume.
+                // on resume. Excludes CoherentSingleRange206 — see the
+                // identical exclusion and its comment in
+                // settle_precise_complete_content_length_buffering above:
+                // bounded_released never advances for that class, so an
+                // unqualified "bounded" gate here would pause the recv and
+                // then never have a release left to resume it.
                 const bool bounded_read_ahead_full =
-                    bounded && c.response_read_deadline_post_commit_origin_received -
-                                       c.response_read_deadline_bounded_released >=
-                                   kBoundedReadAheadBytes;
+                    bounded &&
+                    c.response_read_deadline_post_commit_response_class ==
+                        CompleteContentLengthResponseClass::BoundedPositiveBody &&
+                    c.response_read_deadline_post_commit_origin_received -
+                            c.response_read_deadline_bounded_released >=
+                        kBoundedReadAheadBytes;
                 if (owner.saw_terminal && !c.upstream_recv_armed) {
                     if (bounded_read_ahead_full) {
                         c.response_read_deadline_bounded_read_ahead_paused = true;

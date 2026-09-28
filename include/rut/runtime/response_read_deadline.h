@@ -86,20 +86,31 @@ static constexpr u32 kBoundedHoldTimeoutMicros = 200u;
 // admission keeps the existing 1 MiB ResponseBodyChain::kMaxBody cap. Bounded
 // releases whole buffers as they arrive and pauses the upstream recv at
 // kBoundedReadAheadBytes, so memory stays bounded regardless of how large the
-// declared Content-Length is — lift the cap for it.
+// declared Content-Length is — lift the cap for it, but only for the one
+// response class Bounded can ever actually release early
+// (BoundedPositiveBody, see try_advance_bounded_release). A coherent 206
+// range (CoherentSingleRange206) keeps the untouched, complete-buffered-only
+// path — try_advance_bounded_release is a no-op for it and
+// bounded_released never advances — so it must stay bounded exactly like
+// CompleteContentLength: the lifted cap combined with the (excluded, see the
+// read-ahead pause sites) memory bound would otherwise let it buffer without
+// limit.
 //
-// Lifting it to UINT32_MAX outright would be unsafe: raw-stream positions
-// such as (header + bounded_released) and (response_header_buf.len() +
-// released) are u32 and must never wrap. header is bounded by
-// upstream_recv_buf's fixed SlicePool::kSliceSize capacity (see
-// strict_positive_complete_buffering's raw_header_end <=
-// upstream_recv_buf.capacity() admission check), so leaving exactly that
-// much headroom below UINT32_MAX guarantees header + declared_body can never
-// exceed UINT32_MAX for any admitted response — the simplest correct fix,
-// versus widening every raw-stream offset to u64/i64.
-inline u32 complete_content_length_declared_body_cap(ForwardResponseBufferingMode mode) {
-    return mode == ForwardResponseBufferingMode::Bounded ? UINT32_MAX - SlicePool::kSliceSize
-                                                         : ResponseBodyChain::kMaxBody;
+// Lifting it to UINT32_MAX outright would also be unsafe even for
+// BoundedPositiveBody: raw-stream positions such as (header +
+// bounded_released) and (response_header_buf.len() + released) are u32 and
+// must never wrap. header is bounded by upstream_recv_buf's fixed
+// SlicePool::kSliceSize capacity (see strict_positive_complete_buffering's
+// raw_header_end <= upstream_recv_buf.capacity() admission check), so
+// leaving exactly that much headroom below UINT32_MAX guarantees header +
+// declared_body can never exceed UINT32_MAX for any admitted response — the
+// simplest correct fix, versus widening every raw-stream offset to u64/i64.
+inline u32 complete_content_length_declared_body_cap(
+    ForwardResponseBufferingMode mode, CompleteContentLengthResponseClass response_class) {
+    return mode == ForwardResponseBufferingMode::Bounded &&
+                   response_class == CompleteContentLengthResponseClass::BoundedPositiveBody
+               ? UINT32_MAX - SlicePool::kSliceSize
+               : ResponseBodyChain::kMaxBody;
 }
 
 inline bool response_read_deadline_http_date_is_normalized(Str value) {
@@ -2326,10 +2337,11 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.response_read_deadline_post_commit_declared_body == 0 ||
         c.response_read_deadline_post_commit_raw_header_end > c.upstream_recv_buf.capacity() ||
         c.response_read_deadline_post_commit_declared_body >
-            (complete_buffering
-                 ? complete_content_length_declared_body_cap(c.response_read_deadline_buffering)
-                 : c.upstream_recv_buf.capacity() -
-                       c.response_read_deadline_post_commit_raw_header_end) ||
+            (complete_buffering ? complete_content_length_declared_body_cap(
+                                      c.response_read_deadline_buffering,
+                                      c.response_read_deadline_post_commit_response_class)
+                                : c.upstream_recv_buf.capacity() -
+                                      c.response_read_deadline_post_commit_raw_header_end) ||
         c.response_read_deadline_post_commit_origin_received >
             c.response_read_deadline_post_commit_declared_body ||
         c.response_read_deadline_post_commit_downstream_completed >

@@ -61602,7 +61602,9 @@ TEST(response_buffering_runtime,
      bounded_declared_body_cap_leaves_header_headroom_and_rejects_the_next_value) {
     static constexpr u32 kCap = UINT32_MAX - SlicePool::kSliceSize;
     REQUIRE_EQ(kCap,
-               complete_content_length_declared_body_cap(ForwardResponseBufferingMode::Bounded));
+               complete_content_length_declared_body_cap(
+                   ForwardResponseBufferingMode::Bounded,
+                   CompleteContentLengthResponseClass::BoundedPositiveBody));
     for (const u32 declared : {kCap, kCap + 1u}) {
         const bool overflow = declared > kCap;
         ScopedIoUringLoopForRetirement guard;
@@ -61640,6 +61642,95 @@ TEST(response_buffering_runtime,
             cleanup_prebuilt_d2(loop, fixture);
         }
     }
+}
+
+// Regression test for issue #4: a coherent single-range 206
+// (CompleteContentLengthResponseClass::CoherentSingleRange206) is
+// non-releasable under Bounded — try_advance_bounded_release is a no-op for
+// it, so bounded_released never advances. The 512 KiB read-ahead pause must
+// therefore never engage for this class: try_advance_bounded_release's
+// resume branch is unreachable for the same reason (it, too, no-ops
+// immediately for this class), so pausing here would stop arming reads and
+// never resume — a permanent hang, not a pause.
+TEST(response_buffering_runtime,
+     bounded_coherent_206_never_pauses_the_upstream_recv_past_the_read_ahead_threshold) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/5));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+    // A single-range 206 body whose first chunk alone crosses
+    // kBoundedReadAheadBytes (512 KiB) of unreleased bytes while the response
+    // is still incomplete (kChunk < kDeclared) — still fits
+    // CompleteContentLength's 1 MiB cap (issue #3's fix keeps this class at
+    // that cap even under Bounded).
+    static constexpr u32 kDeclared = 700000;
+    static constexpr u32 kChunk = 600000;
+    char header[128];
+    const int n = snprintf(header,
+                           sizeof(header),
+                           "HTTP/1.1 206 Partial Content\r\nContent-Length: %u\r\n"
+                           "Content-Range: bytes 0-%u/1000000\r\n\r\n",
+                           kDeclared,
+                           kDeclared - 1u);
+    REQUIRE_GT(n, 0);
+    REQUIRE_LT(static_cast<u32>(n), sizeof(header));
+    const u32 header_len = static_cast<u32>(n);
+    REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(header), header_len),
+               header_len);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(header), header_len, &response),
+               ParseStatus::Complete);
+    REQUIRE_EQ(response.status_code, 206u);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent header_event = response_read_copy_event(conn, header_len, true, 0, header_len);
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_response_class,
+               CompleteContentLengthResponseClass::CoherentSingleRange206);
+    conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+    conn.response_read_deadline_progress_episode = conn.upstream_episode;
+    conn.response_read_deadline_progress_bytes =
+        conn.response_read_deadline_post_commit_origin_received;
+    loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    // One recv lands a still-incomplete chunk. bounded_released never
+    // advances for this class, so pre-fix this crosses the read-ahead
+    // threshold and pauses the recv with nothing ever able to resume it —
+    // and the response is not yet complete, so this cannot instead take the
+    // CompleteBody disposition.
+    static std::vector<u8> chunk(kChunk, 'x');
+    const u32 begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk.data(), kChunk));
+    const u32 end = conn.buffered_response_len();
+    IoEvent body_event =
+        response_read_copy_event(conn, static_cast<i32>(kChunk), /*more=*/false, begin, end);
+    body_event.sock_nonempty = 0;
+    loop->dispatch_batch(&body_event, 1);
+
+    // Fixed behavior: never paused, recv re-armed exactly as
+    // CompleteContentLength would — this class keeps the untouched,
+    // complete-buffered-only path.
+    CHECK_FALSE(conn.response_read_deadline_bounded_read_ahead_paused);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.response_read_deadline_bounded_released, 0u);
+
+    cleanup_prebuilt_d2(loop, fixture);
 }
 
 TEST(response_buffering_runtime,
