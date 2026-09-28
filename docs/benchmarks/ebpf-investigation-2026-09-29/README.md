@@ -913,3 +913,17 @@ All four traces are usable, preserve target process identity, and have zero warm
 | c32 | 398.864 us | 7.691 us |
 
 The c32 reduction supports eliminating delayed FIN while awaiting asynchronous completion. Instrumented throughput is not acceptance evidence. Corrected reverse-order uninstrumented results are archived separately from the incorrect first prototype. Formal nginx comparison remains pending.
+
+Corrected forward-order controls also completed with 28 valid samples, exact-body checks and zero warm/load errors:
+
+| Case | Mean RPS change |
+|---|---:|
+| 1024-c1-close | +2.22% |
+| 1024-c32-close | +14.03% |
+| 16-c1-close | +1.95% |
+| 16-c1-keepalive | -0.96% |
+| 16-c32-close | +13.96% |
+| 65536-c1-close | -0.08% |
+| 65536-c1-keepalive | -0.71% |
+
+Both orders retain the closing-small-response gain; excluded-path controls show up to about 1% negative variation. The nginx 12-coordinate acceptance run has now started. Runtime retention awaits its result and formatting gate.
