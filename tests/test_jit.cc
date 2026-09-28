@@ -21656,6 +21656,7 @@ TEST(jit, art_segment_prefix_terminal_boundaries) {
         CHECK_EQ(trie.match_canonical_key(path, key), c.expected);
         CHECK_EQ(fn(path.ptr, path.len, key), c.expected);
     }
+    engine.shutdown();
 }
 
 TEST(jit, art_segment_boundary_at_unreadable_page) {
@@ -21690,4 +21691,5 @@ TEST(jit, art_segment_boundary_at_unreadable_page) {
     CHECK_EQ(fn(end - 3, 3, key), 1u);
     CHECK_EQ(fn(end, 0, key), TrieNode::kInvalidRoute);
     CHECK_EQ(trie.match_canonical_key({end - 3, 3}, key), 1u);
+    engine.shutdown();
 }
