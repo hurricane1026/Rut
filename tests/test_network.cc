@@ -60524,6 +60524,37 @@ TEST(response_read_deadline_get_304_metadata,
     cleanup_prebuilt_d2(loop, fixture);
 }
 
+TEST(response_read_deadline_get_304_metadata,
+     bounded_one_shot_incomplete_header_preserves_initial_timeout) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    REQUIRE(config.policy_bundle_id_is_valid(conn.response_read_deadline_bundle_id));
+    config.policy_bundles[conn.response_read_deadline_bundle_id - 1].response_buffering =
+        ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_first_batch_buffering = ForwardResponseBufferingMode::Bounded;
+    const u32 timer_generation = conn.response_read_timer_owner_generation;
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nX-Progress: incomplete\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+               sizeof(kPartial) - 1u);
+    const IoEvent progress = response_read_copy_event(
+        conn, sizeof(kPartial) - 1u, /*more=*/false, 0, sizeof(kPartial) - 1u);
+    loop->dispatch_batch(&progress, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK_EQ(conn.response_read_timer_owner_generation, timer_generation);
+    CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::Armed);
+    CHECK_EQ(conn.resp_status, 0u);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
 // Same-batch safety must hold for Bounded too: prepare_response_read_deadline_batch
 // folds every UpstreamRecv CQE for this upstream_episode into the owner before
 // any dispatch runs, so a real close landing in the same wait() batch as the

@@ -12479,9 +12479,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 }
                 return;
             }
-            // Every other terminal incomplete response has consumed its only
-            // proven Recv owner and remains fail-closed.
-            if (exact_terminal_response_recv) {
+            // The bodyless GET profile can still receive an incomplete header
+            // on Bounded's one-shot recv. Its exact terminal proof is needed
+            // only after parsing a complete 304; while incomplete, rearm the
+            // recv and retain the initial read deadline.
+            if (exact_terminal_response_recv && !bodyless_304_candidate) {
                 disarm_explicit_deadline();
                 loop->close_conn(conn);
                 return;
