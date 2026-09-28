@@ -1,0 +1,80 @@
+[
+  {
+    "case": "16-c1-close-nginx",
+    "usable": true,
+    "maps": {
+      "@front_read_to_front_send_count": {
+        "2758009": 59394
+      },
+      "@front_read_to_front_send_ns": {
+        "2758009": 4563295799
+      },
+      "@front_read_to_upstream_send_count": {
+        "2758009": 59394
+      },
+      "@front_read_to_upstream_send_ns": {
+        "2758009": 1969199277
+      },
+      "@tcp_close_count": {
+        "2758009,2": 59394,
+        "2758009,1": 59396
+      },
+      "@tcp_close_elapsed_ns": {
+        "2758009,1": 180748152,
+        "2758009,2": 666819254
+      },
+      "@upstream_read_to_front_send_count": {
+        "2758009": 59394
+      },
+      "@upstream_read_to_front_send_ns": {
+        "2758009": 1117260888
+      },
+      "@upstream_send_to_read_count": {
+        "2758009": 59394
+      },
+      "@upstream_send_to_read_ns": {
+        "2758009": 1495962407
+      }
+    }
+  },
+  {
+    "case": "16-c1-close-rut-base",
+    "usable": true,
+    "maps": {
+      "@front_read_to_front_send_count": {
+        "2758262": 59628
+      },
+      "@front_read_to_front_send_ns": {
+        "2758262": 4687757272
+      },
+      "@front_read_to_upstream_send_count": {
+        "2758262": 59628
+      },
+      "@front_read_to_upstream_send_ns": {
+        "2758262": 1986147213
+      },
+      "@tcp_close_count": {
+        "2758262,0": 692,
+        "2758262,1": 58938,
+        "2758262,2": 59628
+      },
+      "@tcp_close_elapsed_ns": {
+        "2758262,0": 844886,
+        "2758262,1": 43558160,
+        "2758262,2": 653220975
+      },
+      "@upstream_read_to_front_send_count": {
+        "2758262": 59628
+      },
+      "@upstream_read_to_front_send_ns": {
+        "2758262": 1253634510
+      },
+      "@upstream_send_to_read_count": {
+        "2758262": 59628
+      },
+      "@upstream_send_to_read_ns": {
+        "2758262": 1466296588
+      }
+    }
+  }
+]

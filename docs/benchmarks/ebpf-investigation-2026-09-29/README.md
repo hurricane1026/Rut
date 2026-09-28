@@ -749,3 +749,7 @@ Both traces usable, identity stable, exact-body preflight passed, zero warm/load
 | 16-c1-close-rut-base | 33.468 | 24.419 | 20.328 | 77.910 |
 
 The three stage means should sum closely to the full interval; probe execution between timestamps adds small overhead. Instrumented timings do not substitute for an uninstrumented throughput comparison.
+
+## Upstream TCP close timing control
+
+HTTP 16 B c1 close, both traces usable with exact-body and zero warm/load error checks. Mean inclusive upstream tcp_close elapsed time is 11.227 us for nginx and 10.955 us for Rut. Front read→send is 76.831/78.617 us and upstream read→front send is 18.811/21.024 us respectively. These traces do not support slower upstream close as the cause of Rut’s response-stage gap. Close time is an inclusive kernel interval, not CPU time; asynchronous close could also run outside the response-stage interval, so subtraction is not a proof of userspace overhead. Runtime retirement ordering remains unchanged.
