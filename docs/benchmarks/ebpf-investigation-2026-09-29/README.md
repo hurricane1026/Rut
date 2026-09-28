@@ -996,3 +996,9 @@ All 28 reverse-order samples are valid with clean warm/load checks.
 | 65536-c1-keepalive | +0.05% |
 
 The c32 gains do not repeat and reverse into regressions; c1 effects remain near noise. Revert the runtime prototype and its added differential test, preserving the complete patch, passing parser tests and both causal orders. No full network test or retention is claimed. The frozen vector binary is diagnostic only; the accepted runtime remains 271cd98c / rut-combined-fin-ordered.
+
+## First Bounded plaintext header direct-recv prototype
+
+The initial validated header owner can receive directly into its pinned upstream_recv_buf, capped at the existing one-shot ring limit and using POLL_FIRST. It records destination, length, episode and deadline generation. The backend does not release that ownership for a foreign episode; the matching terminal CQE checks destination, bound, generation and pre-header phase before committing. Subsequent fragmented-header reads keep the existing provided-buffer path. Body and TLS recv selection are unchanged.
+
+All existing 1425 network tests / 371796 checks pass. An additional target-ownership test (foreign episode followed by correct completion, pointer/generation drift, cancellation) is queued for build; it was not included in the preceding full run. The first causal benchmark compares against the accepted FIN runtime. No retention or performance claim yet.

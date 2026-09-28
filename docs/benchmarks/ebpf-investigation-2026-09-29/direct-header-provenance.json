@@ -1,0 +1,8 @@
+{
+  "runtime_base": "271cd98c",
+  "candidate_sha256": "7e67936deb04bac4842a2a1fff7930111ff81426271aa9091264865ecab217d8",
+  "existing_network_tests": 1425,
+  "existing_network_checks": 371796,
+  "new_target_test": "queued; not included in existing network run",
+  "performance": "first causal order running"
+}

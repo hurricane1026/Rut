@@ -1,0 +1,226 @@
+diff --git a/include/rut/runtime/connection_base.h b/include/rut/runtime/connection_base.h
+index 9694a980..0f3a330d 100644
+--- a/include/rut/runtime/connection_base.h
++++ b/include/rut/runtime/connection_base.h
+@@ -1788,6 +1788,12 @@ struct ConnectionBase {
+     // not be freed or rebound: the kernel may still be writing into that
+     // exact memory. epoll never sets this.
+     bool upstream_recv_direct_armed = false;
++    // First Bounded plaintext header recv: the exact pinned destination and
++    // deadline/episode owner, retained until its terminal kernel completion.
++    u8* upstream_header_direct_dst = nullptr;
++    u32 upstream_header_direct_len = 0;
++    u32 upstream_header_direct_episode = 0;
++    u32 upstream_header_direct_generation = 0;
+ 
+     u32 buffered_response_len() const { return upstream_recv_buf.len() + response_body_tail.size; }
+     const u8* buffered_response_data() const {
+@@ -2079,6 +2085,10 @@ struct ConnectionBase {
+         upstream_recv_slice = nullptr;
+         upstream_recv_buf.bind(nullptr, 0);
+         direct_write_completion_pending = false;
++        upstream_header_direct_dst = nullptr;
++        upstream_header_direct_len = 0;
++        upstream_header_direct_episode = 0;
++        upstream_header_direct_generation = 0;
+         upstream_relay_slice = nullptr;
+         upstream_relay_send_len = 0;
+     }
+diff --git a/include/rut/runtime/io_uring_backend.h b/include/rut/runtime/io_uring_backend.h
+index 7bfc2c99..52b57b4d 100644
+--- a/include/rut/runtime/io_uring_backend.h
++++ b/include/rut/runtime/io_uring_backend.h
+@@ -203,7 +203,8 @@ struct IoUringBackend {
+     // every intermediate arrival, so an origin that trickles steadily (each
+     // gap under the timeout) but fills `len` more slowly than the timeout
+     // would be expired as idle.
+-    bool add_recv_upstream_direct(i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len);
++    bool add_recv_upstream_direct(
++        i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len, bool poll_first = false);
+     // Dedicated single submission point for the bounded explicit
+     // first-response deadline.  It intentionally does not inherit the ordinary
+     // recv path's idempotent/deferred-rearm semantics.
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index e5d2680c..40ba440a 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -3728,7 +3728,28 @@ public:
+             c.h2_proxy_recv_draining || c.h2_proxy_synth_quarantined ||
+             c.pending_ops != ordinary_pending)
+             return false;
+-        if (!add_response_read_recv(c)) {
++        bool direct_header = false;
++        if (!c.tls_active &&
++            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
++            c.response_read_deadline_post_commit_phase ==
++                ResponseReadDeadlinePostCommitPhase::None &&
++            c.upstream_recv_slice != nullptr && !c.upstream_recv_direct_armed &&
++            c.upstream_header_direct_dst == nullptr && c.upstream_recv_buf.write_avail() != 0) {
++            const u32 avail = c.upstream_recv_buf.write_avail();
++            const u32 limit = backend.upstream_once_max_len();
++            const u32 len = avail < limit ? avail : limit;
++            u8* dst = c.upstream_recv_buf.write_ptr();
++            direct_header = backend.add_recv_upstream_direct(
++                c.upstream_fd, c.id, c.upstream_episode, dst, len, true);
++            if (direct_header) {
++                c.upstream_recv_direct_armed = true;
++                c.upstream_header_direct_dst = dst;
++                c.upstream_header_direct_len = len;
++                c.upstream_header_direct_episode = c.upstream_episode;
++                c.upstream_header_direct_generation = c.response_read_deadline_generation;
++            }
++        }
++        if (!direct_header && !add_response_read_recv(c)) {
+             c.clear_response_read_deadline();
+             return false;
+         }
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index fb5132ee..8ab64ea5 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -546,7 +546,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
+ }
+ 
+ bool IoUringBackend::add_recv_upstream_direct(
+-    i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len) {
++    i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len, bool poll_first) {
+     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
+         dst == nullptr || len == 0)
+         return false;
+@@ -558,6 +558,7 @@ bool IoUringBackend::add_recv_upstream_direct(
+     sqe->fd = fd;
+     sqe->addr = reinterpret_cast<u64>(dst);
+     sqe->len = len;
++    if (poll_first) sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
+     // msg_flags stays 0 (memset above): no MSG_WAITALL, see the declaration.
+     // No IOSQE_BUFFER_SELECT / buf_group: the kernel writes straight into
+     // dst, so this CQE never carries IORING_CQE_F_BUFFER. wait() recognizes
+@@ -1670,8 +1671,23 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
+         // release_upstream_relay_slice, take_relay_recv_buffer) safely reuse
+         // that buffer once dispatch observes this event.
+         if (type == IoEventType::UpstreamRecv && aux == 0 && conns != nullptr &&
+-            conn_id < max_conns && conns[conn_id].upstream_recv_direct_armed) {
++            conn_id < max_conns && conns[conn_id].upstream_recv_direct_armed &&
++            (conns[conn_id].upstream_header_direct_dst == nullptr ||
++             upstream_episode == conns[conn_id].upstream_header_direct_episode)) {
+             Connection& conn = conns[conn_id];
++            const bool header_direct = conn.upstream_header_direct_dst != nullptr;
++            const u32 header_direct_len = conn.upstream_header_direct_len;
++            const bool header_target_stable =
++                !header_direct ||
++                (conn.upstream_header_direct_dst == conn.upstream_recv_buf.write_ptr() &&
++                 header_direct_len <= conn.upstream_recv_buf.write_avail() &&
++                 conn.upstream_header_direct_generation == conn.response_read_deadline_generation &&
++                 conn.response_read_deadline_post_commit_phase ==
++                     ResponseReadDeadlinePostCommitPhase::None);
++            conn.upstream_header_direct_dst = nullptr;
++            conn.upstream_header_direct_len = 0;
++            conn.upstream_header_direct_episode = 0;
++            conn.upstream_header_direct_generation = 0;
+             conn.upstream_recv_direct_armed = false;
+ 
+             // Mirrors the #4 provided-buffer branch's staleness/deadline
+@@ -1686,7 +1702,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
+                 conn.response_read_deadline_owner_generation != 0 &&
+                 conn.response_read_deadline_owner_generation ==
+                     conn.response_read_deadline_generation;
+-            bool stale_direct = upstream_episode == 0 || upstream_episode != conn.upstream_episode;
++            bool stale_direct = !header_target_stable || upstream_episode == 0 ||
++                                upstream_episode != conn.upstream_episode;
+             bool deadline_owner = false;
+             if (!stale_direct) {
+                 deadline_owner =
+@@ -1715,16 +1732,16 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
+             // Both destinations were sized to exactly write_avail() at arm
+             // time and stay pinned until this CQE, so the same bound and
+             // commit shape apply — only which buffer differs.
+-            const bool targets_chain =
+-                response_pool != nullptr && conn.response_read_deadline_post_commit_phase ==
+-                                                ResponseReadDeadlinePostCommitPhase::Buffering;
++            const bool targets_chain = !header_direct && response_pool != nullptr &&
++                                       conn.response_read_deadline_post_commit_phase ==
++                                           ResponseReadDeadlinePostCommitPhase::Buffering;
+             i32 direct_result = cqe->res;
+             if (cqe->res > 0 && !stale_direct) {
+                 const u32 nbytes = static_cast<u32>(cqe->res);
+                 const u32 target_avail = targets_chain
+                                              ? conn.response_body_tail.write_avail(*response_pool)
+                                              : conn.upstream_recv_buf.write_avail();
+-                if (nbytes > target_avail) {
++                if (nbytes > target_avail || (header_direct && nbytes > header_direct_len)) {
+                     // A direct recv's destination length was set from write_avail()
+                     // at arm time and is pinned until this CQE; the kernel can never
+                     // legitimately report more bytes than it was asked to read.
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index 668d5d92..ffbb2517 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -36371,6 +36371,68 @@ TEST(iouring_upstream_recv, direct_recv_commits_bytes_and_rejects_stale_episode)
+     fixture.cleanup();
+ }
+ 
++TEST(iouring_upstream_recv, direct_header_target_survives_stale_episode_and_rejects_drift) {
++    for (u32 mode = 0; mode < 4; ++mode) {
++        ScopedIoUringLoopForRetirement guard;
++        if (!guard.init()) SKIP("io_uring unavailable");
++        auto* loop = guard.loop;
++        auto& backend = loop->backend;
++        OneShotRecvFixture fixture;
++        REQUIRE(fixture.stage(loop, /*plaintext=*/true));
++        Connection& conn = *fixture.conn;
++        u8* const dst = conn.upstream_recv_buf.write_ptr();
++        constexpr u32 kLen = 32;
++        REQUIRE_GE(conn.upstream_recv_buf.write_avail(), kLen);
++        conn.response_read_deadline_generation = 7;
++        REQUIRE(backend.add_recv_upstream_direct(
++            conn.upstream_fd, conn.id, conn.upstream_episode, dst, kLen, true));
++        const auto& sqe = backend.sq_entries[fixture.sq_tail_before & *backend.sq_ring_mask];
++        CHECK_EQ(sqe.addr, reinterpret_cast<u64>(dst));
++        CHECK_EQ(sqe.len, kLen);
++        CHECK_EQ(sqe.flags & IOSQE_BUFFER_SELECT, 0u);
++        CHECK_NE(sqe.ioprio & IORING_RECVSEND_POLL_FIRST, 0u);
++        conn.upstream_recv_direct_armed = true;
++        conn.upstream_recv_armed = true;
++        conn.pending_ops++;
++        conn.upstream_header_direct_dst = dst;
++        conn.upstream_header_direct_len = kLen;
++        conn.upstream_header_direct_episode = conn.upstream_episode;
++        conn.upstream_header_direct_generation = 7;
++        fixture.restore_ring();
++        backend.pending = 0;
++        auto complete = [&](i32 result, u32 episode, IoEvent* ev) {
++            const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
++            auto& cqe = backend.cq_entries[tail & *backend.cq_ring_mask];
++            cqe.user_data = encode_upstream_event_token(
++                {conn.id, IoEventType::UpstreamRecv, episode, 0});
++            cqe.res = result;
++            cqe.flags = 0;
++            __atomic_store_n(backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
++            return backend.wait(ev, 1, loop->conns, IoUringEventLoop::kMaxConns);
++        };
++        IoEvent ev{};
++        REQUIRE_EQ(complete(kLen, conn.upstream_episode + 1, &ev), 1u);
++        CHECK(conn.upstream_recv_direct_armed);
++        CHECK_EQ(conn.upstream_header_direct_dst, dst);
++        CHECK_EQ(conn.upstream_recv_buf.len(), 0u);
++        for (u32 i = 0; i < kLen; ++i) dst[i] = static_cast<u8>(i + 1);
++        if (mode == 1) conn.upstream_recv_buf.commit(1);  // write pointer drift
++        if (mode == 2) ++conn.response_read_deadline_generation;
++        REQUIRE_EQ(complete(mode == 3 ? -ECANCELED : kLen, conn.upstream_episode, &ev), 1u);
++        CHECK_FALSE(conn.upstream_recv_direct_armed);
++        CHECK_EQ(conn.upstream_header_direct_dst, nullptr);
++        CHECK_EQ(conn.upstream_header_direct_len, 0u);
++        CHECK_EQ(conn.upstream_recv_buf.len(), mode == 0 ? kLen : (mode == 1 ? 1u : 0u));
++        if (mode == 0) {
++            for (u32 i = 0; i < kLen; ++i)
++                CHECK_EQ(conn.upstream_recv_buf.data()[i], static_cast<u8>(i + 1));
++        }
++        conn.upstream_recv_armed = false;
++        conn.pending_ops--;
++        fixture.cleanup();
++    }
++}
++
+ TEST(iouring_upstream_recv, buffered_response_uses_existing_separate_multishot_ring) {
+     ScopedIoUringLoopForRetirement guard;
+     if (!guard.init()) SKIP("io_uring unavailable");
