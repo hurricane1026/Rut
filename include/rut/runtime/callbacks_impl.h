@@ -12384,13 +12384,25 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     const bool configured_head_candidate =
         (explicit_first_batch || explicit_progress_batch) &&
         explicit_profile == ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead;
+    // Bounded's header recv is one-shot (see add_response_read_recv), so a
+    // positive 304-metadata completion always retires upstream_recv_armed
+    // before begin_prebuilt_http1_response runs — unlike CCL's multishot,
+    // which stays armed. current_terminal_response_recv_is_exact proves this
+    // one-shot completion is the batch's sole, unfaulted terminal event (no
+    // hidden EOF), which begin_prebuilt_http1_response's exact_consumed_terminal
+    // then accepts in place of a live kUpstreamOpRecv target. Harmless to
+    // evaluate for CCL too: its multishot completion always carries ev.more,
+    // so the predicate is trivially false there.
+    const bool bodyless_304_candidate =
+        (explicit_first_batch || explicit_progress_batch) &&
+        explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
     bool exact_terminal_response_recv = false;
     if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
                       candidate->current_terminal_response_recv_is_exact(
                           c, event, u32{}, ResponseReadDeadlineProfile::None, u8{}, u32{});
                   }) {
         exact_terminal_response_recv =
-            configured_head_candidate &&
+            (configured_head_candidate || bodyless_304_candidate) &&
             loop->current_terminal_response_recv_is_exact(conn,
                                                           ev,
                                                           explicit_generation,

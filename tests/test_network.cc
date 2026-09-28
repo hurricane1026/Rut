@@ -60131,10 +60131,10 @@ static constexpr u8 kStrict304MetadataResponse[] =
     "\r\n";
 static_assert(sizeof(kStrict304MetadataResponse) - 1u == 120u);
 
-static IoEvent stage_strict_304_metadata_response(Connection& conn) {
+static IoEvent stage_strict_304_metadata_response(Connection& conn, bool more = true) {
     const u32 len = sizeof(kStrict304MetadataResponse) - 1u;
     if (conn.upstream_recv_buf.write(kStrict304MetadataResponse, len) != len) return {};
-    return response_read_copy_event(conn, len, true, 0, len);
+    return response_read_copy_event(conn, len, more, 0, len);
 }
 
 #ifdef __linux__
@@ -60455,6 +60455,100 @@ TEST(response_read_deadline_get_304_metadata,
             const u32 id = conn.id;
             const u32 episode = conn.upstream_episode;
             const IoEvent response = stage_strict_304_metadata_response(conn);
+            REQUIRE_GT(response.result, 0);
+            const IoEvent terminal{
+                id, terminal_result, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
+            const IoEvent events[2] = {terminal_first ? terminal : response,
+                                       terminal_first ? response : terminal};
+            loop->dispatch_batch(events, 2);
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_NE(loop->conns[id].http1_prebuilt_response_purpose,
+                     Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+            CHECK_FALSE(buf_has(loop->conns[id].response_header_buf.data(),
+                                loop->conns[id].response_header_buf.len(),
+                                "HTTP/1.1 304 Not Modified\r\n"));
+            release_closed_response_read_fixture(fixture);
+        }
+    }
+}
+
+// Bounded's header recv is one-shot (see add_response_read_recv), so its own
+// positive completion always carries !ev.more, unlike CCL's multishot header
+// recv whose ordinary positive completions carry more=true. Confirm the
+// shortcut still admits a keep-alive 304 rather than misreading the one-shot
+// recv's own terminal flag as an already-observed origin close (issue #529).
+TEST(response_read_deadline_get_304_metadata,
+     bounded_one_shot_header_recv_success_preserves_keep_alive) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    // response_read_deadline_identity_is_stable cross-checks the connection's
+    // cached buffering against the config bundle's, so both must agree.
+    REQUIRE(config.policy_bundle_id_is_valid(conn.response_read_deadline_bundle_id));
+    config.policy_bundles[conn.response_read_deadline_bundle_id - 1].response_buffering =
+        ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_first_batch_buffering = ForwardResponseBufferingMode::Bounded;
+    const IoEvent response = stage_strict_304_metadata_response(conn, /*more=*/false);
+    REQUIRE_EQ(response.result, static_cast<i32>(sizeof(kStrict304MetadataResponse) - 1u));
+    REQUIRE_FALSE(response.more);
+    loop->dispatch_batch(&response, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.resp_status, 304u);
+    CHECK_EQ(conn.http1_prebuilt_response_layout,
+             Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus);
+    CHECK_EQ(conn.http1_prebuilt_response_purpose,
+             Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "Connection: keep-alive\r\n"));
+    CHECK_FALSE(
+        buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "HTTP/1.1 200"));
+    // A one-shot recv is already fully retired by generic CQE accounting
+    // before this callback runs, so retirement tombstones trivially instead
+    // of owning a live kUpstreamOpRecv target the way CCL's multishot does.
+    CHECK_FALSE(conn.upstream_retirement_active);
+    CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+
+    drain_strict_304_timer_cancel(_tc, loop, conn, true);
+    complete_prebuilt_d2_header(loop, conn);
+    REQUIRE(conn.http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK_GE(conn.fd, 0);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+// Same-batch safety must hold for Bounded too: prepare_response_read_deadline_batch
+// folds every UpstreamRecv CQE for this upstream_episode into the owner before
+// any dispatch runs, so a real close landing in the same wait() batch as the
+// one-shot header recv's positive completion is still visible via
+// owner.terminal_fault and must not be admitted as a keep-alive shortcut.
+TEST(response_read_deadline_get_304_metadata,
+     bounded_one_shot_clean_eof_or_recv_error_in_completion_batch_fails_closed) {
+    for (const i32 terminal_result : {0, -ECONNRESET}) {
+        for (const bool terminal_first : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_get(loop, config, &fixture));
+            Connection& conn = *fixture.conn;
+            REQUIRE(config.policy_bundle_id_is_valid(conn.response_read_deadline_bundle_id));
+            config.policy_bundles[conn.response_read_deadline_bundle_id - 1].response_buffering =
+                ForwardResponseBufferingMode::Bounded;
+            conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+            conn.response_read_deadline_first_batch_buffering =
+                ForwardResponseBufferingMode::Bounded;
+            const u32 id = conn.id;
+            const u32 episode = conn.upstream_episode;
+            const IoEvent response = stage_strict_304_metadata_response(conn, /*more=*/false);
             REQUIRE_GT(response.result, 0);
             const IoEvent terminal{
                 id, terminal_result, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};

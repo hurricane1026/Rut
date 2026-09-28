@@ -1602,6 +1602,23 @@ public:
     // The strict no-body metadata success is evidenced only while the origin's
     // Recv remains live. A later EOF/error already present in this wait batch
     // cannot be hidden by dispatching the complete positive header first.
+    //
+    // Bounded's header recv is one-shot (see add_response_read_recv), so its
+    // own positive completion always carries !ev.more and therefore always
+    // sets owner.saw_terminal, even though the origin never closed — a
+    // one-shot SQE yields exactly one CQE, so "terminal" here just means
+    // "this recv slot retired", not "the connection closed". Unlike CCL's
+    // multishot header recv, this one-shot can never have a second,
+    // EOF-carrying CQE for the same SQE folded into the same owner, so there
+    // is no batch-local EOF for a positive one-shot completion to hide: the
+    // batch pre-pass (see prepare_response_read_deadline_batch) has already
+    // folded every UpstreamRecv CQE for this upstream_episode into the owner
+    // before any dispatch runs, so a real same-batch close — however it
+    // arrived — still lands in owner.terminal_fault regardless of event
+    // order, and is still rejected below. A close that lands in a later wait()
+    // batch is symmetric with CCL: neither buffering mode can see it yet, and
+    // the upstream fd is closed unconditionally once the shortcut commits
+    // (begin_prebuilt_http1_response), so no stale "open" belief survives.
     [[nodiscard]] bool current_response_read_batch_keeps_origin_open(const Connection& c,
                                                                      const IoEvent& ev) const {
         if (response_read_batch_event_index >= response_read_batch_event_count ||
@@ -1611,12 +1628,15 @@ public:
         const u16 owner_index = response_read_batch_event_owner[response_read_batch_event_index];
         if (owner_index == 0 || owner_index > response_read_batch_owner_count) return false;
         const auto& owner = response_read_batch_owners[owner_index - 1u];
+        const bool bounded_one_shot_terminal_is_not_a_close =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            owner.positive_terminal && !owner.terminal_fault;
         return owner.valid && owner.conn_id == c.id &&
                owner.deadline_generation == c.response_read_deadline_generation &&
                owner.profile == c.response_read_deadline_profile &&
                owner.method == c.response_read_deadline_method &&
                owner.upstream_episode == c.upstream_episode && owner.saw_positive &&
-               !owner.saw_terminal;
+               (!owner.saw_terminal || bounded_one_shot_terminal_is_not_a_close);
     }
 
     // Advance an exact, owner-free episode into the persistent tombstone. This
@@ -1705,16 +1725,22 @@ public:
                 ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
             c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::ConfiguredForwardFailure;
-        const bool exact_consumed_terminal = selected_targets == 0 &&
-                                             consumed_terminal != nullptr &&
-                                             (strict_head || configured_forward_failure) &&
-                                             current_terminal_response_recv_is_exact(
-                                                 c,
-                                                 *consumed_terminal,
-                                                 c.http1_prebuilt_deadline_generation,
-                                                 c.http1_prebuilt_deadline_profile,
-                                                 c.http1_prebuilt_deadline_method,
-                                                 c.http1_prebuilt_deadline_upload.upload_episode);
+        // Bounded's header recv is one-shot, so it has already fully retired
+        // (upstream_recv_armed cleared by generic CQE accounting) by the time
+        // a strict_no_body_metadata (304) shortcut commits — unlike CCL's
+        // multishot header recv, which stays armed through its positive
+        // completion. Accept the same exact-tombstone proof strict_head and
+        // configured_forward_failure already use in that shape.
+        const bool exact_consumed_terminal =
+            selected_targets == 0 && consumed_terminal != nullptr &&
+            (strict_head || configured_forward_failure || strict_no_body_metadata) &&
+            current_terminal_response_recv_is_exact(
+                c,
+                *consumed_terminal,
+                c.http1_prebuilt_deadline_generation,
+                c.http1_prebuilt_deadline_profile,
+                c.http1_prebuilt_deadline_method,
+                c.http1_prebuilt_deadline_upload.upload_episode);
         const bool header_only_head_timeout =
             c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
             c.http1_prebuilt_response_purpose ==
