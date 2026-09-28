@@ -65540,6 +65540,68 @@ TEST(response_buffering_runtime,
     }
 }
 
+TEST(response_buffering_runtime, bounded_combined_final_write_accounts_after_peer_eof) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(
+        stage_strict_read_timeout_method(loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+    Connection& conn = *fixture.conn;
+    conn.response_read_deadline_route_method = kRouteMethodGet;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    conn.keep_alive = false;
+    conn.req_keep_alive = true;
+    conn.req_client_keep_alive = false;
+    conn.req_client_connection_close = true;
+    conn.req_client_connection_close_exact = true;
+    conn.req_client_connection_count = 1;
+    conn.response_read_deadline_upload.downstream_close = true;
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nAb9!";
+    constexpr u32 kOriginLen = sizeof(kOrigin) - 1;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, kOriginLen), kOriginLen);
+    const IoEvent response = response_read_copy_event(conn, kOriginLen, false, 0, kOriginLen);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::CombinedSend);
+    REQUIRE(conn.direct_write_completion_pending);
+    REQUIRE(conn.send_armed);
+    REQUIRE(conn.response_read_deadline_send_owner_active);
+    CHECK_EQ(metrics.requests_total, 0u);
+    const u32 length = conn.response_read_deadline_send_len;
+    u8 wire[4096]{};
+    REQUIRE_LT(length, sizeof(wire));
+    REQUIRE_EQ(recv(fixture.peer_fd, wire, sizeof(wire), MSG_DONTWAIT),
+               static_cast<ssize_t>(length));
+    CHECK_EQ(__builtin_memcmp(wire, conn.response_header_buf.data(), length), 0);
+    CHECK_EQ(recv(fixture.peer_fd, wire, sizeof(wire), MSG_DONTWAIT), 0);
+    const u32 id = conn.id;
+    const IoEvent peer_eof{id, 0, 0, 0, IoEventType::Recv, 0};
+    loop->dispatch_batch(&peer_eof, 1);
+    CHECK_GE(conn.fd, 0);
+    CHECK(conn.direct_write_completion_pending);
+    CHECK_EQ(metrics.requests_total, 0u);
+    const IoEvent sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&sent, 1);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop->conns[id].fd, -1);
+    const u32 pending = loop->conns[id].pending_ops;
+    loop->dispatch_batch(&sent, 1);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop->conns[id].pending_ops, pending);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
 TEST(response_buffering_runtime,
      complete_body_uses_one_combined_send_and_keeps_the_origin_frame_until_completion) {
     for (const bool downstream_close : {false, true}) {
