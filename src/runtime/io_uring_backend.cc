@@ -545,7 +545,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
 }
 
 bool IoUringBackend::add_recv_upstream_direct(
-    i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len, bool wait_all) {
+    i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
         dst == nullptr || len == 0)
         return false;
@@ -557,13 +557,7 @@ bool IoUringBackend::add_recv_upstream_direct(
     sqe->fd = fd;
     sqe->addr = reinterpret_cast<u64>(dst);
     sqe->len = len;
-    // MSG_WAITALL: without it, a one-shot recv completes as soon as any
-    // bytes are readable (one loopback skb, ~64 KiB), not once `len` bytes
-    // have arrived — so a 256 KiB bulk-sized target would still cost several
-    // CQEs/re-arms despite never copying. The kernel still completes on
-    // close/error (short count, no hang); the caller sizes `len` to exactly
-    // what it's willing to wait for (see this function's declaration).
-    sqe->msg_flags = wait_all ? static_cast<u32>(MSG_WAITALL) : 0u;
+    // msg_flags stays 0 (memset above): no MSG_WAITALL, see the declaration.
     // No IOSQE_BUFFER_SELECT / buf_group: the kernel writes straight into
     // dst, so this CQE never carries IORING_CQE_F_BUFFER. wait() recognizes
     // it by Connection::upstream_recv_direct_armed rather than by opcode.
@@ -1651,8 +1645,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                                     cqe->user_data == last_read_owner_token) ||
                                    response_deadline_copy_owner(conn, upstream_episode, aux));
 
-            // Part B (path 3): a response_read_deadline connection buffering
-            // a complete body targets the ResponseBodyChain tail instead of
+            // A response_read_deadline connection in Buffering phase
+            // targets the ResponseBodyChain tail instead of
             // upstream_recv_buf (see arm_response_read_direct_body_recv).
             // Both destinations were sized to exactly write_avail() at arm
             // time and stay pinned until this CQE, so the same bound and

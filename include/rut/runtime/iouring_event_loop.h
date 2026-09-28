@@ -1481,25 +1481,19 @@ public:
                 c.response_read_deadline_buffering));
     }
 
-    // Part B (path 3): once a CompleteContentLength body has proven large —
-    // response_body_tail.size crossed the bulk_after threshold — the
-    // remainder recvs straight into the chain's tail node instead of through
-    // the large provided-buffer ring, so a 256 KiB chunk costs one CQE and no
-    // ring-to-buffer copy. Called only from try_deferred_upstream_rearm,
-    // once the multishot recv that settle_response_read_deadline_batch
-    // cancelled to request this has fully drained. Bounds the recv to
-    // exactly the remaining declared body, so — unlike the provided-buffer
-    // path — a direct body recv can never read past the response.
+    // A one-shot recv of the rest of a buffered Content-Length body
+    // straight into the chain's tail node, with no provided-buffer copy.
+    // It is only ever armed as the connection's first body recv, never as a
+    // mid-body replacement for a cancelled provided-buffer recv: that switch
+    // dropped the connection when the origin was still sending. Bounded
+    // response buffering is the caller. The recv never reads past the
+    // response, because `len` is capped at the remaining declared body.
     //
-    // Armed with MSG_WAITALL: nothing is sent downstream until the whole
-    // body is buffered, so waiting here for the full `len` is semantically
-    // free, and it is what makes the CQE count match the chunk count —
-    // without it, a one-shot recv completes on the first readable skb
-    // (~64 KiB on loopback) well short of a 256 KiB bulk node, turning one
-    // intended chunk back into several. The final chunk's `len` is exactly
-    // the remaining declared bytes (min() below), so WAITALL never waits for
-    // bytes the origin was never going to send; a short origin still
-    // completes it (close/error), never hangs — see add_recv_upstream_direct.
+    // Deliberately not MSG_WAITALL: settle_response_read_deadline_batch
+    // refreshes the inactivity deadline only on a positive recv CQE, so a
+    // WAITALL recv filling a 256 KiB node from a steadily trickling origin
+    // would expire the response although no single gap reached
+    // response_read_timeout.
     [[nodiscard]] bool arm_response_read_direct_body_recv(Connection& c) {
         if (c.response_read_deadline_post_commit_phase !=
             ResponseReadDeadlinePostCommitPhase::Buffering)
@@ -1515,8 +1509,7 @@ public:
         if (avail == 0) return false;
         const u32 len = remaining < avail ? remaining : avail;
         u8* dst = c.response_body_tail.write_ptr(pool);
-        return backend.add_recv_upstream_direct(
-            c.upstream_fd, c.id, c.upstream_episode, dst, len, /*wait_all=*/true);
+        return backend.add_recv_upstream_direct(c.upstream_fd, c.id, c.upstream_episode, dst, len);
     }
 
     // Exact one-dispatch witness for a positive terminal upstream Recv.  The
@@ -5234,37 +5227,17 @@ public:
                         close_conn(c);
                     continue;
                 }
-                // Part B (path 3): the body has now proven large enough that
-                // a new chain node would be bulk-sized (append()'s own
-                // bulk_after rule). Cancel the still-armed provided-buffer
-                // recv so the remainder can move to a direct one-shot recv
-                // straight into the chain tail instead — see
-                // arm_response_read_direct_body_recv / try_deferred_upstream_rearm,
-                // which arms the replacement once this cancel drains. Once
-                // requested, size only grows, so this never needs to retry.
-                const u32 bulk_after = c.tls_active ? ResponseBodyChain::kBulkAfterTls
-                                                    : ResponseBodyChain::kBulkAfterPlaintext;
-                if (c.upstream_recv_armed && !c.upstream_recv_direct_armed &&
-                    !c.response_read_deadline_want_direct_body &&
-                    c.response_body_tail.size >= bulk_after && pause_upstream_recv_impl(c))
-                    c.response_read_deadline_want_direct_body = true;
+                // The body keeps arriving through the provided-buffer recv.
+                // A mid-body cancel-and-switch to a direct recv into the
+                // chain tail dropped the connection whenever the origin was
+                // still sending, so this path never switches.
                 if (owner.saw_terminal && !c.upstream_recv_armed) {
                     if (c.upstream_recv_pause_cancel_pending ||
-                        c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight) {
+                        c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
+                        !add_response_read_recv(c)) {
                         close_conn(c);
                         continue;
                     }
-                    // Already large enough for a direct recv (e.g. the recv
-                    // that just terminated on its own, with no cancel
-                    // needed): arm it straight into the chain tail; fall
-                    // back to the ordinary deadline recv otherwise/on failure.
-                    const bool direct = c.response_body_tail.size >= bulk_after &&
-                                        arm_response_read_direct_body_recv(c);
-                    if (!direct && !add_response_read_recv(c)) {
-                        close_conn(c);
-                        continue;
-                    }
-                    c.upstream_recv_direct_armed = direct;
                     c.pending_ops++;
                     c.upstream_recv_armed = true;
                 }
@@ -5623,27 +5596,6 @@ public:
         if (c.close_after_idle_return && kUpstreamRecvDrained) {
             c.close_after_idle_return = false;
             this->free_conn(c);
-            return true;
-        }
-        // Part B (path 3): settle_response_read_deadline_batch cancelled the
-        // live body recv to switch it to a direct one-shot recv into the
-        // chain tail. Both the cancel and the cancelled recv's own terminal
-        // CQE have now drained (kUpstreamRecvDrained), so it's safe to arm
-        // the replacement. A failed direct arm falls back to the ordinary
-        // deadline recv rather than leaving no recv armed at all; only a
-        // failure there is fatal.
-        if (c.response_read_deadline_want_direct_body && kUpstreamRecvDrained) {
-            c.response_read_deadline_want_direct_body = false;
-            if (c.upstream_fd < 0) return true;  // torn down while the cancel drained
-            const bool direct = arm_response_read_direct_body_recv(c);
-            if (!direct && !add_response_read_recv(c)) {
-                close_conn(c);
-                return true;
-            }
-            c.upstream_recv_direct_armed = direct;
-            c.pending_ops++;
-            c.upstream_recv_armed = true;
-            c.upstream_recv_pause_rearm_pending = false;
             return true;
         }
         if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight ||

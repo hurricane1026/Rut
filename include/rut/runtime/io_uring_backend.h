@@ -196,19 +196,14 @@ struct IoUringBackend {
     // rebinding guards in IoUringEventLoop (upgrade_upstream_recv_to_bulk,
     // release_upstream_relay_slice, take_relay_recv_buffer).
     //
-    // wait_all sets MSG_WAITALL (sqe->msg_flags): the kernel does not
-    // complete the recv until `len` bytes have arrived (or the peer closes /
-    // errors, which still completes it — with a short count on close, never
-    // a hang). A one-shot recv without it completes as soon as *any* bytes
-    // are readable, which on loopback means one physical skb (~64 KiB) even
-    // for a 256 KiB bulk-sized len, turning one intended "256 KiB chunk = one
-    // CQE" step back into several. Only a caller that reads no partial bytes
-    // until the whole `len` (or the whole response) is in hand — currently
-    // just the complete-buffered response path, never the streaming relay/
-    // pump paths, which must forward a slow origin's partial chunks — may
-    // pass true. Default false preserves the streaming paths' behavior.
-    bool add_recv_upstream_direct(
-        i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len, bool wait_all = false);
+    // Never MSG_WAITALL: the recv completes as soon as any bytes are
+    // readable. Every caller needs each partial arrival as its own CQE —
+    // the streaming relay/pump paths forward it, and the response-read
+    // deadline refreshes its inactivity timer on it. A WAITALL recv hides
+    // every intermediate arrival, so an origin that trickles steadily (each
+    // gap under the timeout) but fills `len` more slowly than the timeout
+    // would be expired as idle.
+    bool add_recv_upstream_direct(i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len);
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.
