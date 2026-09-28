@@ -726,3 +726,15 @@ For requests up to 4096 bytes, reserve an SQE before a nonblocking send; full wr
 | 65536-c1-keepalive | +1.03% |
 
 All preflight and warm/load checks passed. The c32 small-response regression outweighs the roughly 1% 64 KiB keepalive improvement; reverted before full network regression. A diagnostic phase trace is being collected separately; no instrumented RPS is used for acceptance.
+
+## Small proxy upstream send-to-read phase trace
+
+HTTP 16 B c1 close; all three traces usable with stable target identities and zero warm/load errors. Interval is tcp_sendmsg entry to the first successful tcp_recvmsg exit on the same upstream socket. It includes origin, scheduler, network, and receive-copy time; it is not CPU time.
+
+| Engine | Samples | Mean us |
+|---|---:|---:|
+| 16-c1-close-nginx | 60295 | 25.134 |
+| 16-c1-close-rut-base | 60425 | 24.613 |
+| 16-c1-close-rut-direct | 60322 | 24.579 |
+
+Rut does not have a larger mean than nginx in this interval in this diagnostic. Instrumentation overhead and run ordering prevent interpreting this as an acceptance comparison. The rejected direct-send experiment did not improve uninstrumented c1 throughput materially. The next trace splits the front-read to upstream-send and upstream-read to front-send intervals; process-level correlation is only valid for this c1, non-pipelined workload.

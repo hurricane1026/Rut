@@ -1,0 +1,23 @@
+[
+  {
+    "case": "16-c1-close-nginx",
+    "count": 60295,
+    "mean_us": 25.133962169334108,
+    "usable": true,
+    "warm_load_errors": false
+  },
+  {
+    "case": "16-c1-close-rut-base",
+    "count": 60425,
+    "mean_us": 24.61268228382292,
+    "usable": true,
+    "warm_load_errors": false
+  },
+  {
+    "case": "16-c1-close-rut-direct",
+    "count": 60322,
+    "mean_us": 24.578842511853054,
+    "usable": true,
+    "warm_load_errors": false
+  }
+]

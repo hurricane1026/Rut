@@ -1,0 +1,6 @@
+{
+  "source": "/tmp/rut-bounded-followup-20260928/ebpf-proxy-phases-r2",
+  "sha256": "5cd3b93abf9f0f2406cf63a3a8a00bd02ed7017f97b823f993716a92fcb2751d",
+  "failed_prior_run": "/tmp/rut-bounded-followup-20260928/ebpf-proxy-phases-r1",
+  "failure": "signed subtraction and discarded delete-return warnings; corrected explicit casts and assignment"
+}
