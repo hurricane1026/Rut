@@ -15,8 +15,16 @@ for line in (root / 'validation.log').read_text().splitlines():
         _, profile, size, candidate = line.split()
         selected[(profile, size)] = candidate
 samples = defaultdict(lambda: defaultdict(list))
+repeats = defaultdict(lambda: defaultdict(list))
 for row in csv.DictReader((root / 'raw.csv').open()):
-    samples[(row['profile'], row['routes'], row['trace'])][row['candidate']].append(float(row['ns_per_lookup']))
+    key = (row['profile'], row['routes'], row['trace'])
+    try:
+        repeat = int(row['repeat'])
+        value = float(row['ns_per_lookup'])
+    except (TypeError, ValueError) as error:
+        raise AssertionError(f"Invalid repeat or measurement for {key}") from error
+    repeats[key][row['candidate']].append(repeat)
+    samples[key][row['candidate']].append(value)
 expected = set()
 for profile in g.PROFILES:
     for size in g.SIZES:
@@ -33,7 +41,9 @@ for (profile, size, trace), candidates in samples.items():
     assert set(candidates) == expected_candidates, (
         f"Unexpected candidates for {(profile, size, trace)}: "
         f"got {set(candidates)}, expected {expected_candidates}")
-    assert all(len(values) == 8 for values in candidates.values())
+    for candidate in expected_candidates:
+        assert sorted(repeats[(profile, size, trace)][candidate]) == list(range(8)), (
+            f"Expected unique repeats 0..7 for {(profile, size, trace, candidate)}")
     medians = {name: statistics.median(values) for name, values in candidates.items()}
     winner = min(medians, key=medians.get)
     pick = selected[(profile, size)]

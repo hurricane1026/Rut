@@ -254,6 +254,10 @@ class ComparisonGateTests(unittest.TestCase):
             subprocess.run([sys.executable, str(summarize), str(root)], check=True,
                            capture_output=True, cwd=ROOT / "bench/routing")
             raw = (root / "raw.csv").read_text()
+            repeated = raw.replace(",jit_art,7,1\n", ",jit_art,6,1\n", 1)
+            (root / "raw.csv").write_text(repeated)
+            self.assertNotEqual(subprocess.run([sys.executable, str(summarize), str(root)],
+                                               capture_output=True, cwd=ROOT / "bench/routing").returncode, 0)
             (root / "raw.csv").write_text("\n".join(
                 line for line in raw.splitlines() if ",jit_art," not in line) + "\n")
             self.assertNotEqual(subprocess.run([sys.executable, str(summarize), str(root)],

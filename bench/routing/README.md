@@ -146,7 +146,7 @@ Linkerd 的动态请求路由基于 Gateway API HTTPRoute；后端选择在 outb
 ### 验收索引
 
 `comparison.py` 生成的每行初始为 `not_run`。缺少任一端、可执行行被跳过、hash 不一致、探针不完整均退出非零。
-唯一预先列明的非通过行是 Linkerd `local_static`，必须显式记录 `unsupported` 和原因：
+预先列明的非通过行包括 Linkerd `local_static`、Rut `exact` 合约和超过 128 条路由的 Rut case；这些行都必须显式记录 `unsupported` 和非空原因。Rut exact 与超容量同时成立时，超容量 prerequisite 优先：
 
 ```sh
 python3 bench/routing/comparison.py build/routing-corpus/manifest.json \
