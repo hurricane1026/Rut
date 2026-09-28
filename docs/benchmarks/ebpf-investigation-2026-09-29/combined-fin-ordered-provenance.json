@@ -1,0 +1,14 @@
+{
+  "runtime_base": "06cdea9d",
+  "binary_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "full_network": {
+    "passed": 1425,
+    "checks": 371796,
+    "failed": 0
+  },
+  "focused": {
+    "passed": 1,
+    "checks": 21
+  },
+  "performance": "both orders and nginx acceptance pending"
+}

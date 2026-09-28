@@ -1,0 +1,10 @@
+=== response_buffering_runtime ===
+RUN: response_buffering_runtime.bounded_combined_final_write_accounts_after_peer_eof
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:63231 -> (conn.fd) >= (0)
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:63232 -> conn.direct_write_completion_pending
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:63236 -> (metrics.requests_total) == (1u)
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:63240 -> (metrics.requests_total) == (1u)
+    check: /home/hurricane/private/code/Rut-s1/tests/test_network.cc:63241 -> (loop->conns[id].pending_ops) == (pending)
+  FAIL: bounded_combined_final_write_accounts_after_peer_eof (/home/hurricane/private/code/Rut-s1/tests/test_network.cc:63241: (loop->conns[id].pending_ops) == (pending))
+
+0 passed, 1 failed, 21 checks, 5 failed checks, 1424 skipped

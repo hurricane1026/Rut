@@ -894,3 +894,11 @@ A complete <=4096-byte plaintext Bounded response, with exact CombinedSend frame
 | 65536-c1-keepalive | +0.63% |
 
 This targets the merged small response, unlike the previous >=64 KiB BodySend-only FIN experiment. A new lifecycle regression asserts body and EOF are visible before completion, peer EOF cannot pre-empt accounting, and duplicate completion does not count twice. Full network testing and reverse order are pending; no retention or nginx acceptance claim yet.
+
+## CombinedSend FIN lifecycle gate and fix
+
+The first added test failed before CombinedSend because the hand-built Bounded fixture lacked an exact GET route marker. After correcting the fixture, the test exposed an actual lifecycle defect in the prototype: response batch preparation invalidated the owner on peer EOF before the already-written response’s CQE could account completion. The earlier performance samples therefore describe an unretained, incorrect prototype.
+
+The corrected runtime defers only untagged terminal downstream events for a fully written final CombinedSend with matching source, fd, length, generation, frame and pending operation. Partial direct writes do not acquire this deferral. Upstream surplus/timer validation remains in its normal path; dispatch still accounts the downstream receive event. The exact send completion then accounts and closes once; stale/duplicate generations remain handled by existing ownership checks.
+
+The focused lifecycle test now passes 21 checks; full network regression passes all 1425 tests / 371796 checks. Original failures and passing logs are retained. The corrected binary has its own hash; both performance orders, a send-to-shutdown eBPF comparison, and the 12-coordinate HTTP small-proxy nginx acceptance matrix are queued/running under the shared lock. No runtime retention or full-matrix pass is claimed yet.
