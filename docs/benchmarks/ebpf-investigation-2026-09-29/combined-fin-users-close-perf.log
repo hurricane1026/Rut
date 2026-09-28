@@ -1,0 +1,2 @@
+[ perf record: Woken up 546 times to write data ]
+[ perf record: Captured and wrote 136.301 MB /tmp/rut-bounded-followup-20260928/combined-fin-users-r1/16-c1-close-0-candidate/perf.data (16964 samples) ]

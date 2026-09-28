@@ -948,3 +948,7 @@ All 12 HTTP cells complete, with three valid 5-second samples per engine, clean 
 | 1024 | proxy-keepalive | 128 | 1.3564 | pass |
 
 Both causal orders and the full 1425-test network regression support retaining this closing-small-response optimization. CPU profiling of the corrected binary and front-socket shutdown cost comparison with nginx follow under the same benchmark lock.
+
+## Corrected FIN current user-cycle profile: small proxy close
+
+The 20-second HTTP 16-byte c1 close profile has 16,964 cycles:u samples with zero lost samples and clean warm/load errors. Self shares: io_uring wait 5.59%, response parser 4.36%, coalesced GET phase-1 proof 3.56%, header-name scan 2.99%, policy-bundle validity 2.71%, and memset 1.07%. These percentages describe sampled userspace cycles, not total request latency or a direct nginx comparison. Some DWARF call stacks are incomplete/unknown; use self attribution and do not infer reliable complete call chains. Raw perf.data remains in the lab directory; textual reports and collector/workload logs are retained here. Keepalive profiling and kernel shutdown-cost comparison are still running/queued.
