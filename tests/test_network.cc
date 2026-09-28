@@ -1760,7 +1760,7 @@ TEST(response_policy, response_read_timeout_bundle_config_shapes_are_exact_and_f
     rejects(response_only);
     rir::Module forged_buffering = module;
     forged_buffering.policy_bundles[4].response_buffering =
-        static_cast<ForwardResponseBufferingMode>(2);
+        static_cast<ForwardResponseBufferingMode>(3);
     rejects(forged_buffering);
     rir::Module buffering_without_timeout = module;
     buffering_without_timeout.policy_bundles[4].response_read_timeout_seconds = 0;
@@ -1899,7 +1899,7 @@ TEST(response_policy, complete_buffering_bundle_revalidates_roles_and_tuple_fiel
     rejects([&] { config.policy_bundles[0].response_read_timeout_seconds = 0; });
     rejects([&] { config.policy_bundles[0].response_read_timeout_seconds = 64; });
     rejects([&] {
-        config.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(2);
+        config.policy_bundles[0].response_buffering = static_cast<ForwardResponseBufferingMode>(3);
     });
 
     rejects(
@@ -2336,6 +2336,89 @@ TEST(response_buffering, unsupported_loop_rejects_before_handler_or_forward_effe
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
     CHECK_EQ(__builtin_memcmp(loop.recv_storage[conn_id], kRequest, sizeof(kRequest) - 1), 0);
+}
+
+// Bounded is step 1's pure aliasing of CompleteContentLength: every runtime
+// site that used to compare directly against
+// ForwardResponseBufferingMode::CompleteContentLength now calls
+// forward_response_buffering_uses_content_length_machinery(), which is true
+// for both. This proves that aliasing is exact — not just "close enough" —
+// across the exhaustive input domain of one representative predicate
+// (response_read_deadline_fixed_upload_method_admitted) plus every other
+// (buffering, profile)-shaped predicate reachable without a live RouteConfig
+// bundle (Bounded bundle admission is the frontend agent's compiler-side
+// change; see the runtime-side README note in this PR), and directly on the
+// two helper functions themselves.
+TEST(response_buffering, bounded_aliases_complete_content_length_exactly) {
+    CHECK(forward_response_buffering_mode_valid(ForwardResponseBufferingMode::Bounded));
+    CHECK_FALSE(forward_response_buffering_uses_content_length_machinery(
+        ForwardResponseBufferingMode::None));
+    CHECK(forward_response_buffering_uses_content_length_machinery(
+        ForwardResponseBufferingMode::CompleteContentLength));
+    CHECK(forward_response_buffering_uses_content_length_machinery(
+        ForwardResponseBufferingMode::Bounded));
+
+    // Exhaustive over every LogHttpMethod value: Bounded and CompleteContentLength
+    // must select the identical admission outcome.
+    for (u32 m = 0; m <= static_cast<u32>(LogHttpMethod::Other); m++) {
+        const u8 method = static_cast<u8>(m);
+        CHECK_EQ(response_read_deadline_fixed_upload_method_admitted(
+                     method, ForwardResponseBufferingMode::CompleteContentLength),
+                 response_read_deadline_fixed_upload_method_admitted(
+                     method, ForwardResponseBufferingMode::Bounded));
+    }
+    // None is a genuinely different outcome for Delete/Options (the one
+    // method class this predicate actually distinguishes by buffering mode),
+    // proving the exhaustive loop above is not vacuously true.
+    CHECK_FALSE(response_read_deadline_fixed_upload_method_admitted(
+        static_cast<u8>(LogHttpMethod::Delete), ForwardResponseBufferingMode::None));
+    CHECK(response_read_deadline_fixed_upload_method_admitted(
+        static_cast<u8>(LogHttpMethod::Delete),
+        ForwardResponseBufferingMode::CompleteContentLength));
+    CHECK(response_read_deadline_fixed_upload_method_admitted(
+        static_cast<u8>(LogHttpMethod::Delete), ForwardResponseBufferingMode::Bounded));
+
+    // http1_pipeline_successor_semantic_shape_is_stable: another pure
+    // (profile, buffering, method, route_method)-shaped predicate exercised
+    // directly, again proving identical acceptance for both modes across a
+    // small representative grid (it also needs a live Connection, so this
+    // covers ==/!= comparisons against the connection-independent fields).
+    for (const auto profile : {ResponseReadDeadlineProfile::None,
+                               ResponseReadDeadlineProfile::HeaderOnlyHead,
+                               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero}) {
+        for (const u8 method : {static_cast<u8>(LogHttpMethod::Get),
+                                static_cast<u8>(LogHttpMethod::Head),
+                                static_cast<u8>(LogHttpMethod::Post)}) {
+            for (const u8 route_method : {kRouteMethodGet, static_cast<u8>(kRouteMethodGet + 1)}) {
+                SmallLoop loop;
+                loop.setup();
+                auto* conn = loop.alloc_conn();
+                REQUIRE(conn != nullptr);
+                conn->protocol = ConnProtocol::Http11;
+                conn->tls_active = false;
+                conn->h2 = nullptr;
+                conn->req_http_version = static_cast<u8>(HttpVersion::Http11);
+                conn->req_strict_h1_complete = true;
+                const ResponseReadDeadlineUploadProof proof{};
+                const bool complete = http1_pipeline_successor_semantic_shape_is_stable(
+                    *conn,
+                    proof,
+                    profile,
+                    ForwardResponseBufferingMode::CompleteContentLength,
+                    method,
+                    route_method);
+                const bool bounded = http1_pipeline_successor_semantic_shape_is_stable(
+                    *conn,
+                    proof,
+                    profile,
+                    ForwardResponseBufferingMode::Bounded,
+                    method,
+                    route_method);
+                CHECK_EQ(complete, bounded);
+                loop.free_conn(*conn);
+            }
+        }
+    }
 }
 
 TEST(response_read_timeout, route_preflight_marker_fails_closed_for_every_nonzero_shape) {
@@ -14207,10 +14290,14 @@ TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
     CHECK_EQ(SlicePool::capacity_for_connections(2), 142u);
 
     SlicePool pool;
-    REQUIRE(pool.init(SlicePool::capacity_for_connections(2)).has_value());
+    constexpr u32 kTestBulk = SlicePool::bulk_capacity_for_connections(2);
+    static_assert(kTestBulk == 8u);
+    REQUIRE(
+        pool.init(SlicePool::capacity_for_connections(2), 0, SlicePool::kMaxCachedSlices, kTestBulk)
+            .has_value());
     // The slice sizing must hold on its own: bulk buffers are an optional
     // bounded extra, so take them all first.
-    u8* bulk[SlicePool::kBulkSlices]{};
+    u8* bulk[kTestBulk]{};
     for (u8*& b : bulk) REQUIRE((b = pool.alloc_bulk()) != nullptr);
     CHECK_EQ(pool.alloc_bulk(), nullptr);
     u8* ordinary[SlicePool::kOrdinarySlicesPerConnection * 2]{};
@@ -14235,15 +14322,18 @@ TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
     for (u8* slice : ordinary) pool.free(slice);
     for (u8* b : bulk) pool.free(b);
     CHECK_EQ(pool.available(), pool.max_count);
-    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
     pool.destroy();
 }
 
 TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
+    // 70 crosses one bulk_in_use bitmap word boundary (64 bits/word), so this
+    // exercises the dynamic per-connection bitmap, not just a single word.
+    constexpr u32 kTestBulk = 70;
     SlicePool pool;
-    REQUIRE(pool.init(4).has_value());
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, kTestBulk).has_value());
     CHECK_EQ(pool.bulk_base, nullptr);  // not mapped until first use
-    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
     u8* slice = pool.alloc();
     REQUIRE(slice != nullptr);
     CHECK_FALSE(pool.is_bulk(slice));
@@ -14255,14 +14345,14 @@ TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
     CHECK_EQ(pool.capacity_of(first), SlicePool::kBulkSliceSize);
     __builtin_memset(first, 0xa5, SlicePool::kBulkSliceSize);
     pool.free(first);  // routed to the bulk set by address
-    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
     CHECK_EQ(pool.in_use(), 1u);  // the ordinary slice is untouched
     pool.free(first);             // duplicate free is ignored
-    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
     pool.free(first + 1);  // misaligned pointer is ignored
-    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
 
-    u8* all[SlicePool::kBulkSlices]{};
+    u8* all[kTestBulk]{};
     for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
     CHECK_EQ(pool.alloc_bulk(), nullptr);  // bounded: exhaustion is not an error
     CHECK_EQ(pool.bulk_available(), 0u);
@@ -14276,7 +14366,7 @@ TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
         }
     }
     for (u8* b : all) pool.free(b);
-    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
     pool.free(slice);
     pool.destroy();
     CHECK_EQ(pool.bulk_base, nullptr);
@@ -14284,14 +14374,15 @@ TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
 }
 
 TEST(slice_pool, bulk_free_written_rezeroes_the_written_prefix) {
+    constexpr u32 kTestBulk = 4;
     SlicePool pool;
-    REQUIRE(pool.init(4).has_value());
-    u8* all[SlicePool::kBulkSlices]{};
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, kTestBulk).has_value());
+    u8* all[kTestBulk]{};
     for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
     u8* const target = all[0];
     __builtin_memset(target, 0x3c, 4096);
     pool.free_written(target, 4096);
-    for (u32 i = 1; i < SlicePool::kBulkSlices; ++i) pool.free(all[i]);
+    for (u32 i = 1; i < kTestBulk; ++i) pool.free(all[i]);
     for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
     bool found = false;
     for (u8* b : all) found |= b == target;
@@ -14303,7 +14394,67 @@ TEST(slice_pool, bulk_free_written_rezeroes_the_written_prefix) {
     pool.free_written(target, 0xFFFFFFFFu);
     for (u8* b : all)
         if (b != target) pool.free(b);
-    CHECK_EQ(pool.bulk_available(), SlicePool::kBulkSlices);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
+    pool.destroy();
+}
+
+// A burst that touches more bulk buffers than the resident cache holds must
+// not keep all of them resident afterwards: returns past kMaxCachedBulk are
+// discarded, and reuse still prefers the retained (hot) buffers.
+TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
+    constexpr u32 kTestBulk = SlicePool::kMaxCachedBulk + 6;
+    SlicePool pool;
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, kTestBulk).has_value());
+    u8* all[kTestBulk]{};
+    for (u8*& b : all) {
+        REQUIRE((b = pool.alloc_bulk()) != nullptr);
+        __builtin_memset(b, 0x5a, SlicePool::kBulkSliceSize);
+    }
+    for (u8* b : all) pool.free(b);
+    CHECK_EQ(pool.bulk_available(), kTestBulk);
+    CHECK_EQ(pool.bulk_cached_count, SlicePool::kMaxCachedBulk);
+
+#ifdef __linux__
+    // Only Linux discards with MADV_DONTNEED; elsewhere a discarded buffer is
+    // zeroed in place and stays resident.
+    const u64 page = static_cast<u64>(sysconf(_SC_PAGESIZE));
+    const u64 pages = SlicePool::kBulkSliceSize / page;
+    unsigned char residency[SlicePool::kBulkSliceSize / 4096]{};
+    REQUIRE(pages <= sizeof(residency));
+    auto resident_pages = [&](u8* b) -> u64 {
+        if (mincore(b, SlicePool::kBulkSliceSize, residency) != 0) return ~u64{0};
+        u64 n = 0;
+        for (u64 i = 0; i < pages; ++i) n += residency[i] & 1u;
+        return n;
+    };
+    // The first kMaxCachedBulk returns stay resident; the rest were released.
+    u32 released = 0;
+    for (u32 i = 0; i < kTestBulk; ++i) {
+        const u64 n = resident_pages(all[i]);
+        if (i < SlicePool::kMaxCachedBulk)
+            CHECK_EQ(n, pages);
+        else
+            released += n == 0 ? 1u : 0u;
+    }
+    CHECK_EQ(released, kTestBulk - SlicePool::kMaxCachedBulk);
+#endif
+
+    // Reuse drains the resident set first, and every reused buffer reads zero.
+    u8* again[kTestBulk]{};
+    for (u32 i = 0; i < kTestBulk; ++i) {
+        REQUIRE((again[i] = pool.alloc_bulk()) != nullptr);
+        if (i < SlicePool::kMaxCachedBulk) {
+            bool hot = false;
+            for (u32 j = 0; j < SlicePool::kMaxCachedBulk; ++j) hot |= again[i] == all[j];
+            CHECK(hot);
+        }
+        bool zero = true;
+        for (u32 byte = 0; byte < SlicePool::kBulkSliceSize; ++byte) zero &= again[i][byte] == 0;
+        CHECK(zero);
+    }
+    CHECK_EQ(pool.bulk_cached_count, 0u);
+    CHECK_EQ(pool.alloc_bulk(), nullptr);
+    for (u8* b : again) pool.free(b);
     pool.destroy();
 }
 
@@ -36055,13 +36206,95 @@ TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_
              static_cast<u16>(large_tail + 2u));
     CHECK_EQ(__atomic_load_n(&backend.buf_ring->tail, __ATOMIC_ACQUIRE), small_tail);
 
-    // Ids past the dedicated ring belong to the bulk ring only when it is
-    // registered; ids past the bulk ring are never treated as selected buffers.
-    CHECK_EQ(backend.provided_buffer_id_valid(
-                 static_cast<u16>(kLargeProvidedBufIdBase + kLargeProvidedBufCount)),
-             backend.bulk_buf_ring != nullptr);
+    // Ids past the dedicated ring are never treated as selected buffers:
+    // bulk-sized recvs use add_recv_upstream_direct, not a third ring.
     CHECK_FALSE(backend.provided_buffer_id_valid(
-        static_cast<u16>(kBulkProvidedBufIdBase + kBulkProvidedBufCount)));
+        static_cast<u16>(kLargeProvidedBufIdBase + kLargeProvidedBufCount)));
+    fixture.cleanup();
+}
+
+// Part A: exercises add_recv_upstream_direct's SQE shape and wait()'s CQE
+// commit directly, against a plain (non-bulk) upstream_recv_buf slice — the
+// same primitive a bulk-buffer target uses, isolated here from bulk
+// allocation so the commit/staleness logic itself is under test.
+TEST(iouring_upstream_recv, direct_recv_commits_bytes_and_rejects_stale_episode) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    auto& backend = loop->backend;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.upstream_recv_buf.len(), 0u);
+    const u32 avail = conn.upstream_recv_buf.write_avail();
+    REQUIRE(avail > 0);
+    u8* const dst = conn.upstream_recv_buf.write_ptr();
+
+    REQUIRE(backend.add_recv_upstream_direct(
+        conn.upstream_fd, conn.id, conn.upstream_episode, dst, avail));
+    conn.upstream_recv_direct_armed = true;
+    conn.upstream_recv_armed = true;
+    conn.pending_ops++;
+    const auto& sqe = backend.sq_entries[fixture.sq_tail_before & *backend.sq_ring_mask];
+    CHECK_EQ(sqe.opcode, static_cast<u8>(IORING_OP_RECV));
+    CHECK_EQ(sqe.addr, reinterpret_cast<u64>(dst));
+    CHECK_EQ(sqe.len, avail);
+    CHECK_EQ(sqe.flags & IOSQE_BUFFER_SELECT, 0u);  // no provided-buffer ring involved
+    fixture.restore_ring();
+
+    auto append_cqe = [&](u32 len, u32 episode) {
+        const u32 cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& cqe = backend.cq_entries[cq_tail & *backend.cq_ring_mask];
+        cqe.user_data =
+            encode_upstream_event_token({conn.id, IoEventType::UpstreamRecv, episode, 0});
+        cqe.res = static_cast<i32>(len);
+        cqe.flags = 0;  // a direct recv's CQE never carries IORING_CQE_F_BUFFER
+        __atomic_store_n(backend.cq_tail, cq_tail + 1u, __ATOMIC_RELEASE);
+    };
+
+    // A non-stale completion commits straight into the destination with no
+    // copy: the kernel already wrote these bytes at dst.
+    constexpr u32 kLen = 4096;
+    for (u32 i = 0; i < kLen; i++) dst[i] = static_cast<u8>((i * 37u + 3u) & 0xFFu);
+    append_cqe(kLen, conn.upstream_episode);
+    backend.pending = 0;
+    IoEvent events[2]{};
+    REQUIRE_EQ(backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(events[0].result, static_cast<i32>(kLen));
+    CHECK_EQ(events[0].has_buf, 0u);
+    CHECK_EQ(events[0].more, 0u);  // a direct recv is always one-shot
+    REQUIRE_EQ(conn.upstream_recv_buf.len(), kLen);
+    for (u32 i = 0; i < kLen; i++)
+        CHECK_EQ(conn.upstream_recv_buf.data()[i], static_cast<u8>((i * 37u + 3u) & 0xFFu));
+    // Cleared unconditionally on the terminal CQE — this is what lets the
+    // event loop's rebinding sites reuse the buffer once dispatch observes it.
+    CHECK_FALSE(conn.upstream_recv_direct_armed);
+    conn.upstream_recv_armed = false;
+    conn.pending_ops--;
+
+    // A stale (mismatched) episode's direct-recv CQE must never commit bytes
+    // into the live buffer, even though the destination memory itself was
+    // physically written by the kernel (a dead episode's terminal CQE landing
+    // on a reused connection slot must not mutate it).
+    conn.upstream_recv_buf.reset();
+    const u32 avail2 = conn.upstream_recv_buf.write_avail();
+    u8* const dst2 = conn.upstream_recv_buf.write_ptr();
+    REQUIRE(backend.add_recv_upstream_direct(
+        conn.upstream_fd, conn.id, conn.upstream_episode, dst2, avail2));
+    conn.upstream_recv_direct_armed = true;
+    conn.upstream_recv_armed = true;
+    conn.pending_ops++;
+    for (u32 i = 0; i < 64; i++) dst2[i] = 0xEE;
+    append_cqe(64, conn.upstream_episode + 1u);  // stale: does not match conn.upstream_episode
+    backend.pending = 0;
+    REQUIRE_EQ(backend.wait(events, 2, loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(events[0].type, IoEventType::UpstreamRecv);
+    CHECK_EQ(events[0].upstream_episode, conn.upstream_episode + 1u);
+    CHECK_EQ(conn.upstream_recv_buf.len(), 0u);  // stale completion never committed
+    CHECK_FALSE(conn.upstream_recv_direct_armed);
+    conn.upstream_recv_armed = false;
+    conn.pending_ops--;
     fixture.cleanup();
 }
 
@@ -36287,7 +36520,7 @@ TEST(iouring_upstream_relay, large_body_relays_through_bulk_buffers_and_returns_
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
-    if (loop->backend.bulk_buf_ring == nullptr) SKIP("bulk provided-buffer ring unavailable");
+    if (loop->pool.bulk_available() == 0) SKIP("no bulk relay buffers reserved for this pool");
     constexpr u32 kSlice = SlicePool::kSliceSize;
     constexpr u32 kBulk = SlicePool::kBulkSliceSize;
     OneShotRecvFixture fixture;
@@ -36301,18 +36534,21 @@ TEST(iouring_upstream_relay, large_body_relays_through_bulk_buffers_and_returns_
     on_response_body_recvd<IoUringEventLoop>(loop, conn, relay_upstream_event(conn, kSlice));
 
     // Enough body remains: the idle relay slice was traded for a bulk buffer
-    // and the recv asks the bulk ring for a whole bulk buffer.
+    // and the recv goes straight into it (direct recv, Part A), not through a
+    // provided-buffer ring.
     REQUIRE_EQ(conn.upstream_relay_slice, first);
     u8* const bulk_a = conn.upstream_recv_slice;
     CHECK(pool.is_bulk(bulk_a));
     CHECK_EQ(conn.upstream_recv_buf.capacity(), kBulk);
     CHECK_EQ(pool.bulk_available(), bulk_before - 1u);
+    CHECK(conn.upstream_recv_direct_armed);
     const u32 mask = *loop->backend.sq_ring_mask;
     REQUIRE_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail0 + 2u);
     const auto& recv_sqe = loop->backend.sq_entries[(tail0 + 1u) & mask];
     CHECK_EQ(recv_sqe.opcode, static_cast<u8>(IORING_OP_RECV));
     CHECK_EQ(recv_sqe.len, kBulk);
-    CHECK_EQ(recv_sqe.buf_group, kBulkBufGroupId);
+    CHECK_EQ(recv_sqe.addr, reinterpret_cast<u64>(bulk_a));
+    CHECK_EQ(recv_sqe.flags & IOSQE_BUFFER_SELECT, 0u);
 
     // A bulk-sized chunk lands while the first send is in flight; once that send
     // drains, the chunk is relayed and the freed first slice is traded too.
@@ -36341,6 +36577,21 @@ TEST(iouring_upstream_relay, large_body_relays_through_bulk_buffers_and_returns_
     conn.upstream_relay_send_len = 0;
     conn.upstream_recv_armed = false;
     conn.upstream_recv_buf.reset();
+    // A direct recv still physically targets bulk_b (upstream_recv_slice) in
+    // the kernel: release_upstream_relay_slice may free the now-idle relay
+    // slice (bulk_a — never a recv target) but must refuse to trade bulk_b
+    // back for a plain slice while that terminal CQE hasn't been consumed.
+    REQUIRE(conn.upstream_recv_direct_armed);
+    u8* const pinned_recv_slice = conn.upstream_recv_slice;
+    loop->release_upstream_relay_slice(conn);
+    CHECK_EQ(conn.upstream_relay_slice, nullptr);           // bulk_a freed: not the pinned target
+    CHECK_EQ(conn.upstream_recv_slice, pinned_recv_slice);  // bulk_b: untouched, still pinned
+    CHECK(pool.is_bulk(conn.upstream_recv_slice));
+    CHECK_EQ(pool.bulk_available(), bulk_before - 1u);
+    // The bulk recv's terminal CQE (which real wait() processing would have
+    // consumed already) must be observed before the buffer can be traded
+    // back — this is what unpins it.
+    conn.upstream_recv_direct_armed = false;
     loop->release_upstream_relay_slice(conn);
     CHECK_EQ(conn.upstream_relay_slice, nullptr);
     REQUIRE(conn.upstream_recv_slice != nullptr);
@@ -36363,6 +36614,17 @@ TEST(iouring_upstream_relay, serialized_pump_moves_buffered_bytes_into_a_bulk_bu
     conn.upstream_recv_buf.reset();
     for (u32 i = 0; i < 100; i++) conn.upstream_recv_buf.write_ptr()[i] = static_cast<u8>(i + 7);
     conn.upstream_recv_buf.commit(100);
+
+    // A direct recv physically targeting the current (still slice-sized)
+    // buffer pins it: the kernel may be mid-write, so the swap must not
+    // free/rebind that memory out from under it.
+    u8* const still_slice = conn.upstream_recv_slice;
+    conn.upstream_recv_direct_armed = true;
+    loop->upgrade_upstream_recv_to_bulk(conn);
+    CHECK_EQ(conn.upstream_recv_slice, still_slice);
+    CHECK_FALSE(pool.is_bulk(conn.upstream_recv_slice));
+    CHECK_EQ(pool.bulk_available(), bulk_before);
+    conn.upstream_recv_direct_armed = false;  // simulates the terminal CQE draining
 
     loop->upgrade_upstream_recv_to_bulk(conn);
     REQUIRE(pool.is_bulk(conn.upstream_recv_slice));

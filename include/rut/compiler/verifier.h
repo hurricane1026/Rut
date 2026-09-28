@@ -1098,7 +1098,7 @@ inline VerifyResult verify_module_impl(const Module& mod,
             (seconds == 0 && bundle.failure_policy_id == 0))
             return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, 0);
         if (bundle.response_buffering != ForwardResponseBufferingMode::None &&
-            (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+            (!forward_response_buffering_uses_content_length_machinery(bundle.response_buffering) ||
              !response_read_timeout_seconds_valid(seconds) || bundle.response_policy_id == 0 ||
              bundle.failure_policy_id == 0 || bundle.timeout_failure_policy_id == 0 ||
              bundle.timeout_failure_policy_id > mod.failure_policy_count ||
@@ -1216,8 +1216,8 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 if (!response_read_deadline_request_policy_is_admitted(
                         static_cast<u16>(request_policy)) &&
                     !fixed_upload_head_policy &&
-                    !(policy_bundle.response_buffering ==
-                          ForwardResponseBufferingMode::CompleteContentLength &&
+                    !(forward_response_buffering_uses_content_length_machinery(
+                          policy_bundle.response_buffering) &&
                       fn.http_method == kRouteMethodGet &&
                       static_cast<u16>(request_policy) ==
                           static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab)))
@@ -1231,7 +1231,7 @@ inline VerifyResult verify_module_impl(const Module& mod,
                      static_cast<u16>(request_policy) ==
                          static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
                 if (buffering != ForwardResponseBufferingMode::None &&
-                    (buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+                    (!forward_response_buffering_uses_content_length_machinery(buffering) ||
                      !complete_content_length_route_method_is_admitted(fn.http_method) ||
                      request_policy < 0 || request_policy > 0xffff || !complete_policy))
                     return verify_fail(
@@ -1325,8 +1325,11 @@ inline VerifyResult verify_module_impl(const Module& mod,
                        forward.operand_count == 3 && forward.operand(0).id == upstream.result.id &&
                        forward.operand(1).id == request_policy.result.id &&
                        forward.operand(2).id == bundle.result.id &&
-                       mod.policy_bundles[preflight_id - 1].response_buffering ==
-                           expected_buffering &&
+                       (expected_buffering == ForwardResponseBufferingMode::None
+                            ? mod.policy_bundles[preflight_id - 1].response_buffering ==
+                                  ForwardResponseBufferingMode::None
+                            : forward_response_buffering_uses_content_length_machinery(
+                                  mod.policy_bundles[preflight_id - 1].response_buffering)) &&
                        (expected_buffering == ForwardResponseBufferingMode::None ||
                         (get_framing &&
                          mod.policy_bundles[preflight_id - 1].response_policy_id != 0 &&
@@ -1359,8 +1362,8 @@ inline VerifyResult verify_module_impl(const Module& mod,
                               ForwardResponseBufferingMode::CompleteContentLength);
             if (!entry_shape || (!exact_head && !exact_get) ||
                 then_block.insts[0].imm.i32_val != else_block.insts[0].imm.i32_val ||
-                (get_framing && mod.policy_bundles[preflight_id - 1].response_buffering !=
-                                    ForwardResponseBufferingMode::CompleteContentLength) ||
+                (get_framing && !forward_response_buffering_uses_content_length_machinery(
+                                    mod.policy_bundles[preflight_id - 1].response_buffering)) ||
                 (head_framing && mod.policy_bundles[preflight_id - 1].response_buffering !=
                                      ForwardResponseBufferingMode::None))
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
@@ -1444,8 +1447,8 @@ inline VerifyResult verify_module_impl(const Module& mod,
                 forward.operand_count == 3 && forward.operand(0).id == upstream.result.id &&
                 forward.operand(1).id == request_policy.result.id &&
                 forward.operand(2).id == bundle.result.id && &forward == sole_timeout_ret &&
-                mod.policy_bundles[preflight_id - 1].response_buffering ==
-                    ForwardResponseBufferingMode::CompleteContentLength;
+                forward_response_buffering_uses_content_length_machinery(
+                    mod.policy_bundles[preflight_id - 1].response_buffering);
             if (!entry_shape || !result_types || !redirect_shape || !forward_shape)
                 return verify_fail(summary, VerifyIssueCode::InvalidForwardPreflight, fi);
         }

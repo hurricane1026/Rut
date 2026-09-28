@@ -80,12 +80,6 @@ struct IoUringBackend {
     io_uring_buf_ring* large_buf_ring = nullptr;
     u8* large_buf_base = nullptr;  // kLargeProvidedBufCount * kLargeProvidedBufSize bytes
 
-    // Ring for one-shot upstream recvs into bulk relay buffers
-    // (kBulkBufGroupId). Optional like the large ring: without it no recv
-    // asks for more than kLargeProvidedBufSize, so bulk relays stay 16 KiB.
-    io_uring_buf_ring* bulk_buf_ring = nullptr;
-    u8* bulk_buf_base = nullptr;  // kBulkProvidedBufCount * kBulkProvidedBufSize bytes
-
     // Listen socket
     i32 listen_fd = -1;
 
@@ -186,6 +180,30 @@ struct IoUringBackend {
                                 u32 conn_id,
                                 u32 upstream_episode = 1,
                                 u32 max_len = kProvidedBufSize);
+    // Direct one-shot recv: IORING_OP_RECV straight into a caller-owned
+    // buffer region (sqe->addr/len), with no IOSQE_BUFFER_SELECT and no
+    // provided-buffer ring involved — the kernel writes the bytes exactly
+    // where dst points, so wait() commits them with no copy. Used only when
+    // the destination is a bulk relay buffer (SlicePool::kBulkSliceSize);
+    // ordinary slice-sized targets keep using the provided-buffer rings.
+    //
+    // Ownership contract: once this returns true, [dst, dst+len) is pinned —
+    // the caller must not free or rebind that memory (e.g. trade the bulk
+    // buffer back for a slice, or hand it to a different recv) until the
+    // CQE for this exact recv has been consumed by wait(). wait() tracks
+    // this per connection (Connection::upstream_recv_direct_armed) and
+    // clears it only when that terminal CQE is processed — see the
+    // rebinding guards in IoUringEventLoop (upgrade_upstream_recv_to_bulk,
+    // release_upstream_relay_slice, take_relay_recv_buffer).
+    //
+    // Never MSG_WAITALL: the recv completes as soon as any bytes are
+    // readable. Every caller needs each partial arrival as its own CQE —
+    // the streaming relay/pump paths forward it, and the response-read
+    // deadline refreshes its inactivity timer on it. A WAITALL recv hides
+    // every intermediate arrival, so an origin that trickles steadily (each
+    // gap under the timeout) but fills `len` more slowly than the timeout
+    // would be expired as idle.
+    bool add_recv_upstream_direct(i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len);
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.
@@ -342,33 +360,26 @@ struct IoUringBackend {
     void return_buffer(u16 buf_id);
 
     // Provided buffer ids span the ordinary ring, then the dedicated large
-    // ring, then the bulk ring — each only when it is registered.
-    static bool is_bulk_buffer_id(u16 buf_id) { return buf_id >= kBulkProvidedBufIdBase; }
+    // ring — each only when it is registered. Bulk-buffer recvs never select
+    // from a ring (see add_recv_upstream_direct), so there is no bulk id space.
     bool provided_buffer_id_valid(u16 buf_id) const {
         if (buf_id < kProvidedBufCount) return true;
-        if (is_bulk_buffer_id(buf_id))
-            return bulk_buf_ring != nullptr &&
-                   buf_id - kBulkProvidedBufIdBase < kBulkProvidedBufCount;
         return large_buf_ring != nullptr && buf_id >= kLargeProvidedBufIdBase &&
                buf_id - kLargeProvidedBufIdBase < kLargeProvidedBufCount;
     }
     u32 provided_buffer_size(u16 buf_id) const {
-        if (buf_id < kProvidedBufCount) return kProvidedBufSize;
-        return is_bulk_buffer_id(buf_id) ? kBulkProvidedBufSize : kLargeProvidedBufSize;
+        return buf_id < kProvidedBufCount ? kProvidedBufSize : kLargeProvidedBufSize;
     }
     const u8* provided_buffer_data(u16 buf_id) const {
         if (buf_id < kProvidedBufCount)
             return buf_base + static_cast<u64>(buf_id) * kProvidedBufSize;
-        if (is_bulk_buffer_id(buf_id))
-            return bulk_buf_base +
-                   static_cast<u64>(buf_id - kBulkProvidedBufIdBase) * kBulkProvidedBufSize;
         return large_buf_base +
                static_cast<u64>(buf_id - kLargeProvidedBufIdBase) * kLargeProvidedBufSize;
     }
-    // Largest length a bounded one-shot upstream recv may request. Lengths
-    // above kLargeProvidedBufSize select the bulk ring.
+    // Largest length a bounded one-shot *provided-buffer* upstream recv may
+    // request. A bulk-sized target instead uses add_recv_upstream_direct,
+    // which has no ring-size ceiling beyond the destination's own capacity.
     u32 upstream_once_max_len() const {
-        if (bulk_buf_ring != nullptr) return kBulkProvidedBufSize;
         return large_buf_ring != nullptr ? kLargeProvidedBufSize : kProvidedBufSize;
     }
 

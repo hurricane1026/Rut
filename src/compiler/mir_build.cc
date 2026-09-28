@@ -55,7 +55,7 @@ static bool response_read_deadline_request_policy_is_admitted_for_term(const Mir
     if (function.method == kRouteMethodGet &&
         term.forward_request_policy_id ==
             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
-        term.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        forward_response_buffering_uses_content_length_machinery(term.forward_response_buffering) &&
         response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
         return true;
     return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
@@ -106,8 +106,8 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
             module, function, *preflight_term))
         return false;
 
-    const bool complete_buffering = preflight_term->forward_response_buffering ==
-                                    ForwardResponseBufferingMode::CompleteContentLength;
+    const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
+        preflight_term->forward_response_buffering);
     const bool common = function.locals.len == 0 && function.waits.len == 0 &&
                         !function.state_zero_enters_entry && !function.has_explicit_resume_blocks &&
                         function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
@@ -155,7 +155,10 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
                    term.forward_request_policy_id == static_cast<u16>(policy) &&
                    response_read_timeout_seconds_valid(
                        term.forward_response_read_timeout_seconds) &&
-                   term.forward_response_buffering == buffering &&
+                   (buffering == ForwardResponseBufferingMode::None
+                        ? term.forward_response_buffering == ForwardResponseBufferingMode::None
+                        : forward_response_buffering_uses_content_length_machinery(
+                              term.forward_response_buffering)) &&
                    response_read_deadline_request_policy_is_admitted_for_term(
                        module, function, term) &&
                    (buffering == ForwardResponseBufferingMode::None ||
@@ -266,7 +269,8 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
         forward.upstream_index < module.upstreams.len && forward.forward_set_path.ptr == nullptr &&
         forward.forward_set_headers.len == 0 && !forward.has_forward_target_transform &&
         response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
-        forward.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        forward_response_buffering_uses_content_length_machinery(
+            forward.forward_response_buffering) &&
         complete_content_length_request_policy_is_admitted_for_term(function, forward) &&
         policy_bundle_valid;
     return redirect_valid && forward_valid;

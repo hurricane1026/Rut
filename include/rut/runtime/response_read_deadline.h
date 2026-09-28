@@ -87,7 +87,7 @@ inline bool response_read_deadline_fixed_upload_method_admitted(
             return true;
         case LogHttpMethod::Delete:
         case LogHttpMethod::Options:
-            return buffering == ForwardResponseBufferingMode::CompleteContentLength;
+            return forward_response_buffering_uses_content_length_machinery(buffering);
         case LogHttpMethod::Head:
         case LogHttpMethod::Trace:
         case LogHttpMethod::Connect:
@@ -398,7 +398,7 @@ inline bool complete_content_length_explicit_close_request_is_stable(
     ForwardResponseBufferingMode buffering,
     ResponseReadDeadlineProfile profile) {
     if (!proof.downstream_close ||
-        buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        !forward_response_buffering_uses_content_length_machinery(buffering) ||
         profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
         c.req_client_keep_alive || !c.req_client_connection_close ||
         !c.req_client_connection_close_exact || c.req_client_connection_count != 1)
@@ -908,8 +908,8 @@ inline bool response_read_deadline_exact_get_layout_is_stable(const Connection& 
            c.pipeline_stash_len == 0 &&
            c.response_read_deadline_profile ==
                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-           c.response_read_deadline_buffering ==
-               ForwardResponseBufferingMode::CompleteContentLength &&
+           forward_response_buffering_uses_content_length_machinery(
+               c.response_read_deadline_buffering) &&
            c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
            c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
            c.response_read_deadline_route_method == kRouteMethodGet;
@@ -936,7 +936,8 @@ inline bool complete_content_length_request_policy_owner_is_stable(
                 : c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip);
         return admitted && proof.request_policy_id == c.request_policy_id;
     }
-    if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength)
+    if (!forward_response_buffering_uses_content_length_machinery(
+            c.response_read_deadline_buffering))
         return true;
     if (c.response_read_deadline_profile ==
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -1126,7 +1127,7 @@ inline bool complete_content_length_fixed_upload_materialization_is_stable(
     ForwardResponseBufferingMode buffering,
     bool retired_episode = false) {
     if (profile != ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero ||
-        buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        !forward_response_buffering_uses_content_length_machinery(buffering) ||
         c.request_policy_id != static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
         proof.request_policy_id != c.request_policy_id ||
         !complete_content_length_route_method_is_admitted(route_method) ||
@@ -1151,8 +1152,8 @@ inline bool complete_content_length_fixed_upload_composition_is_stable(
     u16 bundle_id,
     u8 route_method,
     bool retired_episode = false) {
-    return c.response_read_deadline_buffering ==
-               ForwardResponseBufferingMode::CompleteContentLength &&
+    return forward_response_buffering_uses_content_length_machinery(
+               c.response_read_deadline_buffering) &&
            response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile) &&
            complete_content_length_fixed_upload_materialization_is_stable(
                c,
@@ -1221,7 +1222,7 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
                                           c, proof, identity_buffering, identity_profile);
     if (cfg == nullptr ||
         identity_profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-        identity_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        !forward_response_buffering_uses_content_length_machinery(identity_buffering) ||
         c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
         identity_method != static_cast<u8>(LogHttpMethod::Get) ||
         identity_route_method != kRouteMethodGet ||
@@ -1353,12 +1354,12 @@ inline bool response_read_deadline_tls_complete_get_profile_is_stable(const Conn
     const u16 bundle_id = c.response_read_deadline_bundle_id;
     return response_read_deadline_tls_http11_engine_is_stable(c) && config != nullptr &&
            config->policy_bundle_id_is_valid(bundle_id) &&
-           config->policy_bundles[bundle_id - 1u].response_buffering ==
-               ForwardResponseBufferingMode::CompleteContentLength &&
+           forward_response_buffering_uses_content_length_machinery(
+               config->policy_bundles[bundle_id - 1u].response_buffering) &&
            c.response_read_deadline_profile ==
                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-           c.response_read_deadline_buffering ==
-               ForwardResponseBufferingMode::CompleteContentLength &&
+           forward_response_buffering_uses_content_length_machinery(
+               c.response_read_deadline_buffering) &&
            c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
            c.response_read_deadline_route_method == kRouteMethodGet &&
            response_read_deadline_exact_get_layout_is_stable(c) &&
@@ -1374,7 +1375,7 @@ inline bool http1_pipeline_successor_semantic_shape_is_stable(
     u8 method,
     u8 route_method) {
     return profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-           buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+           forward_response_buffering_uses_content_length_machinery(buffering) &&
            method == static_cast<u8>(LogHttpMethod::Get) && route_method == kRouteMethodGet &&
            c.protocol == ConnProtocol::Http11 && !c.tls_active && c.h2 == nullptr &&
            c.req_http_version == static_cast<u8>(HttpVersion::Http11) && c.req_strict_h1_complete &&
@@ -1476,7 +1477,8 @@ inline bool http1_pipeline_successor_materialization_is_stable(const Connection&
         c.response_read_deadline_state != ResponseReadDeadlineState::Validated ||
         c.response_read_deadline_profile !=
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-        c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        !forward_response_buffering_uses_content_length_machinery(
+            c.response_read_deadline_buffering) ||
         c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
         c.response_read_deadline_route_method != kRouteMethodGet ||
         c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
@@ -1484,8 +1486,9 @@ inline bool http1_pipeline_successor_materialization_is_stable(const Connection&
         c.response_read_deadline_owner_generation != c.response_read_deadline_generation ||
         c.response_read_deadline_bundle_id == 0 || c.request_config == nullptr ||
         !c.request_config->policy_bundle_id_is_valid(c.response_read_deadline_bundle_id) ||
-        c.request_config->policy_bundles[c.response_read_deadline_bundle_id - 1]
-                .response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        !forward_response_buffering_uses_content_length_machinery(
+            c.request_config->policy_bundles[c.response_read_deadline_bundle_id - 1]
+                .response_buffering) ||
         c.pipeline_stash_len != 0 || c.recv_buf.data() == nullptr || c.req_header_end == 0 ||
         c.req_header_end != c.req_initial_send_len || c.req_initial_send_len != c.recv_buf.len() ||
         c.req_client_has_content_length || c.req_client_content_length_count != 0 ||
@@ -1644,7 +1647,7 @@ inline bool http1_pipeline_request_generation_prebuilt_is_stable(
                                                            copied_method,
                                                            copied_route_method) ||
         copied_profile != ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-        copied_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        !forward_response_buffering_uses_content_length_machinery(copied_buffering) ||
         copied_method != static_cast<u8>(LogHttpMethod::Get) ||
         copied_route_method != kRouteMethodGet ||
         copied_layout != Http1PrebuiltResponseLayout::FullContentLengthNonHead ||
@@ -1780,7 +1783,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         c.tls_active &&
         c.response_read_deadline_profile ==
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        forward_response_buffering_uses_content_length_machinery(
+            c.response_read_deadline_buffering) &&
         c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
         c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
         c.pipeline_stash_len == 0 && response_read_deadline_tls_http11_engine_is_stable(c) &&
@@ -1801,8 +1805,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     const bool coalesced_get = response_read_deadline_coalesced_get_phase1_stash_is_stable(
         c, c.response_read_deadline_upload);
     if (c.pipeline_stash_len != 0 && !coalesced_get) return false;
-    const bool complete_buffering =
-        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength;
+    const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
+        c.response_read_deadline_buffering);
     const bool fixed_upload =
         response_read_deadline_profile_is_fixed_upload(c.response_read_deadline_profile);
     const bool suppresses_head =
@@ -2008,7 +2012,8 @@ inline bool bodyless_get_keep_alive_precise_arm_is_stable(
     if (config == nullptr || config != c.request_config ||
         c.response_read_deadline_profile !=
             ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-        c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        !forward_response_buffering_uses_content_length_machinery(
+            c.response_read_deadline_buffering) ||
         c.response_read_deadline_method != static_cast<u8>(LogHttpMethod::Get) ||
         c.response_read_deadline_route_method != kRouteMethodGet ||
         c.req_method != c.response_read_deadline_method ||
@@ -2153,7 +2158,8 @@ inline bool response_read_deadline_combined_send_frame_is_stable(const Connectio
     const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
     if (c.response_read_deadline_post_commit_phase !=
             ResponseReadDeadlinePostCommitPhase::CombinedSend ||
-        c.response_read_deadline_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+        !forward_response_buffering_uses_content_length_machinery(
+            c.response_read_deadline_buffering) ||
         c.response_read_deadline_state != ResponseReadDeadlineState::BodyComplete ||
         c.response_read_deadline_post_commit_response_class !=
             CompleteContentLengthResponseClass::BoundedPositiveBody ||
@@ -2191,8 +2197,8 @@ inline bool response_read_deadline_combined_send_frame_is_stable(const Connectio
 inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const RouteConfig* cfg = c.request_config;
     const u16 bundle_id = c.response_read_deadline_bundle_id;
-    const bool complete_buffering =
-        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength;
+    const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
+        c.response_read_deadline_buffering);
     const bool retired_buffered_send =
         complete_buffering && c.response_read_deadline_post_commit_phase !=
                                   ResponseReadDeadlinePostCommitPhase::Buffering;
@@ -2420,8 +2426,8 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
                ResponseReadDeadlinePostCommitPhase::Buffering &&
            c.response_read_deadline_profile ==
                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-           c.response_read_deadline_buffering ==
-               ForwardResponseBufferingMode::CompleteContentLength &&
+           forward_response_buffering_uses_content_length_machinery(
+               c.response_read_deadline_buffering) &&
            c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
            c.response_read_deadline_route_method == kRouteMethodGet &&
            c.req_method == static_cast<u8>(LogHttpMethod::Get) && c.pipeline_depth == 0 &&

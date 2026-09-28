@@ -459,7 +459,7 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             (bundle.response_read_timeout_seconds == 0 && bundle.failure_policy_id == 0))
             return false;
         if (bundle.response_buffering != ForwardResponseBufferingMode::None &&
-            (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+            (!forward_response_buffering_uses_content_length_machinery(bundle.response_buffering) ||
              !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
              bundle.response_policy_id == 0 || bundle.failure_policy_id == 0 ||
              bundle.timeout_failure_policy_id == 0 ||

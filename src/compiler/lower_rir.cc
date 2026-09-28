@@ -16,7 +16,7 @@ static bool response_read_deadline_request_policy_is_admitted_for_term(const Mir
     if (route_method == kRouteMethodGet &&
         term.forward_request_policy_id ==
             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
-        term.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        forward_response_buffering_uses_content_length_machinery(term.forward_response_buffering) &&
         response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
         return true;
     return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
@@ -3136,8 +3136,8 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         if (!forward_response_buffering_mode_valid(term.forward_response_buffering))
             return frontend_error(FrontendError::UnsupportedSyntax, term.span);
         if (term.forward_response_buffering != ForwardResponseBufferingMode::None) {
-            if (term.forward_response_buffering !=
-                    ForwardResponseBufferingMode::CompleteContentLength ||
+            if (!forward_response_buffering_uses_content_length_machinery(
+                    term.forward_response_buffering) ||
                 term.forward_response_read_timeout_seconds == 0 ||
                 !complete_content_length_request_policy_is_admitted_for_term(fn->http_method,
                                                                              term) ||
@@ -3357,8 +3357,8 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
                         function.rate_limit.count == 0 && function.throttle_down_bps == 0 &&
                         !function.is_timer;
     if (function.forward_preflight_mode == ForwardPreflightMode::EagerDirect) {
-        const bool complete = timeout_term->forward_response_buffering ==
-                              ForwardResponseBufferingMode::CompleteContentLength;
+        const bool complete = forward_response_buffering_uses_content_length_machinery(
+            timeout_term->forward_response_buffering);
         return common && function.blocks.len == 1 && function.values.len == 0 &&
                &function.blocks[0].term == timeout_term && function.blocks[0].effects.len == 0 &&
                timeout_term->kind == MirTerminatorKind::ForwardUpstream &&
@@ -3400,7 +3400,10 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
                    term.forward_request_policy_id == static_cast<u16>(policy) &&
                    response_read_timeout_seconds_valid(
                        term.forward_response_read_timeout_seconds) &&
-                   term.forward_response_buffering == buffering &&
+                   (buffering == ForwardResponseBufferingMode::None
+                        ? term.forward_response_buffering == ForwardResponseBufferingMode::None
+                        : forward_response_buffering_uses_content_length_machinery(
+                              term.forward_response_buffering)) &&
                    response_read_deadline_request_policy_is_admitted_for_term(
                        module, function.method, term) &&
                    (buffering == ForwardResponseBufferingMode::None ||
@@ -3501,8 +3504,8 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
            forward.forward_set_path.ptr == nullptr && forward.forward_set_headers.len == 0 &&
            !forward.has_forward_target_transform &&
            response_read_timeout_seconds_valid(forward.forward_response_read_timeout_seconds) &&
-           forward.forward_response_buffering ==
-               ForwardResponseBufferingMode::CompleteContentLength &&
+           forward_response_buffering_uses_content_length_machinery(
+               forward.forward_response_buffering) &&
            complete_content_length_request_policy_is_admitted_for_term(function.method, forward) &&
            policy_bundle_valid;
 }

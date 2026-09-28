@@ -9805,7 +9805,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     const bool retained_bodyless_buffering_candidate =
         stmt.forward_request_policy_id ==
             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
-        stmt.forward_response_buffering == ForwardResponseBufferingMode::CompleteContentLength;
+        forward_response_buffering_uses_content_length_machinery(stmt.forward_response_buffering);
     if (stmt.has_forward_response_read_timeout &&
         !response_read_deadline_request_policy_is_admitted(stmt.forward_request_policy_id) &&
         !fixed_upload_head_timeout_candidate && !retained_bodyless_buffering_candidate)
@@ -9821,11 +9821,13 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     if (stmt.forward_request_policy_id ==
             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
         (!stmt.has_forward_response_read_timeout ||
-         stmt.forward_response_buffering != ForwardResponseBufferingMode::CompleteContentLength))
-        return frontend_error(FrontendError::UnsupportedSyntax,
-                              stmt.span,
-                              lit_str("retained_header_value requires complete response buffering "
-                                      "and a response read timeout"));
+         !forward_response_buffering_uses_content_length_machinery(
+             stmt.forward_response_buffering)))
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            stmt.span,
+            lit_str("retained_header_value requires complete or bounded response buffering "
+                    "and a response read timeout"));
     if (has_response_buffering &&
         (!stmt.has_forward_response_read_timeout || response_policy == nullptr ||
          failure_policy == nullptr || timeout_failure_policy == nullptr ||
@@ -19286,8 +19288,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         }
         if (timeout_term != nullptr) {
             const HirTerminator& direct = route.control.direct_term;
-            const bool complete_buffering = timeout_term->forward_response_buffering ==
-                                            ForwardResponseBufferingMode::CompleteContentLength;
+            const bool complete_buffering =
+                forward_response_buffering_uses_content_length_machinery(
+                    timeout_term->forward_response_buffering);
             auto timeout_request_policy_is_admitted = [&](const HirTerminator& term) {
                 if (response_read_deadline_request_policy_is_admitted(
                         term.forward_request_policy_id))
@@ -19295,8 +19298,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 if (route.method == kRouteMethodGet &&
                     term.forward_request_policy_id ==
                         static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab) &&
-                    term.forward_response_buffering ==
-                        ForwardResponseBufferingMode::CompleteContentLength &&
+                    forward_response_buffering_uses_content_length_machinery(
+                        term.forward_response_buffering) &&
                     response_read_timeout_seconds_valid(term.forward_response_read_timeout_seconds))
                     return true;
                 return term.forward_response_buffering == ForwardResponseBufferingMode::None &&
@@ -19325,8 +19328,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.forward_response_read_timeout_seconds != 0 &&
                        response_read_timeout_seconds_valid(
                            term.forward_response_read_timeout_seconds) &&
-                       term.forward_response_buffering ==
-                           ForwardResponseBufferingMode::CompleteContentLength &&
+                       forward_response_buffering_uses_content_length_machinery(
+                           term.forward_response_buffering) &&
                        (complete_content_length_request_policy_is_admitted(
                             term.forward_request_policy_id) ||
                         (route.method == kRouteMethodGet &&
@@ -19404,7 +19407,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                        term.forward_response_read_timeout_seconds != 0 &&
                        response_read_timeout_seconds_valid(
                            term.forward_response_read_timeout_seconds) &&
-                       term.forward_response_buffering == buffering &&
+                       (buffering == ForwardResponseBufferingMode::None
+                            ? term.forward_response_buffering == ForwardResponseBufferingMode::None
+                            : forward_response_buffering_uses_content_length_machinery(
+                                  term.forward_response_buffering)) &&
                        (buffering == ForwardResponseBufferingMode::None
                             ? timeout_request_policy_is_admitted(term)
                             : route.method == kRouteMethodGet &&

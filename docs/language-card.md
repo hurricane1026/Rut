@@ -406,6 +406,13 @@ return forward(users, request_policy: {
 // response_policy too — fully buffered, unchunked, with no pipelined
 // successor bytes, and never served from a reused idle upstream socket (see
 // `request_policy_body_response_admitted` in callbacks_impl.h).
+// response_read_timeout: <1..63s> plus response_buffering: "complete_content_length"
+// commits the entire upstream response before any downstream byte is sent.
+// response_buffering: "bounded" (nginx proxy_buffering-on semantics) releases
+// the Content-Length body downstream in whole 4 KiB units of raw upstream
+// bytes; below one unit it behaves exactly like "complete_content_length".
+// ⏳ pending: "bounded" is accepted everywhere "complete_content_length" is,
+// but the runtime still serves it exactly as "complete_content_length".
 
 return forward(users, response_policy: {
     version: "HTTP/1.1", framing: "content_length", connection: "request",

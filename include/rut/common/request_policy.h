@@ -91,9 +91,11 @@ inline bool request_policy_preserves_host(u16 id) {
     return id == static_cast<u16>(RequestPolicyId::Http11PreserveHostLowercase);
 }
 
-// ID3 is intentionally admitted only by the closed bodyless GET + complete
-// response-buffering profile.  The ordinary complete-buffering predicate below
-// remains unchanged so adding this policy cannot widen other routes.
+// ID3 is intentionally admitted only by the closed bodyless GET + complete-
+// or-bounded response-buffering profile (see
+// forward_response_buffering_uses_content_length_machinery).  The ordinary
+// complete-buffering predicate below remains unchanged so adding this policy
+// cannot widen other routes.
 inline bool bodyless_get_complete_content_length_request_policy_is_admitted(u16 id) {
     return id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
            id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);

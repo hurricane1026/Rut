@@ -1526,8 +1526,8 @@ private:
         if (forward_preflight_mode == ForwardPreflightMode::AfterCanonicalSelection &&
             (needs_req_body || method_key == kRouteMethodAny ||
              !complete_content_length_route_method_is_admitted(method_key) ||
-             policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
-                 ForwardResponseBufferingMode::CompleteContentLength))
+             !forward_response_buffering_uses_content_length_machinery(
+                 policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering)))
             return false;
         if (forward_preflight_mode == ForwardPreflightMode::AfterRequestFramingSelection &&
             (needs_req_body ||
@@ -1536,8 +1536,8 @@ private:
                policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
                    ForwardResponseBufferingMode::None) ||
               (method_key == kRouteMethodGet &&
-               policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering !=
-                   ForwardResponseBufferingMode::CompleteContentLength))))
+               !forward_response_buffering_uses_content_length_machinery(
+                   policy_bundles[preflight_forward_policy_bundle_id - 1].response_buffering)))))
             return false;
         auto& r = routes[route_count];
         r.path_len = 0;
@@ -1819,7 +1819,7 @@ public:
                 return 0;
         }
         if (response_buffering != ForwardResponseBufferingMode::None &&
-            (response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+            (!forward_response_buffering_uses_content_length_machinery(response_buffering) ||
              !response_read_timeout_seconds_valid(response_read_timeout_seconds) ||
              response_policy_id == 0 || failure_policy_id == 0 || timeout_failure_policy_id == 0 ||
              !complete_content_length_buffering_policies_valid(
@@ -1913,7 +1913,7 @@ public:
             (b.response_read_timeout_seconds == 0 && b.failure_policy_id == 0))
             return false;
         if (b.response_buffering != ForwardResponseBufferingMode::None) {
-            if (b.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
+            if (!forward_response_buffering_uses_content_length_machinery(b.response_buffering) ||
                 !response_read_timeout_seconds_valid(b.response_read_timeout_seconds) ||
                 b.response_policy_id == 0 || b.failure_policy_id == 0 ||
                 b.timeout_failure_policy_id == 0 ||

@@ -38,9 +38,9 @@
 namespace rut {
 
 // A bounded one-shot upstream recv may fill the whole upstream receive slice
-// from one dedicated provided buffer.
+// from one dedicated provided buffer. A bulk-sized target instead recvs
+// directly (add_recv_upstream_direct) — no ring, so no matching size assert.
 static_assert(kLargeProvidedBufSize == SlicePool::kSliceSize);
-static_assert(kBulkProvidedBufSize == SlicePool::kBulkSliceSize);
 
 namespace detail {
 
@@ -465,8 +465,12 @@ public:
         timer.init();
         // Reserve six ordinary slices and one complete bounded response chain
         // per admitted connection. TLS input remains separately mmap-backed.
-        auto pooled =
-            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
+        // Bulk relay buffers (Part D) are reserved per connection too, bounded
+        // by SlicePool::kMaxBulkSlices — only io_uring ever borrows one.
+        auto pooled = pool.init(SlicePool::capacity_for_connections(connection_capacity),
+                                pool_prealloc,
+                                SlicePool::kMaxCachedSlices,
+                                SlicePool::bulk_capacity_for_connections(connection_capacity));
         if (!pooled) {
             backend.shutdown();
             destroy_slot_storage();
@@ -817,7 +821,7 @@ private:
             c.http1_prebuilt_deadline_route_method == kRouteMethodGet &&
             bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id);
         if (!response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds) ||
-            (bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+            (forward_response_buffering_uses_content_length_machinery(bundle.response_buffering) &&
              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
                   !bodyless_get_retained_policy ||
               !complete_content_length_route_method_is_admitted(
@@ -1132,8 +1136,8 @@ private:
                    c.upstream_attempts == 1 &&
                    c.http1_prebuilt_deadline_profile ==
                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                   bundle.response_buffering ==
-                       ForwardResponseBufferingMode::CompleteContentLength &&
+                   forward_response_buffering_uses_content_length_machinery(
+                       bundle.response_buffering) &&
                    c.http1_prebuilt_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
                    c.http1_prebuilt_deadline_route_method == kRouteMethodGet &&
                    (c.upstream_retirement_target_owned & static_cast<u8>(~kUpstreamOpRecv)) == 0 &&
@@ -1473,8 +1477,39 @@ public:
             c.upstream_fd,
             c.id,
             c.upstream_episode,
-            c.response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength);
+            forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering));
+    }
+
+    // A one-shot recv of the rest of a buffered Content-Length body
+    // straight into the chain's tail node, with no provided-buffer copy.
+    // It is only ever armed as the connection's first body recv, never as a
+    // mid-body replacement for a cancelled provided-buffer recv: that switch
+    // dropped the connection when the origin was still sending. Bounded
+    // response buffering is the caller. The recv never reads past the
+    // response, because `len` is capped at the remaining declared body.
+    //
+    // Deliberately not MSG_WAITALL: settle_response_read_deadline_batch
+    // refreshes the inactivity deadline only on a positive recv CQE, so a
+    // WAITALL recv filling a 256 KiB node from a steadily trickling origin
+    // would expire the response although no single gap reached
+    // response_read_timeout.
+    [[nodiscard]] bool arm_response_read_direct_body_recv(Connection& c) {
+        if (c.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::Buffering)
+            return false;
+        const u32 declared = c.response_read_deadline_post_commit_declared_body;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        if (received >= declared) return false;
+        const u32 remaining = declared - received;
+        const u32 bulk_after = c.tls_active ? ResponseBodyChain::kBulkAfterTls
+                                            : ResponseBodyChain::kBulkAfterPlaintext;
+        if (!c.response_body_tail.reserve_tail(pool, bulk_after)) return false;
+        const u32 avail = c.response_body_tail.write_avail(pool);
+        if (avail == 0) return false;
+        const u32 len = remaining < avail ? remaining : avail;
+        u8* dst = c.response_body_tail.write_ptr(pool);
+        return backend.add_recv_upstream_direct(c.upstream_fd, c.id, c.upstream_episode, dst, len);
     }
 
     // Exact one-dispatch witness for a positive terminal upstream Recv.  The
@@ -1566,7 +1601,8 @@ public:
                        c.http1_boundary_successor_episode == 0);
         return phase_state && c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
                c.pipeline_stash_len == 0 &&
-               bundle.response_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+               forward_response_buffering_uses_content_length_machinery(
+                   bundle.response_buffering) &&
                bodyless_get_complete_content_length_request_policy_is_admitted(
                    c.request_policy_id) &&
                c.http1_prebuilt_deadline_upload.request_policy_id == c.request_policy_id &&
@@ -1941,8 +1977,8 @@ public:
             c.response_read_deadline_post_commit_generation == 0 ||
             c.response_read_deadline_post_commit_generation !=
                 c.response_read_deadline_generation ||
-            c.response_read_deadline_buffering !=
-                ForwardResponseBufferingMode::CompleteContentLength ||
+            !forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) ||
             c.response_read_deadline_send_owner_generation == 0 ||
             c.response_read_deadline_send_deadline_generation !=
                 c.response_read_deadline_post_commit_generation ||
@@ -3089,8 +3125,8 @@ public:
             generation = c.response_read_deadline_send_owner_generation;
             c.response_read_deadline_send_deadline_generation = c.response_read_deadline_generation;
             c.response_read_deadline_send_upstream_episode =
-                c.response_read_deadline_buffering ==
-                        ForwardResponseBufferingMode::CompleteContentLength
+                forward_response_buffering_uses_content_length_machinery(
+                    c.response_read_deadline_buffering)
                     ? c.response_read_deadline_post_commit_episode
                     : c.upstream_episode;
             c.response_read_deadline_send_src = buf;
@@ -3292,11 +3328,12 @@ public:
     // The buffer the next relay recv fills: the idle relay buffer, traded for
     // a bulk relay buffer while enough body remains and one is available. The
     // idle buffer is neither being sent (upstream_relay_send_len == 0 is part
-    // of relay eligibility) nor a recv target, so it can be released here.
+    // of relay eligibility) nor a recv target, so it can be released here
+    // regardless of whether a direct recv is currently armed into the
+    // *other* buffer (c.upstream_recv_slice) — they're never the same one.
     u8* take_relay_recv_buffer(Connection& c) {
         u8* idle = c.upstream_relay_slice;
-        if (idle == nullptr || pool.is_bulk(idle) || backend.bulk_buf_ring == nullptr ||
-            c.resp_body_remaining < kBulkRelayMinRemaining)
+        if (idle == nullptr || pool.is_bulk(idle) || c.resp_body_remaining < kBulkRelayMinRemaining)
             return idle;
         u8* bulk = pool.alloc_bulk();
         if (bulk == nullptr) return idle;
@@ -3311,13 +3348,18 @@ public:
     // Serialized body pump (response policies, non-relay owners): trade the
     // upstream recv slice for a bulk relay buffer while a large Content-Length
     // body remains, so the recv accumulates up to 256 KiB between client sends.
-    // Called between sends: nothing reads the slice, and a still-armed recv
-    // only ever lands bytes by copying into whatever buffer is bound when its
-    // CQE is processed, so rebinding here is safe. Buffered bytes move along.
+    // Called between sends: nothing reads the slice, so rebinding is normally
+    // safe. The one exception is a *direct* recv (Part A): its destination is
+    // the exact memory address captured at arm time, so the kernel could
+    // still be writing into `cur` even though no callback reads it — pinning
+    // (upstream_recv_direct_armed) must hold until that recv's terminal CQE
+    // is consumed, so skip the upgrade this cycle rather than rebind live
+    // kernel memory; the next opportunity (or release_upstream_relay_slice)
+    // retries it once the recv is no longer armed direct.
     void upgrade_upstream_recv_to_bulk(Connection& c) {
         u8* cur = c.upstream_recv_slice;
         if (cur == nullptr || pool.is_bulk(cur) || c.resp_body_mode != BodyMode::ContentLength ||
-            c.resp_body_remaining < kBulkRelayMinRemaining)
+            c.resp_body_remaining < kBulkRelayMinRemaining || c.upstream_recv_direct_armed)
             return;
         u8* bulk = pool.alloc_bulk();
         if (bulk == nullptr) return;
@@ -3337,10 +3379,17 @@ public:
             pool.free(c.upstream_relay_slice);
             c.upstream_relay_slice = nullptr;
         }
-        // A still-armed recv copies into whatever buffer is bound when its CQE
-        // is processed, so the swap is safe with one in flight.
+        // A still-armed provided-buffer recv copies into whatever buffer is
+        // bound when its CQE is processed, so the swap is normally safe with
+        // one in flight. A *direct* recv (Part A) is different: it already
+        // targets this exact memory in the kernel, so the buffer must stay
+        // pinned until that recv's terminal CQE is consumed — skip the swap
+        // this boundary rather than free/rebind live kernel memory; an idle
+        // keep-alive connection that stays pinned this way is a correctness
+        // requirement, not just an optimization (see add_recv_upstream_direct).
         u8* bulk = c.upstream_recv_slice;
-        if (!pool.is_bulk(bulk) || c.upstream_recv_buf.len() != 0) return;
+        if (!pool.is_bulk(bulk) || c.upstream_recv_buf.len() != 0 || c.upstream_recv_direct_armed)
+            return;
         u8* s = pool.alloc();
         if (s == nullptr) return;  // keep it; close or the next boundary returns it
         pool.free(bulk);
@@ -3416,17 +3465,31 @@ public:
         }
         const bool one_shot = use_one_shot_upstream_recv(c);
         bool submitted = false;
+        bool direct = false;
         if (one_shot) {
             const u32 available = c.upstream_recv_buf.write_avail();
             if (available == 0) return false;
-            const u32 max_len = backend.upstream_once_max_len();
-            const u32 recv_len = available < max_len ? available : max_len;
-            submitted =
-                backend.add_recv_upstream_once(c.upstream_fd, c.id, c.upstream_episode, recv_len);
+            if (pool.is_bulk(c.upstream_recv_slice)) {
+                // The destination is a bulk relay buffer: recv straight into
+                // it (Part A/B) instead of through a provided-buffer ring, so
+                // a 256 KiB chunk costs one CQE and no ring-to-buffer copy.
+                direct = true;
+                submitted = backend.add_recv_upstream_direct(c.upstream_fd,
+                                                             c.id,
+                                                             c.upstream_episode,
+                                                             c.upstream_recv_buf.write_ptr(),
+                                                             available);
+            } else {
+                const u32 max_len = backend.upstream_once_max_len();
+                const u32 recv_len = available < max_len ? available : max_len;
+                submitted = backend.add_recv_upstream_once(
+                    c.upstream_fd, c.id, c.upstream_episode, recv_len);
+            }
         } else {
             submitted = backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
         }
         if (submitted) {
+            c.upstream_recv_direct_armed = direct;
             c.pending_ops++;
             c.upstream_recv_armed = true;
             c.upstream_recv_pause_rearm_pending = false;
@@ -3599,8 +3662,8 @@ public:
         if (streaming_response_read_timer_is_stable(c)) return true;
         if (c.response_read_deadline_profile ==
                 ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-            c.response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength &&
+            forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) &&
             c.req_method == static_cast<u8>(LogHttpMethod::Get)) {
             if (c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::None)
@@ -4081,8 +4144,8 @@ public:
             auto& owner = response_read_batch_owners[oi];
             const Connection& c = conns[owner.conn_id];
             if (!owner.post_commit_at_start && owner.clean_eof && owner.saw_positive &&
-                c.response_read_deadline_buffering ==
-                    ForwardResponseBufferingMode::CompleteContentLength)
+                forward_response_buffering_uses_content_length_machinery(
+                    c.response_read_deadline_buffering))
                 owner.last_relevant = owner.last_positive;
         }
 
@@ -4343,8 +4406,8 @@ public:
         if (c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending ||
             c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::None ||
-            c.response_read_deadline_buffering !=
-                ForwardResponseBufferingMode::CompleteContentLength ||
+            !forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) ||
             !response_read_deadline_identity_is_stable(c) ||
             (c.response_read_deadline_profile !=
                  ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
@@ -4589,8 +4652,8 @@ public:
         Connection& c,
         CompleteContentLengthTerminalDisposition disposition,
         const ResponseReadBatchOwner* terminal_owner = nullptr) {
-        if (c.response_read_deadline_buffering !=
-                ForwardResponseBufferingMode::CompleteContentLength ||
+        if (!forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) ||
             c.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::Buffering ||
             (c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
@@ -4782,8 +4845,8 @@ public:
             c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight)
             return false;
         const bool already_retired_buffered_origin =
-            c.response_read_deadline_buffering ==
-                ForwardResponseBufferingMode::CompleteContentLength &&
+            forward_response_buffering_uses_content_length_machinery(
+                c.response_read_deadline_buffering) &&
             c.response_read_deadline_post_commit_episode == c.upstream_retiring_episode &&
             c.upstream_fd < 0 && c.upstream_abandoned;
         if (!c.upstream_retirement_active && !already_retired_buffered_origin) {
@@ -4919,8 +4982,8 @@ public:
                     ResponseReadDeadlinePostCommitPhase::Buffering &&
                 c.response_read_deadline_profile ==
                     ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                c.response_read_deadline_buffering ==
-                    ForwardResponseBufferingMode::CompleteContentLength &&
+                forward_response_buffering_uses_content_length_machinery(
+                    c.response_read_deadline_buffering) &&
                 c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
                 (owner.saw_precise_timer ||
                  c.response_read_timer_phase == ResponseReadTimerPhase::Armed);
@@ -5164,6 +5227,10 @@ public:
                         close_conn(c);
                     continue;
                 }
+                // The body keeps arriving through the provided-buffer recv.
+                // A mid-body cancel-and-switch to a direct recv into the
+                // chain tail dropped the connection whenever the origin was
+                // still sending, so this path never switches.
                 if (owner.saw_terminal && !c.upstream_recv_armed) {
                     if (c.upstream_recv_pause_cancel_pending ||
                         c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
@@ -5361,8 +5428,8 @@ public:
                 continue;
             if (c.response_read_deadline_post_commit_phase ==
                     ResponseReadDeadlinePostCommitPhase::Buffering &&
-                c.response_read_deadline_buffering ==
-                    ForwardResponseBufferingMode::CompleteContentLength) {
+                forward_response_buffering_uses_content_length_machinery(
+                    c.response_read_deadline_buffering)) {
                 if (!start_complete_content_length_send(
                         c, CompleteContentLengthTerminalDisposition::InactivityExpiry))
                     close_conn(c);
