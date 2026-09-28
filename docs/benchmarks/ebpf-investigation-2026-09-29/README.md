@@ -1062,3 +1062,14 @@ The small c1 system CPU saving repeats, but throughput remains uncertain: the 16
 ## Accepted 64 KiB proxy recv attempts
 
 All four c1 close/keepalive Rut/nginx traces are usable, exact-body checked and zero warm/load errors. Counts are grouped by requested tcp_recvmsg length and return kind; request normalization uses the overlapping load window (trace edges may add a request). Rut has roughly three positive reads/request and only rare EAGAIN on the body read. This does not support body POLL_FIRST as a significant fix. nginx performs more smaller positive reads, so fewer recv calls alone does not explain the latency gap. Kind 3 combines EOF and other errors and must not be described as EAGAIN. Instrumented throughput is not acceptance evidence.
+
+## Reject universal shutdown deduplication after static controls
+
+All eight static controls pass exact-body/warm/load checks.
+
+| Static case | Mean RPS change | Baseline system us/request | Candidate system us/request |
+|---|---:|---:|---:|
+| 16-c1-close | -5.15% | 18.34 | 17.59 |
+| 16-c32-close | +0.75% | 11.50 | 11.00 |
+
+Both static c1 candidate samples regress against both baseline samples despite lower CPU cost. The mechanism reduces syscalls but does not provide a reliable throughput win across affected paths. Revert runtime and test changes, retaining the patch, full regression, both proxy orders, static controls and eBPF evidence. No causal claim is made about why the lower-CPU static path is slower. The accepted runtime remains 271cd98c. A c1 64 KiB response-stage trace is now queued/running against that accepted binary and nginx.
