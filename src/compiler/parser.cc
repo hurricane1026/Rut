@@ -2255,6 +2255,10 @@ struct Parser {
                         bool have_date = false;
                         bool have_hide_headers = false;
                         bool have_head_mode = false;
+                        bool have_header_order = false;
+                        bool have_header_names = false;
+                        bool have_connection_header = false;
+                        bool have_status_reason = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2304,13 +2308,62 @@ struct Parser {
                                 policy.server = value.value()->text;
                             } else if (field_name.eq({"date", 4})) {
                                 seen = &have_date;
-                                auto value = expect_policy_case(lit_str(".current"));
+                                auto value =
+                                    expect_policy_case(lit_str(".current .preserveOrCurrent"));
                                 if (!value) return core::make_unexpected(value.error());
-                                if (!value.value()->text.eq({"current", 7}))
+                                const Str v = value.value()->text;
+                                if (v.eq({"current", 7})) {
+                                    policy.date = ResponsePolicyDate::Current;
+                                } else if (v.eq({"preserveOrCurrent", 17})) {
+                                    policy.date = ResponsePolicyDate::PreserveOrCurrent;
+                                } else {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
-                                                          value.value()->text);
-                                policy.date = ResponsePolicyDate::Current;
+                                                          v);
+                                }
+                            } else if (field_name.eq({"header_order", 12})) {
+                                seen = &have_header_order;
+                                auto value = expect_policy_case(lit_str(".upstream"));
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (v.eq({"upstream", 8})) {
+                                    policy.header_order = ResponsePolicyHeaderOrder::Upstream;
+                                } else {
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                }
+                            } else if (field_name.eq({"header_names", 12})) {
+                                seen = &have_header_names;
+                                auto value = expect_policy_case(lit_str(".lowercase"));
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"lowercase", 9}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                policy.header_names = ResponsePolicyHeaderNames::Lowercase;
+                            } else if (field_name.eq({"connection_header", 17})) {
+                                seen = &have_connection_header;
+                                auto value = expect_policy_case(lit_str(".closeOnly"));
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"closeOnly", 9}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                policy.connection_header =
+                                    ResponsePolicyConnectionHeader::CloseOnly;
+                            } else if (field_name.eq({"status_reason", 13})) {
+                                seen = &have_status_reason;
+                                auto value = expect_policy_case(lit_str(".canonical"));
+                                if (!value) return core::make_unexpected(value.error());
+                                const Str v = value.value()->text;
+                                if (!v.eq({"canonical", 9}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          v);
+                                policy.status_reason = ResponsePolicyStatusReason::Canonical;
                             } else if (field_name.eq({"head_mode", 9})) {
                                 seen = &have_head_mode;
                                 auto value = expect_policy_case(lit_str(".reject .suppressBody"));
@@ -2408,6 +2461,9 @@ struct Parser {
                         bool have_connection = false;
                         bool have_body = false;
                         bool have_head_mode = false;
+                        bool have_header_names = false;
+                        bool have_connection_header = false;
+                        bool have_header_order = false;
                         while (true) {
                             auto field = expect(TokenType::Ident);
                             if (!field) return core::make_unexpected(field.error());
@@ -2429,9 +2485,10 @@ struct Parser {
                                 auto value = expect(TokenType::IntLit);
                                 if (!value) return core::make_unexpected(value.error());
                                 auto status = parse_status_i32(*value.value());
-                                if (!status || (!is_timeout_policy && status.value() != 502) ||
-                                    (is_timeout_policy &&
-                                     (status.value() < 400 || status.value() > 599)))
+                                if (!status ||
+                                    (is_timeout_policy
+                                         ? (status.value() < 400 || status.value() > 599)
+                                         : (status.value() != 502 && status.value() != 503)))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           value.value()->text);
@@ -2487,6 +2544,32 @@ struct Parser {
                                 auto value = parse_failure_body_literal();
                                 if (!value) return core::make_unexpected(value.error());
                                 policy.body = value.value();
+                            } else if (field_name.eq({"header_names", 12})) {
+                                seen = &have_header_names;
+                                auto value = expect_policy_case(lit_str(".lowercase"));
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"lowercase", 9}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                            } else if (field_name.eq({"connection_header", 17})) {
+                                seen = &have_connection_header;
+                                auto value = expect_policy_case(lit_str(".closeOnly"));
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"closeOnly", 9}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                            } else if (field_name.eq({"header_order", 12})) {
+                                seen = &have_header_order;
+                                auto value = expect_policy_case(lit_str(".lengthTypeDateServer"));
+                                if (!value) return core::make_unexpected(value.error());
+                                if (!value.value()->text.eq({"lengthTypeDateServer", 20}))
+                                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.header_order =
+                                    FailurePolicyHeaderOrder::LengthTypeDateServer;
                             } else {
                                 return frontend_error(FrontendError::UnexpectedToken,
                                                       span_from(*field.value()),
@@ -2502,6 +2585,14 @@ struct Parser {
                         }
                         auto rbrace = expect(TokenType::RBrace);
                         if (!rbrace) return core::make_unexpected(rbrace.error());
+                        // `header_names`/`connection_header`/`header_order` are optional as
+                        // a closed trio, mirroring `local_response` (envoy-pr-plan.md PR5):
+                        // any one present requires all three.
+                        if ((have_header_names || have_connection_header || have_header_order) &&
+                            !(have_header_names && have_connection_header && have_header_order))
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*rbrace.value()),
+                                                  kw_text);
                         if (!have_version || !have_status || !have_reason || !have_content_type ||
                             !have_server || !have_date || !have_connection || !have_body ||
                             (is_timeout_policy ? !forward_timeout_failure_policy_spec_valid(policy)
@@ -5018,6 +5109,35 @@ struct Parser {
                 auto value = parse_strict_local_response_body_literal();
                 if (!value) return core::make_unexpected(value.error());
                 policy.body = value.value();
+            } else if (field.eq({"header_names", 12})) {
+                bit = 1u << 9;
+                auto value = expect_policy_case(lit_str(".lowercase"));
+                if (!value) return core::make_unexpected(value.error());
+                if (!value.value()->text.eq({"lowercase", 9}))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*value.value()),
+                                          value.value()->text);
+            } else if (field.eq({"connection_header", 17})) {
+                bit = 1u << 10;
+                auto value = expect_policy_case(lit_str(".closeOnly"));
+                if (!value) return core::make_unexpected(value.error());
+                if (!value.value()->text.eq({"closeOnly", 9}))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span_from(*value.value()),
+                                          value.value()->text);
+            } else if (field.eq({"header_order", 12})) {
+                bit = 1u << 11;
+                auto value = expect_policy_case(lit_str(".dateServerLength .lengthTypeDateServer"));
+                if (!value) return core::make_unexpected(value.error());
+                const Str v = value.value()->text;
+                if (v.eq({"dateServerLength", 16})) {
+                    policy.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
+                } else if (v.eq({"lengthTypeDateServer", 20})) {
+                    policy.header_order = StrictLocalResponseHeaderOrder::LengthTypeDateServer;
+                } else {
+                    return frontend_error(
+                        FrontendError::UnsupportedSyntax, span_from(*value.value()), v);
+                }
             } else {
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, span_from(*name.value()), field);
@@ -5028,7 +5148,24 @@ struct Parser {
             fields = static_cast<u16>(fields | bit);
             take(TokenType::Comma);
         }
-        if (fields != 0x1ffu)
+        // `header_names`/`connection_header`/`header_order` are optional as a
+        // closed trio (docs/envoy-converter.md; envoy-pr-plan.md PR5): any one
+        // present requires all three. `content_type` (bit 5) is otherwise
+        // always required, except the empty-body no-route layout
+        // (`date_server_length`), which requires it to be absent instead.
+        static constexpr u16 kEnvoyGroupBits = (1u << 9) | (1u << 10) | (1u << 11);
+        if ((fields & kEnvoyGroupBits) != 0 && (fields & kEnvoyGroupBits) != kEnvoyGroupBits)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  span_from(cur()),
+                                  lit_str("header_names, connection_header and header_order "
+                                          "must be used together"));
+        u16 required = 0x1ffu;
+        if ((fields & kEnvoyGroupBits) == kEnvoyGroupBits) {
+            required = static_cast<u16>(required | kEnvoyGroupBits);
+            if (policy.header_order == StrictLocalResponseHeaderOrder::DateServerLength)
+                required = static_cast<u16>(required & ~(1u << 5));
+        }
+        if (fields != required)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, span_from(cur()), lit_str("missing field"));
         auto object_rbrace = expect(TokenType::RBrace);

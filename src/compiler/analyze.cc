@@ -9761,6 +9761,16 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         if (!response_policy_spec_valid(*response_policy))
             return frontend_error(
                 FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid response policy"));
+        // `header_order: .upstream` is ordinary-forward-only, mirroring
+        // `request_policy host: .preserve` above: it never carries response
+        // read timing, response buffering, or a timeout failure policy bundle.
+        if (response_policy->header_order == ResponsePolicyHeaderOrder::Upstream &&
+            (stmt.has_forward_response_read_timeout || stmt.has_forward_response_buffering ||
+             stmt.has_forward_timeout_failure_policy))
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  stmt.span,
+                                  lit_str("response_policy header_order: .upstream does not "
+                                          "support this forward option"));
     }
     if (stmt.has_forward_failure_policy) {
         if (stmt.forward_failure_policy_id == 0 ||
@@ -9771,6 +9781,21 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         if (!forward_failure_policy_spec_valid(*failure_policy))
             return frontend_error(
                 FrontendError::UnsupportedSyntax, stmt.span, lit_str("invalid failure policy"));
+        // Envoy H1 status 503 / header_order: .lengthTypeDateServer is
+        // ordinary connect-failure-only, mirroring response_policy
+        // header_order: .upstream above: the response-read-deadline runtime
+        // custody paths (prepare_response_read_deadline_preflight_for_mode,
+        // include/rut/runtime/callbacks_impl.h) hard-require the default
+        // failure policy's status to be 502 and close the downstream
+        // connection on any mismatch, so admitting this layout into a
+        // response_read_timeout bundle would drop every matching request
+        // instead of serving the intended 503.
+        if (failure_policy->header_order == FailurePolicyHeaderOrder::LengthTypeDateServer &&
+            stmt.has_forward_response_read_timeout)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("failure_policy status 503 does not support response_read_timeout"));
     }
     if (stmt.has_forward_timeout_failure_policy) {
         if (!stmt.has_forward_response_policy || !stmt.has_forward_failure_policy ||

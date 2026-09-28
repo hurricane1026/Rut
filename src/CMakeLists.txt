@@ -207,24 +207,6 @@ target_include_directories(rut_nginx PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )
 
-# Standalone Envoy compatibility frontend: bounded JSON document parser plus
-# the Envoy v3 bootstrap semantic model (docs/envoy-converter.md). Like the
-# nginx frontend it owns no Rut grammar and links no runtime/lowering library.
-add_library(rut_envoy STATIC
-    envoy/json.cc
-    envoy/parser.cc
-    envoy/converter.cc
-)
-target_include_directories(rut_envoy PUBLIC
-    ${PROJECT_SOURCE_DIR}/include
-)
-
-# Standalone bounded Envoy-bootstrap-to-RUT conversion command. Links only the
-# Envoy frontend, so it cannot execute generated programs or open any
-# configured runtime resources.
-add_executable(rut-envoy-convert envoy/main.cc placement_new.cc)
-target_link_libraries(rut-envoy-convert rut_envoy)
-
 # Standalone bounded nginx-to-RUT conversion command. This deliberately links
 # only the nginx frontend so it cannot execute generated programs or open any
 # configured runtime resources.

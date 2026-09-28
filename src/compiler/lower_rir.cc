@@ -3592,6 +3592,10 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         dst.connection = src.connection;
         dst.date = src.date;
         dst.head_mode = src.head_mode;
+        dst.header_order = src.header_order;
+        dst.header_names = src.header_names;
+        dst.connection_header = src.connection_header;
+        dst.status_reason = src.status_reason;
         if (!copy_policy_str(src.server, dst.server))
             return frontend_error(FrontendError::OutOfMemory);
         dst.hide_header_count = src.hide_header_count;
@@ -3625,6 +3629,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         dst.date = src.date;
         dst.connection = src.connection;
         dst.head_mode = src.head_mode;
+        dst.header_order = src.header_order;
         if (!copy_failure_str(src.reason, dst.reason) ||
             !copy_failure_str(src.content_type, dst.content_type) ||
             !copy_failure_str(src.server, dst.server) || !copy_failure_str(src.body, dst.body))
@@ -3660,7 +3665,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         dst.date = src.date;
         dst.connection = src.connection;
         dst.head_mode = src.head_mode;
-        dst.reserved1 = src.reserved1;
+        dst.header_order = src.header_order;
         if (!copy_policy_str(src.reason, dst.reason) ||
             !copy_policy_str(src.content_type, dst.content_type) ||
             !copy_policy_str(src.server, dst.server) || !copy_policy_str(src.body, dst.body))

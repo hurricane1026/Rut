@@ -16,7 +16,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 SRC_FILES=$(find "$PROJECT_DIR/include" "$PROJECT_DIR/src" "$PROJECT_DIR/tests" \
-    "$PROJECT_DIR/testing" "$PROJECT_DIR/bench" \
+    "$PROJECT_DIR/testing" "$PROJECT_DIR/bench" "$PROJECT_DIR/helpers" \
     -name '*.h' -o -name '*.cc' 2>/dev/null | grep -v third_party)
 
 # Use LLVM 20 consistently for macOS compilation, JIT, formatting and linting.
@@ -101,7 +101,7 @@ tidy() {
     # Exclude all arch-specific SIMD backends — they require target intrinsic
     # headers that may not be available on the host (e.g. sse2.cc on ARM).
     # Only lint the scalar backend and the main parser code.
-    local src_cc=$(find "$PROJECT_DIR/src" -name '*.cc' \
+    local src_cc=$(find "$PROJECT_DIR/src" "$PROJECT_DIR/helpers" -name '*.cc' \
         ! -path '*/simd/sse2.cc' \
         ! -path '*/simd/avx2.cc' \
         ! -path '*/simd/avx512.cc' \
