@@ -1,0 +1,4 @@
+RUN: iouring_body_pump_ready_set.rejects_foreign_slots_and_rolls_back_bitmap_allocation
+  PASS: rejects_foreign_slots_and_rolls_back_bitmap_allocation
+
+1424 passed, 0 failed, 371775 checks, 0 failed checks
