@@ -5035,8 +5035,24 @@ public:
         // flush the newly-buffered-but-unreleased tail (nginx does not
         // publish a partial buffer on timeout): select exactly what already
         // went out.
+        //
+        // Gate on bounded_header_sent, not "released > 0": the origin can
+        // complete or cleanly EOF while the very first release — the
+        // header-only send from try_advance_bounded_release — is still in
+        // flight, when released is still 0 but the header has already been
+        // handed to the kernel. finish_bounded_release_as_complete/
+        // _clean_eof call in here (via response_read_deadline_bounded_pending_complete/
+        // _clean_eof) right after that send's completion callback sets
+        // bounded_header_sent — before any body byte is ever released. A
+        // released > 0 gate would miss that window, fall through to the
+        // ordinary HeaderSend path below, and resend the header a second
+        // time (then desync upstream_send_len against raw_header_end when it
+        // starts consuming body). bounded_header_sent already implies
+        // released >= 0 has been reached honestly (on_bounded_release_body_sent
+        // refuses to credit released before header_sent is set), so this is a
+        // strict widening, not a relaxation, of the released > 0 case.
         if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
-            c.response_read_deadline_bounded_released > 0 &&
+            c.response_read_deadline_bounded_header_sent &&
             c.response_read_deadline_post_commit_response_class ==
                 CompleteContentLengthResponseClass::BoundedPositiveBody) {
             const u32 released = c.response_read_deadline_bounded_released;

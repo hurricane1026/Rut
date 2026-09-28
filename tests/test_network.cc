@@ -62637,6 +62637,115 @@ TEST(response_buffering_runtime, bounded_complete_response_never_holds_even_when
     cleanup_prebuilt_d2(loop, fixture);
 }
 
+// Regression test for issue #2 (terminal handoff while the header release is
+// in flight): the origin can complete while the very first bounded release —
+// the header-only send from try_advance_bounded_release — is still
+// draining. At that instant response_read_deadline_bounded_header_sent is
+// still false and response_read_deadline_bounded_released is still 0, so a
+// fast-forward guard keyed on "released > 0" misses this window, falls
+// through to the ordinary HeaderSend path once the header send completes,
+// and resends the already-delivered header a second time (then desyncs
+// upstream_send_len against raw_header_end once it starts consuming body).
+TEST(response_buffering_runtime, bounded_complete_while_header_release_in_flight_fast_forwards) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/5));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 40000\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(kHeader, sizeof(kHeader) - 1u, &response), ParseStatus::Complete);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent header_event =
+        response_read_copy_event(conn, sizeof(kHeader) - 1u, true, 0, sizeof(kHeader) - 1u);
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_response_class,
+               CompleteContentLengthResponseClass::BoundedPositiveBody);
+    conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+    conn.response_read_deadline_progress_episode = conn.upstream_episode;
+    conn.response_read_deadline_progress_bytes =
+        conn.response_read_deadline_post_commit_origin_received;
+    loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    // First chunk: 25000 bytes, drained — crosses a release boundary and
+    // exceeds kBoundedMinReleaseBytes, so it releases immediately: the
+    // header-only send arms right here (see try_advance_bounded_release).
+    static constexpr u32 kFirstChunk = 25000;
+    static std::vector<u8> chunk1(kFirstChunk, 'a');
+    u32 begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk1.data(), kFirstChunk));
+    u32 end = conn.buffered_response_len();
+    IoEvent body1 =
+        response_read_copy_event(conn, static_cast<i32>(kFirstChunk), /*more=*/false, begin, end);
+    body1.sock_nonempty = 0;
+    loop->dispatch_batch(&body1, 1);
+
+    REQUIRE(conn.send_armed);
+    REQUIRE(conn.on_send == &on_bounded_release_header_sent<IoUringEventLoop>);
+    REQUIRE_FALSE(conn.response_read_deadline_bounded_header_sent);
+    REQUIRE_EQ(conn.response_read_deadline_bounded_released, 0u);
+    REQUIRE(conn.upstream_recv_armed);
+
+    // Second chunk: the remaining 15000 bytes complete the declared 40000-byte
+    // body in a SEPARATE wait batch, while the header send above is still in
+    // flight (its own completion is never dispatched in between).
+    static constexpr u32 kSecondChunk = 15000;
+    static std::vector<u8> chunk2(kSecondChunk, 'b');
+    begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk2.data(), kSecondChunk));
+    end = conn.buffered_response_len();
+    IoEvent body2 =
+        response_read_copy_event(conn, static_cast<i32>(kSecondChunk), /*more=*/false, begin, end);
+    body2.sock_nonempty = 0;
+    loop->dispatch_batch(&body2, 1);
+
+    // The completion was proven but must defer: the header send is still the
+    // live owner, so the terminal disposition cannot run until it drains.
+    CHECK(conn.response_read_deadline_bounded_pending_complete);
+    CHECK(conn.send_armed);
+    CHECK(conn.on_send == &on_bounded_release_header_sent<IoUringEventLoop>);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::Buffering);
+
+    // The in-flight header send now completes, running
+    // finish_bounded_release_as_complete's deferred CompleteBody disposition.
+    complete_prebuilt_d2_header(loop, conn);
+
+    // Fixed behavior: fast-forward straight to WaitingBody for the full,
+    // still-unreleased body — never resend the header, never touch
+    // upstream_send_len as if it were about to consume raw header bytes
+    // again.
+    CHECK(conn.response_read_deadline_bounded_header_sent);
+    CHECK_FALSE(conn.response_read_deadline_bounded_pending_complete);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::WaitingBody);
+    CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 40000u);
+    CHECK_EQ(conn.response_read_deadline_post_commit_downstream_submitted, 0u);
+    CHECK_EQ(conn.response_read_deadline_post_commit_downstream_completed, 0u);
+    CHECK_EQ(conn.resp_body_remaining, 40000u);
+    CHECK_EQ(conn.resp_body_sent, conn.response_header_buf.len());
+    CHECK(conn.response_read_deadline_post_commit_pump_pending);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
 // Regression test for the 64 KiB send-count fix: when the whole declared
 // body fits in one bulk node (kBulkPayload), the *first* direct body recv
 // for a Bounded response must reserve a bulk node immediately, not the
