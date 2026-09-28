@@ -33924,11 +33924,303 @@ TEST(response_policy, head_mode_is_owned_deduplicated_and_printed) {
     rir::print_module(buf, module);
     static constexpr char expected[] =
         "response_policies: 2\n"
-        "  response_policy#1: head_mode=reject\n"
-        "  response_policy#2: head_mode=suppress_body\n";
+        "  response_policy#1: head_mode=reject, header_order=synthesized, "
+        "header_names=preserve, connection_header=always, status_reason=upstream, "
+        "date=current, server=\"server\"\n"
+        "  response_policy#2: head_mode=suppress_body, header_order=synthesized, "
+        "header_names=preserve, connection_header=always, status_reason=upstream, "
+        "date=current, server=\"server\"\n";
     CHECK_FALSE(buf.overflow);
     CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
     CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
+}
+
+// Codex sweep-7 review (PR #698): before this fix, `print_module_impl`
+// rendered every response policy as just `head_mode=...`, so a synthesized
+// policy and an Envoy H1 `header_order: "upstream"` policy sharing the same
+// `head_mode` produced byte-identical dumps even though they serialize
+// different runtime bytes and admit a different status/header domain
+// (`build_strict_response_headers` dispatches on `header_order` in
+// include/rut/runtime/callbacks_impl.h). Assert the two profiles now print
+// distinctly via the layout fields lower_rir preserves
+// (src/compiler/lower_rir.cc): `header_order`, `header_names`,
+// `connection_header`, `status_reason`, `date`, and `server`.
+TEST(response_policy, upstream_order_and_synthesized_prints_differ_with_same_head_mode) {
+    char synth_server[] = "server";
+    ForwardResponsePolicySpec synthesized{};
+    synthesized.version = ResponsePolicyVersion::Http11;
+    synthesized.framing = ResponsePolicyFraming::ContentLength;
+    synthesized.connection = ResponsePolicyConnection::Request;
+    synthesized.date = ResponsePolicyDate::Current;
+    synthesized.head_mode = ResponsePolicyHeadMode::Reject;
+    synthesized.server = {synth_server, 6};
+    CHECK(response_policy_spec_valid(synthesized));
+
+    char envoy_server[] = "envoy";
+    ForwardResponsePolicySpec upstream_order{};
+    upstream_order.version = ResponsePolicyVersion::Http11;
+    upstream_order.framing = ResponsePolicyFraming::ContentLength;
+    upstream_order.connection = ResponsePolicyConnection::Request;
+    upstream_order.head_mode = ResponsePolicyHeadMode::Reject;
+    upstream_order.header_order = ResponsePolicyHeaderOrder::Upstream;
+    upstream_order.header_names = ResponsePolicyHeaderNames::Lowercase;
+    upstream_order.connection_header = ResponsePolicyConnectionHeader::CloseOnly;
+    upstream_order.status_reason = ResponsePolicyStatusReason::Canonical;
+    upstream_order.date = ResponsePolicyDate::PreserveOrCurrent;
+    upstream_order.server = {envoy_server, 5};
+    CHECK(response_policy_spec_valid(upstream_order));
+
+    rir::Module module{};
+    module.response_policy_count = 2;
+    module.response_policies[0] = synthesized;
+    module.response_policies[1] = upstream_order;
+    char output[1024];
+    rir::PrintBuf buf;
+    buf.init(output, sizeof(output), -1);
+    rir::print_module(buf, module);
+    static constexpr char expected[] =
+        "response_policies: 2\n"
+        "  response_policy#1: head_mode=reject, header_order=synthesized, "
+        "header_names=preserve, connection_header=always, status_reason=upstream, "
+        "date=current, server=\"server\"\n"
+        "  response_policy#2: head_mode=reject, header_order=upstream, "
+        "header_names=lowercase, connection_header=close_only, status_reason=canonical, "
+        "date=preserve_or_current, server=\"envoy\"\n";
+    CHECK_FALSE(buf.overflow);
+    CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
+    CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
+}
+
+TEST(frontend, response_policy_header_order_upstream_parses_and_propagates) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            header_order: "upstream", header_names: "lowercase",
+            connection_header: "close_only", status_reason: "canonical",
+            server: "envoy", date: "preserve_or_current", hide_headers: []
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->response_policies.len, 1u);
+    const auto& parsed_policy = ast->response_policies[0];
+    CHECK(parsed_policy.header_order == ResponsePolicyHeaderOrder::Upstream);
+    CHECK(parsed_policy.header_names == ResponsePolicyHeaderNames::Lowercase);
+    CHECK(parsed_policy.connection_header == ResponsePolicyConnectionHeader::CloseOnly);
+    CHECK(parsed_policy.status_reason == ResponsePolicyStatusReason::Canonical);
+    CHECK(parsed_policy.date == ResponsePolicyDate::PreserveOrCurrent);
+    CHECK(response_policy_spec_valid(parsed_policy));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK_EQ(hir->routes[0].control.direct_term.forward_response_policy_id, 1u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    CHECK_EQ(mir->functions[0].blocks[0].term.forward_response_policy_id, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE_EQ(rir.module.response_policy_count, 1u);
+    const auto& lowered_policy = rir.module.response_policies[0];
+    CHECK(lowered_policy.header_order == ResponsePolicyHeaderOrder::Upstream);
+    CHECK(lowered_policy.header_names == ResponsePolicyHeaderNames::Lowercase);
+    CHECK(lowered_policy.connection_header == ResponsePolicyConnectionHeader::CloseOnly);
+    CHECK(lowered_policy.status_reason == ResponsePolicyStatusReason::Canonical);
+    CHECK(lowered_policy.date == ResponsePolicyDate::PreserveOrCurrent);
+    RouteConfig cfg{};
+    REQUIRE(populate_route_config(cfg, rir.module));
+    REQUIRE_EQ(cfg.response_policy_count, 1u);
+    CHECK(cfg.response_policies[0].header_order == ResponsePolicyHeaderOrder::Upstream);
+    rir.destroy();
+}
+
+TEST(frontend, response_policy_header_order_upstream_rejects_every_missing_companion) {
+    const char* invalid[] = {
+        // Missing header_names.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", connection_header: \"close_only\", status_reason: \"canonical\", "
+        "server: \"envoy\", date: \"preserve_or_current\", hide_headers: [] }) }\n",
+        // Missing connection_header.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", header_names: \"lowercase\", status_reason: \"canonical\", "
+        "server: \"envoy\", date: \"preserve_or_current\", hide_headers: [] }) }\n",
+        // Missing status_reason.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", header_names: \"lowercase\", connection_header: \"close_only\", "
+        "server: \"envoy\", date: \"preserve_or_current\", hide_headers: [] }) }\n",
+        // date stays "current" instead of "preserve_or_current".
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", header_names: \"lowercase\", connection_header: \"close_only\", "
+        "status_reason: \"canonical\", server: \"envoy\", date: \"current\", "
+        "hide_headers: [] }) }\n",
+        // header_names/connection_header/status_reason set without header_order at all.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_names: "
+        "\"lowercase\", server: \"envoy\", date: \"current\", hide_headers: [] }) }\n",
+        // date: "preserve_or_current" alone, header_order omitted (Synthesized).
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", server: \"envoy\", "
+        "date: \"preserve_or_current\", hide_headers: [] }) }\n",
+        // header_order: "upstream" duplicated.
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
+        "\"HTTP/1.1\", framing: \"content_length\", connection: \"request\", header_order: "
+        "\"upstream\", header_order: \"upstream\", header_names: \"lowercase\", "
+        "connection_header: \"close_only\", status_reason: \"canonical\", server: \"envoy\", "
+        "date: \"preserve_or_current\", hide_headers: [] }) }\n",
+    };
+    for (const char* src : invalid) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        CHECK_FALSE(ast.has_value());
+    }
+}
+
+TEST(frontend, response_policy_header_order_upstream_rejects_timing_and_buffering_options) {
+    const auto source_for = [](const char* kwarg) {
+        return std::string(R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend, response_policy: {
+        version: "HTTP/1.1", framing: "content_length", connection: "request",
+        header_order: "upstream", header_names: "lowercase",
+        connection_header: "close_only", status_reason: "canonical",
+        server: "envoy", date: "preserve_or_current", hide_headers: []
+    }, )rut") + kwarg +
+               ")\n}\n";
+    };
+    const char* rejected_kwargs[] = {
+        "response_read_timeout: 1s",
+        "response_buffering: \"complete_content_length\"",
+        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: \"current\", "
+        "connection: \"request\", body: b\"bad\" }, "
+        "timeout_failure_policy: { version: \"HTTP/1.1\", status: 504, "
+        "reason: \"Gateway Time-out\", content_type: \"text/plain\", server: \"s\", "
+        "date: \"current\", connection: \"request\", body: b\"slow\" }",
+    };
+    for (const char* kwarg : rejected_kwargs) {
+        const std::string source = source_for(kwarg);
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(lit(
+            "response_policy header_order: \"upstream\" does not support this forward option")));
+    }
+}
+
+// Codex round-7 review: analyze.cc, compile_to_config.h, and route_table.h
+// all reject an upstream-order response policy bundled with response read
+// timing, response buffering, or a timeout failure policy, but the RIR
+// verifier's bundle-validation loop did not, so a hand-built module could
+// be reported as verified and only fail later in populate_route_config.
+// Verification and publication must agree on this invariant.
+TEST(frontend, response_policy_header_order_upstream_verifier_rejects_forged_bundles) {
+    const char source[] = R"rut(
+upstream backend at "127.0.0.1:9000"
+route GET "/" {
+    return forward(backend,
+        response_policy: {
+            version: "HTTP/1.1", framing: "content_length", connection: "request",
+            header_order: "upstream", header_names: "lowercase",
+            connection_header: "close_only", status_reason: "canonical",
+            server: "envoy", date: "preserve_or_current", hide_headers: []
+        },
+        failure_policy: {
+            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: "current",
+            connection: "request", body: b"bad"
+        })
+}
+)rut";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto& mod = rir.module;
+    REQUIRE_EQ(mod.response_policy_count, 1u);
+    REQUIRE_EQ(mod.failure_policy_count, 1u);
+    REQUIRE_EQ(mod.policy_bundle_count, 1u);
+    auto& bundle = mod.policy_bundles[0];
+    CHECK(mod.response_policies[0].header_order == ResponsePolicyHeaderOrder::Upstream);
+    REQUIRE_EQ(bundle.response_policy_id, 1u);
+    REQUIRE_EQ(bundle.failure_policy_id, 1u);
+    CHECK_EQ(bundle.timeout_failure_policy_id, 0u);
+    CHECK_EQ(bundle.response_read_timeout_seconds, 0u);
+    CHECK(bundle.response_buffering == ForwardResponseBufferingMode::None);
+
+    // The ordinary-forward-only shape (response + default failure policy,
+    // nothing else) is accepted by both the verifier and config population.
+    REQUIRE(rir::verify_module(mod).ok);
+    {
+        RouteConfig cfg{};
+        REQUIRE(populate_route_config(cfg, mod));
+    }
+
+    // An otherwise-valid timeout failure policy (same shape and HEAD mode as
+    // the default 502 policy, distinct status so `add_failure_policy` does
+    // not dedupe it away) so the forgeries below fail only on the
+    // upstream-order invariant, not on a malformed companion.
+    mod.failure_policies[1] = mod.failure_policies[0];
+    mod.failure_policies[1].status_code = 504;
+    mod.failure_policy_count = 2;
+    REQUIRE(forward_timeout_failure_policy_spec_valid(mod.failure_policies[1]));
+    REQUIRE(rir::verify_module(mod).ok);
+
+    auto expect_rejected = [&]() {
+        const auto verified = rir::verify_module(mod);
+        CHECK_FALSE(verified.ok);
+        CHECK_EQ(verified.issue.code, rir::VerifyIssueCode::InvalidForwardPreflight);
+        RouteConfig cfg{};
+        CHECK_FALSE(populate_route_config(cfg, mod));
+    };
+
+    // Valid response read timeout alone.
+    bundle.response_read_timeout_seconds = 5;
+    expect_rejected();
+    bundle.response_read_timeout_seconds = 0;
+    REQUIRE(rir::verify_module(mod).ok);
+
+    // Valid timeout failure policy alone.
+    bundle.timeout_failure_policy_id = 2;
+    expect_rejected();
+    bundle.timeout_failure_policy_id = 0;
+    REQUIRE(rir::verify_module(mod).ok);
+
+    // Complete buffering with every companion it would otherwise require.
+    bundle.response_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    bundle.response_read_timeout_seconds = 5;
+    bundle.timeout_failure_policy_id = 2;
+    expect_rejected();
+    bundle.response_buffering = ForwardResponseBufferingMode::None;
+    bundle.response_read_timeout_seconds = 0;
+    bundle.timeout_failure_policy_id = 0;
+
+    // Exact restoration verifies and publishes again.
+    REQUIRE(rir::verify_module(mod).ok);
+    {
+        RouteConfig cfg{};
+        REQUIRE(populate_route_config(cfg, mod));
+    }
+    rir.destroy();
 }
 
 TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fields) {
@@ -35393,6 +35685,108 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK_FALSE(forward_failure_policy_spec_valid(spec));
 }
 
+// Envoy H1 failure_policy layout (envoy-pr-plan.md PR5, oracle overrides):
+// status 503 is admitted only paired with the closed
+// header_names/connection_header/header_order trio and a non-empty body;
+// 502 stays exactly today's Synthesized-only contract; 504 is never valid on
+// `failure_policy` (only `timeout_failure_policy` spans 400..599).
+TEST(frontend, failure_policy_envoy_layout_admits_503_and_keeps_502_closed) {
+    auto compiles = [&](const std::string& src) {
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        if (!lexed) return false;
+        return parse_file_heap(lexed.value()).has_value();
+    };
+    const std::string prefix =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", ";
+    const std::string envoy_fields =
+        "connection_header: \"close_only\", header_names: \"lowercase\", header_order: "
+        "\"length_type_date_server\", ";
+    const std::string body_and_close =
+        "connection: \"request\", body: b\"upstream connect error\" "
+        "}) }\n";
+
+    // 503 with the full Envoy layout: accepted.
+    CHECK(compiles(prefix +
+                   "status: 503, reason: \"Service Unavailable\", content_type: "
+                   "\"text/plain\", server: \"envoy\", date: \"current\", " +
+                   envoy_fields + body_and_close));
+
+    // 503 without the layout: rejected (falls back to the 502-only contract).
+    CHECK_FALSE(compiles(prefix +
+                         "status: 503, reason: \"Service Unavailable\", content_type: "
+                         "\"text/plain\", server: \"envoy\", date: \"current\", " +
+                         body_and_close));
+
+    // Partial trio (header_order without header_names/connection_header): rejected.
+    CHECK_FALSE(compiles(
+        prefix +
+        "status: 503, reason: \"Service Unavailable\", content_type: \"text/plain\", server: "
+        "\"envoy\", date: \"current\", header_order: \"length_type_date_server\", " +
+        body_and_close));
+
+    // 503 with the layout but an empty body: rejected (LengthTypeDateServer
+    // requires a non-empty body).
+    CHECK_FALSE(compiles(prefix +
+                         "status: 503, reason: \"Service Unavailable\", content_type: "
+                         "\"text/plain\", server: \"envoy\", date: \"current\", " +
+                         envoy_fields + "connection: \"request\", body: b\"\" }) }\n"));
+
+    // 502 with the Envoy layout: rejected (502 stays Synthesized-only).
+    CHECK_FALSE(compiles(prefix +
+                         "status: 502, reason: \"Bad Gateway\", content_type: "
+                         "\"text/plain\", server: \"envoy\", date: \"current\", " +
+                         envoy_fields + body_and_close));
+
+    // 502 without the layout (today's contract): still accepted.
+    CHECK(compiles(prefix +
+                   "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", "
+                   "server: \"envoy\", date: \"current\", " +
+                   body_and_close));
+
+    // 504 is never a valid `failure_policy` status, layout or not.
+    CHECK_FALSE(compiles(prefix +
+                         "status: 504, reason: \"Gateway Timeout\", content_type: "
+                         "\"text/plain\", server: \"envoy\", date: \"current\", " +
+                         envoy_fields + body_and_close));
+}
+
+// Codex round-3 review: prepare_response_read_deadline_preflight_for_mode
+// (include/rut/runtime/callbacks_impl.h) hard-requires the default failure
+// policy's status to be 502 and closes the downstream connection on
+// mismatch, so the Envoy 503/length_type_date_server failure_policy must
+// never be admitted alongside response_read_timeout -- it would drop every
+// matching request instead of serving the intended 503. The plain
+// connect-failure-only usage (no response_read_timeout) stays admitted.
+TEST(frontend, failure_policy_status_503_rejects_response_read_timeout) {
+    const std::string prefix =
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "status: 503, reason: \"Service Unavailable\", content_type: \"text/plain\", server: "
+        "\"envoy\", date: \"current\", connection_header: \"close_only\", header_names: "
+        "\"lowercase\", header_order: \"length_type_date_server\", connection: \"request\", "
+        "body: b\"upstream connect error\"";
+    {
+        // Ordinary connect-failure-only usage: still admitted.
+        const std::string src = prefix + " }) }\n";
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(hir.has_value());
+    }
+    {
+        const std::string src = prefix + " }, response_read_timeout: 1s) }\n";
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE_FALSE(hir.has_value());
+        CHECK(hir.error().detail.eq(
+            lit("failure_policy status 503 does not support response_read_timeout")));
+    }
+}
+
 TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     const char* src =
         "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
@@ -35460,8 +35854,12 @@ TEST(frontend, failure_policy_head_mode_is_owned_deduplicated_and_printed) {
     rir::print_module(buf, module);
     static constexpr char expected[] =
         "failure_policies: 2\n"
-        "  failure_policy#1: head_mode=reject\n"
-        "  failure_policy#2: head_mode=suppress_body\n";
+        "  failure_policy#1: version=HTTP/1.1, status=502, reason=\"Bad Gateway\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=reject, header_order=synthesized, body=b\"unavailable\" (len=11)\n"
+        "  failure_policy#2: version=HTTP/1.1, status=502, reason=\"Bad Gateway\", "
+        "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
+        "head_mode=suppress_body, header_order=synthesized, body=b\"unavailable\" (len=11)\n";
     CHECK_FALSE(buf.overflow);
     CHECK_EQ(buf.len, static_cast<u32>(sizeof(expected) - 1));
     CHECK(__builtin_memcmp(buf.data, expected, sizeof(expected) - 1) == 0);
@@ -36695,16 +37093,16 @@ unmatched { return local_response({
         "strict_local_response_policies: 4\n"
         "  local_response#1: version=HTTP/1.1, status=400, reason=\"Bad Request\", "
         "server=\"rut\", content_type=\"text/html\", date=current, connection=request, "
-        "head_mode=reject, body=b\"options\" (len=7)\n"
+        "head_mode=reject, header_order=synthesized, body=b\"options\" (len=7)\n"
         "  local_response#2: version=HTTP/1.1, status=405, reason=\"Not Allowed\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=reject, body=b\"connect\" (len=7)\n"
+        "head_mode=reject, header_order=synthesized, body=b\"connect\" (len=7)\n"
         "  local_response#3: version=HTTP/1.1, status=403, reason=\"Forbidden\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=suppress_body, body=b\"trace\" (len=5)\n"
+        "head_mode=suppress_body, header_order=synthesized, body=b\"trace\" (len=5)\n"
         "  local_response#4: version=HTTP/1.1, status=404, reason=\"Not Found\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=suppress_body, body=b\"A\\x00\\nB\" (len=4)\n"
+        "head_mode=suppress_body, header_order=synthesized, body=b\"A\\x00\\nB\" (len=4)\n"
         "unmatched:\n"
         "  ANY -> local_response#4\n"
         "  OPTIONS -> local_response#1\n"
@@ -36906,16 +37304,16 @@ route exact slash_normalized "/health/check" { return local_response({
         "strict_local_response_policies: 4\n"
         "  local_response#1: version=HTTP/1.1, status=400, reason=\"Raw Get\", server=\"rut\", "
         "content_type=\"text/plain\", date=current, connection=request, head_mode=reject, "
-        "body=b\"raw-get\" (len=7)\n"
+        "header_order=synthesized, body=b\"raw-get\" (len=7)\n"
         "  local_response#2: version=HTTP/1.1, status=401, reason=\"Normalized Get\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=reject, body=b\"normalized-get\" (len=14)\n"
+        "head_mode=reject, header_order=synthesized, body=b\"normalized-get\" (len=14)\n"
         "  local_response#3: version=HTTP/1.1, status=402, reason=\"Raw Any\", server=\"rut\", "
         "content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=suppress_body, body=b\"raw-any\" (len=7)\n"
+        "head_mode=suppress_body, header_order=synthesized, body=b\"raw-any\" (len=7)\n"
         "  local_response#4: version=HTTP/1.1, status=403, reason=\"Normalized Any\", "
         "server=\"rut\", content_type=\"text/plain\", date=current, connection=request, "
-        "head_mode=suppress_body, body=b\"normalized-any\" (len=14)\n"
+        "head_mode=suppress_body, header_order=synthesized, body=b\"normalized-any\" (len=14)\n"
         "unmatched:\n"
         "exact:\n"
         "  GET \"/health/check\" -> local_response#1\n"
@@ -37090,6 +37488,35 @@ TEST(frontend, exact_local_response_syntax_and_selector_rejection_matrix) {
     REQUIRE(generic_lexed);
     CHECK_FALSE(parse_file_heap(generic_lexed.value()).has_value());
 
+    // DESIGN.md §3.3.5.1: the optional method precedes the exact path
+    // (`route exact GET "/healthz"`, either method case). The path-first
+    // spelling `route exact "/healthz" GET` parses the string literal as an
+    // ANY-method selector and is rejected at the trailing method token, where
+    // the policy block's opening brace is expected.
+    for (const char* method : {"GET", "get"}) {
+        const std::string path_first = source_for("\"/healthz\" " + std::string(method));
+        auto path_first_lexed = lex({path_first.data(), static_cast<u32>(path_first.size())});
+        REQUIRE(path_first_lexed);
+        auto rejected = parse_file_heap(path_first_lexed.value());
+        REQUIRE_FALSE(rejected);
+        CHECK_EQ(rejected.error().code, FrontendError::UnexpectedToken);
+        const std::size_t method_at = path_first.find(method, path_first.find("/healthz\""));
+        REQUIRE(method_at != std::string::npos);
+        CHECK_EQ(rejected.error().span.start, static_cast<u32>(method_at));
+        CHECK_EQ(rejected.error().span.line, 1u);
+        CHECK_EQ(rejected.error().span.col, static_cast<u32>(method_at + 1u));
+
+        const std::string method_first =
+            source_for(std::string(method) + " \"/healthz\"", "reject");
+        auto method_first_lexed = lex({method_first.data(), static_cast<u32>(method_first.size())});
+        REQUIRE(method_first_lexed);
+        auto accepted = parse_file_heap(method_first_lexed.value());
+        REQUIRE(accepted);
+        REQUIRE_EQ(accepted->exact_strict_local_response_bindings.len, 1u);
+        CHECK_EQ(accepted->exact_strict_local_response_bindings[0].method, kRouteMethodGet);
+        CHECK_EQ(accepted->exact_strict_local_response_bindings[0].path_len, 8u);
+    }
+
     const std::string normalized_invalid[] = {
         "slash_normalized \"/\"",
         "slash_normalized \"//health\"",
@@ -37193,7 +37620,7 @@ unmatched { return local_response({
     CHECK_EQ(strict_local_response_profile(ast_policy.status_code),
              StrictLocalResponseProfile::Representation200);
     CHECK_EQ(ast_policy.reserved0, 0u);
-    CHECK_EQ(ast_policy.reserved1, 0u);
+    CHECK(ast_policy.header_order == StrictLocalResponseHeaderOrder::Synthesized);
     CHECK(ast_policy.reason.eq(lit("OK")));
     CHECK(ast_policy.content_type.eq(lit("text/plain")));
     CHECK(ast_policy.server.eq(lit("nginx/1.29.7")));
@@ -37207,19 +37634,21 @@ unmatched { return local_response({
     REQUIRE(hir);
     REQUIRE_EQ(hir->strict_local_response_policies.len, 1u);
     CHECK_EQ(hir->strict_local_response_policies[0].reserved0, 0u);
-    CHECK_EQ(hir->strict_local_response_policies[0].reserved1, 0u);
+    CHECK(hir->strict_local_response_policies[0].header_order ==
+          StrictLocalResponseHeaderOrder::Synthesized);
     auto mir = build_mir_heap(hir.value());
     REQUIRE(mir);
     REQUIRE_EQ(mir->strict_local_response_policies.len, 1u);
     CHECK_EQ(mir->strict_local_response_policies[0].reserved0, 0u);
-    CHECK_EQ(mir->strict_local_response_policies[0].reserved1, 0u);
+    CHECK(mir->strict_local_response_policies[0].header_order ==
+          StrictLocalResponseHeaderOrder::Synthesized);
     FrontendRirModule lowered{};
     REQUIRE(lower_to_rir(mir.value(), lowered));
     REQUIRE(rir::verify_module(lowered.module).ok);
     REQUIRE_EQ(lowered.module.strict_local_response_policy_count, 1u);
     const auto& rir_policy = lowered.module.strict_local_response_policies[0];
     CHECK_EQ(rir_policy.reserved0, 0u);
-    CHECK_EQ(rir_policy.reserved1, 0u);
+    CHECK(rir_policy.header_order == StrictLocalResponseHeaderOrder::Synthesized);
     CHECK(strict_local_response_policy_spec_valid(rir_policy));
     CHECK(rir_policy.reason.eq(lit("OK")));
     CHECK(rir_policy.content_type.eq(lit("text/plain")));
@@ -37237,6 +37666,7 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
     static_assert(static_cast<u8>(StrictLocalResponseProfile::Representation200) == 1);
     static_assert(static_cast<u8>(StrictLocalResponseProfile::LegacyError) == 2);
     static_assert(static_cast<u8>(StrictLocalResponseProfile::NoContent204) == 3);
+    static_assert(static_cast<u8>(StrictLocalResponseProfile::EmptyError) == 4);
     static_assert(sizeof(StrictLocalResponsePolicySpec) == 72);
     static_assert(offsetof(StrictLocalResponsePolicySpec, version) == 0);
     static_assert(offsetof(StrictLocalResponsePolicySpec, reserved0) == 1);
@@ -37244,7 +37674,7 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
     static_assert(offsetof(StrictLocalResponsePolicySpec, date) == 4);
     static_assert(offsetof(StrictLocalResponsePolicySpec, connection) == 5);
     static_assert(offsetof(StrictLocalResponsePolicySpec, head_mode) == 6);
-    static_assert(offsetof(StrictLocalResponsePolicySpec, reserved1) == 7);
+    static_assert(offsetof(StrictLocalResponsePolicySpec, header_order) == 7);
     static_assert(offsetof(StrictLocalResponsePolicySpec, reason) == 8);
     static_assert(offsetof(StrictLocalResponsePolicySpec, content_type) == 24);
     static_assert(offsetof(StrictLocalResponsePolicySpec, server) == 40);
@@ -37252,7 +37682,7 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
 
     StrictLocalResponsePolicySpec representation{};
     CHECK_EQ(representation.reserved0, 0u);
-    CHECK_EQ(representation.reserved1, 0u);
+    CHECK(representation.header_order == StrictLocalResponseHeaderOrder::Synthesized);
     representation.version = StrictLocalResponseVersion::Http11;
     representation.status_code = 200;
     representation.date = StrictLocalResponseDate::Current;
@@ -37274,6 +37704,19 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
     legacy.body = {};
     CHECK_EQ(strict_local_response_policy_profile(legacy), StrictLocalResponseProfile::LegacyError);
     CHECK(strict_local_response_policy_spec_valid(legacy));
+
+    // A hand-built RIR module or RouteConfig could smuggle in a
+    // StrictLocalResponseHeaderOrder value outside the closed
+    // {Synthesized, DateServerLength, LengthTypeDateServer} vocabulary: the
+    // LegacyError branch must reject it explicitly rather than fall through
+    // to the final `return profile;` and silently admit it as Synthesized.
+    for (const u8 raw_order : {static_cast<u8>(3), static_cast<u8>(4), static_cast<u8>(255)}) {
+        StrictLocalResponsePolicySpec forged_order = legacy;
+        forged_order.header_order = static_cast<StrictLocalResponseHeaderOrder>(raw_order);
+        CHECK_EQ(strict_local_response_policy_profile(forged_order),
+                 StrictLocalResponseProfile::Invalid);
+        CHECK_FALSE(strict_local_response_policy_spec_valid(forged_order));
+    }
 
     std::string max_reason(kMaxStrictLocalResponseReasonLen, 'r');
     std::string max_content_type(kMaxStrictLocalResponseContentTypeLen, 't');
@@ -37349,7 +37792,10 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
     forged.reserved0 = 1;
     rejects_derivation(forged);
     forged = no_content;
-    forged.reserved1 = 1;
+    forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
+    rejects_derivation(forged);
+    forged = no_content;
+    forged.header_order = StrictLocalResponseHeaderOrder::LengthTypeDateServer;
     rejects_derivation(forged);
 
     char control[] = {'x', '\r'};
@@ -37407,19 +37853,16 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
     REQUIRE(public_204_lexed);
     CHECK(parse_file_heap(public_204_lexed.value()).has_value());
 
-    for (const bool first_reserved : {true, false}) {
+    {
+        // `reserved0` must always be zero: `spec_equal` rejects it on either
+        // side unconditionally, so even a forged spec compared to itself is
+        // "not equal" (never dedups garbage).
         auto representation_forged = representation;
         auto legacy_forged = legacy;
-        if (first_reserved) {
-            representation_forged.reserved0 = 1;
-            legacy_forged.reserved0 = 1;
-        } else {
-            representation_forged.reserved1 = 1;
-            legacy_forged.reserved1 = 1;
-        }
+        representation_forged.reserved0 = 1;
+        legacy_forged.reserved0 = 1;
         const auto copied_forgery = representation_forged;
         CHECK_EQ(copied_forgery.reserved0, representation_forged.reserved0);
-        CHECK_EQ(copied_forgery.reserved1, representation_forged.reserved1);
         CHECK_FALSE(strict_local_response_policy_spec_valid(representation_forged));
         CHECK_FALSE(strict_local_response_policy_spec_valid(legacy_forged));
         CHECK_FALSE(strict_local_response_policy_spec_equal(representation, representation_forged));
@@ -37427,6 +37870,20 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
             strict_local_response_policy_spec_equal(representation_forged, representation_forged));
         CHECK_FALSE(strict_local_response_policy_spec_equal(legacy, legacy_forged));
         CHECK_FALSE(strict_local_response_policy_spec_equal(legacy_forged, legacy_forged));
+    }
+    {
+        // `header_order` is real data (unlike `reserved0`), so forging it to a
+        // value inconsistent with the policy's base profile is invalid, but a
+        // pair sharing the same forged value does compare equal to each
+        // other; distinctness is asserted against the original instead.
+        auto representation_forged = representation;
+        auto legacy_forged = legacy;
+        representation_forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
+        legacy_forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
+        CHECK_FALSE(strict_local_response_policy_spec_valid(representation_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_valid(legacy_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_equal(representation, representation_forged));
+        CHECK_FALSE(strict_local_response_policy_spec_equal(legacy, legacy_forged));
     }
 }
 
@@ -37531,7 +37988,7 @@ TEST(frontend, strict_local_response_no_content_public_source_rejects_neighbors_
     forged.reserved0 = 1;
     CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
     forged = valid_ast->strict_local_response_policies[0];
-    forged.reserved1 = 1;
+    forged.header_order = StrictLocalResponseHeaderOrder::DateServerLength;
     CHECK_FALSE(strict_local_response_policy_spec_valid(forged));
 }
 
@@ -37924,6 +38381,71 @@ TEST(frontend, unmatched_connect_trace_are_contextual_and_source_shape_is_strict
         REQUIRE(bad_lexed);
         CHECK_FALSE(parse_file_heap(bad_lexed.value()).has_value());
     }
+}
+
+// Envoy H1 local_response layout (envoy-pr-plan.md PR5, oracle overrides):
+// the no-route 404 has no content-type and an empty body, admitted only
+// through the closed header_names/connection_header/header_order trio.
+TEST(frontend, unmatched_local_response_envoy_layout_matches_oracle_404) {
+    auto compiles = [&](const std::string& src) {
+        auto lexed = lex({src.data(), static_cast<u32>(src.size())});
+        if (!lexed) return false;
+        return parse_file_heap(lexed.value()).has_value();
+    };
+
+    // Valid Envoy no-route 404: date/server/close-only/empty-body layout.
+    const std::string valid_404 =
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"envoy\",\n"
+        "  date: \"current\", connection: \"request\", connection_header: \"close_only\",\n"
+        "  header_names: \"lowercase\", header_order: \"date_server_length\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    CHECK(compiles(valid_404));
+
+    // The same 404 with a non-empty content_type: rejected (date_server_length
+    // requires content_type to be absent).
+    const std::string with_content_type =
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"envoy\",\n"
+        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+        "  connection_header: \"close_only\", header_names: \"lowercase\",\n"
+        "  header_order: \"date_server_length\", head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    CHECK_FALSE(compiles(with_content_type));
+
+    // Partial trio (connection_header without header_names/header_order): rejected.
+    const std::string partial_trio =
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"envoy\",\n"
+        "  date: \"current\", connection: \"request\", connection_header: \"close_only\",\n"
+        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "}) }\n";
+    CHECK_FALSE(compiles(partial_trio));
+
+    // date_server_length with a non-empty body: rejected (the layout is
+    // closed to the empty-body no-route shape).
+    const std::string with_body =
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"envoy\",\n"
+        "  date: \"current\", connection: \"request\", connection_header: \"close_only\",\n"
+        "  header_names: \"lowercase\", header_order: \"date_server_length\",\n"
+        "  head_mode: \"suppress_body\", body: b\"x\"\n"
+        "}) }\n";
+    CHECK_FALSE(compiles(with_body));
+
+    // length_type_date_server (the bodied Envoy layout) on a 5xx local
+    // response: accepted, following the LegacyError content_type/body rules.
+    const std::string bodied_layout =
+        "unmatched { return local_response({\n"
+        "  version: \"HTTP/1.1\", status: 503, reason: \"Service Unavailable\", server: "
+        "\"envoy\",\n"
+        "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n"
+        "  connection_header: \"close_only\", header_names: \"lowercase\",\n"
+        "  header_order: \"length_type_date_server\", head_mode: \"suppress_body\", "
+        "body: b\"unavailable\"\n"
+        "}) }\n";
+    CHECK(compiles(bodied_layout));
 }
 
 TEST(frontend, unmatched_local_response_rejects_fields_selectors_and_aggregate_overflow) {

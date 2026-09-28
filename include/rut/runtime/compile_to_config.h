@@ -456,7 +456,31 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             (bundle.response_read_timeout_seconds != 0 &&
              !response_read_timeout_seconds_valid(bundle.response_read_timeout_seconds)) ||
             !forward_response_buffering_mode_valid(bundle.response_buffering) ||
-            (bundle.response_read_timeout_seconds == 0 && bundle.failure_policy_id == 0))
+            (bundle.response_read_timeout_seconds == 0 && bundle.failure_policy_id == 0) ||
+            // `header_order: "upstream"` is ordinary-forward-only (see
+            // analyze.cc): it never carries response read timing, response
+            // buffering, or a timeout failure policy bundle. Defensive
+            // rejection here in case a hand-built module skipped analyze.
+            (bundle.response_policy_id != 0 &&
+             bundle.response_policy_id <= mod.response_policy_count &&
+             mod.response_policies[bundle.response_policy_id - 1].header_order ==
+                 ResponsePolicyHeaderOrder::Upstream &&
+             (bundle.response_read_timeout_seconds != 0 ||
+              bundle.response_buffering != ForwardResponseBufferingMode::None ||
+              bundle.timeout_failure_policy_id != 0)) ||
+            // Envoy H1 status 503 / header_order: "length_type_date_server" is
+            // ordinary connect-failure-only (see analyze.cc): the runtime's
+            // response-read-deadline preflight hard-requires the default
+            // failure policy's status to be 502 and closes the downstream
+            // connection on mismatch, so a bundle pairing this layout with a
+            // response read timeout would drop every matching request.
+            // Defensive rejection here in case a hand-built module skipped
+            // analyze.
+            (bundle.failure_policy_id != 0 &&
+             bundle.failure_policy_id <= mod.failure_policy_count &&
+             mod.failure_policies[bundle.failure_policy_id - 1].header_order ==
+                 FailurePolicyHeaderOrder::LengthTypeDateServer &&
+             bundle.response_read_timeout_seconds != 0))
             return false;
         if (bundle.response_buffering != ForwardResponseBufferingMode::None &&
             (bundle.response_buffering != ForwardResponseBufferingMode::CompleteContentLength ||
