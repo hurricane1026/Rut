@@ -1,0 +1,122 @@
+[
+  {
+    "transport": "http",
+    "body_size": 65536,
+    "connection": "close",
+    "concurrency": 1,
+    "baseline": {
+      "samples": 3,
+      "rps": 5821.263063474006,
+      "p99_us": 178.0,
+      "cpu_us_per_request": 89.30718235839659,
+      "rss_bytes": 158486528,
+      "nginx_rps": 6083.379958851877
+    },
+    "candidate": {
+      "samples": 3,
+      "rps": 5812.681057955018,
+      "p99_us": 176.0,
+      "cpu_us_per_request": 87.94316457442405,
+      "rss_bytes": 158388224,
+      "nginx_rps": 6104.672366504655
+    },
+    "rps_delta_pct": -0.1474251451173303,
+    "cpu_delta_pct": -1.527332682492022
+  },
+  {
+    "transport": "http",
+    "body_size": 65536,
+    "connection": "keepalive",
+    "concurrency": 1,
+    "baseline": {
+      "samples": 3,
+      "rps": 7697.655423432822,
+      "p99_us": 177.0,
+      "cpu_us_per_request": 75.91969835931928,
+      "rss_bytes": 158359552,
+      "nginx_rps": 8075.215469149586
+    },
+    "candidate": {
+      "samples": 3,
+      "rps": 7736.228135286428,
+      "p99_us": 174.0,
+      "cpu_us_per_request": 74.88450017769203,
+      "rss_bytes": 158445568,
+      "nginx_rps": 8073.899418863586
+    },
+    "rps_delta_pct": 0.5010968890109657,
+    "cpu_delta_pct": -1.3635435914507665
+  },
+  {
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "close",
+    "concurrency": 32,
+    "baseline": {
+      "samples": 6,
+      "rps": 2066.239869665951,
+      "p99_us": 16502.5,
+      "cpu_us_per_request": 347.3309804041647,
+      "rss_bytes": 176474112.0,
+      "nginx_rps": 2334.6121909014287
+    },
+    "candidate": {
+      "samples": 6,
+      "rps": 2108.970044889895,
+      "p99_us": 16170.5,
+      "cpu_us_per_request": 338.90348253759896,
+      "rss_bytes": 176457728.0,
+      "nginx_rps": 2336.4112974789136
+    },
+    "rps_delta_pct": 2.0680161994382606,
+    "cpu_delta_pct": -2.4263593926344362
+  },
+  {
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "close",
+    "concurrency": 128,
+    "baseline": {
+      "samples": 6,
+      "rps": 1764.0466624280689,
+      "p99_us": 78076.5,
+      "cpu_us_per_request": 416.7869005937953,
+      "rss_bytes": 227954688.0,
+      "nginx_rps": 2324.7800027524763
+    },
+    "candidate": {
+      "samples": 6,
+      "rps": 1831.461840705862,
+      "p99_us": 73281.0,
+      "cpu_us_per_request": 400.9501078515603,
+      "rss_bytes": 215230464.0,
+      "nginx_rps": 2317.054553347822
+    },
+    "rps_delta_pct": 3.821621032688638,
+    "cpu_delta_pct": -3.7997338015355986
+  },
+  {
+    "transport": "https",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "concurrency": 32,
+    "baseline": {
+      "samples": 3,
+      "rps": 1168.6443365743683,
+      "p99_us": 27680.0,
+      "cpu_us_per_request": 711.847046773643,
+      "rss_bytes": 187404288,
+      "nginx_rps": 913.8832057263082
+    },
+    "candidate": {
+      "samples": 3,
+      "rps": 1187.7681476575774,
+      "p99_us": 28170.0,
+      "cpu_us_per_request": 698.6531986531986,
+      "rss_bytes": 187297792,
+      "nginx_rps": 918.7140083688167
+    },
+    "rps_delta_pct": 1.6364098541106653,
+    "cpu_delta_pct": -1.8534667215722611
+  }
+]

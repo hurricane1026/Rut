@@ -1,0 +1,50 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 5K of event 'cycles:u'
+# Event count (approx.): 1869065286
+#
+# Overhead  Command          Shared Object      Symbol
+# ........  ...............  .................  ............................................................................................................................................................................................................................................................................................................................................................................
+#
+     8.07%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)
+     7.70%  rut-no-bulk-zer  libc.so.6          [.] __memset_avx2_unaligned_erms
+     6.99%  rut-no-bulk-zer  libc.so.6          [.] __memmove_avx_unaligned_erms
+     5.78%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)
+     4.42%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+     4.42%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)
+     3.20%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)
+     3.01%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const
+     2.97%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)
+     2.77%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)
+     2.47%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::simd::scan_header_value(unsigned char const*, unsigned int, unsigned int)
+     2.47%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+     2.39%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+     2.34%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
+     1.96%  rut-no-bulk-zer  libc.so.6          [.] __memcmp_avx2_movbe
+     1.48%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::response_read_deadline_identity_is_stable(rut::ConnectionBase const&) const
+     1.24%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)
+     1.09%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)
+     1.08%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)
+     0.99%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::settle_response_read_deadline_batch()
+     0.98%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::classify_complete_content_length_response(rut::ParsedResponse const&)
+     0.92%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::RouteConfig::timeout_failure_policy_id_is_valid(unsigned short) const
+     0.89%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)
+     0.83%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::arm_response_read_direct_body_recv(rut::ConnectionBase&)
+     0.77%  rut-no-bulk-zer  rut-no-bulk-zero   [.] void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
+     0.75%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::try_advance_bounded_release(rut::ConnectionBase&, bool)
+     0.74%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::consume_response_read_deadline_send_event(rut::ConnectionBase&, rut::IoEvent const&)
+     0.74%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::complete_content_length_pinned_header_is_stable(rut::ConnectionBase const&)
+     0.63%  rut-no-bulk-zer  rut-no-bulk-zero   [.] void rut::pump_response_read_deadline_body<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&)
+     0.57%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::capture_request_metadata(rut::ConnectionBase&)
+     0.56%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::classify_response_read_deadline_profile(rut::ConnectionBase const&, rut::ForwardResponsePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardResponseBufferingMode, unsigned short)
+     0.52%  rut-no-bulk-zer  rut-no-bulk-zero   [.] rut::IoUringEventLoop::settle_precise_complete_content_length_buffering(rut::ConnectionBase&, rut::IoUringEventLoop::ResponseReadBatchOwner const&)
+     0.51%  rut-no-bulk-zer  rut-no-bulk-zero   [.] void rut::on_header_received<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+     0.51%  rut-no-bulk-zer  rut-no-bulk-zero   [.] void rut::on_bounded_release_body_sent<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
