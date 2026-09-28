@@ -78,5 +78,6 @@
   },
   "bulk_first_commit": "83e5d8a1",
   "bulk512_commit": "641a4872",
-  "buffered_more_base_commit": "641a4872"
+  "buffered_more_base_commit": "641a4872",
+  "buffered_more_commit": "187bd5d9"
 }

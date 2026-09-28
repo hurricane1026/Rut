@@ -304,3 +304,44 @@ The focused results above neither cover that scope nor pass that gate. The
 latest archived full run predates these runtime changes and is not current
 completion evidence. A fresh full matrix remains required after selecting
 the candidate. The no-huge-pages constraint also remains in force.
+
+Clean-r3/r4 completed after the external test process exited, without triggering
+the per-sample host guards. Diagnostic mean RPS changes versus 512 KiB baseline:
+
+| Run | Cell | Change |
+|---|---|---:|
+| buffered-more-clean-r3 | 1m-c128-close | +4.39% |
+| buffered-more-clean-r3 | 1m-c32-close | +8.35% |
+| buffered-more-clean-r3 | 64k-c1-close | +3.17% |
+| buffered-more-clean-r3 | 64k-c1-keepalive | +0.07% |
+| buffered-more-clean-r4 | 1m-c128-close | +4.70% |
+| buffered-more-clean-r4 | 1m-c32-close | +5.17% |
+| buffered-more-clean-r4 | 64k-c1-close | +2.98% |
+| buffered-more-clean-r4 | 64k-c1-keepalive | -0.61% |
+
+The c32 r3 samples vary substantially, so its unusually large delta is not
+treated as the expected gain. The c128 and reversed c32 comparison corroborate
+a roughly 4–5% large-response gain; 64 KiB keepalive shows no established win.
+The guarded nginx acceptance and repeat eBPF comparison are still running.
+
+The guarded three-repeat nginx comparison completed without warmup/load errors
+or host-guard failures. Median RPS (the matrix uses median ratios):
+
+| HTTP size / connection / concurrency | nginx | Rut | Rut/nginx |
+|---|---:|---:|---:|
+| 64k / close / 1 | 6078 | 5923 | 0.975 |
+| 64k / keepalive / 1 | 8022 | 7670 | 0.956 |
+| 1m / close / 32 | 2308 | 2349 | 1.017 |
+| 1m / close / 128 | 2291 | 2286 | 0.998 |
+
+None reaches the full-matrix 1.10 target. Earlier tables explicitly report
+means, so they should not be subtracted directly from these median ratios.
+
+The repeat trace is complete and usable for all four runs. Downstream send
+calls remain near six per request, while TCP send elapsed time falls from
+174.5 to 154.7 us/request at c32 and from 179.8 to 157.9 at c128. Receive-copy
+time remains near 106–114 us/request. This supports a send-side benefit from
+MSG_MORE without attributing it to fewer send calls or a solved receive-copy
+gap. The code is retained in `187bd5d9`, after full network tests, socket stall
+checks, opposite-order baseline probes and guarded nginx comparison. The
+measured binary differs from final source only in comments and formatting.

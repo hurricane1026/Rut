@@ -1,0 +1,258 @@
+[
+  {
+    "case": "1m-c128-close-rut-base",
+    "requests": 16679,
+    "rps_traced": 2078.931594437951,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 25.78092211763295,
+    "system_us": 327.3577552611068,
+    "minor_faults_per_request": 1.257089753582349,
+    "runqueue_ns_per_request": 2596.881347802626,
+    "offcpu_ns_per_request": 917288.1858025062,
+    "downstream_recv": {
+      "calls_per_request": 2.0206247376941064,
+      "bytes_per_call": 31.916444127944928,
+      "us_per_request": 1.8940611547454882,
+      "ns_per_byte": 29.36931598441126
+    },
+    "downstream_send": {
+      "calls_per_request": 6.01582828706757,
+      "bytes_per_call": 174682.1624509159,
+      "us_per_request": 179.8413528388992,
+      "ns_per_byte": 0.17113765224153576
+    },
+    "other_recv": {
+      "calls_per_request": 0.0024581809460998863,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.0009916661670363932,
+      "ns_per_byte": 0
+    },
+    "other_send": {
+      "calls_per_request": 0.0029378260087535224,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.0011579830925115416,
+      "ns_per_byte": 0
+    },
+    "upstream_recv": {
+      "calls_per_request": 6.532705797709695,
+      "bytes_per_call": 161228.23447351757,
+      "us_per_request": 192.29866688650398,
+      "ns_per_byte": 0.18257532196015097
+    },
+    "upstream_send": {
+      "calls_per_request": 1.0076743210024581,
+      "bytes_per_call": 45.0,
+      "us_per_request": 6.1115609449007735,
+      "ns_per_byte": 134.77813477188738
+    },
+    "copy_side_1": {
+      "ns_per_byte": 5.781584681977748,
+      "us_per_request": 0.3728610827987289,
+      "bytes_per_request": 64.49115654415732
+    },
+    "copy_side_2": {
+      "ns_per_byte": 0.10782528855711832,
+      "us_per_request": 113.56769920259008,
+      "bytes_per_request": 1053256.6220996464
+    }
+  },
+  {
+    "case": "1m-c128-close-rut-buffered-more",
+    "requests": 17479,
+    "rps_traced": 2179.804230409011,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 25.745179930201957,
+    "system_us": 322.1008066823045,
+    "minor_faults_per_request": 0.4686766977515876,
+    "runqueue_ns_per_request": 2575.431260369586,
+    "offcpu_ns_per_request": 879724.5138737914,
+    "downstream_recv": {
+      "calls_per_request": 2.0208822014989414,
+      "bytes_per_call": 31.901254140361804,
+      "us_per_request": 1.902375650780937,
+      "ns_per_byte": 29.508526438348383
+    },
+    "downstream_send": {
+      "calls_per_request": 6.016248069111505,
+      "bytes_per_call": 174765.83076893818,
+      "us_per_request": 157.94924349219065,
+      "ns_per_byte": 0.150222605103016
+    },
+    "other_recv": {
+      "calls_per_request": 0.0010298071972080782,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.0006992390869042851,
+      "ns_per_byte": 0
+    },
+    "other_send": {
+      "calls_per_request": 0.0025745179930201957,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.0010855884203901825,
+      "ns_per_byte": 0
+    },
+    "upstream_recv": {
+      "calls_per_request": 6.450998340866183,
+      "bytes_per_call": 163351.47224562554,
+      "us_per_request": 192.88090914812062,
+      "ns_per_byte": 0.18303715686172886
+    },
+    "upstream_send": {
+      "calls_per_request": 1.0073230734023686,
+      "bytes_per_call": 45.0,
+      "us_per_request": 6.318927799073173,
+      "ns_per_byte": 139.39978291462361
+    },
+    "copy_side_1": {
+      "ns_per_byte": 5.668807150565116,
+      "us_per_request": 0.3654604954516849,
+      "bytes_per_request": 64.46867669775159
+    },
+    "copy_side_2": {
+      "ns_per_byte": 0.10782687760209976,
+      "us_per_request": 113.62581532124264,
+      "bytes_per_request": 1053780.0764345787
+    }
+  },
+  {
+    "case": "1m-c32-close-rut-base",
+    "requests": 17178,
+    "rps_traced": 2120.652772922012,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 22.703457911281873,
+    "system_us": 328.90906974036557,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 1206.753347304692,
+    "offcpu_ns_per_request": 885145.1160787053,
+    "downstream_recv": {
+      "calls_per_request": 1.92548608685528,
+      "bytes_per_call": 33.300278147297135,
+      "us_per_request": 2.0004871347071838,
+      "ns_per_byte": 31.199491574665892
+    },
+    "downstream_send": {
+      "calls_per_request": 6.004715333566189,
+      "bytes_per_call": 174759.13647248156,
+      "us_per_request": 174.47912684829433,
+      "ns_per_byte": 0.16626895435522657
+    },
+    "other_recv": {
+      "calls_per_request": 0.040749796251018745,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.03850733496332519,
+      "ns_per_byte": 0
+    },
+    "other_send": {
+      "calls_per_request": 0.0006403539410874374,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.0003413668645942485,
+      "ns_per_byte": 0
+    },
+    "upstream_recv": {
+      "calls_per_request": 7.08382815228781,
+      "bytes_per_call": 148224.72230987952,
+      "us_per_request": 185.4260011060659,
+      "ns_per_byte": 0.17659645040925798
+    },
+    "upstream_send": {
+      "calls_per_request": 1.001862847828618,
+      "bytes_per_call": 45.0,
+      "us_per_request": 6.200364827104436,
+      "ns_per_byte": 137.52968816579508
+    },
+    "copy_side_1": {
+      "ns_per_byte": 6.125558359965137,
+      "us_per_request": 0.3927660379555245,
+      "bytes_per_request": 64.11922226103155
+    },
+    "copy_side_2": {
+      "ns_per_byte": 0.10084541924907996,
+      "us_per_request": 105.88753498661079,
+      "bytes_per_request": 1049998.4607637676
+    }
+  },
+  {
+    "case": "1m-c32-close-rut-buffered-more",
+    "requests": 17580,
+    "rps_traced": 2197.0754151760175,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "usable": true,
+    "user_us": 25.59726962457338,
+    "system_us": 323.094425483504,
+    "minor_faults_per_request": 0.0,
+    "runqueue_ns_per_request": 1321.906313993174,
+    "offcpu_ns_per_request": 876940.9850967008,
+    "downstream_recv": {
+      "calls_per_request": 1.9060295790671218,
+      "bytes_per_call": 33.63686283872508,
+      "us_per_request": 2.006385096700796,
+      "ns_per_byte": 31.294583286014422
+    },
+    "downstream_send": {
+      "calls_per_request": 6.0060864618885095,
+      "bytes_per_call": 174754.9481659674,
+      "us_per_request": 154.68402918088736,
+      "ns_per_byte": 0.14737520238181298
+    },
+    "other_recv": {
+      "calls_per_request": 0.01689419795221843,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.017824175199089874,
+      "ns_per_byte": 0
+    },
+    "other_send": {
+      "calls_per_request": 0.0006825938566552901,
+      "bytes_per_call": 0.0,
+      "us_per_request": 0.00036228668941979525,
+      "ns_per_byte": 0
+    },
+    "upstream_recv": {
+      "calls_per_request": 7.093230944254835,
+      "bytes_per_call": 148062.064619604,
+      "us_per_request": 187.9429034129693,
+      "ns_per_byte": 0.17895260744119298
+    },
+    "upstream_send": {
+      "calls_per_request": 1.0017633674630262,
+      "bytes_per_call": 45.0,
+      "us_per_request": 6.716746530147895,
+      "ns_per_byte": 148.99829525738332
+    },
+    "copy_side_1": {
+      "ns_per_byte": 6.213582774970189,
+      "us_per_request": 0.3983705346985211,
+      "bytes_per_request": 64.11285551763368
+    },
+    "copy_side_2": {
+      "ns_per_byte": 0.10181107462316857,
+      "us_per_request": 106.92590199089875,
+      "bytes_per_request": 1050238.418430034
+    }
+  }
+]
