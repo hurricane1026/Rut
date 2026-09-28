@@ -27,6 +27,7 @@
 
 #include "rut/jit/art_jit_codegen.h"
 
+#include "rut/common/types.h"
 #include "rut/jit/jit_engine.h"
 #include "rut/runtime/route_art.h"
 
@@ -195,13 +196,30 @@ void emit_child_descent(EmitCtx& c, ArtChildRef child_ref, u32 depth) {
     LLVMValueRef fits = LLVMBuildICmp(c.builder, LLVMIntULE, end, c.eff_len, "edge_fits");
     emit_check_or_break(c, fits, "edge_fits_ok");
 
-    // Per-byte edge compare (constants on the route side).
-    for (u32 k = 0; k < edge.len; k++) {
+    // Compare bounded native-width chunks. The full edge length was checked
+    // above, so unaligned loads never read beyond the request (including at
+    // a guard page). Long compressed edges no longer branch on every byte.
+    for (u32 k = 0; k < edge.len;) {
+        const u32 kRemaining = edge.len - k;
+        const u32 kWidth = kRemaining >= 8 ? 8 : kRemaining >= 4 ? 4 : kRemaining >= 2 ? 2 : 1;
+        u64 expected = 0;
+        for (u32 j = 0; j < kWidth; ++j) {
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+            const u32 kShift = (kWidth - 1 - j) * 8;
+#else
+            const u32 kShift = j * 8;
+#endif
+            expected |= static_cast<u64>(static_cast<u8>(edge.ptr[k + j])) << kShift;
+        }
+        LLVMTypeRef ty = LLVMIntTypeInContext(c.ctx, kWidth * 8);
         LLVMValueRef off = LLVMConstInt(c.i32_ty, depth + k, 0);
-        LLVMValueRef p_byte = emit_load_byte(c, off);
-        LLVMValueRef e_byte = LLVMConstInt(c.i8_ty, static_cast<u8>(edge.ptr[k]), 0);
-        LLVMValueRef eq = LLVMBuildICmp(c.builder, LLVMIntEQ, p_byte, e_byte, "edge_eq");
-        emit_check_or_break(c, eq, "edge_byte_ok");
+        LLVMValueRef ptr = LLVMBuildGEP2(c.builder, c.i8_ty, c.eff_ptr, &off, 1, "edge_ptr");
+        LLVMValueRef actual = LLVMBuildLoad2(c.builder, ty, ptr, "edge_chunk");
+        LLVMSetAlignment(actual, 1);
+        LLVMValueRef eq =
+            LLVMBuildICmp(c.builder, LLVMIntEQ, actual, LLVMConstInt(ty, expected, 0), "edge_eq");
+        emit_check_or_break(c, eq, "edge_chunk_ok");
+        k += kWidth;
     }
 
     // A terminal inside a request segment is not a route match. Keep descending:

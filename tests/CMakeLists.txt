@@ -448,6 +448,10 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME test_routing_corpus
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py)
+set_tests_properties(test_routing_corpus PROPERTIES LABELS "unit;routing" TIMEOUT 30)
+
 # /proc-based check that the process ignores SIGPIPE (Linux only).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_test(
