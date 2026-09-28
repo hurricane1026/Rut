@@ -425,3 +425,45 @@ checks passed without host-guard rejection. eBPF sees about 17 kernel
 chunks, not 17 application syscalls). At c32 Rut's send elapsed and process
 CPU times are lower despite lower throughput. These results do not establish
 a server-copy CPU bottleneck; the file-prefix prototype remains under test.
+
+## Static file-prefix and header-push controls
+
+Removing the initial userspace body prefix for plaintext file-backed bodies
+showed less than 1% change and was reverted. A separate candidate preserves
+the prefix and clears MSG_MORE only for local file-backed plaintext output,
+leaving the newly retained proxy-buffer hint unchanged. Diagnostic deltas:
+
+| Candidate | Cell | Mean RPS change |
+|---|---|---:|
+| file-body-only-r1 | 1m-c1-keepalive | +0.66% |
+| file-body-only-r1 | 1m-c32-close | +0.55% |
+| file-body-only-r1 | 1m-c32-keepalive | +0.54% |
+| file-header-push-r1 | 1m-c1-keepalive | +8.31% |
+| file-header-push-r1 | 1m-c32-close | +4.40% |
+| file-header-push-r1 | 1m-c32-keepalive | +17.78% |
+
+The header-push c1 samples vary substantially; the c32 keepalive gain is
+large in both samples. Reverse-order and 64 KiB controls are pending.
+Neither variant has a full runtime test run yet; preflight bodies and
+warmup/load errors passed for these probes.
+
+The reverse-order and small-file controls completed:
+
+| Run | Cell | Mean RPS change |
+|---|---|---:|
+| file-header-push-r2 | 1m-c1-keepalive | +25.32% |
+| file-header-push-r2 | 1m-c32-close | +5.20% |
+| file-header-push-r2 | 1m-c32-keepalive | +15.03% |
+| file-header-push-64k-r1 | 64k-c1-close | +1.61% |
+| file-header-push-64k-r1 | 64k-c1-keepalive | +2.70% |
+| file-header-push-64k-r1 | 64k-c32-close | -0.80% |
+| file-header-push-64k-r1 | 64k-c32-keepalive | -2.40% |
+
+The large keepalive c32 gain repeats, but the 64 KiB keepalive c32 control
+regresses about 2.4%. The next candidate therefore suppresses MSG_MORE only
+when a plaintext file tail exceeds 64 KiB, preserving coalescing for smaller
+tails. This threshold is a measured performance heuristic, not a protocol
+requirement. The step patch is relative to the all-file prototype. A fresh
+network test build and all 12 affected HTTP static acceptance coordinates
+(two sizes, two connection modes, three concurrency levels) are queued.
+TCP send-window diagnostics for the large-body candidate are also queued.

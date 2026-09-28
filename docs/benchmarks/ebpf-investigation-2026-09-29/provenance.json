@@ -78,6 +78,14 @@
     "ebpf-tools/rut-proxy-final-fin": {
       "sha256": "e34084b3026da79e8d644c7c74dc13132d0e425d9a793fc48eeb5b4a0794b765",
       "size": 19127072
+    },
+    "ebpf-tools/rut-file-body-only": {
+      "sha256": "64f5aa0138aed0a3d041b421676f50cb5eb55680cd11e42db8c7f9335e4a207a",
+      "size": 19127072
+    },
+    "ebpf-tools/rut-file-header-push": {
+      "sha256": "c31094cc175cc0f90f1740890061e7bd1bd96d6dc5421a5adc20e48ab4bbdf85",
+      "size": 19127072
     }
   },
   "bulk_first_commit": "83e5d8a1",
