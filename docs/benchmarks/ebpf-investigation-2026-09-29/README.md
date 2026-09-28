@@ -570,3 +570,24 @@ The 64 KiB/c1 proxy controls completed with three valid five-second samples per 
 Both remain below the 1.10 goal; this is not proof that the candidate beats the accepted Rut baseline. Raw evidence and its hash are retained. The separate 12-cell 16 B acceptance process is live.
 
 A one-line POLL_FIRST follow-up is queued behind the 16 B acceptance matrix. It changes only `add_recv_upstream_once` and compares against the frozen uninitialized-connection candidate, isolating receive submission timing from buffer clearing. The earlier POLL_FIRST probes covered 64 KiB, while the retained tiny-response eBPF return counters now justify checking 16 B/c1 and c32 explicitly, with 64 KiB controls. Its build and load remain serialized; no POLL_FIRST runtime change has yet been accepted.
+
+## Ordinary dirty-buffer candidate: 16 B formal results
+
+All 12 coordinates have three valid five-second samples per engine, clean warmup/load counters and complete cleanup. Eight meet the 1.10 target. The matrix exit code 2 reflects the unmet performance target.
+
+| Scenario | Concurrency | nginx median RPS | Rut median RPS | Ratio |
+|---|---:|---:|---:|---:|
+| static-close | 1 | 14119 | 16285 | 1.1534 |
+| static-close | 32 | 34886 | 45471 | 1.3034 |
+| static-close | 128 | 34072 | 45323 | 1.3302 |
+| static-keepalive | 1 | 38386 | 60856 | 1.5853 |
+| static-keepalive | 32 | 83326 | 249677 | 2.9964 |
+| static-keepalive | 128 | 83609 | 258150 | 3.0876 |
+| proxy-close | 1 | 7614 | 7609 | 0.9994 |
+| proxy-close | 32 | 14024 | 14688 | 1.0473 |
+| proxy-close | 128 | 13897 | 15001 | 1.0794 |
+| proxy-keepalive | 1 | 10904 | 10998 | 1.0086 |
+| proxy-keepalive | 32 | 16709 | 19859 | 1.1886 |
+| proxy-keepalive | 128 | 16691 | 22833 | 1.3680 |
+
+Proxy close c1 remains effectively tied; close c32/c128 and keepalive c1 still miss the target. These results do not establish the causal change against the previous Rut binary for static responses; the separate alternating static probe is queued. The POLL_FIRST prototype builds after this completed matrix and uses its own binary and evidence directory.
