@@ -1,0 +1,41 @@
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index 2512a758..06bd6913 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -3219,6 +3219,36 @@ public:
+             c.response_read_deadline_send_kind = kind;
+             c.response_read_deadline_send_owner_active = true;
+         }
++        // This prefix cannot finish the response: a non-empty file tail
++        // remains. Its completion can synchronously finish that tail, whose
++        // existing completion guard forces the next pipelined response back
++        // to async. Guarding the prefix itself would force a body CQE too.
++        if (phase == ResponseReadDeadlinePostCommitPhase::None && !c.tls_active && c.keep_alive &&
++            !in_sync_send_completion && c.fd >= 0 && c.id < backend.connection_capacity &&
++            !c.send_armed && c.throttle_down_bps == 0 && len != 0 &&
++            len <= static_cast<u32>(INT32_MAX) && c.local_body_file_fd >= 0 &&
++            c.local_body_base != nullptr && c.local_body_remaining > 64u * 1024u &&
++            c.on_send == &on_response_sent<Self> && c.send_progress == 0 &&
++            c.local_body_send_len == 0 && buf == c.send_buf.data() && len == c.send_buf.len() &&
++            backend.failure_code() == 0 && backend.sq_has_room()) {
++            const ssize_t n = ::send(c.fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
++            if (n == static_cast<ssize_t>(len)) {
++                IoEvent synthetic{};
++                synthetic.conn_id = c.id;
++                synthetic.type = IoEventType::Send;
++                synthetic.result = static_cast<i32>(len);
++                this->dispatch_event(c, synthetic);
++                return true;
++            }
++            if (n > 0) {
++                if (!backend.add_send_after_direct_write(
++                        c.fd, c.id, buf, len, static_cast<u32>(n), 0))
++                    return false;
++                c.pending_ops++;
++                c.send_armed = true;
++                return true;
++            }
++        }
+         // The completion SQE is reserved first: once written, the bytes and
+         // FIN cannot be withdrawn, so the send must stay accountable.
+         if (!deadline_send && final_local_response_send(c, buf, len) && backend.sq_has_room()) {

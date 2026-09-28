@@ -1,0 +1,31 @@
+diff --git a/include/rut/runtime/callbacks_impl.h b/include/rut/runtime/callbacks_impl.h
+index 96510220..9895b13e 100644
+--- a/include/rut/runtime/callbacks_impl.h
++++ b/include/rut/runtime/callbacks_impl.h
+@@ -3393,6 +3393,26 @@ void handle_jit_outcome(Loop* loop,
+             }
+             if (segmented_body && response_formatted) {
+                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
++                // Experimental larger first burst before the remaining sendfile.
++                if constexpr (requires(Loop* l) { l->pool.alloc_bulk(); }) {
++                    constexpr u32 kFilePrefixCapacity = 64u * 1024u;
++                    if (!conn.tls_active && body.file_fd() >= 0 &&
++                        body.len >= 2u * kFilePrefixCapacity && !conn.send_armed &&
++                        !conn.upstream_send_armed && conn.send_slice != nullptr &&
++                        conn.send_buf.data() == conn.send_slice &&
++                        conn.send_buf.capacity() < kFilePrefixCapacity &&
++                        conn.send_buf.len() <= kFilePrefixCapacity) {
++                        if (u8* expanded = loop->pool.alloc_bulk()) {
++                            const u32 header_len = conn.send_buf.len();
++                            __builtin_memcpy(expanded, conn.send_buf.data(), header_len);
++                            u8* previous = conn.send_slice;
++                            conn.send_slice = expanded;
++                            conn.send_buf.bind(expanded, kFilePrefixCapacity);
++                            conn.send_buf.commit(header_len);
++                            loop->pool.free(previous);
++                        }
++                    }
++                }
+                 const u32 n =
+                     body.len < conn.send_buf.write_avail() ? body.len : conn.send_buf.write_avail();
+                 conn.local_response_size = conn.send_buf.len() + body.len;

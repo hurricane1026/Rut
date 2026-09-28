@@ -110,6 +110,14 @@
     "ebpf-tools/rut-large-file-header-only": {
       "sha256": "5d3051b76c122f6e364bc439e7107798a0788e06a1a899682957dd327ee2e666",
       "size": 19127184
+    },
+    "ebpf-tools/rut-large-file-prefix64": {
+      "sha256": "18576503926ad4ffbe234b589ac551b761e660c0eb5a0084a6ca044af714e9a0",
+      "size": 19127184
+    },
+    "ebpf-tools/rut-file-prefix-inline": {
+      "sha256": "e071c83f046f59e09731b538e67bb35897499af9a22966ec8ef24601e472c752",
+      "size": 19127184
     }
   },
   "bulk_first_commit": "83e5d8a1",

@@ -675,3 +675,27 @@ The complete HTTP/HTTPS × four scenarios × four sizes × three concurrency lev
 | https | 1048576 | proxy-close | 128 | 1.0076 |
 
 All four ratios below 1.00 are HTTP/c1 proxy: 16 B close, 1024 B close, 64 KiB close, and 64 KiB keepalive. The other 21 listed coordinates lead nginx in this scan but miss the 1.10 target. Prior 1 MiB/static/keepalive c1 formal measurements were effectively tied, so its favorable single sample here is not proof that it is solved. Complete raw logs, host snapshots, configurations and per-group statuses are archived with a hash; TLS private keys and payload binaries are excluded.
+
+## Rejected 64 KiB initial file prefix
+
+Two alternating samples per engine, all preflight and warmup/load checks passing:
+
+| Case | Mean RPS change | Candidate/baseline mean RSS MiB |
+|---|---:|---:|
+| 1m-c1-keepalive | -20.43% | 133.7/133.7 |
+| 1m-c32-close | -3.08% | 135.9/134.8 |
+| 1m-c32-keepalive | +1.05% | 135.8/134.6 |
+
+The c1 keepalive regression is about 20%; c32 close also regresses. Revert the prototype, which did not receive a full network test run. At c32 keepalive its system CPU time rises from about 35.6 to 57.6 us/request despite almost flat throughput; this does not establish a specific kernel mechanism. The accepted 16 KiB prefix remains. The next proposed control revisits synchronous prefix completion: the earlier prototype set the file-completion recursion guard around the prefix, which forced a full keepalive file tail to queue a completion. A non-empty file tail can instead use its existing body-completion guard to stop synchronous pipeline recursion. That needs an explicit pipeline test before retention.
+
+## Rejected synchronous keepalive file prefix without outer guard
+
+Two alternating 6-second samples per engine, body preflight and warmup/load checks passed.
+
+| Case | Mean RPS change |
+|---|---:|
+| 1m-c1-keepalive | +8.70% |
+| 1m-c32-close | +0.88% |
+| 1m-c32-keepalive | -2.57% |
+
+The c1 baseline was bimodal (5463.5 and 4686.0 RPS), while the candidate was around 5510–5523 RPS. This does not establish a stable c1 gain; c32 keepalive regressed. The prototype was reverted without a full network test run. No acceptance claim.
