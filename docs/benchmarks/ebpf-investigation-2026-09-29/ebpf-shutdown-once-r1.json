@@ -1,0 +1,30 @@
+[
+  {
+    "case": "16-c1-close-rut-base",
+    "usable": true,
+    "front_sends": 59553,
+    "shutdown_syscalls": 119106,
+    "tcp_shutdown": 113821
+  },
+  {
+    "case": "16-c1-close-rut-fin",
+    "usable": true,
+    "front_sends": 60723,
+    "shutdown_syscalls": 60723,
+    "tcp_shutdown": 60723
+  },
+  {
+    "case": "16-c32-close-rut-base",
+    "usable": true,
+    "front_sends": 130903,
+    "shutdown_syscalls": 261806,
+    "tcp_shutdown": 130916
+  },
+  {
+    "case": "16-c32-close-rut-fin",
+    "usable": true,
+    "front_sends": 132049,
+    "shutdown_syscalls": 132066,
+    "tcp_shutdown": 132032
+  }
+]

@@ -1040,3 +1040,5 @@ All 28 samples finish with clean exact-body/warm/load checks.
 | 65536-c1-keepalive | +0.20% | 58.57 | 57.93 |
 
 Small c1 system CPU savings require reverse-order confirmation; throughput is essentially flat. eBPF shutdown counting is in progress. A separate accepted-runtime/nginx 64 KiB recv-attempt trace is queued to distinguish header and body request lengths and EAGAIN outcomes before considering body POLL_FIRST.
+
+The four shutdown traces are usable with zero warm/load errors. At c1, process-wide shutdown syscall count falls from 119106 / 59553 front sends (2.0/send) to 60723 / 60723 (1.0/send). At c32 it falls from 261806 / 130903 to 132066 / 132049. Occasional unsuccessful shutdowns can still retry, as intended. This confirms the mechanism; instrumented throughput is not acceptance evidence. Reverse-order uninstrumented controls remain in progress.
