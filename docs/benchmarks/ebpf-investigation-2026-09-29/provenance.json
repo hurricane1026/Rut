@@ -62,7 +62,16 @@
     "ebpf-tools/rut-bulk-always": {
       "sha256": "7c6099cba6ef5df5ded35e9fe4a5877a34ad47e1e662db4b4beef7e028fd720e",
       "size": 19127072
+    },
+    "ebpf-tools/rut-force-epoll": {
+      "sha256": "d372568b59b511261ed4f477cfce308f06c8cf6960a2b55648eaa753a1e74bb1",
+      "size": 18834032
+    },
+    "ebpf-tools/rut-bulk512": {
+      "sha256": "15f139bf51bf1c601c3fbe693a1adb265314d539a846768ec8ca30b72ec6177d",
+      "size": 19127072
     }
   },
-  "bulk_first_commit": "83e5d8a1"
+  "bulk_first_commit": "83e5d8a1",
+  "bulk512_commit": "641a4872"
 }

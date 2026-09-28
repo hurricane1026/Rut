@@ -210,3 +210,52 @@ logs, configurations, binaries and PMU CSV remain in:
 
 The first comparison attempt failed to start nonroot nginx without its writable
 cache directory. It is excluded; the corrected r2 setup is the retained trace.
+
+## Follow-up: 512 KiB bulk blocks
+
+Against the retained bulk-first binary, 512 KiB blocks with a 128-block idle
+cache preserve the 64 MiB idle byte limit. The initial process-order probe
+improved 1 MiB close c32 by 4.47% and c128 by 6.18%; reverse order improved
+those cells by 3.99% and 6.62%. All 1,423 network tests (338,996 checks) and 68 arena tests (1,073,509
+checks) passed. Focused nginx acceptance runs are recorded below; these diagnostic probes
+are not evidence of an across-matrix win. The prototype keeps
+4096 maximum bulk nodes, so its reserved virtual-address ceiling doubles to
+2 GiB per pool. Its physical working-set tradeoff still needs assessment.
+
+The follow-up trace reduces downstream sends from about 7 to 6 per request,
+and send elapsed time by about 22–26 us/request. Receive-copy time is nearly
+unchanged, around 103–113 us/request. At c128 minor faults increased from
+0.084 to 0.455 per request. Traced throughput is diagnostic only.
+
+A separate forced-epoll control failed exact-body preflight: the server closed
+the connection without a response. Its log confirms epoll activation. No load
+measurements were accepted, and its source edit was reverted. This is not a
+valid backend performance comparison, nor evidence that io_uring causes the
+copy gap. The cause of the epoll preflight failure has not been isolated.
+
+In both process-order probes, c128 mean RSS increased from roughly 224–225 MiB
+to 245–247 MiB. Minor faults increased from 0.11–0.12 to 0.53–0.71 per
+request. c32 RSS increased from about 169 MiB to 175 MiB. Keeping the idle
+byte limit constant therefore does not keep active memory constant.
+
+The uninstrumented three-repeat nginx comparison for the 512 KiB candidate
+passed all preflights and warmup/load error checks. Mean RPS:
+
+| HTTP body / connection / concurrency | nginx | Rut | Rut/nginx |
+|---|---:|---:|---:|
+| 64 KiB / close / 1 | 6,104 | 5,770 | 0.945 |
+| 64 KiB / keepalive / 1 | 7,995 | 7,628 | 0.954 |
+| 1 MiB / close / 32 | 2,329 | 2,245 | 0.964 |
+| 1 MiB / close / 128 | 2,307 | 2,190 | 0.949 |
+
+The large-response gap narrows, but every focused HTTP cell still loses.
+Small-response results do not establish an improvement. Comparing separate
+acceptance runs does not isolate a 64 KiB regression; no same-session
+candidate/baseline causal probe has been run for those small cells yet.
+
+The TLS 1 MiB keepalive c32 control passed all checks: Rut averages 1,156
+RPS and nginx 912 (ratio 1.268). The 512 KiB change is retained for its
+repeatable 4–6.6% large-plaintext improvement, with the measured memory cost
+explicitly recorded. These gates do not prove no regressions across the full
+matrix, which remains outstanding. No huge-page advice or kernel tuning was
+introduced. Final source differs from the measured prototype only in comments.
