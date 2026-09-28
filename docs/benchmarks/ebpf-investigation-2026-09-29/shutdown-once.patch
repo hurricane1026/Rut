@@ -1,0 +1,58 @@
+diff --git a/include/rut/runtime/connection_base.h b/include/rut/runtime/connection_base.h
+index 9694a980..df40d197 100644
+--- a/include/rut/runtime/connection_base.h
++++ b/include/rut/runtime/connection_base.h
+@@ -1800,6 +1800,8 @@ struct ConnectionBase {
+     // io_uring: the final response was written directly and its Send
+     // completion (which accounts the request) is still pending.
+     bool direct_write_completion_pending;
++    // Successful plaintext SHUT_WR survives Send completion until slot reset.
++    bool plaintext_write_shutdown = false;
+     // io_uring plaintext body relay: the second upstream receive slice. While
+     // a client send reads one slice, the next upstream recv fills the other.
+     // Owned like the other slices: freed only once no kernel op references it.
+@@ -2079,6 +2081,7 @@ struct ConnectionBase {
+         upstream_recv_slice = nullptr;
+         upstream_recv_buf.bind(nullptr, 0);
+         direct_write_completion_pending = false;
++        plaintext_write_shutdown = false;
+         upstream_relay_slice = nullptr;
+         upstream_relay_send_len = 0;
+     }
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index e5d2680c..a93dc062 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -3238,7 +3238,8 @@ public:
+             const ssize_t n = ::send(c.fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+             if (n > 0) {
+                 const u32 written = static_cast<u32>(n);
+-                if (written == len) (void)::shutdown(c.fd, SHUT_WR);
++                if (written == len && !c.plaintext_write_shutdown && ::shutdown(c.fd, SHUT_WR) == 0)
++                    c.plaintext_write_shutdown = true;
+                 if (backend.add_send_after_direct_write(
+                         c.fd, c.id, buf, len, written, generation)) {
+                     c.pending_ops++;
+@@ -3431,7 +3432,9 @@ public:
+     void end_stream_before_close(Connection& c) {
+         // A send still in flight keeps the ordinary close ordering: half-
+         // closing now would fail that send and truncate the response.
+-        if (c.fd >= 0 && !c.tls_active && !c.send_armed) (void)::shutdown(c.fd, SHUT_WR);
++        if (c.fd >= 0 && !c.tls_active && !c.send_armed && !c.plaintext_write_shutdown &&
++            ::shutdown(c.fd, SHUT_WR) == 0)
++            c.plaintext_write_shutdown = true;
+     }
+ 
+     // Plaintext body relay: the one-shot body owner of an ordinary native
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index 668d5d92..ed244bee 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -63215,6 +63215,7 @@ TEST(response_buffering_runtime, bounded_combined_final_write_accounts_after_pee
+     REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                ResponseReadDeadlinePostCommitPhase::CombinedSend);
+     REQUIRE(conn.direct_write_completion_pending);
++    CHECK(conn.plaintext_write_shutdown);
+     REQUIRE(conn.send_armed);
+     REQUIRE(conn.response_read_deadline_send_owner_active);
+     CHECK_EQ(metrics.requests_total, 0u);
