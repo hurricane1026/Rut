@@ -1,0 +1,46 @@
+[
+  {
+    "case": "16-c1-close-nginx",
+    "usable": true,
+    "phases": {
+      "@front_read_to_front_send": {
+        "count": 60380,
+        "mean_us": 76.57652206028486
+      },
+      "@front_read_to_upstream_send": {
+        "count": 60380,
+        "mean_us": 33.29962891685989
+      },
+      "@upstream_read_to_front_send": {
+        "count": 60380,
+        "mean_us": 18.66380018217953
+      },
+      "@upstream_send_to_read": {
+        "count": 60380,
+        "mean_us": 24.964386965882742
+      }
+    }
+  },
+  {
+    "case": "16-c1-close-rut-base",
+    "usable": true,
+    "phases": {
+      "@front_read_to_front_send": {
+        "count": 60005,
+        "mean_us": 77.91000584951254
+      },
+      "@front_read_to_upstream_send": {
+        "count": 60005,
+        "mean_us": 33.46797130239147
+      },
+      "@upstream_read_to_front_send": {
+        "count": 60005,
+        "mean_us": 20.32755815348721
+      },
+      "@upstream_send_to_read": {
+        "count": 60005,
+        "mean_us": 24.418594750437464
+      }
+    }
+  }
+]

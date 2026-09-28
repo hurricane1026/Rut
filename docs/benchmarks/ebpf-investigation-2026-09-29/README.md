@@ -738,3 +738,14 @@ HTTP 16 B c1 close; all three traces usable with stable target identities and ze
 | 16-c1-close-rut-direct | 60322 | 24.579 |
 
 Rut does not have a larger mean than nginx in this interval in this diagnostic. Instrumentation overhead and run ordering prevent interpreting this as an acceptance comparison. The rejected direct-send experiment did not improve uninstrumented c1 throughput materially. The next trace splits the front-read to upstream-send and upstream-read to front-send intervals; process-level correlation is only valid for this c1, non-pipelined workload.
+
+## Expanded c1 proxy phase trace
+
+Both traces usable, identity stable, exact-body preflight passed, zero warm/load errors. Process-level correlation is restricted to this non-pipelined HTTP 16 B c1 close load. Intervals include scheduling and kernel work and are not CPU time.
+
+| Engine | Front read→upstream send us | Upstream send→read us | Upstream read→front send us | Front read→send us |
+|---|---:|---:|---:|---:|
+| 16-c1-close-nginx | 33.300 | 24.964 | 18.664 | 76.577 |
+| 16-c1-close-rut-base | 33.468 | 24.419 | 20.328 | 77.910 |
+
+The three stage means should sum closely to the full interval; probe execution between timestamps adds small overhead. Instrumented timings do not substitute for an uninstrumented throughput comparison.
