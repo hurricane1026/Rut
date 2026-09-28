@@ -147,10 +147,10 @@ private:
 bool put_unmatched(Writer& w) {
     return w.put_cstr(
         "unmatched { return local_response({\n"
-        "  version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"envoy\",\n"
-        "  date: \"current\", connection: \"request\", connection_header: \"close_only\",\n"
-        "  header_names: \"lowercase\", header_order: \"date_server_length\",\n"
-        "  head_mode: \"suppress_body\", body: b\"\"\n"
+        "  version: .http11, status: 404, reason: \"Not Found\", server: \"envoy\",\n"
+        "  date: .current, connection: .request, connection_header: .closeOnly,\n"
+        "  header_names: .lowercase, header_order: .dateServerLength,\n"
+        "  head_mode: .suppressBody, body: b\"\"\n"
         "}) }\n");
 }
 
@@ -168,10 +168,10 @@ bool put_route_exact_404(Writer& w, Str node_text) {
         return false;
     return w.put_cstr(
         "    return local_response({\n"
-        "        version: \"HTTP/1.1\", status: 404, reason: \"Not Found\", server: \"envoy\",\n"
-        "        date: \"current\", connection: \"request\", connection_header: \"close_only\",\n"
-        "        header_names: \"lowercase\", header_order: \"date_server_length\",\n"
-        "        head_mode: \"suppress_body\", body: b\"\"\n"
+        "        version: .http11, status: 404, reason: \"Not Found\", server: \"envoy\",\n"
+        "        date: .current, connection: .request, connection_header: .closeOnly,\n"
+        "        header_names: .lowercase, header_order: .dateServerLength,\n"
+        "        head_mode: .suppressBody, body: b\"\"\n"
         "    })\n"
         "}\n");
 }
@@ -186,45 +186,42 @@ bool put_route_exact_404(Writer& w, Str node_text) {
 bool put_forward_call(Writer& w, u32 cluster_index, bool include_head_mode) {
     if (!w.put_cstr("    return forward(envoy_cluster_")) return false;
     if (!w.put_u16(static_cast<u16>(cluster_index))) return false;
-    if (!w.put_cstr(
-            ", request_policy: {\n"
-            "            version: \"HTTP/1.1\",\n"
-            "            host: \"preserve\",\n"
-            "            connection: \"omit\",\n"
-            "            header_names: \"lowercase\",\n"
-            "            forwarded_proto: \"http\",\n"
-            "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-            "\"Upgrade\", \"Proxy-Connection\"]\n"
-            "        },\n"
-            "        response_policy: {\n"
-            "            version: \"HTTP/1.1\",\n"
-            "            framing: \"content_length\",\n"
-            "            connection: \"request\",\n"))
+    if (!w.put_cstr(", request_policy: {\n"
+                    "            version: .http11,\n"
+                    "            host: .preserve,\n"
+                    "            connection: .omit,\n"
+                    "            header_names: .lowercase,\n"
+                    "            forwarded_proto: .http,\n"
+                    "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+                    ".upgrade, .proxyConnection]\n"
+                    "        },\n"
+                    "        response_policy: {\n"
+                    "            version: .http11,\n"
+                    "            framing: .contentLength,\n"
+                    "            connection: .request,\n"))
         return false;
-    if (include_head_mode && !w.put_cstr("            head_mode: \"suppress_body\",\n"))
-        return false;
-    if (!w.put_cstr("            header_order: \"upstream\",\n"
-                    "            header_names: \"lowercase\",\n"
-                    "            connection_header: \"close_only\",\n"
-                    "            status_reason: \"canonical\",\n"
+    if (include_head_mode && !w.put_cstr("            head_mode: .suppressBody,\n")) return false;
+    if (!w.put_cstr("            header_order: .upstream,\n"
+                    "            header_names: .lowercase,\n"
+                    "            connection_header: .closeOnly,\n"
+                    "            status_reason: .canonical,\n"
                     "            server: \"envoy\",\n"
-                    "            date: \"preserve_or_current\",\n"
+                    "            date: .preserveOrCurrent,\n"
                     "            hide_headers: []\n"
                     "        },\n"
                     "        failure_policy: {\n"
-                    "            version: \"HTTP/1.1\",\n"
+                    "            version: .http11,\n"
                     "            status: 503,\n"
                     "            reason: \"Service Unavailable\",\n"
                     "            content_type: \"text/plain\",\n"
                     "            server: \"envoy\",\n"
-                    "            date: \"current\",\n"
-                    "            connection: \"request\",\n"
-                    "            connection_header: \"close_only\",\n"
-                    "            header_names: \"lowercase\",\n"
-                    "            header_order: \"length_type_date_server\",\n"))
+                    "            date: .current,\n"
+                    "            connection: .request,\n"
+                    "            connection_header: .closeOnly,\n"
+                    "            header_names: .lowercase,\n"
+                    "            header_order: .lengthTypeDateServer,\n"))
         return false;
-    if (include_head_mode && !w.put_cstr("            head_mode: \"suppress_body\",\n"))
-        return false;
+    if (include_head_mode && !w.put_cstr("            head_mode: .suppressBody,\n")) return false;
     return w.put_cstr("            body: b\"") && w.put_cstr(kEnvoyConnectFailureBody) &&
            w.put_cstr("\"\n        }\n    )\n");
 }
@@ -1359,12 +1356,12 @@ FrontendResult<bool> validate(const Bootstrap& model, const RutCapabilities& cap
         return unsupported(
             virtual_host.routes[0].action.cluster_span,
             lit_str("BLOCKED_BY_RUT: Envoy preserves Host and lowercases upstream request header "
-                    "names; RUT request_policy lacks host: \"preserve\""));
+                    "names; RUT request_policy lacks host: .preserve"));
     if (!caps.response_envoy_h1)
         return unsupported(
             hcm.span,
             lit_str("BLOCKED_BY_RUT: Envoy lowercases response header names and preserves the "
-                    "upstream date; RUT response_policy lacks header_order: \"upstream\""));
+                    "upstream date; RUT response_policy lacks header_order: .upstream"));
     if (!caps.local_reply_envoy_h1)
         return unsupported(
             hcm.route_config.span,

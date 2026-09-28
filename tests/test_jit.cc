@@ -8270,9 +8270,9 @@ TEST(jit_dispatch, forward_bundle_keeps_request_and_bundle_ids_independent) {
 
 TEST(jit, compiled_failure_only_forward_bundle_preserves_zero_response_id) {
     const char* src =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"x\" }) }\n";
+        "date: .current, connection: .request, body: b\"x\" }) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -8308,16 +8308,16 @@ TEST(jit, compiled_timeout_failure_policy_preserves_single_packed_bundle_id) {
 upstream b
 route GET "/" {
     return forward(b, response_policy: {
-        version: "HTTP/1.1", framing: "content_length", connection: "request",
-        server: "s", date: "current", hide_headers: []
+        version: .http11, framing: .contentLength, connection: .request,
+        server: "s", date: .current, hide_headers: []
     }, failure_policy: {
-        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/plain", server: "s", date: "current",
-        connection: "request", body: b"bad"
+        version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "s", date: .current,
+        connection: .request, body: b"bad"
     }, timeout_failure_policy: {
-        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
-        content_type: "text/plain", server: "s", date: "current",
-        connection: "request", body: b"slow"
+        version: .http11, status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "s", date: .current,
+        connection: .request, body: b"slow"
     })
 }
 )rut";
@@ -8357,11 +8357,11 @@ TEST(jit, compiled_response_read_timeout_preserves_single_bundle_and_request_pol
 upstream b at "127.0.0.1:9000"
 route GET "/" {
     return forward(b, request_policy: {
-        version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
     }, response_policy: {
-        version: "HTTP/1.1", framing: "content_length", connection: "request",
-        server: "rut", date: "current", hide_headers: []
+        version: .http11, framing: .contentLength, connection: .request,
+        server: "rut", date: .current, hide_headers: []
     }, response_read_timeout: 7s)
 }
 route GET "/later" { return 204 }
@@ -8439,18 +8439,18 @@ TEST(jit, compiled_response_buffering_reaches_config_without_changing_handler_re
 upstream b at "127.0.0.1:9000"
 route POST "/" {
     return forward(b,
-        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        request_policy: { version: .http11, host: .upstream, connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
+            date: .current, connection: .request, body: b"slow" },
         response_read_timeout: 1s,
-        response_buffering: "complete_content_length")
+        response_buffering: .completeContentLength)
 }
 )rut";
     for (const bool any_route : {false, true}) {
@@ -20121,19 +20121,19 @@ TEST(jit, fixed_302_conditional_returns_redirect_identity_and_neighbor_bundle) {
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
   if req.pathOnly == "/old" {
-    return redirect({scheme: "http", authority: "static",
-      static_authority: "redirect.example", port: "omit", path: "static",
-      query: "discard", date: "current", connection: "close",
-      header_order: "connection_then_location", status: 302,
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close,
+      header_order: .connectionThenLocation, status: 302,
       reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
       target_path: "/new", body: b"fixed-302"})
   } else {
     return forward(backend,
-      response_policy: {version: "HTTP/1.1", framing: "content_length",
-        connection: "request", server: "rut", date: "current", hide_headers: []},
-      failure_policy: {version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/plain", server: "rut", date: "current",
-        connection: "request", body: b"bad"})
+      response_policy: {version: .http11, framing: .contentLength,
+        connection: .request, server: "rut", date: .current, hide_headers: []},
+      failure_policy: {version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: .current,
+        connection: .request, body: b"bad"})
   }
 }
 )rut";

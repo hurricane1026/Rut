@@ -1414,7 +1414,7 @@ TEST(envoy_convert, cli_milestone_s_fails_closed_with_request_gap) {
     CHECK(result.out.empty());
     const std::string expected_prefix = expected_location(path, span);
     CHECK_EQ(result.err.compare(0, expected_prefix.size(), expected_prefix), 0);
-    CHECK(result.err.find("RUT response_policy lacks header_order: \"upstream\"") !=
+    CHECK(result.err.find("RUT response_policy lacks header_order: .upstream") !=
           std::string::npos);
 }
 
@@ -2520,7 +2520,7 @@ TEST(envoy_convert, blocked_on_redirect) {
 // ── PR 8: ordered route-list lowering ──────────────────────────────────
 //
 // TODO(PR3-PR5): once the RUT policy vocabulary these goldens use
-// (`host: "preserve"`, `header_order: "upstream"`, the Envoy local_response
+// (`host: .preserve`, `header_order: .upstream`, the Envoy local_response
 // layout) exists in the compiler, add the lex/parse/analyze/MIR/RIR
 // round-trip test for each golden here, mirroring
 // tests/test_nginx_parser.cc's `golden_compiles`-style checks (see PR5's
@@ -2566,31 +2566,32 @@ TEST(envoy_convert, golden_routes_a_prefix_then_root) {
 // here rather than only showing up as a mysterious golden-test failure.
 // Sweep-8: #697 raised `LexedTokens::kMaxTokens` from 932 to 4096, so all
 // three goldens now lex successfully -- `kEnvoyRoutesAGolden` (scenario a)
-// at 963 tokens (was `TooManyTokens` at byte 8400 under the old 932 budget;
+// at 1126 tokens (was `TooManyTokens` at byte 8400 under the old 932 budget;
 // see `golden_routes_a_prefix_then_root` above) alongside
-// `kEnvoyRoutesBGolden` / `kEnvoyRoutesCGolden` at 360 and 668.
+// `kEnvoyRoutesBGolden` / `kEnvoyRoutesCGolden` at 419 and 779.
 // `kEnvoyRoutesBGolden`'s count dropped from 655 (two live nodes) to 360
-// (root-only) under Codex round-9: "/api" is now dropped as globally
-// shadowed by the earlier "/" instead of being planned as a dead node (see
+// (root-only) before the enum migration under Codex round-9: "/api" is
+// dropped as globally shadowed by the earlier "/" instead of being planned
+// as a dead node (see
 // envoy_routes_b.inc).
 TEST(envoy_convert, token_budget_goldens_match_the_real_lexer) {
     const Str golden_a = lit_str(kEnvoyRoutesAGolden);
     const auto lexed_a = lex(golden_a);
     REQUIRE(lexed_a);
-    CHECK_EQ(lexed_a.value().tokens.len, 963u);
+    CHECK_EQ(lexed_a.value().tokens.len, 1126u);
     CHECK_LT(lexed_a.value().tokens.len, LexedTokens::kMaxTokens);
-    CHECK_EQ(golden_a.len, 8804u);
+    CHECK_EQ(golden_a.len, 8533u);
 
     const Str golden_b = lit_str(kEnvoyRoutesBGolden);
     const auto lexed_b = lex(golden_b);
     REQUIRE(lexed_b);
-    CHECK_EQ(lexed_b.value().tokens.len, 360u);
+    CHECK_EQ(lexed_b.value().tokens.len, 419u);
     CHECK_LT(lexed_b.value().tokens.len, LexedTokens::kMaxTokens);
 
     const Str golden_c = lit_str(kEnvoyRoutesCGolden);
     const auto lexed_c = lex(golden_c);
     REQUIRE(lexed_c);
-    CHECK_EQ(lexed_c.value().tokens.len, 668u);
+    CHECK_EQ(lexed_c.value().tokens.len, 779u);
     CHECK_LT(lexed_c.value().tokens.len, LexedTokens::kMaxTokens);
 }
 
@@ -2706,7 +2707,7 @@ TEST(envoy_convert, shadowed_siblings_dropped_before_registration) {
 
     const auto lexed = lex((*lowered).value().view());
     REQUIRE(lexed);
-    CHECK_EQ(lexed.value().tokens.len, 364u);
+    CHECK_EQ(lexed.value().tokens.len, 423u);
     CHECK_LT(lexed.value().tokens.len, LexedTokens::kMaxTokens);
 }
 
@@ -2874,7 +2875,7 @@ TEST(envoy_convert, golden_routes_g_duplicate_exact_deduped) {
 
     const auto lexed = lex((*lowered).value().view());
     REQUIRE(lexed);
-    CHECK_EQ(lexed.value().tokens.len, 668u);
+    CHECK_EQ(lexed.value().tokens.len, 779u);
     CHECK_LT(lexed.value().tokens.len, LexedTokens::kMaxTokens);
 }
 
@@ -3039,7 +3040,7 @@ TEST(envoy_convert, cli_two_routes_blocked_by_first_capability) {
     CHECK(result.out.empty());
     const std::string expected_prefix = expected_location(path, span);
     CHECK_EQ(result.err.compare(0, expected_prefix.size(), expected_prefix), 0);
-    CHECK(result.err.find("RUT response_policy lacks header_order: \"upstream\"") !=
+    CHECK(result.err.find("RUT response_policy lacks header_order: .upstream") !=
           std::string::npos);
 }
 

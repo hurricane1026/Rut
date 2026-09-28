@@ -1245,29 +1245,29 @@ static std::string make_policy_heavy_route_source(u32 route_count) {
         source += "route GET \"/route" + std::to_string(i) +
                   "\" {\n"
                   "    return forward(nginx_upstream, request_policy: {\n"
-                  "            version: \"HTTP/1.1\",\n"
-                  "            host: \"upstream\",\n"
-                  "            connection: \"omit\",\n"
-                  "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
-                  "\"Expect\", \"Upgrade\"]\n"
+                  "            version: .http11,\n"
+                  "            host: .upstream,\n"
+                  "            connection: .omit,\n"
+                  "            strip_headers: [.connection, .keepAlive, .te, "
+                  ".expect, .upgrade]\n"
                   "        },\n"
                   "        response_policy: {\n"
-                  "            version: \"HTTP/1.1\",\n"
-                  "            framing: \"content_length\",\n"
-                  "            connection: \"request\",\n"
+                  "            version: .http11,\n"
+                  "            framing: .contentLength,\n"
+                  "            connection: .request,\n"
                   "            server: \"nginx/1.29.7\",\n"
-                  "            date: \"current\",\n"
+                  "            date: .current,\n"
                   "            hide_headers: [\"Date\", \"Server\", \"X-Pad\", "
                   "\"X-Compat-Hidden\"]\n"
                   "        },\n"
                   "        failure_policy: {\n"
-                  "            version: \"HTTP/1.1\",\n"
+                  "            version: .http11,\n"
                   "            status: 502,\n"
                   "            reason: \"Bad Gateway\",\n"
                   "            content_type: \"text/html\",\n"
                   "            server: \"nginx/1.29.7\",\n"
-                  "            date: \"current\",\n"
-                  "            connection: \"request\",\n"
+                  "            date: .current,\n"
+                  "            connection: .request,\n"
                   "            body: b\"<html><body>502 Bad Gateway</body></html>\"\n"
                   "        }\n"
                   "    )\n"
@@ -1284,9 +1284,9 @@ TEST(frontend, policy_heavy_multi_route_source_exceeds_legacy_token_bound_and_pa
     const std::string source = make_policy_heavy_route_source(9);
     auto lexed = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(lexed);
-    CHECK_GT(lexed->tokens.len, 932u);
+    CHECK_GT(lexed->tokens.len, 1036u);
     CHECK_LT(lexed->tokens.len, LexedTokens::kMaxTokens);
-    REQUIRE_EQ(lexed->tokens.len, 1032u);
+    REQUIRE_EQ(lexed->tokens.len, 1167u);
 
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
@@ -33292,15 +33292,115 @@ route GET "/x" {
     REQUIRE_FALSE(hir.has_value());
 }
 
+TEST(frontend, http_policy_enum_members_are_contextual_and_strings_are_rejected) {
+    // Each program is independently valid. Mutate every selector occurrence,
+    // including repeated version/date fields and each strip-list element, so
+    // a parser failure elsewhere cannot hide an unconverted field.
+    const char* programs[] = {
+        R"rut(upstream b at "127.0.0.1:9000"
+route GET "/" { return forward(b, request_policy: {
+    version: .http11, host: .upstream, connection: .omit,
+    content_length_position: .afterHost,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+}) }
+)rut",
+        R"rut(upstream b at "127.0.0.1:9000"
+route GET "/" { return forward(b, request_policy: {
+    version: .http11, host: .upstream, connection: .omit,
+    retained_header_value: .trimSpPreserveHtab,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+}) }
+)rut",
+        R"rut(upstream b at "127.0.0.1:9000"
+route GET "/" { return forward(b, request_policy: {
+    version: .http11, host: .preserve, connection: .omit,
+    header_names: .lowercase, forwarded_proto: .http,
+    strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
+}) }
+)rut",
+        R"rut(upstream b at "127.0.0.1:9000"
+route GET "/" { return forward(b, response_policy: {
+    version: .http11, framing: .contentLength, connection: .request,
+    head_mode: .reject, server: "custom-server", date: .current,
+    hide_headers: ["X-Custom-Header"]
+}, failure_policy: {
+    version: .http11, status: 502, reason: "Custom failure",
+    content_type: "application/vnd.custom+json", server: "custom-server",
+    date: .current, connection: .request, head_mode: .reject, body: b"custom"
+}, timeout_failure_policy: {
+    version: .http11, status: 504, reason: "Custom timeout",
+    content_type: "text/plain", server: "custom-server",
+    date: .current, connection: .request, head_mode: .reject, body: b"timeout"
+}, response_read_timeout: 1s, response_buffering: .completeContentLength) }
+)rut",
+        R"rut(unmatched { return local_response({
+    version: .http11, status: 404, reason: "Custom missing", server: "custom-server",
+    date: .current, content_type: "text/plain", connection: .request,
+    head_mode: .suppressBody, body: b"missing"
+}) }
+)rut",
+        R"rut(route GET "/" { return redirect({
+    scheme: .http, authority: .static, static_authority: "custom.example", port: .omit,
+    path: .static, query: .discard, date: .current, connection: .close,
+    header_order: .connectionThenLocation,
+    status: 301, reason: "Custom redirect", server: "custom-server",
+    content_type: "text/plain", target_path: "/destination/", body: b"redirect"
+}) }
+)rut",
+    };
+    for (const char* program : programs) {
+        const std::string source(program);
+        auto lexed = lex(lit(program));
+        REQUIRE(lexed);
+        REQUIRE(parse_file_heap(lexed.value()));
+        const auto& tokens = lexed->tokens;
+        for (u32 i = 0; i + 1 < tokens.len; ++i) {
+            if (tokens[i].type != TokenType::Dot) continue;
+            const auto& member = tokens[i + 1];
+            const std::string name(member.text.ptr, member.text.len);
+            const std::string legacy = name == "http11" ? "HTTP/1.1" : name;
+            for (const std::string& replacement : {
+                     "\"" + legacy + "\"",
+                     name,
+                     std::string(".unknownHttpPolicyCase"),
+                     std::string("."),
+                     std::string(".42"),
+                     std::string(".\"http11\""),
+                 }) {
+                std::string invalid = source;
+                invalid.replace(tokens[i].start, member.end - tokens[i].start, replacement);
+                auto invalid_lexed = lex({invalid.data(), static_cast<u32>(invalid.size())});
+                REQUIRE(invalid_lexed);
+                auto parsed = parse_file_heap(invalid_lexed.value());
+                REQUIRE_FALSE(parsed.has_value());
+                CHECK_EQ(parsed.error().code, FrontendError::UnsupportedSyntax);
+                // The diagnostic names the enum cases allowed for this field.
+                CHECK_GT(parsed.error().detail.len, 0u);
+                CHECK_EQ(parsed.error().detail.ptr[0], '.');
+                CHECK_GE(parsed.error().span.start, tokens[i].start);
+            }
+        }
+    }
+    // A real enum case from a different field is also a type error.
+    const char* invalid = R"rut(upstream b
+route GET "/" { return forward(b, request_policy: { version: .current }) }
+)rut";
+    auto lexed = lex(lit(invalid));
+    REQUIRE(lexed);
+    auto parsed = parse_file_heap(lexed.value());
+    REQUIRE_FALSE(parsed.has_value());
+    CHECK(parsed.error().detail.eq(lit(".http11")));
+}
+
 TEST(frontend, forward_request_policy_requires_exact_fixed_strip_contract) {
     const char* valid = R"rut(
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
     return forward(backend, request_policy: {
-        version: "HTTP/1.1",
-        host: "upstream",
-        connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        version: .http11,
+        host: .upstream,
+        connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
     })
 }
 )rut";
@@ -33313,20 +33413,20 @@ route GET "/" {
 
     const char* invalid[] = {
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.0\", host: \"upstream\", connection: \"omit\", strip_headers: "
-        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "version: .http10, host: .upstream, connection: .omit, strip_headers: "
+        "[.connection, .keepAlive, .te, .expect, .upgrade] }) }\n",
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"close\", strip_headers: "
-        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "version: .http11, host: .upstream, connection: .close, strip_headers: "
+        "[.connection, .keepAlive, .te, .expect, .upgrade] }) }\n",
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
-        "[\"Connection\", \"Keep-Alive\"] }) }\n",
+        "version: .http11, host: .upstream, connection: .omit, strip_headers: "
+        "[.connection, .keepAlive] }) }\n",
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
-        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\", \"Foo\"] }) }\n",
+        "version: .http11, host: .upstream, connection: .omit, strip_headers: "
+        "[.connection, .keepAlive, .te, .expect, .upgrade, \"Foo\"] }) }\n",
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
-        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }, set_path: \"/x\") "
+        "version: .http11, host: .upstream, connection: .omit, strip_headers: "
+        "[.connection, .keepAlive, .te, .expect, .upgrade] }, set_path: \"/x\") "
         "}\n",
     };
     for (const char* src : invalid) {
@@ -33337,7 +33437,7 @@ route GET "/" {
     }
 }
 
-// PR3: the Envoy-compatible `host: "preserve"` request-policy combination
+// PR3: the Envoy-compatible `host: .preserve` request-policy combination
 // (RequestPolicyId::Http11PreserveHostLowercase). The oracle
 // (tests/fixtures/envoy_oracle_milestone_s.inc) establishes the runtime wire
 // behaviour; this test only pins the grammar -> RIR pipeline.
@@ -33346,12 +33446,12 @@ TEST(frontend, request_policy_preserve_host_parses_to_id4) {
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
     return forward(backend, request_policy: {
-        version: "HTTP/1.1",
-        host: "preserve",
-        connection: "omit",
-        header_names: "lowercase",
-        forwarded_proto: "http",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+        version: .http11,
+        host: .preserve,
+        connection: .omit,
+        header_names: .lowercase,
+        forwarded_proto: .http,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
     })
 }
 )rut";
@@ -33387,46 +33487,46 @@ TEST(frontend, request_policy_preserve_host_rejects_every_other_combination) {
     const char* invalid[] = {
         // Missing header_names.
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
-        "forwarded_proto: \"http\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
-        "\"Expect\", \"Upgrade\", \"Proxy-Connection\"] }) }\n",
+        "version: .http11, host: .preserve, connection: .omit, "
+        "forwarded_proto: .http, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade, .proxyConnection] }) }\n",
         // Missing forwarded_proto.
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
-        "header_names: \"lowercase\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
-        "\"Expect\", \"Upgrade\", \"Proxy-Connection\"] }) }\n",
+        "version: .http11, host: .preserve, connection: .omit, "
+        "header_names: .lowercase, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade, .proxyConnection] }) }\n",
         // Five-name strip list (missing Proxy-Connection) with preserve.
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
-        "header_names: \"lowercase\", forwarded_proto: \"http\", strip_headers: [\"Connection\", "
-        "\"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"] }) }\n",
+        "version: .http11, host: .preserve, connection: .omit, "
+        "header_names: .lowercase, forwarded_proto: .http, strip_headers: [.connection, "
+        ".keepAlive, .te, .expect, .upgrade] }) }\n",
         // content_length_position rejected with preserve.
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
-        "header_names: \"lowercase\", forwarded_proto: \"http\", content_length_position: "
-        "\"after_host\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-        "\"Upgrade\", \"Proxy-Connection\"] }) }\n",
+        "version: .http11, host: .preserve, connection: .omit, "
+        "header_names: .lowercase, forwarded_proto: .http, content_length_position: "
+        ".afterHost, strip_headers: [.connection, .keepAlive, .te, .expect, "
+        ".upgrade, .proxyConnection] }) }\n",
         // retained_header_value rejected with preserve.
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"preserve\", connection: \"omit\", "
-        "header_names: \"lowercase\", forwarded_proto: \"http\", retained_header_value: "
-        "\"trim_sp_preserve_htab\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
-        "\"Expect\", \"Upgrade\", \"Proxy-Connection\"] }) }\n",
-        // header_names rejected with host: "upstream".
+        "version: .http11, host: .preserve, connection: .omit, "
+        "header_names: .lowercase, forwarded_proto: .http, retained_header_value: "
+        ".trimSpPreserveHtab, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade, .proxyConnection] }) }\n",
+        // header_names rejected with host: .upstream.
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
-        "header_names: \"lowercase\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
-        "\"Expect\", \"Upgrade\"] }) }\n",
-        // forwarded_proto rejected with host: "upstream".
+        "version: .http11, host: .upstream, connection: .omit, "
+        "header_names: .lowercase, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade] }) }\n",
+        // forwarded_proto rejected with host: .upstream.
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
-        "forwarded_proto: \"http\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
-        "\"Expect\", \"Upgrade\"] }) }\n",
-        // "Proxy-Connection" rejected in the strip list with host: "upstream".
+        "version: .http11, host: .upstream, connection: .omit, "
+        "forwarded_proto: .http, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade] }) }\n",
+        // "Proxy-Connection" rejected in the strip list with host: .upstream.
         "upstream b at \"127.0.0.1:9000\"\nroute GET \"/\" { return forward(b, request_policy: { "
-        "version: \"HTTP/1.1\", host: \"upstream\", connection: \"omit\", "
-        "strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\", "
-        "\"Proxy-Connection\"] }) }\n",
+        "version: .http11, host: .upstream, connection: .omit, "
+        "strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, "
+        ".proxyConnection] }) }\n",
     };
     for (const char* src : invalid) {
         auto bad_lex = lex(lit(src));
@@ -33442,18 +33542,18 @@ TEST(frontend, request_policy_preserve_host_rejects_timing_and_buffering_options
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
     return forward(backend, request_policy: {
-        version: "HTTP/1.1",
-        host: "preserve",
-        connection: "omit",
-        header_names: "lowercase",
-        forwarded_proto: "http",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade", "Proxy-Connection"]
+        version: .http11,
+        host: .preserve,
+        connection: .omit,
+        header_names: .lowercase,
+        forwarded_proto: .http,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade, .proxyConnection]
     }, )rut") + kwarg +
                ")\n}\n";
     };
     const char* rejected_kwargs[] = {
         "response_read_timeout: 1s",
-        "response_buffering: \"complete_content_length\"",
+        "response_buffering: .completeContentLength",
         "target_transform: { strip_prefix: \"/\", replace_prefix: \"/x/\" }",
     };
     for (const char* kwarg : rejected_kwargs) {
@@ -33465,7 +33565,7 @@ route GET "/" {
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
         CHECK(hir.error().detail.eq(
-            lit("request_policy host: \"preserve\" does not support this forward option")));
+            lit("request_policy host: .preserve does not support this forward option")));
     }
 }
 
@@ -33474,15 +33574,15 @@ TEST(frontend, request_policy_content_length_position_selects_id_after_complete_
 upstream backend at "127.0.0.1:9000"
 route POST "/legacy" {
     return forward(backend, request_policy: {
-        version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
     })
 }
 route POST "/after" {
     return forward(backend, request_policy: {
-        content_length_position: "after_host", strip_headers: ["Connection", "Keep-Alive",
-            "TE", "Expect", "Upgrade"], connection: "omit", host: "upstream",
-        version: "HTTP/1.1"
+        content_length_position: .afterHost, strip_headers: [.connection, .keepAlive,
+            .te, .expect, .upgrade], connection: .omit, host: .upstream,
+        version: .http11
     })
 }
 )rut";
@@ -33527,14 +33627,14 @@ route POST "/after" {
 
     const char* invalid[] = {
         "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
-        "\"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
-        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
-        "content_length_position: \"before_host\" }) }\n",
+        ".http11, host: .upstream, connection: .omit, strip_headers: "
+        "[.connection, .keepAlive, .te, .expect, .upgrade], "
+        "content_length_position: .before_host }) }\n",
         "upstream b\nroute POST \"/\" { return forward(b, request_policy: { version: "
-        "\"HTTP/1.1\", host: \"upstream\", connection: \"omit\", strip_headers: "
-        "[\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
-        "content_length_position: \"after_host\", content_length_position: "
-        "\"after_host\" }) }\n",
+        ".http11, host: .upstream, connection: .omit, strip_headers: "
+        "[.connection, .keepAlive, .te, .expect, .upgrade], "
+        "content_length_position: .afterHost, content_length_position: "
+        ".afterHost }) }\n",
     };
     for (const char* bad : invalid) {
         lexed = lex(lit(bad));
@@ -33546,9 +33646,9 @@ route POST "/after" {
     const char timeout[] = R"rut(
 upstream b
 route POST "/" {
-    return forward(b, request_policy: { version: "HTTP/1.1", host: "upstream",
-        connection: "omit", content_length_position: "after_host",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
+    return forward(b, request_policy: { version: .http11, host: .upstream,
+        connection: .omit, content_length_position: .afterHost,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
         response_read_timeout: 1s)
 }
 )rut";
@@ -33572,22 +33672,22 @@ route POST "/" {
 
 TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) {
     static constexpr const char kPolicies[] = R"rut(
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
-        response_read_timeout: 60s, response_buffering: "complete_content_length")
+            date: .current, connection: .request, body: b"slow" },
+        response_read_timeout: 60s, response_buffering: .completeContentLength)
     )rut";
     const std::string source = std::string("upstream b at \"127.0.0.1:9000\"\n") +
                                "route GET \"/ok\" { return forward(b, "
-                               "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
-                               "connection: \"omit\", strip_headers: [\"Connection\", "
-                               "\"Keep-Alive\", \"TE\", \"Expect\", \"Upgrade\"], "
-                               "retained_header_value: \"trim_sp_preserve_htab\" }, " +
+                               "request_policy: { version: .http11, host: .upstream, "
+                               "connection: .omit, strip_headers: [.connection, "
+                               ".keepAlive, .te, .expect, .upgrade], "
+                               "retained_header_value: .trimSpPreserveHtab }, " +
                                kPolicies + "}\n";
     auto lexed = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(lexed);
@@ -33667,21 +33767,19 @@ TEST(frontend, retained_header_value_trim_sp_preserve_htab_is_get_timeout_only) 
     bad_method.replace(bad_method.find("route GET"), 9, "route POST");
     expect_rejected(bad_method);
     std::string missing_buffering = source;
-    const auto buffering =
-        missing_buffering.find("response_buffering: \"complete_content_length\"");
+    const auto buffering = missing_buffering.find("response_buffering: .completeContentLength");
     REQUIRE_NE(buffering, std::string::npos);
-    missing_buffering.erase(buffering,
-                            sizeof("response_buffering: \"complete_content_length\"") - 1);
+    missing_buffering.erase(buffering, sizeof("response_buffering: .completeContentLength") - 1);
     expect_rejected(missing_buffering);
     std::string after_host = source;
-    const auto retained = after_host.find("retained_header_value: \"trim_sp_preserve_htab\"");
+    const auto retained = after_host.find("retained_header_value: .trimSpPreserveHtab");
     REQUIRE_NE(retained, std::string::npos);
-    after_host.insert(retained, "content_length_position: \"after_host\", ");
+    after_host.insert(retained, "content_length_position: .afterHost, ");
     expect_rejected(after_host);
     std::string unknown = source;
-    const auto value_pos = unknown.find("trim_sp_preserve_htab");
+    const auto value_pos = unknown.find("trimSpPreserveHtab");
     REQUIRE_NE(value_pos, std::string::npos);
-    unknown.replace(value_pos, sizeof("trim_sp_preserve_htab") - 1, "unknown");
+    unknown.replace(value_pos, sizeof("trimSpPreserveHtab") - 1, "unknown");
     expect_rejected(unknown);
 }
 
@@ -33689,18 +33787,18 @@ TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_p
     const auto source_for = [](const char* route) {
         return std::string("upstream backend at \"127.0.0.1:9000\"\n") + route + R"rut( {
     return forward(backend,
-        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-            content_length_position: "after_host",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current",
-            head_mode: "suppress_body", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", head_mode: "suppress_body", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        request_policy: { version: .http11, host: .upstream, connection: .omit,
+            content_length_position: .afterHost,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current,
+            head_mode: .suppressBody, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, head_mode: .suppressBody, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", head_mode: "suppress_body", body: b"slow" },
+            date: .current, connection: .request, head_mode: .suppressBody, body: b"slow" },
         response_read_timeout: 1s)
 }
 )rut";
@@ -33750,7 +33848,7 @@ TEST(frontend, request_policy_after_host_admits_only_fixed_upload_head_timeout_p
         std::string source = source_for("route HEAD \"/one\"");
         const auto timeout = source.find("response_read_timeout: 1s");
         REQUIRE_NE(timeout, std::string::npos);
-        source.insert(timeout, "response_buffering: \"complete_content_length\",\n        ");
+        source.insert(timeout, "response_buffering: .completeContentLength,\n        ");
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(lexed);
         auto ast = parse_file_heap(lexed.value());
@@ -33821,10 +33919,10 @@ func add_header(_ resp: Response) -> i32 {
 chain access { after add_header(resp) }
 route GET "/" use chain access {
     return forward(backend, request_policy: {
-        version: "HTTP/1.1",
-        host: "upstream",
-        connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        version: .http11,
+        host: .upstream,
+        connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
     })
 }
 )rut";
@@ -33843,16 +33941,16 @@ TEST(frontend, response_policy_metadata_is_bounded_and_carried_to_rir) {
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
     return forward(backend, request_policy: {
-        version: "HTTP/1.1",
-        host: "upstream",
-        connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        version: .http11,
+        host: .upstream,
+        connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
     }, response_policy: {
-        version: "HTTP/1.1",
-        framing: "content_length",
-        connection: "keep_alive",
+        version: .http11,
+        framing: .contentLength,
+        connection: .keepAlive,
         server: "nginx",
-        date: "current",
+        date: .current,
         hide_headers: ["Date", "Server", "X-Pad"]
     })
 }
@@ -33933,21 +34031,21 @@ TEST(response_policy, head_mode_is_owned_deduplicated_and_printed) {
 
 TEST(frontend, response_policy_rejects_invalid_values_duplicates_and_missing_fields) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.0\", "
-        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
-        "\"current\", hide_headers: [] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"chunked\", connection: \"keep_alive\", server: \"nginx\", date: \"current\", "
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http10, "
+        "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
+        ".current, hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .chunked, connection: .keepAlive, server: \"nginx\", date: .current, "
         "hide_headers: [] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
-        "\"current\", hide_headers: [\"Date\", \"date\"] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", hide_headers: "
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
+        ".current, hide_headers: [\"Date\", \"date\"] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .keepAlive, server: \"nginx\", hide_headers: "
         "[] }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"keep_alive\", server: \"bad\rvalue\", date: "
-        "\"current\", hide_headers: [] }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .keepAlive, server: \"bad\rvalue\", date: "
+        ".current, hide_headers: [] }) }\n",
     };
     for (const char* src : invalid) {
         auto lexed = lex(lit(src));
@@ -33963,13 +34061,13 @@ upstream backend at "127.0.0.1:9000"
 route GET "/head" {
     return forward(backend,
         response_policy: {
-            version: "HTTP/1.1", framing: "content_length", connection: "request",
-            head_mode: "suppress_body", server: "nginx", date: "current", hide_headers: []
+            version: .http11, framing: .contentLength, connection: .request,
+            head_mode: .suppressBody, server: "nginx", date: .current, hide_headers: []
         },
         failure_policy: {
-            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "nginx", date: "current",
-            connection: "request", head_mode: "suppress_body", body: b"x"
+            version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "nginx", date: .current,
+            connection: .request, head_mode: .suppressBody, body: b"x"
         })
 }
 )rut";
@@ -34007,13 +34105,13 @@ upstream b at "127.0.0.1:9000"
 route GET "/" {
     return forward(b,
         response_policy: {
-            version: "HTTP/1.1", framing: "content_length", connection: "request",
-            head_mode: "reject", server: "s", date: "current", hide_headers: []
+            version: .http11, framing: .contentLength, connection: .request,
+            head_mode: .reject, server: "s", date: .current, hide_headers: []
         },
         failure_policy: {
-            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", head_mode: "reject", body: b"x"
+            version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, head_mode: .reject, body: b"x"
         })
 }
 )rut";
@@ -34031,13 +34129,13 @@ upstream b at "127.0.0.1:9000"
 route GET "/" {
     return forward(b,
         response_policy: {
-            version: "HTTP/1.1", framing: "content_length", connection: "request",
-            server: "s", date: "current", hide_headers: []
+            version: .http11, framing: .contentLength, connection: .request,
+            server: "s", date: .current, hide_headers: []
         },
         failure_policy: {
-            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"x"
+            version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"x"
         })
 }
 )rut";
@@ -34053,11 +34151,11 @@ route GET "/" {
 
 TEST(frontend, public_head_mode_applies_through_nested_control_paths) {
     const char* forward =
-        "return forward(b, response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
-        "connection: \"request\", head_mode: \"suppress_body\", server: \"s\", date: \"current\", "
-        "hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad "
-        "Gateway\", content_type: \"text/plain\", server: \"s\", date: \"current\", connection: "
-        "\"request\", head_mode: \"suppress_body\", body: b\"x\" })";
+        "return forward(b, response_policy: { version: .http11, framing: .contentLength, "
+        "connection: .request, head_mode: .suppressBody, server: \"s\", date: .current, "
+        "hide_headers: [] }, failure_policy: { version: .http11, status: 502, reason: \"Bad "
+        "Gateway\", content_type: \"text/plain\", server: \"s\", date: .current, connection: "
+        ".request, head_mode: .suppressBody, body: b\"x\" })";
     const std::string prefix = "upstream b at \"127.0.0.1:9000\"\n";
     const std::string sources[] = {
         prefix + "route \"/\" { if req.method == GET { " + forward + " } else { return 404 } }\n",
@@ -34096,8 +34194,8 @@ upstream b at "127.0.0.1:9000"
 route GET "/" {
     return forward(b,
         response_policy: {
-            version: "HTTP/1.1", framing: "content_length", connection: "request",
-            head_mode: "reject", server: "s", date: "current", hide_headers: []
+            version: .http11, framing: .contentLength, connection: .request,
+            head_mode: .reject, server: "s", date: .current, hide_headers: []
         })
 }
 )rut";
@@ -34116,9 +34214,9 @@ upstream b at "127.0.0.1:9000"
 route GET "/" {
     return forward(b,
         failure_policy: {
-            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"x"
+            version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"x"
         })
 }
 )rut";
@@ -34147,28 +34245,28 @@ route GET "/" {
 
 TEST(frontend, public_head_mode_parser_rejects_duplicate_unknown_and_invalid_values) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"request\", head_mode: \"bogus\", server: "
-        "\"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", "
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .request, head_mode: .bogus, server: "
+        "\"s\", date: .current, hide_headers: [] }, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"s\", date: "
-        "\"current\", connection: \"request\", head_mode: \"suppress_body\", body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", "
-        "head_mode: \"reject\", server: \"s\", date: \"current\", hide_headers: [] }, "
-        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
-        "content_type: \"text/plain\", server: \"s\", date: \"current\", connection: \"request\", "
-        "head_mode: \"suppress_body\", body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", nope: "
-        "\"x\", server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: "
-        "\"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
-        "\"s\", date: \"current\", connection: \"request\", head_mode: \"suppress_body\", body: "
+        ".current, connection: .request, head_mode: .suppressBody, body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .request, head_mode: .suppressBody, "
+        "head_mode: .reject, server: \"s\", date: .current, hide_headers: [] }, "
+        "failure_policy: { version: .http11, status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: .current, connection: .request, "
+        "head_mode: .suppressBody, body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .request, head_mode: .suppressBody, nope: "
+        "\"x\", server: \"s\", date: .current, hide_headers: [] }, failure_policy: { version: "
+        ".http11, status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
+        "\"s\", date: .current, connection: .request, head_mode: .suppressBody, body: "
         "b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"request\", head_mode: \"suppress_body\", "
-        "server: \"s\", date: \"current\", hide_headers: [] }, failure_policy: { version: "
-        "\"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
-        "\"s\", date: \"current\", connection: \"request\", head_mode: \"bogus\", body: b\"x\" }) "
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .request, head_mode: .suppressBody, "
+        "server: \"s\", date: .current, hide_headers: [] }, failure_policy: { version: "
+        ".http11, status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: "
+        "\"s\", date: .current, connection: .request, head_mode: .bogus, body: b\"x\" }) "
         "}\n",
     };
     for (const char* source : invalid) {
@@ -34196,22 +34294,22 @@ TEST(frontend, public_head_mode_rejects_unpaired_or_unsupported_combinations) {
         bool comma = false;
         if (response) {
             source +=
-                "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
-                "connection: \"";
+                "response_policy: { version: .http11, framing: .contentLength, "
+                "connection: .";
             source += response_connection;
-            source += "\", head_mode: \"";
+            source += ", head_mode: .";
             source += response_mode;
-            source += "\", server: \"s\", date: \"current\", hide_headers: [] }";
+            source += ", server: \"s\", date: .current, hide_headers: [] }";
             comma = true;
         }
         if (failure) {
             if (comma) source += ", ";
             source +=
-                "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
-                "content_type: \"text/plain\", server: \"s\", date: \"current\", connection: "
-                "\"request\", head_mode: \"";
+                "failure_policy: { version: .http11, status: 502, reason: \"Bad Gateway\", "
+                "content_type: \"text/plain\", server: \"s\", date: .current, connection: "
+                ".request, head_mode: .";
             source += failure_mode;
-            source += "\", body: b\"x\" }";
+            source += ", body: b\"x\" }";
             comma = true;
         }
         if (target_transform) {
@@ -34222,12 +34320,12 @@ TEST(frontend, public_head_mode_rejects_unpaired_or_unsupported_combinations) {
         return source;
     };
     const std::string cases[] = {
-        make_source(true, "request", "suppress_body", false, "reject", false),
-        make_source(false, "request", "reject", true, "suppress_body", false),
-        make_source(true, "request", "suppress_body", true, "reject", false),
-        make_source(true, "request", "reject", true, "suppress_body", false),
-        make_source(true, "keep_alive", "suppress_body", true, "suppress_body", false),
-        make_source(true, "request", "suppress_body", true, "suppress_body", true),
+        make_source(true, "request", "suppressBody", false, "reject", false),
+        make_source(false, "request", "reject", true, "suppressBody", false),
+        make_source(true, "request", "suppressBody", true, "reject", false),
+        make_source(true, "request", "reject", true, "suppressBody", false),
+        make_source(true, "keepAlive", "suppressBody", true, "suppressBody", false),
+        make_source(true, "request", "suppressBody", true, "suppressBody", true),
     };
     for (const std::string& source : cases) {
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -34249,13 +34347,13 @@ route "/" {
     if req.method == HEAD && req.pathOnly == "/head" {
         return forward(backend,
             response_policy: {
-                version: "HTTP/1.1", framing: "content_length", connection: "request",
-                head_mode: "suppress_body", server: "s", date: "current", hide_headers: []
+                version: .http11, framing: .contentLength, connection: .request,
+                head_mode: .suppressBody, server: "s", date: .current, hide_headers: []
             },
             failure_policy: {
-                version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-                content_type: "text/plain", server: "s", date: "current",
-                connection: "request", head_mode: "suppress_body", body: b"x"
+                version: .http11, status: 502, reason: "Bad Gateway",
+                content_type: "text/plain", server: "s", date: .current,
+                connection: .request, head_mode: .suppressBody, body: b"x"
             })
     } else {
         return forward(backend)
@@ -34304,12 +34402,12 @@ TEST(frontend, response_policy_rejects_invalid_and_duplicate_connection_fields) 
     };
     static constexpr InvalidCase kCases[] = {
         {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
-         "\"HTTP/1.1\", framing: \"content_length\", connection: \"close\", server: \"nginx\", "
-         "date: \"current\", hide_headers: [] }) }\n",
+         ".http11, framing: .contentLength, connection: .close, server: \"nginx\", "
+         "date: .current, hide_headers: [] }) }\n",
          FrontendError::UnsupportedSyntax},
         {"upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: "
-         "\"HTTP/1.1\", framing: \"content_length\", connection: \"keep_alive\", connection: "
-         "\"request\", server: \"nginx\", date: \"current\", hide_headers: [] }) }\n",
+         ".http11, framing: .contentLength, connection: .keepAlive, connection: "
+         ".request, server: \"nginx\", date: .current, hide_headers: [] }) }\n",
          FrontendError::UnexpectedToken},
     };
     for (const InvalidCase& test : kCases) {
@@ -34334,8 +34432,8 @@ func add_header(_ resp: Response) -> i32 {
 chain access { after add_header(resp) }
 route GET "/" use chain access {
     return forward(backend, response_policy: {
-        version: "HTTP/1.1", framing: "content_length", connection: "keep_alive",
-        server: "nginx", date: "current", hide_headers: ["Date"]
+        version: .http11, framing: .contentLength, connection: .keepAlive,
+        server: "nginx", date: .current, hide_headers: ["Date"]
     })
 }
 )rut";
@@ -34354,25 +34452,25 @@ TEST(frontend, failure_policy_bundle_is_carried_and_route_owned) {
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
     return forward(backend, request_policy: {
-        version: "HTTP/1.1",
-        host: "upstream",
-        connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+        version: .http11,
+        host: .upstream,
+        connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
     }, response_policy: {
-        version: "HTTP/1.1",
-        framing: "content_length",
-        connection: "keep_alive",
+        version: .http11,
+        framing: .contentLength,
+        connection: .keepAlive,
         server: "rut",
-        date: "current",
+        date: .current,
         hide_headers: ["Date", "Server"]
     }, failure_policy: {
-        version: "HTTP/1.1",
+        version: .http11,
         status: 502,
         reason: "Bad Gateway",
         content_type: "text/plain",
         server: "rut",
-        date: "current",
-        connection: "request",
+        date: .current,
+        connection: .request,
         body: b"unavailable"
     })
 }
@@ -34503,42 +34601,42 @@ TEST(frontend, response_buffering_parses_propagates_deduplicates_and_preserves_p
 upstream b at "127.0.0.1:9000"
 route GET "/one" {
     return forward(b,
-        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        request_policy: { version: .http11, host: .upstream, connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
+            date: .current, connection: .request, body: b"slow" },
         response_read_timeout: 1s,
-        response_buffering: "complete_content_length")
+        response_buffering: .completeContentLength)
 }
 route GET "/same" {
     return forward(b,
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
+            date: .current, connection: .request, body: b"slow" },
         response_read_timeout: 1s,
-        response_buffering: "complete_content_length")
+        response_buffering: .completeContentLength)
 }
 route GET "/stream" {
     return forward(b,
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
+            date: .current, connection: .request, body: b"slow" },
         response_read_timeout: 1s)
 }
 )rut";
@@ -34629,13 +34727,16 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
         const char* detail;
     } invalid_syntax[] = {
         {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: 1) }\n",
-         FrontendError::UnexpectedToken,
-         "1"},
-        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: \"stream\") }\n",
          FrontendError::UnsupportedSyntax,
-         "stream"},
+         ".completeContentLength .bounded"},
+        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: .stream) }\n",
+         FrontendError::UnsupportedSyntax,
+         ".completeContentLength .bounded"},
+        {"upstream b\nroute GET \"/\" { return forward(b, response_buffering: \"bounded\") }\n",
+         FrontendError::UnsupportedSyntax,
+         ".completeContentLength .bounded"},
         {"upstream b\nroute GET \"/\" { return forward(b, response_buffering:) }\n",
-         FrontendError::UnexpectedToken,
+         FrontendError::UnsupportedSyntax,
          nullptr},
     };
     for (const auto& test : invalid_syntax) {
@@ -34650,8 +34751,8 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
     }
     const char duplicate[] =
         "upstream b\nroute GET \"/\" { return forward(b, "
-        "response_buffering: \"complete_content_length\", "
-        "response_buffering: \"complete_content_length\") }\n";
+        "response_buffering: .completeContentLength, "
+        "response_buffering: .completeContentLength) }\n";
     auto lexed = lex(lit(duplicate));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -34661,7 +34762,7 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
 
     const char incomplete_bundle[] =
         "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
-        "response_buffering: \"complete_content_length\") }\n";
+        "response_buffering: .completeContentLength) }\n";
     lexed = lex(lit(incomplete_bundle));
     REQUIRE(lexed);
     ast = parse_file_heap(lexed.value());
@@ -34675,18 +34776,18 @@ TEST(frontend, response_buffering_rejects_bad_syntax_static_shapes_and_forgery) 
 upstream b
 route GET "/" {
     return forward(b,
-        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        request_policy: { version: .http11, host: .upstream, connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
+            date: .current, connection: .request, body: b"slow" },
         response_read_timeout: 1s,
-        response_buffering: "complete_content_length")
+        response_buffering: .completeContentLength)
 }
 )rut";
     lexed = lex(lit(valid));
@@ -34841,19 +34942,19 @@ route GET "/" {
 
 TEST(frontend, response_buffering_admits_closed_bodyless_non_head_static_route_method_set) {
     static constexpr const char kRequestPolicy[] =
-        "request_policy: { version: \"HTTP/1.1\", host: \"upstream\", "
-        "connection: \"omit\", strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", "
-        "\"Expect\", \"Upgrade\"] }, ";
+        "request_policy: { version: .http11, host: .upstream, "
+        "connection: .omit, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade] }, ";
     static constexpr const char kPolicies[] =
-        "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
-        "connection: \"request\", server: \"s\", date: \"current\", hide_headers: [] }, "
-        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
-        "content_type: \"text/plain\", server: \"s\", date: \"current\", "
-        "connection: \"request\", body: b\"bad\" }, "
-        "timeout_failure_policy: { version: \"HTTP/1.1\", status: 504, "
+        "response_policy: { version: .http11, framing: .contentLength, "
+        "connection: .request, server: \"s\", date: .current, hide_headers: [] }, "
+        "failure_policy: { version: .http11, status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: .current, "
+        "connection: .request, body: b\"bad\" }, "
+        "timeout_failure_policy: { version: .http11, status: 504, "
         "reason: \"Gateway Time-out\", content_type: \"text/plain\", server: \"s\", "
-        "date: \"current\", connection: \"request\", body: b\"slow\" }, "
-        "response_read_timeout: 1s, response_buffering: \"complete_content_length\") }\n";
+        "date: .current, connection: .request, body: b\"slow\" }, "
+        "response_read_timeout: 1s, response_buffering: .completeContentLength) }\n";
     struct MethodCase {
         const char* source_method;
         u8 route_method;
@@ -34911,22 +35012,22 @@ route GET "/same" { return forward(b, response_read_timeout: 1000ms) }
 route GET "/different" { return forward(b, response_read_timeout: 2s) }
 route GET "/response" {
     return forward(b, response_policy: {
-        version: "HTTP/1.1", framing: "content_length", connection: "request",
-        server: "s", date: "current", hide_headers: []
+        version: .http11, framing: .contentLength, connection: .request,
+        server: "s", date: .current, hide_headers: []
     }, response_read_timeout: 2s)
 }
 route GET "/triple" {
     return forward(b, response_policy: {
-        version: "HTTP/1.1", framing: "content_length", connection: "request",
-        server: "s", date: "current", hide_headers: []
+        version: .http11, framing: .contentLength, connection: .request,
+        server: "s", date: .current, hide_headers: []
     }, failure_policy: {
-        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/plain", server: "s", date: "current",
-        connection: "request", body: b"bad"
+        version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "s", date: .current,
+        connection: .request, body: b"bad"
     }, timeout_failure_policy: {
-        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
-        content_type: "text/plain", server: "s", date: "current",
-        connection: "request", body: b"slow"
+        version: .http11, status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "s", date: .current,
+        connection: .request, body: b"slow"
     }, response_read_timeout: 3s)
 }
 )rut";
@@ -35193,30 +35294,30 @@ TEST(frontend, timeout_failure_policy_is_carried_as_a_deduplicated_triple_bundle
 upstream backend at "127.0.0.1:9000"
 route GET "/one" {
     return forward(backend, response_policy: {
-        version: "HTTP/1.1", framing: "content_length", connection: "request",
-        head_mode: "suppress_body", server: "rut", date: "current", hide_headers: []
+        version: .http11, framing: .contentLength, connection: .request,
+        head_mode: .suppressBody, server: "rut", date: .current, hide_headers: []
     }, failure_policy: {
-        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/plain", server: "rut", date: "current",
-        connection: "request", head_mode: "suppress_body", body: b"bad"
+        version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: .current,
+        connection: .request, head_mode: .suppressBody, body: b"bad"
     }, timeout_failure_policy: {
-        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
-        content_type: "text/plain", server: "rut", date: "current",
-        connection: "request", head_mode: "suppress_body", body: b"slow"
+        version: .http11, status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "rut", date: .current,
+        connection: .request, head_mode: .suppressBody, body: b"slow"
     })
 }
 route GET "/two" {
     return forward(backend, response_policy: {
-        version: "HTTP/1.1", framing: "content_length", connection: "request",
-        head_mode: "suppress_body", server: "rut", date: "current", hide_headers: []
+        version: .http11, framing: .contentLength, connection: .request,
+        head_mode: .suppressBody, server: "rut", date: .current, hide_headers: []
     }, failure_policy: {
-        version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/plain", server: "rut", date: "current",
-        connection: "request", head_mode: "suppress_body", body: b"bad"
+        version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: .current,
+        connection: .request, head_mode: .suppressBody, body: b"bad"
     }, timeout_failure_policy: {
-        version: "HTTP/1.1", status: 504, reason: "Gateway Time-out",
-        content_type: "text/plain", server: "rut", date: "current",
-        connection: "request", head_mode: "suppress_body", body: b"slow"
+        version: .http11, status: 504, reason: "Gateway Time-out",
+        content_type: "text/plain", server: "rut", date: .current,
+        connection: .request, head_mode: .suppressBody, body: b"slow"
     })
 }
 )rut";
@@ -35252,28 +35353,28 @@ route GET "/two" {
 
 TEST(frontend, timeout_failure_policy_rejects_missing_peers_duplicate_status_and_head_mismatch) {
     const char* response =
-        "response_policy: { version: \"HTTP/1.1\", framing: \"content_length\", "
-        "connection: \"request\", head_mode: \"suppress_body\", server: \"s\", "
-        "date: \"current\", hide_headers: [] }";
+        "response_policy: { version: .http11, framing: .contentLength, "
+        "connection: .request, head_mode: .suppressBody, server: \"s\", "
+        "date: .current, hide_headers: [] }";
     const char* failure =
-        "failure_policy: { version: \"HTTP/1.1\", status: 502, reason: \"Bad Gateway\", "
-        "content_type: \"text/plain\", server: \"s\", date: \"current\", "
-        "connection: \"request\", head_mode: \"suppress_body\", body: b\"bad\" }";
+        "failure_policy: { version: .http11, status: 502, reason: \"Bad Gateway\", "
+        "content_type: \"text/plain\", server: \"s\", date: .current, "
+        "connection: .request, head_mode: .suppressBody, body: b\"bad\" }";
     auto timeout = [](u32 status, const char* head) {
-        return std::string("timeout_failure_policy: { version: \"HTTP/1.1\", status: ") +
+        return std::string("timeout_failure_policy: { version: .http11, status: ") +
                std::to_string(status) +
                ", reason: \"Gateway Time-out\", content_type: \"text/plain\", "
-               "server: \"s\", date: \"current\", connection: \"request\", head_mode: \"" +
-               head + "\", body: b\"slow\" }";
+               "server: \"s\", date: .current, connection: .request, head_mode: ." +
+               head + ", body: b\"slow\" }";
     };
     const std::string prefix = "upstream b\nroute GET \"/\" { return forward(b, ";
     const std::string suffix = ") }\n";
-    const std::string valid_timeout = timeout(504, "suppress_body");
+    const std::string valid_timeout = timeout(504, "suppressBody");
     const std::string invalid[] = {
         prefix + valid_timeout + suffix,
         prefix + response + ", " + valid_timeout + suffix,
-        prefix + response + ", " + failure + ", " + timeout(399, "suppress_body") + suffix,
-        prefix + response + ", " + failure + ", " + timeout(600, "suppress_body") + suffix,
+        prefix + response + ", " + failure + ", " + timeout(399, "suppressBody") + suffix,
+        prefix + response + ", " + failure + ", " + timeout(600, "suppressBody") + suffix,
         prefix + response + ", " + failure + ", " + timeout(504, "reject") + suffix,
         prefix + response + ", " + failure + ", " + valid_timeout + ", " + valid_timeout + suffix,
     };
@@ -35288,38 +35389,38 @@ TEST(frontend, timeout_failure_policy_rejects_missing_peers_duplicate_status_and
 
 TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     const char* invalid[] = {
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
-        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 500, "
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
+        ".current, hide_headers: [] }, failure_policy: { version: .http11, status: 500, "
         "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
-        "\"current\", connection: \"request\", body: b\"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
-        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        ".current, connection: .request, body: b\"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
+        ".current, hide_headers: [] }, failure_policy: { version: .http11, status: 502, "
         "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
-        "\"current\", connection: \"request\", body: b\"x\", nope: \"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
-        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        ".current, connection: .request, body: b\"x\", nope: \"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
+        ".current, hide_headers: [] }, failure_policy: { version: .http11, status: 502, "
         "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
-        "\"current\", connection: \"request\", body: b\"x\", body: b\"y\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: \"HTTP/1.1\", "
-        "framing: \"content_length\", connection: \"keep_alive\", server: \"nginx\", date: "
-        "\"current\", hide_headers: [] }, failure_policy: { version: \"HTTP/1.1\", status: 502, "
+        ".current, connection: .request, body: b\"x\", body: b\"y\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, response_policy: { version: .http11, "
+        "framing: .contentLength, connection: .keepAlive, server: \"nginx\", date: "
+        ".current, hide_headers: [] }, failure_policy: { version: .http11, status: 502, "
         "reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", date: "
-        "\"current\", connection: \"request\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        ".current, connection: .request }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: \"x\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "date: .current, connection: .request, body: \"x\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"\\q\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "date: .current, connection: .request, body: b\"\\q\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"\\x0\" }) }\n",
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "date: .current, connection: .request, body: b\"\\x0\" }) }\n",
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"\\xGG\" }) }\n",
+        "date: .current, connection: .request, body: b\"\\xGG\" }) }\n",
     };
     for (const char* src : invalid) {
         auto lexed = lex(lit(src));
@@ -35328,9 +35429,9 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
         CHECK_FALSE(ast.has_value());
     }
     const char* independent =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"x\" }) }\n";
+        "date: .current, connection: .request, body: b\"x\" }) }\n";
     auto independent_lexed = lex(lit(independent));
     REQUIRE(independent_lexed);
     auto independent_ast = parse_file_heap(independent_lexed.value());
@@ -35340,9 +35441,9 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK_EQ(independent_ast->failure_policies[0].head_mode, FailurePolicyHeadMode::Reject);
 
     const char* bytes =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"\\x00\\n\\xff\" }) }\n";
+        "date: .current, connection: .request, body: b\"\\x00\\n\\xff\" }) }\n";
     auto bytes_lexed = lex(lit(bytes));
     REQUIRE(bytes_lexed);
     auto bytes_ast = parse_file_heap(bytes_lexed.value());
@@ -35353,9 +35454,9 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK(static_cast<u8>(bytes_ast->failure_policies[0].body.ptr[2]) == 0xff);
 
     const char* empty =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"\" }) }\n";
+        "date: .current, connection: .request, body: b\"\" }) }\n";
     auto empty_lexed = lex(lit(empty));
     REQUIRE(empty_lexed);
     auto empty_ast = parse_file_heap(empty_lexed.value());
@@ -35366,9 +35467,9 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
     CHECK_EQ(empty_copy->failure_policies[0].body.len, 0u);
 
     std::string oversized =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"";
+        "date: .current, connection: .request, body: b\"";
     oversized.append(kMaxFailurePolicyBodyLen + 1, 'x');
     oversized += "\" }) }\n";
     auto oversized_lexed = lex({oversized.data(), static_cast<u32>(oversized.size())});
@@ -35399,9 +35500,9 @@ TEST(frontend, failure_policy_rejects_invalid_fields_and_caps) {
 
 TEST(frontend, failure_policy_byte_body_reaches_rir_and_keeps_nul_lf) {
     const char* src =
-        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: \"HTTP/1.1\", "
+        "upstream b\nroute GET \"/\" { return forward(b, failure_policy: { version: .http11, "
         "status: 502, reason: \"Bad Gateway\", content_type: \"text/plain\", server: \"nginx\", "
-        "date: \"current\", connection: \"request\", body: b\"A\\x00\\nB\" }) }\n";
+        "date: .current, connection: .request, body: b\"A\\x00\\nB\" }) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -35523,17 +35624,17 @@ route GET "/api" {
     return forward(backend,
         target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
         request_policy: {
-            version: "HTTP/1.1", host: "upstream", connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"]
+            version: .http11, host: .upstream, connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
         },
         response_policy: {
-            version: "HTTP/1.1", framing: "content_length", connection: "keep_alive",
-            server: "rut", date: "current", hide_headers: []
+            version: .http11, framing: .contentLength, connection: .keepAlive,
+            server: "rut", date: .current, hide_headers: []
         },
         failure_policy: {
-            version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "rut", date: "current",
-            connection: "request", body: b"unavailable"
+            version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "rut", date: .current,
+            connection: .request, body: b"unavailable"
         })
 }
 )rut";
@@ -35817,20 +35918,20 @@ TEST(frontend, target_transform_precedes_forward_bundle_and_preserves_operands) 
 upstream backend at "127.0.0.1:9000"
 route GET "/api" {
     return forward(backend, response_policy: {
-        version: "HTTP/1.1",
-        framing: "content_length",
-        connection: "keep_alive",
+        version: .http11,
+        framing: .contentLength,
+        connection: .keepAlive,
         server: "rut",
-        date: "current",
+        date: .current,
         hide_headers: []
     }, failure_policy: {
-        version: "HTTP/1.1",
+        version: .http11,
         status: 502,
         reason: "Bad Gateway",
         content_type: "text/plain",
         server: "rut",
-        date: "current",
-        connection: "request",
+        date: .current,
+        connection: .request,
         body: b"unavailable"
     })
 }
@@ -36083,16 +36184,16 @@ TEST(frontend, inline_redirect_source_reaches_rir_and_owned_config) {
         "upstream backend at \"127.0.0.1:9000\"\n"
         "route GET \"/api\" {\n"
         "  return redirect({"
-        "scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", "
-        "path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "scheme: .http, authority: .requestHost, port: .actualListener, "
+        "path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", "
         "server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: \"/api/\", "
         "body: b\"OK\\n\\x00\"})\n"
         "}\n"
         "route POST \"/other\" { return redirect({"
-        "scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", "
-        "path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "scheme: .http, authority: .requestHost, port: .actualListener, "
+        "path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", "
         "server: \"nginx/1.29.7\", content_type: \"text/html\", target_path: \"/api/\", "
         "body: b\"OK\\n\\x00\"})\n"
         "}\n";
@@ -36149,10 +36250,10 @@ TEST(frontend, fixed_redirect_source_is_complete_and_reaches_rir) {
     const char source[] =
         "route GET \"/old\" { return redirect({"
         "body: b\"fixed\", target_path: \"/new\", content_type: \"text/html\", status: 301, "
-        "header_order: \"connection_then_location\", query: \"discard\", scheme: \"http\", "
-        "server: \"nginx/1.29.7\", port: \"omit\", reason: \"Moved Permanently\", "
-        "connection: \"close\", static_authority: \"redirect.example\", date: \"current\", "
-        "path: \"static\", authority: \"static\"}) }\n";
+        "header_order: .connectionThenLocation, query: .discard, scheme: .http, "
+        "server: \"nginx/1.29.7\", port: .omit, reason: \"Moved Permanently\", "
+        "connection: .close, static_authority: \"redirect.example\", date: .current, "
+        "path: .static, authority: .static}) }\n";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -36189,10 +36290,10 @@ TEST(frontend, build_mir_releases_provisional_module_on_post_allocation_errors) 
         "  let observed = req.path\n"
         "  return redirect({"
         "body: b\"fixed\", target_path: \"/new\", content_type: \"text/html\", status: 301, "
-        "header_order: \"connection_then_location\", query: \"discard\", scheme: \"http\", "
-        "server: \"nginx/1.29.7\", port: \"omit\", reason: \"Moved Permanently\", "
-        "connection: \"close\", static_authority: \"redirect.example\", date: \"current\", "
-        "path: \"static\", authority: \"static\"})\n"
+        "header_order: .connectionThenLocation, query: .discard, scheme: .http, "
+        "server: \"nginx/1.29.7\", port: .omit, reason: \"Moved Permanently\", "
+        "connection: .close, static_authority: \"redirect.example\", date: .current, "
+        "path: .static, authority: .static})\n"
         "}\n";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
@@ -36249,10 +36350,10 @@ TEST(frontend, fixed_302_redirect_crosses_all_frontend_boundaries_and_forgery_fa
 upstream backend at "127.0.0.1:9000"
 route GET "/" {
   if req.pathOnly == "/old" {
-    return redirect({scheme: "http", authority: "static",
-      static_authority: "redirect.example", port: "omit", path: "static",
-      query: "discard", date: "current", connection: "close",
-      header_order: "connection_then_location", status: 302,
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close,
+      header_order: .connectionThenLocation, status: 302,
       reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
       target_path: "/new", body: b"fixed-302"})
   } else { return forward(backend) }
@@ -36342,71 +36443,71 @@ route GET "/" {
 
 TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
     const char* sources[] = {
-        "route GET \"/\" { return redirect({scheme: \"http\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"https\", authority: \"request_host\", port: "
-        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http}) }",
+        "route GET \"/\" { return redirect({scheme: .https, authority: .requestHost, port: "
+        ".actualListener, path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", scheme: \"http\", authority: "
-        "\"request_host\", port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", "
-        "date: \"current\", connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "route GET \"/\" { return redirect({scheme: .http, scheme: .http, authority: "
+        ".requestHost, port: .actualListener, path: .static, query: .preserveRaw, "
+        "date: .current, connection: .close, status: 301, reason: \"Moved Permanently\", "
         "server: \"s\", content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
-        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 200, reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, port: "
+        ".actualListener, path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 200, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
-        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, port: "
+        ".actualListener, path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\", extra: 1}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
-        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: \"301\", reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, port: "
+        ".actualListener, path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: \"301\", reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
-        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, port: "
+        ".actualListener, path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x?y=1\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", port: "
-        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, port: "
+        ".actualListener, path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\\xZZ\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", port: "
-        "\"actual_listener\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .static, port: "
+        ".actualListener, path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
-        "port: \"omit\", path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, "
+        "port: .omit, path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
-        "port: \"actual_listener\", path: \"static\", query: \"discard\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, "
+        "port: .actualListener, path: .static, query: .discard, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
-        "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: "
-        "\"current\", connection: \"close\", header_order: \"connection_then_location\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, "
+        "port: .actualListener, path: .static, query: .preserveRaw, date: "
+        ".current, connection: .close, header_order: .connectionThenLocation, "
         "status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: "
         "\"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
-        "static_authority: \"redirect.example\", port: \"omit\", path: \"static\", "
-        "query: \"discard\", date: \"current\", connection: \"close\", status: 301, "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .static, "
+        "static_authority: \"redirect.example\", port: .omit, path: .static, "
+        "query: .discard, date: .current, connection: .close, status: 301, "
         "reason: \"Moved Permanently\", server: \"s\", content_type: \"text/html\", "
         "target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
-        "static_authority: \"redirect.example\", port: \"omit\", path: \"static\", "
-        "query: \"discard\", date: \"current\", connection: \"close\", header_order: "
-        "\"connection_then_location\", status: 303, reason: \"See Other\", server: \"s\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .static, "
+        "static_authority: \"redirect.example\", port: .omit, path: .static, "
+        "query: .discard, date: .current, connection: .close, header_order: "
+        ".connectionThenLocation, status: 303, reason: \"See Other\", server: \"s\", "
         "content_type: \"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"request_host\", "
-        "port: \"actual_listener\", path: \"static\", query: \"preserve_raw\", date: "
-        "\"current\", connection: \"close\", header_order: \"location_then_connection\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .requestHost, "
+        "port: .actualListener, path: .static, query: .preserveRaw, date: "
+        ".current, connection: .close, header_order: .locationThenConnection, "
         "status: 301, reason: \"Moved Permanently\", server: \"s\", content_type: "
         "\"text/html\", target_path: \"/x\", body: b\"\"}) }",
-        "route GET \"/\" { return redirect({scheme: \"http\", authority: \"static\", "
+        "route GET \"/\" { return redirect({scheme: .http, authority: .static, "
         "static_authority: \"redirect.example\", static_authority: \"other.example\", port: "
-        "\"omit\", path: \"static\", query: \"discard\", date: \"current\", connection: "
-        "\"close\", header_order: \"connection_then_location\", status: 301, reason: "
+        ".omit, path: .static, query: .discard, date: .current, connection: "
+        ".close, header_order: .connectionThenLocation, status: 301, reason: "
         "\"Moved Permanently\", server: \"s\", content_type: \"text/html\", target_path: "
         "\"/x\", body: b\"\"}) }",
     };
@@ -36420,9 +36521,9 @@ TEST(frontend, inline_redirect_rejects_invalid_shape_and_duplicate_fields) {
 
 TEST(frontend, inline_redirect_duplicate_policy_is_transactional_and_stable) {
     const char source[] = R"rut(
-route GET "/a" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"same"}) }
-route GET "/b" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"same"}) }
-route GET "/c" { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"unique"}) }
+route GET "/a" { return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"same"}) }
+route GET "/b" { return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"same"}) }
+route GET "/c" { return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/api/", body: b"unique"}) }
 )rut";
     auto lexed = lex(lit(source));
     REQUIRE(lexed);
@@ -36442,19 +36543,19 @@ TEST(frontend, inline_redirect_chain_after_rejects_selected_control_paths) {
         R"rut(
 func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after after_headers(resp) }
-route "/" use chain access { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) }
+route "/" use chain access { return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) }
 )rut",
         R"rut(
 upstream b at "127.0.0.1:9000"
 func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after after_headers(resp) }
-route "/" use chain access { if req.method == GET { return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) } else { return forward(b) } }
+route "/" use chain access { if req.method == GET { return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) } else { return forward(b) } }
 )rut",
         R"rut(
 upstream b at "127.0.0.1:9000"
 func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after after_headers(resp) }
-route "/" use chain access { match req.method { GET => return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) _ => return forward(b) } }
+route "/" use chain access { match req.method { GET => return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""}) _ => return forward(b) } }
 )rut",
     };
     for (const char* source : sources) {
@@ -36473,7 +36574,7 @@ func after_headers(_ resp: Response) -> i32 { resp.set("X-Test", "v") 0 }
 chain access { after after_headers(resp) }
 route "/" use chain access {
     guard req.http11 else {
-        return redirect({scheme: "http", authority: "request_host", port: "actual_listener", path: "static", query: "preserve_raw", date: "current", connection: "close", status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""})
+        return redirect({scheme: .http, authority: .requestHost, port: .actualListener, path: .static, query: .preserveRaw, date: .current, connection: .close, status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html", target_path: "/x", body: b""})
     }
     return forward(b)
 }
@@ -36529,19 +36630,19 @@ TEST(frontend, inline_redirect_supports_method_omitted_terminal_if_with_forward_
 upstream backend at "127.0.0.1:9000"
 route "/" {
   if req.method == GET && req.pathOnly == "/api" {
-    return redirect({scheme: "http", authority: "request_host", port: "actual_listener",
-      path: "static", query: "preserve_raw", date: "current", connection: "close",
+    return redirect({scheme: .http, authority: .requestHost, port: .actualListener,
+      path: .static, query: .preserveRaw, date: .current, connection: .close,
       status: 301, reason: "Moved Permanently", server: "s", content_type: "text/html",
       target_path: "/api/", body: b"redirect"})
   } else {
     return forward(backend,
       target_transform: { strip_prefix: "/api/", replace_prefix: "/" },
-      request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-        strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-      response_policy: { version: "HTTP/1.1", framing: "content_length",
-        connection: "keep_alive", server: "s", date: "current", hide_headers: [] },
-      failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-        content_type: "text/plain", server: "s", date: "current", connection: "request",
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .keepAlive, server: "s", date: .current, hide_headers: [] },
+      failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "s", date: .current, connection: .request,
         body: b"unavailable" })
   }
 }
@@ -36621,24 +36722,24 @@ route "/" {
 TEST(frontend, unmatched_local_response_metadata_reaches_rir_with_canonical_ids) {
     const char source[] = R"rut(
 unmatched OPTIONS { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"options"
+  version: .http11, status: 400, reason: "Bad Request", server: "rut",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"options"
 }) }
 unmatched CONNECT { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"connect"
+  version: .http11, status: 405, reason: "Not Allowed", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"connect"
 }) }
 unmatched TRACE { return local_response({
-  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"trace"
+  version: .http11, status: 403, reason: "Forbidden", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"trace"
 }) }
 unmatched { return local_response({
-  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"A\x00\nB"
+  version: .http11, status: 404, reason: "Not Found", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"A\x00\nB"
 }) }
 )rut";
     auto lexed = lex(lit(source));
@@ -36721,14 +36822,14 @@ unmatched { return local_response({
 TEST(frontend, exact_local_response_metadata_is_lossless_without_executable_routes) {
     static constexpr char kSource[] = R"rut(
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 route exact GET "/health" { return local_response({
-  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"missing"
+  version: .http11, status: 404, reason: "Not Found", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"missing"
 }) }
 )rut";
     auto lexed = lex(lit(kSource));
@@ -36830,24 +36931,24 @@ TEST(frontend, slash_normalized_exact_metadata_is_owned_lossless_and_view_distin
     {
         std::string source = R"rut(
 route exact GET "/health/check" { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Raw Get", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"raw-get"
+  version: .http11, status: 400, reason: "Raw Get", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"raw-get"
 }) }
 route exact slash_normalized GET "/health/check" { return local_response({
-  version: "HTTP/1.1", status: 401, reason: "Normalized Get", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"normalized-get"
+  version: .http11, status: 401, reason: "Normalized Get", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"normalized-get"
 }) }
 route exact "/health/check" { return local_response({
-  version: "HTTP/1.1", status: 402, reason: "Raw Any", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"raw-any"
+  version: .http11, status: 402, reason: "Raw Any", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"raw-any"
 }) }
 route exact slash_normalized "/health/check" { return local_response({
-  version: "HTTP/1.1", status: 403, reason: "Normalized Any", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"normalized-any"
+  version: .http11, status: 403, reason: "Normalized Any", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"normalized-any"
 }) }
 )rut";
         auto lexed = lex({source.data(), static_cast<u32>(source.size())});
@@ -36935,9 +37036,9 @@ TEST(frontend, exact_local_response_accepts_the_62_byte_path_boundary_losslessly
     REQUIRE_EQ(path.size(), static_cast<std::size_t>(kMaxExactStrictLocalResponsePathLen));
     const std::string source =
         "route exact GET \"" + path +
-        "\" { return local_response({ version: \"HTTP/1.1\", status: 400, "
-        "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
-        "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+        "\" { return local_response({ version: .http11, status: 400, "
+        "reason: \"Bad Request\", server: \"rut\", date: .current, "
+        "content_type: \"text/plain\", connection: .request, head_mode: .reject, "
         "body: b\"boundary\" }) }\n";
     auto lexed = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(lexed);
@@ -36985,19 +37086,19 @@ TEST(frontend, exact_local_response_accepts_the_62_byte_path_boundary_losslessly
 TEST(frontend, exact_and_unmatched_source_tables_coexist_with_same_path_any_and_get) {
     static constexpr char kSource[] = R"rut(
 unmatched OPTIONS { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"unmatched"
+  version: .http11, status: 400, reason: "Bad Request", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"unmatched"
 }) }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"any"
+  version: .http11, status: 403, reason: "Forbidden", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"any"
 }) }
 route exact GET "/static" { return local_response({
-  version: "HTTP/1.1", status: 404, reason: "Not Found", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"get"
+  version: .http11, status: 404, reason: "Not Found", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"get"
 }) }
 )rut";
     auto lexed = lex(lit(kSource));
@@ -37047,12 +37148,12 @@ route exact GET "/static" { return local_response({
 }
 
 TEST(frontend, exact_local_response_syntax_and_selector_rejection_matrix) {
-    auto source_for = [](const std::string& selector, const char* head_mode = "suppress_body") {
+    auto source_for = [](const std::string& selector, const char* head_mode = "suppressBody") {
         return "route exact " + selector +
-               " { return local_response({ version: \"HTTP/1.1\", status: 400, "
-               "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
-               "content_type: \"text/plain\", connection: \"request\", head_mode: \"" +
-               head_mode + "\", body: b\"x\" }) }\n";
+               " { return local_response({ version: .http11, status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: .current, "
+               "content_type: \"text/plain\", connection: .request, head_mode: ." +
+               head_mode + ", body: b\"x\" }) }\n";
     };
     const std::string too_long = "/" + std::string(kMaxExactStrictLocalResponsePathLen, 'x');
     const std::string invalid_selectors[] = {
@@ -37153,9 +37254,9 @@ TEST(frontend, exact_local_response_syntax_and_selector_rejection_matrix) {
     std::string capacity;
     auto capacity_source_for = [](u32 i) {
         return "route exact slash_normalized GET \"/n" + std::to_string(i) +
-               "\" { return local_response({ version: \"HTTP/1.1\" status: 400 "
-               "reason: \"Bad\" server: \"rut\" date: \"current\" content_type: \"x\" "
-               "connection: \"request\" head_mode: \"reject\" body: b\"x\" }) }\n";
+               "\" { return local_response({ version: .http11 status: 400 "
+               "reason: \"Bad\" server: \"rut\" date: .current content_type: \"x\" "
+               "connection: .request head_mode: .reject body: b\"x\" }) }\n";
     };
     for (u32 i = 0; i < kMaxExactStrictLocalResponseBindings; i++)
         capacity += capacity_source_for(i);
@@ -37182,9 +37283,9 @@ TEST(frontend, strict_local_response_representation200_profile_is_exact_and_reac
 
     static constexpr char kSource[] = R"rut(
 unmatched { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 )rut";
     auto lexed = lex(lit(kSource));
@@ -37403,9 +37504,9 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
         &no_content, 1, pre_route_policy_ids, unmatched_policy_ids, exact_bindings, 0));
 
     const char public_204[] = R"rut(route exact GET "/static" { return local_response({
-      version: "HTTP/1.1", status: 204, reason: "No Content", server: "nginx/1.29.7",
-      date: "current", content_type: "", connection: "request",
-      head_mode: "suppress_body", body: b""
+      version: .http11, status: 204, reason: "No Content", server: "nginx/1.29.7",
+      date: .current, content_type: "", connection: .request,
+      head_mode: .suppressBody, body: b""
     }) })rut";
     auto public_204_lexed = lex(lit(public_204));
     REQUIRE(public_204_lexed);
@@ -37436,9 +37537,9 @@ TEST(frontend, strict_local_response_no_content_profile_contract_is_complete_and
 
 TEST(frontend, strict_local_response_no_content_public_source_reaches_normal_owned_rir) {
     std::string source = R"rut(route exact GET "/static" { return local_response({
-  version: "HTTP/1.1", status: 204, reason: "No Content", server: "nginx/1.29.7",
-  date: "current", content_type: "", connection: "request",
-  head_mode: "suppress_body", body: b""
+  version: .http11, status: 204, reason: "No Content", server: "nginx/1.29.7",
+  date: .current, content_type: "", connection: .request,
+  head_mode: .suppressBody, body: b""
 }) })rut";
     auto lexed = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(lexed);
@@ -37483,9 +37584,9 @@ TEST(frontend, strict_local_response_no_content_public_source_reaches_normal_own
 
 TEST(frontend, strict_local_response_no_content_public_source_rejects_neighbors_and_mutations) {
     const std::string base =
-        "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
-        "status: 204, reason: \"No Content\", server: \"nginx/1.29.7\", date: \"current\", "
-        "content_type: \"\", connection: \"request\", head_mode: \"suppress_body\", "
+        "route exact GET \"/static\" { return local_response({ version: .http11, "
+        "status: 204, reason: \"No Content\", server: \"nginx/1.29.7\", date: .current, "
+        "content_type: \"\", connection: .request, head_mode: .suppressBody, "
         "body: b\"\" }) }";
     auto replace_once = [&](std::string value, const std::string& from, const std::string& to) {
         const auto pos = value.find(from);
@@ -37511,11 +37612,11 @@ TEST(frontend, strict_local_response_no_content_public_source_rejects_neighbors_
         replace_once(base, "reason: \"No Content\"", "reason: \"Not Content\""),
         replace_once(base, "reason: \"No Content\", ", ""),
         replace_once(base, "server: \"nginx/1.29.7\"", "server: \"\""),
-        replace_once(base, "HTTP/1.1", "HTTP/1.0"),
-        replace_once(base, "date: \"current\"", "date: \"static\""),
+        replace_once(base, ".http11", ".http10"),
+        replace_once(base, "date: .current", "date: .static"),
         replace_once(base, "content_type: \"\"", "content_type: \"text/plain\""),
-        replace_once(base, "connection: \"request\"", "connection: \"close\""),
-        replace_once(base, "head_mode: \"suppress_body\"", "head_mode: \"reject\""),
+        replace_once(base, "connection: .request", "connection: .close"),
+        replace_once(base, "head_mode: .suppressBody", "head_mode: .reject"),
         replace_once(base, "body: b\"\"", "body: b\"x\""),
     };
     for (const auto& mutation : mutations)
@@ -37687,20 +37788,20 @@ TEST(frontend, strict_local_response_representation200_rejection_matrix_is_centr
     const u16 invalid_statuses[] = {199, 201, 204, 205, 206, 304};
     for (const u16 status : invalid_statuses) {
         const std::string source =
-            "unmatched { return local_response({ version: \"HTTP/1.1\", status: " +
+            "unmatched { return local_response({ version: .http11, status: " +
             std::to_string(status) +
-            ", reason: \"OK\", server: \"nginx/1.29.7\", date: \"current\", "
-            "content_type: \"text/plain\", connection: \"request\", "
-            "head_mode: \"suppress_body\", body: b\"successor-static\" }) }\n";
+            ", reason: \"OK\", server: \"nginx/1.29.7\", date: .current, "
+            "content_type: \"text/plain\", connection: .request, "
+            "head_mode: .suppressBody, body: b\"successor-static\" }) }\n";
         auto invalid_lexed = lex({source.data(), static_cast<u32>(source.size())});
         REQUIRE(invalid_lexed);
         CHECK_FALSE(parse_file_heap(invalid_lexed.value()).has_value());
     }
 
     const std::string valid_source =
-        "unmatched { return local_response({ version: \"HTTP/1.1\", status: 200, "
-        "reason: \"OK\", server: \"nginx/1.29.7\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"suppress_body\", "
+        "unmatched { return local_response({ version: .http11, status: 200, "
+        "reason: \"OK\", server: \"nginx/1.29.7\", date: .current, content_type: "
+        "\"text/plain\", connection: .request, head_mode: .suppressBody, "
         "body: b\"successor-static\" }) }\n";
     auto replace_once = [&](std::string value, const char* from, const std::string& to) {
         const auto pos = value.find(from);
@@ -37713,7 +37814,7 @@ TEST(frontend, strict_local_response_representation200_rejection_matrix_is_centr
     const std::string invalid_profiles[] = {
         replace_once(valid_source, "reason: \"OK\"", "reason: \"Created\""),
         replace_once(valid_source, "content_type: \"text/plain\"", "content_type: \"text/html\""),
-        replace_once(valid_source, "head_mode: \"suppress_body\"", "head_mode: \"reject\""),
+        replace_once(valid_source, "head_mode: .suppressBody", "head_mode: .reject"),
         replace_once(valid_source, "body: b\"successor-static\"", "body: b\"\""),
         replace_once(valid_source,
                      "body: b\"successor-static\"",
@@ -37730,9 +37831,9 @@ TEST(frontend, strict_local_response_representation200_rejection_matrix_is_centr
         aggregate += "unmatched ";
         aggregate += method;
         aggregate +=
-            " { return local_response({ version: \"HTTP/1.1\", status: 200, reason: \"OK\", "
-            "server: \"nginx/1.29.7\", date: \"current\", content_type: \"text/plain\", "
-            "connection: \"request\", head_mode: \"suppress_body\", body: b\"";
+            " { return local_response({ version: .http11, status: 200, reason: \"OK\", "
+            "server: \"nginx/1.29.7\", date: .current, content_type: \"text/plain\", "
+            "connection: .request, head_mode: .suppressBody, body: b\"";
         aggregate.append(4080, method[0]);
         aggregate += "\" }) }\n";
     }
@@ -37741,9 +37842,9 @@ TEST(frontend, strict_local_response_representation200_rejection_matrix_is_centr
     CHECK_FALSE(parse_file_heap(aggregate_lexed.value()).has_value());
 
     const char malformed_escape[] = R"rut(unmatched { return local_response({
-      version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-      date: "current", content_type: "text/plain", connection: "request",
-      head_mode: "suppress_body", body: b"bad\q"
+      version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+      date: .current, content_type: "text/plain", connection: .request,
+      head_mode: .suppressBody, body: b"bad\q"
     }) })rut";
     auto malformed_lexed = lex(lit(malformed_escape));
     REQUIRE(malformed_lexed);
@@ -37753,14 +37854,14 @@ TEST(frontend, strict_local_response_representation200_rejection_matrix_is_centr
 TEST(frontend, strict_local_response_ast_copy_move_owns_nonempty_and_empty_bodies) {
     const char source[] = R"rut(
 unmatched OPTIONS { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"A\x00B"
+  version: .http11, status: 400, reason: "Bad Request", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"A\x00B"
 }) }
 unmatched CONNECT { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b""
+  version: .http11, status: 405, reason: "Not Allowed", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b""
 }) }
 )rut";
     auto lexed = lex(lit(source));
@@ -37807,9 +37908,9 @@ unmatched CONNECT { return local_response({
 
 TEST(frontend, strict_local_response_body_parse_failures_are_transactional) {
     const char source[] = R"rut(unmatched OPTIONS { return local_response({
-      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-      date: "current", content_type: "text/plain", connection: "request",
-      head_mode: "reject", body: b"ok"
+      version: .http11, status: 400, reason: "Bad Request", server: "rut",
+      date: .current, content_type: "text/plain", connection: .request,
+      head_mode: .reject, body: b"ok"
     }) })rut";
     auto lexed_result = lex(lit(source));
     REQUIRE(lexed_result);
@@ -37863,9 +37964,9 @@ TEST(frontend, strict_local_response_body_parse_failures_are_transactional) {
 
 TEST(frontend, exact_local_response_body_parse_failures_are_transactional) {
     const char source[] = R"rut(route exact slash_normalized GET "/static" { return local_response({
-      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-      date: "current", content_type: "text/plain", connection: "request",
-      head_mode: "reject", body: b"ok"
+      version: .http11, status: 400, reason: "Bad Request", server: "rut",
+      date: .current, content_type: "text/plain", connection: .request,
+      head_mode: .reject, body: b"ok"
     }) })rut";
     auto lexed_result = lex(lit(source));
     REQUIRE(lexed_result);
@@ -37932,34 +38033,34 @@ TEST(frontend, unmatched_connect_trace_are_contextual_and_source_shape_is_strict
 
 TEST(frontend, unmatched_local_response_rejects_fields_selectors_and_aggregate_overflow) {
     const std::string prefix =
-        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
-        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\"";
+        "unmatched OPTIONS { return local_response({ version: .http11, status: 400, "
+        "reason: \"Bad Request\", server: \"rut\", date: .current, content_type: "
+        "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\"";
     const std::string suffix = " }) }\n";
     auto replace_once = [](std::string value, const char* from, const char* to) {
         const auto pos = value.find(from);
         if (pos != std::string::npos) value.replace(pos, std::char_traits<char>::length(from), to);
         return value;
     };
-    const std::string bad_version = replace_once(prefix + suffix, "HTTP/1.1", "HTTP/1.0");
+    const std::string bad_version = replace_once(prefix + suffix, ".http11", ".http10");
     const std::string bad_date = replace_once(prefix + suffix, "current", "static");
     const std::string bad_connection = replace_once(prefix + suffix, "request", "close");
     const std::string bad_head = replace_once(prefix + suffix, "reject", "invalid");
     const std::string invalid[] = {
         prefix + ", status: 401" + suffix,
         prefix + ", extra: \"x\"" + suffix,
-        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 399, "
-        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
-        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 600, "
-        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
-        "unmatched { return local_response({ version: \"HTTP/1.1\", status: 400, reason: "
-        "\"Bad Request\", server: \"rut\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
-        "unmatched HEAD { return local_response({ version: \"HTTP/1.1\", status: 400, reason: "
-        "\"Bad Request\", server: \"rut\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }",
+        "unmatched OPTIONS { return local_response({ version: .http11, status: 399, "
+        "reason: \"Bad Request\", server: \"rut\", date: .current, content_type: "
+        "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\" }) }",
+        "unmatched OPTIONS { return local_response({ version: .http11, status: 600, "
+        "reason: \"Bad Request\", server: \"rut\", date: .current, content_type: "
+        "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\" }) }",
+        "unmatched { return local_response({ version: .http11, status: 400, reason: "
+        "\"Bad Request\", server: \"rut\", date: .current, content_type: "
+        "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\" }) }",
+        "unmatched HEAD { return local_response({ version: .http11, status: 400, reason: "
+        "\"Bad Request\", server: \"rut\", date: .current, content_type: "
+        "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\" }) }",
         prefix + suffix + prefix + suffix,
         bad_version,
         bad_date,
@@ -37978,9 +38079,9 @@ TEST(frontend, unmatched_local_response_rejects_fields_selectors_and_aggregate_o
         aggregate += "unmatched ";
         aggregate += method;
         aggregate +=
-            " { return local_response({ version: \"HTTP/1.1\", status: 400, reason: \"r\", "
-            "server: \"s\", date: \"current\", content_type: \"t\", connection: \"request\", "
-            "head_mode: \"reject\", body: b\"";
+            " { return local_response({ version: .http11, status: 400, reason: \"r\", "
+            "server: \"s\", date: .current, content_type: \"t\", connection: .request, "
+            "head_mode: .reject, body: b\"";
         aggregate.append(kMaxStrictLocalResponseBodyLen, 'x');
         aggregate += "\" }) }\n";
     }
@@ -38063,9 +38164,9 @@ TEST(frontend, strict_local_response_policy_bounds_and_forged_compiler_metadata_
     CHECK_FALSE(strict_local_response_policy_spec_valid(policy));
 
     const char valid[] = R"rut(unmatched OPTIONS { return local_response({
-      version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-      date: "current", content_type: "text/plain", connection: "request",
-      head_mode: "reject", body: b"x"
+      version: .http11, status: 400, reason: "Bad Request", server: "rut",
+      date: .current, content_type: "text/plain", connection: .request,
+      head_mode: .reject, body: b"x"
     }) })rut";
     auto valid_lexed = lex(lit(valid));
     REQUIRE(valid_lexed);
@@ -38083,25 +38184,25 @@ TEST(frontend, strict_local_response_policy_bounds_and_forged_compiler_metadata_
 TEST(frontend, pre_route_contextual_source_survives_every_ir_and_combines_three_selectors) {
     static constexpr char kSource[] = R"rut(
 pre_route TRACE { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"trace-pre"
+  version: .http11, status: 405, reason: "Not Allowed", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"trace-pre"
 }) }
 pre_route OPTIONS { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"options-pre"
+  version: .http11, status: 400, reason: "Bad Request", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"options-pre"
 }) }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"exact"
+  version: .http11, status: 200, reason: "OK", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"exact"
 }) }
 route GET "/" { return 204 }
 unmatched TRACE { return local_response({
-  version: "HTTP/1.1", status: 403, reason: "Forbidden", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"trace-miss"
+  version: .http11, status: 403, reason: "Forbidden", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"trace-miss"
 }) }
 )rut";
     auto lexed = lex(lit(kSource));
@@ -38191,10 +38292,10 @@ unmatched TRACE { return local_response({
 TEST(frontend, pre_route_shape_head_and_parser_transaction_fail_closed) {
     auto source_for = [](const char* selector, const char* head_mode = "reject") {
         return std::string("pre_route ") + selector +
-               " { return local_response({ version: \"HTTP/1.1\", status: 400, "
-               "reason: \"Bad Request\", server: \"rut\", date: \"current\", "
-               "content_type: \"text/plain\", connection: \"request\", head_mode: \"" +
-               head_mode + "\", body: b\"ok\" }) }\n";
+               " { return local_response({ version: .http11, status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: .current, "
+               "content_type: \"text/plain\", connection: .request, head_mode: ." +
+               head_mode + ", body: b\"ok\" }) }\n";
     };
     for (const std::string& source : {
              source_for(""),
@@ -38209,7 +38310,7 @@ TEST(frontend, pre_route_shape_head_and_parser_transaction_fail_closed) {
         REQUIRE(bad_lexed);
         CHECK_FALSE(parse_file_heap(bad_lexed.value()).has_value());
     }
-    const std::string head = source_for("HEAD", "suppress_body");
+    const std::string head = source_for("HEAD", "suppressBody");
     auto head_lexed = lex({head.data(), static_cast<u32>(head.size())});
     REQUIRE(head_lexed);
     auto head_ast = parse_file_heap(head_lexed.value());
@@ -38254,9 +38355,9 @@ TEST(frontend, imported_pre_route_declaration_and_table_only_forgery_are_rejecte
     const std::string dir = "/tmp/rut_import_pre_route_frontend";
     std::filesystem::create_directories(dir);
     const std::string declaration =
-        "pre_route TRACE { return local_response({ version: \"HTTP/1.1\", status: 405, "
-        "reason: \"Not Allowed\", server: \"rut\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" "
+        "pre_route TRACE { return local_response({ version: .http11, status: 405, "
+        "reason: \"Not Allowed\", server: \"rut\", date: .current, content_type: "
+        "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\" "
         "}) }\n";
     {
         std::ofstream out(dir + "/pre.rut", std::ios::binary);
@@ -38282,9 +38383,9 @@ TEST(frontend, imported_unmatched_declaration_is_rejected) {
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/fallback.rut", std::ios::binary);
-        out << "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
-               "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
-               "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" "
+        out << "unmatched OPTIONS { return local_response({ version: .http11, status: 400, "
+               "reason: \"Bad Request\", server: \"rut\", date: .current, content_type: "
+               "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\" "
                "}) }\n";
     }
     const char main_source[] = "import \"fallback.rut\"\nroute GET \"/\" { return 200 }\n";
@@ -38300,9 +38401,9 @@ TEST(frontend, imported_exact_local_response_declaration_is_rejected) {
     std::filesystem::create_directories(dir);
     {
         std::ofstream out(dir + "/exact.rut", std::ios::binary);
-        out << "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
-               "status: 400, reason: \"Bad Request\", server: \"rut\", date: \"current\", "
-               "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+        out << "route exact GET \"/static\" { return local_response({ version: .http11, "
+               "status: 400, reason: \"Bad Request\", server: \"rut\", date: .current, "
+               "content_type: \"text/plain\", connection: .request, head_mode: .reject, "
                "body: b\"x\" }) }\n";
     }
     const char main_source[] = "import \"exact.rut\"\nroute GET \"/\" { return 200 }\n";
@@ -38748,18 +38849,18 @@ TEST(frontend, bounded_response_buffering_parses_and_propagates_like_complete_co
 upstream b at "127.0.0.1:9000"
 route GET "/one" {
     return forward(b,
-        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        request_policy: { version: .http11, host: .upstream, connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
+            date: .current, connection: .request, body: b"slow" },
         response_read_timeout: 1s,
-        response_buffering: "bounded")
+        response_buffering: .bounded)
 }
 )rut";
     auto lexed = lex(lit(source));
@@ -38843,7 +38944,7 @@ TEST(frontend, bounded_response_buffering_rejects_same_shapes_as_complete_conten
     // missing the paired timeout/policy bundle produces the same rejection.
     const char incomplete_bundle[] =
         "upstream b\nroute GET \"/\" { return forward(b, response_read_timeout: 1s, "
-        "response_buffering: \"bounded\") }\n";
+        "response_buffering: .bounded) }\n";
     auto lexed = lex(lit(incomplete_bundle));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -38861,18 +38962,18 @@ TEST(frontend, bounded_response_buffering_rejects_same_shapes_as_complete_conten
 upstream b
 route GET "/" {
     return forward(b,
-        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-            retained_header_value: "trim_sp_preserve_htab",
-            strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        request_policy: { version: .http11, host: .upstream, connection: .omit,
+            retained_header_value: .trimSpPreserveHtab,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
-        response_buffering: "bounded")
+            date: .current, connection: .request, body: b"slow" },
+        response_buffering: .bounded)
 }
 )rut";
     lexed = lex(lit(retained_no_timeout));

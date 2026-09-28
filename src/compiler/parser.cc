@@ -145,6 +145,29 @@ struct Parser {
         return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
     }
 
+    // HTTP policy selectors are contextual enum members, never strings or
+    // arbitrary expressions. The enclosing field supplies its closed set of
+    // cases (space-separated, including the leading dots). Keep that set in
+    // the diagnostic so generated code can be corrected without guessing.
+    // `upstream` is already a keyword, but is also valid after a member dot.
+    FrontendResult<const Token*> expect_policy_case(Str cases) {
+        if (!take(TokenType::Dot))
+            return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()), cases);
+        const Token& member = cur();
+        if (member.type == TokenType::Ident || member.type == TokenType::KwUpstream) {
+            for (u32 begin = 0; begin < cases.len;) {
+                u32 end = begin;
+                while (end < cases.len && cases.ptr[end] != ' ') ++end;
+                if (end > begin + 1 && member.text.eq({cases.ptr + begin + 1, end - begin - 1})) {
+                    ++pos;
+                    return &member;
+                }
+                begin = end + 1;
+            }
+        }
+        return frontend_error(FrontendError::UnsupportedSyntax, span_from(member), cases);
+    }
+
     FrontendResult<const Token*> expect_adjacent(TokenType type, const Token& previous) {
         if (cur().start != previous.end) {
             const FrontendError code = cur().type == TokenType::Eof
@@ -1791,7 +1814,7 @@ struct Parser {
                     bool* seen = nullptr;
                     if (name.eq({"scheme", 6})) {
                         seen = &have_scheme;
-                        auto v = expect(TokenType::StringLit);
+                        auto v = expect_policy_case(lit_str(".http"));
                         if (!v) return core::make_unexpected(v.error());
                         if (!v.value()->text.eq({"http", 4}))
                             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -1800,9 +1823,9 @@ struct Parser {
                         policy.scheme = RedirectPolicyScheme::Http;
                     } else if (name.eq({"authority", 9})) {
                         seen = &have_authority;
-                        auto v = expect(TokenType::StringLit);
+                        auto v = expect_policy_case(lit_str(".requestHost .static"));
                         if (!v) return core::make_unexpected(v.error());
-                        if (v.value()->text.eq({"request_host", 12})) {
+                        if (v.value()->text.eq({"requestHost", 11})) {
                             policy.authority = RedirectPolicyAuthority::RequestHost;
                         } else if (v.value()->text.eq({"static", 6})) {
                             policy.authority = RedirectPolicyAuthority::Static;
@@ -1814,9 +1837,9 @@ struct Parser {
                         }
                     } else if (name.eq({"port", 4})) {
                         seen = &have_port;
-                        auto v = expect(TokenType::StringLit);
+                        auto v = expect_policy_case(lit_str(".actualListener .omit"));
                         if (!v) return core::make_unexpected(v.error());
-                        if (v.value()->text.eq({"actual_listener", 15})) {
+                        if (v.value()->text.eq({"actualListener", 14})) {
                             policy.port = RedirectPolicyPort::ActualListener;
                         } else if (v.value()->text.eq({"omit", 4})) {
                             policy.port = RedirectPolicyPort::Omit;
@@ -1828,7 +1851,7 @@ struct Parser {
                         }
                     } else if (name.eq({"path", 4})) {
                         seen = &have_path;
-                        auto v = expect(TokenType::StringLit);
+                        auto v = expect_policy_case(lit_str(".static"));
                         if (!v) return core::make_unexpected(v.error());
                         if (!v.value()->text.eq({"static", 6}))
                             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -1837,9 +1860,9 @@ struct Parser {
                         policy.path = RedirectPolicyPath::Static;
                     } else if (name.eq({"query", 5})) {
                         seen = &have_query;
-                        auto v = expect(TokenType::StringLit);
+                        auto v = expect_policy_case(lit_str(".preserveRaw .discard"));
                         if (!v) return core::make_unexpected(v.error());
-                        if (v.value()->text.eq({"preserve_raw", 12})) {
+                        if (v.value()->text.eq({"preserveRaw", 11})) {
                             policy.query = RedirectPolicyQuery::PreserveRaw;
                         } else if (v.value()->text.eq({"discard", 7})) {
                             policy.query = RedirectPolicyQuery::Discard;
@@ -1851,7 +1874,7 @@ struct Parser {
                         }
                     } else if (name.eq({"date", 4})) {
                         seen = &have_date;
-                        auto v = expect(TokenType::StringLit);
+                        auto v = expect_policy_case(lit_str(".current"));
                         if (!v) return core::make_unexpected(v.error());
                         if (!v.value()->text.eq({"current", 7}))
                             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -1860,7 +1883,7 @@ struct Parser {
                         policy.date = RedirectPolicyDate::Current;
                     } else if (name.eq({"connection", 10})) {
                         seen = &have_connection;
-                        auto v = expect(TokenType::StringLit);
+                        auto v = expect_policy_case(lit_str(".close"));
                         if (!v) return core::make_unexpected(v.error());
                         if (!v.value()->text.eq({"close", 5}))
                             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -1870,11 +1893,12 @@ struct Parser {
                     } else if (name.eq({"header_order", 12})) {
                         seen = &have_header_order;
                         have_new_selector = true;
-                        auto v = expect(TokenType::StringLit);
+                        auto v = expect_policy_case(
+                            lit_str(".locationThenConnection .connectionThenLocation"));
                         if (!v) return core::make_unexpected(v.error());
-                        if (v.value()->text.eq({"location_then_connection", 24})) {
+                        if (v.value()->text.eq({"locationThenConnection", 22})) {
                             policy.header_order = RedirectPolicyHeaderOrder::LocationThenConnection;
-                        } else if (v.value()->text.eq({"connection_then_location", 24})) {
+                        } else if (v.value()->text.eq({"connectionThenLocation", 22})) {
                             policy.header_order = RedirectPolicyHeaderOrder::ConnectionThenLocation;
                         } else {
                             return frontend_error(FrontendError::UnsupportedSyntax,
@@ -2006,9 +2030,9 @@ struct Parser {
                         if (stmt.has_forward_response_buffering)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
-                        auto value = expect(TokenType::StringLit);
+                        auto value = expect_policy_case(lit_str(".completeContentLength .bounded"));
                         if (!value) return core::make_unexpected(value.error());
-                        if (value.value()->text.eq({"complete_content_length", 23})) {
+                        if (value.value()->text.eq({"completeContentLength", 21})) {
                             stmt.forward_response_buffering =
                                 ForwardResponseBufferingMode::CompleteContentLength;
                         } else if (value.value()->text.eq({"bounded", 7})) {
@@ -2051,16 +2075,16 @@ struct Parser {
                             bool* seen = nullptr;
                             if (field_name.eq({"version", 7})) {
                                 seen = &have_version;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".http11"));
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
-                                if (!v.eq({"HTTP/1.1", 8}))
+                                if (!v.eq({"http11", 6}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
                             } else if (field_name.eq({"host", 4})) {
                                 seen = &have_host;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".preserve .upstream"));
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
                                 if (v.eq({"preserve", 8})) {
@@ -2072,7 +2096,7 @@ struct Parser {
                                 }
                             } else if (field_name.eq({"connection", 10})) {
                                 seen = &have_connection;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".omit"));
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
                                 if (!v.eq({"omit", 4}))
@@ -2081,7 +2105,7 @@ struct Parser {
                                                           v);
                             } else if (field_name.eq({"header_names", 12})) {
                                 seen = &have_header_names;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".lowercase"));
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
                                 if (!v.eq({"lowercase", 9}))
@@ -2090,7 +2114,7 @@ struct Parser {
                                                           v);
                             } else if (field_name.eq({"forwarded_proto", 15})) {
                                 seen = &have_forwarded_proto;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".http"));
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
                                 if (!v.eq({"http", 4}))
@@ -2099,19 +2123,19 @@ struct Parser {
                                                           v);
                             } else if (field_name.eq({"content_length_position", 23})) {
                                 seen = &have_content_length_position;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".afterHost"));
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
-                                if (!v.eq({"after_host", 10}))
+                                if (!v.eq({"afterHost", 9}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
                             } else if (field_name.eq({"retained_header_value", 21})) {
                                 seen = &have_retained_header_value;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".trimSpPreserveHtab"));
                                 if (!value) return core::make_unexpected(value.error());
                                 const Str v = value.value()->text;
-                                if (!v.eq({"trim_sp_preserve_htab", 21}))
+                                if (!v.eq({"trimSpPreserveHtab", 18}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           v);
@@ -2121,21 +2145,23 @@ struct Parser {
                                 auto lbracket = expect(TokenType::LBracket);
                                 if (!lbracket) return core::make_unexpected(lbracket.error());
                                 // The 6th name (Proxy-Connection) is gated by
-                                // `host: "preserve"`; validated once the full
+                                // `host: .preserve`; validated once the full
                                 // object (and thus the host mode) is known, at
                                 // the closing brace below.
-                                static constexpr const char* kStrip[] = {"Connection",
-                                                                         "Keep-Alive",
-                                                                         "TE",
-                                                                         "Expect",
-                                                                         "Upgrade",
-                                                                         "Proxy-Connection"};
+                                static constexpr const char* kStrip[] = {"connection",
+                                                                         "keepAlive",
+                                                                         "te",
+                                                                         "expect",
+                                                                         "upgrade",
+                                                                         "proxyConnection"};
                                 if (cur().type == TokenType::RBracket)
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(cur()),
                                                           field_name);
                                 while (true) {
-                                    auto item = expect(TokenType::StringLit);
+                                    auto item = expect_policy_case(
+                                        lit_str(".connection .keepAlive .te .expect .upgrade "
+                                                ".proxyConnection"));
                                     if (!item) return core::make_unexpected(item.error());
                                     u32 match = 6;
                                     for (u32 si = 0; si < 6; si++) {
@@ -2181,11 +2207,11 @@ struct Parser {
                             return frontend_error(FrontendError::UnsupportedSyntax,
                                                   span_from(*rbrace.value()),
                                                   kw_text);
-                        // `host: "preserve"` is the only Envoy H1 combination:
+                        // `host: .preserve` is the only Envoy H1 combination:
                         // header_names + forwarded_proto + the full six-name
                         // strip list (including Proxy-Connection) are all
                         // required, and the upstream-only fields are rejected.
-                        // `host: "upstream"` keeps today's closed contract:
+                        // `host: .upstream` keeps today's closed contract:
                         // header_names/forwarded_proto/Proxy-Connection are
                         // rejected and exactly the original five strip names
                         // are required.
@@ -2238,27 +2264,27 @@ struct Parser {
                             bool* seen = nullptr;
                             if (field_name.eq({"version", 7})) {
                                 seen = &have_version;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".http11"));
                                 if (!value) return core::make_unexpected(value.error());
-                                if (!value.value()->text.eq({"HTTP/1.1", 8}))
+                                if (!value.value()->text.eq({"http11", 6}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           value.value()->text);
                                 policy.version = ResponsePolicyVersion::Http11;
                             } else if (field_name.eq({"framing", 7})) {
                                 seen = &have_framing;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".contentLength"));
                                 if (!value) return core::make_unexpected(value.error());
-                                if (!value.value()->text.eq({"content_length", 14}))
+                                if (!value.value()->text.eq({"contentLength", 13}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           value.value()->text);
                                 policy.framing = ResponsePolicyFraming::ContentLength;
                             } else if (field_name.eq({"connection", 10})) {
                                 seen = &have_connection;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".keepAlive .request"));
                                 if (!value) return core::make_unexpected(value.error());
-                                if (value.value()->text.eq({"keep_alive", 10})) {
+                                if (value.value()->text.eq({"keepAlive", 9})) {
                                     policy.connection = ResponsePolicyConnection::KeepAlive;
                                 } else if (value.value()->text.eq({"request", 7})) {
                                     policy.connection = ResponsePolicyConnection::Request;
@@ -2278,7 +2304,7 @@ struct Parser {
                                 policy.server = value.value()->text;
                             } else if (field_name.eq({"date", 4})) {
                                 seen = &have_date;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".current"));
                                 if (!value) return core::make_unexpected(value.error());
                                 if (!value.value()->text.eq({"current", 7}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -2287,11 +2313,11 @@ struct Parser {
                                 policy.date = ResponsePolicyDate::Current;
                             } else if (field_name.eq({"head_mode", 9})) {
                                 seen = &have_head_mode;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".reject .suppressBody"));
                                 if (!value) return core::make_unexpected(value.error());
                                 if (value.value()->text.eq({"reject", 6})) {
                                     policy.head_mode = ResponsePolicyHeadMode::Reject;
-                                } else if (value.value()->text.eq({"suppress_body", 13})) {
+                                } else if (value.value()->text.eq({"suppressBody", 12})) {
                                     policy.head_mode = ResponsePolicyHeadMode::SuppressBody;
                                 } else {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -2391,9 +2417,9 @@ struct Parser {
                             bool* seen = nullptr;
                             if (field_name.eq({"version", 7})) {
                                 seen = &have_version;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".http11"));
                                 if (!value) return core::make_unexpected(value.error());
-                                if (!value.value()->text.eq({"HTTP/1.1", 8}))
+                                if (!value.value()->text.eq({"http11", 6}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
                                                           span_from(*value.value()),
                                                           value.value()->text);
@@ -2427,7 +2453,7 @@ struct Parser {
                                 policy.server = value.value()->text;
                             } else if (field_name.eq({"date", 4})) {
                                 seen = &have_date;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".current"));
                                 if (!value) return core::make_unexpected(value.error());
                                 if (!value.value()->text.eq({"current", 7}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -2436,7 +2462,7 @@ struct Parser {
                                 policy.date = ForwardFailurePolicyDate::Current;
                             } else if (field_name.eq({"connection", 10})) {
                                 seen = &have_connection;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".request"));
                                 if (!value) return core::make_unexpected(value.error());
                                 if (!value.value()->text.eq({"request", 7}))
                                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -2445,11 +2471,11 @@ struct Parser {
                                 policy.connection = ForwardFailurePolicyConnection::Request;
                             } else if (field_name.eq({"head_mode", 9})) {
                                 seen = &have_head_mode;
-                                auto value = expect(TokenType::StringLit);
+                                auto value = expect_policy_case(lit_str(".reject .suppressBody"));
                                 if (!value) return core::make_unexpected(value.error());
                                 if (value.value()->text.eq({"reject", 6})) {
                                     policy.head_mode = FailurePolicyHeadMode::Reject;
-                                } else if (value.value()->text.eq({"suppress_body", 13})) {
+                                } else if (value.value()->text.eq({"suppressBody", 12})) {
                                     policy.head_mode = FailurePolicyHeadMode::SuppressBody;
                                 } else {
                                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -4918,9 +4944,9 @@ struct Parser {
             const Str field = name.value()->text;
             if (field.eq({"version", 7})) {
                 bit = 1u << 0;
-                auto value = expect(TokenType::StringLit);
+                auto value = expect_policy_case(lit_str(".http11"));
                 if (!value) return core::make_unexpected(value.error());
-                if (!value.value()->text.eq({"HTTP/1.1", 8}))
+                if (!value.value()->text.eq({"http11", 6}))
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span_from(*value.value()),
                                           value.value()->text);
@@ -4954,7 +4980,7 @@ struct Parser {
                 policy.server = value.value()->text;
             } else if (field.eq({"date", 4})) {
                 bit = 1u << 4;
-                auto value = expect(TokenType::StringLit);
+                auto value = expect_policy_case(lit_str(".current"));
                 if (!value) return core::make_unexpected(value.error());
                 if (!value.value()->text.eq({"current", 7}))
                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -4968,7 +4994,7 @@ struct Parser {
                 policy.content_type = value.value()->text;
             } else if (field.eq({"connection", 10})) {
                 bit = 1u << 6;
-                auto value = expect(TokenType::StringLit);
+                auto value = expect_policy_case(lit_str(".request"));
                 if (!value) return core::make_unexpected(value.error());
                 if (!value.value()->text.eq({"request", 7}))
                     return frontend_error(FrontendError::UnsupportedSyntax,
@@ -4977,11 +5003,11 @@ struct Parser {
                 policy.connection = StrictLocalResponseConnection::Request;
             } else if (field.eq({"head_mode", 9})) {
                 bit = 1u << 7;
-                auto value = expect(TokenType::StringLit);
+                auto value = expect_policy_case(lit_str(".reject .suppressBody"));
                 if (!value) return core::make_unexpected(value.error());
                 if (value.value()->text.eq({"reject", 6}))
                     policy.head_mode = StrictLocalResponseHeadMode::Reject;
-                else if (value.value()->text.eq({"suppress_body", 13}))
+                else if (value.value()->text.eq({"suppressBody", 12}))
                     policy.head_mode = StrictLocalResponseHeadMode::SuppressBody;
                 else
                     return frontend_error(FrontendError::UnsupportedSyntax,

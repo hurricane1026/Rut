@@ -1731,16 +1731,16 @@ bool put_unmatched(Writer& writer,
                    u32 body_len) {
     static constexpr char kPrefix[] = "unmatched";
     static constexpr char kOpen[] = " { return local_response({\n";
-    static constexpr char kStatus[] = "  version: \"HTTP/1.1\", status: ";
+    static constexpr char kStatus[] = "  version: .http11, status: ";
     static constexpr char kReason[] = ", reason: \"";
     static constexpr char kServer[] = "\", server: \"nginx/1.29.7\",\n";
     static constexpr char kFields[] =
-        "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n";
-    static constexpr char kHeadMode[] = "  head_mode: \"";
-    static constexpr char kBody[] = "\", body: b\"";
+        "  date: .current, content_type: \"text/html\", connection: .request,\n";
+    static constexpr char kHeadMode[] = "  head_mode: .";
+    static constexpr char kBody[] = ", body: b\"";
     static constexpr char kClose[] = "\"\n}) }\n";
-    const char* head_mode = selector_len == 0 ? "suppress_body" : "reject";
-    const u32 head_mode_len = selector_len == 0 ? 13u : 6u;
+    const char* head_mode = selector_len == 0 ? "suppressBody" : "reject";
+    const u32 head_mode_len = selector_len == 0 ? 12u : 6u;
     return writer.put_lit(kPrefix, sizeof(kPrefix) - 1) &&
            (selector_len == 0 || writer.put_lit(" ", 1)) &&
            writer.put_lit(selector, selector_len) && writer.put_lit(kOpen, sizeof(kOpen) - 1) &&
@@ -1757,11 +1757,11 @@ bool put_pre_route_trace(Writer& writer, ImplicitPreRouteProfile profile) {
     if (profile != ImplicitPreRouteProfile::Nginx1297PreLocationTrace405) return false;
     return writer.put_cstr("pre_route TRACE { return local_response({\n") &&
            writer.put_cstr(
-               "  version: \"HTTP/1.1\", status: 405, reason: \"Not Allowed\", server: "
+               "  version: .http11, status: 405, reason: \"Not Allowed\", server: "
                "\"nginx/1.29.7\",\n") &&
            writer.put_cstr(
-               "  date: \"current\", content_type: \"text/html\", connection: \"request\",\n") &&
-           writer.put_cstr("  head_mode: \"reject\", body: b\"") &&
+               "  date: .current, content_type: \"text/html\", connection: .request,\n") &&
+           writer.put_cstr("  head_mode: .reject, body: b\"") &&
            writer.put_lit(kTraceBody, sizeof(kTraceBody) - 1u) && writer.put_cstr("\"\n}) }\n");
 }
 
@@ -1773,29 +1773,29 @@ enum class RequestPolicyPlacement : u8 {
 
 bool put_request_policy(Writer& writer, RequestPolicyPlacement placement) {
     return writer.put_cstr("request_policy: {\n") &&
-           writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
-           writer.put_cstr("            host: \"upstream\",\n") &&
-           writer.put_cstr("            connection: \"omit\",\n") &&
+           writer.put_cstr("            version: .http11,\n") &&
+           writer.put_cstr("            host: .upstream,\n") &&
+           writer.put_cstr("            connection: .omit,\n") &&
            (placement != RequestPolicyPlacement::ContentLengthAfterHost ||
-            writer.put_cstr("            content_length_position: \"after_host\",\n")) &&
+            writer.put_cstr("            content_length_position: .afterHost,\n")) &&
            writer.put_cstr(
-               "            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-               "\"Upgrade\"]") &&
+               "            strip_headers: [.connection, .keepAlive, .te, .expect, "
+               ".upgrade]") &&
            (placement == RequestPolicyPlacement::RetainedHeaderValue ? writer.put_cstr(",\n")
                                                                      : writer.put_cstr("\n")) &&
            (placement != RequestPolicyPlacement::RetainedHeaderValue ||
-            writer.put_cstr("            retained_header_value: \"trim_sp_preserve_htab\"\n")) &&
+            writer.put_cstr("            retained_header_value: .trimSpPreserveHtab\n")) &&
            writer.put_cstr("        },\n");
 }
 
 bool put_response_policy(Writer& writer, bool suppress_body, Str hide_header_name) {
     return writer.put_cstr("        response_policy: {\n") &&
-           writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
-           writer.put_cstr("            framing: \"content_length\",\n") &&
-           writer.put_cstr("            connection: \"request\",\n") &&
-           (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
+           writer.put_cstr("            version: .http11,\n") &&
+           writer.put_cstr("            framing: .contentLength,\n") &&
+           writer.put_cstr("            connection: .request,\n") &&
+           (!suppress_body || writer.put_cstr("            head_mode: .suppressBody,\n")) &&
            writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
-           writer.put_cstr("            date: \"current\",\n") &&
+           writer.put_cstr("            date: .current,\n") &&
            writer.put_cstr("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"") &&
            (hide_header_name.len == 0u
                 ? writer.put_cstr("]\n")
@@ -1807,14 +1807,14 @@ bool put_response_policy(Writer& writer, bool suppress_body, Str hide_header_nam
 
 bool put_failure_policy(Writer& writer, bool suppress_body, bool buffered) {
     return writer.put_cstr("        failure_policy: {\n") &&
-           writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
+           writer.put_cstr("            version: .http11,\n") &&
            writer.put_cstr("            status: 502,\n") &&
            writer.put_cstr("            reason: \"Bad Gateway\",\n") &&
            writer.put_cstr("            content_type: \"text/html\",\n") &&
            writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
-           writer.put_cstr("            date: \"current\",\n") &&
-           writer.put_cstr("            connection: \"request\",\n") &&
-           (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
+           writer.put_cstr("            date: .current,\n") &&
+           writer.put_cstr("            connection: .request,\n") &&
+           (!suppress_body || writer.put_cstr("            head_mode: .suppressBody,\n")) &&
            writer.put_cstr("            body: b\"") &&
            writer.put_lit(kBadGatewayBody, sizeof(kBadGatewayBody) - 1) &&
            writer.put_cstr("\"\n") && writer.put_cstr(buffered ? "        },\n" : "        }\n");
@@ -1822,14 +1822,14 @@ bool put_failure_policy(Writer& writer, bool suppress_body, bool buffered) {
 
 bool put_timeout_failure_policy(Writer& writer, bool suppress_body) {
     return writer.put_cstr("        timeout_failure_policy: {\n") &&
-           writer.put_cstr("            version: \"HTTP/1.1\",\n") &&
+           writer.put_cstr("            version: .http11,\n") &&
            writer.put_cstr("            status: 504,\n") &&
            writer.put_cstr("            reason: \"Gateway Time-out\",\n") &&
            writer.put_cstr("            content_type: \"text/html\",\n") &&
            writer.put_cstr("            server: \"nginx/1.29.7\",\n") &&
-           writer.put_cstr("            date: \"current\",\n") &&
-           writer.put_cstr("            connection: \"request\",\n") &&
-           (!suppress_body || writer.put_cstr("            head_mode: \"suppress_body\",\n")) &&
+           writer.put_cstr("            date: .current,\n") &&
+           writer.put_cstr("            connection: .request,\n") &&
+           (!suppress_body || writer.put_cstr("            head_mode: .suppressBody,\n")) &&
            writer.put_cstr("            body: b\"") &&
            writer.put_lit(kGatewayTimeoutBody, sizeof(kGatewayTimeoutBody) - 1) &&
            writer.put_cstr("\"\n") && writer.put_cstr("        },\n");
@@ -1858,7 +1858,7 @@ bool put_root_forward(Writer& writer,
                                         : true) &&
            (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
            (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
-           (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
+           (buffered ? writer.put_cstr("        response_buffering: .completeContentLength\n")
                      : true) &&
            writer.put_cstr("    )\n}\n");
 }
@@ -1881,7 +1881,7 @@ bool put_root_forward_action(Writer& writer,
                                         : true) &&
            (buffered || timeout_present ? writer.put_u16(timeout_seconds) : true) &&
            (buffered || timeout_present ? writer.put_cstr(buffered ? "s,\n" : "s\n") : true) &&
-           (buffered ? writer.put_cstr("        response_buffering: \"complete_content_length\"\n")
+           (buffered ? writer.put_cstr("        response_buffering: .completeContentLength\n")
                      : true) &&
            writer.put_cstr("    )\n");
 }
@@ -1963,13 +1963,13 @@ bool put_exact_absolute_redirect(Writer& writer,
     return writer.put_cstr("route GET \"/\" {\n") && writer.put_cstr("    if req.pathOnly == \"") &&
            writer.put(location_path) && writer.put_cstr("\" {\n") &&
            writer.put_cstr(
-               "        return redirect({scheme: \"http\", authority: \"static\", "
+               "        return redirect({scheme: .http, authority: .static, "
                "static_authority: \"") &&
-           writer.put(static_authority) && writer.put_cstr("\", port: \"omit\",\n") &&
+           writer.put(static_authority) && writer.put_cstr("\", port: .omit,\n") &&
            writer.put_cstr(
-               "            path: \"static\", query: \"discard\", date: \"current\", "
-               "connection: \"close\",\n") &&
-           writer.put_cstr("            header_order: \"connection_then_location\", status: ") &&
+               "            path: .static, query: .discard, date: .current, "
+               "connection: .close,\n") &&
+           writer.put_cstr("            header_order: .connectionThenLocation, status: ") &&
            writer.put_u16(status) && writer.put_cstr(", reason: \"") &&
            writer.put_lit(reason, reason_len) && writer.put_cstr("\",\n") &&
            writer.put_cstr(
@@ -1996,11 +1996,11 @@ bool put_exact_local_return(Writer& writer, Str path, Str body) {
     return writer.put_cstr("route exact slash_normalized \"") && writer.put(path) &&
            writer.put_cstr("\" { return local_response({\n") &&
            writer.put_cstr(
-               "  version: \"HTTP/1.1\", status: 200, reason: \"OK\", server: "
+               "  version: .http11, status: 200, reason: \"OK\", server: "
                "\"nginx/1.29.7\",\n") &&
            writer.put_cstr(
-               "  date: \"current\", content_type: \"text/plain\", connection: \"request\",\n") &&
-           writer.put_cstr("  head_mode: \"suppress_body\", body: b\"") && writer.put(body) &&
+               "  date: .current, content_type: \"text/plain\", connection: .request,\n") &&
+           writer.put_cstr("  head_mode: .suppressBody, body: b\"") && writer.put(body) &&
            writer.put_cstr("\"\n}) }\n");
 }
 
@@ -2011,10 +2011,10 @@ bool put_exact_no_content_return(Writer& writer, Str path) {
     return writer.put_cstr("route exact slash_normalized GET \"") && writer.put(path) &&
            writer.put_cstr("\" { return local_response({\n") &&
            writer.put_cstr(
-               "  version: \"HTTP/1.1\", status: 204, reason: \"No Content\", server: "
+               "  version: .http11, status: 204, reason: \"No Content\", server: "
                "\"nginx/1.29.7\",\n") &&
-           writer.put_cstr("  date: \"current\", content_type: \"\", connection: \"request\",\n") &&
-           writer.put_cstr("  head_mode: \"suppress_body\", body: b\"\"\n}) }\n");
+           writer.put_cstr("  date: .current, content_type: \"\", connection: .request,\n") &&
+           writer.put_cstr("  head_mode: .suppressBody, body: b\"\"\n}) }\n");
 }
 
 bool spans_equal(const Span& left, const Span& right) {
@@ -2463,10 +2463,10 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
     if (!put("route \"") || !writer.put(route_path) || !put("\" {\n") ||
         !put("    if req.method == GET && req.pathOnly == \"") || !writer.put(route_path) ||
         !put("\" {\n") ||
-        !put("        return redirect({scheme: \"http\", authority: \"request_host\", port: "
-             "\"actual_listener\",\n") ||
-        !put("            path: \"static\", query: \"preserve_raw\", date: \"current\", "
-             "connection: \"close\",\n") ||
+        !put("        return redirect({scheme: .http, authority: .requestHost, port: "
+             ".actualListener,\n") ||
+        !put("            path: .static, query: .preserveRaw, date: .current, "
+             "connection: .close,\n") ||
         !put("            status: 301, reason: \"Moved Permanently\", server: "
              "\"nginx/1.29.7\",\n") ||
         !put("            content_type: \"text/html\", target_path: \"") ||
@@ -2478,22 +2478,20 @@ FrontendResult<RutSource> lower_to_rut(const Server& server) {
          (!put(" target_transform: {\n") || !put("            strip_prefix: \"") ||
           !writer.put(location_path) || !put("\",\n") || !put("            replace_prefix: \"") ||
           !writer.put(proxy.uri) || !put("\"\n") || !put("        },"))) ||
-        !put(" request_policy: {\n") || !put("            version: \"HTTP/1.1\",\n") ||
-        !put("            host: \"upstream\",\n") || !put("            connection: \"omit\",\n") ||
-        !put("            strip_headers: [\"Connection\", \"Keep-Alive\", \"TE\", \"Expect\", "
-             "\"Upgrade\"]\n") ||
-        !put("        }, response_policy: {\n") || !put("            version: \"HTTP/1.1\",\n") ||
-        !put("            framing: \"content_length\",\n") ||
-        !put("            connection: \"request\",\n") ||
-        !put("            server: \"nginx/1.29.7\",\n") ||
-        !put("            date: \"current\",\n") ||
+        !put(" request_policy: {\n") || !put("            version: .http11,\n") ||
+        !put("            host: .upstream,\n") || !put("            connection: .omit,\n") ||
+        !put("            strip_headers: [.connection, .keepAlive, .te, .expect, "
+             ".upgrade]\n") ||
+        !put("        }, response_policy: {\n") || !put("            version: .http11,\n") ||
+        !put("            framing: .contentLength,\n") ||
+        !put("            connection: .request,\n") ||
+        !put("            server: \"nginx/1.29.7\",\n") || !put("            date: .current,\n") ||
         !put("            hide_headers: [\"Date\", \"Server\", \"X-Pad\"]\n") ||
-        !put("        }, failure_policy: {\n") || !put("            version: \"HTTP/1.1\",\n") ||
+        !put("        }, failure_policy: {\n") || !put("            version: .http11,\n") ||
         !put("            status: 502,\n") || !put("            reason: \"Bad Gateway\",\n") ||
         !put("            content_type: \"text/html\",\n") ||
-        !put("            server: \"nginx/1.29.7\",\n") ||
-        !put("            date: \"current\",\n") ||
-        !put("            connection: \"request\",\n") ||
+        !put("            server: \"nginx/1.29.7\",\n") || !put("            date: .current,\n") ||
+        !put("            connection: .request,\n") ||
         !put("            body: b\"<html>\\r\\n<head><title>502 Bad "
              "Gateway</title></head>\\r\\n<body>\\r\\n<center><h1>502 Bad "
              "Gateway</h1></center>\\r\\n<hr><center>nginx/1.29.7</center>\\r\\n</body>\\r\\n</"

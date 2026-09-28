@@ -5759,7 +5759,7 @@ static bool build_generated_proxy_source(const privileged_listener::ListenerPlan
     if (generated.ptr == nullptr || generated.len == 0u ||
         generated.len >= rut::nginx::RutSource::kCapacity ||
         std::string(generated.ptr, generated.len)
-                .find("failure_policy: {\n            version: \"HTTP/1.1\",\n            status: "
+                .find("failure_policy: {\n            version: .http11,\n            status: "
                       "502,") == std::string::npos) {
         diagnostic = "converter output was not the ordinary generated 502 proxy program";
         return false;

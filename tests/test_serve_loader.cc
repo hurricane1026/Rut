@@ -153,10 +153,10 @@ std::string make_above_legacy_token_bound_source() {
     for (u32 i = 92u; i < 96u; ++i) {
         source += "route exact GET \"/capacity/";
         source += std::to_string(i);
-        source += "\" { return local_response({ version: \"HTTP/1.1\", status: 204, ";
-        source += "reason: \"No Content\", server: \"nginx/1.29.7\", date: \"current\", ";
-        source += "content_type: \"\", connection: \"request\", ";
-        source += "head_mode: \"suppress_body\", body: b\"\" }) }\n";
+        source += "\" { return local_response({ version: .http11, status: 204, ";
+        source += "reason: \"No Content\", server: \"nginx/1.29.7\", date: .current, ";
+        source += "content_type: \"\", connection: .request, ";
+        source += "head_mode: .suppressBody, body: b\"\" }) }\n";
     }
     return source;
 }
@@ -295,19 +295,19 @@ TEST(serve_loader, status_routes_load) {
 TEST(serve_loader, public_no_content_strict_source_and_default_activation_are_owned) {
     static constexpr char kSource[] = R"rut(
 pre_route TRACE { return local_response({
-  version: "HTTP/1.1", status: 204, reason: "No Content", server: "pre",
-  date: "current", content_type: "", connection: "request",
-  head_mode: "suppress_body", body: b""
+  version: .http11, status: 204, reason: "No Content", server: "pre",
+  date: .current, content_type: "", connection: .request,
+  head_mode: .suppressBody, body: b""
 }) }
 route exact GET "/static" { return local_response({
-  version: "HTTP/1.1", status: 204, reason: "No Content", server: "nginx/1.29.7",
-  date: "current", content_type: "", connection: "request",
-  head_mode: "suppress_body", body: b""
+  version: .http11, status: 204, reason: "No Content", server: "nginx/1.29.7",
+  date: .current, content_type: "", connection: .request,
+  head_mode: .suppressBody, body: b""
 }) }
 unmatched POST { return local_response({
-  version: "HTTP/1.1", status: 204, reason: "No Content", server: "unmatched",
-  date: "current", content_type: "", connection: "request",
-  head_mode: "suppress_body", body: b""
+  version: .http11, status: 204, reason: "No Content", server: "unmatched",
+  date: .current, content_type: "", connection: .request,
+  head_mode: .suppressBody, body: b""
 }) }
 )rut";
     const std::string path =
@@ -404,9 +404,9 @@ unmatched POST { return local_response({
 
 TEST(serve_loader, public_no_content_source_rejections_leave_runtime_config_unmodified) {
     const std::string base =
-        "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
-        "status: 204, reason: \"No Content\", server: \"nginx/1.29.7\", date: \"current\", "
-        "content_type: \"\", connection: \"request\", head_mode: \"suppress_body\", "
+        "route exact GET \"/static\" { return local_response({ version: .http11, "
+        "status: 204, reason: \"No Content\", server: \"nginx/1.29.7\", date: .current, "
+        "content_type: \"\", connection: .request, head_mode: .suppressBody, "
         "body: b\"\" }) }";
     auto replace_once = [&](std::string value, const std::string& from, const std::string& to) {
         const auto pos = value.find(from);
@@ -427,11 +427,11 @@ TEST(serve_loader, public_no_content_source_rejections_leave_runtime_config_unmo
         replace_once(base, "reason: \"No Content\"", "reason: \"Not Content\""),
         replace_once(base, "reason: \"No Content\", ", ""),
         replace_once(base, "server: \"nginx/1.29.7\"", "server: \"\""),
-        replace_once(base, "HTTP/1.1", "HTTP/1.0"),
-        replace_once(base, "date: \"current\"", "date: \"static\""),
+        replace_once(base, ".http11", ".http10"),
+        replace_once(base, "date: .current", "date: .static"),
         replace_once(base, "content_type: \"\"", "content_type: \"text/plain\""),
-        replace_once(base, "connection: \"request\"", "connection: \"close\""),
-        replace_once(base, "head_mode: \"suppress_body\"", "head_mode: \"reject\""),
+        replace_once(base, "connection: .request", "connection: .close"),
+        replace_once(base, "head_mode: .suppressBody", "head_mode: .reject"),
         replace_once(base, "body: b\"\"", "body: b\"x\""),
     };
     for (const auto& mutation : mutations)
@@ -514,16 +514,16 @@ TEST(serve_loader, forward_preflight_mode_reaches_owned_routes_and_deferred_publ
 upstream b at "127.0.0.1:9000"
 route GET "/buffered" {
     return forward(b,
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "s", date: "current", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "s", date: "current",
-            connection: "request", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "s", date: .current, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "s", date: .current,
+            connection: .request, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "s",
-            date: "current", connection: "request", body: b"slow" },
+            date: .current, connection: .request, body: b"slow" },
         response_read_timeout: 1s,
-        response_buffering: "complete_content_length")
+        response_buffering: .completeContentLength)
 }
 route GET "/plain" { return 204 }
 )rut";
@@ -624,8 +624,8 @@ TEST(serve_loader, above_legacy_token_bound_source_registers_all_owned_routes) {
     const std::string source = make_above_legacy_token_bound_source();
     const auto lexed = lex({source.data(), static_cast<u32>(source.size())});
     REQUIRE(lexed);
-    REQUIRE_EQ(lexed->tokens.len, 837u);
-    static_assert(837u > 768u);
+    REQUIRE_EQ(lexed->tokens.len, 853u);
+    static_assert(853u > 768u);
     REQUIRE_LE(lexed->tokens.len, LexedTokens::kMaxTokens);
     const std::string path = write_file(dir, "app.rut", source.c_str());
 
@@ -1489,7 +1489,7 @@ TEST(serve_loader, nginx_exact_loopback_fixed_302_output_is_owned_and_reuses_cle
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5913u);
+        REQUIRE_EQ(lowered.value().len, 5797u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
     }
@@ -1694,8 +1694,8 @@ TEST(serve_loader, issue351_exact_5945_byte_redirect_output_is_owned_and_reuses_
     REQUIRE(parsed);
     auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    REQUIRE_EQ(lowered.value().len, 5945u);
-    REQUIRE_EQ(lowered.value().len, 5945u);
+    REQUIRE_EQ(lowered.value().len, 5829u);
+    REQUIRE_EQ(lowered.value().len, 5829u);
     REQUIRE_EQ(lowered.value().data[lowered.value().len], '\0');
     std::string generated(lowered.value().data, lowered.value().len);
     REQUIRE_EQ(generated.rfind("listen 127.0.0.1:65535\n", 0u), 0u);
@@ -1703,7 +1703,7 @@ TEST(serve_loader, issue351_exact_5945_byte_redirect_output_is_owned_and_reuses_
 
     const std::string dir = "/tmp/rut_serve_loader_issue351_exact_301";
     const std::string path = write_file(dir, "app.rut", generated.c_str());
-    REQUIRE_EQ(std::filesystem::file_size(path), 5945u);
+    REQUIRE_EQ(std::filesystem::file_size(path), 5829u);
     std::fill(generated.begin(), generated.end(), 'y');
     memset(lowered.value().data, 'z', lowered.value().len);
     lowered.value().len = 0u;
@@ -1866,7 +1866,7 @@ TEST(serve_loader,
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3358u);
+        REQUIRE_EQ(lowered.value().len, 3300u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
     }
@@ -2081,7 +2081,7 @@ TEST(serve_loader, nginx_exact_loopback_fixed_replacement_output_is_owned_and_re
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3345u);
+        REQUIRE_EQ(lowered.value().len, 3287u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
     }
@@ -2394,7 +2394,7 @@ TEST(serve_loader, issue372_root_empty_query_transform_is_owned_and_reload_clear
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3343u);
+        REQUIRE_EQ(lowered.value().len, 3285u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'x', sizeof(source) - 1u);
     }
@@ -2506,7 +2506,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5366u);
+        REQUIRE_EQ(lowered.value().len, 5260u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'x', sizeof(source) - 1u);
     }
@@ -2642,7 +2642,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 6975u);
+        REQUIRE_EQ(lowered.value().len, 6834u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'z', sizeof(source) - 1u);
     }
@@ -2678,7 +2678,7 @@ TEST(serve_loader, nginx_exact_loopback_api_no_uri_output_is_owned_and_reuses_cl
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3244u);
+        REQUIRE_EQ(lowered.value().len, 3186u);
         generated.assign(lowered.value().data, lowered.value().len);
         CHECK(generated.find("target_transform") == std::string::npos);
         CHECK(generated.find("strip_prefix") == std::string::npos);
@@ -3254,7 +3254,7 @@ TEST(serve_loader, nginx_issue356_p63_no_uri_output_is_owned_and_reuses_cleanly)
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3425u);
+        REQUIRE_EQ(lowered.value().len, 3367u);
         generated.assign(lowered.value().data, lowered.value().len);
         CHECK(generated.find("target_transform") == std::string::npos);
         CHECK(generated.find("strip_prefix") == std::string::npos);
@@ -3780,9 +3780,9 @@ TEST(serve_loader, nginx_issue357_wildcard_p63_no_uri_output_is_owned_and_reuses
         CHECK_FALSE(parsed.value().location.proxy_pass.has_uri);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 3417u);
+        REQUIRE_EQ(lowered.value().len, 3359u);
         CHECK_EQ(lowered.value().data[lowered.value().len], '\0');
-        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 9362u);
+        CHECK_EQ(nginx::RutSource::kCapacity - lowered.value().len, 9420u);
         generated.assign(lowered.value().data, lowered.value().len);
         REQUIRE_EQ(generated.rfind("listen :65535\n", 0u), 0u);
         CHECK(generated.find("target_transform") == std::string::npos);
@@ -4759,13 +4759,13 @@ TEST(serve_loader, format_read_stage_without_diag) {
 }
 
 TEST(serve_loader, unmatched_source_loads_into_owned_runtime_table) {
-    const std::string path = write_file(
-        "/tmp/rut_serve_loader_unmatched_guard",
-        "app.rut",
-        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
-        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }\n"
-        "route GET \"/\" { return 200 }\n");
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_unmatched_guard",
+                   "app.rut",
+                   "unmatched OPTIONS { return local_response({ version: .http11, status: 400, "
+                   "reason: \"Bad Request\", server: \"rut\", date: .current, content_type: "
+                   "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\" }) }\n"
+                   "route GET \"/\" { return 200 }\n");
 
     LoadedProgram program;
     LoadError err;
@@ -4785,9 +4785,9 @@ TEST(serve_loader, unmatched_representation200_is_deep_owned_and_copyable) {
     const std::string path =
         write_file("/tmp/rut_serve_loader_unmatched_representation200",
                    "app.rut",
-                   "unmatched { return local_response({ version: \"HTTP/1.1\", status: 200, "
-                   "reason: \"OK\", server: \"nginx/1.29.7\", date: \"current\", content_type: "
-                   "\"text/plain\", connection: \"request\", head_mode: \"suppress_body\", "
+                   "unmatched { return local_response({ version: .http11, status: 200, "
+                   "reason: \"OK\", server: \"nginx/1.29.7\", date: .current, content_type: "
+                   "\"text/plain\", connection: .request, head_mode: .suppressBody, "
                    "body: b\"successor-static\" }) }\n"
                    "route GET \"/\" { return 204 }\n");
 
@@ -4994,14 +4994,14 @@ TEST(serve_loader, exact_strict_local_response_metadata_installs_atomically) {
 TEST(serve_loader, slash_normalized_exact_source_loads_and_owns_runtime_inventory) {
     static constexpr char kSource[] = R"rut(
 route exact slash_normalized GET "/health/check" { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"get"
+  version: .http11, status: 400, reason: "Bad Request", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"get"
 }) }
 route exact slash_normalized "/health/any" { return local_response({
-  version: "HTTP/1.1", status: 401, reason: "Unauthorized", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"any"
+  version: .http11, status: 401, reason: "Unauthorized", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"any"
 }) }
 )rut";
     const std::string path =
@@ -5067,9 +5067,9 @@ route exact slash_normalized "/health/any" { return local_response({
 TEST(serve_loader, slash_normalized_exact_and_jit_route_activate_together) {
     static constexpr char kSource[] = R"rut(
 route exact slash_normalized GET "/health/check" { return local_response({
-  version: "HTTP/1.1", status: 400, reason: "Bad Request", server: "rut",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "reject", body: b"get"
+  version: .http11, status: 400, reason: "Bad Request", server: "rut",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .reject, body: b"get"
 }) }
 route GET "/sentinel" { return 204 }
 )rut";
@@ -5121,9 +5121,9 @@ TEST(serve_loader, exact_strict_local_response_source_reaches_runtime_config) {
     const std::string path =
         write_file("/tmp/rut_serve_loader_exact_strict_foundation",
                    "app.rut",
-                   "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
-                   "status: 400, reason: \"Bad Request\", server: \"rut\", date: \"current\", "
-                   "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
+                   "route exact GET \"/static\" { return local_response({ version: .http11, "
+                   "status: 400, reason: \"Bad Request\", server: \"rut\", date: .current, "
+                   "content_type: \"text/plain\", connection: .request, head_mode: .reject, "
                    "body: b\"x\" }) }\n"
                    "route GET \"/sentinel\" { return 204 }\n");
 
@@ -5152,25 +5152,25 @@ TEST(serve_loader, pre_route_source_installs_full_owned_deduplicated_selector_ta
     static constexpr char kSource[] = R"rut(
 upstream backend at "127.0.0.1:9000"
 pre_route TRACE { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"trace-rejected"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"trace-rejected"
 }) }
 pre_route OPTIONS { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"trace-rejected"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"trace-rejected"
 }) }
 route exact "/static" { return local_response({
-  version: "HTTP/1.1", status: 200, reason: "OK", server: "nginx/1.29.7",
-  date: "current", content_type: "text/plain", connection: "request",
-  head_mode: "suppress_body", body: b"successor-static"
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
 }) }
 route "/" { return forward(backend) }
 unmatched TRACE { return local_response({
-  version: "HTTP/1.1", status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
-  date: "current", content_type: "text/html", connection: "request",
-  head_mode: "reject", body: b"trace-rejected"
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"trace-rejected"
 }) }
 )rut";
     const std::string path =
@@ -5253,16 +5253,16 @@ unmatched TRACE { return local_response({
 }
 
 TEST(serve_loader, no_pre_route_source_keeps_pre_route_table_neutral) {
-    const std::string path = write_file(
-        "/tmp/rut_serve_loader_pre_route_neutral",
-        "app.rut",
-        "unmatched OPTIONS { return local_response({ version: \"HTTP/1.1\", status: 400, "
-        "reason: \"Bad Request\", server: \"rut\", date: \"current\", content_type: "
-        "\"text/plain\", connection: \"request\", head_mode: \"reject\", body: b\"x\" }) }\n"
-        "route exact GET \"/static\" { return local_response({ version: \"HTTP/1.1\", "
-        "status: 400, reason: \"Bad Request\", server: \"rut\", date: \"current\", "
-        "content_type: \"text/plain\", connection: \"request\", head_mode: \"reject\", "
-        "body: b\"y\" }) }\n");
+    const std::string path =
+        write_file("/tmp/rut_serve_loader_pre_route_neutral",
+                   "app.rut",
+                   "unmatched OPTIONS { return local_response({ version: .http11, status: 400, "
+                   "reason: \"Bad Request\", server: \"rut\", date: .current, content_type: "
+                   "\"text/plain\", connection: .request, head_mode: .reject, body: b\"x\" }) }\n"
+                   "route exact GET \"/static\" { return local_response({ version: .http11, "
+                   "status: 400, reason: \"Bad Request\", server: \"rut\", date: .current, "
+                   "content_type: \"text/plain\", connection: .request, head_mode: .reject, "
+                   "body: b\"y\" }) }\n");
     LoadedProgram program;
     LoadError err;
     REQUIRE(load_rut_program(path.c_str(), program, err));
@@ -5673,10 +5673,10 @@ TEST(serve_loader, verified_get_framing_selection_owns_complete_buffering_after_
 
 TEST(serve_loader, fixed_302_source_deletion_preserves_owned_policy_and_jit_route) {
     const char source[] = R"rut(
-route GET "/old" { return redirect({scheme: "http", authority: "static",
-  static_authority: "redirect.example", port: "omit", path: "static",
-  query: "discard", date: "current", connection: "close",
-  header_order: "connection_then_location", status: 302,
+route GET "/old" { return redirect({scheme: .http, authority: .static,
+  static_authority: "redirect.example", port: .omit, path: .static,
+  query: .discard, date: .current, connection: .close,
+  header_order: .connectionThenLocation, status: 302,
   reason: "Moved Temporarily", server: "wire-test", content_type: "text/html",
   target_path: "/new", body: b"fixed-302"}) }
 )rut";
@@ -5708,10 +5708,10 @@ route GET "/old" { return redirect({scheme: "http", authority: "static",
     program.destroy();
 
     const char invalid_source[] = R"rut(
-route GET "/old" { return redirect({scheme: "http", authority: "static",
-  static_authority: "redirect.example", port: "omit", path: "static",
-  query: "discard", date: "current", connection: "close",
-  header_order: "connection_then_location", status: 303,
+route GET "/old" { return redirect({scheme: .http, authority: .static,
+  static_authority: "redirect.example", port: .omit, path: .static,
+  query: .discard, date: .current, connection: .close,
+  header_order: .connectionThenLocation, status: 303,
   reason: "See Other", server: "wire-test", content_type: "text/html",
   target_path: "/new", body: b"fixed-303"}) }
 )rut";
@@ -5758,23 +5758,23 @@ TEST(serve_loader, public_fixed_upload_head_jit_reaches_normal_dispatch) {
         const std::string route =
             test.route_method == kRouteMethodHead ? "route HEAD \"/one\"" : "route \"/one\"";
         const std::string content_length_position =
-            content_length_after_host ? "content_length_position: \"after_host\", " : "";
+            content_length_after_host ? "content_length_position: .afterHost, " : "";
         const std::string source =
             "upstream backend at \"127.0.0.1:9000\"\n" + route + R"rut( {
     return forward(backend,
-        request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
+        request_policy: { version: .http11, host: .upstream, connection: .omit,
             )rut" +
             content_length_position +
-            R"rut(strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-        response_policy: { version: "HTTP/1.1", framing: "content_length",
-            connection: "request", server: "source-test", date: "current",
-            head_mode: "suppress_body", hide_headers: [] },
-        failure_policy: { version: "HTTP/1.1", status: 502, reason: "Bad Gateway",
-            content_type: "text/plain", server: "source-test", date: "current",
-            connection: "request", head_mode: "suppress_body", body: b"bad" },
-        timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+            R"rut(strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+        response_policy: { version: .http11, framing: .contentLength,
+            connection: .request, server: "source-test", date: .current,
+            head_mode: .suppressBody, hide_headers: [] },
+        failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+            content_type: "text/plain", server: "source-test", date: .current,
+            connection: .request, head_mode: .suppressBody, body: b"bad" },
+        timeout_failure_policy: { version: .http11, status: 504,
             reason: "Gateway Time-out", content_type: "text/plain", server: "source-test",
-            date: "current", connection: "request", head_mode: "suppress_body", body: b"slow" },
+            date: .current, connection: .request, head_mode: .suppressBody, body: b"slow" },
         response_read_timeout: 5s)
 }
 )rut";

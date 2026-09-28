@@ -644,9 +644,9 @@ TEST(redirect_policy, publication_rejects_forged_ret_redirect_before_config_muta
 TEST(redirect_policy, source_redirect_reaches_owned_route_config) {
     const char source[] =
         "route GET \"/api\" { return redirect({"
-        "scheme: \"http\", authority: \"request_host\", port: \"actual_listener\", "
-        "path: \"static\", query: \"preserve_raw\", date: \"current\", "
-        "connection: \"close\", status: 301, reason: \"Moved Permanently\", "
+        "scheme: .http, authority: .requestHost, port: .actualListener, "
+        "path: .static, query: .preserveRaw, date: .current, "
+        "connection: .close, status: 301, reason: \"Moved Permanently\", "
         "server: \"nginx/1.29.7\", content_type: \"text/html\", "
         "target_path: \"/api/\", body: b\"OK\\n\\x00\"}) }\n";
     auto lexed = lex(source_lit(source));
@@ -683,9 +683,9 @@ TEST(redirect_policy, source_redirect_reaches_owned_route_config) {
 TEST(redirect_policy, fixed_source_reaches_rir_and_owned_route_config) {
     const char source[] =
         "route GET \"/old\" { return redirect({"
-        "scheme: \"http\", authority: \"static\", static_authority: \"redirect.example\", "
-        "port: \"omit\", path: \"static\", query: \"discard\", date: \"current\", "
-        "connection: \"close\", header_order: \"connection_then_location\", status: 301, "
+        "scheme: .http, authority: .static, static_authority: \"redirect.example\", "
+        "port: .omit, path: .static, query: .discard, date: .current, "
+        "connection: .close, header_order: .connectionThenLocation, status: 301, "
         "reason: \"Moved Permanently\", server: \"nginx/1.29.7\", "
         "content_type: \"text/html\", target_path: \"/new\", body: b\"fixed\"}) }\n";
     auto lexed = lex(source_lit(source));
@@ -725,9 +725,9 @@ TEST(redirect_policy, fixed_source_reaches_rir_and_owned_route_config) {
 TEST(redirect_policy, fixed_302_source_reaches_rir_and_owned_route_config) {
     const char source[] =
         "route GET \"/old\" { return redirect({"
-        "scheme: \"http\", authority: \"static\", static_authority: \"redirect.example\", "
-        "port: \"omit\", path: \"static\", query: \"discard\", date: \"current\", "
-        "connection: \"close\", header_order: \"connection_then_location\", status: 302, "
+        "scheme: .http, authority: .static, static_authority: \"redirect.example\", "
+        "port: .omit, path: .static, query: .discard, date: .current, "
+        "connection: .close, header_order: .connectionThenLocation, status: 302, "
         "reason: \"Moved Temporarily\", server: \"nginx/1.29.7\", "
         "content_type: \"text/html\", target_path: \"/new\", body: b\"fixed-302\"}) }\n";
     auto lexed = lex(source_lit(source));
