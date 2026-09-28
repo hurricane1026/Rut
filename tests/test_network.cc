@@ -61733,6 +61733,47 @@ TEST(response_buffering_runtime,
     cleanup_prebuilt_d2(loop, fixture);
 }
 
+#ifdef __linux__
+// Issue #5 evidence: before building any epoll-specific Bounded support,
+// establish whether CompleteContentLength with response_read_timeout
+// already fails on the epoll fallback today — a pre-existing limitation of
+// the explicit response-read-deadline machinery — or whether this is
+// something Bounded introduces. prepare_response_read_deadline_preflight_for_mode
+// (callbacks_impl.h) closes any route whose forward_preflight_mode can own
+// the runtime deadline unless Loop::kSupportsExplicitFirstResponseDeadline
+// is true; only IoUringEventLoop defines it (iouring_event_loop.h). This
+// gate is buffering-mode-agnostic — CompleteContentLength closes exactly the
+// same way Bounded would, so epoll-specific Bounded support is out of scope
+// (see callbacks.h's on_bounded_release_header_sent/_body_sent forward
+// declarations: "io_uring only").
+TEST(response_read_deadline_epoll_parity,
+     complete_content_length_response_read_timeout_route_closes_on_epoll_preflight) {
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodGet, &response_read_deadline_handler, false, /*preflight bundle=*/2));
+    REQUIRE_EQ(config.routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+
+    auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->init(0, -1).has_value());
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 sv[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+    conn->fd = sv[0];
+    conn->request_config = &config;
+
+    const bool admitted =
+        prepare_response_read_deadline_preflight(loop.get(), *conn, &config.routes[0], &config);
+
+    CHECK_FALSE(admitted);
+    CHECK_EQ(conn->fd, -1);
+    close(sv[1]);
+}
+#endif  // __linux__
+
 TEST(response_buffering_runtime,
      buffered_header_and_body_send_faults_close_without_publishing_failure_bytes) {
     enum class Fault : u8 { HeaderShort, HeaderError, BodyShort, BodyError };
