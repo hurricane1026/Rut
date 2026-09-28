@@ -74,6 +74,10 @@
     "ebpf-tools/rut-buffered-more": {
       "sha256": "a6893782982a4dcedeeb62535a6537db71eeaa8cd67059ad3829d59282fcef1a",
       "size": 19127072
+    },
+    "ebpf-tools/rut-proxy-final-fin": {
+      "sha256": "e34084b3026da79e8d644c7c74dc13132d0e425d9a793fc48eeb5b4a0794b765",
+      "size": 19127072
     }
   },
   "bulk_first_commit": "83e5d8a1",

@@ -345,3 +345,31 @@ MSG_MORE without attributing it to fewer send calls or a solved receive-copy
 gap. The code is retained in `187bd5d9`, after full network tests, socket stall
 checks, opposite-order baseline probes and guarded nginx comparison. The
 measured binary differs from final source only in comments and formatting.
+
+## Rejected: direct final proxy send and early FIN
+
+For a complete, closing plaintext Bounded response only, the prototype
+reused the local-response nonblocking final write plus early shutdown path,
+retaining the authenticated asynchronous completion. Exact-body preflights
+and warmup/load error checks passed in the diagnostic probe; full runtime
+tests were not run for this discarded variant. Relative to buffered-more:
+
+| Cell | Mean RPS change |
+|---|---:|
+| 1m-c128-close | -0.01% |
+| 1m-c32-close | +2.44% |
+| 64k-c1-close | +0.88% |
+| 64k-c1-keepalive | +0.39% |
+
+The c32 samples had substantial variation, c128 was effectively flat, and
+the small-close gain was below 1%. This does not justify the additional
+branch and ownership conditions; the prototype was reverted.
+
+A quick diagnostic now covers all 96 coordinates using the retained
+`187bd5d9` runtime, native-body static and converter-strict proxy profiles.
+Its 1-repeat, 2-second samples are explicitly ineligible for acceptance.
+The first launch was rejected by CPU-affinity validation before any load:
+pinning the matrix driver to CPU 6 hid CPUs 2–5 from its available-CPU check.
+The corrected r2 leaves driver affinity unrestricted while retaining the
+harness's explicit server/origin/client pinning and per-sample host guards.
+Results are pending; no matrix pass is claimed.
