@@ -1024,3 +1024,19 @@ The additional direct-header ownership test passes all 96 checks (foreign episod
 ## Successful plaintext shutdown deduplication prototype
 
 The earlier eBPF trace observed excess front tcp_shutdown calls at c1. This independent prototype records successful plaintext SHUT_WR until connection reset, skips a repeated call in the normal completion close path, and preserves retry after failure. It does not move Send completion accounting. The existing CombinedSend EOF regression additionally checks that the successful early shutdown is recorded. Full network regression passes; causal and eBPF comparisons are running/queued. A process-wide sys_enter_shutdown counter complements front tcp_shutdown counters, because early-returning syscalls may not reach that kernel function. No performance or retention claim yet.
+
+## Shutdown deduplication first control
+
+All 28 samples finish with clean exact-body/warm/load checks.
+
+| Case | Mean RPS change | Baseline system us/request | Candidate system us/request |
+|---|---:|---:|---:|
+| 1024-c1-close | +0.38% | 54.08 | 52.18 |
+| 1024-c32-close | +0.25% | 31.57 | 31.70 |
+| 16-c1-close | -0.01% | 53.66 | 52.08 |
+| 16-c1-keepalive | -0.05% | 41.69 | 41.19 |
+| 16-c32-close | +0.49% | 31.73 | 31.58 |
+| 65536-c1-close | +0.00% | 70.39 | 70.25 |
+| 65536-c1-keepalive | +0.20% | 58.57 | 57.93 |
+
+Small c1 system CPU savings require reverse-order confirmation; throughput is essentially flat. eBPF shutdown counting is in progress. A separate accepted-runtime/nginx 64 KiB recv-attempt trace is queued to distinguish header and body request lengths and EAGAIN outcomes before considering body POLL_FIRST.
