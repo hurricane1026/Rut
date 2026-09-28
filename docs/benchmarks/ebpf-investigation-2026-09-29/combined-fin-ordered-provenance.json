@@ -10,5 +10,5 @@
     "passed": 1,
     "checks": 21
   },
-  "performance": "both orders and nginx acceptance pending"
+  "performance": "both causal orders complete; formal small proxy 12/12 valid, 8/12 meet ratio >=1.10; full matrix pending"
 }

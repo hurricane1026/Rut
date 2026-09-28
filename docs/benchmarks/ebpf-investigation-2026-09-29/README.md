@@ -927,3 +927,24 @@ Corrected forward-order controls also completed with 28 valid samples, exact-bod
 | 65536-c1-keepalive | -0.71% |
 
 Both orders retain the closing-small-response gain; excluded-path controls show up to about 1% negative variation. The nginx 12-coordinate acceptance run has now started. Runtime retention awaits its result and formatting gate.
+
+## Corrected CombinedSend FIN: formal small-proxy acceptance
+
+All 12 HTTP cells complete, with three valid 5-second samples per engine, clean warmup/load and response checks. Exit 2 reflects the unmet performance target, not invalid measurement. Eight cells meet the 1.10 ratio; all four c1 cells remain below the target. No full 96-coordinate success is claimed.
+
+| Bytes | Scenario | Concurrency | Rut/nginx median RPS | Target |
+|---|---|---:|---:|---|
+| 16 | proxy-close | 1 | 1.0238 | below 1.10 |
+| 16 | proxy-close | 32 | 1.2064 | pass |
+| 16 | proxy-close | 128 | 1.3077 | pass |
+| 16 | proxy-keepalive | 1 | 1.0022 | below 1.10 |
+| 16 | proxy-keepalive | 32 | 1.1866 | pass |
+| 16 | proxy-keepalive | 128 | 1.3841 | pass |
+| 1024 | proxy-close | 1 | 1.0283 | below 1.10 |
+| 1024 | proxy-close | 32 | 1.2083 | pass |
+| 1024 | proxy-close | 128 | 1.2672 | pass |
+| 1024 | proxy-keepalive | 1 | 1.0010 | below 1.10 |
+| 1024 | proxy-keepalive | 32 | 1.1863 | pass |
+| 1024 | proxy-keepalive | 128 | 1.3564 | pass |
+
+Both causal orders and the full 1425-test network regression support retaining this closing-small-response optimization. CPU profiling of the corrected binary and front-socket shutdown cost comparison with nginx follow under the same benchmark lock.
