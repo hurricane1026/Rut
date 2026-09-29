@@ -1,0 +1,17 @@
+[1/3] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/io_uring_backend.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/io_uring_backend.cc:7:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/response_read_deadline.h:7:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/runtime/io_uring_backend.cc:290:5: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  290 |     TRY_VOID(setup_buf_ring());
+      |     ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:453:44: note: expanded from macro 'TRY_VOID'
+  453 | #define TRY_VOID(expr) TRY_VOID_IMPL(expr, __COUNTER__)
+      |                                            ^
+2 warnings generated.
+[2/3] Linking CXX static library src/librut_runtime.a
+[3/3] Linking CXX executable src/rut

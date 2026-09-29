@@ -1391,3 +1391,7 @@ Completed 1 MiB close controls have clean exact-body preflight and warm/load err
 - 1048576-c32-close: -5.84%.
 
 At c32, user CPU stays around 21 us/request but system CPU rises to about 303 from 291–294 us/request. Earlier synchronous receive timing alone does not improve this target. The staging experiment's much larger user-CPU cost is consistent with the extra copy, but both variants also change receive timing and we do not claim a fully isolated cache-cost measurement. Stop after the completed controls (intentional SIGINT, driver exit 130); incomplete c128 is excluded. No full network regression was run for this rejected candidate. Runtime edit reverted; retained runtime baseline remains unchanged. Rebuild accepted source before any further measurements using build-rel.
+
+## Accepted build restored after receive controls
+
+After reverting both receive prototypes, `git diff 271cd98c -- include src` is empty. The rebuilt `build-rel/src/rut` SHA256 is `4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a`, exactly matching the frozen accepted `rut-combined-fin-ordered`. Rebuild succeeds; no new regression-suite claim is made. Docker benchmark containers and listeners 8987/9987 are cleared. The user-owned untracked bounded-laggards evidence was not changed.
