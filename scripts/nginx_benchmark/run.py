@@ -20,7 +20,6 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SHARD_LIMITS = ROOT / "include/rut/common/shard_limits.h"
 SCENARIOS = ("static-close", "static-keepalive", "proxy-close", "proxy-keepalive")
 ERROR_NAMES = ("connect", "read", "write", "status", "timeout")
 # Keep aligned with the converter's safe quoted return-body profile.
@@ -446,6 +445,23 @@ class Harness:
                 time.sleep(0.1)
         raise RuntimeError(f"listener {port} did not become ready")
 
+    @staticmethod
+    def rut_shards_ready(log, pid, workers):
+        # The binary under test clamps --shards to its own kMaxShards, so trust
+        # its startup report rather than the checkout's source constant.
+        pattern = re.compile(rb"^Listening on port \d+ with (\d+) shard\(s\)$", re.M)
+        for _ in range(100):
+            match = pattern.search(log.read_bytes())
+            if match:
+                if int(match[1]) != workers:
+                    raise RuntimeError(
+                        f"RUT started {int(match[1])} shard(s), expected {workers}")
+                return
+            if not Path(f"/proc/{pid}").exists():
+                raise RuntimeError("RUT exited before reporting its shard count")
+            time.sleep(0.1)
+        raise RuntimeError("RUT did not report its shard count")
+
     @contextlib.contextmanager
     def nginx(self, name, config, cpu, port):
         # Capture the ID before start/inspect/readiness so failures still clean up.
@@ -526,10 +542,12 @@ class Harness:
             argv += [str(a.front_port), "--tls-cert", str(a.tls_cert), "--tls-key", str(a.tls_key)]
         self.commands.append(argv)
         save_json(self.out / "commands.json", self.commands)
-        with (self.out / (label + "-server.log")).open("w") as log:
+        server_log = self.out / (label + "-server.log")
+        with server_log.open("w") as log:
             proc = subprocess.Popen(argv, stdout=log, stderr=log)
         try:
             self.ready(a.front_port, proc.pid)
+            self.rut_shards_ready(server_log, proc.pid, a.workers)
             yield proc.pid
             if proc.poll() is not None:
                 raise RuntimeError(f"RUT exited unexpectedly: {proc.returncode}")
@@ -1040,7 +1058,7 @@ def add_cpu_arguments(parser):
 
 
 def normalize_cpu_arguments(parser, args):
-    """Canonicalize and validate the worker mask against Rut's shard cap."""
+    """Canonicalize the worker mask; the Rut shard cap is checked at startup."""
     if type(args.workers) is not int or args.workers < 1:
         parser.error("workers must be a positive integer")
     try:
@@ -1054,13 +1072,6 @@ def normalize_cpu_arguments(parser, args):
         parser.error("--workers greater than one requires --server-cpus")
     if args.workers != len(server_cpus):
         parser.error("workers must equal the number of server CPUs")
-    try:
-        shard_header = SHARD_LIMITS.read_text()
-        max_shards = int(re.search(r"kMaxShards\s*=\s*(\d+)", shard_header)[1])
-    except (OSError, TypeError, AttributeError, ValueError):
-        parser.error(f"cannot read runtime shard limit from {SHARD_LIMITS}")
-    if args.workers > max_shards:
-        parser.error(f"workers must not exceed runtime shard limit {max_shards}")
     args.server_cpus = ",".join(map(str, server_cpus))
     args.server_cpu = server_cpus[0]
     return args

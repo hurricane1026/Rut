@@ -238,8 +238,10 @@ converter compatibility. Original HTTP output stays unmodified.
 Use `--server-cpus 2,6 --workers 2` to run both frontends with two workers
 on two distinct physical cores. `--workers` defaults to 1, and the legacy
 `--server-cpu N` form remains the single-worker default. Worker count must match
-the server mask and stay within Rut's runtime shard limit. Rut receives the full
-mask with `--shards N --no-pin`; nginx uses the same CPU mask and worker count.
+the server mask. Rut receives the full mask with `--shards N --no-pin`, and the
+run fails unless the selected binary reports starting exactly N shards (a binary
+clamps `--shards` to its own compiled limit); nginx uses the same CPU mask and
+worker count.
 The origin remains pinned to its separate single CPU and one nginx worker.
 CPU usage remains the aggregate process and child usage; it is not divided by
 the worker count. Matrix reports keep each worker count and CPU topology in its

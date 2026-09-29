@@ -175,19 +175,15 @@ class ToolsTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--server-cpu=2", "--server-cpus=2", "--origin-cpu=3",
                                "--client-cpus=4"])
-        with tempfile.TemporaryDirectory() as directory:
-            limits = Path(directory) / "shard_limits.h"
-            limits.write_text("inline constexpr u32 kMaxShards = 2;\n")
-            with mock.patch.object(run, "SHARD_LIMITS", limits):
-                args = SimpleNamespace(server_cpu=None, server_cpus="02, 03", workers=2)
-                run.normalize_cpu_arguments(parser, args)
-                self.assertEqual(args.server_cpus, "2,3")
-                for mask, workers in (("2,02", 2), ("2,,3", 2), ("2,3", 1),
-                                      ("2,3,4", 3), ("2,3", True)):
-                    with self.subTest(mask=mask, workers=workers), \
-                            contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                        run.normalize_cpu_arguments(parser, SimpleNamespace(
-                            server_cpu=None, server_cpus=mask, workers=workers))
+        args = SimpleNamespace(server_cpu=None, server_cpus="02, 03", workers=2)
+        run.normalize_cpu_arguments(parser, args)
+        self.assertEqual(args.server_cpus, "2,3")
+        for mask, workers in (("2,02", 2), ("2,,3", 2), ("2,3", 1),
+                              ("2,3,4", 4), ("2,3", True)):
+            with self.subTest(mask=mask, workers=workers), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                run.normalize_cpu_arguments(parser, SimpleNamespace(
+                    server_cpu=None, server_cpus=mask, workers=workers))
 
     def test_matrix_normalizes_and_forwards_worker_topology_before_child(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -242,8 +238,11 @@ class ToolsTest(unittest.TestCase):
                 proc.poll.return_value = None
                 with mock.patch.object(run.subprocess, "Popen", return_value=proc) as popen, \
                         mock.patch.object(harness, "ready"), \
+                        mock.patch.object(harness, "rut_shards_ready") as shards_ready, \
                         harness.frontend("rut", "proxy", f"case-{workers}"):
                     pass
+                shards_ready.assert_called_once_with(
+                    out / f"case-{workers}-server.log", proc.pid, workers)
                 argv = popen.call_args.args[0]
                 self.assertEqual(argv[0:3], ["taskset", "-c", mask])
                 self.assertEqual(argv[argv.index("--shards") + 1], str(workers))
@@ -252,6 +251,21 @@ class ToolsTest(unittest.TestCase):
                     self.assertEqual(argv, ["taskset", "-c", "2", str(rut),
                                             str(out / "proxy.rut"), "--shards", "1",
                                             "--no-pin", "--drain", "1", "--opt", "2"])
+
+    def test_rut_shard_count_comes_from_the_selected_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "server.log"
+            pid = os.getpid()
+            log.write_text("TLS: enabled\nListening on port 8087 with 2 shard(s)\n")
+            Harness.rut_shards_ready(log, pid, 2)
+            # A binary with a smaller compiled cap clamps --shards silently.
+            log.write_text("Listening on port 8087 with 1 shard(s)\n")
+            with self.assertRaisesRegex(RuntimeError, "started 1 shard"):
+                Harness.rut_shards_ready(log, pid, 2)
+            log.write_text("")
+            with mock.patch.object(run.Path, "exists", return_value=False), \
+                    self.assertRaisesRegex(RuntimeError, "exited before reporting"):
+                Harness.rut_shards_ready(log, pid, 2)
 
     def test_nginx_container_uses_complete_server_mask(self):
         with tempfile.TemporaryDirectory() as directory:
