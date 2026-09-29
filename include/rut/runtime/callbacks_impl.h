@@ -1011,8 +1011,9 @@ inline bool inspect_response_read_deadline_coalesced_get_phase1(const Connection
         conn.req_initial_send_len != conn.req_header_end ||
         conn.req_initial_send_len >= conn.recv_buf.len() ||
         conn.req_initial_send_len > conn.recv_buf.capacity() ||
-        conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.h2 != nullptr ||
-        conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        conn.protocol != ConnProtocol::Http11 ||
+        (conn.tls_active && !response_read_deadline_tls_http11_engine_is_stable(conn)) ||
+        conn.h2 != nullptr || conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
         !response_read_deadline_default_persistence_is_stable(conn) ||
         conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
@@ -1287,7 +1288,10 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
                    conn.tls_pending_on_recv == nullptr);
         const bool tls_bodyless_get_precise_preflight =
             !conn.tls_active ||
-            (exact_bodyless_get_precise_preflight &&
+            ((exact_bodyless_get_precise_preflight ||
+              (complete_buffering && route->method == kRouteMethodGet &&
+               conn.recv_buf.len() > conn.req_initial_send_len &&
+               inspect_response_read_deadline_coalesced_get_phase1(conn))) &&
              response_read_deadline_tls_http11_engine_is_stable(conn) &&
              tls_recv_callback_is_current<Loop>(conn) && tls_preflight_pending_recv_stable &&
              conn.tls_raw_send_owner_is_neutral() && conn.tls_single_shot_send_owner_is_neutral() &&
@@ -2200,7 +2204,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // settled boundary at a time with no depth limit.
     const bool successor_has_suffix = conn.req_initial_send_len != 0 && !conn.req_malformed &&
                                       conn.recv_buf.len() > conn.req_initial_send_len;
-    if (complete_pipeline_request && (successor_has_suffix || conn.pipeline_depth >= 2) &&
+    // TLS has no depth-1 token path at all, so a settled TLS successor always
+    // re-bases.
+    if (complete_pipeline_request &&
+        (successor_has_suffix || conn.pipeline_depth >= 2 || conn.tls_active) &&
         conn.http1_pipeline_boundary_owners_settled &&
         http1_pipeline_predecessor_owners_are_settled(conn)) {
         conn.pipeline_depth = 0;
@@ -3932,7 +3939,7 @@ void handle_jit_outcome(Loop* loop,
                     conn.resp_header_mutation_pending_overflow ||
                     conn.resp_header_mutation_overflow || conn.protocol != ConnProtocol::Http11 ||
                     (conn.tls_active &&
-                     (!bodyless_get_materialization ||
+                     (!(bodyless_get_materialization || coalesced_get) ||
                       !response_read_deadline_tls_http11_engine_is_stable(conn))) ||
                     !http1_pipeline_request_generation_jit_candidate_is_stable(
                         conn,
@@ -3953,8 +3960,9 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 tls_complete_get_deadline_outcome_valid =
-                    conn.tls_active && bodyless_get_materialization && request_policy_valid &&
-                    target_valid && response_read_deadline_tls_http11_engine_is_stable(conn);
+                    conn.tls_active && (bodyless_get_materialization || coalesced_get) &&
+                    request_policy_valid && target_valid &&
+                    response_read_deadline_tls_http11_engine_is_stable(conn);
                 if (fixed_upload) {
                     auto& proof = conn.response_read_deadline_upload;
                     if ((proof.upstream_id != 0xffffu &&

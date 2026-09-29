@@ -40822,6 +40822,118 @@ TEST(tls_iouring, strict_bodyless_get_tls_preflight_reaches_precise_owner) {
     }
 }
 
+TEST(tls_iouring, coalesced_bodyless_get_stashes_successor_and_begins_tls_504) {
+    // A pipelined HTTPS request 1 is admitted through the TLS bridge as a
+    // coalesced depth-0 GET: only request 1 is rewritten and uploaded, request
+    // 2 moves to the stash, and the TLS read-timeout 504 still begins with that
+    // stash in place.
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    static constexpr u8 kRequest1[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr u8 kRequest2[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    constexpr u32 kRequest1Len = sizeof(kRequest1) - 1u;
+    constexpr u32 kRequest2Len = sizeof(kRequest2) - 1u;
+
+    for (const RequestPolicyId policy :
+         {RequestPolicyId::Http11FixedStrip, RequestPolicyId::Http11FixedTrimSpPreserveHtab}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(/*capacity=*/2));
+        IoUringEventLoop& loop = *guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        REQUIRE(config.add_jit_handler(
+            "/one", kRouteMethodGet, &response_read_deadline_handler, false, 2));
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+
+        PrebuiltD2Fixture fixture{};
+        Connection* conn_ptr = loop.alloc_conn();
+        REQUIRE(conn_ptr != nullptr);
+        Connection& conn = *conn_ptr;
+        fixture.conn = conn_ptr;
+        fixture.sq_tail_before = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+        fixture.backend_pending_before = loop.backend.pending;
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+        conn.fd = downstream[0];
+        fixture.peer_fd = downstream[1];
+        REQUIRE_EQ(conn.recv_buf.write(kRequest1, kRequest1Len), kRequest1Len);
+        REQUIRE_EQ(conn.recv_buf.write(kRequest2, kRequest2Len), kRequest2Len);
+        capture_request_metadata(conn);
+        conn.keep_alive = true;
+        conn.req_start_us = monotonic_us();
+        conn.handler_gen = 1;
+        conn.request_config = &config;
+        loop.tls_server = context.get();
+        REQUIRE(loop.tls_setup(conn));
+        REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+        conn.tls_handshake_complete = true;
+        conn.tls_pending_on_recv = &on_header_received<IoUringEventLoop>;
+
+        REQUIRE(prepare_response_read_deadline_preflight(&loop, conn, &config.routes[0], &config));
+        CHECK_EQ(conn.response_read_deadline_upload.raw_total_length, kRequest1Len);
+        conn.tls_pending_on_recv = nullptr;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        outcome.request_policy_id = static_cast<u16>(policy);
+        outcome.policy_bundle_id = 2;
+        handle_jit_outcome<IoUringEventLoop>(
+            &loop, conn, outcome, &response_read_deadline_handler, false);
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Validated);
+        REQUIRE(conn.upstream_connect_armed);
+        fixture.episode = conn.upstream_episode;
+        loop.dispatch({conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, fixture.episode});
+        REQUIRE(conn.upstream_send_armed);
+
+        auto& send = loop.backend.upstream_send_state[conn.id];
+        const char* expected_wire =
+            policy == RequestPolicyId::Http11FixedTrimSpPreserveHtab
+                ? "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n"
+                : "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: keep\r\n\r\n";
+        const u32 expected_len = static_cast<u32>(__builtin_strlen(expected_wire));
+        REQUIRE_EQ(send.remaining, expected_len);
+        CHECK_EQ(__builtin_memcmp(send.src, expected_wire, expected_len), 0);
+        const u32 sent_len = send.remaining;
+        send.offset = sent_len;
+        send.remaining = 0;
+        loop.dispatch({conn.id,
+                       static_cast<i32>(sent_len),
+                       0,
+                       0,
+                       IoEventType::UpstreamSend,
+                       0,
+                       0,
+                       fixture.episode});
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE_EQ(conn.pipeline_stash_len, kRequest2Len);
+        CHECK_EQ(__builtin_memcmp(conn.send_buf.data(), kRequest2, kRequest2Len), 0);
+        CHECK(response_read_deadline_tls_complete_get_profile_is_stable(conn));
+
+        // A coalesced layout is timed by the connection wheel, not the precise
+        // ring timer, so the wheel expiry enters ExpiryPending directly.
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+        REQUIRE(try_prebuilt_strict_read_timeout(&loop, conn));
+        REQUIRE_GE(conn.fd, 0);
+        CHECK_EQ(conn.resp_status, 504u);
+        CHECK_EQ(conn.http1_prebuilt_response_purpose,
+                 Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+        CHECK_EQ(conn.pipeline_stash_len, kRequest2Len);
+        cleanup_prebuilt_d2(&loop, fixture);
+    }
+}
+
 void complete_staged_tls_prebuilt_send(ScopedTlsRawSendLoop& guard,
                                        Connection& conn,
                                        u32 raw_generation,

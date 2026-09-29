@@ -1599,8 +1599,20 @@ public:
                        c.http1_prebuilt_wait == 0 && c.http1_prebuilt_request_prefix_len == 0 &&
                        !c.http1_boundary_deferred && !c.http1_boundary_ready &&
                        c.http1_boundary_successor_episode == 0);
+        // A coalesced request 1 keeps its pipelined successor in the stash; the
+        // copied deadline proof re-proves that stash exactly as plaintext does.
+        const bool stash_stable =
+            c.pipeline_stash_len == 0 ||
+            response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable(
+                c,
+                c.http1_prebuilt_deadline_upload,
+                c.http1_prebuilt_deadline_profile,
+                bundle.response_buffering,
+                c.http1_prebuilt_deadline_bundle_id,
+                c.http1_prebuilt_deadline_method,
+                c.http1_prebuilt_deadline_route_method);
         return phase_state && c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
-               c.pipeline_stash_len == 0 &&
+               stash_stable &&
                forward_response_buffering_uses_content_length_machinery(
                    bundle.response_buffering) &&
                bodyless_get_complete_content_length_request_policy_is_admitted(
