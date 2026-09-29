@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Watchdog"
+  short_description: "持续并行处理多个 PR 的 review、CI 与 rebase"
+  default_prompt: "Use $pr-watchdog for these PR IDs: <IDs>."
