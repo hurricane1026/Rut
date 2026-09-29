@@ -2205,6 +2205,8 @@ public:
                                                          const IoEvent& ev,
                                                          ResponseReadDeadlineSendKind kind) const {
         if (c.id >= connection_capacity) return false;
+        if (kind == ResponseReadDeadlineSendKind::Body && c.buffered_response_front_is_pipe())
+            return response_body_pipe_send_completion_is_valid(c, ev, true);
         Connection::Callback expected_callback = nullptr;
         switch (kind) {
             case ResponseReadDeadlineSendKind::None:
@@ -2855,6 +2857,7 @@ public:
         auto* owner = c.response_body_pipe;
         if (!owner) return;
         owner->closing = true;
+        if (owner->send.kind != ResponseBodyPipeOwner::SendKind::None) c.send_armed = false;
         // Only raw pipe targets retire through the pipe ledger. A positive
         // input already translated to UpstreamRecv has targets[0]==0 and must
         // retain the ordinary recv custody until that queued event dispatches.
@@ -2882,6 +2885,109 @@ public:
                 close_response_body_pipe(conns[i]);
     }
 
+    bool response_body_pipe_send_frame_is_current(const Connection& c, bool terminal) const {
+        const auto* p = c.response_body_pipe;
+        if (!p || p->closing || c.id >= connection_capacity || c.fd < 0 || p->conn_id != c.id ||
+            p->downstream_fd != c.fd || c.tls_active || c.h2 ||
+            c.protocol != ConnProtocol::Http11 || !c.buffered_response_front_is_pipe() ||
+            c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            !c.response_read_deadline_bounded_header_sent ||
+            c.response_read_deadline_post_commit_response_class !=
+                CompleteContentLengthResponseClass::BoundedPositiveBody ||
+            p->deadline_generation != c.response_read_deadline_generation ||
+            p->deadline_generation != c.response_read_deadline_post_commit_generation ||
+            p->upstream_episode != c.response_read_deadline_post_commit_episode ||
+            p->profile != static_cast<u8>(c.response_read_deadline_profile) ||
+            p->method != c.response_read_deadline_method ||
+            !response_read_deadline_send_fields_are_neutral(c) || c.send_progress != 0 ||
+            !response_read_deadline_post_commit_is_stable(c))
+            return false;
+        return terminal
+                   ? c.response_read_deadline_post_commit_phase ==
+                             ResponseReadDeadlinePostCommitPhase::BodySend &&
+                         c.on_send == &on_response_body_sent<Self> &&
+                         c.upstream_send_len == c.response_read_deadline_post_commit_inflight_body
+                   : c.response_read_deadline_post_commit_phase ==
+                             ResponseReadDeadlinePostCommitPhase::Buffering &&
+                         c.on_send == &on_bounded_release_body_sent<Self> &&
+                         response_body_pipe_receive_identity_is_current(c);
+    }
+
+    bool response_body_pipe_send_completion_is_valid(const Connection& c,
+                                                     const IoEvent& ev,
+                                                     bool terminal) const {
+        if (!response_body_pipe_send_frame_is_current(c, terminal)) return false;
+        const auto& p = *c.response_body_pipe;
+        return p.send.kind == (terminal ? ResponseBodyPipeOwner::SendKind::Terminal
+                                        : ResponseBodyPipeOwner::SendKind::Release) &&
+               p.send.delivering && p.send.serial != 0 && p.send.total != 0 &&
+               p.send.completed == p.send.total && p.direction_idle(false) && !c.send_armed &&
+               c.upstream_send_len == p.send.total && ev.type == IoEventType::Send &&
+               ev.conn_id == c.id && ev.result > 0 && static_cast<u32>(ev.result) == p.send.total &&
+               ev.non_upstream_generation == p.send.serial && ev.aux == 0 && !ev.more &&
+               !ev.has_buf && ev.buf_id == 0 && ev.upstream_episode == 0 &&
+               ev.copy_witness == IoEventCopyWitness::None && ev.copy_deadline_generation == 0 &&
+               ev.copy_deadline_profile == 0 && ev.copy_deadline_method == 0xff &&
+               ev.copy_begin == 0 && ev.copy_end == 0 && !ev.provided_ring_empty &&
+               !ev.sock_nonempty;
+    }
+
+    bool queue_response_body_pipe_output(Connection& c) {
+        auto& p = *c.response_body_pipe;
+        if (p.closing || p.send.kind == ResponseBodyPipeOwner::SendKind::None ||
+            p.send.delivering || p.send.completed >= p.send.total || !p.direction_idle(false))
+            return false;
+        ResponseBodyPipe::Operation op{};
+        const u32 remaining = p.send.total - p.send.completed;
+        if (!p.storage.reserve_output(remaining, &op)) return false;
+        if (op.limit != remaining || !backend.add_body_pipe_splice(c.fd, c.id, p.storage, false)) {
+            (void)p.storage.rollback_output(op.serial);
+            return false;
+        }
+        (void)p.own_target(BodyPipeOperation::Output, op.serial);
+        if (p.send.serial == 0) p.send.serial = op.serial;
+        ++c.pending_ops;
+        return true;
+    }
+
+    bool submit_response_body_pipe_send(Connection& c, u32 length, bool terminal) {
+        if (!response_body_pipe_send_frame_is_current(c, terminal) || c.send_armed || length == 0 ||
+            length > static_cast<u32>(INT32_MAX) || c.upstream_send_len != length)
+            return false;
+        auto& p = *c.response_body_pipe;
+        if (p.send.kind != ResponseBodyPipeOwner::SendKind::None || !p.direction_idle(false) ||
+            length > p.storage.bytes)
+            return false;
+        if (!terminal) {
+            const u32 target =
+                bounded_response_release_bytes(c.response_read_deadline_post_commit_raw_header_end,
+                                               c.response_read_deadline_post_commit_origin_received,
+                                               false);
+            if (target < c.response_read_deadline_bounded_released ||
+                length > target - c.response_read_deadline_bounded_released)
+                return false;
+        }
+        p.send.kind = terminal ? ResponseBodyPipeOwner::SendKind::Terminal
+                               : ResponseBodyPipeOwner::SendKind::Release;
+        p.send.total = length;
+        if (!queue_response_body_pipe_output(c)) {
+            p.send = {};
+            return false;
+        }
+        c.send_armed = true;
+        return true;
+    }
+
+    bool wait_response_body_pipe_output_ready(Connection& c) {
+        auto& p = *c.response_body_pipe;
+        if (!p.direction_idle(false) || p.storage.sequence == UINT32_MAX) return false;
+        const u32 serial = ++p.storage.sequence;
+        if (!backend.add_body_pipe_poll(c.fd, c.id, serial, false)) return false;
+        (void)p.own_target(BodyPipeOperation::OutputReady, serial);
+        ++c.pending_ops;
+        return true;
+    }
+
     void dispatch_body_pipe_transport(const IoEvent& event) {
         if (event.conn_id >= connection_capacity) return;
         auto& c = conns[event.conn_id];
@@ -2889,11 +2995,44 @@ public:
         if (!owner || c.pending_ops == 0 || !owner->retire(event)) return;
         --c.pending_ops;
         refresh_body_pipe_cancel_retry(*owner);
-        // This stage wires teardown only. Before adding a live response
-        // caller, replace this fail-closed branch with authenticated semantic
-        // receive/send progress (including batch deadline arbitration).
-        if (!owner->closing && c.fd >= 0) close_conn(c);
-        reclaim_pending();
+        if (owner->closing || c.fd < 0) {
+            reclaim_pending();
+            return;
+        }
+        const auto operation = static_cast<BodyPipeOperation>(event.aux);
+        const bool terminal = owner->send.kind == ResponseBodyPipeOwner::SendKind::Terminal;
+        if ((operation != BodyPipeOperation::Output &&
+             operation != BodyPipeOperation::OutputReady) ||
+            owner->send.kind == ResponseBodyPipeOwner::SendKind::None || !c.send_armed ||
+            !response_body_pipe_send_frame_is_current(c, terminal)) {
+            close_conn(c);
+            return;
+        }
+        if (operation == BodyPipeOperation::Output && event.result == -EAGAIN) {
+            if (!wait_response_body_pipe_output_ready(c)) close_conn(c);
+            return;
+        }
+        if (event.result <= 0) {
+            close_conn(c);
+            return;
+        }
+        if (owner->send.completed != owner->send.total) {
+            if (!queue_response_body_pipe_output(c)) close_conn(c);
+            return;
+        }
+        // Deliver exactly once, directly to the authenticated continuation.
+        // No ordinary memory SendState or source pointer is fabricated.
+        c.send_armed = false;
+        owner->send.delivering = true;
+        IoEvent logical{};
+        logical.conn_id = c.id;
+        logical.type = IoEventType::Send;
+        logical.result = static_cast<i32>(owner->send.total);
+        logical.non_upstream_generation = owner->send.serial;
+        auto callback = c.on_send;
+        callback(this, c, logical);
+        // The callback may release this owner or start a successor frame.
+        return;
     }
 
     void reclaim_slot(u32 cid) {
@@ -5144,7 +5283,8 @@ public:
         // the established header-then-body path without staging any bytes.
         enum class CombinedSendEligibility : u8 { Eligible, Fallback, Invalid };
         const auto combined_send_eligibility = [&]() {
-            if (c.response_body_tail.size != 0) return CombinedSendEligibility::Fallback;
+            if (c.response_body_tail.size != 0 || c.response_body_pipe != nullptr)
+                return CombinedSendEligibility::Fallback;
             if (disposition != CompleteContentLengthTerminalDisposition::CompleteBody ||
                 terminal_owner != nullptr || received != declared || declared == 0 ||
                 c.response_read_deadline_post_commit_response_class !=
@@ -5439,6 +5579,8 @@ public:
         // no partial-record tail to avoid in the first place — dropped.
         c.upstream_send_len = avail;
         c.transition_to_sending(&on_bounded_release_body_sent<Self>);
+        if (c.buffered_response_front_is_pipe())
+            return submit_response_body_pipe_send(c, avail, false);
         return submit_send(c, c.buffered_response_data(), avail);
     }
 

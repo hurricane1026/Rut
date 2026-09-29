@@ -9,6 +9,24 @@ namespace rut {
 // includes readiness and cancellation SQEs which also pin the connection slot.
 struct ResponseBodyPipeOwner {
     ResponseBodyPipe storage{};
+    enum class SendKind : u8 { None, Release, Terminal };
+    struct SendFrame {
+        u32 serial = 0;
+        u32 total = 0;
+        u32 completed = 0;
+        SendKind kind = SendKind::None;
+        bool delivering = false;
+    } send{};
+
+    u32 logical_bytes() const { return storage.bytes + send.completed; }
+    bool acknowledge_send(u32 serial, u32 length) {
+        if (closing || !send.delivering || send.kind == SendKind::None || serial == 0 ||
+            serial != send.serial || length != send.total || send.completed != send.total ||
+            !direction_idle(false))
+            return false;
+        send = {};
+        return true;
+    }
     u32 conn_id = 0;
     i32 downstream_fd = -1;
     i32 upstream_fd = -1;
@@ -32,7 +50,7 @@ struct ResponseBodyPipeOwner {
         return targets[i] == 0 && targets[i + 2] == 0 && cancels[i] == 0 && cancels[i + 2] == 0;
     }
     bool busy() const {
-        if (storage.busy()) return true;
+        if (storage.busy() || (!closing && send.kind != SendKind::None)) return true;
         for (u32 i = 0; i < 4; ++i)
             if (targets[i] || cancels[i]) return true;
         return false;
@@ -78,7 +96,15 @@ struct ResponseBodyPipeOwner {
         }
         if (targets[i] != serial) return false;
         if (i == 0 && !storage.complete_input(serial, event.result)) return false;
-        if (i == 1 && !storage.complete_output(serial, event.result)) return false;
+        if (i == 1) {
+            if (send.kind != SendKind::None && event.result > 0 &&
+                (send.completed > send.total ||
+                 static_cast<u32>(event.result) > send.total - send.completed))
+                return false;
+            if (!storage.complete_output(serial, event.result)) return false;
+            if (send.kind != SendKind::None && event.result > 0)
+                send.completed += static_cast<u32>(event.result);
+        }
         targets[i] = 0;
         cancel_attempted &= static_cast<u8>(~(1u << i));
         return true;

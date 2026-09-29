@@ -8265,6 +8265,17 @@ template <typename Loop>
 void on_bounded_release_body_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     const u32 sent = conn.upstream_send_len;
+    if (conn.buffered_response_front_is_pipe()) {
+        bool valid = false;
+        if constexpr (requires(const Loop* l, const Connection& c, const IoEvent& event) {
+                          l->response_body_pipe_send_completion_is_valid(c, event, false);
+                      })
+            valid = loop->response_body_pipe_send_completion_is_valid(conn, ev, false);
+        if (!valid) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
     if (ev.result <= 0 ||
         conn.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
         conn.response_read_deadline_post_commit_phase !=
@@ -8278,7 +8289,13 @@ void on_bounded_release_body_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    if (conn.upstream_recv_buf.len() != 0) {
+    if (conn.buffered_response_front_is_pipe()) {
+        if (!conn.response_body_pipe->acknowledge_send(ev.non_upstream_generation, sent)) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.upstream_send_len = 0;
+    } else if (conn.upstream_recv_buf.len() != 0) {
         (void)consume_upstream_sent(conn);
     } else {
         // Bounded's direct recv always targets response_body_tail's tail
@@ -8496,6 +8513,17 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
             return;
         }
         if (received == conn.response_read_deadline_post_commit_declared_body) {
+            if (conn.response_body_pipe) {
+                bool released = false;
+                if constexpr (requires(Loop* l, Connection& c) {
+                                  l->release_response_body_pipe(c);
+                              })
+                    released = loop->release_response_body_pipe(conn);
+                if (!released) {
+                    loop->close_conn(conn);
+                    return;
+                }
+            }
             if constexpr (requires(Loop* candidate, Connection& c) {
                               candidate->retire_response_read_deadline_origin(c);
                           }) {
@@ -8529,6 +8557,15 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     conn.upstream_send_len = available;
     conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
     conn.transition_to_sending(&on_response_body_sent<Loop>);
+    if (conn.buffered_response_front_is_pipe()) {
+        bool queued = false;
+        if constexpr (requires(Loop* l, Connection& c) {
+                          l->submit_response_body_pipe_send(c, available, true);
+                      })
+            queued = loop->submit_response_body_pipe_send(conn, available, true);
+        if (!queued) close_conn_if_live(loop, conn);
+        return;
+    }
     if (!client_send(loop, conn, conn.buffered_response_data(), available))
         close_conn_if_live(loop, conn);
 }
@@ -8975,7 +9012,13 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.clear_response_read_deadline_send_owner();
         conn.response_read_deadline_post_commit_downstream_completed += inflight;
         conn.response_read_deadline_post_commit_inflight_body = 0;
-        if (conn.upstream_recv_buf.len() != 0) {
+        if (conn.buffered_response_front_is_pipe()) {
+            if (!conn.response_body_pipe->acknowledge_send(ev.non_upstream_generation, inflight)) {
+                loop->close_conn(conn);
+                return;
+            }
+            conn.upstream_send_len = 0;
+        } else if (conn.upstream_recv_buf.len() != 0) {
             (void)consume_upstream_sent(conn);
         } else {
             conn.response_body_tail.consume(inflight);

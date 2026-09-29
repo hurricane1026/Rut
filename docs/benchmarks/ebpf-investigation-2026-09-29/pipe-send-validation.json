@@ -1,0 +1,44 @@
+{
+  "stage": "pipe logical send accounting and release/terminal routing; production admission disabled",
+  "focused_tests": {
+    "passed": 5,
+    "failed": 0,
+    "checks": 12458,
+    "filtered_out": 1429,
+    "scope": "existing receive cases, synthetic partial/EAGAIN output, real io_uring release and terminal callbacks including admitted GET policy"
+  },
+  "storage_transport_tests": {
+    "passed": 15,
+    "failed": 0,
+    "checks": 509
+  },
+  "network_tests": {
+    "passed": 1434,
+    "failed": 0,
+    "checks": 384388,
+    "failed_checks": 0,
+    "log_sha256": "83f5982a8f9d7fa7c6506db8c8ed6caec0775c1f9fab6324ead94ce018f61725"
+  },
+  "commands": [
+    "cmake --build build-rel --target test_network test_response_body_pipe -j 8",
+    "timeout 45 build-rel/tests/test_response_body_pipe",
+    "timeout 60 build-rel/tests/test_network --filter=response_buffering_runtime.pipe_",
+    "build-rel/tests/test_network"
+  ],
+  "serialization": "flock /tmp/rut-clean-bench/bench.lock",
+  "fixes_during_validation": [
+    "Qualified the event-loop terminal-disposition enum in the new test.",
+    "Required exact remaining dummy recv ownership before real-ring fixture cleanup.",
+    "Excluded pipe storage from the combined memory-send shortcut; added an admitted GET-policy terminal case."
+  ],
+  "acceptance_unchanged": true,
+  "rut_binary_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "production_pipe_hit_count": null,
+  "performance_gain": null,
+  "remaining": [
+    "receive arming/readiness and fragmentation fallback",
+    "production admission and actual response path-hit verification",
+    "end-to-end deadline/backpressure cases and unchanged acceptance matrix"
+  ],
+  "macos_validation": "not run; Linux host"
+}

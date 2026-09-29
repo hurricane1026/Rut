@@ -1,6 +1,6 @@
 # Pipe-backed bounded body relay: integration plan
 
-Status: feasibility probe passed; pipe storage owner, io_uring transport, connection teardown custody, typed pipe receive evidence and tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
+Status: feasibility probe passed; pipe storage owner, io_uring transport, connection teardown custody, typed pipe receive evidence, logical send routing and tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
 
 ## Initial eligibility
 
@@ -75,3 +75,9 @@ Still pending before production admission: receive rearming/readiness and fragme
 - Full relevant regression plus causal candidate/baseline orders for 1 MiB close/keepalive at c1/c32/c128 and excluded-path controls.
 - eBPF verification that the intended pipe path executes and reduces the measured copy path under the real Rut workload.
 - Retain only demonstrated improvements without material control regressions, then update the existing 96-coordinate acceptance matrix. Standalone relay throughput cannot substitute for this gate.
+
+## Logical pipe output progress
+
+Output now routes through explicit release/terminal frames, retaining physical completion bytes in logical buffered length until the matching callback acknowledges the whole frame. Partial transfers, EAGAIN polls and exact-token cancellation preserve the frame and connection custody. Real-ring callback tests and the full network suite pass; see `pipe-send-validation.json`. The combined memory-send shortcut excludes pipe storage. Production admission is still disabled.
+
+The next integration must replace body receive arming consistently at all four Bounded call sites, without setting the ordinary direct-memory receive flag for a pipe operation. EAGAIN readiness must retain logical receive ownership without refreshing inactivity time; page-slot exhaustion must migrate bytes in order after outstanding transfers settle. Never append an ordinary receive behind nonempty pipe bytes without first completing that migration. Admission hit counts are essential: current release-before-rearm ordering may have a memory-prefix send in flight at the natural transition point, so a blanket no-send admission condition needs review against actual event ordering rather than assuming the path will execute.

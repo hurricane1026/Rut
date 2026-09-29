@@ -1,0 +1,13 @@
+=== response_buffering_runtime ===
+RUN: response_buffering_runtime.pipe_receive_has_distinct_batch_witness_and_ordered_prefix
+  PASS: pipe_receive_has_distinct_batch_witness_and_ordered_prefix
+RUN: response_buffering_runtime.pipe_receive_rejects_stale_identity_and_declared_overrun
+  PASS: pipe_receive_rejects_stale_identity_and_declared_overrun
+RUN: response_buffering_runtime.pipe_eof_is_terminal_and_eagain_remains_transport_only
+  PASS: pipe_eof_is_terminal_and_eagain_remains_transport_only
+RUN: response_buffering_runtime.pipe_partial_output_and_eagain_keep_one_logical_release
+  PASS: pipe_partial_output_and_eagain_keep_one_logical_release
+RUN: response_buffering_runtime.pipe_real_output_uses_release_and_terminal_callbacks
+  PASS: pipe_real_output_uses_release_and_terminal_callbacks
+
+5 passed, 0 failed, 12458 checks, 0 failed checks, 1429 skipped
