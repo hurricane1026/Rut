@@ -1,0 +1,42 @@
+[
+  {
+    "case": "1048576-c1-close",
+    "median_rps": {
+      "candidate": 2220.001265196791,
+      "baseline": 2213.481256918092
+    },
+    "change_pct": 0.2945590010451138
+  },
+  {
+    "case": "1048576-c32-close",
+    "median_rps": {
+      "candidate": 2400.2836787649394,
+      "baseline": 2411.019471600642
+    },
+    "change_pct": -0.4452802211744711
+  },
+  {
+    "case": "1048576-c128-close",
+    "median_rps": {
+      "candidate": 2308.909077480671,
+      "baseline": 2292.4476175855107
+    },
+    "change_pct": 0.7180735458853338
+  },
+  {
+    "case": "1048576-c32-keepalive",
+    "median_rps": {
+      "candidate": 2404.325309785418,
+      "baseline": 2415.219226784998
+    },
+    "change_pct": -0.45105292632510174
+  },
+  {
+    "case": "1048576-c128-keepalive",
+    "median_rps": {
+      "candidate": 2299.944979005117,
+      "baseline": 2301.7496764085245
+    },
+    "change_pct": -0.07840545919933772
+  }
+]

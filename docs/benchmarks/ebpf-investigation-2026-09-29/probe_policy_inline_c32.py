@@ -27,7 +27,7 @@ def metrics(raw):
  m=next(l for l in raw.splitlines() if l.startswith('METRICS ')).split()[1:]
  assert not any(map(int,m[5:])),m
  return int(m[0]),int(m[1])/1e6
-cases=[('65536',32,'close'),('65536',32,'keepalive'),('65536',128,'keepalive'),('1048576',1,'close'),('1048576',32,'close'),('1048576',128,'close'),('1048576',32,'keepalive'),('1048576',128,'keepalive')]
+cases=[('1048576',32,'close'),('1048576',32,'keepalive')]
 if len(sys.argv)>3:cases=[x for x in cases if x[0]==sys.argv[3]]
 for size,c,mode in cases:
  ev=root/'combined-fin-full-acceptance'/f'http-{size}-proxy-{mode}'

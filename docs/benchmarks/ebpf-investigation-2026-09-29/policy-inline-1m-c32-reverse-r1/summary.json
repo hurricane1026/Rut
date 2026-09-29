@@ -1,0 +1,18 @@
+[
+  {
+    "case": "1048576-c32-close",
+    "median_rps": {
+      "candidate": 2434.2352812065483,
+      "baseline": 2434.8683266923417
+    },
+    "change_pct": -0.02599916713580397
+  },
+  {
+    "case": "1048576-c32-keepalive",
+    "median_rps": {
+      "candidate": 2373.44622834703,
+      "baseline": 2394.478528392427
+    },
+    "change_pct": -0.8783666170319671
+  }
+]

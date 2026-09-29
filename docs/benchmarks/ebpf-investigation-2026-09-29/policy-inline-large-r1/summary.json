@@ -1,0 +1,26 @@
+[
+  {
+    "case": "65536-c32-close",
+    "median_rps": {
+      "candidate": 10986.693302927548,
+      "baseline": 10910.959524801669
+    },
+    "change_pct": 0.6941074059868768
+  },
+  {
+    "case": "65536-c32-keepalive",
+    "median_rps": {
+      "candidate": 14961.606172091319,
+      "baseline": 14892.757201622371
+    },
+    "change_pct": 0.46229834769244693
+  },
+  {
+    "case": "65536-c128-keepalive",
+    "median_rps": {
+      "candidate": 15379.141744451998,
+      "baseline": 15335.957139332848
+    },
+    "change_pct": 0.28159054388847693
+  }
+]

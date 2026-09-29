@@ -1282,3 +1282,9 @@ One attribute forces policy_bundle_id_is_valid into callers; validation semantic
 | 64 KiB c1 keepalive | +0.24% | +0.52% |
 
 The target close signal repeats, while the small c32 signs do not. This is an incremental candidate, not a retained optimization or evidence of beating nginx. Larger response and concurrent proxy controls are running before retention. Original runtime baseline remains the frozen CombinedSend FIN binary.
+
+## Policy validator inline experiment: rejected after larger controls
+
+64 KiB concurrent proxy controls are mildly positive: c32 close +0.69%, c32 keepalive +0.46%, c128 keepalive +0.28%. The first larger driver then stopped because the old quick-matrix directory lacked a 1 MiB c1 wrk script. No valid 1 MiB timing came from that attempt. Preserve its partial evidence and rerun only the unfinished 1 MiB cases from the completed formal-matrix configuration.
+
+The valid 1 MiB initial order gives c1 close +0.30%, c32 close -0.45%, c128 close +0.72%, c32 keepalive -0.45%, c128 keepalive -0.08%. Focused reverse order gives c32 close -0.03% and c32 keepalive -0.88%. All completed measurements have clean preflight/warm/load checks. The keepalive c32 deficit repeats in direction; no strong statistical significance is claimed for these small effects on an unreserved host. There is insufficient evidence to trade that deficit for the approximately 0.8% target c1-close gain. Revert the one-line runtime attribute. Full network regression passed but does not establish performance. The frozen candidate and its patch remain evidence only; build-rel still contains the rejected candidate until rebuilt.
