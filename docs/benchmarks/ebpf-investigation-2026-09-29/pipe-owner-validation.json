@@ -1,0 +1,34 @@
+{
+  "stage": "connection teardown custody; semantic response routing remains disabled",
+  "focused_tests": {
+    "passed": 4,
+    "failed": 0,
+    "checks": 126,
+    "filtered_out": 1425
+  },
+  "storage_transport_tests": {
+    "passed": 14,
+    "failed": 0,
+    "checks": 471
+  },
+  "network_tests": {
+    "passed": 1429,
+    "failed": 0,
+    "checks": 371930,
+    "failed_checks": 0,
+    "log_sha256": "667a919355d5dd348809be2042d6ab2a011a043647dedbec90b87ada2eeaa079"
+  },
+  "commands": [
+    "cmake --build build-rel --target test_network test_response_body_pipe -j 8",
+    "timeout 45 build-rel/tests/test_network iouring_body_pipe",
+    "build-rel/tests/test_response_body_pipe",
+    "build-rel/tests/test_network"
+  ],
+  "serialization": "flock /tmp/rut-clean-bench/bench.lock",
+  "invalid_initial_attempt": "Source was edited during compilation, invalidating compiler input; that build failed and is not counted. Final fixed-source r2 build and all tests completed successfully.",
+  "acceptance_unchanged": true,
+  "rut_binary_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "production_pipe_hit_count": null,
+  "performance_gain": null,
+  "macos_validation": "not run; Linux host"
+}

@@ -1,0 +1,11 @@
+=== iouring_body_pipe ===
+RUN: iouring_body_pipe.target_and_cancel_both_pin_slot_across_reset_in_both_orders
+  PASS: target_and_cancel_both_pin_slot_across_reset_in_both_orders
+RUN: iouring_body_pipe.sq_full_close_retry_survives_reset_and_terminal_race
+  PASS: sq_full_close_retry_survives_reset_and_terminal_race
+RUN: iouring_body_pipe.late_positive_input_closes_only_after_its_cancel
+  PASS: late_positive_input_closes_only_after_its_cancel
+RUN: iouring_body_pipe.real_poll_close_drains_and_forced_shutdown_releases_descriptors
+  PASS: real_poll_close_drains_and_forced_shutdown_releases_descriptors
+
+4 passed, 0 failed, 126 checks, 0 failed checks, 1425 skipped

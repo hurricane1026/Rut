@@ -1,6 +1,6 @@
 # Pipe-backed bounded body relay: integration plan
 
-Status: feasibility probe passed; pipe storage owner, io_uring transport submission/decoding and real-kernel tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
+Status: feasibility probe passed; pipe storage owner, io_uring transport, connection teardown custody and real-kernel tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
 
 ## Initial eligibility
 
@@ -43,7 +43,17 @@ Storage/primitive stage result: 9 tests, 224 checks, zero failures and zero skip
 
 Before splice is admitted, `bind_body_pipe_workers` must successfully register the current thread's allowed CPU mask for io_wq. Failed registration disables admission. A SQ-full failure preserves a reservation for explicit rollback. Malformed raw flags, zero serials and out-of-range connection IDs fail the backend before publication. Exact serial cancellation of an old readiness wait cannot cancel a successor. The transport event cannot resume a JIT yield.
 
-No response-path caller exists yet. Existing dispatchers deliberately do not interpret raw pipe events as semantic I/O; the next stage must add authenticated dispatch before enabling any caller. That stage must also retain connection lifetime across readiness/cancel completion (even when no splice currently owns the pipe), persist a serial namespace across allocator and connection-slot reuse, and convert EAGAIN into readiness/fallback rather than origin failure. Do not infer production cancellation or timeout correctness from the backend tests alone.
+No response-path caller exists yet. Raw pipe dispatch now supports teardown custody (see below), but does not interpret pipe records as successful response I/O. Before enabling a caller, add authenticated semantic receive/send progress and convert EAGAIN into readiness/fallback rather than origin failure. Do not infer live-response deadline correctness from transport or teardown tests alone.
+
+## Connection teardown custody progress
+
+`ConnectionBase` now holds a lazily allocated `ResponseBodyPipeOwner` and a persistent operation-sequence high-water mark. The owner uses the existing shard SlicePool with explicit placement construction; it snapshots the connection descriptors, upstream episode and response-deadline identity for later semantic admission. Teardown preserves the owner through connection reset, keeps transfer/readiness targets separate from their cancellation SQEs, and retires each exact record once. Both target/cancel completion orders retain the slot until all owners drain. Generic pending-count exhaustion alone cannot bypass the pipe owner check.
+
+Close rolls back reservations that never reached the kernel and cancels submitted targets by exact token. SQ-full cancellation gets a retry registration; retry scanning is skipped when no owner needs it. A target finishing before a cancel can be submitted removes that retry obligation. Once queued, the cancel keeps its own ownership until its CQE arrives, even if the target is already terminal. Positive bytes arriving after close update storage custody only, without advancing response progress. Sequence exhaustion disables new pipe allocation on that slot rather than wrapping.
+
+After ring teardown, forced shutdown releases the process's pipe descriptors before destroying the pool. Pipe SQEs never contain pointers into the owner; kernel operations retain their own file references. This forced shutdown path is distinct from normal CQE-driven slot reuse and does not fabricate semantic completion.
+
+The next semantic integration must preserve two timing boundaries: receive evidence must be materialized before the existing whole-batch deadline arbitration; physical output completion must not remove bytes from the logical buffered-body invariant before the corresponding send callback accounts for them. Preserve the ordinary-memory prefix in front of pipe bytes and represent the pipe source explicitly in both Bounded release and terminal-body paths. The current live-transport dispatch deliberately closes instead of pretending that an unintegrated operation successfully forwarded a response.
 
 ## Correctness and retention gates
 

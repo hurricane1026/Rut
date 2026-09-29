@@ -18,6 +18,7 @@
 #include "rut/runtime/mapped_array.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/rate_limit.h"
+#include "rut/runtime/response_body_pipe_owner.h"
 #include "rut/runtime/response_read_deadline.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/slab_pool.h"
@@ -527,6 +528,7 @@ public:
 
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
+            retry_body_pipe_cancels();
             u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
@@ -602,6 +604,21 @@ public:
         close_deferred_idle_return_fds();
         reclaim_pending();
         backend.shutdown();
+        // Pipe SQEs contain fd numbers, never pointers into this owner. Once
+        // ring teardown prevents further userspace dispatch, drop our fd
+        // references even if forced shutdown did not deliver terminal CQEs;
+        // any kernel operation retains its own file references until it exits.
+        for (u32 i = 0; i < connection_capacity; ++i) {
+            auto* owner = conns[i].response_body_pipe;
+            if (!owner) continue;
+            if (owner->storage.read_fd >= 0) ::close(owner->storage.read_fd);
+            if (owner->storage.write_fd >= 0) ::close(owner->storage.write_fd);
+            conns[i].response_body_pipe_sequence = owner->storage.sequence;
+            conns[i].response_body_pipe = nullptr;
+            owner->~ResponseBodyPipeOwner();
+            pool.free(reinterpret_cast<u8*>(owner));
+        }
+        body_pipe_cancel_retry_count = 0;
         // No CQE can arrive after the backend is stopped.  Release any
         // deferred config epochs now so shutdown does not leave a shard pinned
         // forever when the kernel never returned a cancelled Send.
@@ -2778,8 +2795,106 @@ public:
         }
     }
 
+    u32 body_pipe_cancel_retry_count = 0;
+
+    // Allocation is separate from semantic admission. No production response
+    // caller enables this owner until receive/send policy integration is ready.
+    bool allocate_response_body_pipe(Connection& c, u32 capacity) {
+        if (c.id >= connection_capacity || c.fd < 0 || c.upstream_fd < 0 || c.response_body_pipe ||
+            c.response_body_pipe_sequence == UINT32_MAX || c.tls_active || c.send_armed ||
+            c.upstream_recv_armed || c.upstream_recv_direct_armed)
+            return false;
+        static_assert(sizeof(ResponseBodyPipeOwner) <= SlicePool::kSliceSize);
+        u8* allocation = pool.alloc_uninitialized();
+        if (!allocation) return false;
+        auto* owner = new (allocation) ResponseBodyPipeOwner();
+        owner->storage.sequence = c.response_body_pipe_sequence;
+        if (!owner->storage.open(capacity)) {
+            owner->~ResponseBodyPipeOwner();
+            pool.free(allocation);
+            return false;
+        }
+        owner->conn_id = c.id;
+        owner->downstream_fd = c.fd;
+        owner->upstream_fd = c.upstream_fd;
+        owner->upstream_episode = c.upstream_episode;
+        owner->deadline_generation = c.response_read_deadline_generation;
+        owner->profile = static_cast<u8>(c.response_read_deadline_profile);
+        owner->method = c.response_read_deadline_method;
+        c.response_body_pipe = owner;
+        return true;
+    }
+
+    static bool body_pipe_blocks_reclaim(const Connection& c) {
+        return c.response_body_pipe &&
+               (c.response_body_pipe->busy() || c.response_body_pipe->retry_registered);
+    }
+
+    bool release_response_body_pipe(Connection& c) {
+        auto* owner = c.response_body_pipe;
+        if (!owner) return true;
+        if (body_pipe_blocks_reclaim(c) || !owner->storage.close()) return false;
+        c.response_body_pipe_sequence = owner->storage.sequence;
+        c.response_body_pipe = nullptr;
+        owner->~ResponseBodyPipeOwner();
+        pool.free(reinterpret_cast<u8*>(owner));
+        return true;
+    }
+
+    void refresh_body_pipe_cancel_retry(ResponseBodyPipeOwner& owner) {
+        const bool retry = owner.needs_cancel_retry();
+        if (retry == owner.retry_registered) return;
+        if (retry)
+            ++body_pipe_cancel_retry_count;
+        else
+            --body_pipe_cancel_retry_count;
+        owner.retry_registered = retry;
+    }
+
+    void close_response_body_pipe(Connection& c) {
+        auto* owner = c.response_body_pipe;
+        if (!owner) return;
+        owner->closing = true;
+        // Reservations which never reached the kernel own no CQE.
+        if (owner->storage.input.phase == ResponseBodyPipe::Phase::Reserved)
+            (void)owner->storage.rollback_input(owner->storage.input.serial);
+        if (owner->storage.output.phase == ResponseBodyPipe::Phase::Reserved)
+            (void)owner->storage.rollback_output(owner->storage.output.serial);
+        for (u32 i = 0; i < 4; ++i) {
+            if (!owner->targets[i] || (owner->cancel_attempted & (1u << i))) continue;
+            const auto target = static_cast<BodyPipeOperation>(i);
+            if (backend.cancel_body_pipe(c.id, owner->targets[i], target)) {
+                (void)owner->own_cancel(target);
+                ++c.pending_ops;
+            }
+        }
+        refresh_body_pipe_cancel_retry(*owner);
+    }
+
+    void retry_body_pipe_cancels() {
+        if (body_pipe_cancel_retry_count == 0) return;
+        for (u32 i = 0; i < connection_capacity && body_pipe_cancel_retry_count != 0; ++i)
+            if (conns[i].response_body_pipe && conns[i].response_body_pipe->retry_registered)
+                close_response_body_pipe(conns[i]);
+    }
+
+    void dispatch_body_pipe_transport(const IoEvent& event) {
+        if (event.conn_id >= connection_capacity) return;
+        auto& c = conns[event.conn_id];
+        auto* owner = c.response_body_pipe;
+        if (!owner || c.pending_ops == 0 || !owner->retire(event)) return;
+        --c.pending_ops;
+        refresh_body_pipe_cancel_retry(*owner);
+        // This stage wires teardown only. Before adding a live response
+        // caller, replace this fail-closed branch with authenticated semantic
+        // receive/send progress (including batch deadline arbitration).
+        if (!owner->closing && c.fd >= 0) close_conn(c);
+        reclaim_pending();
+    }
+
     void reclaim_slot(u32 cid) {
         if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
+            body_pipe_blocks_reclaim(conns[cid]) ||
             strict_upstream_retirement_blocks_reclaim(conns[cid]) ||
             !conns[cid].response_read_timer_owner_is_neutral())
             return;
@@ -2815,6 +2930,7 @@ public:
             pool.free(conns[cid].response_header_slice);
             conns[cid].response_header_slice = nullptr;
         }
+        (void)release_response_body_pipe(conns[cid]);
         release_deferred_epoch(conns[cid]);
         conns[cid].response_body_tail.release();
         free_tls_in_buf(conns[cid]);
@@ -2827,6 +2943,7 @@ public:
         for (u32 i = 0; i < pending_free_count; i++) {
             u32 cid = pending_free[i];
             if (!response_read_batch_reuse_pinned(cid) && conns[cid].pending_ops == 0 &&
+                !body_pipe_blocks_reclaim(conns[cid]) &&
                 !strict_upstream_retirement_blocks_reclaim(conns[cid]) &&
                 conns[cid].response_read_timer_owner_is_neutral()) {
                 if (conns[cid].recv_slice) {
@@ -2850,6 +2967,7 @@ public:
                     pool.free(conns[cid].response_header_slice);
                     conns[cid].response_header_slice = nullptr;
                 }
+                (void)release_response_body_pipe(conns[cid]);
                 release_deferred_epoch(conns[cid]);
                 conns[cid].response_body_tail.release();
                 free_tls_in_buf(conns[cid]);
@@ -2906,6 +3024,7 @@ public:
     }
 
     void free_conn_impl(Connection& c) {
+        close_response_body_pipe(c);
         u32 cid = c.id;
         timer.remove(&c);
         // The h2 engine is a pool object, not a kernel buffer — safe to reclaim
@@ -2931,13 +3050,14 @@ public:
         // Reclaim immediately only after ordinary ops and the separately
         // accounted response-read timer have both drained.
         if (c.pending_ops == 0 && !response_read_batch_reuse_pinned(cid) &&
-            !strict_upstream_retirement_blocks_reclaim(c) &&
+            !body_pipe_blocks_reclaim(c) && !strict_upstream_retirement_blocks_reclaim(c) &&
             c.response_read_timer_owner_is_neutral()) {
             if (c.recv_slice) pool.free(c.recv_slice);
             if (c.send_slice) pool.free(c.send_slice);
             if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
             if (c.upstream_relay_slice) pool.free(c.upstream_relay_slice);
             if (c.response_header_slice) pool.free(c.response_header_slice);
+            (void)release_response_body_pipe(c);
             c.response_body_tail.release();
             free_tls_in_buf(c);
             free_tls_out_buf(c);
@@ -2950,6 +3070,7 @@ public:
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
         auto response_body_tail = c.response_body_tail;
+        auto* response_body_pipe = c.response_body_pipe;
         u8* us = c.upstream_recv_slice;
         u8* relay = c.upstream_relay_slice;
         u8* hs = c.response_header_slice;
@@ -2979,6 +3100,7 @@ public:
         conns[cid].recv_slice_capacity = rs != nullptr ? SlicePool::kSliceSize : 0;
         conns[cid].send_slice = ss;
         conns[cid].response_body_tail = response_body_tail;
+        conns[cid].response_body_pipe = response_body_pipe;
         conns[cid].upstream_recv_slice = us;
         conns[cid].upstream_relay_slice = relay;
         conns[cid].response_header_slice = hs;
@@ -6353,6 +6475,7 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
+        close_response_body_pipe(c);
         if (c.tls_out_inflight) {
             // TLS close custody belongs to the actual ciphertext SQE, not the
             // logical plaintext continuation. The common ledger survives
@@ -7227,6 +7350,8 @@ public:
                 }
                 break;
             case IoEventType::BodyPipeTransport:
+                dispatch_body_pipe_transport(ev);
+                break;
             case IoEventType::Count:
                 break;
         }
