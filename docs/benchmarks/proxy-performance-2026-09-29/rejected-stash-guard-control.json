@@ -1,0 +1,72 @@
+{
+  "stash-guard-abba-r1": {
+    "16-c1-keepalive-proxy": {
+      "ratio": 1.0024807091138228,
+      "adjacent_pair_ratios": [
+        1.0016779019603959,
+        1.0032836212881304
+      ],
+      "medians": {
+        "candidate": 10957.589317478996,
+        "baseline": 10930.473991031042
+      }
+    },
+    "65536-c1-close-proxy": {
+      "ratio": 1.017059232032787,
+      "adjacent_pair_ratios": [
+        1.0209820140920511,
+        1.0131623146320943
+      ],
+      "medians": {
+        "candidate": 6046.747803343974,
+        "baseline": 5945.325122567734
+      }
+    },
+    "65536-c1-keepalive-proxy": {
+      "ratio": 0.9960907343665548,
+      "adjacent_pair_ratios": [
+        0.9884491472007668,
+        1.003702693241223
+      ],
+      "medians": {
+        "candidate": 7841.398566293882,
+        "baseline": 7872.172981591353
+      }
+    }
+  },
+  "stash-guard-baab-r2": {
+    "16-c1-keepalive-proxy": {
+      "ratio": 1.0032190109838954,
+      "adjacent_pair_ratios": [
+        0.9999036849767243,
+        1.0065489644336052
+      ],
+      "medians": {
+        "candidate": 10955.90558991539,
+        "baseline": 10920.751570657052
+      }
+    },
+    "65536-c1-close-proxy": {
+      "ratio": 0.9942115938448266,
+      "adjacent_pair_ratios": [
+        0.9944710720291658,
+        0.9939517493714649
+      ],
+      "medians": {
+        "candidate": 6014.226984099197,
+        "baseline": 6049.242456367772
+      }
+    },
+    "65536-c1-keepalive-proxy": {
+      "ratio": 1.0017052009058325,
+      "adjacent_pair_ratios": [
+        1.001537284928605,
+        1.0018729134219495
+      ],
+      "medians": {
+        "candidate": 7942.5948691660205,
+        "baseline": 7929.074204649838
+      }
+    }
+  }
+}

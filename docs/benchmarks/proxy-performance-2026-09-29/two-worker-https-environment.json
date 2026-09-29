@@ -1,0 +1,98 @@
+{
+  "harness_revision": "2ca5363a3ed760142a24672b38664afbcfc43515",
+  "harness_dirty": false,
+  "started_at": "2026-09-29T13:32:50Z",
+  "arguments": {
+    "rut": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+    "converter": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-nginx-convert-rebased-main-733",
+    "wrk": "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk",
+    "output": "/tmp/rut-bounded-followup-20260928/multiworker2-https-proxy64k-keep-accept-r1",
+    "mode": "benchmark",
+    "server_cpu": 2,
+    "server_cpus": "2,6",
+    "workers": 2,
+    "origin_cpu": 3,
+    "client_cpus": "4,5",
+    "keepalive_header": "implicit",
+    "body_size": 65536,
+    "static_profile": "converter-return",
+    "proxy_profile": "converter-strict",
+    "tls_cert": "/tmp/rut-clean-bench/tls2/cert.pem",
+    "tls_key": "/tmp/rut-clean-bench/tls2/key.pem",
+    "front_port": 8987,
+    "origin_port": 9987,
+    "concurrency": [
+      32,
+      128
+    ],
+    "profile": "acceptance",
+    "duration": 5,
+    "warmup": 2,
+    "repeats": 3,
+    "first_engine": "nginx",
+    "scenarios": [
+      "proxy-keepalive"
+    ]
+  },
+  "static_profile": "converter-return",
+  "proxy_profile": {
+    "name": "converter-strict",
+    "body_size": 65536,
+    "origin_keepalive": "disabled",
+    "native_origin_reuse_observation": null,
+    "nginx_keepalive_requests": null
+  },
+  "engine_order_by_scenario_and_repeat": [
+    {
+      "scenario": "proxy-keepalive",
+      "repeat": 1,
+      "engines": [
+        "nginx",
+        "rut"
+      ]
+    },
+    {
+      "scenario": "proxy-keepalive",
+      "repeat": 2,
+      "engines": [
+        "rut",
+        "nginx"
+      ]
+    },
+    {
+      "scenario": "proxy-keepalive",
+      "repeat": 3,
+      "engines": [
+        "nginx",
+        "rut"
+      ]
+    }
+  ],
+  "binaries_sha256": {
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-nginx-convert-rebased-main-733": "2e19980ca539377c968bed8347d6b9dcf1907debbf8b5437d469a94c0de5659f",
+    "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30"
+  },
+  "nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "nginx_image_id": "sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "kernel": [
+    "Linux",
+    "leopard",
+    "6.19.10-300.fc44.x86_64",
+    "#1 SMP PREEMPT_DYNAMIC Wed Mar 25 18:23:49 UTC 2026",
+    "x86_64"
+  ],
+  "cpu_topology": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           39 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz\nCPU family:                              6\nModel:                                   165\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                5\nCPU(s) scaling MHz:                      51%\nCPU max MHz:                             4800.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                5799.77\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx rdseed adx smap clflushopt intel_pt xsaveopt xsavec xgetbv1 xsaves dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp vnmi pku ospke md_clear flush_l1d arch_capabilities\nVirtualization:                          VT-x\nL1d cache:                               256 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                2 MiB (8 instances)\nL3 cache:                                16 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Mitigation; Microcode\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             KVM: Mitigation: Split huge pages\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Mitigation; Clear CPU buffers; SMT vulnerable\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Mitigation; Microcode\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace\n",
+  "workers": 2,
+  "server_cpus": "2,6",
+  "tcp_tw_reuse": "2",
+  "note": "Harness revision is not proof of binary source revision. Record build provenance separately.",
+  "tls_profile": {
+    "certificate_sha256": "1576f17eb6306aba9659c2a8a594c7d0a6b40ae69633b86d17fcacc7e87dd9de",
+    "protocol": "TLSv1.3",
+    "cipher": "TLS_AES_256_GCM_SHA384",
+    "reconnect": "full-handshake",
+    "key_exchange": "X25519 (enforced by load client)",
+    "listener_adaptation": "converter cleartext listener replaced by CLI TLS; wildcard IPv4 on both frontends"
+  }
+}
