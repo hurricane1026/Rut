@@ -1,0 +1,29 @@
+{
+  "candidate_sha256": "47dedd0e3745e8b6ec8d1e1c0c71181d58e00860b2746ba9b691329cd8e512cc",
+  "baseline_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "scenario": "HTTP 64KiB proxy c1, no huge pages",
+  "cases": {
+    "close": {
+      "candidate_rps": [
+        6067.254614013839,
+        6011.865734998585
+      ],
+      "baseline_rps": [
+        6047.852255791343,
+        6028.034096559702
+      ],
+      "candidate_over_baseline": 1.0002678061524444
+    },
+    "keepalive": {
+      "candidate_rps": [
+        7888.180386709715,
+        7897.447767829625
+      ],
+      "baseline_rps": [
+        7907.293059243133,
+        7922.966306120465
+      ],
+      "candidate_over_baseline": 0.9971806393190303
+    }
+  }
+}
