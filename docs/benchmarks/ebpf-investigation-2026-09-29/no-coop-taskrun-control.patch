@@ -1,0 +1,8 @@
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -216,7 +216,7 @@
+     memset(&params, 0, sizeof(params));
+     // wait() consults IORING_SQ_TASKRUN before bypassing enter. Request the
+     // notification so a busy visible CQ cannot hide cooperative task work.
+-    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
++    params.flags = 0;

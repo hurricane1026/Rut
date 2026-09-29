@@ -1,0 +1,39 @@
+{
+  "case": "HTTP 65536-byte proxy implicit keepalive c1",
+  "scope": "PID-filtered syscall trace, separate instrumented 8-second runs; no uninstrumented acceptance comparison",
+  "rut": {
+    "requests": 62445,
+    "seconds": 8.099711,
+    "rps": 7709.534327829722,
+    "exact_body": true,
+    "zero_errors": true,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-rebased-main-733",
+    "server_pid": 2991815,
+    "enter_calls": 500790,
+    "trace_ready": true,
+    "trace_exit_code": 0,
+    "enters_per_request": 8.019697333653616,
+    "trace_valid": true
+  },
+  "nginx": {
+    "requests": 60554,
+    "seconds": 8.000301,
+    "rps": 7568.965217683684,
+    "exact_body": true,
+    "zero_errors": true,
+    "worker_pid": 2992260,
+    "syscalls": {
+      "socket": 60555,
+      "connect": 60555,
+      "close": 60617,
+      "recvfrom": 121112,
+      "epoll_wait": 242283,
+      "writev": 363426,
+      "readv": 588232
+    },
+    "trace_ready": true,
+    "trace_exit_code": 0
+  },
+  "nginx_epoll_waits_per_request": 4.001106450440929,
+  "trace_limit": "The two engines have different traced syscall sets and different probe overhead; counts include small startup/preflight overhead."
+}

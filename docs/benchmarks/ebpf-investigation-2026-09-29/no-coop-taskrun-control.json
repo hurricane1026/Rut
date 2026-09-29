@@ -1,0 +1,22 @@
+{
+  "candidate_change": "remove IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG at io_uring_backend.cc:219",
+  "candidate_sha256": "0006ba29ddb28d55f0a371682916de6087d46858c0f58e18589b84b9a7acdfd1",
+  "baseline_sha256": "f98ae490e57774dae6adb9ceb20db84e13804bdd57409e4dd8020e0230b22c2d",
+  "design": "candidate/baseline/baseline/candidate, 2s warmup, 6s measured per row, exact full-body preflight",
+  "cases": {
+    "65536-c1-close-proxy": {
+      "candidate_median_rps": 6023.956064783581,
+      "baseline_median_rps": 6028.307002685529,
+      "candidate_over_baseline": 0.9992782487852708,
+      "all_body_checks": true,
+      "all_errors_zero": true
+    },
+    "65536-c1-keepalive-proxy": {
+      "candidate_median_rps": 7807.653472624031,
+      "baseline_median_rps": 7835.440492351151,
+      "candidate_over_baseline": 0.9964536748439037,
+      "all_body_checks": true,
+      "all_errors_zero": true
+    }
+  }
+}
