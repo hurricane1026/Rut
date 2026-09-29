@@ -1,0 +1,195 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 16K of event 'cycles:u'
+# Event count (approx.): 12082568495
+#
+# Overhead  Command          Shared Object             Symbol                                                                                                                                                                                                                                                                                                                                                                      
+# ........  ...............  ........................  ............................................................................................................................................................................................................................................................................................................................................................................
+#
+     6.04%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+            |
+            ---rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+
+     4.92%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)
+            |
+            ---rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)
+
+     4.32%  rut-combined-fi  libc.so.6                 [.] __memmove_avx_unaligned_erms
+            |
+            ---__memmove_avx_unaligned_erms
+               |          
+               |--2.46%--rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+               |          
+                --1.33%--rut::consume_upstream_sent(rut::ConnectionBase&)
+
+     4.14%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)
+            |
+            ---rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)
+
+     3.66%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)
+            |
+            ---rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)
+
+     3.20%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const
+            |
+            ---rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const
+
+     2.98%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)
+            |
+            ---rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)
+
+     2.85%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)
+            |
+            ---rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)
+
+     2.82%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)
+            |
+            ---rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)
+
+     2.69%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
+            |
+            ---rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
+
+     2.61%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::simd::scan_header_value(unsigned char const*, unsigned int, unsigned int)
+            |
+            ---rut::simd::scan_header_value(unsigned char const*, unsigned int, unsigned int)
+
+     2.56%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+            |
+            ---rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+
+     2.46%  rut-combined-fi  libc.so.6                 [.] __memcmp_avx2_movbe
+            |
+            ---__memcmp_avx2_movbe
+               |          
+               |--1.11%--rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)
+               |          
+                --0.56%--rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+
+     2.45%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)
+            |
+            ---rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)
+
+     1.90%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)
+            |
+            ---rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)
+
+     1.88%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+            |
+            ---rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+
+     1.62%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)
+            |
+            ---rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)
+
+     1.46%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)
+            |
+            ---rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)
+
+     1.28%  rut-combined-fi  rut-combined-fin-ordered  [.] void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
+            |
+            ---void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
+
+     1.18%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringEventLoop::poll_command()
+            |
+            ---rut::IoUringEventLoop::poll_command()
+
+     1.07%  rut-combined-fi  libc.so.6                 [.] __memset_avx2_unaligned_erms
+            |
+            ---__memset_avx2_unaligned_erms
+               |          
+                --0.54%--rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+
+     0.97%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringEventLoop::settle_response_read_deadline_batch()
+            |
+            ---rut::IoUringEventLoop::settle_response_read_deadline_batch()
+
+     0.97%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::RouteConfig::timeout_failure_policy_id_is_valid(unsigned short) const
+            |
+            ---rut::RouteConfig::timeout_failure_policy_id_is_valid(unsigned short) const
+
+     0.97%  rut-combined-fi  libc.so.6                 [.] clock_gettime@@GLIBC_2.17
+            |
+            ---clock_gettime@@GLIBC_2.17
+               |          
+                --0.58%--rut::monotonic_ns()
+
+     0.91%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringEventLoop::response_read_deadline_identity_is_stable(rut::ConnectionBase const&) const
+            |
+            ---rut::IoUringEventLoop::response_read_deadline_identity_is_stable(rut::ConnectionBase const&) const
+
+     0.88%  rut-combined-fi  rut-combined-fin-ordered  [.] void rut::on_header_received<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+            |
+            ---void rut::on_header_received<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+
+     0.84%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringEventLoop::run()
+            |
+            ---rut::IoUringEventLoop::run()
+
+     0.83%  rut-combined-fi  [vdso]                    [.] 0x0000000000000932
+            |
+            ---0x7f698c42e932
+               clock_gettime@@GLIBC_2.17
+
+     0.77%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::classify_complete_content_length_response(rut::ParsedResponse const&)
+            |
+            ---rut::classify_complete_content_length_response(rut::ParsedResponse const&)
+
+     0.76%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::complete_content_length_pinned_header_is_stable(rut::ConnectionBase const&)
+            |
+            ---rut::complete_content_length_pinned_header_is_stable(rut::ConnectionBase const&)
+
+     0.59%  rut-combined-fi  rut-combined-fin-ordered  [.] void rut::on_upstream_response<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+            |
+            ---void rut::on_upstream_response<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+
+     0.59%  rut-combined-fi  libc.so.6                 [.] syscall
+            |
+            ---syscall
+               |          
+                --0.53%--rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+
+     0.57%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::IoUringEventLoop::consume_response_read_deadline_send_event(rut::ConnectionBase&, rut::IoEvent const&)
+            |
+            ---rut::IoUringEventLoop::consume_response_read_deadline_send_event(rut::ConnectionBase&, rut::IoEvent const&)
+
+     0.57%  rut-combined-fi  rut-combined-fin-ordered  [.] void rut::pump_response_read_deadline_body<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&)
+            |
+            ---void rut::pump_response_read_deadline_body<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&)
+
+     0.57%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::strict_local_response_policy_profile(rut::StrictLocalResponsePolicySpec const&)
+            |
+            ---rut::strict_local_response_policy_profile(rut::StrictLocalResponsePolicySpec const&)
+
+     0.54%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::response_policy_name_eq(rut::Str, char const*, unsigned int)
+            |
+            ---rut::response_policy_name_eq(rut::Str, char const*, unsigned int)
+
+     0.54%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::ConnectionBase::reset()
+            |
+            ---rut::ConnectionBase::reset()
+
+     0.52%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::RouteConfig::strict_local_response_table_is_valid() const
+            |
+            ---rut::RouteConfig::strict_local_response_table_is_valid() const
+
+     0.52%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::build_strict_response_headers(rut::ConnectionBase&, rut::RouteConfig const&, rut::ParsedResponse const&, rut::Http1PrebuiltResponsePurpose)
+            |
+            ---rut::build_strict_response_headers(rut::ConnectionBase&, rut::RouteConfig const&, rut::ParsedResponse const&, rut::Http1PrebuiltResponsePurpose)
+
+     0.51%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::classify_response_read_deadline_profile(rut::ConnectionBase const&, rut::ForwardResponsePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardResponseBufferingMode, unsigned short)
+            |
+            ---rut::classify_response_read_deadline_profile(rut::ConnectionBase const&, rut::ForwardResponsePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardResponseBufferingMode, unsigned short)
+
+     0.51%  rut-combined-fi  rut-combined-fin-ordered  [.] rut::response_read_deadline_persistence_owner_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&)
+            |
+            ---rut::response_read_deadline_persistence_owner_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&)
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

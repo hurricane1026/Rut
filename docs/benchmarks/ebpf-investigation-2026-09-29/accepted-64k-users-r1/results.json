@@ -1,0 +1,50 @@
+[
+  {
+    "case": "65536-c1-close",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-combined-fin-ordered",
+    "requests": 115034,
+    "seconds": 20.099679,
+    "rps": 5723.175977088988,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158359552,
+    "user_us_per_request": 18.25547229514752,
+    "system_us_per_request": 75.97753707599492,
+    "minor_faults_per_request": 6.954465636246675e-05,
+    "runqueue_us_per_request": 0.1247379296555801,
+    "voluntary_per_request": 2.0174557087469793,
+    "involuntary_per_request": 0.014891249543613193
+  },
+  {
+    "case": "65536-c1-keepalive",
+    "engine": "candidate",
+    "rep": 0,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-combined-fin-ordered",
+    "requests": 146588,
+    "seconds": 20.099707,
+    "rps": 7293.041634885524,
+    "errors": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "body_check": true,
+    "rss_bytes": 158253056,
+    "user_us_per_request": 16.37241793325511,
+    "system_us_per_request": 62.82915381886648,
+    "minor_faults_per_request": 0.0,
+    "runqueue_us_per_request": 0.10603760880836087,
+    "voluntary_per_request": 2.000081862089666,
+    "involuntary_per_request": 0.01084672688078151
+  }
+]

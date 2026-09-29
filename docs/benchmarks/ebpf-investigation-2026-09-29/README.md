@@ -1260,3 +1260,9 @@ This contradicts a strong attribution of the original deficit to a 4–8 us firs
 ## First-send-only sparse decomposition: reverse order
 
 All four cases again have zero warmup/load errors and zero incomplete sampled correlations. Reverse-order Rut-minus-nginx request processing is +1.54 us close / +1.63 us keepalive; origin wait +0.34/+0.14 us; response processing -0.29/-1.12 us. First-send total is +1.58/+0.65 us, well below the earlier stage-probe 4–8 us claim. Throughput remains below nginx (0.9783 close / 0.9799 keepalive). Both orders support inspecting the request-to-upstream-send path, but do not establish an exact uninstrumented causal latency budget. Raw evidence: `ebpf-first-sampled-reverse-r1`.
+
+## Accepted 64 KiB userspace cycle profile
+
+Both close and keepalive workloads completed exact-body preflight, warmup and 20-second load without errors. Raw DWARF perf.data is retained in the lab; text reports and workload logs are archived under `accepted-64k-users-r1`. Short-lived addr2line expansion was slow; the driver ultimately completed both reports and workloads successfully. Sampled self shares for close/keepalive: policy_bundle_id_is_valid 3.20%/3.48%, phase1 proof 4.14%/4.34%, all memmove 4.32%/5.17%. Attribution to consume_upstream_sent is approximately 1.33%/1.83%; stack incompleteness limits caller interpretation. These are userspace cycle fractions, not latency fractions or causal gains.
+
+The next isolated experiment forces policy_bundle_id_is_valid inline to let existing caller conditions fold into identical validation logic. It changes no policy checks, cached admission state, memory initialization, or ownership semantics. Retention requires causal throughput evidence and regression tests.
