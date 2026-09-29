@@ -1489,7 +1489,7 @@ TEST(serve_loader, nginx_exact_loopback_fixed_302_output_is_owned_and_reuses_cle
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5797u);
+        REQUIRE_EQ(lowered.value().len, 5783u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(nginx_source, 'x', sizeof(nginx_source) - 1u);
     }
@@ -1694,8 +1694,8 @@ TEST(serve_loader, issue351_exact_5929_byte_redirect_output_is_owned_and_reuses_
     REQUIRE(parsed);
     auto lowered = nginx::lower_to_rut(parsed.value());
     REQUIRE(lowered);
-    REQUIRE_EQ(lowered.value().len, 5829u);
-    REQUIRE_EQ(lowered.value().len, 5829u);
+    REQUIRE_EQ(lowered.value().len, 5815u);
+    REQUIRE_EQ(lowered.value().len, 5815u);
     REQUIRE_EQ(lowered.value().data[lowered.value().len], '\0');
     std::string generated(lowered.value().data, lowered.value().len);
     REQUIRE_EQ(generated.rfind("listen 127.0.0.1:65535\n", 0u), 0u);
@@ -1703,7 +1703,7 @@ TEST(serve_loader, issue351_exact_5929_byte_redirect_output_is_owned_and_reuses_
 
     const std::string dir = "/tmp/rut_serve_loader_issue351_exact_301";
     const std::string path = write_file(dir, "app.rut", generated.c_str());
-    REQUIRE_EQ(std::filesystem::file_size(path), 5829u);
+    REQUIRE_EQ(std::filesystem::file_size(path), 5815u);
     std::fill(generated.begin(), generated.end(), 'y');
     memset(lowered.value().data, 'z', lowered.value().len);
     lowered.value().len = 0u;
@@ -2506,7 +2506,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 5260u);
+        REQUIRE_EQ(lowered.value().len, 5246u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'x', sizeof(source) - 1u);
     }
@@ -2642,7 +2642,7 @@ TEST(serve_loader, issue373_hide_headers_are_owned_and_same_owner_reload_clears_
         REQUIRE(parsed);
         const auto lowered = nginx::lower_to_rut(parsed.value());
         REQUIRE(lowered);
-        REQUIRE_EQ(lowered.value().len, 6834u);
+        REQUIRE_EQ(lowered.value().len, 6806u);
         generated.assign(lowered.value().data, lowered.value().len);
         memset(source, 'z', sizeof(source) - 1u);
     }

@@ -448,9 +448,7 @@ return forward(users, request_policy: {
 // commits the entire upstream response before any downstream byte is sent.
 // response_buffering: .bounded (nginx proxy_buffering-on semantics) releases
 // the Content-Length body downstream in whole 4 KiB units of raw upstream
-// bytes; below one unit it behaves exactly like "complete_content_length".
-// ⏳ pending: `.bounded` is accepted everywhere `.completeContentLength` is,
-// but the runtime still serves it exactly as "complete_content_length".
+// bytes; below one unit it behaves exactly like `.completeContentLength`.
 
 return forward(users, response_policy: {
     version: .http11, framing: .contentLength, connection: .request,

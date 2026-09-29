@@ -87,7 +87,7 @@ route GET "/" {
             body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
         },
         response_read_timeout: 60s,
-        response_buffering: .completeContentLength
+        response_buffering: .bounded
     )
 }
 route "/" {
