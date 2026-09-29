@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <linux/io_uring.h>
 #include <poll.h>
+#include <sched.h>
 #include <string.h>  // memset
 #include <sys/mman.h>
 #include <sys/sendfile.h>
@@ -627,6 +628,75 @@ bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32
                                type,
                                kUpstreamRetirementCancelAux,
                                upstream_episode);
+}
+
+bool IoUringBackend::bind_body_pipe_workers() {
+    body_pipe_workers_bound = false;
+    if (ring_fd < 0 || failure_code() != 0) return false;
+    cpu_set_t affinity;
+    if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0) return false;
+    body_pipe_workers_bound =
+        io_uring_register(ring_fd, IORING_REGISTER_IOWQ_AFF, &affinity, sizeof(affinity)) == 0;
+    return body_pipe_workers_bound;
+}
+
+bool IoUringBackend::add_body_pipe_splice(i32 socket_fd,
+                                          u32 conn_id,
+                                          ResponseBodyPipe& pipe,
+                                          bool input) {
+    const auto& op = input ? pipe.input : pipe.output;
+    if (failure_code() != 0 || !body_pipe_workers_bound || socket_fd < 0 ||
+        conn_id >= connection_capacity || !pipe.active() ||
+        op.phase != ResponseBodyPipe::Phase::Reserved || op.serial == 0 || op.limit == 0 ||
+        op.limit > static_cast<u32>(INT32_MAX))
+        return false;
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+    if (!(input ? pipe.submit_input(op.serial) : pipe.submit_output(op.serial))) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_SPLICE;
+    sqe->fd = input ? pipe.write_fd : socket_fd;
+    sqe->splice_fd_in = input ? socket_fd : pipe.read_fd;
+    sqe->splice_off_in = ~u64{0};
+    sqe->off = ~u64{0};
+    sqe->len = op.limit;
+    sqe->splice_flags = SPLICE_F_NONBLOCK;
+    sqe->user_data = encode_body_pipe_token(
+        {conn_id, op.serial, input ? BodyPipeOperation::Input : BodyPipeOperation::Output});
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+bool IoUringBackend::add_body_pipe_poll(i32 socket_fd, u32 conn_id, u32 serial, bool input) {
+    if (failure_code() != 0 || socket_fd < 0 || conn_id >= connection_capacity || serial == 0)
+        return false;
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_POLL_ADD;
+    sqe->fd = socket_fd;
+    sqe->poll32_events = input ? POLLIN : POLLOUT;
+    sqe->user_data = encode_body_pipe_token(
+        {conn_id, serial, input ? BodyPipeOperation::InputReady : BodyPipeOperation::OutputReady});
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
+bool IoUringBackend::cancel_body_pipe(u32 conn_id, u32 serial, BodyPipeOperation target) {
+    if (failure_code() != 0 || conn_id >= connection_capacity || serial == 0 ||
+        !body_pipe_operation_is_target(target))
+        return false;
+    io_uring_sqe* sqe = get_sqe();
+    if (!sqe) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_ASYNC_CANCEL;
+    sqe->addr = encode_body_pipe_token({conn_id, serial, target});
+    sqe->user_data = encode_body_pipe_token({conn_id, serial, body_pipe_cancel_operation(target)});
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
 }
 
 bool IoUringBackend::add_send(
@@ -1323,6 +1393,25 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // slot before decoding so metadata from a prior CQE can never become
         // evidence for the current one.
         events[count] = {};
+
+        // Pipe CQEs are transport evidence only. In particular, poll masks
+        // and cancel counts must never reach recv-copy or send-proactor code.
+        if (is_body_pipe_raw_tag(static_cast<u8>(cqe->user_data))) {
+            BodyPipeToken token;
+            if (!decode_body_pipe_token(cqe->user_data, &token) ||
+                token.conn_id >= connection_capacity || cqe->flags != 0) {
+                protocol_failure();
+                break;
+            }
+            events[count].conn_id = token.conn_id;
+            events[count].type = IoEventType::BodyPipeTransport;
+            events[count].result = cqe->res;
+            events[count].aux = static_cast<u8>(token.operation);
+            events[count].non_upstream_generation = token.serial;
+            head++;
+            count++;
+            continue;
+        }
 
         u32 conn_id;
         IoEventType type;
@@ -2056,6 +2145,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
 // --- Shutdown ---
 
 void IoUringBackend::shutdown() {
+    body_pipe_workers_bound = false;
     reset_downstream_recv_wait_state();
     if (timer_fd >= 0) {
         close(timer_fd);

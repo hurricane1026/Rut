@@ -36258,6 +36258,7 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
             case IoEventType::Accept:
             case IoEventType::ResponseReadTimer:
             case IoEventType::BoundedHoldTimer:
+            case IoEventType::BodyPipeTransport:
             case IoEventType::Count:
                 break;
         }

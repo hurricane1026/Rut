@@ -140,6 +140,7 @@ inline jit::YieldKind yield_kind_from_event(IoEventType type) {
         case IoEventType::Accept:
         case IoEventType::ResponseReadTimer:
         case IoEventType::BoundedHoldTimer:
+        case IoEventType::BodyPipeTransport:
         case IoEventType::Count:
             return jit::YieldKind::HttpGet;
     }

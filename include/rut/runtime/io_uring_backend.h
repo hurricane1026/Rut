@@ -2,10 +2,12 @@
 
 #include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/runtime/body_pipe_transport.h"
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/mapped_array.h"
+#include "rut/runtime/response_body_pipe.h"
 #include <atomic>
 
 #include <errno.h>
@@ -70,6 +72,7 @@ struct IoUringBackend {
     // Kernel supports IORING_NOP_INJECT_RESULT (probed at init); required to
     // complete a send that was written directly in full.
     bool nop_inject_result = false;
+    bool body_pipe_workers_bound = false;
 
     // Provided buffer ring
     io_uring_buf_ring* buf_ring = nullptr;
@@ -204,6 +207,17 @@ struct IoUringBackend {
     // gap under the timeout) but fills `len` more slowly than the timeout
     // would be expired as idle.
     bool add_recv_upstream_direct(i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len);
+    // Pipe transport primitives. The event loop supplies authenticated owners;
+    // wait() emits raw BodyPipeTransport records, without committing bytes,
+    // refreshing deadlines, inventing copy witnesses or resubmitting partials.
+    // A failed SQ allocation leaves the reservation intact for caller rollback.
+    bool add_body_pipe_splice(i32 socket_fd, u32 conn_id, ResponseBodyPipe& pipe, bool input);
+    bool add_body_pipe_poll(i32 socket_fd, u32 conn_id, u32 serial, bool input);
+    bool cancel_body_pipe(u32 conn_id, u32 serial, BodyPipeOperation target);
+    // Call on the shard worker before enabling splice. Never allow io_wq to
+    // escape the shard's current CPU budget. Failure keeps the ordinary path.
+    bool bind_body_pipe_workers();
+
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.
