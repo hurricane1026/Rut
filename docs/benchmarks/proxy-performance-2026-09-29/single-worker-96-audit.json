@@ -1,0 +1,1279 @@
+{
+  "observed_at": "2026-09-29T12:49:16.944568+00:00",
+  "status": "96 coordinates validated across original93 and separately completed tail3 retry",
+  "original_failed_runs_retained": [
+    "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-full-r1/https-1048576-proxy-keepalive",
+    "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-tail-r2",
+    "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-tail-r3"
+  ],
+  "validated_cells": 96,
+  "validated_samples": 576,
+  "wins": 94,
+  "at_least_1_05": 84,
+  "scope": [
+    "Single worker HTTP1; native-body static and converter-strict proxy only",
+    "No uploads, multiworker, native streaming or proof of universal correctness",
+    "Three samples with 2:1 process order; two marginal64KiB losses queued for reversed order"
+  ],
+  "tail_cells": [
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 1.2165646992842258,
+      "evidence": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-https1m-keep-retry-r4"
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.3020255456453722,
+      "evidence": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-https1m-keep-retry-r4"
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.1760919612139948,
+      "evidence": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-https1m-keep-retry-r4"
+    }
+  ],
+  "cells": [
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 0.9864836967834948,
+      "paired_ratios": [
+        0.9887089637256098,
+        0.9864836967834948,
+        0.9865988977488218
+      ],
+      "p99_ratio": 1.0119760479041917
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "ratio": 0.9880284399073029,
+      "paired_ratios": [
+        0.9858294435985827,
+        0.9889234407077302,
+        0.9971471340700699
+      ],
+      "p99_ratio": 1.0292397660818713
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 1.0022449298177165,
+      "paired_ratios": [
+        0.9989932051631406,
+        1.01063255067207,
+        1.0097458485225306
+      ],
+      "p99_ratio": 0.9846153846153847
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 1.0052169544433789,
+      "paired_ratios": [
+        1.019195605575891,
+        1.002247370702252,
+        1.0059461035783726
+      ],
+      "p99_ratio": 1.0077519379844961
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "ratio": 1.015710329888664,
+      "paired_ratios": [
+        1.010705379506012,
+        1.01573986717002,
+        1.02352552086905
+      ],
+      "p99_ratio": 14.535017457383447
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "ratio": 1.02190695024716,
+      "paired_ratios": [
+        1.0168373874901588,
+        1.0203706332982125,
+        1.0231805284103785
+      ],
+      "p99_ratio": 1.0
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "ratio": 1.0244451915056438,
+      "paired_ratios": [
+        1.020833259132925,
+        1.0244451915056438,
+        1.0305376036876086
+      ],
+      "p99_ratio": 1.0
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "ratio": 1.026316803666237,
+      "paired_ratios": [
+        1.028166012191494,
+        1.0128685075857145,
+        1.035246356892096
+      ],
+      "p99_ratio": 0.9769322235434007
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "ratio": 1.0340958127212614,
+      "paired_ratios": [
+        1.0340958127212614,
+        1.0411420175644788,
+        1.0310526073485196
+      ],
+      "p99_ratio": 0.75
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 1.0392292041630389,
+      "paired_ratios": [
+        1.0392292041630389,
+        1.0355056210283804,
+        1.0340894644658472
+      ],
+      "p99_ratio": 0.9773755656108597
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "ratio": 1.0401484860473127,
+      "paired_ratios": [
+        1.0435379193095646,
+        1.041109965116307,
+        1.0401484860473127
+      ],
+      "p99_ratio": 1.0333333333333334
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 1.0491388480365134,
+      "paired_ratios": [
+        1.04596933496055,
+        1.0457652831005042,
+        1.0602156445078281
+      ],
+      "p99_ratio": 0.9726027397260274
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "ratio": 1.0537366977514895,
+      "paired_ratios": [
+        1.0537366977514895,
+        1.0993286064068404,
+        1.048591392213433
+      ],
+      "p99_ratio": 0.941321044546851
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 1.0570683195744028,
+      "paired_ratios": [
+        1.0641564691566612,
+        1.0574276302797285,
+        1.0529193331423559
+      ],
+      "p99_ratio": 0.9722222222222222
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "ratio": 1.0610823313382527,
+      "paired_ratios": [
+        1.0552563600295968,
+        1.0606877851014302,
+        1.0620830215688581
+      ],
+      "p99_ratio": 0.9473684210526315
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "ratio": 1.0643191009677473,
+      "paired_ratios": [
+        1.0612609737134675,
+        1.064790307823136,
+        1.0615636931792878
+      ],
+      "p99_ratio": 0.7762803234501348
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "ratio": 1.0739539848627526,
+      "paired_ratios": [
+        1.0667985587963538,
+        1.0857220247745871,
+        1.0739539848627526
+      ],
+      "p99_ratio": 0.9173228346456693
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "ratio": 1.084321384232552,
+      "paired_ratios": [
+        1.1113096856374798,
+        1.0832440373518164,
+        1.1150487975955503
+      ],
+      "p99_ratio": 29.138823064770932
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "ratio": 1.0898053999438877,
+      "paired_ratios": [
+        1.0554951411367979,
+        1.210202725852398,
+        1.0845976558053927
+      ],
+      "p99_ratio": 0.9250764525993884
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "ratio": 1.0956263716330448,
+      "paired_ratios": [
+        1.0963495996348391,
+        1.1326866100978212,
+        1.064889756636887
+      ],
+      "p99_ratio": 0.6739130434782609
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "ratio": 1.114397269914413,
+      "paired_ratios": [
+        1.0988485713840621,
+        1.122957119566573,
+        1.1124717592885562
+      ],
+      "p99_ratio": 0.931095406360424
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "ratio": 1.1193672782785227,
+      "paired_ratios": [
+        1.1193672782785227,
+        1.1034029476369152,
+        1.1459092966709865
+      ],
+      "p99_ratio": 0.9119318181818182
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "ratio": 1.1295781118101451,
+      "paired_ratios": [
+        1.128914760382624,
+        1.1273048464782776,
+        1.1562927607960118
+      ],
+      "p99_ratio": 0.8528301886792453
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "ratio": 1.134048677107288,
+      "paired_ratios": [
+        1.1586338602474944,
+        1.133754466991935,
+        1.134048677107288
+      ],
+      "p99_ratio": 0.7985347985347986
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "ratio": 1.1674253153407157,
+      "paired_ratios": [
+        1.184816745933035,
+        1.165825714562718,
+        1.1674253153407157
+      ],
+      "p99_ratio": 0.7280701754385965
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.174685680896438,
+      "paired_ratios": [
+        1.1807172199209885,
+        1.174685680896438,
+        1.1727527683150256
+      ],
+      "p99_ratio": 1.12481426448737
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.1760919612139948,
+      "evidence": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-https1m-keep-retry-r4"
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "ratio": 1.1840791394088612,
+      "paired_ratios": [
+        1.1983851341224423,
+        1.1811708235746692,
+        1.1783048130810148
+      ],
+      "p99_ratio": 0.8677357977711334
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "ratio": 1.1870757470895905,
+      "paired_ratios": [
+        1.189300293733318,
+        1.174155732092479,
+        1.1808646348609813
+      ],
+      "p99_ratio": 0.8837209302325582
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "ratio": 1.1896323831017737,
+      "paired_ratios": [
+        1.2214228705578833,
+        1.1500204285705733,
+        1.2075114184162525
+      ],
+      "p99_ratio": 12.816901408450704
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.1905631445296068,
+      "paired_ratios": [
+        1.1982375587747114,
+        1.1905631445296068,
+        1.1839171170313
+      ],
+      "p99_ratio": 1.1009401286491836
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "ratio": 1.1909828428855482,
+      "paired_ratios": [
+        1.1909828428855482,
+        1.0128732945306644,
+        1.0723388664501676
+      ],
+      "p99_ratio": 0.8449612403100775
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "ratio": 1.1917222999831711,
+      "paired_ratios": [
+        1.1877837975263041,
+        1.2021565422491842,
+        1.1839041432992425
+      ],
+      "p99_ratio": 0.8388377926421404
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "ratio": 1.2021474349108092,
+      "paired_ratios": [
+        1.202859743299771,
+        1.2114327384512862,
+        1.1937583114025687
+      ],
+      "p99_ratio": 0.4098360655737705
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "ratio": 1.2054726734375818,
+      "paired_ratios": [
+        1.1958282447842568,
+        1.2054726734375818,
+        1.1802528672639159
+      ],
+      "p99_ratio": 0.42391304347826086
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "ratio": 1.206813819004897,
+      "paired_ratios": [
+        1.2030405589163404,
+        1.1893606785022004,
+        1.20719012574117
+      ],
+      "p99_ratio": 0.786908077994429
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "ratio": 1.2071773391244787,
+      "paired_ratios": [
+        1.1806990399508475,
+        1.2073345103592623,
+        1.2219512354666238
+      ],
+      "p99_ratio": 1.2925840727352393
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "ratio": 1.2072707297630756,
+      "paired_ratios": [
+        1.1950729790602512,
+        1.207700374807073,
+        1.2149437621890882
+      ],
+      "p99_ratio": 0.872331519464211
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "ratio": 1.21310862354705,
+      "paired_ratios": [
+        1.2051239916120324,
+        1.221794055034577,
+        1.2199603535065056
+      ],
+      "p99_ratio": 0.8561330561330561
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 1.2165646992842258,
+      "evidence": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-https1m-keep-retry-r4"
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "ratio": 1.2350835106288003,
+      "paired_ratios": [
+        1.2488444060883839,
+        1.2350835106288003,
+        1.2767065647867903
+      ],
+      "p99_ratio": 19.933088909257563
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "ratio": 1.273308949481798,
+      "paired_ratios": [
+        1.297738466844237,
+        1.2702709466393143,
+        1.2844052236511208
+      ],
+      "p99_ratio": 14.875878220140516
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "ratio": 1.2739489889399083,
+      "paired_ratios": [
+        1.2739489889399083,
+        1.2799787961505922,
+        1.259943423314576
+      ],
+      "p99_ratio": 0.8168866540959564
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "ratio": 1.278335524657632,
+      "paired_ratios": [
+        1.2765449758882255,
+        1.2820047562700831,
+        1.2782638261976509
+      ],
+      "p99_ratio": 0.8049645390070922
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "ratio": 1.2789252283212975,
+      "paired_ratios": [
+        1.2677022838436787,
+        1.30993758258136,
+        1.266325501239058
+      ],
+      "p99_ratio": 0.8051524710830704
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "ratio": 1.2824226142587145,
+      "paired_ratios": [
+        1.2980373163740937,
+        1.2824226142587145,
+        1.2798702291923787
+      ],
+      "p99_ratio": 53.18050789293068
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "ratio": 1.2867018314808991,
+      "paired_ratios": [
+        1.2867018314808991,
+        1.2490450760499747,
+        1.2667982900959691
+      ],
+      "p99_ratio": 5.050348027842228
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "ratio": 1.287855677996871,
+      "paired_ratios": [
+        1.2583760610741326,
+        1.2984652870428277,
+        1.2814357139283237
+      ],
+      "p99_ratio": 0.7027027027027027
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "ratio": 1.29325507458694,
+      "paired_ratios": [
+        1.294621689522134,
+        1.29325507458694,
+        1.2976274011676012
+      ],
+      "p99_ratio": 0.5732421875
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "ratio": 1.2969251077580584,
+      "paired_ratios": [
+        1.3046244258695316,
+        1.2969251077580584,
+        1.3220474109436333
+      ],
+      "p99_ratio": 38.64502164502164
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.298562197423837,
+      "paired_ratios": [
+        1.273128468325729,
+        1.298562197423837,
+        1.31380566258992
+      ],
+      "p99_ratio": 0.7773682270549207
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.3020255456453722,
+      "evidence": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-https1m-keep-retry-r4"
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "ratio": 1.304937174281351,
+      "paired_ratios": [
+        1.304937174281351,
+        1.3029276976874073,
+        1.3114406758353816
+      ],
+      "p99_ratio": 8.860726643598616
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "ratio": 1.3051797111884584,
+      "paired_ratios": [
+        1.3104442878646527,
+        1.3003892976093363,
+        1.3051797111884584
+      ],
+      "p99_ratio": 0.78125
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "ratio": 1.3055024418109753,
+      "paired_ratios": [
+        1.3055024418109753,
+        1.301577671524108,
+        1.3071446367033037
+      ],
+      "p99_ratio": 37.12555654496883
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "ratio": 1.3059071522586616,
+      "paired_ratios": [
+        1.3247927461284255,
+        1.304700931757013,
+        1.33511185822124
+      ],
+      "p99_ratio": 18.541182290378433
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "ratio": 1.3084073195189678,
+      "paired_ratios": [
+        1.317684196972452,
+        1.3015131086425427,
+        1.3536846936268045
+      ],
+      "p99_ratio": 18.212136284506343
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.3094603953028983,
+      "paired_ratios": [
+        1.3115852052085535,
+        1.305862314526695,
+        1.3150918897633035
+      ],
+      "p99_ratio": 0.8208
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "ratio": 1.3098460223683597,
+      "paired_ratios": [
+        1.3059144552034796,
+        1.308472628571687,
+        1.313213608916931
+      ],
+      "p99_ratio": 0.7859186379178006
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "ratio": 1.3099746454566068,
+      "paired_ratios": [
+        1.3004970850395592,
+        1.312705886587379,
+        1.3040828413256973
+      ],
+      "p99_ratio": 0.7734028596575718
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "ratio": 1.3118857574283374,
+      "paired_ratios": [
+        1.3210420352964307,
+        1.300681774345514,
+        1.3118857574283374
+      ],
+      "p99_ratio": 0.674812030075188
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "ratio": 1.313522131542603,
+      "paired_ratios": [
+        1.2457259758846109,
+        1.317526359089703,
+        1.318691561726924
+      ],
+      "p99_ratio": 0.5685328185328186
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "ratio": 1.3159819483544848,
+      "paired_ratios": [
+        1.3226376487014677,
+        1.3109897784182538,
+        1.3461699338464488
+      ],
+      "p99_ratio": 4.502098247346335
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "ratio": 1.3165783702331488,
+      "paired_ratios": [
+        1.3207744064581601,
+        1.3146865624651776,
+        1.3337397596676288
+      ],
+      "p99_ratio": 4.6425327951564075
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "ratio": 1.3254287921332972,
+      "paired_ratios": [
+        1.3058543156299294,
+        1.3002974014311626,
+        1.352422939363967
+      ],
+      "p99_ratio": 9.02654109589041
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "ratio": 1.35194436009415,
+      "paired_ratios": [
+        1.3643101144911003,
+        1.35194436009415,
+        1.3596241298394134
+      ],
+      "p99_ratio": 0.7391407548065512
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.3643734971398718,
+      "paired_ratios": [
+        1.370659943686406,
+        1.3643734971398718,
+        1.347950686766787
+      ],
+      "p99_ratio": 0.9615189873417721
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.3710947304377281,
+      "paired_ratios": [
+        1.364362446827608,
+        1.3833920371905741,
+        1.363791744004599
+      ],
+      "p99_ratio": 0.9529780564263323
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "ratio": 1.3912006747327195,
+      "paired_ratios": [
+        1.3940745318776309,
+        1.3940575264422923,
+        1.390034682914584
+      ],
+      "p99_ratio": 0.7461406518010292
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "ratio": 1.398868690315798,
+      "paired_ratios": [
+        1.4037659647340364,
+        1.3774381613878643,
+        1.3651264069158686
+      ],
+      "p99_ratio": 0.282523927685218
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.4055935063333602,
+      "paired_ratios": [
+        1.429929506230343,
+        1.4037469931586775,
+        1.4055935063333602
+      ],
+      "p99_ratio": 0.8021938283510125
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "ratio": 1.4146681245907893,
+      "paired_ratios": [
+        1.4082084419031429,
+        1.425561143706835,
+        1.4162802879966714
+      ],
+      "p99_ratio": 0.7461704164672092
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "ratio": 1.4274587463692368,
+      "paired_ratios": [
+        1.4112644347469012,
+        1.4274587463692368,
+        1.435467958514534
+      ],
+      "p99_ratio": 0.7148779364348227
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "ratio": 1.4286925746286347,
+      "paired_ratios": [
+        1.4354322936619388,
+        1.4439268711395163,
+        1.3985763509442322
+      ],
+      "p99_ratio": 0.22491210447011553
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.4367652153376145,
+      "paired_ratios": [
+        1.4274799070238864,
+        1.478446729029657,
+        1.4253931767556751
+      ],
+      "p99_ratio": 0.6522353772751369
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.4485613692002084,
+      "paired_ratios": [
+        1.4485613692002084,
+        1.4492341510680324,
+        1.4458372740496146
+      ],
+      "p99_ratio": 0.807579355600208
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.456023759521946,
+      "paired_ratios": [
+        1.4415234111364503,
+        1.4582457394849775,
+        1.4441675975933537
+      ],
+      "p99_ratio": 0.6338083927157562
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.481235002266902,
+      "paired_ratios": [
+        1.4635410488135263,
+        1.481235002266902,
+        1.4970142465006837
+      ],
+      "p99_ratio": 0.4984148862853205
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "ratio": 1.4840582235443895,
+      "paired_ratios": [
+        1.43967915760737,
+        1.4906477477945432,
+        1.4840582235443895
+      ],
+      "p99_ratio": 0.6263736263736264
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "ratio": 1.4970385483314446,
+      "paired_ratios": [
+        1.5242506686734612,
+        1.4970385483314446,
+        1.4861897495713499
+      ],
+      "p99_ratio": 0.6747894103489771
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.5125055728458672,
+      "paired_ratios": [
+        1.5230101378222172,
+        1.5049394061858774,
+        1.5125055728458672
+      ],
+      "p99_ratio": 0.4763554830819405
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "ratio": 1.5320063172809255,
+      "paired_ratios": [
+        1.5538400060958446,
+        1.5102147150817036,
+        1.5467548961286295
+      ],
+      "p99_ratio": 0.6991422001428358
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "ratio": 1.5468455027589452,
+      "paired_ratios": [
+        1.4673948765893106,
+        1.5468455027589452,
+        1.5674096143988174
+      ],
+      "p99_ratio": 0.6129032258064516
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "ratio": 1.5629063066902282,
+      "paired_ratios": [
+        1.5629063066902282,
+        1.5570318647448629,
+        1.5506942379423159
+      ],
+      "p99_ratio": 0.6461734311816684
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "ratio": 1.5759793497198804,
+      "paired_ratios": [
+        1.5591277475334437,
+        1.585425878445388,
+        1.5685923023021915
+      ],
+      "p99_ratio": 0.6551724137931034
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "ratio": 1.6781782518893702,
+      "paired_ratios": [
+        1.6985926569058762,
+        1.6449948021560807,
+        1.6781782518893702
+      ],
+      "p99_ratio": 0.6153478593272171
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "ratio": 1.8249966561773643,
+      "paired_ratios": [
+        1.8188966410702474,
+        1.801646137075729,
+        1.8319968519638574
+      ],
+      "p99_ratio": 0.5022367515485203
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "ratio": 1.8570694991191778,
+      "paired_ratios": [
+        1.8570694991191778,
+        1.8340431934031756,
+        1.8723369696134209
+      ],
+      "p99_ratio": 0.6065012831479898
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "ratio": 2.8158616585565395,
+      "paired_ratios": [
+        2.8104146598523974,
+        2.9827720897160552,
+        2.8323066881120766
+      ],
+      "p99_ratio": 0.4511627906976744
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "ratio": 2.9340035352478075,
+      "paired_ratios": [
+        2.8384165320479955,
+        2.9624333796646507,
+        2.9340035352478075
+      ],
+      "p99_ratio": 0.45691056910569106
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "ratio": 2.9909840666253262,
+      "paired_ratios": [
+        2.960030445403011,
+        3.158775580585465,
+        2.9909840666253262
+      ],
+      "p99_ratio": 0.3513011152416357
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "ratio": 3.0016457627523083,
+      "paired_ratios": [
+        2.865600700773176,
+        3.055286196480891,
+        2.9854258300575665
+      ],
+      "p99_ratio": 0.28543547206635766
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "ratio": 3.0608680175074996,
+      "paired_ratios": [
+        3.05846961783733,
+        3.019924473815038,
+        3.0955855247313435
+      ],
+      "p99_ratio": 0.44387755102040816
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "ratio": 3.1029791078341264,
+      "paired_ratios": [
+        3.068494576208572,
+        3.1029791078341264,
+        3.1250053545842427
+      ],
+      "p99_ratio": 0.3022560478390867
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "ratio": 3.4418656902123166,
+      "paired_ratios": [
+        2.958222704483725,
+        3.464119653052921,
+        3.4418656902123166
+      ],
+      "p99_ratio": 0.3877159309021113
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "ratio": 3.6753344148700924,
+      "paired_ratios": [
+        3.595764136124203,
+        3.6753344148700924,
+        3.7968706357557527
+      ],
+      "p99_ratio": 0.2823244552058111
+    }
+  ]
+}

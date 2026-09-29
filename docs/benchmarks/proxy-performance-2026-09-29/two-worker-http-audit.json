@@ -1,0 +1,56 @@
+{
+  "valid": true,
+  "scope": "2workers HTTP64KiB converter-strict proxy keepalive c32/c128,3repeats5s,zero errors/exact-body preflight",
+  "result": [
+    {
+      "concurrency": 32,
+      "rut_nginx_rps_ratio": 1.2457520781701779,
+      "rut_nginx_p99_ratio": 0.6478719534376137,
+      "medians": {
+        "rut": {
+          "rps": 23071.44154153687,
+          "p99_us": 1781.0,
+          "server_cpu_pct": 138.7950588959033,
+          "origin_cpu_pct": 78.82912473395173,
+          "server_rss_bytes": 251121664
+        },
+        "nginx": {
+          "rps": 18520.090751464242,
+          "p99_us": 2749.0,
+          "server_cpu_pct": 135.4988573779422,
+          "origin_cpu_pct": 63.53347292395557,
+          "server_rss_bytes": 24281088
+        }
+      }
+    },
+    {
+      "concurrency": 128,
+      "rut_nginx_rps_ratio": 1.2544358242874016,
+      "rut_nginx_p99_ratio": 0.7883646965279618,
+      "medians": {
+        "rut": {
+          "rps": 23045.914448380474,
+          "p99_us": 5949.0,
+          "server_cpu_pct": 137.9752294585888,
+          "origin_cpu_pct": 78.63590005556264,
+          "server_rss_bytes": 259829760
+        },
+        "nginx": {
+          "rps": 18371.537229871446,
+          "p99_us": 7546.0,
+          "server_cpu_pct": 135.15017569522837,
+          "origin_cpu_pct": 62.40758112985548,
+          "server_rss_bytes": 25067520
+        }
+      }
+    }
+  ],
+  "origin_single_worker": true,
+  "run": "/tmp/rut-bounded-followup-20260928/multiworker2-proxy64k-keep-accept-r1",
+  "hashes": {
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-nginx-convert-rebased-main-733": "2e19980ca539377c968bed8347d6b9dcf1907debbf8b5437d469a94c0de5659f",
+    "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30"
+  },
+  "caveat": "Not evidence for all worker counts/profiles; memory and origin costs included, separate topology from singleworker matrix"
+}

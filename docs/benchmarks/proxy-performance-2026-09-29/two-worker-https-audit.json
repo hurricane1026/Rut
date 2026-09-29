@@ -1,0 +1,56 @@
+{
+  "valid": true,
+  "at": "2026-09-29T14:30:05.164936+00:00",
+  "scope": "2 workers, HTTPS 64KiB proxy keepalive, c32/c128, three repeats, exact-body preflight, zero errors",
+  "run": "/tmp/rut-bounded-followup-20260928/multiworker2-https-proxy64k-keep-accept-r1",
+  "results": [
+    {
+      "concurrency": 32,
+      "rut_nginx_rps_ratio": 1.3016171746324439,
+      "rut_nginx_p99_ratio": 0.5647897713302188,
+      "medians": {
+        "rut": {
+          "rps": 17695.745333578117,
+          "p99_us": 2297.0,
+          "server_cpu_pct": 148.99112012924027,
+          "origin_cpu_pct": 60.3954099488439,
+          "server_rss_bytes": 254226432
+        },
+        "nginx": {
+          "rps": 13595.199632007865,
+          "p99_us": 4067.0,
+          "server_cpu_pct": 148.23349206342982,
+          "origin_cpu_pct": 46.66609935330197,
+          "server_rss_bytes": 34828288
+        }
+      }
+    },
+    {
+      "concurrency": 128,
+      "rut_nginx_rps_ratio": 1.367963117567806,
+      "rut_nginx_p99_ratio": 0.7758689572512985,
+      "medians": {
+        "rut": {
+          "rps": 18162.163411837602,
+          "p99_us": 7768.0,
+          "server_cpu_pct": 150.5742208579707,
+          "origin_cpu_pct": 60.866197599126906,
+          "server_rss_bytes": 266461184
+        },
+        "nginx": {
+          "rps": 13276.793196098253,
+          "p99_us": 10012.0,
+          "server_cpu_pct": 147.86319744798485,
+          "origin_cpu_pct": 46.12275611300473,
+          "server_rss_bytes": 39415808
+        }
+      }
+    }
+  ],
+  "hashes": {
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-nginx-convert-rebased-main-733": "2e19980ca539377c968bed8347d6b9dcf1907debbf8b5437d469a94c0de5659f",
+    "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30"
+  },
+  "limits": "Only two concurrency points and one payload/profile; RSS is parent+children sum, not PSS"
+}

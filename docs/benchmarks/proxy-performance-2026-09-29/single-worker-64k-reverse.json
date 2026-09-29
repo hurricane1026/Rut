@@ -1,0 +1,98 @@
+{
+  "at": "2026-09-29T13:08:22.818353+00:00",
+  "valid": true,
+  "scope": "HTTP64KiB proxy c1 close/keepalive reverse-order confirmation; separate evidence, no replacement of full matrix",
+  "cells": [
+    {
+      "scenario": "proxy-close",
+      "median_rps": {
+        "rut": 6046.832658151401,
+        "nginx": 6107.140286750455
+      },
+      "rut_nginx_ratio": 0.9901250625059502,
+      "paired_ratios": [
+        0.9974208905592276,
+        0.9912559006909921,
+        0.9868211533572184
+      ],
+      "evidence": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-64k-reverse-r6/http-65536-proxy-close",
+      "hashes": {
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-nginx-convert-rebased-main-733": "2e19980ca539377c968bed8347d6b9dcf1907debbf8b5437d469a94c0de5659f",
+        "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30"
+      },
+      "order": [
+        {
+          "scenario": "proxy-close",
+          "repeat": 1,
+          "engines": [
+            "rut",
+            "nginx"
+          ]
+        },
+        {
+          "scenario": "proxy-close",
+          "repeat": 2,
+          "engines": [
+            "nginx",
+            "rut"
+          ]
+        },
+        {
+          "scenario": "proxy-close",
+          "repeat": 3,
+          "engines": [
+            "rut",
+            "nginx"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": "proxy-keepalive",
+      "median_rps": {
+        "rut": 7881.8130032756735,
+        "nginx": 8041.245846042594
+      },
+      "rut_nginx_ratio": 0.9801731167260128,
+      "paired_ratios": [
+        0.9746334811519473,
+        0.9820417782767341,
+        0.9814777269664111
+      ],
+      "evidence": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-64k-reverse-r6/http-65536-proxy-keepalive",
+      "hashes": {
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+        "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-nginx-convert-rebased-main-733": "2e19980ca539377c968bed8347d6b9dcf1907debbf8b5437d469a94c0de5659f",
+        "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30"
+      },
+      "order": [
+        {
+          "scenario": "proxy-keepalive",
+          "repeat": 1,
+          "engines": [
+            "rut",
+            "nginx"
+          ]
+        },
+        {
+          "scenario": "proxy-keepalive",
+          "repeat": 2,
+          "engines": [
+            "nginx",
+            "rut"
+          ]
+        },
+        {
+          "scenario": "proxy-keepalive",
+          "repeat": 3,
+          "engines": [
+            "rut",
+            "nginx"
+          ]
+        }
+      ]
+    }
+  ],
+  "failed_launch_retained": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-64k-reverse-r5"
+}

@@ -1,7 +1,7 @@
 # Local nginx / RUT benchmark
 
 Run real pinned nginx and converter-generated RUT against the same requests on
-one physical core each, with separate cores for the client and origin. This is
+one physical core each by default, with separate cores for the client and origin. This is
 an opt-in local experiment, not a performance CI gate or an expansion of the
 nginx compatibility matrix. The harness does not modify production source.
 
@@ -18,7 +18,7 @@ nginx compatibility matrix. The harness does not modify production source.
   `a211dd5a7050b1f9e8a9870b95513060e72ac4a0`. Build with `make -j1
   WITH_OPENSSL=/usr` if using system OpenSSL development files; LuaJIT is built
   from wrk's bundled source. The harness neither downloads nor builds tools.
-- Four available physical cores (the example uses 2, 3, 4, 5). The script rejects
+- Four available physical cores for the default one-worker run (the example uses 2, 3, 4, 5). The script rejects
   unavailable CPUs, overlapping assignments, and SMT siblings. It does not
   reserve these cores against other programs or lock CPU frequency.
 
@@ -234,6 +234,19 @@ as `.converted.rut`, its cleartext listener line is removed in the runnable
 file, and CLI port/certificate/key configure TLS. Both TLS frontends bind the
 same wildcard IPv4 port. This tests Rut TLS runtime performance, **not** TLS
 converter compatibility. Original HTTP output stays unmodified.
+
+Use `--server-cpus 2,6 --workers 2` to run both frontends with two workers
+on two distinct physical cores. `--workers` defaults to 1, and the legacy
+`--server-cpu N` form remains the single-worker default. Worker count must match
+the server mask. Rut receives the full mask with `--shards N --no-pin`, and the
+run fails unless the selected binary reports starting exactly N shards (a binary
+clamps `--shards` to its own compiled limit); nginx uses the same CPU mask and
+worker count.
+The origin remains pinned to its separate single CPU and one nginx worker.
+CPU usage remains the aggregate process and child usage; it is not divided by
+the worker count. Matrix reports keep each worker count and CPU topology in its
+cell, so do not merge summaries from different topologies. The one-core origin
+can become a bottleneck in multi-worker runs.
 
 `matrix.py` accepts the same binary/CPU arguments as `run.py`, plus required
 `--tls-cert` / `--tls-key`. Defaults are all four scenarios, HTTP and HTTPS,
