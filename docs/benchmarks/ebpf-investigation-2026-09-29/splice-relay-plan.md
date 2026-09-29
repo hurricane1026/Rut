@@ -1,6 +1,6 @@
 # Pipe-backed bounded body relay: integration plan
 
-Status: feasibility probe passed; **no runtime implementation yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
+Status: feasibility probe passed; pipe storage owner and real-kernel primitive tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
 
 ## Initial eligibility
 
@@ -26,6 +26,16 @@ Keep the ordinary path for all other cases and for pipe allocation failure befor
 2. Backend splice input/output SQEs, partial completion and cancellation decoding.
 3. Post-header direct-body receive arming, batch witnesses and bounded release/terminal completion paths.
 4. Existing body-length/front-data consumers: pipe data must be routed explicitly, including final completion and error paths, rather than allowing a null or fabricated data pointer into a memory send.
+
+## Storage and primitive progress
+
+`ResponseBodyPipe` now owns the nonblocking close-on-exec pipe and separate input/output reservation phases. SQ rollback is distinct from completion of a submitted operation; partial transfers update committed bytes only once. Zero/error completions retire an operation without inventing progress. Operation serials survive close/reopen and refuse wraparound. The eventual caller still must authenticate connection, episode, deadline and send ownership before applying a completion; local serials are not a substitute for that integration.
+
+Pipe page slots can fill before the requested byte limit. The regression test actually exhausts an 8 KiB pipe with one-byte fragments from separate pages. `drain_into` migrates committed bytes into ordinary storage only when no input/output owns the pipe. Production fallback must preserve origin-received counters and must not refresh network inactivity time for this memory migration. Disable splice reentry for the response after fragmentation fallback to avoid a repeated loop.
+
+Two real TCP/io_uring tests verify declared-length capping with trailing bytes, publication credit, EOF, EAGAIN and cancellation of a queued splice linked behind POLLIN. Workers use the test process's allowed affinity. Link members are published in one submission; an initial test harness incorrectly submitted the two members separately and was corrected. The cancellation test does not cover canceling a running blocking worker: the intended primitive is nonblocking, and the production design still needs an explicit readiness owner for EAGAIN. The tests use a separate small raw ring, not the runtime dispatcher.
+
+Current result: 9 tests, 224 checks, zero failures and zero skips on this Linux host. Runtime executable SHA256 still matches the accepted baseline. No production hit count or throughput improvement is claimed.
 
 ## Correctness and retention gates
 

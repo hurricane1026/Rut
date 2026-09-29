@@ -1,0 +1,21 @@
+=== response_body_pipe ===
+RUN: response_body_pipe.real_uring_tcp_declared_bound_publication_and_eof
+  PASS: real_uring_tcp_declared_bound_publication_and_eof
+RUN: response_body_pipe.real_uring_empty_origin_retry_and_queued_cancel
+  PASS: real_uring_empty_origin_retry_and_queued_cancel
+RUN: response_body_pipe.flags_capacity_and_transactional_reservations
+  PASS: flags_capacity_and_transactional_reservations
+RUN: response_body_pipe.partial_progress_and_stale_completions
+  PASS: partial_progress_and_stale_completions
+RUN: response_body_pipe.cancellation_eof_retry_and_reopen_keep_identity
+  PASS: cancellation_eof_retry_and_reopen_keep_identity
+RUN: response_body_pipe.publication_credit_errors_and_final_fd_release
+  PASS: publication_credit_errors_and_final_fd_release
+RUN: response_body_pipe.logical_capacity_and_input_first_completion_order
+  PASS: logical_capacity_and_input_first_completion_order
+RUN: response_body_pipe.page_slot_exhaustion_can_migrate_before_publication
+  PASS: page_slot_exhaustion_can_migrate_before_publication
+RUN: response_body_pipe.fd_exhaustion_leaves_empty_owner
+  PASS: fd_exhaustion_leaves_empty_owner
+
+9 passed, 0 failed, 224 checks, 0 failed checks
