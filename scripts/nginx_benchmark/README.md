@@ -1,7 +1,7 @@
 # Local nginx / RUT benchmark
 
 Run real pinned nginx and converter-generated RUT against the same requests on
-one physical core each, with separate cores for the client and origin. This is
+one physical core each by default, with separate cores for the client and origin. This is
 an opt-in local experiment, not a performance CI gate or an expansion of the
 nginx compatibility matrix. The harness does not modify production source.
 
