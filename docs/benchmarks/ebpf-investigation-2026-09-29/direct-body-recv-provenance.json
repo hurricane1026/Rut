@@ -1,0 +1,6 @@
+{
+  "source_base": "c0eb8321db03d27cb4605501688a0d8272632d58",
+  "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-direct-body-recv",
+  "sha256": "64b4c837edd37c990f3fc5628fa746faa9e58b7811abc5f1bd0976929828a685",
+  "full_network_regression": "not run; rejected after clear causal throughput regression"
+}

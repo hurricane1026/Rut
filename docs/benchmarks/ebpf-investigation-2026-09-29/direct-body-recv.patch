@@ -1,0 +1,20 @@
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index fb5132ee..134573cc 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -558,6 +558,15 @@ bool IoUringBackend::add_recv_upstream_direct(
+     sqe->fd = fd;
+     sqe->addr = reinterpret_cast<u64>(dst);
+     sqe->len = len;
++    // Experimental control: change receive timing without a staging copy.
++    if (len >= 65536 && nop_inject_result) {
++        const ssize_t received = ::recv(fd, dst, len, MSG_DONTWAIT);
++        if (received > 0) {
++            sqe->opcode = IORING_OP_NOP;
++            sqe->rw_flags = IORING_NOP_INJECT_RESULT;
++            sqe->len = static_cast<u32>(received);
++        }
++    }
+     // msg_flags stays 0 (memset above): no MSG_WAITALL, see the declaration.
+     // No IOSQE_BUFFER_SELECT / buf_group: the kernel writes straight into
+     // dst, so this CQE never carries IORING_CQE_F_BUFFER. wait() recognizes
