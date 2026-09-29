@@ -156,13 +156,13 @@ inline constexpr u8 kUpstreamOpConnect = 1u << 0;
 inline constexpr u8 kUpstreamOpRecv = 1u << 1;
 inline constexpr u8 kUpstreamOpSend = 1u << 2;
 
-// Backend copy evidence for an upstream response CQE.  The io_uring event
-// loop accepts deadline progress only when the provided-buffer payload was
-// copied atomically into the current response buffer.  All other producers
-// leave this neutral.
+// Backend storage evidence for an upstream response CQE. Full identifies an
+// exact memory-buffer commit; Pipe identifies a separately authenticated body
+// commit without a readable user pointer. Other producers leave this neutral.
 enum class IoEventCopyWitness : u8 {
     None,
     Full,
+    Pipe,  // exact body bytes committed to pipe storage, never a memory-copy witness
     Invalid,
 };
 

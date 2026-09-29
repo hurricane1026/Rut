@@ -1,0 +1,35 @@
+{
+  "stage": "typed pipe receive evidence and ordered storage; production admission disabled",
+  "focused_tests": {
+    "passed": 3,
+    "failed": 0,
+    "checks": 144,
+    "filtered_out": 1429,
+    "scope": "synthetic CQEs through production backend wait and strict response-policy fixture; actual pipe storage"
+  },
+  "storage_transport_tests": {
+    "passed": 14,
+    "failed": 0,
+    "checks": 471
+  },
+  "network_tests": {
+    "passed": 1432,
+    "failed": 0,
+    "checks": 372074,
+    "failed_checks": 0,
+    "log_sha256": "f8b501127b61260110fcb74e9eb649057e5abf1e0465d997f5d44084f811bf74"
+  },
+  "commands": [
+    "cmake --build build-rel --target test_network test_response_body_pipe -j 8",
+    "timeout 60 build-rel/tests/test_network --filter=response_buffering_runtime.pipe_",
+    "build-rel/tests/test_response_body_pipe",
+    "build-rel/tests/test_network"
+  ],
+  "serialization": "flock /tmp/rut-clean-bench/bench.lock",
+  "initial_attempt": "Two focused tests passed; the third fixture reused BatchPending for a second independent batch. Restoring its Armed/prefix fixture fixed the test; production validation was not relaxed.",
+  "acceptance_unchanged": true,
+  "rut_binary_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "production_pipe_hit_count": null,
+  "performance_gain": null,
+  "macos_validation": "not run; Linux host"
+}

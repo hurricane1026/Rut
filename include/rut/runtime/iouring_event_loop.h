@@ -2855,6 +2855,10 @@ public:
         auto* owner = c.response_body_pipe;
         if (!owner) return;
         owner->closing = true;
+        // Only raw pipe targets retire through the pipe ledger. A positive
+        // input already translated to UpstreamRecv has targets[0]==0 and must
+        // retain the ordinary recv custody until that queued event dispatches.
+        if (owner->targets[0] || owner->targets[2]) c.upstream_recv_armed = false;
         // Reservations which never reached the kernel own no CQE.
         if (owner->storage.input.phase == ResponseBodyPipe::Phase::Reserved)
             (void)owner->storage.rollback_input(owner->storage.input.serial);
@@ -4382,7 +4386,7 @@ public:
                 owner.last_positive = i;
                 owner.last_positive_sock_nonempty = ev.sock_nonempty != 0;
                 if (owner.saw_terminal && !owner.terminal_fault) owner.valid = false;
-                if (ev.copy_witness != IoEventCopyWitness::Full ||
+                if (!response_read_body_storage_witness_is_current(conns[ev.conn_id], ev) ||
                     ev.copy_deadline_generation != owner.deadline_generation ||
                     ev.copy_deadline_profile != static_cast<u8>(owner.profile) ||
                     ev.copy_deadline_method != owner.method || ev.copy_end < ev.copy_begin ||

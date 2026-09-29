@@ -1408,6 +1408,38 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             events[count].result = cqe->res;
             events[count].aux = static_cast<u8>(token.operation);
             events[count].non_upstream_generation = token.serial;
+            // Convert only an authenticated positive/EOF body input. Raw
+            // EAGAIN, cancel and stale-owner records retain pipe custody and
+            // cannot refresh a response deadline. No provided buffer is used.
+            if (token.operation == BodyPipeOperation::Input && cqe->res >= 0 && conns != nullptr &&
+                token.conn_id < max_conns) {
+                Connection& conn = conns[token.conn_id];
+                auto* owner = conn.response_body_pipe;
+                const u32 received = conn.response_read_deadline_post_commit_origin_received;
+                const u32 declared = conn.response_read_deadline_post_commit_declared_body;
+                if (response_body_pipe_receive_identity_is_current(conn) && conn.pending_ops != 0 &&
+                    response_deadline_copy_owner(conn, owner->upstream_episode, 0) &&
+                    owner->targets[0] == token.serial && received <= declared &&
+                    static_cast<u32>(cqe->res) <= declared - received) {
+                    const u32 begin = conn.buffered_response_len();
+                    if (owner->retire(events[count])) {
+                        events[count].type = IoEventType::UpstreamRecv;
+                        events[count].aux = 0;
+                        events[count].upstream_episode = owner->upstream_episode;
+                        if (cqe->res > 0) {
+                            owner->received_serial = token.serial;
+                            owner->received_begin = begin;
+                            owner->received_end = conn.buffered_response_len();
+                            events[count].copy_witness = IoEventCopyWitness::Pipe;
+                            events[count].copy_deadline_generation = owner->deadline_generation;
+                            events[count].copy_deadline_profile = owner->profile;
+                            events[count].copy_deadline_method = owner->method;
+                            events[count].copy_begin = begin;
+                            events[count].copy_end = owner->received_end;
+                        }
+                    }
+                }
+            }
             head++;
             count++;
             continue;

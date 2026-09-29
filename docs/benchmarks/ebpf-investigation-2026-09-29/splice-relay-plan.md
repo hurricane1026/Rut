@@ -1,6 +1,6 @@
 # Pipe-backed bounded body relay: integration plan
 
-Status: feasibility probe passed; pipe storage owner, io_uring transport, connection teardown custody and real-kernel tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
+Status: feasibility probe passed; pipe storage owner, io_uring transport, connection teardown custody, typed pipe receive evidence and tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
 
 ## Initial eligibility
 
@@ -53,7 +53,17 @@ Close rolls back reservations that never reached the kernel and cancels submitte
 
 After ring teardown, forced shutdown releases the process's pipe descriptors before destroying the pool. Pipe SQEs never contain pointers into the owner; kernel operations retain their own file references. This forced shutdown path is distinct from normal CQE-driven slot reuse and does not fabricate semantic completion.
 
-The next semantic integration must preserve two timing boundaries: receive evidence must be materialized before the existing whole-batch deadline arbitration; physical output completion must not remove bytes from the logical buffered-body invariant before the corresponding send callback accounts for them. Preserve the ordinary-memory prefix in front of pipe bytes and represent the pipe source explicitly in both Bounded release and terminal-body paths. The current live-transport dispatch deliberately closes instead of pretending that an unintegrated operation successfully forwarded a response.
+Semantic integration must preserve two timing boundaries: receive evidence must be materialized before the existing whole-batch deadline arbitration; physical output completion must not remove bytes from the logical buffered-body invariant before the corresponding send callback accounts for them. Preserve the ordinary-memory prefix in front of pipe bytes and represent the pipe source explicitly in both Bounded release and terminal-body paths. The current live-transport dispatch deliberately closes instead of pretending that an unintegrated operation successfully forwarded a response.
+
+## Pipe receive evidence and ordered storage progress
+
+Buffered response accounting now includes committed pipe bytes. The ordinary receive buffer and body chain remain the front prefix; only after that prefix drains does `buffered_response_front_is_pipe()` become true. A pipe front has an explicit length and a null memory pointer. The future send router must select splice explicitly; pipe storage cannot masquerade as an ordinary send source.
+
+For a current admitted Bounded plaintext body after the canonical header, backend `wait()` validates both the existing response-read policy owner and the pipe's captured descriptor/episode/deadline/profile/method tuple before retiring an exact input token. Positive completion establishes `IoEventCopyWitness::Pipe` with its serial and pre/post logical buffer boundaries. The existing batch ledger accepts this distinct storage witness only when those saved boundaries and identity match. No Full memory-copy witness is forged. EOF remains a neutral terminal receive; EAGAIN, cancellation and stale/overrun input remain raw transport records and cannot refresh a deadline. Kernel custody can still retire rejected data during abort without publishing it as response progress.
+
+Close also distinguishes a raw pipe input owner from an already translated semantic UpstreamRecv event. Only the latter retains ordinary recv accounting; a raw pipe target must not acquire a fictitious second generic recv cancel.
+
+Still pending before production admission: receive rearming/readiness and fragmentation fallback, physical-versus-logical output accounting, explicit pipe send routing through both Bounded release and terminal-body paths, and end-to-end timeout/backpressure regression. The isolated batch tests cannot substitute for that complete response integration or a runtime path-hit benchmark.
 
 ## Correctness and retention gates
 

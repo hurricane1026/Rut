@@ -16,6 +16,11 @@ struct ResponseBodyPipeOwner {
     u32 deadline_generation = 0;
     u8 profile = 0;
     u8 method = 0xff;
+    // One-shot receive evidence produced before response batch arbitration.
+    // A new admitted input must clear this proof before it can be submitted.
+    u32 received_serial = 0;
+    u32 received_begin = 0;
+    u32 received_end = 0;
     u32 targets[4]{};
     u32 cancels[4]{};
     u8 cancel_attempted = 0;
