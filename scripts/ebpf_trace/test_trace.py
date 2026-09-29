@@ -252,6 +252,28 @@ if mode != "truncated":
                         "--output", str(link)])
             popen.assert_not_called()
 
+    def test_untrusted_output_parent_is_rejected(self):
+        parent = self.root / "public-parent"
+        parent.mkdir(mode=0o755)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(trace.subprocess, "Popen") as popen:
+            trace.main(["--pid", str(os.getpid()), "--bpftrace", str(self.fake),
+                        "--output", str(parent / "output")])
+            popen.assert_not_called()
+
+    def test_pinned_output_survives_display_path_replacement(self):
+        display = self.root / "pinned"
+        fd = trace.open_output_dir(display)
+        try:
+            original = self.root / "original"
+            display.rename(original)
+            display.mkdir(mode=0o700)
+            trace.secure_text(Path(f"/proc/self/fd/{fd}") / "status.json", "original\n")
+            self.assertTrue((original / "status.json").exists())
+            self.assertFalse((display / "status.json").exists())
+        finally:
+            os.close(fd)
+
     def test_invalid_selection_never_launches_tool(self):
         for args in (["--pid", "0"], ["--pid", "1", "--duration", "0"],
                      ["--pid", "1", "--front-port", "9987"],

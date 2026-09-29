@@ -31,6 +31,34 @@ def secure_text(path, text):
         raise
 
 
+def open_output_dir(path):
+    """Create and pin a private output directory without pathname races."""
+    parent_path, name = path.parent, path.name
+    parent_fd = os.open(parent_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parent_stat = os.fstat(parent_fd)
+        parent_mode = parent_stat.st_mode
+        trusted_owner = parent_stat.st_uid == os.geteuid() and not (parent_mode & 0o077)
+        sticky_directory = (parent_mode & 0o1000) and (parent_mode & 0o002)
+        if not (trusted_owner or sticky_directory):
+            raise PermissionError("output parent is not a trusted directory")
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        out_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                         dir_fd=parent_fd)
+        out_stat = os.fstat(out_fd)
+        entry_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (out_stat.st_dev, out_stat.st_ino) != (entry_stat.st_dev, entry_stat.st_ino):
+            os.close(out_fd)
+            raise RuntimeError("output directory changed during creation")
+        if out_stat.st_uid != os.geteuid() or out_stat.st_mode & 0o077:
+            os.close(out_fd)
+            raise PermissionError("output directory is not private")
+        os.fchmod(out_fd, 0o700)
+        return out_fd
+    finally:
+        os.close(parent_fd)
+
+
 def valid_attached(event):
     data = event.get("data") if isinstance(event, dict) else None
     return (isinstance(event, dict) and event.get("type") == "attached_probes" and
@@ -315,14 +343,18 @@ def main(argv=None):
     display_out = args.output.absolute()
     out_fd = None
     try:
-        args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
-        out_fd = os.open(args.output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        os.fchmod(out_fd, 0o700)
+        out_fd = open_output_dir(args.output)
         out = Path(f"/proc/self/fd/{out_fd}")
     except FileExistsError:
         parser.error(f"output already exists: {display_out}")
+    except (OSError, RuntimeError) as exc:
+        parser.error(f"cannot securely create output directory: {exc}")
     program = out / "program.bt"
-    secure_text(program, script)
+    try:
+        secure_text(program, script)
+    except BaseException:
+        os.close(out_fd)
+        raise
     groups = sorted(set(args.groups) | ({"tcp"} if "rx-copy" in args.groups else set()))
     status = {"completed": False, "usable": False, "mode": "check" if args.check else "trace",
               "kernel": platform.release(), "machine": platform.machine(), "groups": groups,
