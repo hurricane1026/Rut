@@ -1,0 +1,30 @@
+diff --git a/include/rut/runtime/response_body_chain.h b/include/rut/runtime/response_body_chain.h
+index c233bf30..bce364e5 100644
+--- a/include/rut/runtime/response_body_chain.h
++++ b/include/rut/runtime/response_body_chain.h
+@@ -16,9 +16,10 @@ struct ResponseBodyChain {
+         Node* next;
+         u32 len;
+         u32 offset;
+-        u8 bytes[SlicePool::kSliceSize - sizeof(Node*) - 2 * sizeof(u32)];
++        alignas(SlicePool::kResponseBodyAlignment) u8 bytes[SlicePool::kResponseBodyPayload];
+     };
+     static_assert(sizeof(Node) == SlicePool::kSliceSize);
++    static_assert(__builtin_offsetof(Node, bytes) == SlicePool::kResponseBodyAlignment);
+     static constexpr u32 kPayload = sizeof(Node::bytes);
+     static_assert(kPayload == SlicePool::kResponseBodyPayload);
+     static constexpr u32 kHeader = SlicePool::kSliceSize - kPayload;
+diff --git a/include/rut/runtime/slice_pool.h b/include/rut/runtime/slice_pool.h
+index 97eef7d5..cbfd6d6d 100644
+--- a/include/rut/runtime/slice_pool.h
++++ b/include/rut/runtime/slice_pool.h
+@@ -36,7 +36,8 @@ struct SlicePool {
+     // the remaining bounded body in whole SlicePool nodes. Keep this reserve
+     // with the pool sizing contract so every backend accounts for it equally.
+     static constexpr u32 kMaxBufferedResponseBody = 1u << 20;
+-    static constexpr u32 kResponseBodyPayload = kSliceSize - sizeof(void*) - 2 * sizeof(u32);
++    static constexpr u32 kResponseBodyAlignment = 64;
++    static constexpr u32 kResponseBodyPayload = kSliceSize - kResponseBodyAlignment;
+     static constexpr u32 kMaxBufferedResponseSlices =
+         (kMaxBufferedResponseBody + kResponseBodyPayload - 1) / kResponseBodyPayload;
+     static constexpr u32 kOrdinarySlicesPerConnection = 6;

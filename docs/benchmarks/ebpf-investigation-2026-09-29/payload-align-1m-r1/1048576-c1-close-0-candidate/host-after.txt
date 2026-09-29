@@ -1,0 +1,356 @@
+    PID %CPU COMMAND
+2852053 63.9 rut-payload-ali
+2852051 49.5 nginx
+2534198  3.9 codex
+2641460  1.6 codex
+2533986  0.8 codex
+  44583  0.6 tmux: server
+2851975  0.3 python3
+  14667  0.2 easytier-core
+2852016  0.2 nginx
+  12476  0.1 phantun_client
+  51628  0.1 containerd
+  52376  0.1 dockerd
+  40326  0.0 systemd-oomd
+     16  0.0 rcu_preempt
+   5685  0.0 bird
+2843874  0.0 kworker/u64:4-events_unbound
+  12968  0.0 napi/to-vpc8-0
+2850555  0.0 kworker/u64:11-kvfree_rcu_reclaim
+  19554  0.0 ssserver
+2832631  0.0 kworker/u64:0-events_unbound
+2848699  0.0 kworker/u64:6-events_unbound
+2534468  0.0 codex-code-mode
+2843872  0.0 kworker/u64:2-events_unbound
+2832632  0.0 kworker/u64:1-events_unbound
+   1299  0.0 NetworkManager
+2850037  0.0 kworker/u64:8-events_unbound
+      1  0.0 systemd
+    666  0.0 xfsaild/dm-0
+2837836  0.0 kworker/6:1-events_power_efficient
+2848698  0.0 kworker/u64:3-events_unbound
+2850554  0.0 kworker/u64:10-flush-252:0
+2846711  0.0 kworker/2:2-events
+2847065  0.0 kworker/u64:5-events_unbound
+  12372  0.0 phantun_client
+  20638  0.0 sslocal
+   1173  0.0 irqbalance
+2850556  0.0 kworker/u64:12-events_unbound
+2850558  0.0 kworker/u64:14-events_unbound
+  24975  0.0 systemd
+2850553  0.0 kworker/u64:9-events_unbound
+2850557  0.0 kworker/u64:13-events_unbound
+  40318  0.0 rsyslogd
+2848700  0.0 kworker/u64:7-events_unbound
+   1164  0.0 dbus-broker
+2851144  0.0 kworker/13:2-mm_percpu_wq
+   1329  0.0 wpa_supplicant
+   1176  0.0 polkitd
+  40325  0.0 systemd-journal
+2838214  0.0 kworker/10:1-wg-crypt-to-vpc8
+  40329  0.0 systemd-resolve
+2851552  0.0 kworker/10:0-wg-crypt-to-vpc8
+2847943  0.0 kworker/15:2-mm_percpu_wq
+    121  0.0 kcompactd0
+2840838  0.0 kworker/11:0-mm_percpu_wq
+2848994  0.0 kworker/2:1-wg-crypt-to-vpc8
+     31  0.0 ksoftirqd/2
+  40350  0.0 firewalld
+2843822  0.0 kworker/12:1-mm_percpu_wq
+2534048  0.0 codex
+2851171  0.0 kworker/9:0-wg-crypt-to-vpc6
+  47095  0.0 fwupd
+2848448  0.0 kworker/13:1-mm_percpu_wq
+  12826  0.0 napi/to-vpc6-0
+2846979  0.0 kworker/10:2-events
+ 494472  0.0 python3
+2846777  0.0 kworker/9:2-wg-crypt-to-vpc6
+2642601  0.0 python3
+2846142  0.0 kworker/3:1-wg-crypt-to-vpc6
+  40333  0.0 udisksd
+2845652  0.0 kworker/1:2-events
+2846909  0.0 kworker/0:0-events_power_efficient
+2290401  0.0 ssh-agent
+    148  0.0 hwrng
+2848726  0.0 kworker/14:1-mm_percpu_wq
+2848454  0.0 kworker/5:0-mm_percpu_wq
+2848112  0.0 kworker/9:1-cgroup_free
+ 601785  0.0 python3
+ 544296  0.0 python3
+ 544297  0.0 python3
+ 544298  0.0 python3
+   1186  0.0 systemd-logind
+2844959  0.0 kworker/14:2-events
+     37  0.0 ksoftirqd/3
+ 622971  0.0 python3
+ 574342  0.0 python3
+ 544299  0.0 python3
+  27284  0.0 gssproxy
+2846948  0.0 kworker/5:2-cgroup_free
+2846829  0.0 kworker/13:0-events
+  40331  0.0 systemd-udevd
+2846710  0.0 kworker/4:3-cgroup_free
+2846709  0.0 kworker/4:1-mm_percpu_wq
+2846601  0.0 kworker/8:1-wg-crypt-to-vpc6
+2085546  0.0 avahi-daemon
+2510112  0.0 sshd-session
+  29182  0.0 auditd
+  29975  0.0 dbus-broker
+     97  0.0 ksoftirqd/13
+  40324  0.0 systemd-homed
+  44624  0.0 ssh-agent
+  40121  0.0 abrt-dump-journ
+     15  0.0 ksoftirqd/0
+     55  0.0 ksoftirqd/6
+     43  0.0 ksoftirqd/4
+     49  0.0 ksoftirqd/5
+  40160  0.0 abrt-dump-journ
+  40133  0.0 abrt-dump-journ
+  40332  0.0 systemd-userdbd
+  29184  0.0 sedispatch
+   1053  0.0 irq/150-iwlwifi:default_queue
+     18  0.0 rcu_exp_gp_kthread_worker
+2510113  0.0 fish
+  40323  0.0 sshd
+      2  0.0 kthreadd
+    108  0.0 migration/15
+   1245  0.0 ModemManager
+     42  0.0 migration/4
+     48  0.0 migration/5
+    140  0.0 kswapd0
+  26398  0.0 crond
+    102  0.0 migration/14
+     72  0.0 migration/9
+     90  0.0 migration/12
+     78  0.0 migration/10
+     84  0.0 migration/11
+     96  0.0 migration/13
+     54  0.0 migration/6
+     60  0.0 migration/7
+1076316  0.0 ssh-agent
+     66  0.0 migration/8
+     36  0.0 migration/3
+  40317  0.0 chronyd
+   1153  0.0 dbus-broker-lau
+     24  0.0 migration/1
+     30  0.0 migration/2
+     19  0.0 migration/0
+    295  0.0 kworker/2:1H-kblockd
+  40375  0.0 bluetoothd
+    117  0.0 kauditd
+    292  0.0 kworker/3:1H-xfs-log/dm-0
+    255  0.0 kworker/14:1H-kblockd
+    487  0.0 kworker/13:1H-kblockd
+    489  0.0 kworker/6:1H-kblockd
+    298  0.0 kworker/15:1H-kblockd
+    539  0.0 kworker/7:1H-kblockd
+    252  0.0 kworker/0:1H-kblockd
+    168  0.0 kworker/12:1H-xfs-log/dm-0
+    290  0.0 kworker/1:1H-xfs-log/dm-0
+     25  0.0 ksoftirqd/1
+    449  0.0 kworker/10:1H-kblockd
+    536  0.0 kworker/9:1H-kblockd
+    139  0.0 kworker/8:1H-xfs-log/dm-0
+    361  0.0 kworker/4:1H-xfs-log/dm-0
+    324  0.0 kworker/5:1H-xfs-log/dm-0
+     73  0.0 ksoftirqd/9
+    344  0.0 kworker/11:1H-xfs-log/dm-0
+  40114  0.0 abrtd
+1076301  0.0 fish
+  44587  0.0 fish
+    109  0.0 ksoftirqd/15
+    186  0.0 kworker/u65:0-rb_allocator
+     61  0.0 ksoftirqd/7
+     67  0.0 ksoftirqd/8
+     85  0.0 ksoftirqd/11
+     79  0.0 ksoftirqd/10
+    103  0.0 ksoftirqd/14
+2290387  0.0 fish
+  40319  0.0 smartd
+     91  0.0 ksoftirqd/12
+    114  0.0 rcu_tasks_kthread
+    116  0.0 rcu_tasks_trace_kthread
+   1406  0.0 atd
+   1417  0.0 agetty
+   1089  0.0 xfsaild/nvme0n1p2
+      3  0.0 pool_workqueue_release
+      4  0.0 kworker/R-rcu_gp
+      5  0.0 kworker/R-sync_wq
+      6  0.0 kworker/R-kvfree_rcu_reclaim
+      7  0.0 kworker/R-slub_flushwq
+      8  0.0 kworker/R-netns
+     10  0.0 kworker/0:0H-events_highpri
+     13  0.0 kworker/R-mm_percpu_wq
+     17  0.0 rcu_exp_par_gp_kthread_worker/0
+     20  0.0 idle_inject/0
+     21  0.0 cpuhp/0
+     22  0.0 cpuhp/1
+     23  0.0 idle_inject/1
+     27  0.0 kworker/1:0H-events_highpri
+     28  0.0 cpuhp/2
+     29  0.0 idle_inject/2
+     33  0.0 kworker/2:0H-events_highpri
+     34  0.0 cpuhp/3
+     35  0.0 idle_inject/3
+     39  0.0 kworker/3:0H-events_highpri
+     40  0.0 cpuhp/4
+     41  0.0 idle_inject/4
+     45  0.0 kworker/4:0H-events_highpri
+     46  0.0 cpuhp/5
+     47  0.0 idle_inject/5
+     51  0.0 kworker/5:0H-events_highpri
+     52  0.0 cpuhp/6
+     53  0.0 idle_inject/6
+     57  0.0 kworker/6:0H-events_highpri
+     58  0.0 cpuhp/7
+     59  0.0 idle_inject/7
+     63  0.0 kworker/7:0H-events_highpri
+     64  0.0 cpuhp/8
+     65  0.0 idle_inject/8
+     69  0.0 kworker/8:0H-events_highpri
+     70  0.0 cpuhp/9
+     71  0.0 idle_inject/9
+     75  0.0 kworker/9:0H-events_highpri
+     76  0.0 cpuhp/10
+     77  0.0 idle_inject/10
+     81  0.0 kworker/10:0H-events_highpri
+     82  0.0 cpuhp/11
+     83  0.0 idle_inject/11
+     87  0.0 kworker/11:0H-events_highpri
+     88  0.0 cpuhp/12
+     89  0.0 idle_inject/12
+     93  0.0 kworker/12:0H-events_highpri
+     94  0.0 cpuhp/13
+     95  0.0 idle_inject/13
+     99  0.0 kworker/13:0H-events_highpri
+    100  0.0 cpuhp/14
+    101  0.0 idle_inject/14
+    105  0.0 kworker/14:0H-events_highpri
+    106  0.0 cpuhp/15
+    107  0.0 idle_inject/15
+    111  0.0 kworker/15:0H-events_highpri
+    112  0.0 kdevtmpfs
+    113  0.0 kworker/R-inet_frag_wq
+    115  0.0 rcu_tasks_rude_kthread
+    118  0.0 oom_reaper
+    120  0.0 kworker/R-writeback
+    122  0.0 ksmd
+    123  0.0 khugepaged
+    124  0.0 kworker/R-kblockd
+    125  0.0 kworker/R-blkcg_punt_bio
+    126  0.0 kworker/R-kintegrityd
+    129  0.0 irq/9-acpi
+    131  0.0 kworker/R-tpm_dev_wq
+    132  0.0 kworker/R-ata_sff
+    133  0.0 kworker/R-md_bitmap
+    134  0.0 kworker/R-md
+    135  0.0 kworker/R-edac-poller
+    136  0.0 kworker/R-devfreq_wq
+    137  0.0 watchdogd
+    138  0.0 kworker/R-quota_events_unbound
+    141  0.0 kworker/R-cryptd
+    145  0.0 kworker/R-kthrotld
+    146  0.0 kworker/R-acpi_thermal_pm
+    150  0.0 scsi_eh_0
+    151  0.0 kworker/R-scsi_tmf_0
+    152  0.0 scsi_eh_1
+    153  0.0 kworker/R-scsi_tmf_1
+    154  0.0 scsi_eh_2
+    155  0.0 kworker/R-scsi_tmf_2
+    156  0.0 scsi_eh_3
+    157  0.0 kworker/R-scsi_tmf_3
+    165  0.0 kworker/R-dm_bufio_cache
+    166  0.0 kworker/R-mld
+    167  0.0 kworker/R-ipv6_addrconf
+    169  0.0 kworker/R-kstrp
+    351  0.0 kworker/R-kmpath_rdacd
+    355  0.0 kworker/R-kaluad
+    563  0.0 kworker/R-nvme-wq
+    564  0.0 kworker/R-nvme-reset-wq
+    565  0.0 kworker/R-nvme-delete-wq
+    566  0.0 kworker/R-nvme-auth-wq
+    596  0.0 kworker/R-ttm
+    597  0.0 card1-crtc0
+    598  0.0 card1-crtc1
+    599  0.0 card1-crtc2
+    633  0.0 kworker/R-kdmflush/252:0
+    657  0.0 kworker/R-xfsalloc
+    658  0.0 kworker/R-xfs_mru_cache
+    659  0.0 kworker/R-xfs-buf/dm-0
+    660  0.0 kworker/R-xfs-conv/dm-0
+    661  0.0 kworker/R-xfs-reclaim/dm-0
+    662  0.0 kworker/R-xfs-blockgc/dm-0
+    663  0.0 kworker/R-xfs-inodegc/dm-0
+    664  0.0 kworker/R-xfs-log/dm-0
+    665  0.0 kworker/R-xfs-cil/dm-0
+    920  0.0 kworker/R-kmpathd
+    921  0.0 kworker/R-kmpath_handlerd
+   1022  0.0 irq/148-mei_me
+   1043  0.0 kworker/R-cfg80211
+   1054  0.0 irq/151-iwlwifi:queue_1
+   1055  0.0 irq/152-iwlwifi:queue_2
+   1056  0.0 irq/153-iwlwifi:queue_3
+   1057  0.0 irq/154-iwlwifi:queue_4
+   1058  0.0 irq/155-iwlwifi:queue_5
+   1059  0.0 irq/156-iwlwifi:queue_6
+   1060  0.0 irq/157-iwlwifi:queue_7
+   1061  0.0 irq/158-iwlwifi:queue_8
+   1062  0.0 irq/159-iwlwifi:queue_9
+   1063  0.0 irq/160-iwlwifi:queue_10
+   1064  0.0 irq/161-iwlwifi:queue_11
+   1065  0.0 irq/162-iwlwifi:queue_12
+   1066  0.0 irq/163-iwlwifi:queue_13
+   1067  0.0 irq/164-iwlwifi:queue_14
+   1068  0.0 irq/165-iwlwifi:exception
+   1082  0.0 kworker/R-xfs-buf/nvme0n1p2
+   1083  0.0 kworker/R-xfs-conv/nvme0n1p2
+   1084  0.0 kworker/R-xfs-reclaim/nvme0n1p2
+   1085  0.0 kworker/R-xfs-blockgc/nvme0n1p2
+   1086  0.0 kworker/R-xfs-inodegc/nvme0n1p2
+   1087  0.0 kworker/R-xfs-log/nvme0n1p2
+   1088  0.0 kworker/R-xfs-cil/nvme0n1p2
+   1159  0.0 kworker/R-rpciod
+   1160  0.0 kworker/R-xprtiod
+   1175  0.0 mcelog
+  12823  0.0 kworker/R-wg-crypt-to-vpc6
+  12965  0.0 kworker/R-wg-crypt-to-vpc8
+  24977  0.0 (sd-pam)
+  29974  0.0 dbus-broker-lau
+  40301  0.0 kworker/u65:2-hci0
+  40334  0.0 psimon
+  40371  0.0 psimon
+  52362  0.0 psimon
+1713125  0.0 kworker/R-ib-comp-wq
+1713126  0.0 kworker/R-ib-comp-unb-wq
+1713127  0.0 kworker/R-ib_mcast
+1713128  0.0 kworker/R-ib_nl_sa_wq
+1749883  0.0 kworker/R-tls-strp
+1855565  0.0 catatonit
+2085547  0.0 avahi-daemon
+2510109  0.0 sshd-session
+2846806  0.0 kworker/7:1-events
+2847009  0.0 kworker/3:2-events
+2848282  0.0 kworker/6:0-mm_percpu_wq
+2848450  0.0 kworker/1:1-xfs-conv/dm-0
+2848741  0.0 kworker/3:0-events
+2850030  0.0 kworker/15:1-cgroup_free
+2850545  0.0 kworker/12:0-mm_percpu_wq
+2850559  0.0 kworker/u64:15-events_unbound
+2850565  0.0 kworker/u64:17-events_unbound
+2850707  0.0 kworker/8:0-cgroup_free
+2850803  0.0 kworker/0:2-events
+2850804  0.0 kworker/11:1-events
+2850810  0.0 kworker/u64:18-events_unbound
+2850868  0.0 kworker/7:0-mm_percpu_wq
+2851328  0.0 kworker/5:1-events
+2851488  0.0 kworker/1:0-mm_percpu_wq
+2851627  0.0 systemd-userwor
+2851823  0.0 systemd-userwor
+2851853  0.0 systemd-userwor
+2851890  0.0 kworker/6:2
+2851950  0.0 kworker/8:2-events
+2851970  0.0 kworker/14:0
+2851974  0.0 flock
+2851992  0.0 containerd-shim
+2852092  0.0 kworker/2:0
+2852095  0.0 ps

@@ -1,0 +1,6 @@
+{
+  "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-payload-align",
+  "sha256": "5c979084bbf77fcb0ca4bac11da3fd3901bf451b853fc56deed0badcfef0e73c",
+  "source_revision": "3dbe3d9ebb9ead6110227753ae6d21e640da29db",
+  "patch": "payload-align.patch"
+}

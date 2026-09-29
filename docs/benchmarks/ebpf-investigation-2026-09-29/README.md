@@ -1318,3 +1318,17 @@ The first attempt emitted signed/unsigned and redundant-cast warnings and was re
 All four c32/c128 close traces are usable and workload errors are zero. Normalize helper time to actual upstream copied MiB to avoid trace/load boundary skew. Rut retains substantially higher skb_copy_datagram_iter time (about 103–114 us/MiB) than nginx (about 49 us/MiB), despite fewer helper invocations. Instrumentation affects absolute times and engine throughput unequally; this is a repeated structural lead, not an uninstrumented cost proof. Raw evidence and normalized values: `ebpf-current-rx-copy-1m-r1`.
 
 Next hypothesis: ResponseBodyChain currently places its receive payload 16 bytes after a page-aligned slice base. A 64-byte aligned payload may reduce copy alignment penalties without changing block size, read-ahead window, global kernel settings or huge-page policy. It reduces usable payload by 48 bytes per block and needs allocation-boundary/correctness and causal validation. No causal attribution to alignment is established yet.
+
+## 64-byte body payload alignment experiment: rejected
+
+Align the body-chain payload to 64 bytes instead of 16, keeping ordinary/bulk block size and read-ahead limits unchanged. Usable payload decreases by 48 bytes. All 71 arena tests / 1139092 checks and 1425 network tests / 371796 checks pass. Both causal orders contain twenty valid samples with clean exact-body preflight and warm/load checks.
+
+| Case | Initial change | Reverse change |
+|---|---:|---:|
+| 1048576-c1-close | +0.242% | +0.427% |
+| 1048576-c32-close | +0.963% | +0.390% |
+| 1048576-c128-close | +0.488% | -0.019% |
+| 1048576-c32-keepalive | +0.159% | -0.059% |
+| 1048576-c128-keepalive | +0.237% | -0.473% |
+
+The small c1/c32 close gains repeat, but c128 close is flat in reverse order and both concurrent keepalive controls turn negative. This does not establish a useful general solution to the large-response copy gap. Revert the two layout edits rather than retain a changed payload contract on mixed sub-percent evidence. Alignment is not ruled out as a microarchitectural factor; this specific prototype has insufficient throughput support. No candidate eBPF copy-time claim is made. Frozen candidate and build-rel remain rejected artifacts until rebuilt.
