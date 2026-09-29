@@ -14,6 +14,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/listener_context.h"
 #include "rut/runtime/response_body_chain.h"
+#include "rut/runtime/response_body_pipe_owner.h"
 #include "rut/runtime/tls_engine.h"
 #include "rut/runtime/ws_terminate.h"
 
@@ -32,7 +33,6 @@ using IoTimespec = __kernel_timespec;
 using IoTimespec = timespec;
 #endif
 
-struct ResponseBodyPipeOwner;
 struct RouteConfig;  // forward for per-request config pin below
 struct Http2Conn;    // forward: per-connection HTTP/2 engine, pool-allocated
 
@@ -1796,11 +1796,20 @@ struct ConnectionBase {
     // exact memory. epoll never sets this.
     bool upstream_recv_direct_armed = false;
 
-    u32 buffered_response_len() const { return upstream_recv_buf.len() + response_body_tail.size; }
+    bool buffered_response_front_is_pipe() const {
+        return upstream_recv_buf.len() == 0 && response_body_tail.size == 0 && response_body_pipe &&
+               response_body_pipe->storage.bytes != 0;
+    }
+    u32 buffered_response_len() const {
+        return upstream_recv_buf.len() + response_body_tail.size +
+               (response_body_pipe ? response_body_pipe->storage.bytes : 0);
+    }
     const u8* buffered_response_data() const {
+        if (buffered_response_front_is_pipe()) return nullptr;
         return upstream_recv_buf.len() ? upstream_recv_buf.data() : response_body_tail.data();
     }
     u32 buffered_response_front_size() const {
+        if (buffered_response_front_is_pipe()) return response_body_pipe->storage.bytes;
         return upstream_recv_buf.len() ? upstream_recv_buf.len() : response_body_tail.front_size();
     }
 

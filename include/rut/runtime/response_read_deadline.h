@@ -2578,4 +2578,44 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
            response_read_deadline_post_commit_is_stable(c);
 }
 
+// A pipe is admitted only for already-classified plaintext Bounded body
+// bytes after the canonical response header. Kernel custody can survive a
+// close/reset; this semantic identity deliberately cannot.
+inline bool response_body_pipe_receive_identity_is_current(const Connection& c) {
+    const auto* p = c.response_body_pipe;
+    return p && !p->closing && p->storage.active() && p->conn_id == c.id && c.fd >= 0 &&
+           p->downstream_fd == c.fd && c.upstream_fd >= 0 && p->upstream_fd == c.upstream_fd &&
+           valid_upstream_episode(p->upstream_episode) &&
+           p->upstream_episode == c.upstream_episode &&
+           p->upstream_episode == c.response_read_deadline_post_commit_episode &&
+           p->deadline_generation != 0 &&
+           p->deadline_generation == c.response_read_deadline_generation &&
+           p->deadline_generation == c.response_read_deadline_post_commit_generation &&
+           p->profile == static_cast<u8>(c.response_read_deadline_profile) &&
+           p->method == c.response_read_deadline_method && !c.tls_active && c.h2 == nullptr &&
+           c.protocol == ConnProtocol::Http11 &&
+           c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+           c.response_read_deadline_bounded_header_sent &&
+           c.response_read_deadline_post_commit_phase ==
+               ResponseReadDeadlinePostCommitPhase::Buffering &&
+           c.response_read_deadline_post_commit_response_class ==
+               CompleteContentLengthResponseClass::BoundedPositiveBody;
+}
+
+inline bool response_read_body_storage_witness_is_current(const Connection& c, const IoEvent& ev) {
+    if (ev.copy_witness == IoEventCopyWitness::Full) return true;
+    if (ev.copy_witness != IoEventCopyWitness::Pipe ||
+        !response_body_pipe_receive_identity_is_current(c) ||
+        ev.type != IoEventType::UpstreamRecv || ev.conn_id != c.id || ev.result <= 0 || ev.aux ||
+        ev.more || ev.has_buf || ev.buf_id || ev.provided_ring_empty || ev.sock_nonempty ||
+        ev.upstream_episode != c.upstream_episode || ev.non_upstream_generation == 0)
+        return false;
+    const auto& p = *c.response_body_pipe;
+    return ev.non_upstream_generation == p.received_serial && ev.copy_begin == p.received_begin &&
+           ev.copy_end == p.received_end && ev.copy_end >= ev.copy_begin &&
+           ev.copy_end - ev.copy_begin == static_cast<u32>(ev.result) &&
+           ev.copy_deadline_generation == p.deadline_generation &&
+           ev.copy_deadline_profile == p.profile && ev.copy_deadline_method == p.method;
+}
+
 }  // namespace rut

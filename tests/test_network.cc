@@ -65565,6 +65565,214 @@ TEST(response_buffering_runtime, bounded_complete_while_header_release_in_flight
 // the final report): this alone brings Bounded's downstream Send count and
 // sizes to match CompleteContentLength's exactly for a 64 KiB body, both
 // plain and over TLS.
+static bool stage_bounded_pipe_receive(IoUringEventLoop* loop,
+                                       RouteConfig& config,
+                                       PrebuiltD2Fixture& fixture) {
+    if (!config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
+        !add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::Bounded) ||
+        !stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true) ||
+        !arm_staged_response_read_deadline(loop, fixture, 5))
+        return false;
+    auto& c = *fixture.conn;
+    static constexpr u8 header[] = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n";
+    static const u8 body[8192]{};
+    if (c.upstream_recv_buf.write(header, sizeof(header) - 1) != sizeof(header) - 1 ||
+        c.upstream_recv_buf.write(body, sizeof(body)) != sizeof(body))
+        return false;
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    if (parser.parse(header, sizeof(header) - 1, &response) != ParseStatus::Complete) return false;
+    c.resp_status = response.status_code;
+    if (!build_strict_response_headers(c, config, response)) return false;
+    loop->timer.remove(&c);
+    c.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent initial =
+        response_read_copy_event(c, c.upstream_recv_buf.len(), true, 0, c.upstream_recv_buf.len());
+    if (!loop->begin_complete_content_length_buffering(c, initial, parser.header_end, 65536))
+        return false;
+    // Model the canonical header and every eligible prefix already sent.
+    // The header-relative release boundary leaves an ordinary-memory suffix.
+    c.response_read_deadline_bounded_header_sent = true;
+    c.response_read_deadline_bounded_released =
+        bounded_response_release_bytes(parser.header_end, sizeof(body), false);
+    const u32 suffix = sizeof(body) - c.response_read_deadline_bounded_released;
+    c.upstream_recv_buf.reset();
+    if (c.upstream_recv_buf.write(body, suffix) != suffix) return false;
+    c.state = ConnState::Sending;
+    c.response_read_deadline_progress_generation = c.response_read_deadline_generation;
+    c.response_read_deadline_progress_episode = c.upstream_episode;
+    c.response_read_deadline_progress_bytes = sizeof(body);
+    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+    c.upstream_recv_armed = false;
+    if (!loop->allocate_response_body_pipe(c, 65536)) return false;
+    c.upstream_recv_armed = true;
+    return response_body_pipe_receive_identity_is_current(c);
+}
+
+TEST(response_buffering_runtime, pipe_receive_has_distinct_batch_witness_and_ordered_prefix) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_bounded_pipe_receive(loop, config, fixture));
+    auto& c = *fixture.conn;
+    auto& owner = *c.response_body_pipe;
+    const u32 prefix = c.buffered_response_len();
+    REQUIRE_GT(prefix, 0u);
+    ResponseBodyPipe::Operation input{};
+    REQUIRE(owner.storage.reserve_input(4, &input));
+    REQUIRE(owner.storage.submit_input(input.serial));
+    REQUIRE(owner.own_target(BodyPipeOperation::Input, input.serial));
+    REQUIRE_EQ(write(owner.storage.write_fd, "pipe", 4), 4);
+    ScopedTlsRawSendLoop raw;
+    REQUIRE(raw.init());
+    auto& backend = raw.loop->backend;
+    backend.connection_capacity = loop->connection_capacity;
+    raw.cq_entries[0] = {
+        encode_body_pipe_token({c.id, input.serial, BodyPipeOperation::Input}), 4, 0};
+    raw.cq_tail = 1;
+    IoEvent event{};
+    const u32 pending = c.pending_ops;
+    REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+    REQUIRE_EQ(event.type, IoEventType::UpstreamRecv);
+    CHECK_EQ(event.copy_witness, IoEventCopyWitness::Pipe);
+    CHECK_EQ(event.copy_begin, prefix);
+    CHECK_EQ(event.copy_end, prefix + 4);
+    CHECK_EQ(c.pending_ops, pending);  // semantic dispatch still owns this count
+    CHECK_EQ(owner.targets[0], 0u);
+    CHECK_EQ(c.buffered_response_len(), prefix + 4);
+    CHECK_EQ(c.buffered_response_front_size(), prefix);
+    CHECK_EQ(c.buffered_response_data(), c.upstream_recv_buf.data());
+    CHECK(!c.buffered_response_front_is_pipe());
+    REQUIRE(response_read_body_storage_witness_is_current(c, event));
+    loop->prepare_response_read_deadline_batch(&event, 1);
+    REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
+    CHECK(loop->response_read_batch_owners[0].valid);
+    CHECK_EQ(loop->response_read_batch_owners[0].positive_bytes, 4u);
+    CHECK_EQ(loop->response_read_batch_owners[0].expected_copy_end, prefix + 4);
+    IoEvent forged = event;
+    ++forged.non_upstream_generation;
+    CHECK(!response_read_body_storage_witness_is_current(c, forged));
+    // Duplicate raw completion is not another committed body fragment.
+    raw.cq_entries[1] = raw.cq_entries[0];
+    raw.cq_tail = 2;
+    REQUIRE_EQ(backend.wait(&forged, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(forged.type, IoEventType::BodyPipeTransport);
+    CHECK_EQ(c.buffered_response_len(), prefix + 4);
+    CHECK(!owner.retire(forged));
+    c.upstream_recv_buf.reset();
+    CHECK(c.buffered_response_front_is_pipe());
+    CHECK_EQ(c.buffered_response_front_size(), 4u);
+    CHECK_EQ(c.buffered_response_data(), nullptr);
+    CHECK_EQ(c.buffered_response_len(), 4u);
+    // Restore the valid prefix/Armed fixture before presenting a different
+    // batch. prepare() itself transitions the first one to BatchPending.
+    u8 prefix_bytes[4096]{};
+    REQUIRE_LE(prefix, sizeof(prefix_bytes));
+    REQUIRE_EQ(c.upstream_recv_buf.write(prefix_bytes, prefix), prefix);
+    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+    forged = event;
+    ++forged.non_upstream_generation;
+    loop->prepare_response_read_deadline_batch(&forged, 1);
+    REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
+    CHECK(!loop->response_read_batch_owners[0].valid);
+    CHECK_LT(c.fd, 0);
+    loop->response_read_batch_pin_count = 0;
+    loop->response_read_batch_event_count = 0;
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime, pipe_receive_rejects_stale_identity_and_declared_overrun) {
+    for (u32 variant = 0; variant < 7; ++variant) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_receive(loop, config, fixture));
+        auto& c = *fixture.conn;
+        auto& owner = *c.response_body_pipe;
+        ResponseBodyPipe::Operation input{};
+        REQUIRE(owner.storage.reserve_input(4, &input));
+        REQUIRE(owner.storage.submit_input(input.serial));
+        REQUIRE(owner.own_target(BodyPipeOperation::Input, input.serial));
+        REQUIRE_EQ(write(owner.storage.write_fd, "held", 4), 4);
+        if (variant == 0) ++owner.upstream_episode;
+        if (variant == 1) ++owner.deadline_generation;
+        if (variant == 2) owner.method = 0xff;
+        if (variant == 3) ++owner.downstream_fd;
+        if (variant == 4) c.response_read_deadline_bounded_header_sent = false;
+        if (variant == 5)
+            c.response_read_deadline_post_commit_declared_body =
+                c.response_read_deadline_post_commit_origin_received + 3;
+        if (variant == 6) c.tls_active = true;
+        ScopedTlsRawSendLoop raw;
+        REQUIRE(raw.init());
+        auto& backend = raw.loop->backend;
+        backend.connection_capacity = loop->connection_capacity;
+        raw.cq_entries[0] = {
+            encode_body_pipe_token({c.id, input.serial, BodyPipeOperation::Input}), 4, 0};
+        raw.cq_tail = 1;
+        IoEvent event{};
+        REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+        CHECK_EQ(event.type, IoEventType::BodyPipeTransport);
+        CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+        CHECK_EQ(owner.storage.bytes, 0u);
+        CHECK_EQ(owner.targets[0], input.serial);
+        // Custody can still retire on abort; rejected bytes were not published.
+        event.result = -ECANCELED;
+        REQUIRE(owner.retire(event));
+        c.tls_active = false;
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, pipe_eof_is_terminal_and_eagain_remains_transport_only) {
+    for (i32 result : {0, -EAGAIN}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_receive(loop, config, fixture));
+        auto& c = *fixture.conn;
+        auto& owner = *c.response_body_pipe;
+        ResponseBodyPipe::Operation input{};
+        REQUIRE(owner.storage.reserve_input(4, &input));
+        REQUIRE(owner.storage.submit_input(input.serial));
+        REQUIRE(owner.own_target(BodyPipeOperation::Input, input.serial));
+        ScopedTlsRawSendLoop raw;
+        REQUIRE(raw.init());
+        auto& backend = raw.loop->backend;
+        backend.connection_capacity = loop->connection_capacity;
+        raw.cq_entries[0] = {
+            encode_body_pipe_token({c.id, input.serial, BodyPipeOperation::Input}), result, 0};
+        raw.cq_tail = 1;
+        IoEvent event{};
+        REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+        CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+        CHECK_EQ(owner.storage.bytes, 0u);
+        if (result == 0) {
+            REQUIRE_EQ(event.type, IoEventType::UpstreamRecv);
+            loop->prepare_response_read_deadline_batch(&event, 1);
+            REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
+            CHECK(loop->response_read_batch_owners[0].valid);
+            CHECK(loop->response_read_batch_owners[0].clean_eof);
+        } else {
+            REQUIRE_EQ(event.type, IoEventType::BodyPipeTransport);
+            CHECK_EQ(owner.targets[0], input.serial);
+            REQUIRE(owner.retire(event));
+        }
+        loop->response_read_batch_pin_count = 0;
+        loop->response_read_batch_event_count = 0;
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
 TEST(response_buffering_runtime, bounded_direct_body_recv_reserves_bulk_node_when_body_fits) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
