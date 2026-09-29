@@ -552,6 +552,15 @@ target_include_directories(test_arena PRIVATE
 add_test(NAME test_arena COMMAND test_arena)
 set_tests_properties(test_arena PROPERTIES LABELS "unit")
 
+add_executable(test_response_body_pipe test_response_body_pipe.cc)
+target_link_libraries(test_response_body_pipe rut_runtime)
+target_include_directories(test_response_body_pipe PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_response_body_pipe COMMAND test_response_body_pipe)
+set_tests_properties(test_response_body_pipe PROPERTIES LABELS "unit;network" TIMEOUT 30)
+
 add_executable(test_expected test_expected.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
 target_include_directories(test_expected PRIVATE
     ${PROJECT_SOURCE_DIR}/include
