@@ -1087,3 +1087,24 @@ The complete 96-coordinate matrix is now running against the accepted 271cd98c r
 ## Full-matrix checkpoint: HTTP 16-byte coordinates
 
 The first 12 coordinates of the full formal run are complete and valid; ten meet >=1.10. In c1/c32/c128 order, static close ratios are 1.1476/1.2720/1.3601, static keepalive 1.5859/2.8637/2.9596, proxy close 1.0252/1.2060/1.2870, and proxy keepalive 1.0043/1.1912/1.3658. Both proxy c1 coordinates remain below the acceptance target. This is an explicit partial checkpoint, not full-matrix completion; the same live process continues through the remaining coordinates.
+
+## Full-matrix checkpoint: HTTP 1 KiB coordinates
+
+The next twelve coordinates complete with valid measurements. Across the first 24 full-matrix coordinates, 19 meet >=1.10. The 1 KiB proxy-keepalive c1 median is 0.9991, marginally below nginx in this run; do not claim stable superiority from a near-tie.
+
+| Scenario | Concurrency | Rut/nginx median RPS | Target |
+|---|---:|---:|---|
+| static-close | 1 | 1.0623 | below 1.10 |
+| static-close | 32 | 1.3122 | pass |
+| static-close | 128 | 1.4296 | pass |
+| static-keepalive | 1 | 1.5701 | pass |
+| static-keepalive | 32 | 3.4852 | pass |
+| static-keepalive | 128 | 3.6838 | pass |
+| proxy-close | 1 | 1.0268 | below 1.10 |
+| proxy-close | 32 | 1.2092 | pass |
+| proxy-close | 128 | 1.2579 | pass |
+| proxy-keepalive | 1 | 0.9991 | below 1.10 |
+| proxy-keepalive | 32 | 1.1769 | pass |
+| proxy-keepalive | 128 | 1.3512 | pass |
+
+The same live process continues through the 64 KiB, 1 MiB and HTTPS coordinates. This remains partial acceptance.
