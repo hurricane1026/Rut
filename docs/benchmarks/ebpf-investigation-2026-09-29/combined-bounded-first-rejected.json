@@ -1,0 +1,29 @@
+{
+  "candidate_sha256": "669901f50056ebb49bb0a4b91e1e57a4ec17f2e142fa27aa87556c3671a98375",
+  "baseline_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "network_tests": "1460 passed, 391497 checks",
+  "cases": {
+    "close": {
+      "candidate_rps": [
+        6037.5371320993645,
+        5998.615351045233
+      ],
+      "baseline_rps": [
+        6049.057784856189,
+        6008.1819470935725
+      ],
+      "candidate_over_baseline": 0.9982510716155634
+    },
+    "keepalive": {
+      "candidate_rps": [
+        7887.6520291234865,
+        7880.762097188688
+      ],
+      "baseline_rps": [
+        7901.60494434335,
+        7902.599631673217
+      ],
+      "candidate_over_baseline": 0.99773538430661
+    }
+  }
+}
