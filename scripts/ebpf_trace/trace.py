@@ -83,7 +83,7 @@ def generate(pids, duration, front_port, origin_port, groups):
             f'self:signal:SIGUSR1 {{ @stop_ns = nsecs + {duration} * 1000000000; '
             '@armed = 1; printf("RUT_TRACE_ARMED\\n"); }',
             'interval:ms:100 /@armed && nsecs >= @stop_ns/ { exit(); }']
-    transient = ["targets", "armed", "stop_ns"]
+    transient = ["targets", "armed", "stop_ns", "exiting"]
     if "tcp" in groups:
         remote = "$sk->__sk_common.skc_dport"
         if sys.byteorder == "little":
@@ -153,11 +153,15 @@ rawtracepoint:sched_wakeup,rawtracepoint:sched_wakeup_new {
 rawtracepoint:sched_switch {
     $prev = (struct task_struct *)arg1;
     $next = (struct task_struct *)arg2;
-    if (@armed && @targets[$prev->tgid]) {
+    if (@exiting[$prev->pid]) {
+        delete(@exiting[$prev->pid]);
+        delete(@queued[$prev->pid]);
+        delete(@offcpu[$prev->pid]);
+    } else if (@armed && @targets[$prev->tgid]) {
         @offcpu[$prev->pid] = nsecs;
         if (arg0 || arg3 == 0) { @queued[$prev->pid] = nsecs; }
     }
-    if (@armed && @targets[$next->tgid]) {
+    if (@armed && @targets[$next->tgid] && !@exiting[$next->pid]) {
         if (@queued[$next->pid]) {
             $ns = (uint64)((int64)nsecs - (int64)@queued[$next->pid]);
             @runqueue_samples[$next->tgid] = count();
@@ -194,15 +198,17 @@ rawtracepoint:sched_switch {
     code.append("""
 rawtracepoint:sched_process_exec {
     $task = (struct task_struct *)arg0;
-    if (@armed && @targets[$task->tgid]) {
+    // Lifecycle identity must be recorded even during attachment, before arm.
+    if (@targets[$task->tgid]) {
         @target_execs[$task->tgid] = count();
         delete(@targets[$task->tgid]);
     }
 }
 rawtracepoint:sched_process_exit {
     $task = (struct task_struct *)arg0;
-    if (@armed && @targets[$task->tgid]) {
+    if (@targets[$task->tgid] || @target_execs[$task->tgid]) {
         @thread_exits[$task->tgid] = count();
+        @exiting[$task->pid] = 1;
         """ + " ".join(cleanup) + """
         if ($task->pid == $task->tgid) { delete(@targets[$task->tgid]); }
     }
@@ -304,12 +310,17 @@ def main(argv=None):
         return 0
     if args.output is None:
         parser.error("--output is required unless using --emit")
-    out = args.output.resolve()
+    if args.output.is_symlink():
+        parser.error("output must not be a symlink")
+    display_out = args.output.absolute()
+    out_fd = None
     try:
-        out.mkdir(parents=True, exist_ok=False, mode=0o700)
-        os.chmod(out, 0o700)
+        args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
+        out_fd = os.open(args.output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        os.fchmod(out_fd, 0o700)
+        out = Path(f"/proc/self/fd/{out_fd}")
     except FileExistsError:
-        parser.error(f"output already exists: {out}")
+        parser.error(f"output already exists: {display_out}")
     program = out / "program.bt"
     secure_text(program, script)
     groups = sorted(set(args.groups) | ({"tcp"} if "rx-copy" in args.groups else set()))
@@ -349,7 +360,8 @@ def main(argv=None):
             os.close(trace_fd)
             raise
         with os.fdopen(trace_fd, "w") as stdout, os.fdopen(stderr_fd, "w") as stderr:
-            proc = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
+            proc = subprocess.Popen(command, stdout=stdout, stderr=stderr,
+                                    start_new_session=True, pass_fds=(out_fd,))
             try:
                 if not args.check:
                     raw = out / "trace.jsonl"
@@ -405,7 +417,10 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, previous_term)
         status["finished_at"] = time.time()
         secure_text(out / "status.json", json.dumps(status, indent=2) + "\n")
-    print(f"Evidence: {out}; completed={status['completed']}, usable={status['usable']}")
+        if out_fd is not None:
+            os.close(out_fd)
+            out_fd = None
+    print(f"Evidence: {display_out}; completed={status['completed']}, usable={status['usable']}")
     return 0 if (status["completed"] if args.check else status["usable"]) else 1
 
 

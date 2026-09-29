@@ -104,7 +104,7 @@ if mode != "truncated":
         self.assertFalse(result["ready"])
 
     def test_generated_program_has_no_premature_ready_marker(self):
-        program = trace.generate([123], 1, 8987, 9987, ["tcp"])
+        program = trace.generate([123], 1, 8987, 9987, ["tcp", "sched"])
         self.assertNotIn("RUT_TRACE_READY", program)
         self.assertIn("self:signal:SIGUSR1", program)
         self.assertIn('@armed = 1', program)
@@ -112,6 +112,11 @@ if mode != "truncated":
         self.assertIn('interval:ms:100 /@armed && nsecs >= @stop_ns/', program)
         self.assertNotIn('interval:s:1 /@armed/', program)
         self.assertIn('/@armed && @targets[pid]/', program)
+        self.assertIn('if (@targets[$task->tgid]) {', program)
+        self.assertIn('if (@targets[$task->tgid] || @target_execs[$task->tgid]) {', program)
+        self.assertIn('if (@exiting[$prev->pid]) {', program)
+        self.assertIn('!@exiting[$next->pid]', program)
+        self.assertNotIn('if (@armed && @targets[$task->tgid]) {', program)
 
     def test_arm_ack_is_strict_and_missing_arm_fails(self):
         raw = self.root / "armed.jsonl"
@@ -237,6 +242,15 @@ if mode != "truncated":
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             trace.main(["--pid", str(os.getpid()), "--output", str(self.root / "ok")])
         self.assertTrue(json.loads((self.root / "ok/status.json").read_text())["usable"])
+
+    def test_symlinked_output_is_rejected_before_launch(self):
+        link = self.root / "output-link"
+        link.symlink_to(self.root / "future-output", target_is_directory=True)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(trace.subprocess, "Popen") as popen:
+            trace.main(["--pid", str(os.getpid()), "--bpftrace", str(self.fake),
+                        "--output", str(link)])
+            popen.assert_not_called()
 
     def test_invalid_selection_never_launches_tool(self):
         for args in (["--pid", "0"], ["--pid", "1", "--duration", "0"],

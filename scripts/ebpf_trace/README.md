@@ -59,6 +59,8 @@ bpftrace dry-run attach/detach and never arms or measures. The target must remai
 alive until tracing finishes.
 The collector does not launch or signal the target application. Ctrl-C stops
 its own tracer, saves partial evidence and returns failure.
+Process-exec identity tracking and dead-thread cleanup also run during the
+pre-arm window, so a target that changes identity before measurement is rejected.
 
 Extra detail, preferably in a separate diagnostic run:
 
