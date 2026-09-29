@@ -4165,7 +4165,7 @@ TEST(response_policy, paired_suppress_head_rejects_mismatch_and_invalid_original
         {"HEAD /head HTTP/1.1\r\nConnection: close\r\n\r\n", false, false},
         {"HEAD /head HTTP/1.1\r\nHost: a\r\nHost: b\r\nConnection: close\r\n\r\n", false, false},
         {"HEAD /head HTTP/1.1\r\nHost: a:0\r\nConnection: close\r\n\r\n", false, false},
-        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n", false, false},
+        {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, x-extra\r\n\r\n", false, false},
         {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close, keep-alive\r\n\r\n", false, false},
         {"HEAD /head HTTP/1.1\r\nHost: a\r\nConnection: close\r\n"
          "cOnNeCtIoN: close\r\n\r\n",
@@ -42419,7 +42419,9 @@ TEST(response_read_deadline_coalesced_get_phase1,
                 "GET /one HTTP/1.1\r\nHost: client.example\r\nTransfer-Encoding: "
                 "chunked\r\n\r\n0\r\n\r\n";
         else if (shape == Shape::ExplicitConnection)
-            request = "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n\r\n";
+            request =
+                "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive, "
+                "x-extra\r\n\r\n";
         else if (shape == Shape::Head)
             request = "HEAD /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
         else if (shape == Shape::AnyPost)
@@ -44942,7 +44944,7 @@ TEST(http1_pipeline_generation_activation,
         "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close, keep-alive\r\n\r\n",
         "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\nConnection: "
         "close\r\n\r\n",
-        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n\r\n",
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive, x-extra\r\n\r\n",
         "GET /one HTTP/1.0\r\nHost: client.example\r\n\r\n",
     };
     for (const char* request : kRejected) {
@@ -53048,7 +53050,7 @@ TEST(response_read_deadline_non_head_cl0,
         "POST /one HTTP/1.1\r\nHost: x\r\nTE: trailers\r\n\r\n",
         "POST /one HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n",
         "POST /one HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n",
-        "POST /one HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
+        "POST /one HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, x-extra\r\n\r\n",
     };
     for (const char* request : requests) {
         ScopedIoUringLoopForRetirement guard;
@@ -53535,7 +53537,7 @@ TEST(response_read_deadline_fixed_upload_head_activation,
         "Content-Length: 3\r\n\r\nabc",
         "HEAD /one HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n"
         "Content-Length: 3\r\n\r\nabc",
-        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n"
+        "HEAD /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive, x-extra\r\n"
         "Content-Length: 3\r\n\r\nabc",
         "HEAD * HTTP/1.1\r\nHost: client.example\r\nContent-Length: 3\r\n\r\nabc",
     };
@@ -56028,7 +56030,7 @@ TEST(response_read_deadline_fixed_upload,
         "GET /one HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         "GET /one HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nContent-Length: 1\r\n\r\nx",
         "GET /one HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\nx",
-        "GET /one HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\nx",
+        "GET /one HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, x\r\nContent-Length: 1\r\n\r\nx",
         "GET /one HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 1\r\n\r\nx",
     };
     for (const char* request : rejected) {
@@ -58696,7 +58698,15 @@ TEST(response_buffering_explicit_close, preflight_pins_only_one_parser_normalize
         {"GET /one HTTP/1.1\r\nHost: x\r\nConnection: close\r\nConnection: close\r\n\r\n",
          false,
          false},
-        {"GET /one HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n", false, false},
+        // `keep-alive` restates the HTTP/1.1 default, so it is the default shape.
+        {"GET /one HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n", true, false},
+        {"GET /one HTTP/1.1\r\nHost: x\r\nConnection:\t KeEp-AlIvE \t\r\n\r\n", true, false},
+        {"GET /one HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, x-extra\r\n\r\n", false, false},
+        {"GET /one HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n"
+         "Connection: keep-alive\r\n\r\n",
+         false,
+         false},
+        {"GET /one HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n", false, false},
         {"GET /one HTTP/1.1\r\nHost: x\r\nConnection: close,\r\n\r\n", false, false},
     };
     for (const Vector& vector : vectors) {
@@ -58722,6 +58732,76 @@ TEST(response_buffering_explicit_close, preflight_pins_only_one_parser_normalize
             loop->close_conn(*conn);
         }
         CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
+    }
+}
+
+TEST(response_buffering_explicit_close, explicit_keep_alive_classifies_like_default_persistence) {
+    // Browsers send `Connection: keep-alive` on HTTP/1.1; it restates the
+    // default, so every admitted profile must classify it exactly like a
+    // request without the field.
+    struct Vector {
+        bool head_bundle;
+        const char* request_line_and_host;
+        const char* framing_and_body;
+        ResponseReadDeadlineProfile expected;
+    };
+    const Vector vectors[] = {
+        {true,
+         "HEAD /one HTTP/1.1\r\nHost: x\r\n",
+         "\r\n",
+         ResponseReadDeadlineProfile::HeaderOnlyHead},
+        {true,
+         "HEAD /one HTTP/1.1\r\nHost: x\r\n",
+         "Content-Length: 3\r\n\r\nabc",
+         ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead},
+        {false,
+         "GET /one HTTP/1.1\r\nHost: x\r\n",
+         "\r\n",
+         ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero},
+        {false,
+         "POST /one HTTP/1.1\r\nHost: x\r\n",
+         "Content-Length: 1\r\n\r\nx",
+         ResponseReadDeadlineProfile::FixedContentLengthUploadNonHeadContentLengthZero},
+    };
+    for (const Vector& vector : vectors) {
+        for (const bool explicit_keep_alive : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+            REQUIRE(vector.head_bundle
+                        ? add_response_read_deadline_bundle(config)
+                        : add_bodyless_non_head_response_read_deadline_bundle(
+                              config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+            Connection* conn = loop->alloc_conn();
+            REQUIRE(conn != nullptr);
+            static constexpr char kKeepAlive[] = "Connection: keep-alive\r\n";
+            const char* parts[] = {vector.request_line_and_host,
+                                   explicit_keep_alive ? kKeepAlive : "",
+                                   vector.framing_and_body};
+            for (const char* part : parts) {
+                const u32 len = static_cast<u32>(__builtin_strlen(part));
+                REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(part), len), len);
+            }
+            capture_request_metadata(*conn);
+            CHECK_EQ(conn->req_client_connection_keep_alive_exact, explicit_keep_alive);
+            CHECK(request_connection_restates_default_persistence(*conn));
+            conn->handler_gen = 1;
+            conn->keep_alive = true;
+            conn->request_config = &config;
+            const auto& bundle = config.policy_bundles[1];
+            const auto profile = classify_response_read_deadline_profile(
+                *conn,
+                config.response_policies[bundle.response_policy_id - 1],
+                config.failure_policies[bundle.failure_policy_id - 1],
+                config.failure_policies[bundle.timeout_failure_policy_id - 1],
+                bundle.response_buffering,
+                conn->request_policy_id);
+            CHECK_EQ(profile, vector.expected);
+            loop->close_conn(*conn);
+            CHECK_EQ(loop->free_top, IoUringEventLoop::kMaxConns);
+        }
     }
 }
 
@@ -59577,7 +59657,7 @@ TEST(response_buffering_runtime,
         "GET /buffered HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
         "GET /buffered HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         "GET /buffered HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\n\r\n",
-        "GET /buffered HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n",
+        "GET /buffered HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, x-extra\r\n\r\n",
     };
     // A bodyless default-keepalive GET followed by a buffered successor is no
     // longer forbidden wholesale: #277 admits its separately proven phase-1

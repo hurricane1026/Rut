@@ -1419,6 +1419,8 @@ struct ConnectionBase {
     bool req_client_keep_alive;
     bool req_client_connection_close;
     bool req_client_connection_close_exact;
+    // Exactly one Connection field whose whole value is `keep-alive`.
+    bool req_client_connection_keep_alive_exact;
     bool req_client_has_content_length;
     u8 req_client_content_length_count;
     RequestTransferEncoding req_client_transfer_encoding;
@@ -1847,6 +1849,7 @@ struct ConnectionBase {
         req_client_keep_alive = false;
         req_client_connection_close = false;
         req_client_connection_close_exact = false;
+        req_client_connection_keep_alive_exact = false;
         req_client_has_content_length = false;
         req_client_content_length_count = 0;
         req_client_transfer_encoding = RequestTransferEncoding::Unparsed;

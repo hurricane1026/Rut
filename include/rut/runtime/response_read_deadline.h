@@ -393,9 +393,28 @@ inline bool response_read_deadline_upload_proof_equal(const ResponseReadDeadline
            a.route_fn == b.route_fn && a.downstream_close == b.downstream_close;
 }
 
+// The default HTTP/1.1 persistence shape: no Connection field, or one field
+// that only restates the default (`Connection: keep-alive`). Browsers and many
+// clients send the latter, so it must not change admission.
+inline bool request_connection_restates_default_persistence(const Connection& c) {
+    return c.req_client_connection_count == 0 ||
+           (c.req_client_connection_count == 1 && c.req_client_connection_keep_alive_exact &&
+            c.req_http_version == static_cast<u8>(HttpVersion::Http11));
+}
+
+// Raw re-parse counterpart: accumulates one Connection field of a request that
+// the caller has already pinned to HTTP/1.1. Returns false once the fields can
+// no longer be the default persistence shape.
+inline bool request_connection_field_restates_default_persistence(const Header& header,
+                                                                  u32* connection_count) {
+    return ++*connection_count == 1 &&
+           http_connection_value_is_exact_keep_alive(header.value.ptr, header.value.len);
+}
+
 inline bool response_read_deadline_default_persistence_is_stable(const Connection& c) {
     return c.req_keep_alive && c.req_client_keep_alive && !c.req_client_connection_close &&
-           !c.req_client_connection_close_exact && c.req_client_connection_count == 0;
+           !c.req_client_connection_close_exact &&
+           request_connection_restates_default_persistence(c);
 }
 
 inline bool complete_content_length_explicit_close_request_is_stable(

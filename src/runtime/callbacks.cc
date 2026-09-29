@@ -137,6 +137,7 @@ void capture_request_metadata(Connection& conn) {
     conn.req_client_keep_alive = false;
     conn.req_client_connection_close = false;
     conn.req_client_connection_close_exact = false;
+    conn.req_client_connection_keep_alive_exact = false;
     conn.req_client_has_content_length = false;
     conn.req_client_content_length_count = 0;
     conn.req_client_transfer_encoding = RequestTransferEncoding::Unparsed;
@@ -214,6 +215,9 @@ void capture_request_metadata(Connection& conn) {
                         req.headers[i].value.len == 5 &&
                         http_header_name_eq_ci(
                             req.headers[i].value.ptr, req.headers[i].value.len, "close", 5);
+                    conn.req_client_connection_keep_alive_exact =
+                        http_connection_value_is_exact_keep_alive(req.headers[i].value.ptr,
+                                                                  req.headers[i].value.len);
                     break;
                 }
             }
