@@ -1,0 +1,25 @@
+{
+  "requests": 69748,
+  "seconds": 8.099961,
+  "rps": 8610.905657446992,
+  "exact_body": true,
+  "zero_errors": true,
+  "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+  "server_pid": 3062410,
+  "counts": {
+    "coalesced_proof": 1673952,
+    "policy_bundle_valid": 1883196,
+    "post_commit_stable": 557984
+  },
+  "trace_ready": true,
+  "trace_exit_code": 0,
+  "trace_valid": true,
+  "per_request": {
+    "coalesced_proof": 24.0,
+    "policy_bundle_valid": 27.0,
+    "post_commit_stable": 8.0
+  },
+  "binary_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "scenario": "HTTP 16B proxy keepalive c1",
+  "note": "eBPF uprobes add overhead; counts per request are diagnostic, not acceptance RPS"
+}
