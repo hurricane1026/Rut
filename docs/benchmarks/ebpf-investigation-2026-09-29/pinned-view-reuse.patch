@@ -1,0 +1,60 @@
+diff --git a/include/rut/runtime/response_read_deadline.h b/include/rut/runtime/response_read_deadline.h
+index 860b974a..957ce03a 100644
+--- a/include/rut/runtime/response_read_deadline.h
++++ b/include/rut/runtime/response_read_deadline.h
+@@ -327,7 +327,8 @@ inline bool complete_content_length_parsed_header_matches(
+     const Connection& c,
+     const ParsedResponse& parsed,
+     u32 declared_body,
+-    CompleteContentLengthResponseClassification* out_classification = nullptr) {
++    CompleteContentLengthResponseClassification* out_classification = nullptr,
++    CompleteContentLengthContentTypeView* out_content_type = nullptr) {
+     if (c.request_config == nullptr ||
+         !c.request_config->response_policy_id_is_valid(c.response_policy_id))
+         return false;
+@@ -369,6 +370,7 @@ inline bool complete_content_length_parsed_header_matches(
+     }
+     if (server_count != 1 || connection_count != 1) return false;
+     if (out_classification != nullptr) *out_classification = classification;
++    if (out_content_type != nullptr) *out_content_type = content_type;
+     return true;
+ }
+ 
+@@ -412,30 +414,30 @@ inline bool complete_content_length_raw_origin_matches_pinned(
+ 
+     HttpResponseParser pinned_parser;
+     ParsedResponse pinned;
++    CompleteContentLengthResponseClassification pinned_classification{};
++    CompleteContentLengthContentTypeView pinned_content_type{};
+     pinned_parser.reset();
+     pinned.reset();
+     if (pinned_parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &pinned) !=
+             ParseStatus::Complete ||
+         pinned_parser.header_end != c.response_header_buf.len() ||
+         pinned.version != HttpVersion::Http11 ||
+-        !complete_content_length_parsed_header_matches(c, pinned, declared_body) ||
++        !complete_content_length_parsed_header_matches(
++            c, pinned, declared_body, &pinned_classification, &pinned_content_type) ||
+         raw.status_code != pinned.status_code || raw.reason.len != pinned.reason.len ||
+         (raw.reason.len != 0 &&
+          __builtin_memcmp(raw.reason.ptr, pinned.reason.ptr, raw.reason.len) != 0))
+         return false;
+     const CompleteContentLengthResponseClassification raw_classification =
+         classify_complete_content_length_response(raw);
+-    const CompleteContentLengthResponseClassification pinned_classification =
+-        classify_complete_content_length_response(pinned);
+     if (raw_classification.response_class == CompleteContentLengthResponseClass::Unsupported ||
+         !complete_content_length_response_classification_equal(raw_classification,
+                                                                pinned_classification))
+         return false;
++    // The pinned view and classification were validated above in this call.
++    // Neither the parsed headers nor their backing bytes change before use.
+     CompleteContentLengthContentTypeView raw_content_type{};
+-    CompleteContentLengthContentTypeView pinned_content_type{};
+-    if (!complete_content_length_content_type_view(raw, false, &raw_content_type) ||
+-        !complete_content_length_content_type_view(pinned, true, &pinned_content_type))
+-        return false;
++    if (!complete_content_length_content_type_view(raw, false, &raw_content_type)) return false;
+     const auto& policy = c.request_config->response_policies[c.response_policy_id - 1];
+     static constexpr Str kContentTypeName{"Content-Type", 12};
+     const bool content_type_matches =

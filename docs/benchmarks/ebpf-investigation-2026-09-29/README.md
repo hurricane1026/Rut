@@ -1414,3 +1414,18 @@ The alternative ASCII comparison accepts identical bytes immediately and only te
 | header-eq-reverse-r1 | 65536-c1-keepalive | -1.210% |
 
 Small-response initial gains do not generalize to the lagging 64 KiB targets. Both target deltas remain negative in reverse order, and the small c32 gain shrinks. Revert the comparison edit and its added test rather than retain a tradeoff against the target. No full network regression was run for this rejected candidate. Frozen binary remains evidence only.
+
+## Same-call pinned response metadata reuse: rejected
+
+Expose the already validated Content-Type view and response classification from parsed-header validation to raw-origin/pinned comparison in the same stack frame. No persistent cache is added; each invocation still parses and validates both current headers. All 1425 network tests / 371796 checks pass, including duplicate/forged/hidden Content-Type and coherent-206 tuple controls.
+
+All 28 causal samples pass exact-body preflight and zero-error warm/load checks. Candidate changes:
+- 16-c1-close: +0.228%.
+- 16-c32-close: +1.880%.
+- 16-c1-keepalive: +0.513%.
+- 1024-c1-close: +0.127%.
+- 1024-c32-close: +0.702%.
+- 65536-c1-close: +0.184%.
+- 65536-c1-keepalive: -0.075%.
+
+The lagging 64 KiB targets remain essentially flat with opposite signs, so no useful target improvement is established. Revert the output-parameter/API change without broadening testing to chase small fluctuations. Frozen candidate and build-rel remain rejected artifacts until rebuilt. Accepted binary remains rut-combined-fin-ordered. Proceed to sparse eBPF decomposition of the upstream connection stage on that accepted binary.
