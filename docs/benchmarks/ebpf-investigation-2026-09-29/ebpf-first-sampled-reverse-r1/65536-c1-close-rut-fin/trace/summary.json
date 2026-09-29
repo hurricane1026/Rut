@@ -1,0 +1,24 @@
+{
+  "maps": {
+    "@first_origin_ns": {
+      "2836714": 57685807
+    },
+    "@first_request_ns": {
+      "2836714": 65751631
+    },
+    "@first_requests": {
+      "2836714": 1895
+    },
+    "@first_response_ns": {
+      "2836714": 27395726
+    },
+    "@first_total_ns": {
+      "2836714": 150833164
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [],
+  "tcp": []
+}
