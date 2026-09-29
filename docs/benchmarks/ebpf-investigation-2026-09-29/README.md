@@ -1169,3 +1169,22 @@ All twelve coordinates have valid formal measurements, eleven meet >=1.10. Proxy
 | proxy-keepalive | 1 | 1.0568 | below 1.10 |
 | proxy-keepalive | 32 | 1.3065 | pass |
 | proxy-keepalive | 128 | 1.5033 | pass |
+
+## Full-matrix checkpoint: HTTPS 1 KiB coordinates
+
+All twelve coordinates have valid formal measurements; 11 meet >=1.10. Across the first 72 coordinates, 55 meet the target. The remaining 24 coordinates are pending; no full-matrix success is claimed.
+
+| Scenario | Concurrency | Rut/nginx median RPS | Target |
+|---|---:|---:|---|
+| static-close | 1 | 1.1986 | pass |
+| static-close | 32 | 1.3020 | pass |
+| static-close | 128 | 1.2986 | pass |
+| static-keepalive | 1 | 1.2912 | pass |
+| static-keepalive | 32 | 2.9214 | pass |
+| static-keepalive | 128 | 2.9379 | pass |
+| proxy-close | 1 | 1.1620 | pass |
+| proxy-close | 32 | 1.3012 | pass |
+| proxy-close | 128 | 1.3016 | pass |
+| proxy-keepalive | 1 | 1.0560 | below 1.10 |
+| proxy-keepalive | 32 | 1.2849 | pass |
+| proxy-keepalive | 128 | 1.4752 | pass |
