@@ -1,0 +1,70 @@
+[
+  {
+    "case": "1048576-c128-close-nginx",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "unique_start_regions": 929,
+    "median_start_regions_per_100ms": 48,
+    "window_count": 201,
+    "requested_byte_share_percent_by_age_bucket": {
+      "5": 0.031507653037903254,
+      "4": 0.5686976989078679,
+      "0": 1.5483503817361428,
+      "1": 16.230444115419303,
+      "2": 30.842124050905312,
+      "3": 50.77887609999347
+    }
+  },
+  {
+    "case": "1048576-c128-close-rut-fin",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "unique_start_regions": 4858,
+    "median_start_regions_per_100ms": 1354,
+    "window_count": 201,
+    "requested_byte_share_percent_by_age_bucket": {
+      "2": 0.0007929133526936634,
+      "1": 0.006702846479450887,
+      "3": 0.02867265028045526,
+      "5": 0.950899812548522,
+      "0": 9.097166589374279,
+      "4": 89.9157651879646
+    }
+  },
+  {
+    "case": "1048576-c32-close-nginx",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "unique_start_regions": 238,
+    "median_start_regions_per_100ms": 48.0,
+    "window_count": 202,
+    "requested_byte_share_percent_by_age_bucket": {
+      "5": 0.008531389983349263,
+      "4": 0.4422582054997211,
+      "0": 1.5519389075773495,
+      "1": 16.846277749463685,
+      "2": 30.68336266432516,
+      "3": 50.467631083150735
+    }
+  },
+  {
+    "case": "1048576-c32-close-rut-fin",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "unique_start_regions": 2053,
+    "median_start_regions_per_100ms": 675,
+    "window_count": 201,
+    "requested_byte_share_percent_by_age_bucket": {
+      "1": 0.0013478387929463668,
+      "2": 0.14126678986015825,
+      "5": 0.30459684412318944,
+      "0": 9.058081921728311,
+      "3": 34.65854964751514,
+      "4": 55.83615695798026
+    }
+  }
+]

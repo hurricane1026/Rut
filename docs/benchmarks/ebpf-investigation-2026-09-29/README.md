@@ -1354,3 +1354,18 @@ All four current accepted 1 MiB close runs pass exact-body preflight, warm/load 
 | Rut c32 | 104.582 | 0.243 | 0 | 0.003 |
 
 Observed interruption spans are far smaller than the 56–66 us/MiB helper gap. They do not explain its main part. Softirq/hardirq/off-CPU components can overlap; no exact exclusive-copy CPU time is obtained by subtracting their sum. Handler tracepoints omit some interrupt entry/exit overhead, and additional probes change timing. Instrumented throughput is not acceptance evidence. Investigate destination reuse next; no runtime change is retained from this diagnostic.
+
+## Receive destination starting-region reuse
+
+Trace upstream skb_copy_datagram_iter entry destinations for UBUF/IOVEC, grouping their first destination address into 16 KiB regions. All four accepted-binary c32/c128 runs pass trace usability, exact-body preflight and zero-error warm/load checks. No unsupported iterator types were observed. Regions are process virtual addresses, not physical cache lines.
+
+| Case | Distinct starting regions over trace | Median distinct starting regions / 100 ms | Requested bytes whose start region was last seen >=10 ms ago |
+|---|---:|---:|---:|
+| 1048576-c128-close-nginx | 929 | 48 | 0.57% |
+| 1048576-c128-close-rut-fin | 4858 | 1354 | 89.92% |
+| 1048576-c32-close-nginx | 238 | 48.0 | 0.44% |
+| 1048576-c32-close-rut-fin | 2053 | 675 | 55.84% |
+
+Rut touches a much broader set of starting regions and revisits most of them less promptly. This supports investigating buffer reuse and per-connection receive/send scheduling together. Merely reducing allocation size previously regressed throughput; these measurements do not justify repeating that change or retaining an untested rewrite.
+
+Limits: only the helper's initial destination is tracked, not every page crossed or every later iovec. Requested byte weights are entry lengths, not successful-copy totals. A long helper can span several regions. Thus region counts are neither exact working-set bytes nor cache hit/miss rates. The 100 ms windows include partial edge windows; medians are reported. Address reuse across separate allocations counts as reuse of a region. Instrumentation adds map operations per helper and affects engine throughput unequally. This is a structural lead, not causal proof of the copy-time gap or new acceptance evidence. No runtime source was changed.
