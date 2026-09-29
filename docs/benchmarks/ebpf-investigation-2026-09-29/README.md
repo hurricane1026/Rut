@@ -1826,3 +1826,18 @@ Formal pinned-nginx checks of seven lagging coordinates used three valid samples
 The next candidate reused a successful complete request parse for the same input pointer, length and exact bytes up to 256 bytes. It aimed to reduce repeated parsing in the proxy path, and passed the parser suite (217 tests / 3,863 checks) and network suite (1,460 tests / 391,497 checks). The benchmarked binary was SHA256 `62a8af01542e79bfa3541a55d56116d617cd07f72e43fee4a2c957360d15b8f2`; its baseline was the retained pinned response-header cache binary `f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0`.
 
 Paired 6-second Rut comparisons with reversed process order gave candidate/baseline ratios of 1.0011 for 1 KiB close c1, 1.0013 for 1 KiB keepalive c1 and 1.0074 for 64 KiB keepalive c32. Three 64 KiB keepalive c1 controls gave 0.9960, 1.0062 and 1.0111, so the gain is not stable there. Other short-input controls were generally positive but below 1%. Formal three-repeat pinned-nginx comparisons remained below the 1.05 target: 64 KiB proxy close c1 was 0.9905, and keepalive c1 was 0.9798. The corresponding previous candidate measurements were 0.9939 and 0.9816; these small differences are within the observed run variation. The global cache was discarded because its additional state and byte comparisons had no clear, repeatable benefit on the lagging coordinates. `request-parser-cache-rejected.json` contains the paired samples and formal results. No huge pages were used.
+
+## Current userspace profile after retaining response-header cache
+
+Rebuilt the restored runtime to the accepted binary SHA256 `f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0`. Separate 20-second `cycles:u` profiles of HTTP 64 KiB proxy c1 close and keepalive each yielded about 17,000 samples and zero lost samples. Both runs passed exact-body preflight and zero-error warmup/load checks. These are userspace self-cycle shares under `perf`, not causal throughput gains or nginx acceptance samples.
+
+| Symbol | Close | Keepalive |
+|---|---:|---:|
+| `IoUringBackend::wait` | 6.05% | 5.62% |
+| coalesced GET phase-1 proof | 4.99% | 5.04% |
+| libc `memmove` | 4.53% | 5.01% |
+| event-loop batch dispatch | 3.67% | 4.12% |
+| policy-bundle validity | 3.33% | 4.12% |
+| `HttpResponseParser::parse` | 1.72% | 1.63% |
+
+The retained response-header cache moved the parser below the leading costs; repeated proof, policy validation, dispatch, and data movement now warrant targeted causal experiments. The first close-run call-graph report was stopped because DWARF symbolization was unusually slow; a fresh close-run flat report completed and is used here. `pinned-cache-users.json` records the top self symbols and provenance. `pinned-cache-users-evidence.tar.gz` SHA256 `ecf118d40cb23ac8152667de7fa4551d7fb8f8a6b7f60caec279a0bd9ee9448a` contains both completed flat reports, drivers, load logs and process snapshots; raw `perf.data` files remain local. No huge pages or global kernel settings were used.

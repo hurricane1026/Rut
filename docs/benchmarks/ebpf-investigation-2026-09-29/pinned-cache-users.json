@@ -1,0 +1,181 @@
+{
+  "binary_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "method": "perf record cycles:u, 997 Hz, 20 s HTTP 64 KiB proxy c1; self cycles from perf report --no-children; profiling perturbs RPS",
+  "cases": [
+    {
+      "mode": "close",
+      "samples_approximately": 17000,
+      "lost_samples": 0,
+      "top_self_symbols": [
+        {
+          "self_cycle_percent": 6.05,
+          "symbol": "rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)"
+        },
+        {
+          "self_cycle_percent": 4.99,
+          "symbol": "rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)"
+        },
+        {
+          "self_cycle_percent": 4.53,
+          "symbol": "__memmove_avx_unaligned_erms"
+        },
+        {
+          "self_cycle_percent": 3.67,
+          "symbol": "rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)"
+        },
+        {
+          "self_cycle_percent": 3.33,
+          "symbol": "rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const"
+        },
+        {
+          "self_cycle_percent": 3.27,
+          "symbol": "__memcmp_avx2_movbe"
+        },
+        {
+          "self_cycle_percent": 3.24,
+          "symbol": "rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)"
+        },
+        {
+          "self_cycle_percent": 2.81,
+          "symbol": "rut::IoUringEventLoop::dispatch(rut::IoEvent const&)"
+        },
+        {
+          "self_cycle_percent": 2.69,
+          "symbol": "rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)"
+        },
+        {
+          "self_cycle_percent": 2.34,
+          "symbol": "rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)"
+        },
+        {
+          "self_cycle_percent": 2.25,
+          "symbol": "rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)"
+        },
+        {
+          "self_cycle_percent": 2.01,
+          "symbol": "rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)"
+        },
+        {
+          "self_cycle_percent": 1.89,
+          "symbol": "rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)"
+        },
+        {
+          "self_cycle_percent": 1.72,
+          "symbol": "rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)"
+        },
+        {
+          "self_cycle_percent": 1.62,
+          "symbol": "void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)"
+        },
+        {
+          "self_cycle_percent": 1.52,
+          "symbol": "rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)"
+        },
+        {
+          "self_cycle_percent": 1.38,
+          "symbol": "rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)"
+        },
+        {
+          "self_cycle_percent": 1.37,
+          "symbol": "rut::IoUringEventLoop::poll_command()"
+        },
+        {
+          "self_cycle_percent": 1.23,
+          "symbol": "rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)"
+        },
+        {
+          "self_cycle_percent": 1.21,
+          "symbol": "__memset_avx2_unaligned_erms"
+        }
+      ]
+    },
+    {
+      "mode": "keepalive",
+      "samples_approximately": 17000,
+      "lost_samples": 0,
+      "top_self_symbols": [
+        {
+          "self_cycle_percent": 5.62,
+          "symbol": "rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)"
+        },
+        {
+          "self_cycle_percent": 5.04,
+          "symbol": "rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)"
+        },
+        {
+          "self_cycle_percent": 5.01,
+          "symbol": "__memmove_avx_unaligned_erms"
+        },
+        {
+          "self_cycle_percent": 4.12,
+          "symbol": "rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)"
+        },
+        {
+          "self_cycle_percent": 4.12,
+          "symbol": "rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const"
+        },
+        {
+          "self_cycle_percent": 3.72,
+          "symbol": "rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)"
+        },
+        {
+          "self_cycle_percent": 3.34,
+          "symbol": "__memcmp_avx2_movbe"
+        },
+        {
+          "self_cycle_percent": 3.13,
+          "symbol": "rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)"
+        },
+        {
+          "self_cycle_percent": 2.93,
+          "symbol": "rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)"
+        },
+        {
+          "self_cycle_percent": 2.42,
+          "symbol": "rut::IoUringEventLoop::dispatch(rut::IoEvent const&)"
+        },
+        {
+          "self_cycle_percent": 2.34,
+          "symbol": "rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)"
+        },
+        {
+          "self_cycle_percent": 2.22,
+          "symbol": "rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)"
+        },
+        {
+          "self_cycle_percent": 1.64,
+          "symbol": "void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)"
+        },
+        {
+          "self_cycle_percent": 1.63,
+          "symbol": "rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)"
+        },
+        {
+          "self_cycle_percent": 1.57,
+          "symbol": "rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)"
+        },
+        {
+          "self_cycle_percent": 1.44,
+          "symbol": "rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)"
+        },
+        {
+          "self_cycle_percent": 1.33,
+          "symbol": "clock_gettime@@GLIBC_2.17"
+        },
+        {
+          "self_cycle_percent": 1.23,
+          "symbol": "rut::IoUringEventLoop::poll_command()"
+        },
+        {
+          "self_cycle_percent": 1.17,
+          "symbol": "rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)"
+        },
+        {
+          "self_cycle_percent": 1.02,
+          "symbol": "rut::IoUringEventLoop::settle_response_read_deadline_batch()"
+        }
+      ]
+    }
+  ],
+  "archive_sha256": "ecf118d40cb23ac8152667de7fa4551d7fb8f8a6b7f60caec279a0bd9ee9448a"
+}
