@@ -134,6 +134,194 @@ class ToolsTest(unittest.TestCase):
         validate_proxy_profile(argparse.ArgumentParser(), args)
         self.assertIsNone(args.body_size)
 
+    def test_worker_evidence_is_topology_specific_and_bool_is_not_worker_count(self):
+        rows = []
+        for engine in ("nginx", "rut"):
+            for rep in (1, 2, 3):
+                rows.append({
+                    "workload": "static", "connection": "close", "transport": "http",
+                    "body_size": 16, "concurrency": 1, "engine": engine, "rep": rep,
+                    "requests": 100, "rps": 100.0, "seconds": 5.0, "valid": True,
+                    "errors": dict.fromkeys(run.ERROR_NAMES, 0),
+                    "warmup_errors": dict.fromkeys(run.ERROR_NAMES, 0),
+                    "workers": 2, "server_cpus": "2,3",
+                })
+        self.assertTrue(assess(rows, "static-close", "http", 16, 1, 3, 5,
+                               workers=2, server_cpus="2,3")["measurement_valid"])
+        mixed_topology = [dict(row) for row in rows]
+        mixed_topology[0]["server_cpus"] = "2,4"
+        for altered in (rows[:-1], [dict(row, workers=True) for row in rows], mixed_topology):
+            self.assertFalse(assess(altered, "static-close", "http", 16, 1, 3, 5,
+                                    workers=2, server_cpus="2,3")["measurement_valid"])
+        legacy = [dict(row) for row in rows]
+        for row in legacy:
+            row.pop("workers")
+            row.pop("server_cpus")
+        self.assertTrue(assess(legacy, "static-close", "http", 16, 1, 3, 5)["measurement_valid"])
+        self.assertFalse(assess(legacy, "static-close", "http", 16, 1, 3, 5,
+                                workers=2, server_cpus="2,3")["measurement_valid"])
+
+    def test_two_worker_frontend_config_and_legacy_default(self):
+        self.assertIn("worker_processes 2;", Harness.nginx_config("server {};", workers=2))
+        self.assertEqual(
+            Harness.nginx_config("server {};").encode(),
+            b"worker_processes 1;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\n"
+            b"events { worker_connections 8192; }\nhttp { access_log off;\nserver {};\n}\n",
+        )
+
+    def test_worker_cpu_arguments_are_mutually_exclusive_and_normalized(self):
+        parser = argparse.ArgumentParser()
+        run.add_cpu_arguments(parser)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--server-cpu=2", "--server-cpus=2", "--origin-cpu=3",
+                               "--client-cpus=4"])
+        with tempfile.TemporaryDirectory() as directory:
+            limits = Path(directory) / "shard_limits.h"
+            limits.write_text("inline constexpr u32 kMaxShards = 2;\n")
+            with mock.patch.object(run, "SHARD_LIMITS", limits):
+                args = SimpleNamespace(server_cpu=None, server_cpus="02, 03", workers=2)
+                run.normalize_cpu_arguments(parser, args)
+                self.assertEqual(args.server_cpus, "2,3")
+                for mask, workers in (("2,02", 2), ("2,,3", 2), ("2,3", 1),
+                                      ("2,3,4", 3), ("2,3", True)):
+                    with self.subTest(mask=mask, workers=workers), \
+                            contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        run.normalize_cpu_arguments(parser, SimpleNamespace(
+                            server_cpu=None, server_cpus=mask, workers=workers))
+
+    def test_matrix_normalizes_and_forwards_worker_topology_before_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "matrix"
+            argv = ["matrix.py", "--output", str(output), "--tls-cert", "unused.pem",
+                    "--tls-key", "unused.key", "--transports", "http", "--body-sizes", "16",
+                    "--scenarios", "static-close", "--concurrency", "1", "--profile", "quick",
+                    "--server-cpus=02, 03", "--workers", "2", "--origin-cpu", "4",
+                    "--client-cpus", "5,6"]
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+            try:
+                with mock.patch.object(sys, "argv", argv), \
+                        mock.patch.object(matrix, "validate_cpu_topology"), \
+                        mock.patch.object(matrix, "run_cell", return_value=2) as child, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(matrix.main(), 2)
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            command = child.call_args.args[0]
+            self.assertEqual(command[command.index("--server-cpus") + 1], "2,3")
+            self.assertEqual(command[command.index("--workers") + 1], "2")
+            report = json.loads((output / "matrix.json").read_text())
+            self.assertEqual(report["server_cpus"], "2,3")
+            self.assertEqual(report["workers"], 2)
+            invalid_output = Path(directory) / "invalid"
+            invalid_argv = ["matrix.py", "--output", str(invalid_output), "--tls-cert", "unused.pem",
+                            "--tls-key", "unused.key", "--transports", "http", "--body-sizes", "16",
+                            "--scenarios", "static-close", "--concurrency", "1",
+                            "--server-cpus=2,3", "--workers", "1", "--origin-cpu", "4",
+                            "--client-cpus", "5,6"]
+            try:
+                with mock.patch.object(sys, "argv", invalid_argv), \
+                        mock.patch.object(matrix, "run_cell") as invalid_child, \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    matrix.main()
+            finally:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            invalid_child.assert_not_called()
+            self.assertFalse(invalid_output.exists())
+
+    def test_rut_frontend_uses_matching_legacy_and_multiworker_affinity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            rut = out / "rut"
+            rut.touch()
+            for workers, mask in ((1, "2"), (2, "2,6")):
+                args = SimpleNamespace(output=out, rut=rut, server_cpus=mask,
+                                       workers=workers, front_port=8087,
+                                       tls_cert=None, tls_key=None)
+                harness = Harness(args)
+                proc = mock.Mock()
+                proc.poll.return_value = None
+                with mock.patch.object(run.subprocess, "Popen", return_value=proc) as popen, \
+                        mock.patch.object(harness, "ready"), \
+                        harness.frontend("rut", "proxy", f"case-{workers}"):
+                    pass
+                argv = popen.call_args.args[0]
+                self.assertEqual(argv[0:3], ["taskset", "-c", mask])
+                self.assertEqual(argv[argv.index("--shards") + 1], str(workers))
+                self.assertIn("--no-pin", argv)
+                if workers == 1:
+                    self.assertEqual(argv, ["taskset", "-c", "2", str(rut),
+                                            str(out / "proxy.rut"), "--shards", "1",
+                                            "--no-pin", "--drain", "1", "--opt", "2"])
+
+    def test_nginx_container_uses_complete_server_mask(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            harness = Harness(SimpleNamespace(output=out, tls_cert=None, tls_key=None))
+            harness.image = "mock-image"
+            calls = []
+
+            def fake_command(argv, timeout=20):
+                calls.append(argv)
+                stdout = ("container-id" if argv[1] == "create" else
+                          "123" if argv[:2] == ["docker", "inspect"] else "")
+                return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+            with mock.patch.object(harness, "command", side_effect=fake_command), \
+                    mock.patch.object(harness, "ready"), \
+                    harness.nginx("frontend", "frontend.conf", "2,6", 8087):
+                pass
+            create = calls[0]
+            self.assertEqual(create[create.index("--cpuset-cpus") + 1], "2,6")
+
+    def test_prepare_applies_frontend_workers_in_all_profiles_and_origin_stays_single(self):
+        cases = (("converter", "converter-return", "converter-strict", ["proxy-close"], "proxy"),
+                 ("native-body", "native-body", "converter-strict", ["static-close"], "static"),
+                 ("native-streaming", "converter-return", "native-streaming",
+                  ["proxy-keepalive"], "proxy"))
+        for name, static_profile, proxy_profile, scenarios, work in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory)
+                binaries = {}
+                for binary in ("rut", "converter", "wrk"):
+                    path = out / binary
+                    path.write_text("mock executable\n")
+                    path.chmod(0o755)
+                    binaries[binary] = path
+                args = SimpleNamespace(
+                    output=out, rut=binaries["rut"], converter=binaries["converter"],
+                    wrk=binaries["wrk"], tls_cert=None, tls_key=None, body_size=None,
+                    mode="benchmark", server_cpu=2, server_cpus="2,6", workers=2,
+                    origin_cpu=3, client_cpus="4,5", keepalive_header="implicit",
+                    front_port=8087, origin_port=9087, scenarios=scenarios, repeats=1,
+                    first_engine="nginx", static_profile=static_profile,
+                    proxy_profile=proxy_profile,
+                )
+                harness = Harness(args)
+
+                def fake_command(argv, timeout=20):
+                    command = [str(value) for value in argv]
+                    if command == ["docker", "context", "inspect"]:
+                        stdout = '[{"Endpoints":{"docker":{"Host":"unix:///mock.sock"}}}]'
+                    elif command[:2] == ["docker", "info"]:
+                        stdout = "mock docker"
+                    elif command[:3] == ["docker", "image", "inspect"]:
+                        stdout = '[{"Id":"mock-image"}]'
+                    elif command[0] == "git":
+                        stdout = "" if "status" in command else "mock-head"
+                    elif command == ["lscpu"]:
+                        stdout = "mock topology"
+                    elif command[0] == str(binaries["converter"]):
+                        stdout = f"listen 127.0.0.1:{args.front_port}\nmock config\n"
+                    else:
+                        raise AssertionError(f"unexpected command {argv!r}")
+                    return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+                with mock.patch.object(harness, "command", side_effect=fake_command):
+                    harness.prepare()
+                frontend = out / f"{work}-nginx.conf"
+                self.assertIn("worker_processes 2;", frontend.read_text())
+                self.assertIn("worker_processes 1;", (out / "origin.conf").read_text())
+
 
     def test_matrix_profiles_forward_budget_without_dropping_coordinates(self):
         cases = (([], (5, 1, 3)),
@@ -144,10 +332,12 @@ class ToolsTest(unittest.TestCase):
             with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / "matrix"
                 argv = ["matrix.py", "--output", str(output),
-                        "--tls-cert", "unused.pem", "--tls-key", "unused.key", *flags]
+                        "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+                        "--server-cpu", "2", "--origin-cpu", "3", "--client-cpus", "4,5", *flags]
                 previous_sigterm = signal.getsignal(signal.SIGTERM)
                 try:
                     with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "validate_cpu_topology"), \
                             mock.patch.object(matrix, "run_cell", return_value=2) as child, \
                             contextlib.redirect_stdout(io.StringIO()) as stdout:
                         self.assertEqual(matrix.main(), 2)
@@ -185,6 +375,7 @@ class ToolsTest(unittest.TestCase):
                 output = Path(directory) / "matrix"
                 argv = ["matrix.py", "--output", str(output),
                         "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+                        "--server-cpu", "2", "--origin-cpu", "3", "--client-cpus", "4,5",
                         "--transports", "http", "--body-sizes", "16",
                         "--scenarios", "static-close", "--concurrency", "1", "32", "128",
                         "--duration", "5", "--repeats", "3"]
@@ -212,6 +403,7 @@ class ToolsTest(unittest.TestCase):
                 previous_sigterm = signal.getsignal(signal.SIGTERM)
                 try:
                     with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "validate_cpu_topology"), \
                             mock.patch.object(matrix, "run_cell", side_effect=child_run), \
                             contextlib.redirect_stdout(io.StringIO()):
                         self.assertEqual(matrix.main(), expected_exit)
@@ -394,12 +586,16 @@ class ToolsTest(unittest.TestCase):
         self.assertFalse(evaluate(rows[:-1])["target_met"])
         self.assertFalse(evaluate(rows, duration=1)["target_met"])
         for key, value in (("body_size", 16), ("transport", "http"), ("rep", 99),
-                           ("valid", False), ("errors", {"timeout": 1}), ("rps", 105)):
+                           ("valid", False), ("errors", {"timeout": 1}), ("rps", 104.9)):
             bad = copy.deepcopy(rows)
             for row in bad:
                 if row["engine"] == "rut":
                     row[key] = value
             self.assertFalse(evaluate(bad)["target_met"], key)
+        for row in rows:
+            if row["engine"] == "rut":
+                row["rps"] = 105
+        self.assertFalse(evaluate(rows)["target_met"])
 
     def test_matrix_requires_actual_measurement_duration(self):
         import copy
@@ -444,6 +640,7 @@ class ToolsTest(unittest.TestCase):
                 output = Path(directory) / "matrix"
                 argv = ["matrix.py", "--output", str(output),
                         "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+                        "--server-cpu", "2", "--origin-cpu", "3", "--client-cpus", "4,5",
                         "--transports", "http", "--body-sizes", "16", "32",
                         "--scenarios", "static-close", "--concurrency", "1",
                         "--duration", "5", "--repeats", "3"]
@@ -474,6 +671,7 @@ class ToolsTest(unittest.TestCase):
                 previous_sigterm = signal.getsignal(signal.SIGTERM)
                 try:
                     with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(matrix, "validate_cpu_topology"), \
                             mock.patch.object(matrix, "run_cell", side_effect=child_run) as child, \
                             contextlib.redirect_stdout(io.StringIO()):
                         self.assertEqual(matrix.main(), 2)
@@ -530,6 +728,8 @@ class ToolsTest(unittest.TestCase):
                     body_size=None,
                     mode="benchmark",
                     server_cpu=2,
+                    server_cpus="2",
+                    workers=1,
                     origin_cpu=3,
                     client_cpus="4,5",
                     keepalive_header="implicit",

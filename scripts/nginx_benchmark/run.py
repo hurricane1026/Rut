@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+SHARD_LIMITS = ROOT / "include/rut/common/shard_limits.h"
 SCENARIOS = ("static-close", "static-keepalive", "proxy-close", "proxy-keepalive")
 ERROR_NAMES = ("connect", "read", "write", "status", "timeout")
 # Keep aligned with the converter's safe quoted return-body profile.
@@ -281,6 +282,8 @@ class Harness:
             "nginx_image_id": inspection["Id"],
             "kernel": list(os.uname()),
             "cpu_topology": self.command(["lscpu"]).stdout,
+            "workers": a.workers,
+            "server_cpus": a.server_cpus,
             "tcp_tw_reuse": Path("/proc/sys/net/ipv4/tcp_tw_reuse").read_text().strip(),
             "note": "Harness revision is not proof of binary source revision. Record build provenance separately.",
         }
@@ -323,7 +326,7 @@ class Harness:
         (self.out / "origin.conf").write_text(self.nginx_config(
             f"server {{ listen 127.0.0.1:{a.origin_port}; {origin_keepalive} "
             f"{'keepalive_requests 1000000000;' if native_streaming else ''} {origin_log} {origin_location} }}",
-            extra_http=origin_observation,
+            extra_http=origin_observation, workers=1,
         ))
         works = sorted({scenario.split("-")[0] for scenario in a.scenarios})
         for work in works:
@@ -348,7 +351,7 @@ class Harness:
                           'open_file_cache_min_uses 1; '
                           'default_type "text/plain; charset=utf-8"; '
                           'etag off; max_ranges 0; add_header Last-Modified ""; } }')
-                (self.out / "static-nginx.conf").write_text(self.nginx_config(server))
+                (self.out / "static-nginx.conf").write_text(self.nginx_config(server, workers=self.args.workers))
                 continue
             if native_streaming:
                 native = (f'listen 127.0.0.1:{a.front_port}\n'
@@ -380,7 +383,7 @@ class Harness:
                         "ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
                         "ssl_ecdh_curve X25519; ssl_session_cache off;")
                 (self.out / (work + "-nginx.conf")).write_text(
-                    self.nginx_config(nginx_server, extra_http=nginx_http))
+                    self.nginx_config(nginx_server, extra_http=nginx_http, workers=self.args.workers))
                 continue
             local = (
                 'location = /static { return 200 "' + expected_body("static", body_size).decode() + '"; }'
@@ -409,7 +412,7 @@ class Harness:
                     "ssl_protocols TLSv1.3; ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
                     "ssl_ecdh_curve X25519; ssl_session_cache off;",
                 )
-            (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(nginx_fragment))
+            (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(nginx_fragment, workers=self.args.workers))
             converted = self.command([a.converter, "--format", "server", source])
             program = converted.stdout
             if self.tls_context:
@@ -424,9 +427,9 @@ class Harness:
             (self.out / (work + "-converter.log")).write_text(converted.stderr)
 
     @staticmethod
-    def nginx_config(server, extra_http=""):
+    def nginx_config(server, extra_http="", workers=1):
         return (
-            "worker_processes 1;\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\n"
+            f"worker_processes {workers};\nerror_log /dev/stderr warn;\npid /tmp/nginx.pid;\n"
             "events { worker_connections 8192; }\nhttp { access_log off;\n"
             + extra_http + server
             + "\n}\n"
@@ -501,18 +504,18 @@ class Harness:
         self.active_label = label
         if engine == "nginx":
             with self.nginx(
-                label, work + "-nginx.conf", a.server_cpu, a.front_port
+                label, work + "-nginx.conf", a.server_cpus, a.front_port
             ) as pid:
                 yield pid
             return
         argv = [
             "taskset",
             "-c",
-            str(a.server_cpu),
+            a.server_cpus,
             str(a.rut),
             str(self.out / (work + ".rut")),
             "--shards",
-            "1",
+            str(a.workers),
             "--no-pin",
             "--drain",
             "1",
@@ -831,6 +834,8 @@ class Harness:
                                 engine=engine,
                                 rep=rep,
                                 concurrency=concurrency,
+                                workers=self.args.workers,
+                                server_cpus=self.args.server_cpus,
                                 warmup_errors=warmup["errors"],
                                 server_cpu_pct=100
                                 * (after - before)
@@ -1023,6 +1028,67 @@ def print_measurement_budget(args, cells):
           flush=True)
 
 
+def add_cpu_arguments(parser):
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--server-cpu", type=int, help="legacy single server CPU")
+    group.add_argument("--server-cpus", help="comma-separated server CPU mask")
+    parser.add_argument("--workers", type=positive, default=1,
+                        help="frontend worker/shard count; must match --server-cpus")
+    parser.add_argument("--origin-cpu", type=int, required=True)
+    parser.add_argument("--client-cpus", required=True,
+                        help="comma-separated CPU IDs on distinct physical cores")
+
+
+def normalize_cpu_arguments(parser, args):
+    """Canonicalize and validate the worker mask against Rut's shard cap."""
+    if type(args.workers) is not int or args.workers < 1:
+        parser.error("workers must be a positive integer")
+    try:
+        server_cpus = ([args.server_cpu] if args.server_cpu is not None else
+                       [int(cpu) for cpu in args.server_cpus.split(",")])
+    except (AttributeError, ValueError):
+        parser.error("server-cpus must be comma-separated integer CPU IDs")
+    if not server_cpus or len(set(server_cpus)) != len(server_cpus):
+        parser.error("server-cpus must contain unique CPU IDs")
+    if args.server_cpu is not None and args.workers != 1:
+        parser.error("--workers greater than one requires --server-cpus")
+    if args.workers != len(server_cpus):
+        parser.error("workers must equal the number of server CPUs")
+    try:
+        shard_header = SHARD_LIMITS.read_text()
+        max_shards = int(re.search(r"kMaxShards\s*=\s*(\d+)", shard_header)[1])
+    except (OSError, TypeError, AttributeError, ValueError):
+        parser.error(f"cannot read runtime shard limit from {SHARD_LIMITS}")
+    if args.workers > max_shards:
+        parser.error(f"workers must not exceed runtime shard limit {max_shards}")
+    args.server_cpus = ",".join(map(str, server_cpus))
+    args.server_cpu = server_cpus[0]
+    return args
+
+
+def validate_cpu_topology(parser, args):
+    try:
+        clients = [int(cpu) for cpu in args.client_cpus.split(",")]
+    except (AttributeError, ValueError):
+        parser.error("client-cpus must be comma-separated integer CPU IDs")
+    cpus = [*map(int, args.server_cpus.split(",")), args.origin_cpu, *clients]
+    if (not clients or len(set(cpus)) != len(cpus)
+            or not set(cpus) <= os.sched_getaffinity(0)):
+        parser.error("CPU IDs must be available and disjoint")
+    cores = []
+    try:
+        for cpu in cpus:
+            topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+            cores.append(((topology / "physical_package_id").read_text(),
+                          (topology / "core_id").read_text()))
+    except OSError as error:
+        parser.error(f"cannot read CPU topology: {error}")
+    if len(set(cores)) != len(cores):
+        parser.error("choose distinct physical cores, not SMT siblings")
+    args.client_cpus = ",".join(map(str, clients))
+    return args
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rut", type=Path, required=True)
@@ -1034,13 +1100,7 @@ def arguments():
     parser.add_argument(
         "--mode", choices=("benchmark", "diagnose"), default="benchmark"
     )
-    parser.add_argument("--server-cpu", type=int, required=True)
-    parser.add_argument("--origin-cpu", type=int, required=True)
-    parser.add_argument(
-        "--client-cpus",
-        required=True,
-        help="comma-separated CPU IDs on distinct physical cores",
-    )
+    add_cpu_arguments(parser)
     parser.add_argument(
         "--keepalive-header",
         choices=("explicit", "implicit"),
@@ -1094,26 +1154,8 @@ def arguments():
         parser.error(
             "output must be new or empty; existing evidence is never overwritten"
         )
-    cpus = [args.server_cpu, args.origin_cpu]
-    try:
-        clients = [int(cpu) for cpu in args.client_cpus.split(",")]
-    except ValueError:
-        parser.error("client-cpus must be comma-separated integer CPU IDs")
-    cpus += clients
-    if len(set(cpus)) != len(cpus) or not set(cpus) <= os.sched_getaffinity(0):
-        parser.error("CPU IDs must be available and disjoint")
-    cores = []
-    for cpu in cpus:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        cores.append(
-            (
-                (topology / "physical_package_id").read_text(),
-                (topology / "core_id").read_text(),
-            )
-        )
-    if len(set(cores)) != len(cores):
-        parser.error("choose distinct physical cores, not SMT siblings")
-    args.client_cpus = ",".join(map(str, clients))
+    normalize_cpu_arguments(parser, args)
+    validate_cpu_topology(parser, args)
     if args.front_port == args.origin_port or any(
         not 1024 <= p <= 9999 for p in (args.front_port, args.origin_port)
     ):

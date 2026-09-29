@@ -12,7 +12,8 @@ from pathlib import Path
 
 from run import (SCENARIOS, ERROR_NAMES, positive, save_json,
                  add_measurement_arguments, resolve_measurement_arguments,
-                 print_measurement_budget)
+                 print_measurement_budget, add_cpu_arguments,
+                 normalize_cpu_arguments, validate_cpu_topology)
 
 
 def run_cell(command, log):
@@ -57,6 +58,10 @@ def sample_shape_valid(row):
     if not all(type(row.get(key)) is int and row[key] >= 0
                for key in ("body_size", "concurrency", "rep", "requests")):
         return False
+    if "workers" in row and (type(row["workers"]) is not int or row["workers"] < 1):
+        return False
+    if "server_cpus" in row and (not isinstance(row["server_cpus"], str) or not row["server_cpus"]):
+        return False
     if not all(finite_nonnegative(row.get(key)) for key in ("rps", "seconds")):
         return False
     return all(isinstance(row.get(key), dict) and set(row[key]) == set(ERROR_NAMES)
@@ -80,8 +85,11 @@ def load_evidence(folder):
         return [], {}, f"{type(error).__name__}: {error}"
 
 
-def assess(rows, scenario, transport, size, concurrency, repeats, duration, static_profile=None):
+def assess(rows, scenario, transport, size, concurrency, repeats, duration,
+           static_profile=None, workers=1, server_cpus=None):
     work, connection = scenario.split("-")
+    if type(workers) is not int or workers < 1:
+        workers = -1
     if not isinstance(rows, list) or not all(sample_shape_valid(row) for row in rows):
         rows = []
     selected = [r for r in rows if r.get("concurrency") == concurrency]
@@ -95,6 +103,9 @@ def assess(rows, scenario, transport, size, concurrency, repeats, duration, stat
             and (work != "static" or static_profile is None
                  or r.get("static_profile", "converter-return") == static_profile)
             and r.get("body_size") == size and r.get("requests", 0) > 0
+            and ((workers == 1 and "workers" not in r and "server_cpus" not in r)
+                 or (r.get("workers") == workers and server_cpus is not None
+                     and r.get("server_cpus") == server_cpus))
             and r.get("rps", 0) > 0 and r["seconds"] > 0
             and set(r.get("errors", {})) == set(ERROR_NAMES)
             and set(r.get("warmup_errors", {})) == set(ERROR_NAMES)
@@ -127,8 +138,11 @@ def main():
     parser.add_argument("--body-sizes", nargs="+", type=positive, default=[16, 1024, 65536, 1048576])
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--concurrency", nargs="+", type=positive, default=[1, 32, 128])
+    add_cpu_arguments(parser)
     add_measurement_arguments(parser, full_duration=10)
     args, common = parser.parse_known_args()
+    normalize_cpu_arguments(parser, args)
+    validate_cpu_topology(parser, args)
     resolve_measurement_arguments(args)
     for values in (args.transports, args.body_sizes, args.scenarios, args.concurrency):
         if len(values) != len(set(values)):
@@ -142,6 +156,7 @@ def main():
     coordinates = list(itertools.product(args.transports, args.body_sizes, args.scenarios))
     report = {"complete": False, "target_met": False,
               "profile": args.profile, "static_profile": args.static_profile,
+              "workers": args.workers, "server_cpus": args.server_cpus,
               "expected_cells": len(coordinates) * len(args.concurrency), "cells": []}
     print_measurement_budget(args, report["expected_cells"])
     save_json(args.output / "matrix.json", report)
@@ -152,10 +167,14 @@ def main():
         for transport, size, scenario in coordinates:
             folder = args.output / f"{transport}-{size}-{scenario}"
             command = [sys.executable, str(Path(__file__).with_name("run.py")), *common,
+                       "--server-cpus", args.server_cpus,
+                       "--origin-cpu", str(args.origin_cpu),
+                       "--client-cpus", args.client_cpus,
                        "--profile", args.profile, "--static-profile", args.static_profile,
                        "--output", str(folder), "--body-size", str(size), "--scenarios", scenario,
                        "--concurrency", *map(str, args.concurrency), "--duration", str(args.duration),
-                       "--warmup", str(args.warmup), "--repeats", str(args.repeats)]
+                       "--warmup", str(args.warmup), "--repeats", str(args.repeats),
+                       "--workers", str(args.workers)]
             if transport == "https":
                 command += ["--tls-cert", str(args.tls_cert.resolve()), "--tls-key", str(args.tls_key.resolve())]
             with (args.output / (folder.name + ".log")).open("w") as log:
@@ -167,7 +186,10 @@ def main():
             completed = returncode in (0, 1) and status.get("complete") is True
             for concurrency in args.concurrency:
                 cell = assess(rows, scenario, transport, size, concurrency, args.repeats, args.duration,
-                              args.static_profile)
+                              args.static_profile, args.workers,
+                              args.server_cpus)
+                cell["workers"] = args.workers
+                cell["server_cpus"] = args.server_cpus
                 if scenario.startswith("static-"):
                     cell["static_profile"] = args.static_profile
                 cell.update(exit_code=returncode, evidence=str(folder), command=command)
