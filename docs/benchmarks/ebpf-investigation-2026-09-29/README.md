@@ -1207,3 +1207,38 @@ All twelve coordinates have valid formal measurements; eleven meet >=1.10. Proxy
 | proxy-keepalive | 1 | 1.0213 | below 1.10 |
 | proxy-keepalive | 32 | 1.4493 | pass |
 | proxy-keepalive | 128 | 1.4462 | pass |
+
+## Completed full formal acceptance: 96 coordinates
+
+The fixed accepted binary completed all 96 coordinates. All 576 measured samples (three per engine per coordinate, each at least five seconds) are valid, with zero warmup/load errors and 192 successful full-body preflights. Driver exit 2 indicates the performance target was missed, not invalid measurement. Post-run Docker and listener checks were empty.
+
+**76/96 meet >=1.10; 20 remain below target.** Three medians are below nginx; HTTP 1 KiB proxy keepalive c1 at 0.9991 is effectively a near-tie and is not evidence of a stable tiny regression. The two HTTP 64 KiB proxy c1 coordinates remain below nginx by about 2–3%. The goal remains unmet.
+
+| Transport | Bytes | Scenario | Concurrency | Rut/nginx |
+|---|---:|---|---:|---:|
+| http | 16 | proxy-close | 1 | 1.0252 |
+| http | 16 | proxy-keepalive | 1 | 1.0043 |
+| http | 1024 | static-close | 1 | 1.0623 |
+| http | 1024 | proxy-close | 1 | 1.0268 |
+| http | 1024 | proxy-keepalive | 1 | 0.9991 |
+| http | 65536 | static-close | 1 | 1.0359 |
+| http | 65536 | static-keepalive | 1 | 1.0631 |
+| http | 65536 | proxy-close | 1 | 0.9806 |
+| http | 65536 | proxy-keepalive | 1 | 0.9713 |
+| http | 1048576 | static-close | 1 | 1.0665 |
+| http | 1048576 | static-keepalive | 32 | 1.0517 |
+| http | 1048576 | static-keepalive | 128 | 1.0388 |
+| http | 1048576 | proxy-close | 1 | 1.0431 |
+| http | 1048576 | proxy-close | 32 | 1.0460 |
+| http | 1048576 | proxy-close | 128 | 1.0006 |
+| https | 16 | proxy-keepalive | 1 | 1.0568 |
+| https | 1024 | proxy-keepalive | 1 | 1.0560 |
+| https | 65536 | proxy-keepalive | 1 | 1.0213 |
+| https | 1048576 | static-close | 128 | 1.0852 |
+| https | 1048576 | proxy-close | 128 | 1.0272 |
+
+Evidence: `full-acceptance-matrix.json`, `full-acceptance-audit.json`, and `full-acceptance-evidence.tar.gz` (raw text artifacts and per-file SHA256 manifest; no TLS private keys, payload binaries, or executables). Archive SHA256: `69416ad3a8389e28ecf4c8bd4e05864552ff1b0fd1fa266d0f9f63592f04ef87`.
+
+The runtime binary hash is fixed throughout. Harness revision labels changed as documentation checkpoints were committed; the dirty flag includes the pre-existing untracked benchmark evidence directory. No runtime edits/builds/traces ran during this matrix. Host clocks are not locked; small differences retain that limitation.
+
+Next priorities: (1) uninstrumented HTTP 64 KiB c1 proxy deficit, using low-overhead tracing because prior per-call probes reversed ordering; (2) 1 MiB HTTP close and concurrent static keepalive plus HTTPS c128 close; (3) remaining small-response c1 latency. Existing rejected experiments remain rejected; no huge pages or global kernel tuning are introduced.

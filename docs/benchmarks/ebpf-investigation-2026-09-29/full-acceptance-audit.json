@@ -1,0 +1,18 @@
+{
+  "complete": true,
+  "coordinates": 96,
+  "groups": 32,
+  "samples": 576,
+  "repeats_per_engine_and_coordinate": 3,
+  "minimum_sample_seconds": 5,
+  "all_samples_valid": true,
+  "warmup_and_load_errors": 0,
+  "body_preflights": 192,
+  "passing_1_10": 76,
+  "below_1_0": 3,
+  "target_met": false,
+  "binary_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "archive_files": 6833,
+  "archive_bytes": 39821253,
+  "cleanup": "Verified after driver exit: no running Docker containers; no listeners on ports 8987 or 9987."
+}
