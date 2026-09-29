@@ -1,0 +1,31 @@
+BEGIN { @targets[2845304] = 1; printf("RUT_TRACE_READY\n"); }
+interval:s:24 { exit(); }
+
+rawtracepoint:sched_process_exec {
+    $task = (struct task_struct *)arg0;
+    if (@targets[$task->tgid]) {
+        @target_execs[$task->tgid] = count();
+        $ignored = delete(@targets[$task->tgid]);
+    }
+}
+rawtracepoint:sched_process_exit {
+    $task = (struct task_struct *)arg0;
+    if (@targets[$task->tgid]) {
+        @thread_exits[$task->tgid] = count();
+        
+        if ($task->pid == $task->tgid) { $ignored = delete(@targets[$task->tgid]); }
+    }
+}
+
+END { printf("RUT_TRACE_END\n"); clear(@targets); }
+// Offsets compiled from the candidate's headers and exact build flags.
+uprobe:/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-drain-offset:_ZN3rut21consume_upstream_sentERNS_14ConnectionBaseE /@targets[pid]/ {
+ @drain_conn[tid]=arg0;
+ @drain_phase[pid,*(uint8*)uptr(arg0+2380)]=count();
+}
+uretprobe:/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-drain-offset:_ZN3rut21consume_upstream_sentERNS_14ConnectionBaseE /@targets[pid] && @drain_conn[tid]/ {
+ $offset=*(uint32*)uptr(@drain_conn[tid]+3600);
+ @drain_result[pid,$offset,retval>0]=count();
+ $ignored=delete(@drain_conn[tid]);
+}
+END { clear(@drain_conn); }

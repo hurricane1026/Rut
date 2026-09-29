@@ -1,0 +1,46 @@
+{
+  "completed": false,
+  "usable": false,
+  "mode": "trace",
+  "kernel": "6.19.10-300.fc44.x86_64",
+  "machine": "x86_64",
+  "groups": [
+    "drain-offset"
+  ],
+  "duration_seconds": 24,
+  "front_port": 8987,
+  "origin_port": 9987,
+  "started_at": 1790647097.128015,
+  "program_sha256": "14d949100907f0e9cce520cadf75c3e3f49b6229eaaefbfe71405a7e7a1b6d21",
+  "targets_before": [
+    {
+      "pid": 2845304,
+      "start_ticks": 93302511,
+      "state": "S",
+      "comm": "rut-drain-offse",
+      "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-drain-offset"
+    }
+  ],
+  "bpftrace_version": "bpftrace v0.27.0",
+  "command": [
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+    "-f",
+    "json",
+    "-B",
+    "line",
+    "/tmp/rut-bounded-followup-20260928/ebpf-drain-offset-r1/65536-c1-close-rut-fin/trace/program.bt"
+  ],
+  "returncode": 255,
+  "targets_after": [
+    {
+      "pid": 2845304,
+      "start_ticks": 93302511,
+      "state": "S",
+      "comm": "rut-drain-offse",
+      "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-drain-offset"
+    }
+  ],
+  "targets_unchanged": true,
+  "diagnostic_warnings": true,
+  "finished_at": 1790647098.4966087
+}

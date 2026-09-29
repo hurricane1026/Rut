@@ -1288,3 +1288,15 @@ The target close signal repeats, while the small c32 signs do not. This is an in
 64 KiB concurrent proxy controls are mildly positive: c32 close +0.69%, c32 keepalive +0.46%, c128 keepalive +0.28%. The first larger driver then stopped because the old quick-matrix directory lacked a 1 MiB c1 wrk script. No valid 1 MiB timing came from that attempt. Preserve its partial evidence and rerun only the unfinished 1 MiB cases from the completed formal-matrix configuration.
 
 The valid 1 MiB initial order gives c1 close +0.30%, c32 close -0.45%, c128 close +0.72%, c32 keepalive -0.45%, c128 keepalive -0.08%. Focused reverse order gives c32 close -0.03% and c32 keepalive -0.88%. All completed measurements have clean preflight/warm/load checks. The keepalive c32 deficit repeats in direction; no strong statistical significance is claimed for these small effects on an unreserved host. There is insufficient evidence to trade that deficit for the approximately 0.8% target c1-close gain. Revert the one-line runtime attribute. Full network regression passed but does not establish performance. The frozen candidate and its patch remain evidence only; build-rel still contains the rejected candidate until rebuilt.
+
+## Retired upstream drain offset experiment: rejected
+
+Replace header-prefix memmove with a shifted Buffer only for retired Bounded HeaderSend, no armed upstream recv/direct recv, original slice binding, and enough capacity for header proof checks. Restore the base/capacity after full consumption. A new test covers byte preservation, partial drain, restoration, and live/direct/abandoned fallbacks. All 1426 network tests / 373239 checks pass.
+
+The 28-sample causal control has clean preflight/warm/load checks. Changes: 16 B c1 close -0.18%, c32 close +0.50%, c1 keepalive +0.22%; 1 KiB c1 close +0.26%, c32 close -0.56%; 64 KiB c1 close -0.17%, keepalive -0.07%. No target throughput benefit is established.
+
+Attempted eBPF uprobe/uretprobe attachment failed with libbpf perf-event -EACCES. Added SYS_PTRACE and a disk-backed binary copy did not solve the smoke-probe failure; the kernel has CONFIG_UPROBES/UPROBE_EVENTS and PMU type 9. No effective hit counts came from eBPF, and permission failure does not imply no hits.
+
+A separate temporary diagnostic binary logged only the first 24 consume calls per process. Both close and keepalive logs show HeaderSend consuming 146 of 16384 bytes, followed by BodySend with drain offset 146 and 16238 bytes. Thus the candidate path really executes. Occasional early Buffering consumes retain the old path. This is a bounded initial observation, not a whole-run hit-rate estimate; diagnostic RPS is not used as causal evidence. Logs and raw evidence are retained. Diagnostic logging was removed before reverting the candidate runtime and added test. build-rel still contains the rejected diagnostic binary until rebuilt.
+
+Reject the added buffer state/branch complexity without a measured benefit. Existing accepted runtime and no-huge-page constraint remain the baseline.

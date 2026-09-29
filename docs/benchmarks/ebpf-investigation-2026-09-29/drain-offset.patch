@@ -1,0 +1,119 @@
+diff --git a/include/rut/runtime/connection_base.h b/include/rut/runtime/connection_base.h
+index 9694a980..b1d6f91e 100644
+--- a/include/rut/runtime/connection_base.h
++++ b/include/rut/runtime/connection_base.h
+@@ -1775,6 +1775,8 @@ struct ConnectionBase {
+     // Lazy-allocated: only proxy connections pay the cost.
+     u8* upstream_recv_slice;
+     Buffer upstream_recv_buf;
++    // Retired Bounded response drain: prefix skipped without moving body bytes.
++    u32 upstream_recv_drain_offset = 0;
+     ResponseBodyChain response_body_tail{};
+ 
+     // io_uring only: true while a *direct* one-shot upstream recv (straight
+@@ -2078,6 +2080,7 @@ struct ConnectionBase {
+         local_response_size = 0;
+         upstream_recv_slice = nullptr;
+         upstream_recv_buf.bind(nullptr, 0);
++        upstream_recv_drain_offset = 0;
+         direct_write_completion_pending = false;
+         upstream_relay_slice = nullptr;
+         upstream_relay_send_len = 0;
+diff --git a/src/runtime/callbacks.cc b/src/runtime/callbacks.cc
+index fc6ff1d1..8ea4e452 100644
+--- a/src/runtime/callbacks.cc
++++ b/src/runtime/callbacks.cc
+@@ -844,11 +844,36 @@ u32 consume_upstream_sent(Connection& conn) {
+     const u32 kTotal = conn.upstream_recv_buf.len();
+     conn.upstream_send_len = 0;
+     if (kSent >= kTotal) {
+-        conn.upstream_recv_buf.reset();
++        if (conn.upstream_recv_drain_offset != 0) {
++            const u32 offset = conn.upstream_recv_drain_offset;
++            conn.upstream_recv_buf.bind(const_cast<u8*>(conn.upstream_recv_buf.data()) - offset,
++                                        conn.upstream_recv_buf.capacity() + offset);
++            conn.upstream_recv_drain_offset = 0;
++        } else {
++            conn.upstream_recv_buf.reset();
++        }
+         return 0;
+     }
+     const u32 kRemaining = kTotal - kSent;
+     const u8* src = conn.upstream_recv_buf.data() + kSent;
++    // Only a settled origin can leave a drain-only view. A live recv must
++    // retain its exact destination and capacity; ordinary streaming still
++    // compacts below. Keep enough capacity for the pinned header proof.
++    if (conn.upstream_recv_drain_offset == 0 && kSent != 0 &&
++        conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
++        conn.response_read_deadline_post_commit_phase ==
++            ResponseReadDeadlinePostCommitPhase::HeaderSend &&
++        conn.upstream_fd < 0 && conn.upstream_abandoned && !conn.upstream_recv_armed &&
++        !conn.upstream_recv_direct_armed && conn.upstream_recv_slice != nullptr &&
++        conn.upstream_recv_buf.data() == conn.upstream_recv_slice &&
++        kSent == conn.response_read_deadline_post_commit_raw_header_end &&
++        kSent <= conn.upstream_recv_buf.capacity() - kSent) {
++        const u32 capacity = conn.upstream_recv_buf.capacity() - kSent;
++        conn.upstream_recv_buf.bind(const_cast<u8*>(src), capacity);
++        conn.upstream_recv_buf.commit(kRemaining);
++        conn.upstream_recv_drain_offset = kSent;
++        return kRemaining;
++    }
+     conn.upstream_recv_buf.reset();
+     u8* dst = conn.upstream_recv_buf.write_ptr();
+     __builtin_memmove(dst, src, kRemaining);
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index 668d5d92..5c23a331 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -31775,6 +31775,51 @@ TEST(early_response, consume_upstream_sent_normal) {
+     CHECK_EQ(c->upstream_recv_buf.len(), 0u);
+ }
+ 
++TEST(early_response, retired_bounded_header_drain_preserves_storage_and_restores_capacity) {
++    SmallLoop loop;
++    loop.setup();
++    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
++    auto* c = loop.find_fd(42);
++    REQUIRE(c != nullptr);
++    REQUIRE(loop.alloc_upstream_buf(*c));
++    u8* base = c->upstream_recv_slice;
++    const u32 capacity = c->upstream_recv_buf.capacity();
++    for (u32 mode = 0; mode < 4; ++mode) {
++        c->upstream_recv_buf.reset();
++        for (u32 i = 0; i < 300; ++i) base[i] = static_cast<u8>(i);
++        c->upstream_recv_buf.commit(300);
++        c->response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
++        c->response_read_deadline_post_commit_phase =
++            ResponseReadDeadlinePostCommitPhase::HeaderSend;
++        c->response_read_deadline_post_commit_raw_header_end = 100;
++        c->upstream_fd = -1;
++        c->upstream_abandoned = mode != 3;
++        c->upstream_recv_armed = mode == 1;
++        c->upstream_recv_direct_armed = mode == 2;
++        c->upstream_send_len = 100;
++        CHECK_EQ(consume_upstream_sent(*c), 200u);
++        CHECK_EQ(c->upstream_recv_buf.data(), base + (mode == 0 ? 100 : 0));
++        CHECK_EQ(c->upstream_recv_buf.capacity(), capacity - (mode == 0 ? 100 : 0));
++        CHECK_EQ(c->upstream_recv_drain_offset, mode == 0 ? 100u : 0u);
++        if (mode == 0) CHECK_EQ(base[0], 0u);
++        for (u32 i = 0; i < 200; ++i)
++            CHECK_EQ(c->upstream_recv_buf.data()[i], static_cast<u8>(i + 100));
++        c->response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
++        c->upstream_send_len = 50;
++        CHECK_EQ(consume_upstream_sent(*c), 150u);
++        for (u32 i = 0; i < 150; ++i)
++            CHECK_EQ(c->upstream_recv_buf.data()[i], static_cast<u8>(i + 150));
++        c->upstream_send_len = 150;
++        CHECK_EQ(consume_upstream_sent(*c), 0u);
++        CHECK_EQ(c->upstream_recv_buf.data(), base);
++        CHECK_EQ(c->upstream_recv_buf.capacity(), capacity);
++        CHECK_EQ(c->upstream_recv_buf.write_avail(), capacity);
++        CHECK_EQ(c->upstream_recv_drain_offset, 0u);
++    }
++    c->upstream_recv_armed = false;
++    c->upstream_recv_direct_armed = false;
++}
++
+ // === Coverage: legacy EventLoop<Backend> alloc_upstream_buf ===
+ 
+ static u64 state_invariant_wait_recv_then_status(
