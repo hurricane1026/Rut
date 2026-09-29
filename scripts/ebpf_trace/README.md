@@ -50,9 +50,13 @@ sudo python3 scripts/ebpf_trace/trace.py \
 ```
 
 Start the diagnostic load after bpftrace emits its JSON `attached_probes` event
-in `trace.jsonl`; a BEGIN-time print is not a readiness signal.
-The interval is bounded by `--duration` after probe startup; compilation and
-attachment add wall time. The target must remain alive until tracing finishes.
+and the collector acknowledges `RUT_TRACE_ARMED` in `trace.jsonl`; a BEGIN-time
+print is not a readiness signal. The collector sends SIGUSR1 only to its own
+bpftrace child after attachment. Every collection and lifecycle probe is gated
+on that arm event, and the `--duration` measurement deadline is set at arm time,
+so load and elapsed-time evidence exclude compilation and attachment. `--check` uses
+bpftrace dry-run attach/detach and never arms or measures. The target must remain
+alive until tracing finishes.
 The collector does not launch or signal the target application. Ctrl-C stops
 its own tracer, saves partial evidence and returns failure.
 
@@ -101,7 +105,9 @@ For TCP maps the key is `(TGID, direction, side)`:
 - `stderr.log`: tool diagnostics.
 - `summary.json`: maps/histograms plus decoded `tcp` rows and mean elapsed time.
 - `status.json`: kernel, tool version, arguments, source hash, target process
-  identities, return code, completion and conservative `usable` flag.
+  identities, attachment/arm state, return code, completion and conservative
+  `usable` flag. The output directory is mode 0700 and generated evidence files
+  are mode 0600.
 
 Always check `status.json`. An attach failure, missing completion marker,
 reported event loss, diagnostic warning, changed/exited target, or target exec

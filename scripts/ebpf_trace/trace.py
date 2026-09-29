@@ -15,6 +15,50 @@ import time
 
 
 GROUPS = ("tcp", "sched", "fault", "rx-copy", "stacks")
+ARMED_MARKER = "RUT_TRACE_ARMED"
+
+
+def secure_text(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        stream = os.fdopen(fd, "w")
+        fd = None
+        with stream:
+            stream.write(text)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+
+
+def valid_attached(event):
+    data = event.get("data") if isinstance(event, dict) else None
+    return (isinstance(event, dict) and event.get("type") == "attached_probes" and
+            isinstance(data, dict) and type(data.get("probes")) is int and
+            data["probes"] > 0)
+
+
+def valid_armed(event):
+    if not isinstance(event, dict) or event.get("type") != "printf":
+        return False
+    data = event.get("data")
+    return isinstance(data, str) and data.strip() == ARMED_MARKER
+
+
+def event_seen(path, predicate):
+    if not path.exists():
+        return False
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            if predicate(json.loads(line)):
+                return True
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return False
 
 
 def process_identity(pid):
@@ -36,8 +80,10 @@ def generate(pids, duration, front_port, origin_port, groups):
         groups.add("tcp")
     start = [f"@targets[{p}] = 1;" for p in sorted(set(pids))]
     code = ["BEGIN { " + " ".join(start) + " }",
-            f"interval:s:{duration} {{ exit(); }}"]
-    transient = ["targets"]
+            f'self:signal:SIGUSR1 {{ @stop_ns = nsecs + {duration} * 1000000000; '
+            '@armed = 1; printf("RUT_TRACE_ARMED\\n"); }',
+            'interval:ms:100 /@armed && nsecs >= @stop_ns/ { exit(); }']
+    transient = ["targets", "armed", "stop_ns"]
     if "tcp" in groups:
         remote = "$sk->__sk_common.skc_dport"
         if sys.byteorder == "little":
@@ -45,7 +91,7 @@ def generate(pids, duration, front_port, origin_port, groups):
         for direction, function, length in ((1, "tcp_recvmsg", "len"),
                                             (2, "tcp_sendmsg", "size")):
             code.append(f"""
-fentry:{function} /@targets[pid]/ {{
+fentry:{function} /@armed && @targets[pid]/ {{
     $sk = args.sk;
     $side = 0;
     if ($sk->__sk_common.skc_num == {front_port}) {{ $side = 1; }}
@@ -56,7 +102,7 @@ fentry:{function} /@targets[pid]/ {{
     @tcp_calls[pid, {direction}, $side] = count();
     @tcp_requested_bytes[pid, {direction}, $side] = sum(args.{length});
 }}
-fexit:{function} /@tcp_start[tid, {direction}]/ {{
+fexit:{function} /@armed && @tcp_start[tid, {direction}]/ {{
     $side = @tcp_side[tid, {direction}];
     $ns = (uint64)((int64)nsecs - (int64)@tcp_start[tid, {direction}]);
     @tcp_completed_calls[pid, {direction}, $side] = count();
@@ -77,11 +123,11 @@ fexit:{function} /@tcp_start[tid, {direction}]/ {{
     if "rx-copy" in groups:
         for direction, function in ((1, "skb_copy_datagram_iter"),):
             code.append(f"""
-fentry:{function} /@tcp_active[tid] == {direction}/ {{
+fentry:{function} /@armed && @tcp_active[tid] == {direction}/ {{
     @copy_start[tid, {direction}] = nsecs;
     @copy_length[tid, {direction}] = args.len;
 }}
-fexit:{function} /@copy_start[tid, {direction}]/ {{
+fexit:{function} /@armed && @copy_start[tid, {direction}]/ {{
     $side = @tcp_side[tid, {direction}];
     $ns = (uint64)((int64)nsecs - (int64)@copy_start[tid, {direction}]);
     @copy_calls[pid, {direction}, $side] = count();
@@ -99,7 +145,7 @@ fexit:{function} /@copy_start[tid, {direction}]/ {{
         code.append("""
 rawtracepoint:sched_wakeup,rawtracepoint:sched_wakeup_new {
     $task = (struct task_struct *)arg0;
-    if (@targets[$task->tgid] && !@queued[$task->pid]) {
+    if (@armed && @targets[$task->tgid] && !@queued[$task->pid]) {
         @queued[$task->pid] = nsecs;
     }
 }
@@ -107,11 +153,11 @@ rawtracepoint:sched_wakeup,rawtracepoint:sched_wakeup_new {
 rawtracepoint:sched_switch {
     $prev = (struct task_struct *)arg1;
     $next = (struct task_struct *)arg2;
-    if (@targets[$prev->tgid]) {
+    if (@armed && @targets[$prev->tgid]) {
         @offcpu[$prev->pid] = nsecs;
         if (arg0 || arg3 == 0) { @queued[$prev->pid] = nsecs; }
     }
-    if (@targets[$next->tgid]) {
+    if (@armed && @targets[$next->tgid]) {
         if (@queued[$next->pid]) {
             $ns = (uint64)((int64)nsecs - (int64)@queued[$next->pid]);
             @runqueue_samples[$next->tgid] = count();
@@ -131,10 +177,10 @@ rawtracepoint:sched_switch {
 """)
         transient += ["queued", "offcpu"]
     if "fault" in groups:
-        code += ["software:minor-faults:1 /@targets[pid]/ { @minor_faults[pid] = count(); }",
-                 "software:major-faults:1 /@targets[pid]/ { @major_faults[pid] = count(); }"]
+        code += ["software:minor-faults:1 /@armed && @targets[pid]/ { @minor_faults[pid] = count(); }",
+                 "software:major-faults:1 /@armed && @targets[pid]/ { @major_faults[pid] = count(); }"]
     if "stacks" in groups:
-        code.append("profile:hz:99 /@targets[pid]/ { @kernel_stacks[pid, kstack(24)] = count(); }")
+        code.append("profile:hz:99 /@armed && @targets[pid]/ { @kernel_stacks[pid, kstack(24)] = count(); }")
     cleanup = []
     if "tcp" in groups:
         cleanup += [f"delete(@{name}[$task->pid, {d}]);"
@@ -148,14 +194,14 @@ rawtracepoint:sched_switch {
     code.append("""
 rawtracepoint:sched_process_exec {
     $task = (struct task_struct *)arg0;
-    if (@targets[$task->tgid]) {
+    if (@armed && @targets[$task->tgid]) {
         @target_execs[$task->tgid] = count();
         delete(@targets[$task->tgid]);
     }
 }
 rawtracepoint:sched_process_exit {
     $task = (struct task_struct *)arg0;
-    if (@targets[$task->tgid]) {
+    if (@armed && @targets[$task->tgid]) {
         @thread_exits[$task->tgid] = count();
         """ + " ".join(cleanup) + """
         if ($task->pid == $task->tgid) { delete(@targets[$task->tgid]); }
@@ -168,7 +214,7 @@ rawtracepoint:sched_process_exit {
 
 
 def read_results(path):
-    maps, lost, attached, ended = {}, [], False, False
+    maps, lost, attached, armed, ended = {}, [], False, False, False
     diagnostics = []
     for line in path.read_text().splitlines():
         if not line.strip():
@@ -186,15 +232,16 @@ def read_results(path):
             maps.update(data)
         elif kind in ("lost_events", "lost", "error", "warning"):
             lost.append(event)
-        elif (kind == "attached_probes" and isinstance(data, dict) and
-              type(data.get("probes")) is int and data["probes"] > 0):
+        elif valid_attached(event):
             attached = True
         elif kind == "printf":
-            ended |= "RUT_TRACE_END" in str(data)
+            armed |= valid_armed(event)
+            ended |= isinstance(data, str) and data.strip() == "RUT_TRACE_END"
         else:
             diagnostics.append(line)
     return {"maps": maps, "loss_or_errors": lost, "attached": attached,
-            "ready": attached, "ended": ended, "stdout_diagnostics": diagnostics}
+            "armed": armed, "ready": attached and armed, "ended": ended,
+            "stdout_diagnostics": diagnostics}
 
 
 def tcp_rows(maps):
@@ -259,17 +306,19 @@ def main(argv=None):
         parser.error("--output is required unless using --emit")
     out = args.output.resolve()
     try:
-        out.mkdir(parents=True, exist_ok=False)
+        out.mkdir(parents=True, exist_ok=False, mode=0o700)
+        os.chmod(out, 0o700)
     except FileExistsError:
         parser.error(f"output already exists: {out}")
     program = out / "program.bt"
-    program.write_text(script)
+    secure_text(program, script)
     groups = sorted(set(args.groups) | ({"tcp"} if "rx-copy" in args.groups else set()))
     status = {"completed": False, "usable": False, "mode": "check" if args.check else "trace",
               "kernel": platform.release(), "machine": platform.machine(), "groups": groups,
               "duration_seconds": args.duration, "front_port": args.front_port,
               "origin_port": args.origin_port, "started_at": time.time(),
-              "program_sha256": hashlib.sha256(script.encode()).hexdigest()}
+              "program_sha256": hashlib.sha256(script.encode()).hexdigest(),
+              "attached": False, "armed": False}
     proc = None
     previous_term = signal.getsignal(signal.SIGTERM)
 
@@ -292,10 +341,35 @@ def main(argv=None):
             command.append("--dry-run")
         command.append(str(program))
         status["command"] = command
-        print(f"Loading probes; waiting for attachment event: {out / 'trace.jsonl'}", flush=True)
-        with (out / "trace.jsonl").open("w") as stdout, (out / "stderr.log").open("w") as stderr:
+        print(f"Loading probes; waiting for attachment and arm acknowledgement: {out / 'trace.jsonl'}", flush=True)
+        trace_fd = os.open(out / "trace.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            stderr_fd = os.open(out / "stderr.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except BaseException:
+            os.close(trace_fd)
+            raise
+        with os.fdopen(trace_fd, "w") as stdout, os.fdopen(stderr_fd, "w") as stderr:
             proc = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
             try:
+                if not args.check:
+                    raw = out / "trace.jsonl"
+                    deadline = time.monotonic() + 30
+                    while not event_seen(raw, valid_attached):
+                        if proc.poll() is not None:
+                            raise RuntimeError("bpftrace exited before attachment")
+                        if time.monotonic() > deadline:
+                            raise RuntimeError("timed out waiting for attached_probes")
+                        time.sleep(0.05)
+                    status["attached"] = True
+                    proc.send_signal(signal.SIGUSR1)
+                    deadline = time.monotonic() + 30
+                    while not event_seen(raw, valid_armed):
+                        if proc.poll() is not None:
+                            raise RuntimeError("bpftrace exited before arm acknowledgement")
+                        if time.monotonic() > deadline:
+                            raise RuntimeError("timed out waiting for RUT_TRACE_ARMED")
+                        time.sleep(0.05)
+                    status["armed"] = True
                 status["returncode"] = proc.wait(timeout=args.duration + 120)
             finally:
                 stop_tracer(proc)
@@ -312,7 +386,7 @@ def main(argv=None):
             for a, b in zip(status["targets_before"], status["targets_after"]))
         result = read_results(out / "trace.jsonl")
         result["tcp"] = tcp_rows(result["maps"])
-        (out / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
+        secure_text(out / "summary.json", json.dumps(result, indent=2) + "\n")
         warnings = (out / "stderr.log").read_text()
         status["diagnostic_warnings"] = bool(warnings.strip()) or bool(result["stdout_diagnostics"])
         status["completed"] = status["returncode"] == 0 and (
@@ -330,7 +404,7 @@ def main(argv=None):
             stop_tracer(proc)
         signal.signal(signal.SIGTERM, previous_term)
         status["finished_at"] = time.time()
-        (out / "status.json").write_text(json.dumps(status, indent=2) + "\n")
+        secure_text(out / "status.json", json.dumps(status, indent=2) + "\n")
     print(f"Evidence: {out}; completed={status['completed']}, usable={status['usable']}")
     return 0 if (status["completed"] if args.check else status["usable"]) else 1
 

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -44,7 +45,16 @@ if mode == "attach-failure":
 if "--dry-run" in sys.argv:
     sys.exit(0)
 if mode != "no-attachment":
-    print(json.dumps({"type":"attached_probes", "data":{"probes":1}}))
+    print(json.dumps({"type":"attached_probes", "data":{"probes":1}}), flush=True)
+    armed = False
+    def arm(*_):
+        global armed
+        armed = True
+        print(json.dumps({"type":"printf", "data":"RUT_TRACE_ARMED\\n"}), flush=True)
+    signal.signal(signal.SIGUSR1, arm)
+    if mode not in ("no-arm", "early-exit"):
+        while not armed:
+            time.sleep(0.01)
 print(json.dumps({"type":"printf", "data":"RUT_TRACE_READY\\n"}))
 if mode == "warning":
     print("WARNING: probe information incomplete")
@@ -72,6 +82,8 @@ if mode != "truncated":
         rc, status, out = self.run_trace()
         self.assertEqual(rc, 0)
         self.assertTrue(status["usable"])
+        self.assertTrue(status["attached"])
+        self.assertTrue(status["armed"])
         result = json.loads((out / "summary.json").read_text())
         self.assertEqual(result["maps"]["@tcp_latency_us"]["123,1,2"][0]["count"], 2)
         self.assertEqual(result["tcp"][0]["side"], "upstream")
@@ -94,6 +106,34 @@ if mode != "truncated":
     def test_generated_program_has_no_premature_ready_marker(self):
         program = trace.generate([123], 1, 8987, 9987, ["tcp"])
         self.assertNotIn("RUT_TRACE_READY", program)
+        self.assertIn("self:signal:SIGUSR1", program)
+        self.assertIn('@armed = 1', program)
+        self.assertIn('@stop_ns = nsecs + 1 * 1000000000', program)
+        self.assertIn('interval:ms:100 /@armed && nsecs >= @stop_ns/', program)
+        self.assertNotIn('interval:s:1 /@armed/', program)
+        self.assertIn('/@armed && @targets[pid]/', program)
+
+    def test_arm_ack_is_strict_and_missing_arm_fails(self):
+        raw = self.root / "armed.jsonl"
+        raw.write_text(json.dumps({"type": "printf", "data": "RUT_TRACE_ARMED extra"}) + "\n")
+        self.assertFalse(trace.read_results(raw)["armed"])
+        for mode in ("no-arm", "early-exit"):
+            with self.subTest(mode=mode):
+                rc, status, _ = self.run_trace(mode)
+                self.assertEqual(rc, 1)
+                self.assertFalse(status["completed"])
+                self.assertTrue(status["attached"])
+                self.assertFalse(status["armed"])
+
+    def test_evidence_permissions_are_private_under_umask(self):
+        previous = os.umask(0o022)
+        try:
+            _, _, out = self.run_trace()
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o700)
+        for path in out.iterdir():
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600, path.name)
 
     def test_smoke_waits_for_attached_event_and_tolerates_partial_tail(self):
         raw = self.root / "partial.jsonl"
@@ -101,6 +141,8 @@ if mode != "truncated":
         self.assertFalse(smoke.attached(raw))
         raw.write_text(raw.read_text() + '\n{"type":"attached_probes","count":1,"data":{"probes":1}}\n')
         self.assertTrue(smoke.attached(raw))
+        raw.write_text(json.dumps({"type": "printf", "data": "RUT_TRACE_ARMED\n"}) + "\n")
+        self.assertTrue(smoke.armed(raw))
 
     def test_attached_event_requires_positive_probe_count_and_object_data(self):
         raw = self.root / "invalid-attached.jsonl"

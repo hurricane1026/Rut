@@ -5,6 +5,7 @@ import argparse
 import json
 import mmap
 import multiprocessing
+import os
 from pathlib import Path
 import signal
 import socket
@@ -39,6 +40,27 @@ def attached(path):
         except (AttributeError, TypeError, json.JSONDecodeError):
             continue
     return False
+
+
+def armed(path):
+    if not path.exists():
+        return False
+    for line in path.read_text().splitlines():
+        try:
+            event = json.loads(line)
+            data = event.get("data") if isinstance(event, dict) else None
+            if (isinstance(event, dict) and event.get("type") == "printf" and
+                    isinstance(data, str) and data.strip() == "RUT_TRACE_ARMED"):
+                return True
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            continue
+    return False
+
+
+def secure_write(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(text)
 
 
 def fixture(pipe, stop):
@@ -88,7 +110,8 @@ def main():
     parser.add_argument("--bpftrace", default="bpftrace")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=False)
+    args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    os.chmod(args.output, 0o700)
     parent, child = multiprocessing.Pipe()
     stop = multiprocessing.Event()
     server = multiprocessing.Process(target=fixture, args=(child, stop))
@@ -109,6 +132,10 @@ def main():
         while not attached(raw):
             if tracer.poll() is not None or time.monotonic() > deadline:
                 raise RuntimeError("tracer did not become ready; inspect stderr.log")
+            time.sleep(0.1)
+        while not armed(raw):
+            if tracer.poll() is not None or time.monotonic() > deadline:
+                raise RuntimeError("tracer did not arm; inspect stderr.log")
             time.sleep(0.1)
         body = bytes(range(256)) * 256
         transferred = 0
@@ -136,7 +163,7 @@ def main():
             key = f"{server.pid},1,{side}"
             if maps["@copy_success_bytes"].get(key) != transferred:
                 raise RuntimeError(f"incorrect receive-copy byte accounting: {key}")
-        (args.output / "smoke.json").write_text(json.dumps(
+        secure_write(args.output / "smoke.json", json.dumps(
             {"passed": True, "echo_bytes_checked": transferred, "target_pid": server.pid,
              "front_port": front, "origin_port": origin}, indent=2) + "\n")
         print(f"PASS: {transferred} echoed bytes checked; tracing evidence in {args.output}")
