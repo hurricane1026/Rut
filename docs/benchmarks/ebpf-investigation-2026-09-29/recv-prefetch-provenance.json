@@ -1,0 +1,6 @@
+{
+  "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-recv-prefetch",
+  "sha256": "8b1ad2d43d3a13a83a193346a36ceaab670e2dff0385bb1d5a88016b6d265a26",
+  "source_revision": "57a0a30525f7dddd5bc58f281f7d0ac482a7db4f",
+  "patch": "recv-prefetch.patch"
+}

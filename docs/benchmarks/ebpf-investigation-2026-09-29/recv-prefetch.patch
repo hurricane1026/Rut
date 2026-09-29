@@ -1,0 +1,14 @@
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index e5d2680c..243b1822 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -1562,6 +1562,9 @@ public:
+         if (avail == 0) return false;
+         const u32 len = remaining < avail ? remaining : avail;
+         u8* dst = c.response_body_tail.write_ptr(pool);
++        if (len >= 64u * 1024u) {
++            for (u32 offset = 0; offset < len; offset += 64) __builtin_prefetch(dst + offset, 1, 3);
++        }
+         return backend.add_recv_upstream_direct(c.upstream_fd, c.id, c.upstream_episode, dst, len);
+     }
+ 

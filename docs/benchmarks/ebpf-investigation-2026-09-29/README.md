@@ -1332,3 +1332,12 @@ Align the body-chain payload to 64 bytes instead of 16, keeping ordinary/bulk bl
 | 1048576-c128-keepalive | +0.237% | -0.473% |
 
 The small c1/c32 close gains repeat, but c128 close is flat in reverse order and both concurrent keepalive controls turn negative. This does not establish a useful general solution to the large-response copy gap. Revert the two layout edits rather than retain a changed payload contract on mixed sub-percent evidence. Alignment is not ruled out as a microarchitectural factor; this specific prototype has insufficient throughput support. No candidate eBPF copy-time claim is made. Frozen candidate and build-rel remain rejected artifacts until rebuilt.
+
+## Large direct-recv destination prefetch: rejected
+
+For direct body recv lengths >=64 KiB, issue write-intent, high-locality prefetch hints every 64 bytes before SQE submission. No zeroing or buffer geometry change. Build succeeds; no full network regression was run because causal throughput controls clearly regressed. Completed c1 and c32 close controls pass exact-body preflight and warm/load error checks.
+
+- 1048576-c1-close: -7.05% throughput.
+- 1048576-c32-close: -16.27% throughput.
+
+User CPU rises sharply: c1 roughly 39–42 to 59–61 us/request, c32 roughly 21–23 to 91–93 us/request. The driver was intentionally interrupted after these controls; the incomplete c128 group and remaining unrun cases cannot support performance claims. Cleanup was checked: no running Docker containers or benchmark listeners. Revert the hint loop. A lower helper-copy time, if any, would not justify this total request regression; no candidate copy-time claim is made. Frozen binary and build-rel are rejected experiment artifacts until rebuilt.

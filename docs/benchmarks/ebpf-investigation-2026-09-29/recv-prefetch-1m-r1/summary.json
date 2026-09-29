@@ -1,0 +1,23 @@
+{
+  "complete": false,
+  "reason": "stopped after clear regression; exclude incomplete c128 group",
+  "completed_controls": [
+    {
+      "case": "1048576-c1-close",
+      "median_rps": {
+        "candidate": 2057.6015461541692,
+        "baseline": 2213.5485922854105
+      },
+      "change_pct": -7.045115100465516
+    },
+    {
+      "case": "1048576-c32-close",
+      "median_rps": {
+        "candidate": 2037.2591797074379,
+        "baseline": 2433.2500552621996
+      },
+      "change_pct": -16.274154590005384
+    }
+  ],
+  "recorded_samples": 9
+}

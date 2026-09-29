@@ -1,0 +1,163 @@
+[1/13] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/arena.cc.o
+[2/13] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/timer_wheel.cc.o
+[3/13] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/shard.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/shard.cc:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/shard.h:10:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/event_loop.h:19:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+1 warning generated.
+[4/13] Building CXX object src/CMakeFiles/rut_jit.dir/jit/runtime_helpers.cc.o
+[5/13] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/io_uring_backend.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/io_uring_backend.cc:7:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/response_read_deadline.h:7:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/runtime/io_uring_backend.cc:290:5: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  290 |     TRY_VOID(setup_buf_ring());
+      |     ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:453:44: note: expanded from macro 'TRY_VOID'
+  453 | #define TRY_VOID(expr) TRY_VOID_IMPL(expr, __COUNTER__)
+      |                                            ^
+2 warnings generated.
+[6/13] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/epoll_backend.cc.o
+[7/13] Building CXX object src/CMakeFiles/rut_loader.dir/serve_loader.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/serve_loader.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/serve_loader.h:27:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/lower_rir.h:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir.h:6:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/serve_loader.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/serve_loader.h:27:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/lower_rir.h:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir.h:13:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:1067:21: warning: enumeration values 'Upstream', 'Import', and 'Using' not explicitly handled in switch [-Wswitch-enum]
+ 1067 |             switch (items[i].kind) {
+      |                     ^~~~~~~~~~~~~
+2 warnings generated.
+[8/13] Building CXX object src/CMakeFiles/rut.dir/main.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/main.cc:6:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/epoll_event_loop.h:13:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/event_loop.h:19:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/main.cc:7:
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:845:88: warning: '&&' within '||' [-Wlogical-op-parentheses]
+  845 |              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+      |               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~
+  846 |                   !bodyless_get_retained_policy ||
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:845:88: note: place parentheses around the '&&' expression to silence this warning
+  845 |              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+      |                                                                                        ^
+      |               (
+  846 |                   !bodyless_get_retained_policy ||
+      |                                                )
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4895:34: warning: '&&' within '||' [-Wlogical-op-parentheses]
+ 4895 |             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+      |              ~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4896 |                                      owner.expected_copy_end != 0) ||
+      |                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4895:34: note: place parentheses around the '&&' expression to silence this warning
+ 4895 |             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+      |                                  ^
+      |              (
+ 4896 |                                      owner.expected_copy_end != 0) ||
+      |                                                                   )
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4897:33: warning: '&&' within '||' [-Wlogical-op-parentheses]
+ 4896 |                                      owner.expected_copy_end != 0) ||
+      |                                                                    ~~
+ 4897 |              owner.saw_positive &&
+      |              ~~~~~~~~~~~~~~~~~~~^~
+ 4898 |                  (owner.positive_bytes > received ||
+      |                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4899 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4900 |                   owner.expected_copy_end != header + received)))
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4897:33: note: place parentheses around the '&&' expression to silence this warning
+ 4897 |              owner.saw_positive &&
+      |                                 ^
+      |              (
+ 4898 |                  (owner.positive_bytes > received ||
+ 4899 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
+ 4900 |                   owner.expected_copy_end != header + received)))
+      |                                                                
+      |                                                                )
+In file included from /home/hurricane/private/code/Rut-s1/src/main.cc:18:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/serve_loader.h:27:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/lower_rir.h:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir.h:13:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:1067:21: warning: enumeration values 'Upstream', 'Import', and 'Using' not explicitly handled in switch [-Wswitch-enum]
+ 1067 |             switch (items[i].kind) {
+      |                     ^~~~~~~~~~~~~
+5 warnings generated.
+[9/13] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/callbacks.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/callbacks.cc:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/callbacks_impl.h:7:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/callbacks_h2.h:18:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/http2_conn.h:8:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/callbacks.cc:15:
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:845:88: warning: '&&' within '||' [-Wlogical-op-parentheses]
+  845 |              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+      |               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~
+  846 |                   !bodyless_get_retained_policy ||
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:845:88: note: place parentheses around the '&&' expression to silence this warning
+  845 |              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+      |                                                                                        ^
+      |               (
+  846 |                   !bodyless_get_retained_policy ||
+      |                                                )
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4895:34: warning: '&&' within '||' [-Wlogical-op-parentheses]
+ 4895 |             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+      |              ~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4896 |                                      owner.expected_copy_end != 0) ||
+      |                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4895:34: note: place parentheses around the '&&' expression to silence this warning
+ 4895 |             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+      |                                  ^
+      |              (
+ 4896 |                                      owner.expected_copy_end != 0) ||
+      |                                                                   )
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4897:33: warning: '&&' within '||' [-Wlogical-op-parentheses]
+ 4896 |                                      owner.expected_copy_end != 0) ||
+      |                                                                    ~~
+ 4897 |              owner.saw_positive &&
+      |              ~~~~~~~~~~~~~~~~~~~^~
+ 4898 |                  (owner.positive_bytes > received ||
+      |                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4899 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4900 |                   owner.expected_copy_end != header + received)))
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4897:33: note: place parentheses around the '&&' expression to silence this warning
+ 4897 |              owner.saw_positive &&
+      |                                 ^
+      |              (
+ 4898 |                  (owner.positive_bytes > received ||
+ 4899 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
+ 4900 |                   owner.expected_copy_end != header + received)))
+      |                                                                
+      |                                                                )
+4 warnings generated.
+[10/13] Linking CXX static library src/librut_runtime.a
+[11/13] Linking CXX static library src/librut_jit.a
+[12/13] Linking CXX static library src/librut_loader.a
+[13/13] Linking CXX executable src/rut
