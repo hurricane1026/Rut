@@ -1,0 +1,5 @@
+{
+  "base": "0b8fdcab9290d6b6a2093b775087efacd17c59bd",
+  "patch": "bulk512.patch",
+  "binary_sha256": "a6bae3e756ffd6f78254cc778a32c6f2c98cbbb1ef10d463d8fa17722f8dac04"
+}

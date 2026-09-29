@@ -1,0 +1,5 @@
+{
+  "base": "0b8fdcab9290d6b6a2093b775087efacd17c59bd",
+  "binary_sha256": "0961d53d08f361fd8528cd795ff4a254f1220a3d0296ff7aa8103c72c1c238d1",
+  "patch": "header-more.patch"
+}

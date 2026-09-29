@@ -1,0 +1,44 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 2K of event 'cycles:u'
+# Event count (approx.): 3244034209
+#
+# Overhead  Command       Shared Object      Symbol                                                                                                                                                                                                                                                                                                                                                                      
+# ........  ............  .................  ............................................................................................................................................................................................................................................................................................................................................................................
+#
+    41.57%  rut-baseline  libc.so.6          [.] __memset_avx2_unaligned_erms
+     6.03%  rut-baseline  rut-baseline       [.] rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)
+     4.39%  rut-baseline  rut-baseline       [.] rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)
+     4.35%  rut-baseline  rut-baseline       [.] rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+     4.12%  rut-baseline  libc.so.6          [.] __memmove_avx_unaligned_erms
+     2.73%  rut-baseline  rut-baseline       [.] rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)
+     2.56%  rut-baseline  rut-baseline       [.] rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)
+     1.71%  rut-baseline  rut-baseline       [.] rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)
+     1.63%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
+     1.40%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+     1.38%  rut-baseline  rut-baseline       [.] rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)
+     1.32%  rut-baseline  rut-baseline       [.] rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const
+     1.26%  rut-baseline  rut-baseline       [.] rut::simd::scan_header_value(unsigned char const*, unsigned int, unsigned int)
+     1.21%  rut-baseline  libc.so.6          [.] __memcmp_avx2_movbe
+     1.09%  rut-baseline  rut-baseline       [.] rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+     0.82%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)
+     0.76%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::settle_response_read_deadline_batch()
+     0.75%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::consume_response_read_deadline_send_event(rut::ConnectionBase&, rut::IoEvent const&)
+     0.74%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::response_read_deadline_identity_is_stable(rut::ConnectionBase const&) const
+     0.71%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::reclaim_slot(unsigned int)
+     0.70%  rut-baseline  rut-baseline       [.] rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)
+     0.67%  rut-baseline  rut-baseline       [.] void rut::pump_response_read_deadline_body<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&)
+     0.62%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::try_advance_bounded_release(rut::ConnectionBase&, bool)
+     0.62%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::arm_response_read_direct_body_recv(rut::ConnectionBase&)
+     0.59%  rut-baseline  rut-baseline       [.] rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)
+     0.56%  rut-baseline  rut-baseline       [.] rut::classify_complete_content_length_response(rut::ParsedResponse const&)
+     0.56%  rut-baseline  rut-baseline       [.] rut::IoUringEventLoop::consume_tls_ciphertext_send_event(rut::ConnectionBase&, rut::IoEvent const&)
+     0.52%  rut-baseline  rut-baseline       [.] void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

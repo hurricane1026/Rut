@@ -1,0 +1,24 @@
+diff --git a/include/rut/runtime/iouring_event_loop.h b/include/rut/runtime/iouring_event_loop.h
+index add54bd6..dede01c1 100644
+--- a/include/rut/runtime/iouring_event_loop.h
++++ b/include/rut/runtime/iouring_event_loop.h
+@@ -3235,7 +3235,18 @@ public:
+                 return false;
+             }
+         }
+-        if (backend.add_send(c.fd, c.id, buf, len, generation, c.plaintext_send_has_follow_up())) {
++        const bool bounded_header_has_body =
++            !c.tls_active &&
++            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
++            (c.on_send == &on_bounded_release_header_sent<Self> ||
++             (phase == ResponseReadDeadlinePostCommitPhase::HeaderSend &&
++              c.response_read_deadline_post_commit_send_body != 0));
++        if (backend.add_send(c.fd,
++                             c.id,
++                             buf,
++                             len,
++                             generation,
++                             c.plaintext_send_has_follow_up() || bounded_header_has_body)) {
+             c.pending_ops++;
+             c.send_armed = true;
+             return true;

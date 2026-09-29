@@ -1,0 +1,5 @@
+{
+  "observed_at": "2026-09-28T11:25:03.365245+00:00",
+  "performance_comparison_eligible": false,
+  "reason": "Concurrent clang++ and clang-format processes observed during measurement. Surviving compiler processes had cwd /home/hurricane/private/code/rut_enovy/build. nginx and Rut both slowed. Correctness error counters remained zero."
+}

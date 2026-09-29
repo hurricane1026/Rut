@@ -1,0 +1,13 @@
+diff --git a/include/rut/runtime/slice_pool.h b/include/rut/runtime/slice_pool.h
+index 577c87a7..c4b75968 100644
+--- a/include/rut/runtime/slice_pool.h
++++ b/include/rut/runtime/slice_pool.h
+@@ -50,7 +50,7 @@ struct SlicePool {
+     // Separate VA region, faulted in on first use; free() routes a bulk
+     // pointer here by address, so release sites need not know which kind
+     // they hold. Exhaustion is not an error: callers keep slices.
+-    static constexpr u32 kBulkSliceSize = 256 * 1024;
++    static constexpr u32 kBulkSliceSize = 128 * 1024;
+     static constexpr u32 kBulkPerConnection = 4;  // bulk buffers reserved per connection
+     static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 1 GiB VA per pool
+     // Returned bulk buffers kept resident for reuse: at most 16 MiB of idle

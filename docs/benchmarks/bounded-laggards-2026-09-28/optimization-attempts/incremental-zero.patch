@@ -1,0 +1,31 @@
+diff --git a/include/rut/runtime/response_body_chain.h b/include/rut/runtime/response_body_chain.h
+index 2153a8ea..c61b5986 100644
+--- a/include/rut/runtime/response_body_chain.h
++++ b/include/rut/runtime/response_body_chain.h
+@@ -137,6 +137,8 @@ struct ResponseBodyChain {
+     void consume(u32 len, bool tail_pinned = false) {
+         while (len != 0) {
+             const u32 n = len < front_size() ? len : front_size();
++            if (owner->is_bulk(reinterpret_cast<const u8*>(head)))
++                __builtin_memset(payload(head) + head->offset, 0, n);
+             head->offset += n;
+             size -= n;
+             len -= n;
+@@ -213,7 +215,16 @@ private:
+     // Payload bytes are only ever written at [0, len), so that is all a
+     // bulk node has to re-zero on return.
+     void release_node(Node* node) {
+-        owner->free_written(reinterpret_cast<u8*>(node), kHeader + node->len);
++        auto* raw = reinterpret_cast<u8*>(node);
++        if (owner->is_bulk(raw)) {
++            // consume() already cleared the completed prefix. Any suffix
++            // left by cancellation still belongs to this node until release.
++            __builtin_memset(payload(node) + node->offset, 0, node->len - node->offset);
++            __builtin_memset(raw, 0, kHeader);
++            owner->free_written(raw, 0);
++        } else {
++            owner->free_written(raw, kHeader + node->len);
++        }
+     }
+ };
+ 
