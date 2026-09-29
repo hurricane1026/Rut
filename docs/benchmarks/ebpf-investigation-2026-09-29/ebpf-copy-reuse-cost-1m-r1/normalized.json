@@ -1,0 +1,154 @@
+[
+  {
+    "case": "1048576-c128-close-nginx",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "age_buckets": {
+      "0": {
+        "copied_bytes": 710324208,
+        "helper_ns": 31781825,
+        "us_per_mib": 46.916124434266784
+      },
+      "1": {
+        "copied_bytes": 7410060619,
+        "helper_ns": 308984178,
+        "us_per_mib": 43.72344709296743
+      },
+      "5": {
+        "copied_bytes": 14087732,
+        "helper_ns": 3146835,
+        "us_per_mib": 234.2247607322456
+      },
+      "2": {
+        "copied_bytes": 14348056390,
+        "helper_ns": 653554481,
+        "us_per_mib": 47.76267424950202
+      },
+      "4": {
+        "copied_bytes": 233589138,
+        "helper_ns": 13963020,
+        "us_per_mib": 62.67965961465212
+      },
+      "3": {
+        "copied_bytes": 23122371784,
+        "helper_ns": 1073814273,
+        "us_per_mib": 48.69638312382773
+      }
+    }
+  },
+  {
+    "case": "1048576-c128-close-rut-fin",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "age_buckets": {
+      "3": {
+        "copied_bytes": 9590865,
+        "helper_ns": 1010601,
+        "us_per_mib": 110.48971643079118
+      },
+      "2": {
+        "copied_bytes": 191488,
+        "helper_ns": 18897,
+        "us_per_mib": 103.47875935828877
+      },
+      "0": {
+        "copied_bytes": 4278180864,
+        "helper_ns": 451415282,
+        "us_per_mib": 110.6412388315596
+      },
+      "5": {
+        "copied_bytes": 449032204,
+        "helper_ns": 54439101,
+        "us_per_mib": 127.12570337199246
+      },
+      "4": {
+        "copied_bytes": 42261050651,
+        "helper_ns": 4543767157,
+        "us_per_mib": 112.73939282211605
+      },
+      "1": {
+        "copied_bytes": 4691456,
+        "helper_ns": 508335,
+        "us_per_mib": 113.61672814580378
+      }
+    }
+  },
+  {
+    "case": "1048576-c32-close-nginx",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "age_buckets": {
+      "5": {
+        "copied_bytes": 4124649,
+        "helper_ns": 773125,
+        "us_per_mib": 196.54528664136026
+      },
+      "0": {
+        "copied_bytes": 710043408,
+        "helper_ns": 31605397,
+        "us_per_mib": 46.67413342801149
+      },
+      "4": {
+        "copied_bytes": 303568270,
+        "helper_ns": 13344677,
+        "us_per_mib": 46.09476487760727
+      },
+      "2": {
+        "copied_bytes": 12461647408,
+        "helper_ns": 564073937,
+        "us_per_mib": 47.46357950907866
+      },
+      "1": {
+        "copied_bytes": 7484132042,
+        "helper_ns": 308759045,
+        "us_per_mib": 43.25916787050722
+      },
+      "3": {
+        "copied_bytes": 24814309678,
+        "helper_ns": 1142973446,
+        "us_per_mib": 48.298523701244186
+      }
+    }
+  },
+  {
+    "case": "1048576-c32-close-rut-fin",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "age_buckets": {
+      "2": {
+        "copied_bytes": 65550897,
+        "helper_ns": 6927784,
+        "us_per_mib": 110.81935363270468
+      },
+      "1": {
+        "copied_bytes": 1962496,
+        "helper_ns": 199918,
+        "us_per_mib": 106.8176530133055
+      },
+      "5": {
+        "copied_bytes": 148961180,
+        "helper_ns": 15033664,
+        "us_per_mib": 105.82582161650438
+      },
+      "4": {
+        "copied_bytes": 27688190045,
+        "helper_ns": 2726098779,
+        "us_per_mib": 103.2397476556942
+      },
+      "3": {
+        "copied_bytes": 16600791057,
+        "helper_ns": 1735110131,
+        "us_per_mib": 109.59687610526716
+      },
+      "0": {
+        "copied_bytes": 4428253184,
+        "helper_ns": 330589044,
+        "us_per_mib": 78.2809209405277
+      }
+    }
+  }
+]
