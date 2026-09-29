@@ -1250,3 +1250,9 @@ Randomly sample about 1/64 non-pipelined c1 requests. Unlike the earlier full-ev
 Rut front-recv-return to first downstream send-entry is longer: close +5.58/+6.46 us, keepalive +8.14/+4.37 us. This is a lead for further decomposition, not proof of the uninstrumented magnitude. Per-sampled-request tail probes still run more often for nginx, so shorter Rut tail/total probe intervals cannot establish a causal tail advantage. nginx keepalive sampled byte averages differ slightly from 65687 by integral 5-byte header differences; inspect close responses before interpreting that as truncation. Close averages and Rut keepalive averages match exactly.
 
 Raw data and scripts are in `ebpf-response-sampled-r1`, `ebpf-response-sampled-reverse-r1`, and the sampled trace drivers. A separate sparse first-send-only decomposition is next; no runtime change is accepted from these measurements alone.
+
+## First-send-only sparse decomposition: initial order
+
+The previous 4–8 us first-send gap is not robust across probe designs. With no downstream send-exit or close probe, first-send deltas shrink to +0.54 us (close) and +0.43 us (keepalive). Rut request-to-upstream-send is +1.14/+1.30 us; origin wait is -0.08/+0.11 us; response processing is -0.52/-0.98 us. All four loads/warmups have zero errors, all sampled requests have complete three-stage correlation, and throughput still favors nginx by approximately 1.2–1.4%. These remain instrumented observations, not acceptance results or proof that request processing explains the deficit.
+
+This contradicts a strong attribution of the original deficit to a 4–8 us first-byte penalty. Different probe overhead and scheduling effects are unresolved. Reverse engine order is running. No runtime change is justified by the earlier stage numbers alone. Raw evidence: `ebpf-first-sampled-r1`.

@@ -1,0 +1,46 @@
+[
+  {
+    "case": "65536-c1-close-nginx",
+    "requests_sampled": 1899,
+    "incomplete": 0,
+    "rps": 6011.02,
+    "error_lines": [],
+    "request_us": 33.49156187467088,
+    "origin_us": 30.391573986308583,
+    "response_us": 14.788231174302263,
+    "total_us": 78.67136703528173
+  },
+  {
+    "case": "65536-c1-close-rut-fin",
+    "requests_sampled": 1935,
+    "incomplete": 0,
+    "rps": 5938.29,
+    "error_lines": [],
+    "request_us": 34.63362015503876,
+    "origin_us": 30.3090330749354,
+    "response_us": 14.268496640826873,
+    "total_us": 79.21114987080104
+  },
+  {
+    "case": "65536-c1-keepalive-nginx",
+    "requests_sampled": 2376,
+    "incomplete": 0,
+    "rps": 7860.96,
+    "error_lines": [],
+    "request_us": 33.0077037037037,
+    "origin_us": 29.92313846801347,
+    "response_us": 15.302878367003366,
+    "total_us": 78.23372053872053
+  },
+  {
+    "case": "65536-c1-keepalive-rut-fin",
+    "requests_sampled": 2454,
+    "incomplete": 0,
+    "rps": 7750.13,
+    "error_lines": [],
+    "request_us": 34.309362673186634,
+    "origin_us": 30.037775061124695,
+    "response_us": 14.321328850855746,
+    "total_us": 78.66846658516707
+  }
+]
