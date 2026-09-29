@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 import trace
+import smoke
 
 
 class TraceTest(unittest.TestCase):
@@ -42,6 +43,8 @@ if mode == "attach-failure":
     sys.exit(1)
 if "--dry-run" in sys.argv:
     sys.exit(0)
+if mode != "no-attachment":
+    print(json.dumps({"type":"attached_probes", "data":{"probes":1}}))
 print(json.dumps({"type":"printf", "data":"RUT_TRACE_READY\\n"}))
 if mode == "warning":
     print("WARNING: probe information incomplete")
@@ -80,6 +83,51 @@ if mode != "truncated":
                 rc, status, _ = self.run_trace(mode)
                 self.assertEqual(rc, 1)
                 self.assertFalse(status["usable"])
+
+    def test_begin_marker_without_attached_event_is_not_ready(self):
+        raw = self.root / "premature.jsonl"
+        raw.write_text(json.dumps({"type": "printf", "data": "RUT_TRACE_READY\\n"}) + "\n")
+        result = trace.read_results(raw)
+        self.assertFalse(result["attached"])
+        self.assertFalse(result["ready"])
+
+    def test_generated_program_has_no_premature_ready_marker(self):
+        program = trace.generate([123], 1, 8987, 9987, ["tcp"])
+        self.assertNotIn("RUT_TRACE_READY", program)
+
+    def test_smoke_waits_for_attached_event_and_tolerates_partial_tail(self):
+        raw = self.root / "partial.jsonl"
+        raw.write_text('{"type":"printf","data":"RUT_TRACE_READY\\n"}\n{"type":')
+        self.assertFalse(smoke.attached(raw))
+        raw.write_text(raw.read_text() + '\n{"type":"attached_probes","count":1,"data":{"probes":1}}\n')
+        self.assertTrue(smoke.attached(raw))
+
+    def test_attached_event_requires_positive_probe_count_and_object_data(self):
+        raw = self.root / "invalid-attached.jsonl"
+        for event in ({"type": "attached_probes", "data": {"probes": 0}},
+                      {"type": "attached_probes", "data": {"probes": True}},
+                      {"type": "attached_probes", "data": {}},
+                      {"type": "attached_probes", "data": 1},
+                      ["attached_probes"], 1, None):
+            raw.write_text(json.dumps(event) + "\n")
+            self.assertFalse(smoke.attached(raw))
+        raw.write_text(json.dumps({"type": "attached_probes", "data": {"probes": 1}}) + "\n")
+        self.assertTrue(smoke.attached(raw))
+
+        for event in ({"type": "attached_probes", "data": {"probes": 0}},
+                      {"type": "attached_probes", "data": {"probes": "1"}},
+                      {"type": "attached_probes", "data": []},
+                      ["attached_probes"], 1):
+            raw.write_text(json.dumps(event) + "\n")
+            self.assertFalse(trace.read_results(raw)["attached"])
+        raw.write_text(json.dumps({"type": "attached_probes", "data": {"probes": 1}}) + "\n")
+        self.assertTrue(trace.read_results(raw)["attached"])
+
+    def test_trace_without_attachment_cannot_be_completed(self):
+        rc, status, _ = self.run_trace("no-attachment")
+        self.assertEqual(rc, 1)
+        self.assertFalse(status["completed"])
+        self.assertFalse(status["usable"])
 
     def test_pid_reuse_rejects_an_otherwise_complete_trace(self):
         before = trace.process_identity(os.getpid())

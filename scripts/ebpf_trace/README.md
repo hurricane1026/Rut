@@ -49,7 +49,8 @@ sudo python3 scripts/ebpf_trace/trace.py \
   --output /tmp/rut-trace-01
 ```
 
-Start the diagnostic load after `RUT_TRACE_READY` appears in `trace.jsonl`.
+Start the diagnostic load after bpftrace emits its JSON `attached_probes` event
+in `trace.jsonl`; a BEGIN-time print is not a readiness signal.
 The interval is bounded by `--duration` after probe startup; compilation and
 attachment add wall time. The target must remain alive until tracing finishes.
 The collector does not launch or signal the target application. Ctrl-C stops

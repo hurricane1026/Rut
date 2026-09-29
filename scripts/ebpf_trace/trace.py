@@ -35,8 +35,7 @@ def generate(pids, duration, front_port, origin_port, groups):
     if "rx-copy" in groups:
         groups.add("tcp")
     start = [f"@targets[{p}] = 1;" for p in sorted(set(pids))]
-    code = ["BEGIN { " + " ".join(start) +
-            ' printf("RUT_TRACE_READY\\n"); }',
+    code = ["BEGIN { " + " ".join(start) + " }",
             f"interval:s:{duration} {{ exit(); }}"]
     transient = ["targets"]
     if "tcp" in groups:
@@ -169,7 +168,7 @@ rawtracepoint:sched_process_exit {
 
 
 def read_results(path):
-    maps, lost, ready, ended = {}, [], False, False
+    maps, lost, attached, ended = {}, [], False, False
     diagnostics = []
     for line in path.read_text().splitlines():
         if not line.strip():
@@ -187,12 +186,15 @@ def read_results(path):
             maps.update(data)
         elif kind in ("lost_events", "lost", "error", "warning"):
             lost.append(event)
+        elif (kind == "attached_probes" and isinstance(data, dict) and
+              type(data.get("probes")) is int and data["probes"] > 0):
+            attached = True
         elif kind == "printf":
-            ready |= "RUT_TRACE_READY" in str(data)
             ended |= "RUT_TRACE_END" in str(data)
-        elif kind != "attached_probes":
+        else:
             diagnostics.append(line)
-    return {"maps": maps, "loss_or_errors": lost, "ready": ready, "ended": ended, "stdout_diagnostics": diagnostics}
+    return {"maps": maps, "loss_or_errors": lost, "attached": attached,
+            "ready": attached, "ended": ended, "stdout_diagnostics": diagnostics}
 
 
 def tcp_rows(maps):
@@ -290,7 +292,7 @@ def main(argv=None):
             command.append("--dry-run")
         command.append(str(program))
         status["command"] = command
-        print(f"Loading probes; readiness marker and maps: {out / 'trace.jsonl'}", flush=True)
+        print(f"Loading probes; waiting for attachment event: {out / 'trace.jsonl'}", flush=True)
         with (out / "trace.jsonl").open("w") as stdout, (out / "stderr.log").open("w") as stderr:
             proc = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
             try:

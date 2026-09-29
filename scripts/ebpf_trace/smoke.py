@@ -25,6 +25,22 @@ def receive(sock, size):
     return b"".join(chunks)
 
 
+def attached(path):
+    if not path.exists():
+        return False
+    for line in path.read_text().splitlines():
+        try:
+            event = json.loads(line)
+            data = event.get("data") if isinstance(event, dict) else None
+            if (isinstance(event, dict) and event.get("type") == "attached_probes" and
+                    isinstance(data, dict) and type(data.get("probes")) is int and
+                    data["probes"] > 0):
+                return True
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            continue
+    return False
+
+
 def fixture(pipe, stop):
     def listener():
         sock = socket.socket()
@@ -90,7 +106,7 @@ def main():
         tracer = subprocess.Popen(command)
         raw = args.output / "trace" / "trace.jsonl"
         deadline = time.monotonic() + 120
-        while not raw.exists() or "RUT_TRACE_READY" not in raw.read_text():
+        while not attached(raw):
             if tracer.poll() is not None or time.monotonic() > deadline:
                 raise RuntimeError("tracer did not become ready; inspect stderr.log")
             time.sleep(0.1)
