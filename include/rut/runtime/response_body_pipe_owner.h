@@ -18,7 +18,7 @@ struct ResponseBodyPipeOwner {
         bool delivering = false;
     } send{};
 
-    u32 logical_bytes() const { return storage.bytes + send.completed; }
+    u32 logical_bytes() const { return storage.bytes + send.completed - discarded_input_bytes; }
     bool acknowledge_send(u32 serial, u32 length) {
         if (closing || !send.delivering || send.kind == SendKind::None || serial == 0 ||
             serial != send.serial || length != send.total || send.completed != send.total ||
@@ -44,6 +44,12 @@ struct ResponseBodyPipeOwner {
     u8 cancel_attempted = 0;
     bool closing = false;
     bool retry_registered = false;
+    // Fallback preserves this owner until the response boundary so a
+    // fragmented response cannot repeatedly re-enter the pipe path.
+    bool input_disabled = false;
+    bool fallback_pending = false;
+    bool input_stopping = false;
+    u32 discarded_input_bytes = 0;
 
     bool direction_idle(bool input) const {
         const u32 i = input ? 0 : 1;
@@ -70,7 +76,8 @@ struct ResponseBodyPipeOwner {
     }
     bool own_cancel(BodyPipeOperation target) {
         const u32 i = static_cast<u8>(target);
-        if (!closing || i >= 4 || !targets[i] || cancels[i] || (cancel_attempted & (1u << i)))
+        if (i >= 4 || (!closing && !(input_stopping && (i & 1u) == 0)) || !targets[i] ||
+            cancels[i] || (cancel_attempted & (1u << i)))
             return false;
         cancels[i] = targets[i];
         cancel_attempted |= static_cast<u8>(1u << i);
@@ -95,7 +102,11 @@ struct ResponseBodyPipeOwner {
             return true;
         }
         if (targets[i] != serial) return false;
-        if (i == 0 && !storage.complete_input(serial, event.result)) return false;
+        if (i == 0) {
+            if (!storage.complete_input(serial, event.result)) return false;
+            if (input_stopping && event.result > 0)
+                discarded_input_bytes += static_cast<u32>(event.result);
+        }
         if (i == 1) {
             if (send.kind != SendKind::None && event.result > 0 &&
                 (send.completed > send.total ||

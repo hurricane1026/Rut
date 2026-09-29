@@ -516,6 +516,7 @@ public:
     }
 
     void run() {
+        bool body_pipe_workers_checked = false;
         backend.add_accept();
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
@@ -536,6 +537,13 @@ public:
                 // request stall or an endless busy loop.
                 running_.store(false, std::memory_order_release);
                 break;
+            }
+            // The ring was initialized by the control thread. The shard's
+            // first enter establishes its own io_wq context; registering its
+            // affinity before that enter returns EINVAL on Linux.
+            if (!body_pipe_workers_checked) {
+                body_pipe_response_enabled = backend.bind_body_pipe_workers();
+                body_pipe_workers_checked = true;
             }
             dispatch_batch(events, n);
             retry_deferred_accepts();
@@ -1552,6 +1560,7 @@ public:
     // would expire the response although no single gap reached
     // response_read_timeout.
     [[nodiscard]] bool arm_response_read_direct_body_recv(Connection& c) {
+        if (c.response_body_pipe && !c.response_body_pipe->input_disabled) return false;
         if (c.response_read_deadline_post_commit_phase !=
             ResponseReadDeadlinePostCommitPhase::Buffering)
             return false;
@@ -2798,13 +2807,15 @@ public:
     }
 
     u32 body_pipe_cancel_retry_count = 0;
+    bool body_pipe_response_enabled = false;
 
-    // Allocation is separate from semantic admission. No production response
-    // caller enables this owner until receive/send policy integration is ready.
-    bool allocate_response_body_pipe(Connection& c, u32 capacity) {
+    // Allocation is separate from semantic admission; an in-flight memory
+    // prefix may remain pinned while new body bytes use independent storage.
+    bool allocate_response_body_pipe(Connection& c, u32 capacity, bool memory_prefix_send = false) {
         if (c.id >= connection_capacity || c.fd < 0 || c.upstream_fd < 0 || c.response_body_pipe ||
-            c.response_body_pipe_sequence == UINT32_MAX || c.tls_active || c.send_armed ||
-            c.upstream_recv_armed || c.upstream_recv_direct_armed)
+            c.response_body_pipe_sequence == UINT32_MAX || c.tls_active ||
+            (c.send_armed && !memory_prefix_send) || c.upstream_recv_armed ||
+            c.upstream_recv_direct_armed)
             return false;
         static_assert(sizeof(ResponseBodyPipeOwner) <= SlicePool::kSliceSize);
         u8* allocation = pool.alloc_uninitialized();
@@ -2824,6 +2835,137 @@ public:
         owner->profile = static_cast<u8>(c.response_read_deadline_profile);
         owner->method = c.response_read_deadline_method;
         c.response_body_pipe = owner;
+        return true;
+    }
+
+    void try_admit_response_body_pipe(Connection& c) {
+        if (!body_pipe_response_enabled || c.response_body_pipe || c.tls_active || c.h2 ||
+            c.protocol != ConnProtocol::Http11 ||
+            c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::Buffering ||
+            c.response_read_deadline_post_commit_response_class !=
+                CompleteContentLengthResponseClass::BoundedPositiveBody ||
+            !c.response_read_deadline_bounded_header_sent ||
+            c.response_read_deadline_post_commit_declared_body < kBulkRelayMinRemaining ||
+            !response_read_deadline_post_commit_is_stable(c))
+            return;
+        // The old memory prefix stays pinned by its ordinary Send owner. New
+        // pipe bytes are ordered behind it and never change its source pointer.
+        const bool memory_send = c.send_armed && c.on_send == &on_bounded_release_body_sent<Self> &&
+                                 c.upstream_send_len != 0 &&
+                                 c.upstream_send_len <= c.buffered_response_front_size() &&
+                                 response_read_deadline_send_fields_are_neutral(c);
+        if (c.send_armed && !memory_send) return;
+        (void)allocate_response_body_pipe(c, kBoundedReadAheadBytes, memory_send);
+    }
+
+    bool queue_response_body_pipe_input(Connection& c) {
+        auto& p = *c.response_body_pipe;
+        if (!response_body_pipe_receive_identity_is_current(c) || p.input_disabled ||
+            p.fallback_pending || !p.direction_idle(true) || c.upstream_recv_armed ||
+            c.upstream_recv_direct_armed)
+            return false;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        const u32 declared = c.response_read_deadline_post_commit_declared_body;
+        if (received >= declared) return false;
+        ResponseBodyPipe::Operation op{};
+        if (!p.storage.reserve_input(declared - received, &op)) return false;
+        if (!backend.add_body_pipe_splice(c.upstream_fd, c.id, p.storage, true)) {
+            (void)p.storage.rollback_input(op.serial);
+            return false;
+        }
+        (void)p.own_target(BodyPipeOperation::Input, op.serial);
+        p.received_serial = p.received_begin = p.received_end = 0;
+        c.upstream_recv_armed = true;
+        ++c.pending_ops;
+        return true;
+    }
+
+    bool wait_response_body_pipe_input_ready(Connection& c) {
+        auto& p = *c.response_body_pipe;
+        if (!p.direction_idle(true) || c.upstream_recv_armed || p.storage.sequence == UINT32_MAX)
+            return false;
+        const u32 serial = ++p.storage.sequence;
+        if (!backend.add_body_pipe_poll(c.upstream_fd, c.id, serial, true)) return false;
+        (void)p.own_target(BodyPipeOperation::InputReady, serial);
+        c.upstream_recv_armed = true;
+        ++c.pending_ops;
+        return true;
+    }
+
+    bool fallback_response_body_pipe_input(Connection& c) {
+        auto& p = *c.response_body_pipe;
+        if (!response_body_pipe_receive_identity_is_current(c) || !p.direction_idle(true) ||
+            c.upstream_recv_armed || c.upstream_recv_direct_armed)
+            return false;
+        if (!p.direction_idle(false) || p.send.kind != ResponseBodyPipeOwner::SendKind::None) {
+            // An output owns the prefix. Wait for its logical acknowledgment
+            // before migrating the suffix; readiness alone cannot free slots.
+            p.fallback_pending = true;
+            c.response_read_deadline_bounded_read_ahead_paused = true;
+            if (!response_read_deadline_uses_precise_timer(c)) timer.remove(&c);
+            return true;
+        }
+        while (p.storage.bytes != 0) {
+            if (!c.response_body_tail.reserve_tail(pool, 0)) return false;
+            const i32 n = p.storage.drain_into(c.response_body_tail.write_ptr(pool),
+                                               c.response_body_tail.write_avail(pool));
+            if (n <= 0) return false;
+            c.response_body_tail.commit(static_cast<u32>(n));
+        }
+        if (!p.storage.close()) return false;
+        p.input_disabled = true;
+        p.fallback_pending = false;
+        p.received_serial = p.received_begin = p.received_end = 0;
+        const bool paused = c.response_read_deadline_bounded_read_ahead_paused;
+        if (!arm_response_read_body_recv(c)) return false;
+        if (paused) {
+            c.response_read_deadline_bounded_read_ahead_paused = false;
+            c.response_read_timer_last_progress_ns = monotonic_ns();
+            if (!response_read_deadline_uses_precise_timer(c))
+                timer.refresh(&c, c.response_read_deadline_seconds);
+        }
+        // Migration is not origin progress. Only an actual backpressure pause
+        // resumes its clock above; ordinary fallback keeps the previous clock.
+        return true;
+    }
+
+    bool arm_response_read_body_recv(Connection& c) {
+        if (c.upstream_recv_armed || c.upstream_recv_direct_armed) return false;
+        const bool bounded =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded;
+        if (bounded) try_admit_response_body_pipe(c);
+        if (c.response_body_pipe && !c.response_body_pipe->input_disabled) {
+            auto& p = *c.response_body_pipe;
+            if (p.fallback_pending || p.storage.bytes == p.storage.capacity)
+                return fallback_response_body_pipe_input(c);
+            return queue_response_body_pipe_input(c);
+        }
+        const bool direct = bounded && arm_response_read_direct_body_recv(c);
+        if (!direct && !add_response_read_recv(c)) return false;
+        c.upstream_recv_direct_armed = direct;
+        c.upstream_recv_armed = true;
+        ++c.pending_ops;
+        return true;
+    }
+
+    bool stop_response_body_pipe_input(Connection& c) {
+        auto* p = c.response_body_pipe;
+        if (!p || p->input_disabled) return true;
+        // The raw pipe receive keeps its own CQE/cancel custody. Exclude it
+        // from the ordinary UpstreamRecv retirement token before closing the
+        // origin descriptor. Late positive bytes are an unpublishable suffix.
+        if (c.upstream_recv_armed && !p->targets[0] && !p->targets[2]) return false;
+        p->input_stopping = true;
+        if (p->targets[0] || p->targets[2]) c.upstream_recv_armed = false;
+        for (u32 i : {0u, 2u}) {
+            if (!p->targets[i] || p->cancels[i]) continue;
+            const auto op = static_cast<BodyPipeOperation>(i);
+            if (!backend.cancel_body_pipe(c.id, p->targets[i], op)) return false;
+            (void)p->own_cancel(op);
+            ++c.pending_ops;
+        }
         return true;
     }
 
@@ -3000,6 +3142,25 @@ public:
             return;
         }
         const auto operation = static_cast<BodyPipeOperation>(event.aux);
+        if (owner->input_stopping && (event.aux & 1u) == 0) return;
+        if (operation == BodyPipeOperation::Input || operation == BodyPipeOperation::InputReady) {
+            const bool valid =
+                c.upstream_recv_armed && response_body_pipe_receive_identity_is_current(c);
+            c.upstream_recv_armed = false;
+            if (!valid) {
+                close_conn(c);
+                return;
+            }
+            bool queued = false;
+            if (operation == BodyPipeOperation::Input && event.result == -EAGAIN) {
+                queued = owner->storage.bytes != 0 ? fallback_response_body_pipe_input(c)
+                                                   : wait_response_body_pipe_input_ready(c);
+            } else if (operation == BodyPipeOperation::InputReady && event.result > 0) {
+                queued = queue_response_body_pipe_input(c);
+            }
+            if (!queued) close_conn(c);
+            return;
+        }
         const bool terminal = owner->send.kind == ResponseBodyPipeOwner::SendKind::Terminal;
         if ((operation != BodyPipeOperation::Output &&
              operation != BodyPipeOperation::OutputReady) ||
@@ -4997,19 +5158,10 @@ public:
             if (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
                 c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight)
                 return false;
-            // Bounded goes straight to a direct one-shot recv into the chain
-            // tail from the very first body byte after the header commits —
-            // it never arms a provided-buffer recv for the body at all (see
-            // add_response_read_recv). Phase is already Buffering and the
-            // declared/received fields above are already set, so
-            // arm_response_read_direct_body_recv's preconditions hold here.
-            const bool bounded =
-                c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded;
-            const bool direct = bounded && arm_response_read_direct_body_recv(c);
-            if (!direct && !add_response_read_recv(c)) return false;
-            c.upstream_recv_direct_armed = direct;
-            c.pending_ops++;
-            c.upstream_recv_armed = true;
+            // The first body receive uses the chain while the canonical
+            // header is pending. Later receives may use admitted pipe storage;
+            // the helper establishes the matching transport ownership.
+            if (!arm_response_read_body_recv(c)) return false;
         }
         c.response_read_deadline_state = ResponseReadDeadlineState::RefreshPending;
         return true;
@@ -5324,6 +5476,7 @@ public:
                 return false;
         }
         timer.remove(&c);
+        if (!stop_response_body_pipe_input(c)) return false;
         const bool recv_owned = c.upstream_recv_armed;
         if (!begin_strict_upstream_retirement(c)) return false;
         // No buffered response byte may become visible while its origin Recv
@@ -5493,21 +5646,19 @@ public:
             c.response_read_deadline_post_commit_response_class !=
                 CompleteContentLengthResponseClass::BoundedPositiveBody)
             return true;
+        if (c.response_body_pipe && c.response_body_pipe->fallback_pending) {
+            if (!fallback_response_body_pipe_input(c)) return false;
+            if (c.response_body_pipe->fallback_pending) return true;
+        }
         const u32 received = c.response_read_deadline_post_commit_origin_received;
         if (c.response_read_deadline_bounded_read_ahead_paused && !c.upstream_recv_armed &&
             received - c.response_read_deadline_bounded_released <= kBoundedReadAheadBytes / 2) {
             if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
                 c.upstream_recv_cancel_inflight)
                 return true;  // still settling the pause; retried on the next advance
-            // Always a direct one-shot recv into the chain tail: Bounded
-            // never re-arms a provided-buffer recv here (see
-            // add_response_read_recv) — only fall back to one if the chain
-            // itself is out of memory.
-            const bool direct = arm_response_read_direct_body_recv(c);
-            if (!direct && !add_response_read_recv(c)) return false;
-            c.upstream_recv_direct_armed = direct;
-            c.pending_ops++;
-            c.upstream_recv_armed = true;
+            // Resume through the same pipe/chain storage selector used by
+            // normal body progress, preserving its exact receive owner.
+            if (!arm_response_read_body_recv(c)) return false;
             c.response_read_deadline_bounded_read_ahead_paused = false;
             // Re-arm with a fresh full timeout on resume. The precise timer
             // (if that is this connection's mechanism) cannot be rearmed
@@ -5819,15 +5970,9 @@ public:
                 if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
                     c.upstream_recv_cancel_inflight)
                     return false;
-                // Bounded: always a direct recv straight into the chain tail
-                // (see add_response_read_recv / arm_response_read_direct_body_recv);
-                // fall back to the ordinary one-shot deadline recv only if
-                // the chain itself is out of memory.
-                const bool direct = bounded && arm_response_read_direct_body_recv(c);
-                if (!direct && !add_response_read_recv(c)) return false;
-                c.upstream_recv_direct_armed = direct;
-                c.pending_ops++;
-                c.upstream_recv_armed = true;
+                // Bounded selects admitted pipe storage or a direct chain
+                // receive; ordinary provided buffers remain the memory fallback.
+                if (!arm_response_read_body_recv(c)) return false;
             }
         }
 
@@ -6191,21 +6336,13 @@ public:
                             close_conn(c);
                             continue;
                         }
-                        // Bounded: always a direct recv straight into the
-                        // chain tail — it never re-arms a provided-buffer
-                        // recv for the body (see add_response_read_recv).
-                        // CompleteContentLength keeps its provided-buffer
-                        // recv for the whole body: it never switches to a
-                        // direct recv mid-body. Either falls back to the
-                        // ordinary deadline recv on failure.
-                        const bool direct = bounded && arm_response_read_direct_body_recv(c);
-                        if (!direct && !add_response_read_recv(c)) {
+                        // Bounded selects pipe or chain storage consistently
+                        // with the precise-timer path. CompleteContentLength
+                        // retains its ordinary provided-buffer receive.
+                        if (!arm_response_read_body_recv(c)) {
                             close_conn(c);
                             continue;
                         }
-                        c.upstream_recv_direct_armed = direct;
-                        c.pending_ops++;
-                        c.upstream_recv_armed = true;
                     }
                 }
                 const bool streaming_timer =

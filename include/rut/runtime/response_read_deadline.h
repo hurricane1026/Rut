@@ -2547,9 +2547,9 @@ inline bool bodyless_get_complete_content_length_precise_buffering_is_stable(con
 // close/reset; this semantic identity deliberately cannot.
 inline bool response_body_pipe_receive_identity_is_current(const Connection& c) {
     const auto* p = c.response_body_pipe;
-    return p && !p->closing && p->storage.active() && p->conn_id == c.id && c.fd >= 0 &&
-           p->downstream_fd == c.fd && c.upstream_fd >= 0 && p->upstream_fd == c.upstream_fd &&
-           valid_upstream_episode(p->upstream_episode) &&
+    return p && !p->closing && !p->input_stopping && p->storage.active() && p->conn_id == c.id &&
+           c.fd >= 0 && p->downstream_fd == c.fd && c.upstream_fd >= 0 &&
+           p->upstream_fd == c.upstream_fd && valid_upstream_episode(p->upstream_episode) &&
            p->upstream_episode == c.upstream_episode &&
            p->upstream_episode == c.response_read_deadline_post_commit_episode &&
            p->deadline_generation != 0 &&

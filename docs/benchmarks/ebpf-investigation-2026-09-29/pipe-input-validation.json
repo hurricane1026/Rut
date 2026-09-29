@@ -1,0 +1,154 @@
+{
+  "status": "production pipe admission enabled in candidate; not yet accepted across the matrix",
+  "candidate_sha256": "56501558e23bf4f19c2863408bce4f3e7936169c3857e0074f7ddeb76ddc03a6",
+  "baseline_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "focused_tests": {
+    "passed": 9,
+    "failed": 0,
+    "checks": 16714
+  },
+  "storage_tests": {
+    "passed": 15,
+    "failed": 0,
+    "checks": 509
+  },
+  "network_tests": {
+    "passed": 1438,
+    "failed": 0,
+    "checks": 388644,
+    "log_sha256": "c839eca116bd605131861e68e51a6565b1eac17b110eb15d7a3f7e8a12c42831"
+  },
+  "live_smoke": {
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pipe-input-r3",
+    "sha256": "56501558e23bf4f19c2863408bce4f3e7936169c3857e0074f7ddeb76ddc03a6",
+    "rows": [
+      {
+        "mode": "close",
+        "requests": 10,
+        "exact_body": true
+      },
+      {
+        "mode": "keepalive",
+        "requests": 10,
+        "exact_body": true
+      },
+      {
+        "mode": "slow",
+        "requests": 10,
+        "exact_body": true
+      }
+    ],
+    "aborted_clients": 20,
+    "post_abort_body_check": true,
+    "fds_before": 6,
+    "fds_after": 6,
+    "pipe_admission_count": null,
+    "performance_claim": false,
+    "server_pid": 2896307,
+    "trace_requested": false
+  },
+  "live_edges": {
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pipe-input-r3",
+    "sha256": "56501558e23bf4f19c2863408bce4f3e7936169c3857e0074f7ddeb76ddc03a6",
+    "diagnostic_timeout_seconds": 1,
+    "acceptance_configuration_changed": false,
+    "results": [
+      {
+        "case": "fragments",
+        "bytes": 1048576,
+        "exact_body_or_prefix": true,
+        "incomplete": false
+      },
+      {
+        "case": "eof",
+        "bytes": 204800,
+        "exact_body_or_prefix": true,
+        "incomplete": true
+      },
+      {
+        "case": "stall",
+        "bytes": 204716,
+        "exact_body_or_prefix": true,
+        "incomplete": true
+      },
+      {
+        "case": "backpressure",
+        "bytes": 8388608,
+        "exact_body_or_prefix": true,
+        "incomplete": false
+      },
+      {
+        "case": "full",
+        "bytes": 1048576,
+        "exact_body_or_prefix": true,
+        "incomplete": false
+      }
+    ],
+    "performance_claim": false
+  },
+  "trace": {
+    "directory": "pipe-input-trace-r3",
+    "server_pid": 2896424,
+    "worker_comm": "iou-wrk-2896425",
+    "worker_cpus": [
+      2
+    ],
+    "splice_read_calls": 255,
+    "splice_read_bytes": 24657705,
+    "splice_send_calls": 201,
+    "splice_send_bytes": 20507543,
+    "copy_helper_calls": 407,
+    "copy_helper_requested_bytes": 16629421,
+    "scope": "31 exact-body requests plus 20 aborted clients; demonstrates runtime execution, not a normalized copy-cost or throughput comparison"
+  },
+  "diagnostic_failures": [
+    "Initial user uretprobe attachment failed; no zero-hit inference from that failed trace.",
+    "Valid kernel trace r2 showed no splice; GDB found admission disabled and io_wq affinity registration returning -22 before the shard first entered the ring.",
+    "Registration moved after the shard first backend wait. Kernel trace r3 confirms splice and worker CPU 2.",
+    "Initial admission fixture changed declared size without updating its canonical header; parameterizing the complete fixture fixed it without weakening runtime checks."
+  ],
+  "focused_performance": [
+    {
+      "case": "1048576-c1-close",
+      "candidate_median_rps": 2294.280358927536,
+      "baseline_median_rps": 2219.216222037815,
+      "candidate_over_baseline": 1.0338246161614628
+    },
+    {
+      "case": "1048576-c32-close",
+      "candidate_median_rps": 3038.9781585050214,
+      "baseline_median_rps": 2432.0050558430335,
+      "candidate_over_baseline": 1.2495772371869458
+    }
+  ],
+  "performance_scope": {
+    "order": [
+      "candidate",
+      "baseline",
+      "baseline",
+      "candidate"
+    ],
+    "warmup_seconds": 2,
+    "load_seconds": 6,
+    "samples_per_engine": 2,
+    "instrumentation": "none",
+    "nginx_comparison": false,
+    "full_acceptance": false
+  },
+  "formal_acceptance_unchanged": {
+    "coordinates": 96,
+    "at_least_1_10": 76,
+    "below_1_10": 20,
+    "below_1_0": 3
+  },
+  "remaining": [
+    "1 MiB high-concurrency and keepalive controls",
+    "excluded-path controls and normalized receive-copy comparison",
+    "unchanged 96-coordinate full acceptance"
+  ],
+  "huge_pages_or_global_kernel_tuning": false,
+  "source_references": [
+    "https://raw.githubusercontent.com/torvalds/linux/v6.19/io_uring/register.c",
+    "https://raw.githubusercontent.com/torvalds/linux/v6.19/io_uring/io-wq.c"
+  ]
+}

@@ -1,6 +1,6 @@
 # Pipe-backed bounded body relay: integration plan
 
-Status: feasibility probe passed; pipe storage owner, io_uring transport, connection teardown custody, typed pipe receive evidence, logical send routing and tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
+Status: storage, transport, receive/send custody, fallback and production admission are implemented in the candidate. Live HTTP and kernel eBPF confirm execution; the first two-coordinate causal probe improves over the accepted Rut baseline. **Retention across the full unchanged matrix is not yet established.** Earlier progress sections below describe their historical stage.
 
 ## Initial eligibility
 
@@ -81,3 +81,9 @@ Still pending before production admission: receive rearming/readiness and fragme
 Output now routes through explicit release/terminal frames, retaining physical completion bytes in logical buffered length until the matching callback acknowledges the whole frame. Partial transfers, EAGAIN polls and exact-token cancellation preserve the frame and connection custody. Real-ring callback tests and the full network suite pass; see `pipe-send-validation.json`. The combined memory-send shortcut excludes pipe storage. Production admission is still disabled.
 
 The next integration must replace body receive arming consistently at all four Bounded call sites, without setting the ordinary direct-memory receive flag for a pipe operation. EAGAIN readiness must retain logical receive ownership without refreshing inactivity time; page-slot exhaustion must migrate bytes in order after outstanding transfers settle. Never append an ordinary receive behind nonempty pipe bytes without first completing that migration. Admission hit counts are essential: current release-before-rearm ordering may have a memory-prefix send in flight at the natural transition point, so a blanket no-send admission condition needs review against actual event ordering rather than assuming the path will execute.
+
+## Live receive integration progress
+
+All four body receive sites now select pipe/chain ownership consistently. Pipe input has explicit EAGAIN readiness, ordered migration after output settles, per-response fallback disabling and independent terminal cancellation. Late input after terminal selection cannot expand logical buffered response bytes. Admission allows an authenticated ordinary memory-prefix send to remain pinned. io_wq affinity is registered after the shard's first backend wait, because registering before that thread has entered the ring returned EINVAL in the first real candidate.
+
+The candidate now has verified real splice hits on the budgeted CPU, 1438 passing network tests, live byte-exact close/keepalive/slow-reader checks, abort cleanup, fragmentation/EOF/stall/backpressure diagnostics and a first causal comparison at 1 MiB close c1/c32. See `pipe-input-validation.json` for exact scope and results. Remaining gates are larger concurrency/keepalive and excluded-path controls, normalized copy-path comparison, and the original complete 96-coordinate acceptance run. The 1-second timeout is confined to a diagnostic configuration copy; it is not a revised acceptance workload.

@@ -64953,7 +64953,8 @@ TEST(response_buffering_runtime, bounded_complete_while_header_release_in_flight
 // plain and over TLS.
 static bool stage_bounded_pipe_receive(IoUringEventLoop* loop,
                                        RouteConfig& config,
-                                       PrebuiltD2Fixture& fixture) {
+                                       PrebuiltD2Fixture& fixture,
+                                       u32 declared = 65536) {
     if (!config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
         !add_bodyless_non_head_response_read_deadline_bundle(
             config, 5, ForwardResponseBufferingMode::Bounded) ||
@@ -64961,23 +64962,29 @@ static bool stage_bounded_pipe_receive(IoUringEventLoop* loop,
         !arm_staged_response_read_deadline(loop, fixture, 5))
         return false;
     auto& c = *fixture.conn;
-    static constexpr u8 header[] = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n";
+    u8 header[80];
+    const int length = snprintf(reinterpret_cast<char*>(header),
+                                sizeof(header),
+                                "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n",
+                                declared);
+    if (length <= 0 || static_cast<u32>(length) >= sizeof(header)) return false;
+    const u32 header_len = static_cast<u32>(length);
     static const u8 body[8192]{};
-    if (c.upstream_recv_buf.write(header, sizeof(header) - 1) != sizeof(header) - 1 ||
+    if (c.upstream_recv_buf.write(header, header_len) != header_len ||
         c.upstream_recv_buf.write(body, sizeof(body)) != sizeof(body))
         return false;
     HttpResponseParser parser;
     ParsedResponse response;
     parser.reset();
     response.reset();
-    if (parser.parse(header, sizeof(header) - 1, &response) != ParseStatus::Complete) return false;
+    if (parser.parse(header, header_len, &response) != ParseStatus::Complete) return false;
     c.resp_status = response.status_code;
     if (!build_strict_response_headers(c, config, response)) return false;
     loop->timer.remove(&c);
     c.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
     const IoEvent initial =
         response_read_copy_event(c, c.upstream_recv_buf.len(), true, 0, c.upstream_recv_buf.len());
-    if (!loop->begin_complete_content_length_buffering(c, initial, parser.header_end, 65536))
+    if (!loop->begin_complete_content_length_buffering(c, initial, parser.header_end, declared))
         return false;
     // Model the canonical header and every eligible prefix already sent.
     // The header-relative release boundary leaves an ordinary-memory suffix.
@@ -65183,6 +65190,201 @@ static bool stage_bounded_pipe_output(IoUringEventLoop* loop,
         !p.retire(pipe_transport_event(c.id, BodyPipeOperation::Input, in.serial, sizeof(bytes))))
         return false;
     return response_read_deadline_post_commit_is_stable(c);
+}
+
+TEST(response_buffering_runtime, pipe_input_eagain_waits_without_deadline_progress) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(1));
+    auto* loop = guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(*loop, 16));
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_bounded_pipe_receive(loop, config, fixture));
+    auto& c = *fixture.conn;
+    auto& p = *c.response_body_pipe;
+    c.upstream_recv_armed = false;
+    --c.pending_ops;
+    loop->backend.body_pipe_workers_bound = true;
+    c.response_read_timer_last_progress_ns = 123;
+    const u32 progress = c.response_read_deadline_progress_bytes;
+    REQUIRE(loop->arm_response_read_body_recv(c));
+    const u32 first = p.targets[0];
+    REQUIRE_NE(first, 0u);
+    CHECK_FALSE(c.upstream_recv_direct_armed);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Input, first, -EAGAIN));
+    const u32 ready = p.targets[2];
+    REQUIRE_GT(ready, first);
+    CHECK(c.upstream_recv_armed);
+    CHECK_EQ(c.pending_ops, 2u);
+    CHECK_EQ(c.response_read_timer_last_progress_ns, 123u);
+    CHECK_EQ(c.response_read_deadline_progress_bytes, progress);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Input, first, -EAGAIN));
+    CHECK_EQ(c.pending_ops, 2u);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::InputReady, ready, POLLIN));
+    REQUIRE_GT(p.targets[0], ready);
+    CHECK_EQ(p.targets[2], 0u);
+    CHECK_EQ(c.pending_ops, 2u);
+    CHECK_EQ(c.response_read_timer_last_progress_ns, 123u);
+    CHECK_EQ(c.response_read_deadline_progress_bytes, progress);
+    // The fake SQ was never submitted. Retire its last synthetic target.
+    REQUIRE(
+        p.retire(pipe_transport_event(c.id, BodyPipeOperation::Input, p.targets[0], -ECANCELED)));
+    c.upstream_recv_armed = false;
+    --c.pending_ops;
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime, pipe_input_fallback_preserves_body_and_waits_for_output) {
+    for (bool output_active : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(1));
+        auto* loop = guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(*loop, 16));
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_output(loop, config, fixture, false));
+        auto& c = *fixture.conn;
+        auto& p = *c.response_body_pipe;
+        loop->backend.body_pipe_workers_bound = true;
+        const u32 progress = c.response_read_deadline_progress_bytes;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        const u32 released = c.response_read_deadline_bounded_released;
+        c.response_read_timer_last_progress_ns = 123;
+        u32 sent = 0;
+        u32 output_serial = 0;
+        if (output_active) {
+            sent = bounded_response_release_bytes(
+                       c.response_read_deadline_post_commit_raw_header_end, received, false) -
+                   released;
+            c.upstream_send_len = sent;
+            c.transition_to_sending(&on_bounded_release_body_sent<IoUringEventLoop>);
+            REQUIRE(loop->submit_response_body_pipe_send(c, sent, false));
+            output_serial = p.targets[1];
+        }
+        REQUIRE(loop->arm_response_read_body_recv(c));
+        const u32 input_serial = p.targets[0];
+        REQUIRE_NE(input_serial, 0u);
+        loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Input, input_serial, -EAGAIN));
+        REQUIRE_GE(c.fd, 0);
+        if (output_active) {
+            REQUIRE(p.fallback_pending);
+            CHECK(c.response_read_deadline_bounded_read_ahead_paused);
+            CHECK_FALSE(c.upstream_recv_armed);
+            CHECK_EQ(c.buffered_response_len(), 4096u);
+            u8 drained[4096];
+            REQUIRE_EQ(read(p.storage.read_fd, drained, sent), sent);
+            loop->dispatch(
+                pipe_transport_event(c.id, BodyPipeOperation::Output, output_serial, sent));
+        } else {
+            CHECK_EQ(c.response_read_timer_last_progress_ns, 123u);
+        }
+        REQUIRE_GE(c.fd, 0);
+        CHECK(p.input_disabled);
+        CHECK_FALSE(p.fallback_pending);
+        CHECK_FALSE(c.response_read_deadline_bounded_read_ahead_paused);
+        CHECK_EQ(p.storage.read_fd, -1);
+        CHECK_EQ(p.storage.write_fd, -1);
+        CHECK_EQ(c.buffered_response_len(), 4096u - sent);
+        CHECK_EQ(c.response_body_tail.size, 4096u - sent);
+        CHECK_EQ(c.response_read_deadline_progress_bytes, progress);
+        CHECK_EQ(c.response_read_deadline_post_commit_origin_received, received);
+        CHECK_EQ(c.response_read_deadline_bounded_released, released + sent);
+        REQUIRE(c.upstream_recv_direct_armed);
+        REQUIRE(c.upstream_recv_armed);
+        REQUIRE_EQ(c.pending_ops, 2u);
+        for (u32 i = 0; i < c.response_body_tail.front_size(); ++i)
+            CHECK_EQ(c.response_body_tail.data()[i], static_cast<u8>('p'));
+        // No kernel SQ submission occurred in this fake-ring test.
+        c.upstream_recv_direct_armed = c.upstream_recv_armed = false;
+        --c.pending_ops;
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, pipe_terminal_input_cancel_discards_late_suffix_only) {
+    for (bool cancel_first : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(1));
+        auto* loop = guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(*loop, 16));
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_output(loop, config, fixture, false));
+        auto& c = *fixture.conn;
+        auto& p = *c.response_body_pipe;
+        loop->backend.body_pipe_workers_bound = true;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        REQUIRE(loop->arm_response_read_body_recv(c));
+        const u32 serial = p.targets[0];
+        REQUIRE(loop->stop_response_body_pipe_input(c));
+        CHECK_FALSE(c.upstream_recv_armed);
+        REQUIRE_EQ(c.pending_ops, 3u);
+        REQUIRE_EQ(p.cancels[0], serial);
+        const IoEvent cancel =
+            pipe_transport_event(c.id, BodyPipeOperation::CancelInput, serial, 0);
+        const IoEvent target = pipe_transport_event(c.id, BodyPipeOperation::Input, serial, 3);
+        REQUIRE_EQ(write(p.storage.write_fd, "new", 3), 3);
+        if (cancel_first) loop->dispatch(cancel);
+        loop->dispatch(target);
+        if (!cancel_first) loop->dispatch(cancel);
+        REQUIRE_GE(c.fd, 0);
+        CHECK_EQ(c.pending_ops, 1u);
+        CHECK_EQ(p.storage.bytes, 4099u);
+        CHECK_EQ(p.discarded_input_bytes, 3u);
+        CHECK_EQ(c.buffered_response_len(), 4096u);
+        CHECK_EQ(c.response_read_deadline_post_commit_origin_received, received);
+        CHECK_EQ(p.targets[0], 0u);
+        CHECK_EQ(p.cancels[0], 0u);
+        loop->dispatch(target);
+        loop->dispatch(cancel);
+        CHECK_EQ(c.pending_ops, 1u);
+        CHECK_EQ(c.buffered_response_len(), 4096u);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, pipe_admission_preserves_an_inflight_memory_prefix) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(1));
+    auto* loop = guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(*loop, 16));
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_bounded_pipe_receive(loop, config, fixture, 1048576));
+    auto& c = *fixture.conn;
+    REQUIRE(loop->release_response_body_pipe(c));
+    c.upstream_recv_armed = false;
+    --c.pending_ops;
+    u8 next[4096]{};
+    REQUIRE_EQ(c.upstream_recv_buf.write(next, sizeof(next)), sizeof(next));
+    c.response_read_deadline_post_commit_origin_received += sizeof(next);
+    c.response_read_deadline_progress_bytes += sizeof(next);
+    REQUIRE(response_read_deadline_post_commit_is_stable(c));
+    const u8* prefix = c.buffered_response_data();
+    const u32 length = c.buffered_response_front_size();
+    REQUIRE_GT(length, 0u);
+    c.upstream_send_len = 4096;
+    c.transition_to_sending(&on_bounded_release_body_sent<IoUringEventLoop>);
+    c.send_armed = true;
+    loop->backend.body_pipe_workers_bound = true;
+    loop->body_pipe_response_enabled = true;
+    REQUIRE(loop->arm_response_read_body_recv(c));
+    REQUIRE(c.response_body_pipe != nullptr);
+    CHECK_EQ(c.buffered_response_data(), prefix);
+    CHECK_EQ(c.buffered_response_front_size(), length);
+    CHECK_FALSE(c.upstream_recv_direct_armed);
+    CHECK(c.upstream_recv_armed);
+    auto& p = *c.response_body_pipe;
+    REQUIRE_NE(p.targets[0], 0u);
+    REQUIRE(
+        p.retire(pipe_transport_event(c.id, BodyPipeOperation::Input, p.targets[0], -ECANCELED)));
+    c.upstream_recv_armed = false;
+    --c.pending_ops;
+    cleanup_prebuilt_d2(loop, fixture);
 }
 
 TEST(response_buffering_runtime, pipe_partial_output_and_eagain_keep_one_logical_release) {
