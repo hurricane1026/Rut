@@ -4,6 +4,8 @@
 
 #include <string.h>
 #ifdef __linux__
+#include "rut/runtime/io_uring_backend.h"
+
 #include <arpa/inet.h>
 #include <linux/io_uring.h>
 #include <poll.h>
@@ -99,6 +101,23 @@ struct PipeTestRing {
             if (poll(&event, 1, 10) < 0 && errno != EINTR) return false;
         }
         return false;
+    }
+    // Borrow this fixture's ring mappings without transferring cleanup to b.
+    void attach(IoUringBackend& b) {
+        b.ring_fd = fd;
+        b.connection_capacity = 1;
+        b.sq_head = field(sq, params.sq_off.head);
+        b.sq_tail = field(sq, params.sq_off.tail);
+        b.sq_flags = field(sq, params.sq_off.flags);
+        b.sq_ring_mask = field(sq, params.sq_off.ring_mask);
+        b.sq_array = field(sq, params.sq_off.array);
+        b.sq_entries = entries;
+        b.sq_ring_entries = params.sq_entries;
+        b.cq_head = field(cq, params.cq_off.head);
+        b.cq_tail = field(cq, params.cq_off.tail);
+        b.cq_ring_mask = field(cq, params.cq_off.ring_mask);
+        b.cq_entries = reinterpret_cast<io_uring_cqe*>(cq + params.cq_off.cqes);
+        b.cq_ring_entries = params.cq_entries;
     }
     static io_uring_sqe splice(i32 input, i32 output, u32 length, u64 token) {
         io_uring_sqe entry{};
@@ -262,6 +281,199 @@ TEST(response_body_pipe, real_uring_empty_origin_retry_and_queued_cancel) {
     CHECK(!p.complete_input(in.serial, -ECANCELED));
     CHECK_EQ(p.bytes, 0u);
     REQUIRE(p.close());
+}
+
+TEST(response_body_pipe, backend_token_domains_and_full_serial) {
+    for (u8 kind = 0; kind < static_cast<u8>(BodyPipeOperation::Count); ++kind) {
+        for (u32 serial : {1u, 0x80000000u, UINT32_MAX}) {
+            const BodyPipeToken source{
+                kIoUserDataMaxConnId, serial, static_cast<BodyPipeOperation>(kind)};
+            const u64 token = encode_body_pipe_token(source);
+            BodyPipeToken decoded;
+            REQUIRE(decode_body_pipe_token(token, &decoded));
+            CHECK_EQ(decoded.conn_id, source.conn_id);
+            CHECK_EQ(decoded.serial, serial);
+            CHECK_EQ(decoded.operation, source.operation);
+            UpstreamEventToken upstream;
+            NonUpstreamUserData downstream;
+            CHECK(!decode_upstream_event_token(token, &upstream));
+            CHECK(!decode_non_upstream_user_data(token, &downstream));
+        }
+    }
+    CHECK_EQ(encode_body_pipe_token({0, 0, BodyPipeOperation::Input}), kInvalidIoUserData);
+    CHECK_EQ(encode_body_pipe_token({0x1000000, 1, BodyPipeOperation::Input}), kInvalidIoUserData);
+    CHECK_EQ(encode_body_pipe_token({0, 1, BodyPipeOperation::Count}), kInvalidIoUserData);
+    CHECK_EQ(encode_non_upstream_user_data({0, IoEventType::BodyPipeTransport, 1}),
+             kInvalidIoUserData);
+    CHECK_EQ(body_pipe_cancel_operation(BodyPipeOperation::CancelInput), BodyPipeOperation::Count);
+}
+
+TEST(response_body_pipe, backend_real_transfer_emits_neutral_transport_evidence) {
+    PipeFixture f;
+    PipeTestRing ring;
+    PipeTestTcp origin, downstream;
+    const bool initialized = ring.init();
+    if (!initialized && ring.fd < 0 && (errno == ENOSYS || errno == EPERM || errno == EACCES))
+        SKIP("io_uring unavailable or denied by sandbox");
+    REQUIRE(initialized);
+    REQUIRE(origin.init());
+    REQUIRE(downstream.init());
+    IoUringBackend backend{};
+    ring.attach(backend);
+    REQUIRE(f.pipe.open(65536));
+    ResponseBodyPipe::Operation input{}, output{};
+    REQUIRE(f.pipe.reserve_input(4, &input));
+    CHECK(!backend.add_body_pipe_splice(origin.receiver, 0, f.pipe, true));
+    CHECK_EQ(f.pipe.input.phase, ResponseBodyPipe::Phase::Reserved);
+    REQUIRE(backend.bind_body_pipe_workers());
+    REQUIRE_EQ(send(origin.sender, "testTAIL", 8, MSG_NOSIGNAL), 8);
+    REQUIRE(backend.add_body_pipe_splice(origin.receiver, 0, f.pipe, true));
+    CHECK(!backend.add_body_pipe_splice(origin.receiver, 0, f.pipe, true));
+    CHECK(!f.pipe.rollback_input(input.serial));
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.type, IoEventType::BodyPipeTransport);
+    CHECK_EQ(event.aux, static_cast<u8>(BodyPipeOperation::Input));
+    CHECK_EQ(event.non_upstream_generation, input.serial);
+    CHECK_EQ(event.result, 4);
+    CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+    CHECK_EQ(event.copy_begin, 0u);
+    CHECK_EQ(event.copy_end, 0u);
+    CHECK_EQ(event.upstream_episode, 0u);
+    CHECK_EQ(event.has_buf, 0u);
+    CHECK_EQ(event.more, 0u);
+    // Backend decoding never commits application state by itself.
+    CHECK_EQ(f.pipe.bytes, 0u);
+    REQUIRE(f.pipe.complete_input(input.serial, event.result));
+    REQUIRE(f.pipe.reserve_output(4, &output));
+    REQUIRE(backend.add_body_pipe_splice(downstream.sender, 0, f.pipe, false));
+    REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.aux, static_cast<u8>(BodyPipeOperation::Output));
+    CHECK_EQ(event.non_upstream_generation, output.serial);
+    CHECK_EQ(event.result, 4);
+    CHECK_EQ(f.pipe.bytes, 4u);
+    REQUIRE(f.pipe.complete_output(output.serial, event.result));
+    char bytes[4]{};
+    REQUIRE_EQ(recv(downstream.receiver, bytes, 4, 0), 4);
+    CHECK_EQ(memcmp(bytes, "test", 4), 0);
+    REQUIRE_EQ(recv(origin.receiver, bytes, 4, 0), 4);
+    CHECK_EQ(memcmp(bytes, "TAIL", 4), 0);
+    REQUIRE(f.pipe.close());
+}
+
+TEST(response_body_pipe, backend_readiness_and_cancel_are_exact_separate_owners) {
+    PipeTestRing ring;
+    PipeTestTcp origin;
+    const bool initialized = ring.init();
+    if (!initialized && ring.fd < 0 && (errno == ENOSYS || errno == EPERM || errno == EACCES))
+        SKIP("io_uring unavailable or denied by sandbox");
+    REQUIRE(initialized);
+    REQUIRE(origin.init());
+    IoUringBackend backend{};
+    ring.attach(backend);
+    constexpr u32 serial = 0x80000005u;
+    REQUIRE(backend.add_body_pipe_poll(origin.receiver, 0, serial, true));
+    REQUIRE(backend.cancel_body_pipe(0, serial - 1, BodyPipeOperation::InputReady));
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.aux, static_cast<u8>(BodyPipeOperation::CancelInputReady));
+    CHECK_EQ(event.non_upstream_generation, serial - 1);
+    CHECK_EQ(event.result, -ENOENT);
+    REQUIRE(backend.cancel_body_pipe(0, serial, BodyPipeOperation::InputReady));
+    bool saw_target = false, saw_cancel = false;
+    for (u32 i = 0; i < 2; ++i) {
+        REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+        REQUIRE_EQ(event.type, IoEventType::BodyPipeTransport);
+        CHECK_EQ(event.non_upstream_generation, serial);
+        CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+        if (event.aux == static_cast<u8>(BodyPipeOperation::InputReady)) {
+            CHECK(!saw_target);
+            CHECK_EQ(event.result, -ECANCELED);
+            saw_target = true;
+        } else {
+            CHECK_EQ(event.aux, static_cast<u8>(BodyPipeOperation::CancelInputReady));
+            CHECK(!saw_cancel);
+            CHECK_EQ(event.result, 0);
+            saw_cancel = true;
+        }
+    }
+    CHECK(saw_target && saw_cancel);
+    REQUIRE(backend.add_body_pipe_poll(origin.receiver, 0, serial + 1, true));
+    REQUIRE_EQ(send(origin.sender, "x", 1, MSG_NOSIGNAL), 1);
+    REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.aux, static_cast<u8>(BodyPipeOperation::InputReady));
+    CHECK_EQ(event.non_upstream_generation, serial + 1);
+    CHECK(event.result & POLLIN);
+    REQUIRE(backend.add_body_pipe_poll(origin.sender, 0, serial + 2, false));
+    REQUIRE_EQ(backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.aux, static_cast<u8>(BodyPipeOperation::OutputReady));
+    CHECK(event.result & POLLOUT);
+}
+
+struct FakePipeBackend {
+    IoUringBackend backend{};
+    u32 sq_head = 0, sq_tail = 0, sq_mask = 1, sq_array[2]{};
+    io_uring_sqe sqes[2]{};
+    u32 cq_head = 0, cq_tail = 0, cq_mask = 1;
+    io_uring_cqe cqes[2]{};
+    FakePipeBackend() {
+        backend.connection_capacity = 1;
+        backend.body_pipe_workers_bound = true;
+        backend.sq_head = &sq_head;
+        backend.sq_tail = &sq_tail;
+        backend.sq_ring_mask = &sq_mask;
+        backend.sq_array = sq_array;
+        backend.sq_entries = sqes;
+        backend.sq_ring_entries = 2;
+        backend.cq_head = &cq_head;
+        backend.cq_tail = &cq_tail;
+        backend.cq_ring_mask = &cq_mask;
+        backend.cq_entries = cqes;
+        backend.cq_ring_entries = 2;
+    }
+};
+
+TEST(response_body_pipe, backend_sq_full_preserves_reservation_and_rejects_invalid_args) {
+    FakePipeBackend f;
+    PipeFixture storage;
+    auto& b = f.backend;
+    REQUIRE(storage.pipe.open(4096));
+    ResponseBodyPipe::Operation op{};
+    REQUIRE(storage.pipe.reserve_input(4, &op));
+    CHECK(!b.add_body_pipe_splice(-1, 0, storage.pipe, true));
+    CHECK(!b.add_body_pipe_splice(42, 1, storage.pipe, true));
+    CHECK(!b.add_body_pipe_poll(42, 0, 0, true));
+    CHECK(!b.cancel_body_pipe(0, 1, BodyPipeOperation::CancelInput));
+    CHECK_EQ(f.sq_tail, 0u);
+    f.sq_tail = 2;
+    CHECK(!b.add_body_pipe_splice(42, 0, storage.pipe, true));
+    CHECK(!b.add_body_pipe_poll(42, 0, 1, true));
+    CHECK(!b.cancel_body_pipe(0, 1, BodyPipeOperation::Input));
+    CHECK_EQ(storage.pipe.input.phase, ResponseBodyPipe::Phase::Reserved);
+    CHECK_EQ(b.pending, 0u);
+    REQUIRE(storage.pipe.rollback_input(op.serial));
+    REQUIRE(storage.pipe.close());
+}
+
+TEST(response_body_pipe, backend_malformed_flags_or_identity_do_not_publish) {
+    for (u32 flags : {IORING_CQE_F_BUFFER, IORING_CQE_F_MORE, IORING_CQE_F_NOTIF}) {
+        FakePipeBackend f;
+        f.cqes[0] = {encode_body_pipe_token({0, 1, BodyPipeOperation::Input}), 4, flags};
+        f.cq_tail = 1;
+        IoEvent event{};
+        CHECK_EQ(f.backend.wait(&event, 1, nullptr, 0), 0u);
+        CHECK_EQ(f.backend.failure_code(), EPROTO);
+        CHECK_EQ(f.cq_head, 0u);
+    }
+    for (u64 invalid :
+         {u64{kBodyPipeRawTag}, encode_body_pipe_token({1, 1, BodyPipeOperation::Output})}) {
+        FakePipeBackend f;
+        f.cqes[0] = {invalid, 4, 0};
+        f.cq_tail = 1;
+        IoEvent event{};
+        CHECK_EQ(f.backend.wait(&event, 1, nullptr, 0), 0u);
+        CHECK_EQ(f.backend.failure_code(), EPROTO);
+    }
 }
 
 TEST(response_body_pipe, flags_capacity_and_transactional_reservations) {

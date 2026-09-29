@@ -149,6 +149,7 @@ public:
             // io_uring-only (see the enum comment); epoll/kqueue and this
             // generic CRTP dispatch never produce or need to act on one.
             case IoEventType::BoundedHoldTimer:
+            case IoEventType::BodyPipeTransport:
             case IoEventType::Count:
                 break;
         }
@@ -1183,6 +1184,7 @@ public:
             // io_uring-only (see the enum comment); this generic Backend-
             // templated loop (epoll/kqueue/test mocks) never produces one.
             case IoEventType::BoundedHoldTimer:
+            case IoEventType::BodyPipeTransport:
             case IoEventType::Count:
                 break;
         }

@@ -30,10 +30,13 @@ enum class IoEventType : u8 {
                         // and Connection::consume_bounded_hold_timer_completion).
                         // epoll/kqueue: unsupported — those backends release
                         // immediately instead (no equivalent primitive).
+    // io_uring transport only. aux is BodyPipeOperation, generation is the
+    // exact operation serial. Never invoke a request/JIT callback directly.
+    BodyPipeTransport,
     Count,
 };
 
-static_assert(static_cast<u8>(IoEventType::Count) == 10u,
+static_assert(static_cast<u8>(IoEventType::Count) == 11u,
               "IoEventType should keep all runtime event tags and remain small");
 
 // Future upstream-event token layout in the existing 64-bit user_data budget:
@@ -105,7 +108,7 @@ inline constexpr bool decode_upstream_event_token(u64 data, UpstreamEventToken* 
 inline constexpr bool valid_non_upstream_user_data(const NonUpstreamUserData& value) {
     if (value.conn_id > kIoUserDataMaxConnId ||
         static_cast<u8>(value.type) >= static_cast<u8>(IoEventType::Count) ||
-        io_event_is_upstream(value.type))
+        io_event_is_upstream(value.type) || value.type == IoEventType::BodyPipeTransport)
         return false;
     if (value.type == IoEventType::ResponseReadTimer)
         return (value.generation & kResponseReadTimerGenerationMask) != 0;

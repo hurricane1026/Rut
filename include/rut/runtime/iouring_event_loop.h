@@ -7226,6 +7226,7 @@ public:
                     }
                 }
                 break;
+            case IoEventType::BodyPipeTransport:
             case IoEventType::Count:
                 break;
         }

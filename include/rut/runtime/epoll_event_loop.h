@@ -1099,6 +1099,7 @@ public:
             // io_uring-only transport primitive; deliberately inert here.
             case IoEventType::ResponseReadTimer:
             case IoEventType::BoundedHoldTimer:
+            case IoEventType::BodyPipeTransport:
             case IoEventType::Count:
                 break;
         }

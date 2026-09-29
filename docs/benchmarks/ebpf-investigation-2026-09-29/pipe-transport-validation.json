@@ -1,0 +1,27 @@
+{
+  "stage": "io_uring pipe transport, no production response caller",
+  "pipe_tests": {
+    "passed": 14,
+    "failed": 0,
+    "checks": 471,
+    "failed_checks": 0
+  },
+  "network_tests": {
+    "passed": 1425,
+    "failed": 0,
+    "checks": 371804,
+    "failed_checks": 0,
+    "log_sha256": "53c1b45c1e21175d07fb448134b9d2479a4aaec23a285f29a90b0e109aab92b6"
+  },
+  "commands": [
+    "cmake --build build-rel --target test_response_body_pipe test_network -j 8",
+    "timeout 30 build-rel/tests/test_response_body_pipe",
+    "build-rel/tests/test_network"
+  ],
+  "serialization": "flock /tmp/rut-clean-bench/bench.lock",
+  "acceptance_unchanged": true,
+  "rut_binary_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "production_pipe_hit_count": null,
+  "performance_gain": null,
+  "macos_validation": "not run; Linux host"
+}

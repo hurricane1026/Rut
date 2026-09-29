@@ -1,10 +1,10 @@
 # Pipe-backed bounded body relay: integration plan
 
-Status: feasibility probe passed; pipe storage owner and real-kernel primitive tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
+Status: feasibility probe passed; pipe storage owner, io_uring transport submission/decoding and real-kernel tests implemented; **not connected to the production response path yet**. This is a proposed optimization of the existing matrix, not a replacement matrix or relaxed protocol contract.
 
 ## Initial eligibility
 
-Use only Linux io_uring, plaintext downstream, validated BoundedPositiveBody with its pinned canonical response header already sent, no mutation/inspection/TLS/range/full-buffer requirement, and a large declared body. Switch only at an empty memory-buffer boundary, with no upstream recv or downstream send owning those buffers. Existing memory/header data must drain in order first. For the 1 MiB workload, a read-ahead pause/resume boundary may provide this entry; actual hit counts must be measured before interpreting a throughput result.
+Use only Linux io_uring, plaintext downstream, validated BoundedPositiveBody with its pinned canonical response header already sent, no mutation/inspection/TLS/range/full-buffer requirement, and a large declared body. Switch only when no upstream recv or downstream send owns the ordinary buffers. Preserve any existing memory prefix and receive subsequent bytes into the pipe; output must drain the memory prefix before pipe bytes. The original proposal required an entirely empty ordinary buffer, but `bounded_response_release_bytes` rounds header+received down to a 4096-byte boundary. For example header=146 and received=524288 permit release of 524142 body bytes, leaving 146 ordinary bytes even after every eligible byte is sent. Requiring emptiness can therefore prevent entry despite a drained eligible prefix. This is an arithmetic/code-path finding, not a measured runtime hit rate. Actual transition hit counts must be measured before interpreting throughput.
 
 Keep the ordinary path for all other cases and for pipe allocation failure before transition. No huge pages, global pipe-size changes, upstream connection reuse, workload exclusions or concurrency-specific benchmark policy.
 
@@ -35,7 +35,15 @@ Pipe page slots can fill before the requested byte limit. The regression test ac
 
 Two real TCP/io_uring tests verify declared-length capping with trailing bytes, publication credit, EOF, EAGAIN and cancellation of a queued splice linked behind POLLIN. Workers use the test process's allowed affinity. Link members are published in one submission; an initial test harness incorrectly submitted the two members separately and was corrected. The cancellation test does not cover canceling a running blocking worker: the intended primitive is nonblocking, and the production design still needs an explicit readiness owner for EAGAIN. The tests use a separate small raw ring, not the runtime dispatcher.
 
-Current result: 9 tests, 224 checks, zero failures and zero skips on this Linux host. Runtime executable SHA256 still matches the accepted baseline. No production hit count or throughput improvement is claimed.
+Storage/primitive stage result: 9 tests, 224 checks, zero failures and zero skips on this Linux host. Runtime executable SHA256 still matches the accepted baseline. No production hit count or throughput improvement is claimed.
+
+## Backend transport progress
+
+`IoUringBackend` now submits nonblocking splice, one-shot readiness poll and exact-token cancel SQEs. Eight raw token kinds distinguish input/output, their readiness waits and each target's own cancel SQE. Tokens retain the full 32-bit operation serial and 24-bit connection ID. They are disjoint from both existing upstream episode tokens and downstream send generations. `wait()` decodes them into `BodyPipeTransport` events without changing committed bytes, application pending counts, response timers or copy witnesses. Partial transfers remain visible to the future semantic owner; the ordinary Send proactor does not resubmit them.
+
+Before splice is admitted, `bind_body_pipe_workers` must successfully register the current thread's allowed CPU mask for io_wq. Failed registration disables admission. A SQ-full failure preserves a reservation for explicit rollback. Malformed raw flags, zero serials and out-of-range connection IDs fail the backend before publication. Exact serial cancellation of an old readiness wait cannot cancel a successor. The transport event cannot resume a JIT yield.
+
+No response-path caller exists yet. Existing dispatchers deliberately do not interpret raw pipe events as semantic I/O; the next stage must add authenticated dispatch before enabling any caller. That stage must also retain connection lifetime across readiness/cancel completion (even when no splice currently owns the pipe), persist a serial namespace across allocator and connection-slot reuse, and convert EAGAIN into readiness/fallback rather than origin failure. Do not infer production cancellation or timeout correctness from the backend tests alone.
 
 ## Correctness and retention gates
 
