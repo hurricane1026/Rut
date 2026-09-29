@@ -1858,3 +1858,26 @@ Two-sample, 6-second paired Rut controls with exact-body preflight and zero erro
 | 64 KiB keepalive | 0.9946 | 0.9981 |
 
 The 64 KiB keepalive result is negative in both process orders, while close is approximately flat. The extra offset handling across `Buffer` calls likely consumed the saved copy cost, though these controls do not isolate that mechanism. The candidate was reverted. `discard-prefix-rejected.json` has all paired samples and trace counts; `discard-prefix-evidence.tar.gz` SHA256 `5282d1323cc67e7908621005b00c9dcaee90926c6dd3e896133c9661e12f1be4` contains drivers, raw logs, test results and the rejected patch. No nginx acceptance or full-matrix result is updated, and no huge pages were used.
+
+## Post-rebase pinned-cache full-matrix scan: incomplete final coordinate group
+
+The accepted response-header-cache Rut binary `f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0` and rebased converter `2e19980ca539377c968bed8347d6b9dcf1907debbf8b5437d469a94c0de5659f` ran the pinned-nginx acceptance matrix: HTTP/HTTPS, native static/converter-strict proxy, close/implicit keepalive, 16/1024/65536/1048576-byte bodies, c1/c32/c128, 3 repeats, 2 s warmup and at least 5 s measured load. No huge pages or host kernel settings were used. Every included sample had exact-body preflight and zero warmup/load errors.
+
+Of 96 expected coordinates, **93 have valid, performance-eligible measurements**: 81 meet Rut/nginx median RPS >=1.05 and 12 miss it. The final HTTPS 1 MiB proxy keepalive group has three **invalid/missing** coordinates because an unrelated `pr-watchdog` worktree began compiling `test_network` before the third repeat; the host-busy guard stopped that group. Subsequent attempts stopped on the same independent compile. The first two repeats are retained but are not promoted to acceptance evidence. The matrix's `complete` flag means it visited all coordinate groups, not that these three passed. A fresh complete group is required to close the 96-coordinate scan.
+
+| Unmet coordinate | Rut/nginx | Additional Rut gain to 1.05 |
+|---|---:|---:|
+| HTTP 64 KiB proxy keepalive c1 | 0.9865 | 6.44% |
+| HTTP 64 KiB proxy close c1 | 0.9880 | 6.27% |
+| HTTP 16 B proxy keepalive c1 | 1.0022 | 4.76% |
+| HTTP 1 KiB proxy keepalive c1 | 1.0052 | 4.46% |
+| HTTPS 1 MiB proxy close c128 | 1.0157 | 3.38% |
+| HTTP 1 KiB proxy close c1 | 1.0219 | 2.75% |
+| HTTP 16 B proxy close c1 | 1.0244 | 2.49% |
+| HTTP 1 MiB static keepalive c128 | 1.0263 | 2.31% |
+| HTTP 1 KiB static close c1 | 1.0341 | 1.54% |
+| HTTPS 64 KiB proxy keepalive c1 | 1.0392 | 1.04% |
+| HTTP 64 KiB static close c1 | 1.0401 | 0.95% |
+| HTTPS 1 KiB proxy keepalive c1 | 1.0491 | 0.08% |
+
+The HTTPS 1 MiB proxy close c128 result differs from the earlier targeted 1.0526: Rut stayed near 586 RPS while nginx rose from about 556 to 578 RPS. All six current samples are individually valid and tightly grouped; this is a current miss that needs a separate confirmation, not a reason to discard the matrix row. HTTP 1 MiB static keepalive c1 passes at 1.1910 only because the nginx samples vary widely (about 4523–5572 RPS), and c32 passes narrowly at 1.0537; both warrant confirmation before treating their margins as stable. `post-rebase-full-matrix-interim.json` gives exact medians, required gains and invalid run status. `post-rebase-full-matrix-interim-evidence.tar.gz` SHA256 `b0efa187ccdc97445e1e517ec6e54487d676347348fc74cb8d35f5f7f26304c2` retains commands, raw rows, preflights, load logs and host snapshots; TLS private keys, payload files and binaries are excluded.

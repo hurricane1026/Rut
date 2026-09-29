@@ -1,0 +1,230 @@
+{
+  "provenance": {
+    "head": "95b2ab5f97c7fb4c86266b4e072c6dcd31f155a9",
+    "main": "d9c0de8054193c78117e7b94d32feee583265e97",
+    "rut_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+    "converter_sha256": "2e19980ca539377c968bed8347d6b9dcf1907debbf8b5437d469a94c0de5659f",
+    "pinned_nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+    "matrix": "post-rebase-pinned-cache-full-r1",
+    "target_ratio": 1.05,
+    "profile": "acceptance",
+    "repeats": 3,
+    "duration_seconds": 5,
+    "warmup_seconds": 2,
+    "static_profile": "native-body",
+    "proxy_profile": "converter-strict",
+    "keepalive_header": "implicit",
+    "server_cpu": 2,
+    "origin_cpu": 3,
+    "client_cpus": [
+      4,
+      5
+    ],
+    "huge_pages": false
+  },
+  "original_run": "/tmp/rut-bounded-followup-20260928/post-rebase-pinned-cache-full-r1",
+  "matrix_complete_flag": true,
+  "valid_cells": 93,
+  "passed_cells": 81,
+  "missed_cells": 12,
+  "invalid_cells": 3,
+  "misses": [
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 0.9864836967834948,
+      "additional_rut_gain_to_1_05_percent": 6.438657164188832,
+      "median_rps": {
+        "nginx": 8036.887958864185,
+        "rut": 7928.258944295097
+      }
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "rut_over_nginx": 0.9880284399073029,
+      "additional_rut_gain_to_1_05_percent": 6.272244561959295,
+      "median_rps": {
+        "nginx": 6111.5388190371905,
+        "rut": 6038.374164806236
+      }
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0022449298177165,
+      "additional_rut_gain_to_1_05_percent": 4.76481035339027,
+      "median_rps": {
+        "nginx": 10939.147620738824,
+        "rut": 10963.705239413022
+      }
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0052169544433789,
+      "additional_rut_gain_to_1_05_percent": 4.4550626965319085,
+      "median_rps": {
+        "nginx": 10893.210023081174,
+        "rut": 10950.039403513747
+      }
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "rut_over_nginx": 1.015710329888664,
+      "additional_rut_gain_to_1_05_percent": 3.375930036577901,
+      "median_rps": {
+        "nginx": 578.2624268714928,
+        "rut": 587.3471203598634
+      }
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "rut_over_nginx": 1.02190695024716,
+      "additional_rut_gain_to_1_05_percent": 2.74908099470752,
+      "median_rps": {
+        "nginx": 7577.875666921456,
+        "rut": 7743.883812135869
+      }
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0244451915056438,
+      "additional_rut_gain_to_1_05_percent": 2.4945022638837244,
+      "median_rps": {
+        "nginx": 7568.699621829748,
+        "rut": 7753.71793353407
+      }
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "rut_over_nginx": 1.026316803666237,
+      "additional_rut_gain_to_1_05_percent": 2.3075912085977146,
+      "median_rps": {
+        "nginx": 9985.338908556207,
+        "rut": 10248.121112153516
+      }
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0340958127212614,
+      "additional_rut_gain_to_1_05_percent": 1.5379800481820194,
+      "median_rps": {
+        "nginx": 14123.788021793105,
+        "rut": 14605.350053098957
+      }
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0392292041630389,
+      "additional_rut_gain_to_1_05_percent": 1.0364215895602769,
+      "median_rps": {
+        "nginx": 5666.298456950937,
+        "rut": 5888.582835967378
+      }
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0401484860473127,
+      "additional_rut_gain_to_1_05_percent": 0.9471257310698311,
+      "median_rps": {
+        "nginx": 13095.07236260321,
+        "rut": 13620.819692641735
+      }
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0491388480365134,
+      "additional_rut_gain_to_1_05_percent": 0.08208179166164786,
+      "median_rps": {
+        "nginx": 9504.495167942032,
+        "rut": 9971.53511166331
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "source": null,
+      "error": null
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "source": null,
+      "error": null
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "source": null,
+      "error": null
+    }
+  ],
+  "recovery_attempts": [
+    {
+      "run": "post-rebase-pinned-cache-https1m-keep-retry-r1",
+      "status": {
+        "complete": false,
+        "valid": false,
+        "error": "RuntimeError(\"benchmark host busy: ['3048921 cc1plus          100']\")"
+      }
+    },
+    {
+      "run": "post-rebase-pinned-cache-tail-r2",
+      "status": {
+        "complete": false,
+        "valid": false,
+        "error": "RuntimeError(\"benchmark host busy: ['3048921 cc1plus         98.1']\")"
+      }
+    },
+    {
+      "run": "post-rebase-pinned-cache-tail-r3",
+      "status": {
+        "complete": false,
+        "valid": false,
+        "error": "RuntimeError(\"benchmark host busy: ['3051378 cc1plus         99.3']\")"
+      }
+    }
+  ],
+  "archive_sha256": "b0efa187ccdc97445e1e517ec6e54487d676347348fc74cb8d35f5f7f26304c2"
+}
