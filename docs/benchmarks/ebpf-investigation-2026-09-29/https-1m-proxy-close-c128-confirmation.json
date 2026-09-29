@@ -1,0 +1,17 @@
+{
+  "scenario": "proxy-close",
+  "transport": "https",
+  "body_size": 1048576,
+  "concurrency": 128,
+  "median_rps": {
+    "nginx": 575.323453005911,
+    "rut": 585.0430873105267
+  },
+  "rut_over_nginx": 1.0168942083863142,
+  "gain_to_1_05": 0.03255578735788123,
+  "status": {
+    "complete": true,
+    "valid": true
+  },
+  "run": "/tmp/rut-bounded-followup-20260928/post-rebase-https-1m-proxy-close-c128-confirm-r1"
+}
