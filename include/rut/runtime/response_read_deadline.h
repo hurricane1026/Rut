@@ -1936,9 +1936,10 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         c.resp_header_mutation_count == 0 && c.resp_header_mutation_pending_count == 0 &&
         !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow;
     if (!common_request) return false;
-    const bool coalesced_get = response_read_deadline_coalesced_get_phase1_stash_is_stable(
-        c, c.response_read_deadline_upload);
-    if (c.pipeline_stash_len != 0 && !coalesced_get) return false;
+    if (c.pipeline_stash_len != 0 &&
+        !response_read_deadline_coalesced_get_phase1_stash_is_stable(
+            c, c.response_read_deadline_upload))
+        return false;
     const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
         c.response_read_deadline_buffering);
     const bool fixed_upload =
