@@ -1,0 +1,129 @@
+{
+  "scenario": "HTTP 65536-byte converter-strict proxy, implicit keepalive, c1",
+  "rut_binary_sha256": "f98ae490e57774dae6adb9ceb20db84e13804bdd57409e4dd8020e0230b22c2d",
+  "timer": {
+    "requests": 63224,
+    "seconds": 8.099234,
+    "rps": 7806.17031190851,
+    "exact_body": true,
+    "zero_errors": true,
+    "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-rebased-main-733",
+    "server_pid": 2987685,
+    "timer_attempts": 0,
+    "trace_ready": true,
+    "trace_exit_code": 0,
+    "timer_attempts_per_request": 0.0,
+    "trace_valid": true
+  },
+  "old_candidate_pipe_gate": {
+    "r1": {
+      "requests": 62532,
+      "seconds": 8.099473,
+      "rps": 7720.502309224316,
+      "exact_body": true,
+      "zero_errors": true,
+      "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pipe-64k",
+      "server_pid": 2987978,
+      "gates": {
+        "attempt": 124982,
+        "header_sent": 8,
+        "body_size": 8,
+        "stable_state": 8,
+        "send_owner": 8,
+        "allocation": 8,
+        "splice_submit": 16
+      },
+      "trace_ready": true,
+      "trace_exit_code": 0,
+      "gate_attempts_per_request": 1.998688671400243,
+      "trace_valid": true
+    },
+    "r2": {
+      "requests": 59127,
+      "seconds": 8.099891,
+      "rps": 7299.727860535408,
+      "exact_body": true,
+      "zero_errors": true,
+      "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pipe-64k",
+      "server_pid": 2988230,
+      "gates": {
+        "attempt": 118198,
+        "before_header_sent": 118198,
+        "header_sent": 0,
+        "body_size": 0,
+        "stable_state": 0,
+        "send_owner": 0,
+        "allocation": 0,
+        "splice_submit": 0
+      },
+      "trace_ready": true,
+      "trace_exit_code": 0,
+      "gate_attempts_per_request": 1.999052886160299,
+      "trace_valid": true
+    }
+  },
+  "current_stage_traces": {
+    "response": {
+      "nginx": {
+        "sampled_requests": 2438,
+        "mean_us": {
+          "sample_first_ns": 75.43663863822806,
+          "sample_tail_ns": 39.01247169811321,
+          "sample_total_ns": 114.44911033634126
+        },
+        "measured_requests": 157907,
+        "measured_seconds": 20.099577,
+        "trace_usable": true,
+        "zero_warmup_load_errors": true,
+        "exact_body_preflight": true,
+        "incomplete_samples": 0
+      },
+      "rut-rebased": {
+        "sampled_requests": 2336,
+        "mean_us": {
+          "sample_first_ns": 79.11651669520549,
+          "sample_tail_ns": 34.19740796232877,
+          "sample_total_ns": 113.31392465753424
+        },
+        "measured_requests": 154316,
+        "measured_seconds": 20.099689,
+        "trace_usable": true,
+        "zero_warmup_load_errors": true,
+        "exact_body_preflight": true,
+        "incomplete_samples": 0
+      }
+    },
+    "first": {
+      "nginx": {
+        "sampled_requests": 2461,
+        "mean_us": {
+          "first_origin_ns": 29.940234863876473,
+          "first_request_ns": 32.78843031288094,
+          "first_response_ns": 15.155213327915483,
+          "first_total_ns": 77.88387850467291
+        },
+        "measured_requests": 159124,
+        "measured_seconds": 20.09932,
+        "trace_usable": true,
+        "zero_warmup_load_errors": true,
+        "exact_body_preflight": true,
+        "incomplete_samples": 0
+      },
+      "rut-rebased": {
+        "sampled_requests": 2376,
+        "mean_us": {
+          "first_origin_ns": 30.064331228956227,
+          "first_request_ns": 34.73878956228956,
+          "first_response_ns": 15.08963973063973,
+          "first_total_ns": 79.89276052188552
+        },
+        "measured_requests": 154456,
+        "measured_seconds": 20.099632,
+        "trace_usable": true,
+        "zero_warmup_load_errors": true,
+        "exact_body_preflight": true,
+        "incomplete_samples": 0
+      }
+    }
+  }
+}
