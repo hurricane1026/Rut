@@ -1,0 +1,33 @@
+{
+  "maps": {
+    "@cs_afterconnect_ns": {
+      "2865904": 26138090
+    },
+    "@cs_connect_ns": {
+      "2865904": 35882442
+    },
+    "@cs_connect_results": {
+      "2865904,0": 2488
+    },
+    "@cs_established_samples": {
+      "2865904": 2488
+    },
+    "@cs_established_to_send_ns": {
+      "2865904": 22715254
+    },
+    "@cs_preconnect_ns": {
+      "2865904": 23342637
+    },
+    "@cs_request_ns": {
+      "2865904": 85363169
+    },
+    "@cs_samples": {
+      "2865904": 2488
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [],
+  "tcp": []
+}

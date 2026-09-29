@@ -1,0 +1,60 @@
+import sys
+sys.path.insert(0,'/home/hurricane/private/code/Rut-s1/scripts/ebpf_trace')
+import trace
+original=trace.generate
+trace.GROUPS+=('connect-sampled',)
+def generate(*args):
+ return original(*args)+'''
+// c1 only, sample 1/64 positive frontend receives. No upstream reuse.
+fexit:tcp_recvmsg /@targets[pid] && retval>0/ {
+ if (args.sk->__sk_common.skc_num==8987) {
+  if (@cs_socket[pid]) {
+   $sk=@cs_socket[pid];
+   $ignored=delete(@cs_owner[$sk]); $ignored=delete(@cs_established[$sk]);
+   $ignored=delete(@cs_socket[pid]);
+   @cs_unfinished[pid]=count();
+  }
+  $ignored=delete(@cs_front[pid]); $ignored=delete(@cs_enter[pid]);
+  $ignored=delete(@cs_exit[pid]);
+  if ((rand&63)==0) { @cs_front[pid]=nsecs; }
+ }
+}
+fentry:tcp_v4_connect /@targets[pid] && @cs_front[pid]/ {
+ $sk=(uint64)args.sk;
+ @cs_enter[pid]=nsecs;
+ @cs_socket[pid]=$sk; @cs_owner[$sk]=pid;
+}
+fexit:tcp_v4_connect /@targets[pid] && @cs_enter[pid]/ {
+ @cs_exit[pid]=nsecs;
+ @cs_connect_results[pid,retval]=count();
+}
+tracepoint:sock:inet_sock_set_state /args.newstate==1/ {
+ $sk=(uint64)args.skaddr;
+ if (@cs_owner[$sk]) { @cs_established[$sk]=nsecs; }
+}
+fentry:tcp_sendmsg /@targets[pid] && @cs_front[pid]/ {
+ if (bswap(args.sk->__sk_common.skc_dport)==9987) {
+  $sk=(uint64)args.sk; $now=nsecs;
+  if (@cs_socket[pid]==$sk && @cs_enter[pid] && @cs_exit[pid]) {
+   @cs_samples[pid]=count();
+   @cs_preconnect_ns[pid]=sum((uint64)((int64)@cs_enter[pid]-(int64)@cs_front[pid]));
+   @cs_connect_ns[pid]=sum((uint64)((int64)@cs_exit[pid]-(int64)@cs_enter[pid]));
+   @cs_afterconnect_ns[pid]=sum((uint64)((int64)$now-(int64)@cs_exit[pid]));
+   @cs_request_ns[pid]=sum((uint64)((int64)$now-(int64)@cs_front[pid]));
+   if (@cs_established[$sk]) {
+    @cs_established_samples[pid]=count();
+    @cs_established_to_send_ns[pid]=sum((uint64)((int64)$now-(int64)@cs_established[$sk]));
+   } else { @cs_missing_established[pid]=count(); }
+  } else { @cs_unmatched[pid]=count(); }
+  $ignored=delete(@cs_owner[$sk]); $ignored=delete(@cs_established[$sk]);
+  $ignored=delete(@cs_socket[pid]); $ignored=delete(@cs_front[pid]);
+  $ignored=delete(@cs_enter[pid]); $ignored=delete(@cs_exit[pid]);
+ }
+}
+END {
+ clear(@cs_owner); clear(@cs_established); clear(@cs_socket);
+ clear(@cs_front); clear(@cs_enter); clear(@cs_exit);
+}
+'''
+trace.generate=generate
+sys.exit(trace.main())

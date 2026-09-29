@@ -1,0 +1,11 @@
+{"type": "attached_probes", "count": 11, "data": {"probes": 11}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@cs_afterconnect_ns": {"2865661": 25680190}}}
+{"type": "map", "data": {"@cs_connect_ns": {"2865661": 37449192}}}
+{"type": "map", "data": {"@cs_connect_results": {"2865661,0": 2430}}}
+{"type": "map", "data": {"@cs_established_samples": {"2865661": 2430}}}
+{"type": "map", "data": {"@cs_established_to_send_ns": {"2865661": 22259641}}}
+{"type": "map", "data": {"@cs_preconnect_ns": {"2865661": 24375904}}}
+{"type": "map", "data": {"@cs_request_ns": {"2865661": 87505286}}}
+{"type": "map", "data": {"@cs_samples": {"2865661": 2430}}}

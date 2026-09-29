@@ -1429,3 +1429,18 @@ All 28 causal samples pass exact-body preflight and zero-error warm/load checks.
 - 65536-c1-keepalive: -0.075%.
 
 The lagging 64 KiB targets remain essentially flat with opposite signs, so no useful target improvement is established. Revert the output-parameter/API change without broadening testing to chase small fluctuations. Frozen candidate and build-rel remain rejected artifacts until rebuilt. Accepted binary remains rut-combined-fin-ordered. Proceed to sparse eBPF decomposition of the upstream connection stage on that accepted binary.
+
+## Sparse upstream connection-stage decomposition
+
+Use the accepted binary and sample 1/64 positive frontend receives in c1 non-pipelined traffic. Measure frontend tcp_recvmsg return to tcp_v4_connect entry, tcp_v4_connect entry/exit, then its exit to first upstream tcp_sendmsg entry. Separately capture the socket's ESTABLISHED transition and time to that first send. tcp_v4_connect exit is not itself a completed-handshake timestamp. Values are mean microseconds per matched sample.
+
+| Case | Samples | Before connect function | Connect function | Function exit to send | Request stage total | ESTABLISHED to send |
+|---|---:|---:|---:|---:|---:|---:|
+| 65536-c1-close-nginx | 1854 | 9.358 | 15.025 | 10.980 | 35.364 | 9.596 |
+| 65536-c1-close-rut-fin | 1869 | 9.851 | 15.651 | 10.789 | 36.291 | 9.317 |
+| 65536-c1-keepalive-nginx | 2488 | 9.382 | 14.422 | 10.506 | 34.310 | 9.130 |
+| 65536-c1-keepalive-rut-fin | 2430 | 10.031 | 15.411 | 10.568 | 36.010 | 9.160 |
+
+All four runs pass exact-body preflight, zero-error warm/load checks and trace usability. All samples match a socket and ESTABLISHED transition; no unfinished/missing/unmatched sample counters occur. Observed connect function returns are zero.
+
+Rut-minus-nginx request-stage differences are about +0.93 us close and +1.70 us keepalive. Most of that lead appears before or inside tcp_v4_connect; the post-function-return-to-send differences are -0.19 us close and +0.06 us keepalive. This does not support assuming that delayed userspace dispatch after connection completion is the dominant remaining gap. It motivates splitting kernel connect work (such as source-port assignment) from pre-connect userspace/socket setup before choosing another implementation change. This is one process order on an unreserved host. Probe overhead and sampling variation limit sub-microsecond attribution, and instrumented RPS is not acceptance evidence. No conclusion about generic io_uring versus epoll performance follows from this trace.
