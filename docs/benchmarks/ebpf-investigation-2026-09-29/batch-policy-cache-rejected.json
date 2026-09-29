@@ -1,0 +1,51 @@
+{
+  "candidate_sha256": "a7e4236e10124f25ccbe0e1d42206d69400a3ebf26792ae44841fe59ceb206ec",
+  "baseline_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "network_tests": "1460 passed, 391501 checks",
+  "cases": {
+    "16-close": {
+      "candidate_rps": [
+        7799.615601264017,
+        7802.161844571192
+      ],
+      "baseline_rps": [
+        7758.207028584085,
+        7730.975496471918
+      ],
+      "candidate_over_baseline": 1.0072692616667838
+    },
+    "16-keepalive": {
+      "candidate_rps": [
+        10915.401173494565,
+        10971.20350092189
+      ],
+      "baseline_rps": [
+        10925.377489718985,
+        10939.740280349288
+      ],
+      "candidate_over_baseline": 1.0009827024292361
+    },
+    "64k-close": {
+      "candidate_rps": [
+        6055.423032774508,
+        6029.166053896553
+      ],
+      "baseline_rps": [
+        6038.9912381432,
+        5993.605574818758
+      ],
+      "candidate_over_baseline": 1.004320952036978
+    },
+    "64k-keepalive": {
+      "candidate_rps": [
+        7838.129485787622,
+        7853.526742386485
+      ],
+      "baseline_rps": [
+        7853.332325592033,
+        7845.154842206637
+      ],
+      "candidate_over_baseline": 0.9995648663752406
+    }
+  }
+}
