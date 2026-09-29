@@ -36605,6 +36605,230 @@ struct ScopedIoUringLoopForRetirement {
     }
 };
 
+static IoEvent pipe_transport_event(u32 id, BodyPipeOperation operation, u32 serial, i32 result) {
+    IoEvent event{};
+    event.conn_id = id;
+    event.type = IoEventType::BodyPipeTransport;
+    event.aux = static_cast<u8>(operation);
+    event.non_upstream_generation = serial;
+    event.result = result;
+    return event;
+}
+
+TEST(iouring_body_pipe, target_and_cancel_both_pin_slot_across_reset_in_both_orders) {
+    for (bool target_first : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(1));
+        auto& loop = *guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(loop, 8));
+        auto* c = loop.alloc_conn();
+        REQUIRE(c != nullptr);
+        c->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        REQUIRE(c->fd >= 0 && c->upstream_fd >= 0);
+        REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+        auto* owner = c->response_body_pipe;
+        const i32 pipe_fd = owner->storage.read_fd;
+        owner->storage.sequence = 9;
+        REQUIRE(owner->own_target(BodyPipeOperation::InputReady, 9));
+        c->pending_ops = 1;
+        ::close(c->fd);
+        ::close(c->upstream_fd);
+        c->fd = c->upstream_fd = -1;
+        loop.free_conn(*c);
+        CHECK_EQ(loop.free_top, 0u);
+        CHECK_EQ(c->response_body_pipe, owner);
+        CHECK_EQ(c->pending_ops, 2u);
+        CHECK(owner->closing);
+        c->pending_ops = 0;  // independent owner guard must still refuse reuse
+        loop.reclaim_slot(c->id);
+        loop.reclaim_pending();
+        CHECK_EQ(loop.free_top, 0u);
+        CHECK_EQ(c->response_body_pipe, owner);
+        c->pending_ops = 2;
+        CHECK(!loop.release_response_body_pipe(*c));
+        CHECK(fcntl(pipe_fd, F_GETFD) >= 0);
+        auto target = pipe_transport_event(0, BodyPipeOperation::InputReady, 9, -ECANCELED);
+        auto cancel = pipe_transport_event(0, BodyPipeOperation::CancelInputReady, 9, 0);
+        auto stale = target;
+        stale.non_upstream_generation = 8;
+        loop.dispatch(stale);
+        CHECK_EQ(c->pending_ops, 2u);
+        loop.dispatch(target_first ? target : cancel);
+        CHECK_EQ(c->pending_ops, 1u);
+        CHECK_EQ(loop.free_top, 0u);
+        CHECK(fcntl(pipe_fd, F_GETFD) >= 0);
+        loop.dispatch(target_first ? target : cancel);  // duplicate
+        CHECK_EQ(c->pending_ops, 1u);
+        loop.dispatch(target_first ? cancel : target);
+        CHECK_EQ(loop.free_top, 1u);
+        CHECK_EQ(c->response_body_pipe, nullptr);
+        CHECK_EQ(fcntl(pipe_fd, F_GETFD), -1);
+        CHECK_EQ(errno, EBADF);
+        auto* reused = loop.alloc_conn();
+        REQUIRE(reused != nullptr);
+        CHECK_EQ(reused->response_body_pipe_sequence, 9u);
+        reused->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        reused->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        REQUIRE(reused->fd >= 0 && reused->upstream_fd >= 0);
+        REQUIRE(loop.allocate_response_body_pipe(*reused, 4096));
+        auto* fresh = reused->response_body_pipe;
+        REQUIRE_EQ(fresh->storage.sequence, 9u);
+        const u32 next = ++fresh->storage.sequence;
+        REQUIRE(fresh->own_target(BodyPipeOperation::InputReady, next));
+        reused->pending_ops = 1;
+        loop.dispatch(target);
+        loop.dispatch(cancel);
+        CHECK_EQ(reused->pending_ops, 1u);
+        CHECK_EQ(fresh->targets[2], next);
+        ::close(reused->fd);
+        ::close(reused->upstream_fd);
+        reused->fd = reused->upstream_fd = -1;
+        loop.free_conn(*reused);
+        loop.dispatch(pipe_transport_event(0, BodyPipeOperation::InputReady, next, -ECANCELED));
+        loop.dispatch(pipe_transport_event(0, BodyPipeOperation::CancelInputReady, next, 0));
+        CHECK_EQ(loop.free_top, 1u);
+    }
+}
+
+TEST(iouring_body_pipe, sq_full_close_retry_survives_reset_and_terminal_race) {
+    for (bool target_before_retry : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(1));
+        auto& loop = *guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(loop, 8));
+        auto* c = loop.alloc_conn();
+        REQUIRE(c != nullptr);
+        c->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        REQUIRE(c->fd >= 0 && c->upstream_fd >= 0);
+        REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+        auto* owner = c->response_body_pipe;
+        owner->storage.sequence = 3;
+        REQUIRE(owner->own_target(BodyPipeOperation::OutputReady, 3));
+        c->pending_ops = 1;
+        guard.sq_tail = 8;  // no SQ slot, no queued cancel
+        ::close(c->fd);
+        ::close(c->upstream_fd);
+        c->fd = c->upstream_fd = -1;
+        loop.free_conn(*c);
+        CHECK_EQ(c->pending_ops, 1u);
+        CHECK_EQ(loop.body_pipe_cancel_retry_count, 1u);
+        CHECK(owner->retry_registered);
+        CHECK_EQ(loop.free_top, 0u);
+        auto target = pipe_transport_event(0, BodyPipeOperation::OutputReady, 3, POLLOUT);
+        if (target_before_retry) {
+            loop.dispatch(target);
+            CHECK_EQ(loop.body_pipe_cancel_retry_count, 0u);
+            CHECK_EQ(loop.free_top, 1u);
+            loop.retry_body_pipe_cancels();
+            CHECK_EQ(loop.backend.pending, 0u);
+        } else {
+            guard.sq_head = 8;
+            loop.retry_body_pipe_cancels();
+            CHECK_EQ(loop.body_pipe_cancel_retry_count, 0u);
+            CHECK_EQ(c->pending_ops, 2u);
+            loop.dispatch(target);
+            CHECK_EQ(loop.free_top, 0u);
+            loop.dispatch(
+                pipe_transport_event(0, BodyPipeOperation::CancelOutputReady, 3, -ENOENT));
+            CHECK_EQ(loop.free_top, 1u);
+        }
+    }
+}
+
+TEST(iouring_body_pipe, late_positive_input_closes_only_after_its_cancel) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(1));
+    auto& loop = *guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(loop, 8));
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(c->fd >= 0 && c->upstream_fd >= 0);
+    REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+    auto* owner = c->response_body_pipe;
+    ResponseBodyPipe::Operation in{};
+    REQUIRE(owner->storage.reserve_input(4, &in));
+    REQUIRE(owner->storage.submit_input(in.serial));
+    REQUIRE(owner->own_target(BodyPipeOperation::Input, in.serial));
+    REQUIRE_EQ(write(owner->storage.write_fd, "late", 4), 4);
+    c->pending_ops = 1;
+    ::close(c->fd);
+    ::close(c->upstream_fd);
+    c->fd = c->upstream_fd = -1;
+    loop.free_conn(*c);
+    auto positive = pipe_transport_event(0, BodyPipeOperation::Input, in.serial, 4);
+    auto oversized = positive;
+    oversized.result = 5;
+    loop.dispatch(oversized);
+    CHECK_EQ(c->pending_ops, 2u);
+    CHECK_EQ(owner->storage.bytes, 0u);
+    loop.dispatch(positive);
+    CHECK_EQ(c->pending_ops, 1u);
+    CHECK_EQ(owner->storage.bytes, 4u);
+    CHECK_EQ(c->response_read_deadline_post_commit_origin_received, 0u);
+    CHECK_EQ(loop.free_top, 0u);
+    loop.dispatch(pipe_transport_event(0, BodyPipeOperation::CancelInput, in.serial, -ENOENT));
+    CHECK_EQ(loop.free_top, 1u);
+}
+
+TEST(iouring_body_pipe, real_poll_close_drains_and_forced_shutdown_releases_descriptors) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    int sockets[2];
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(sockets), 0);
+    ScopedListenerTestFd peer(sockets[1]);
+    c->fd = sockets[0];
+    c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(c->upstream_fd >= 0);
+    REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+    auto* owner = c->response_body_pipe;
+    owner->storage.sequence = 1;
+    REQUIRE(loop.backend.add_body_pipe_poll(c->fd, c->id, 1, true));
+    REQUIRE(owner->own_target(BodyPipeOperation::InputReady, 1));
+    ++c->pending_ops;
+    const i32 pipe_fd = owner->storage.read_fd;
+    loop.close_conn(*c);
+    CHECK_EQ(c->response_body_pipe, owner);
+    for (u32 i = 0; i < 4 && c->response_body_pipe; ++i) {
+        IoEvent events[8]{};
+        const u32 count = loop.backend.wait(events, 8, loop.conns, loop.connection_capacity);
+        REQUIRE_EQ(loop.backend.failure_code(), 0);
+        loop.dispatch_batch(events, count);
+    }
+    CHECK_EQ(c->response_body_pipe, nullptr);
+    CHECK_EQ(fcntl(pipe_fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(c->fd >= 0 && c->upstream_fd >= 0);
+    REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+    const i32 forced_read = c->response_body_pipe->storage.read_fd;
+    const i32 forced_write = c->response_body_pipe->storage.write_fd;
+    // Reserve without submission: forced ring teardown must still drop fds.
+    ResponseBodyPipe::Operation reserved{};
+    REQUIRE(c->response_body_pipe->storage.reserve_input(4, &reserved));
+    ::close(c->fd);
+    ::close(c->upstream_fd);
+    c->fd = c->upstream_fd = -1;
+    loop.shutdown();
+    guard.initialized = false;
+    CHECK_EQ(fcntl(forced_read, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_EQ(fcntl(forced_write, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+}
+
 TEST(iouring_byte_buffers, dirty_connection_reuse_resets_valid_lengths) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

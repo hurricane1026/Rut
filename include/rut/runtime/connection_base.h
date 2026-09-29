@@ -32,6 +32,7 @@ using IoTimespec = __kernel_timespec;
 using IoTimespec = timespec;
 #endif
 
+struct ResponseBodyPipeOwner;
 struct RouteConfig;  // forward for per-request config pin below
 struct Http2Conn;    // forward: per-connection HTTP/2 engine, pool-allocated
 
@@ -1778,6 +1779,10 @@ struct ConnectionBase {
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
     ResponseBodyChain response_body_tail{};
+    ResponseBodyPipeOwner* response_body_pipe = nullptr;
+    // Persistent across reset and allocator reuse; zero is the initial value,
+    // UINT32_MAX permanently disables new pipe operations on this slot.
+    u32 response_body_pipe_sequence = 0;
 
     // io_uring only: true while a *direct* one-shot upstream recv (straight
     // into either upstream_recv_buf's bulk-sized destination, or — for a
@@ -1825,6 +1830,7 @@ struct ConnectionBase {
     }
 
     void reset() {
+        response_body_pipe = nullptr;
         response_body_tail = {};
         on_recv = nullptr;
         on_send = nullptr;
