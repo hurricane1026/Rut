@@ -1083,3 +1083,7 @@ All four r5 traces are usable with zero warm/load errors and exact completed res
 ## Full accepted-version formal matrix in progress
 
 The complete 96-coordinate matrix is now running against the accepted 271cd98c runtime frozen as rut-combined-fin-ordered. It covers both transports, all four sizes/scenarios and three concurrency levels, with three 5-second measurements and 2-second warmups per engine. The native-body static and converter-strict proxy profiles, implicit keepalive, no upstream reuse, pinned nginx and >=1.10 target remain unchanged. Load budget is 4032 seconds plus setup/validation/cleanup. The rejected token-vector, direct-header and shutdown-once binaries are not used. No huge pages or kernel tuning are enabled. This entry records a live run, not completed acceptance.
+
+## Full-matrix checkpoint: HTTP 16-byte coordinates
+
+The first 12 coordinates of the full formal run are complete and valid; ten meet >=1.10. In c1/c32/c128 order, static close ratios are 1.1476/1.2720/1.3601, static keepalive 1.5859/2.8637/2.9596, proxy close 1.0252/1.2060/1.2870, and proxy keepalive 1.0043/1.1912/1.3658. Both proxy c1 coordinates remain below the acceptance target. This is an explicit partial checkpoint, not full-matrix completion; the same live process continues through the remaining coordinates.
