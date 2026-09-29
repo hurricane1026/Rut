@@ -1266,3 +1266,19 @@ All four cases again have zero warmup/load errors and zero incomplete sampled co
 Both close and keepalive workloads completed exact-body preflight, warmup and 20-second load without errors. Raw DWARF perf.data is retained in the lab; text reports and workload logs are archived under `accepted-64k-users-r1`. Short-lived addr2line expansion was slow; the driver ultimately completed both reports and workloads successfully. Sampled self shares for close/keepalive: policy_bundle_id_is_valid 3.20%/3.48%, phase1 proof 4.14%/4.34%, all memmove 4.32%/5.17%. Attribution to consume_upstream_sent is approximately 1.33%/1.83%; stack incompleteness limits caller interpretation. These are userspace cycle fractions, not latency fractions or causal gains.
 
 The next isolated experiment forces policy_bundle_id_is_valid inline to let existing caller conditions fold into identical validation logic. It changes no policy checks, cached admission state, memory initialization, or ownership semantics. Retention requires causal throughput evidence and regression tests.
+
+## Policy validator inline experiment: two causal orders
+
+One attribute forces policy_bundle_id_is_valid into callers; validation semantics are unchanged. Build and all 1425 network tests / 371796 checks pass. Both 28-sample causal runs pass full-body preflight and warm/load error checks. Frozen candidate provenance and patch are retained.
+
+| Case | Candidate change, initial order | Reverse order |
+|---|---:|---:|
+| 16 B c1 close | +0.06% | +0.34% |
+| 16 B c32 close | +0.98% | -0.66% |
+| 16 B c1 keepalive | +0.20% | +0.18% |
+| 1 KiB c1 close | -0.10% | -0.24% |
+| 1 KiB c32 close | -0.81% | +0.04% |
+| 64 KiB c1 close | +0.80% | +0.85% |
+| 64 KiB c1 keepalive | +0.24% | +0.52% |
+
+The target close signal repeats, while the small c32 signs do not. This is an incremental candidate, not a retained optimization or evidence of beating nginx. Larger response and concurrent proxy controls are running before retention. Original runtime baseline remains the frozen CombinedSend FIN binary.

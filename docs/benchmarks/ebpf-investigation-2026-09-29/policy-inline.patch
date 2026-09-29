@@ -1,0 +1,13 @@
+diff --git a/include/rut/runtime/route_table.h b/include/rut/runtime/route_table.h
+index 478381b8..538370f0 100644
+--- a/include/rut/runtime/route_table.h
++++ b/include/rut/runtime/route_table.h
+@@ -1901,7 +1901,7 @@ public:
+         return true;
+     }
+ 
+-    bool policy_bundle_id_is_valid(u16 id) const {
++    [[gnu::always_inline]] bool policy_bundle_id_is_valid(u16 id) const {
+         if (policy_bundle_count > kMaxForwardPolicyBundles || id == 0 || id > policy_bundle_count)
+             return false;
+         const auto& b = policy_bundles[id - 1];

@@ -1,0 +1,9 @@
+Running 6s test @ http://127.0.0.1:8987/proxy
+  1 threads and 1 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency   128.45us   10.02us 246.00us   92.21%
+    Req/Sec     6.08k    42.01     6.15k    60.66%
+  36883 requests in 6.10s, 2.26GB read
+Requests/sec:   6046.65
+Transfer/sec:    378.76MB
+METRICS 36883 6099739 125 149 174 0 0 0 0 0

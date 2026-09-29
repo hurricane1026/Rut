@@ -1,0 +1,6 @@
+{
+  "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-policy-inline",
+  "sha256": "06ec68a7d097a4ee757f6e20f5829736509d0236339eabf496c4d835015e28d2",
+  "source_revision": "366b2487cdaa1d10972955628a384d7aa6cf9f5e",
+  "patch": "policy-inline.patch"
+}
