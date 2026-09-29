@@ -1677,3 +1677,19 @@ For the all-receive variant, usable PID-filtered TCP traces under HTTP 64 KiB pr
 | 1 KiB keepalive c1 | — | 0.9988 / 0.9985 |
 
 Each entry is candidate/accepted-pipe median RPS from two 6-second samples per engine, with 2-second warmup, exact-body preflight and zero errors. The global variant has no stable 64 KiB benefit. The first-receive-only variant has a sub-1% 64 KiB keepalive improvement in both orders but does not improve 64 KiB close and tends to lower the smaller keepalive cases; the smallest close cases also have negative first-order results. Since the first receive occurs before the response size is known, this change cannot be restricted to 64 KiB by that response property. Revert both variants: removing an empty read alone is insufficient to move the combined candidate toward passing every lagging coordinate. `frontend-poll-first.json` records medians and eBPF counters. All raw rows, logs and traces are in `frontend-poll-first-evidence.tar.gz` SHA256 `849c79504748ffc6906ed8f596a6e3bb270fa361bb9a76b46dead4a750060f94`. The formal nginx matrix remains 84/96 at 1.05.
+
+## Current 64 KiB userspace cycle profile
+
+Reprofiled the restored accepted pipe binary (SHA256 `1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244`) with 20-second HTTP 64 KiB proxy c1 close and keepalive loads. Exact-body preflight, warmup and load errors are clean; each `cycles:u` report has about 17K samples with zero lost samples. This is a self-cycle profile under `perf`, not a causal throughput comparison with nginx. The leading self shares are:
+
+| Symbol | Close | Keepalive |
+|---|---:|---:|
+| `IoUringBackend::wait` | 6.10% | 5.37% |
+| `HttpResponseParser::parse` | 5.09% | 6.08% |
+| libc memmove | 4.11% | 5.16% |
+| coalesced GET phase-1 proof | 4.10% | 4.28% |
+| policy-bundle validity | 3.16% | 3.38% |
+| strict owner stability | 2.69% | 3.31% |
+| post-commit stability | 2.67% | 3.11% |
+
+The same parser/proof/validation costs seen in the older accepted-runtime profile remain hot after the pipe addition. These percentages are userspace self cycles, not fractions of request latency; adding them does not predict a throughput gain. The 64 KiB eBPF comparison above also gives no evidence of extra receive-copy bytes versus nginx. The next causal change should target one of these repeated userspace computations while preserving strict validation semantics, then be measured on all short/64 KiB lagging coordinates. `pipe-current-64k-users.json` has the top symbols and provenance; `pipe-current-64k-users-evidence.tar.gz` SHA256 `0293e3b0a8bf89e03a4e462f8253830c8eb51a324a5f98b5e1c10be9936c3ecb` has the reports, scripts and logs. Raw perf.data remains in the local lab directory and is excluded from the archive because each file exceeds 130 MiB. No new nginx acceptance result is claimed.
