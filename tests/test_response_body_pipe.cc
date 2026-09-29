@@ -1,4 +1,5 @@
 #include "rut/runtime/response_body_pipe.h"
+#include "rut/runtime/response_body_pipe_owner.h"
 #include "test.h"
 #include <initializer_list>
 
@@ -474,6 +475,61 @@ TEST(response_body_pipe, backend_malformed_flags_or_identity_do_not_publish) {
         CHECK_EQ(f.backend.wait(&event, 1, nullptr, 0), 0u);
         CHECK_EQ(f.backend.failure_code(), EPROTO);
     }
+}
+
+TEST(response_body_pipe, send_frame_preserves_logical_bytes_until_exact_acknowledgment) {
+    ResponseBodyPipeOwner p{};
+    REQUIRE(p.storage.open(4096));
+    auto event = [](BodyPipeOperation op, u32 serial, i32 result) {
+        IoEvent e{};
+        e.type = IoEventType::BodyPipeTransport;
+        e.aux = static_cast<u8>(op);
+        e.non_upstream_generation = serial;
+        e.result = result;
+        return e;
+    };
+    ResponseBodyPipe::Operation in{}, out{};
+    REQUIRE(p.storage.reserve_input(8, &in));
+    REQUIRE(p.storage.submit_input(in.serial));
+    REQUIRE(p.own_target(BodyPipeOperation::Input, in.serial));
+    REQUIRE_EQ(write(p.storage.write_fd, "abcdefgh", 8), 8);
+    REQUIRE(p.retire(event(BodyPipeOperation::Input, in.serial, 8)));
+    REQUIRE(p.storage.reserve_output(8, &out));
+    p.send = {out.serial, 8, 0, ResponseBodyPipeOwner::SendKind::Release, false};
+    const u32 frame_serial = out.serial;
+    REQUIRE(p.storage.submit_output(out.serial));
+    REQUIRE(p.own_target(BodyPipeOperation::Output, out.serial));
+    char bytes[8]{};
+    REQUIRE_EQ(read(p.storage.read_fd, bytes, 3), 3);
+    REQUIRE(p.retire(event(BodyPipeOperation::Output, out.serial, 3)));
+    CHECK_EQ(p.storage.bytes, 5u);
+    CHECK_EQ(p.send.completed, 3u);
+    CHECK_EQ(p.logical_bytes(), 8u);
+    CHECK(p.busy());
+    CHECK(!p.acknowledge_send(frame_serial, 8));
+    REQUIRE(p.storage.reserve_input(2, &in));
+    REQUIRE(p.storage.submit_input(in.serial));
+    REQUIRE(p.own_target(BodyPipeOperation::Input, in.serial));
+    REQUIRE_EQ(write(p.storage.write_fd, "ij", 2), 2);
+    REQUIRE(p.retire(event(BodyPipeOperation::Input, in.serial, 2)));
+    CHECK_EQ(p.logical_bytes(), 10u);
+    REQUIRE(p.storage.reserve_output(5, &out));
+    REQUIRE(p.storage.submit_output(out.serial));
+    REQUIRE(p.own_target(BodyPipeOperation::Output, out.serial));
+    CHECK(!p.retire(event(BodyPipeOperation::Output, out.serial, 6)));
+    REQUIRE_EQ(read(p.storage.read_fd, bytes, 5), 5);
+    CHECK_EQ(memcmp(bytes, "defgh", 5), 0);
+    REQUIRE(p.retire(event(BodyPipeOperation::Output, out.serial, 5)));
+    CHECK_EQ(p.logical_bytes(), 10u);
+    CHECK_EQ(p.send.completed, 8u);
+    p.send.delivering = true;
+    CHECK(!p.acknowledge_send(frame_serial + 1, 8));
+    REQUIRE(p.acknowledge_send(frame_serial, 8));
+    CHECK(!p.acknowledge_send(frame_serial, 8));
+    CHECK_EQ(p.logical_bytes(), 2u);
+    REQUIRE_EQ(p.storage.drain_into(reinterpret_cast<u8*>(bytes), sizeof(bytes)), 2);
+    CHECK_EQ(memcmp(bytes, "ij", 2), 0);
+    REQUIRE(p.storage.close());
 }
 
 TEST(response_body_pipe, flags_capacity_and_transactional_reservations) {

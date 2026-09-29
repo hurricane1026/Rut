@@ -1798,18 +1798,18 @@ struct ConnectionBase {
 
     bool buffered_response_front_is_pipe() const {
         return upstream_recv_buf.len() == 0 && response_body_tail.size == 0 && response_body_pipe &&
-               response_body_pipe->storage.bytes != 0;
+               response_body_pipe->logical_bytes() != 0;
     }
     u32 buffered_response_len() const {
         return upstream_recv_buf.len() + response_body_tail.size +
-               (response_body_pipe ? response_body_pipe->storage.bytes : 0);
+               (response_body_pipe ? response_body_pipe->logical_bytes() : 0);
     }
     const u8* buffered_response_data() const {
         if (buffered_response_front_is_pipe()) return nullptr;
         return upstream_recv_buf.len() ? upstream_recv_buf.data() : response_body_tail.data();
     }
     u32 buffered_response_front_size() const {
-        if (buffered_response_front_is_pipe()) return response_body_pipe->storage.bytes;
+        if (buffered_response_front_is_pipe()) return response_body_pipe->logical_bytes();
         return upstream_recv_buf.len() ? upstream_recv_buf.len() : response_body_tail.front_size();
     }
 
