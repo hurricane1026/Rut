@@ -1,0 +1,96 @@
+BEGIN { @targets[2850979] = 1; printf("RUT_TRACE_READY\n"); }
+interval:s:24 { exit(); }
+
+fentry:tcp_recvmsg /@targets[pid]/ {
+    $sk = args.sk;
+    $side = 0;
+    if ($sk->__sk_common.skc_num == 8987) { $side = 1; }
+    else if (bswap($sk->__sk_common.skc_dport) == 9987) { $side = 2; }
+    @tcp_start[tid, 1] = nsecs;
+    @tcp_side[tid, 1] = $side;
+    @tcp_active[tid] = 1;
+    @tcp_calls[pid, 1, $side] = count();
+    @tcp_requested_bytes[pid, 1, $side] = sum(args.len);
+}
+fexit:tcp_recvmsg /@tcp_start[tid, 1]/ {
+    $side = @tcp_side[tid, 1];
+    $ns = (uint64)((int64)nsecs - (int64)@tcp_start[tid, 1]);
+    @tcp_completed_calls[pid, 1, $side] = count();
+    @tcp_elapsed_ns[pid, 1, $side] = sum($ns);
+    @tcp_latency_us[pid, 1, $side] = hist($ns / 1000);
+    $ret = (int64)retval;
+    if ($ret > 0) {
+        @tcp_returned_bytes[pid, 1, $side] = sum($ret);
+    } else if ($ret < 0) {
+        @tcp_errors[pid, 1, $side, $ret] = count();
+    } else { @tcp_zero_returns[pid, 1, $side] = count(); }
+    $ignored = delete(@tcp_start[tid, 1]);
+    $ignored = delete(@tcp_side[tid, 1]);
+    $ignored = delete(@tcp_active[tid]);
+}
+
+
+fentry:tcp_sendmsg /@targets[pid]/ {
+    $sk = args.sk;
+    $side = 0;
+    if ($sk->__sk_common.skc_num == 8987) { $side = 1; }
+    else if (bswap($sk->__sk_common.skc_dport) == 9987) { $side = 2; }
+    @tcp_start[tid, 2] = nsecs;
+    @tcp_side[tid, 2] = $side;
+    @tcp_active[tid] = 2;
+    @tcp_calls[pid, 2, $side] = count();
+    @tcp_requested_bytes[pid, 2, $side] = sum(args.size);
+}
+fexit:tcp_sendmsg /@tcp_start[tid, 2]/ {
+    $side = @tcp_side[tid, 2];
+    $ns = (uint64)((int64)nsecs - (int64)@tcp_start[tid, 2]);
+    @tcp_completed_calls[pid, 2, $side] = count();
+    @tcp_elapsed_ns[pid, 2, $side] = sum($ns);
+    @tcp_latency_us[pid, 2, $side] = hist($ns / 1000);
+    $ret = (int64)retval;
+    if ($ret > 0) {
+        @tcp_returned_bytes[pid, 2, $side] = sum($ret);
+    } else if ($ret < 0) {
+        @tcp_errors[pid, 2, $side, $ret] = count();
+    } else { @tcp_zero_returns[pid, 2, $side] = count(); }
+    $ignored = delete(@tcp_start[tid, 2]);
+    $ignored = delete(@tcp_side[tid, 2]);
+    $ignored = delete(@tcp_active[tid]);
+}
+
+
+fentry:skb_copy_datagram_iter /@tcp_active[tid] == 1/ {
+    @copy_start[tid, 1] = nsecs;
+    @copy_length[tid, 1] = args.len;
+}
+fexit:skb_copy_datagram_iter /@copy_start[tid, 1]/ {
+    $side = @tcp_side[tid, 1];
+    $ns = (uint64)((int64)nsecs - (int64)@copy_start[tid, 1]);
+    @copy_calls[pid, 1, $side] = count();
+    @copy_elapsed_ns[pid, 1, $side] = sum($ns);
+    if (retval == 0) {
+        @copy_success_bytes[pid, 1, $side] = sum(@copy_length[tid, 1]);
+    } else { @copy_errors[pid, 1, $side] = count(); }
+    @copy_latency_us[pid, 1, $side] = hist($ns / 1000);
+    $ignored = delete(@copy_start[tid, 1]);
+    $ignored = delete(@copy_length[tid, 1]);
+}
+
+
+rawtracepoint:sched_process_exec {
+    $task = (struct task_struct *)arg0;
+    if (@targets[$task->tgid]) {
+        @target_execs[$task->tgid] = count();
+        $ignored = delete(@targets[$task->tgid]);
+    }
+}
+rawtracepoint:sched_process_exit {
+    $task = (struct task_struct *)arg0;
+    if (@targets[$task->tgid]) {
+        @thread_exits[$task->tgid] = count();
+        $ignored = delete(@tcp_start[$task->pid, 1]); $ignored = delete(@tcp_start[$task->pid, 2]); $ignored = delete(@tcp_side[$task->pid, 1]); $ignored = delete(@tcp_side[$task->pid, 2]); $ignored = delete(@tcp_active[$task->pid]); $ignored = delete(@copy_start[$task->pid, 1]); $ignored = delete(@copy_length[$task->pid, 1]);
+        if ($task->pid == $task->tgid) { $ignored = delete(@targets[$task->tgid]); }
+    }
+}
+
+END { printf("RUT_TRACE_END\n"); clear(@targets); clear(@tcp_start); clear(@tcp_side); clear(@tcp_active); clear(@copy_start); clear(@copy_length); }

@@ -1,0 +1,30 @@
+[
+  {
+    "case": "1048576-c128-close-nginx",
+    "upstream_copy_bytes": 43485153215,
+    "copy_us_per_MiB": 48.54516807112802,
+    "copy_calls_per_MiB": 18.999112588408988,
+    "tcp_recv_us_per_copied_MiB": 137.7256091909439
+  },
+  {
+    "case": "1048576-c128-close-rut-fin",
+    "upstream_copy_bytes": 46844858432,
+    "copy_us_per_MiB": 113.65591536535183,
+    "copy_calls_per_MiB": 11.464555115596939,
+    "tcp_recv_us_per_copied_MiB": 191.65512868590955
+  },
+  {
+    "case": "1048576-c32-close-nginx",
+    "upstream_copy_bytes": 43443242333,
+    "copy_us_per_MiB": 48.963819242134285,
+    "copy_calls_per_MiB": 18.998687344223463,
+    "tcp_recv_us_per_copied_MiB": 138.49576024192484
+  },
+  {
+    "case": "1048576-c32-close-rut-fin",
+    "upstream_copy_bytes": 48996238097,
+    "copy_us_per_MiB": 103.45099168177094,
+    "copy_calls_per_MiB": 10.374209036083581,
+    "tcp_recv_us_per_copied_MiB": 178.61433661477326
+  }
+]
