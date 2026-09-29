@@ -1,0 +1,49 @@
+{
+  "maps": {
+    "@cp_hash_calls": {
+      "2866737": 1734
+    },
+    "@cp_hash_ns": {
+      "2866737": 1095231
+    },
+    "@cp_socket_calls": {
+      "2866737": 1734
+    },
+    "@cp_socket_ns": {
+      "2866737": 7146480
+    },
+    "@cs_afterconnect_ns": {
+      "2866737": 19676524
+    },
+    "@cs_connect_ns": {
+      "2866737": 27154332
+    },
+    "@cs_connect_results": {
+      "2866737,0": 1734
+    },
+    "@cs_established_samples": {
+      "2866737": 1734
+    },
+    "@cs_established_to_send_ns": {
+      "2866737": 17117550
+    },
+    "@cs_preconnect_ns": {
+      "2866737": 17960804
+    },
+    "@cs_request_ns": {
+      "2866737": 64791660
+    },
+    "@cs_samples": {
+      "2866737": 1734
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [
+    "/tmp/rut-bounded-followup-20260928/ebpf-connect-parts-r1/65536-c1-close-nginx/trace/program.bt:73:6-16: WARNING: Addrspace mismatch",
+    " if (args.ret<0) { @cp_socket_errors[pid]=count(); }",
+    "     ~~~~~~~~~~"
+  ],
+  "tcp": []
+}

@@ -1,0 +1,16 @@
+{"type": "attached_probes", "count": 15, "data": {"probes": 15}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@cp_hash_calls": {"2868015": 1937}}}
+{"type": "map", "data": {"@cp_hash_ns": {"2868015": 1480563}}}
+{"type": "map", "data": {"@cp_socket_calls": {"2868015": 1937}}}
+{"type": "map", "data": {"@cp_socket_ns": {"2868015": 7890565}}}
+{"type": "map", "data": {"@cp_socket_results": {"2868015,7": 1937}}}
+{"type": "map", "data": {"@cs_afterconnect_ns": {"2868015": 21270347}}}
+{"type": "map", "data": {"@cs_connect_ns": {"2868015": 31689460}}}
+{"type": "map", "data": {"@cs_connect_results": {"2868015,0": 1937}}}
+{"type": "map", "data": {"@cs_established_samples": {"2868015": 1937}}}
+{"type": "map", "data": {"@cs_established_to_send_ns": {"2868015": 18252535}}}
+{"type": "map", "data": {"@cs_preconnect_ns": {"2868015": 21154593}}}
+{"type": "map", "data": {"@cs_request_ns": {"2868015": 74114400}}}
+{"type": "map", "data": {"@cs_samples": {"2868015": 1937}}}

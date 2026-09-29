@@ -1,0 +1,18 @@
+/tmp/rut-bounded-followup-20260928/ebpf-connect-parts-r1/65536-c1-close-nginx/trace/program.bt:73:6-16: WARNING: Addrspace mismatch
+ if (args.ret<0) { @cp_socket_errors[pid]=count(); }
+     ~~~~~~~~~~
+{"type": "attached_probes", "count": 15, "data": {"probes": 15}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@cp_hash_calls": {"2866737": 1734}}}
+{"type": "map", "data": {"@cp_hash_ns": {"2866737": 1095231}}}
+{"type": "map", "data": {"@cp_socket_calls": {"2866737": 1734}}}
+{"type": "map", "data": {"@cp_socket_ns": {"2866737": 7146480}}}
+{"type": "map", "data": {"@cs_afterconnect_ns": {"2866737": 19676524}}}
+{"type": "map", "data": {"@cs_connect_ns": {"2866737": 27154332}}}
+{"type": "map", "data": {"@cs_connect_results": {"2866737,0": 1734}}}
+{"type": "map", "data": {"@cs_established_samples": {"2866737": 1734}}}
+{"type": "map", "data": {"@cs_established_to_send_ns": {"2866737": 17117550}}}
+{"type": "map", "data": {"@cs_preconnect_ns": {"2866737": 17960804}}}
+{"type": "map", "data": {"@cs_request_ns": {"2866737": 64791660}}}
+{"type": "map", "data": {"@cs_samples": {"2866737": 1734}}}

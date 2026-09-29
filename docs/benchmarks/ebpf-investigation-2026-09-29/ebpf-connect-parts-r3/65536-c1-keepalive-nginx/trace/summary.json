@@ -1,0 +1,48 @@
+{
+  "maps": {
+    "@cp_hash_calls": {
+      "2868386": 2419
+    },
+    "@cp_hash_ns": {
+      "2868386": 1687247
+    },
+    "@cp_socket_calls": {
+      "2868386": 2419
+    },
+    "@cp_socket_ns": {
+      "2868386": 10801602
+    },
+    "@cp_socket_results": {
+      "2868386,10": 2419
+    },
+    "@cs_afterconnect_ns": {
+      "2868386": 26020033
+    },
+    "@cs_connect_ns": {
+      "2868386": 36729700
+    },
+    "@cs_connect_results": {
+      "2868386,0": 2419
+    },
+    "@cs_established_samples": {
+      "2868386": 2419
+    },
+    "@cs_established_to_send_ns": {
+      "2868386": 22482486
+    },
+    "@cs_preconnect_ns": {
+      "2868386": 24863013
+    },
+    "@cs_request_ns": {
+      "2868386": 87612746
+    },
+    "@cs_samples": {
+      "2868386": 2419
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [],
+  "tcp": []
+}

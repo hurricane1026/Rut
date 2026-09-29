@@ -1446,3 +1446,18 @@ All four runs pass exact-body preflight, zero-error warm/load checks and trace u
 Rut-minus-nginx request-stage differences are about +0.93 us close and +1.70 us keepalive. Most of that lead appears before or inside tcp_v4_connect; the post-function-return-to-send differences are -0.19 us close and +0.06 us keepalive. This does not support assuming that delayed userspace dispatch after connection completion is the dominant remaining gap. It motivates splitting kernel connect work (such as source-port assignment) from pre-connect userspace/socket setup before choosing another implementation change. This is one process order on an unreserved host. Probe overhead and sampling variation limit sub-microsecond attribution, and instrumented RPS is not acceptance evidence. No conclusion about generic io_uring versus epoll performance follows from this trace.
 
 After rejecting the header controls, the rebuilt build-rel/src/rut again matches accepted SHA256 `4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a`. Runtime source matches 271cd98c; no candidate remains applied. The network test executable still represents the tested rejected metadata-reuse build until rebuilt.
+
+## Connection subcomponents: socket creation and source-port hashing
+
+Reverse engine order (nginx then accepted Rut), c1 64 KiB. Add sampled socket syscall timing and inet_hash_connect timing to the connection-stage probes. All four final r3 traces are usable, have clean exact-body preflight and zero warm/load errors, and have one successful socket call and hash-connect call per matched request. Values are mean microseconds. Socket time is inside pre-connect time; hash-connect is inside connect-function time, so these columns must not be added together.
+
+| Case | Samples | Socket syscall | Before connect | Hash-connect | Connect function | Function exit to send | Request total |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 65536-c1-close-nginx | 1911 | 3.871 | 10.113 | 0.627 | 15.602 | 11.269 | 36.985 |
+| 65536-c1-close-rut-fin | 1937 | 4.074 | 10.921 | 0.764 | 16.360 | 10.981 | 38.262 |
+| 65536-c1-keepalive-nginx | 2419 | 4.465 | 10.278 | 0.697 | 15.184 | 10.757 | 36.219 |
+| 65536-c1-keepalive-rut-fin | 2334 | 4.556 | 11.007 | 0.752 | 16.230 | 10.802 | 38.039 |
+
+Rut-minus-nginx socket creation differences are +0.20 us close / +0.09 us keepalive; hash-connect differences are +0.14 / +0.05 us. These account for only a small portion of the request-stage differences (+1.28 / +1.82 us). Post-connect-function dispatch remains essentially tied or favors Rut. Thus source-port assignment is not the principal measured gap, and a broad socket-creation rewrite has limited support from these differences. Additional probes affect absolute costs; this does not establish exact exclusive CPU budgets or acceptance throughput.
+
+r1 was rejected for bpftrace Addrspace mismatch on comparing the socket-return field. Casting in r2 retained that warning and added an unnecessary-cast warning; r2 is also excluded. r3 records raw return values and validates negativity offline. The driver now aborts before load when startup output contains WARNING. Both failed runs remain diagnostic evidence, not benchmark conclusions. No runtime change is applied.

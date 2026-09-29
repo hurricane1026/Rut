@@ -1,0 +1,52 @@
+{
+  "maps": {
+    "@cp_hash_calls": {
+      "2867359": 1917
+    },
+    "@cp_hash_ns": {
+      "2867359": 1156957
+    },
+    "@cp_socket_calls": {
+      "2867359": 1917
+    },
+    "@cp_socket_ns": {
+      "2867359": 7275335
+    },
+    "@cs_afterconnect_ns": {
+      "2867359": 21808674
+    },
+    "@cs_connect_ns": {
+      "2867359": 30027315
+    },
+    "@cs_connect_results": {
+      "2867359,0": 1917
+    },
+    "@cs_established_samples": {
+      "2867359": 1917
+    },
+    "@cs_established_to_send_ns": {
+      "2867359": 18858261
+    },
+    "@cs_preconnect_ns": {
+      "2867359": 19505659
+    },
+    "@cs_request_ns": {
+      "2867359": 71341648
+    },
+    "@cs_samples": {
+      "2867359": 1917
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [
+    "/tmp/rut-bounded-followup-20260928/ebpf-connect-parts-r2/65536-c1-close-nginx/trace/program.bt:73:6-23: WARNING: Addrspace mismatch",
+    " if ((int64)args.ret<0) { @cp_socket_errors[pid]=count(); }",
+    "     ~~~~~~~~~~~~~~~~~",
+    "/tmp/rut-bounded-followup-20260928/ebpf-connect-parts-r2/65536-c1-close-nginx/trace/program.bt:73:6-13: WARNING: Unnecessary cast: expression is already of type int64",
+    " if ((int64)args.ret<0) { @cp_socket_errors[pid]=count(); }",
+    "     ~~~~~~~"
+  ],
+  "tcp": []
+}

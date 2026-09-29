@@ -1,0 +1,58 @@
+[
+  {
+    "case": "65536-c1-close-nginx",
+    "samples": 1911,
+    "usable": true,
+    "workload_errors": 0,
+    "mean_us": {
+      "cp_socket_ns": 3.8712836211407637,
+      "cs_preconnect_ns": 10.113402407116693,
+      "cp_hash_ns": 0.6270099424385139,
+      "cs_connect_ns": 15.60212297226583,
+      "cs_afterconnect_ns": 11.269423338566195,
+      "cs_request_ns": 36.98494871794872
+    }
+  },
+  {
+    "case": "65536-c1-close-rut-fin",
+    "samples": 1937,
+    "usable": true,
+    "workload_errors": 0,
+    "mean_us": {
+      "cp_socket_ns": 4.07360092927207,
+      "cs_preconnect_ns": 10.921318017552917,
+      "cp_hash_ns": 0.764358802271554,
+      "cs_connect_ns": 16.360072276716572,
+      "cs_afterconnect_ns": 10.981077439339185,
+      "cs_request_ns": 38.26246773360867
+    }
+  },
+  {
+    "case": "65536-c1-keepalive-nginx",
+    "samples": 2419,
+    "usable": true,
+    "workload_errors": 0,
+    "mean_us": {
+      "cp_socket_ns": 4.4653170731707315,
+      "cs_preconnect_ns": 10.278219512195122,
+      "cp_hash_ns": 0.6974977263331955,
+      "cs_connect_ns": 15.183836295990078,
+      "cs_afterconnect_ns": 10.756524596940885,
+      "cs_request_ns": 36.21858040512608
+    }
+  },
+  {
+    "case": "65536-c1-keepalive-rut-fin",
+    "samples": 2334,
+    "usable": true,
+    "workload_errors": 0,
+    "mean_us": {
+      "cp_socket_ns": 4.555850042844901,
+      "cs_preconnect_ns": 11.007040702656385,
+      "cp_hash_ns": 0.7523024850042844,
+      "cs_connect_ns": 16.230319194515854,
+      "cs_afterconnect_ns": 10.801578406169664,
+      "cs_request_ns": 38.0389383033419
+    }
+  }
+]
