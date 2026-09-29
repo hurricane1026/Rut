@@ -110,6 +110,8 @@ if mode != "truncated":
         self.assertIn('@armed = 1', program)
         self.assertIn('@stop_ns = nsecs + 1 * 1000000000', program)
         self.assertIn('interval:ms:100 /@armed && nsecs >= @stop_ns/', program)
+        self.assertIn('@deadline_reached = 1; exit()', program)
+        self.assertIn('if (@deadline_reached) { printf("RUT_TRACE_END\\n"); }', program)
         self.assertNotIn('interval:s:1 /@armed/', program)
         self.assertIn('/@armed && @targets[pid]/', program)
         self.assertIn('if (@targets[$task->tgid]) {', program)
@@ -179,14 +181,15 @@ if mode != "truncated":
     def test_pid_reuse_rejects_an_otherwise_complete_trace(self):
         before = trace.process_identity(os.getpid())
         after = dict(before, start_ticks=before["start_ticks"] + 1)
-        with mock.patch.object(trace, "process_identity", side_effect=[before, after]):
+        with mock.patch.object(trace, "process_identity", side_effect=[before, before, after]):
             rc, status, _ = self.run_trace("reuse")
         self.assertEqual(rc, 1)
         self.assertFalse(status["targets_unchanged"])
 
     def test_target_exit_is_partial_evidence(self):
         before = trace.process_identity(os.getpid())
-        with mock.patch.object(trace, "process_identity", side_effect=[before, FileNotFoundError()]):
+        with mock.patch.object(trace, "process_identity",
+                               side_effect=[before, before, FileNotFoundError()]):
             rc, status, _ = self.run_trace("exit")
         self.assertEqual(rc, 1)
         self.assertTrue(status["completed"])

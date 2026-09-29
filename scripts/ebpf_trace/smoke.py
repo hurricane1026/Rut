@@ -14,6 +14,8 @@ import sys
 import threading
 import time
 
+import trace
+
 
 def receive(sock, size):
     chunks = []
@@ -110,8 +112,10 @@ def main():
     parser.add_argument("--bpftrace", default="bpftrace")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=False, mode=0o700)
-    os.chmod(args.output, 0o700)
+    if args.output.is_symlink():
+        parser.error("output must not be a symlink")
+    output_fd = trace.open_output_dir(args.output)
+    output = Path(f"/proc/self/fd/{output_fd}")
     parent, child = multiprocessing.Pipe()
     stop = multiprocessing.Event()
     server = multiprocessing.Process(target=fixture, args=(child, stop))
@@ -125,9 +129,9 @@ def main():
                    "--pid", str(server.pid), "--front-port", str(front),
                    "--origin-port", str(origin), "--duration", "8",
                    "--groups", "tcp", "sched", "fault", "rx-copy", "stacks",
-                   "--bpftrace", args.bpftrace, "--output", str(args.output / "trace")]
-        tracer = subprocess.Popen(command)
-        raw = args.output / "trace" / "trace.jsonl"
+                   "--bpftrace", args.bpftrace, "--output", str(output / "trace")]
+        tracer = subprocess.Popen(command, pass_fds=(output_fd,))
+        raw = output / "trace" / "trace.jsonl"
         deadline = time.monotonic() + 120
         while not attached(raw):
             if tracer.poll() is not None or time.monotonic() > deadline:
@@ -149,7 +153,7 @@ def main():
                     transferred += len(body)
         if tracer.wait(timeout=120) != 0:
             raise RuntimeError("trace rejected; inspect status.json/stderr.log")
-        result = json.loads((args.output / "trace" / "summary.json").read_text())
+        result = json.loads((output / "trace" / "summary.json").read_text())
         maps = result["maps"]
         for name in ("@tcp_calls", "@tcp_returned_bytes", "@runqueue_samples",
                      "@offcpu_samples", "@minor_faults", "@copy_success_bytes"):
@@ -163,7 +167,7 @@ def main():
             key = f"{server.pid},1,{side}"
             if maps["@copy_success_bytes"].get(key) != transferred:
                 raise RuntimeError(f"incorrect receive-copy byte accounting: {key}")
-        secure_write(args.output / "smoke.json", json.dumps(
+        secure_write(output / "smoke.json", json.dumps(
             {"passed": True, "echo_bytes_checked": transferred, "target_pid": server.pid,
              "front_port": front, "origin_port": origin}, indent=2) + "\n")
         print(f"PASS: {transferred} echoed bytes checked; tracing evidence in {args.output}")
@@ -180,6 +184,7 @@ def main():
         if server.is_alive():
             server.terminate()
             server.join()
+        os.close(output_fd)
 
 
 if __name__ == "__main__":

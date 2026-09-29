@@ -112,8 +112,9 @@ def generate(pids, duration, front_port, origin_port, groups):
     code = ["BEGIN { " + " ".join(start) + " }",
             f'self:signal:SIGUSR1 {{ @stop_ns = nsecs + {duration} * 1000000000; '
             '@armed = 1; printf("RUT_TRACE_ARMED\\n"); }',
-            'interval:ms:100 /@armed && nsecs >= @stop_ns/ { exit(); }']
-    transient = ["targets", "armed", "stop_ns", "exiting"]
+            'interval:ms:100 /@armed && nsecs >= @stop_ns/ { '
+            '@deadline_reached = 1; exit(); }']
+    transient = ["targets", "armed", "stop_ns", "deadline_reached", "exiting"]
     if "tcp" in groups:
         remote = "$sk->__sk_common.skc_dport"
         if sys.byteorder == "little":
@@ -244,13 +245,13 @@ rawtracepoint:sched_process_exit {
     }
 }
 """)
-    code.append('END { printf("RUT_TRACE_END\\n"); ' +
+    code.append('END { if (@deadline_reached) { printf("RUT_TRACE_END\\n"); } ' +
                 " ".join(f"clear(@{name});" for name in transient) + " }")
     return "\n".join(code).replace("delete(@", "$ignored = delete(@")
 
 
 def read_results(path):
-    maps, lost, attached, armed, ended = {}, [], False, False, False
+    maps, lost, attached, armed, end_seen = {}, [], False, False, False
     diagnostics = []
     for line in path.read_text().splitlines():
         if not line.strip():
@@ -272,11 +273,11 @@ def read_results(path):
             attached = True
         elif kind == "printf":
             armed |= valid_armed(event)
-            ended |= isinstance(data, str) and data.strip() == "RUT_TRACE_END"
+            end_seen |= isinstance(data, str) and data.strip() == "RUT_TRACE_END"
         else:
             diagnostics.append(line)
     return {"maps": maps, "loss_or_errors": lost, "attached": attached,
-            "armed": armed, "ready": attached and armed, "ended": ended,
+            "armed": armed, "ready": attached and armed, "ended": armed and end_seen,
             "stdout_diagnostics": diagnostics}
 
 
@@ -372,7 +373,10 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, interrupted)
     try:
-        status["targets_before"] = [process_identity(p) for p in sorted(set(args.pid))]
+        # Baseline before tool launch/attachment so an exec in that window is
+        # rejected by the post-run identity comparison.
+        status["targets_requested"] = [process_identity(p) for p in sorted(set(args.pid))]
+        status["targets_before"] = status["targets_requested"]
         if platform.system() != "Linux" or int(platform.release().split(".")[0]) < 6:
             raise RuntimeError("Linux 6.x or newer is required for these probe signatures")
         version = subprocess.run([args.bpftrace, "--version"], capture_output=True, text=True,
@@ -407,6 +411,15 @@ def main(argv=None):
                             raise RuntimeError("timed out waiting for attached_probes")
                         time.sleep(0.05)
                     status["attached"] = True
+                    try:
+                        status["targets_before"] = [process_identity(p) for p in sorted(set(args.pid))]
+                    except (OSError, ValueError) as exc:
+                        raise RuntimeError(f"target changed before arm: {exc}") from exc
+                    for requested, baseline in zip(status["targets_requested"],
+                                                    status["targets_before"]):
+                        if (requested["start_ticks"] != baseline["start_ticks"] or
+                                requested["exe"] != baseline["exe"]):
+                            raise RuntimeError("target changed before arm")
                     proc.send_signal(signal.SIGUSR1)
                     deadline = time.monotonic() + 30
                     while not event_seen(raw, valid_armed):
