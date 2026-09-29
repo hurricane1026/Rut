@@ -1708,3 +1708,24 @@ The same parser/proof/validation costs seen in the older accepted-runtime profil
 | 64 KiB keepalive c1 | 0.9916 | 1.0004 |
 
 The 64 KiB close improvement is small and repeats, but both short keepalive laggards regress in both orders; 64 KiB keepalive is also negative in the first order. Reject the change on the combined version and restore the runtime source. These paired Rut-to-Rut ratios do not update the nginx matrix. `parser-reset-reuse.json` holds exact medians/hashes; `parser-reset-reuse-evidence.tar.gz` SHA256 `12d3fd093a30554940a946642e72183fb312dfd786f3618894b1391ec7e5c0c0` contains all logs and raw rows. The formal result remains 84/96 at 1.05.
+
+## Independent formal recheck of all twelve unmet coordinates
+
+With no runtime source change, rechecked every coordinate that missed 1.05 in the complete pipe matrix. The same frozen Rut and converter binaries, pinned nginx image, native static profile, converter-strict proxy, implicit downstream keepalive, disabled upstream reuse, TLS certificate, CPU roles and 3×5-second-per-engine acceptance rule were used. All 12 measurements are valid and performance-eligible: 72 measured samples, 60 exact-full-body preflights across ten scenario runs, and zero warmup/load errors. The post-run container/listener check is empty. The 12 coordinates remain below 1.05. Other 84 coordinates were **not** remeasured, so this is a targeted stability check, not a replacement for the complete 96-coordinate matrix.
+
+| Transport | Bytes | Scenario | c | Previous | Recheck | Additional Rut gain needed to reach 1.05 |
+|---|---:|---|---:|---:|---:|---:|
+| HTTP | 16 | proxy close | 1 | 1.0242 | 1.0249 | 2.45% |
+| HTTP | 16 | proxy keepalive | 1 | 0.9989 | 0.9997 | 5.03% |
+| HTTP | 1024 | proxy close | 1 | 1.0292 | 1.0211 | 2.83% |
+| HTTP | 1024 | proxy keepalive | 1 | 0.9972 | 1.0019 | 4.80% |
+| HTTP | 65536 | proxy close | 1 | 0.9818 | 0.9921 | 5.83% |
+| HTTP | 65536 | proxy keepalive | 1 | 0.9785 | 0.9805 | 7.09% |
+| HTTP | 65536 | static close | 1 | 1.0420 | 1.0415 | 0.81% |
+| HTTP | 1048576 | static keepalive | 1 | 0.9909 | 0.9963 | 5.39% |
+| HTTP | 1048576 | static keepalive | 32 | 1.0365 | 1.0444 | 0.54% |
+| HTTP | 1048576 | static keepalive | 128 | 1.0334 | 1.0390 | 1.06% |
+| HTTPS | 65536 | proxy keepalive | 1 | 1.0268 | 1.0250 | 2.44% |
+| HTTPS | 1048576 | proxy close | 128 | 1.0223 | 1.0444 | 0.54% |
+
+The additional gain column is `1.05 / recheck_ratio - 1`, a required change relative to this recheck, not a sum of independent optimization estimates. HTTP 64 KiB proxy keepalive c1 remains the largest deficit (~7.1% required), followed by its close counterpart and 1 MiB static keepalive c1. Several others are within 1%, but still fail the stated target. `pipe-unmet-recheck.json` stores exact medians, hashes, validity and evidence paths. `pipe-unmet-recheck-evidence.tar.gz` SHA256 `aaf93ed744b70b3f9941c7086f6205707e01a27adb78861776c8306a3b500de0` contains all raw text evidence and drivers; no TLS private key is archived. A proposed native-streaming comparison produced no measurements because that diagnostic profile requires a 256 KiB keepalive response; it was not substituted for the strict 64 KiB acceptance scenario. No huge pages or global kernel changes were used.
