@@ -448,6 +448,15 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Evidence/lifecycle checks use a fake tracer; no BPF privileges or tools needed.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(
+        NAME test_ebpf_trace_tools
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover
+                -s ${PROJECT_SOURCE_DIR}/scripts/ebpf_trace -p test_trace.py -v)
+    set_tests_properties(test_ebpf_trace_tools PROPERTIES LABELS "unit;tools" TIMEOUT 30)
+endif()
+
 # /proc-based check that the process ignores SIGPIPE (Linux only).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_test(
