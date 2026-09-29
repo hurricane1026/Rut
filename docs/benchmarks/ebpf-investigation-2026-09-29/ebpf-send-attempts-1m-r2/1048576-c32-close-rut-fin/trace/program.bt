@@ -1,0 +1,29 @@
+BEGIN { @targets[2849612] = 1; printf("RUT_TRACE_READY\n"); }
+interval:s:24 { exit(); }
+
+rawtracepoint:sched_process_exec {
+    $task = (struct task_struct *)arg0;
+    if (@targets[$task->tgid]) {
+        @target_execs[$task->tgid] = count();
+        $ignored = delete(@targets[$task->tgid]);
+    }
+}
+rawtracepoint:sched_process_exit {
+    $task = (struct task_struct *)arg0;
+    if (@targets[$task->tgid]) {
+        @thread_exits[$task->tgid] = count();
+        
+        if ($task->pid == $task->tgid) { $ignored = delete(@targets[$task->tgid]); }
+    }
+}
+
+END { printf("RUT_TRACE_END\n"); clear(@targets); }
+fexit:tcp_sendmsg /@targets[pid]/ {
+ if (args.sk->__sk_common.skc_num==8987) {
+  $kind=retval>0 ? ((uint64)retval<args.size ? 2 : 1) : (retval==-11 ? 3 : 4);
+  @send_attempts[pid,$kind]=count();
+  @send_requested[pid,$kind]=sum(args.size);
+  @send_lengths[pid,$kind]=hist(args.size);
+  if (retval>0) { @send_bytes[pid]=sum((uint64)retval); }
+ }
+}

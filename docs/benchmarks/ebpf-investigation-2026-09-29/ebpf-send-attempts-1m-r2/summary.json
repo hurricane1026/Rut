@@ -1,0 +1,46 @@
+[
+  {
+    "case": "1048576-c128-close-nginx",
+    "load_completed_requests": 44905,
+    "send_outcomes": {
+      "1": 1571753,
+      "2": 0,
+      "3": 0,
+      "4": 0
+    },
+    "full_sends_per_completed_request_approx": 35.00173700033404
+  },
+  {
+    "case": "1048576-c128-close-rut-fin",
+    "load_completed_requests": 46480,
+    "send_outcomes": {
+      "1": 279175,
+      "2": 0,
+      "3": 0,
+      "4": 0
+    },
+    "full_sends_per_completed_request_approx": 6.0063468158347675
+  },
+  {
+    "case": "1048576-c32-close-nginx",
+    "load_completed_requests": 44745,
+    "send_outcomes": {
+      "1": 1566197,
+      "2": 0,
+      "3": 0,
+      "4": 0
+    },
+    "full_sends_per_completed_request_approx": 35.002726561627
+  },
+  {
+    "case": "1048576-c32-close-rut-fin",
+    "load_completed_requests": 48402,
+    "send_outcomes": {
+      "1": 290435,
+      "2": 0,
+      "3": 0,
+      "4": 0
+    },
+    "full_sends_per_completed_request_approx": 6.000475186975745
+  }
+]

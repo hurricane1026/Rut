@@ -1,0 +1,7 @@
+{"type": "attached_probes", "count": 6, "data": {"probes": 6}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@send_attempts": {"2849882,1": 1566197}}}
+{"type": "map", "data": {"@send_bytes": {"2849882": 46929169756}}}
+{"type": "hist", "data": {"@send_lengths": {"2849882,1": [{"min": 16384, "max": 32767, "count": 268489},{"min": 32768, "max": 65535, "count": 1297704},{"min": 65536, "max": 131071, "count": 4}]}}}
+{"type": "map", "data": {"@send_requested": {"2849882,1": 46929169756}}}

@@ -1,0 +1,37 @@
+{
+  "maps": {
+    "@send_attempts": {
+      "2849152,1": 1571753
+    },
+    "@send_bytes": {
+      "2849152": 47097817712
+    },
+    "@send_lengths": {
+      "2849152,1": [
+        {
+          "min": 16384,
+          "max": 32767,
+          "count": 269429
+        },
+        {
+          "min": 32768,
+          "max": 65535,
+          "count": 1302296
+        },
+        {
+          "min": 65536,
+          "max": 131071,
+          "count": 28
+        }
+      ]
+    },
+    "@send_requested": {
+      "2849152,1": 47097817712
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [],
+  "tcp": []
+}

@@ -1,0 +1,13 @@
+/tmp/rut-bounded-followup-20260928/ebpf-send-attempts-1m-r1/1048576-c128-close-rut-fin/trace/program.bt:23:28-37: WARNING: Expression of type: uint64 being cast to type: int64. This may cause unexpected results. Use an explicit cast to suppress this warning.
+  $kind=retval>0 ? (retval<args.size ? 2 : 1) : (retval==-11 ? 3 : 4);
+                           ~~~~~~~~~
+/tmp/rut-bounded-followup-20260928/ebpf-send-attempts-1m-r1/1048576-c128-close-rut-fin/trace/program.bt:25:34-42: WARNING: Unnecessary cast: expression is already of type uint64
+  @send_requested[pid,$kind]=sum((uint64)args.size);
+                                 ~~~~~~~~
+{"type": "attached_probes", "count": 6, "data": {"probes": 6}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@send_attempts": {"2848552,1": 279432}}}
+{"type": "map", "data": {"@send_bytes": {"2848552": 48820323196}}}
+{"type": "hist", "data": {"@send_lengths": {"2848552,1": [{"min": 128, "max": 255, "count": 46620},{"min": 256, "max": 511, "count": 0},{"min": 512, "max": 1023, "count": 0},{"min": 1024, "max": 2047, "count": 0},{"min": 2048, "max": 4095, "count": 46548},{"min": 4096, "max": 8191, "count": 0},{"min": 8192, "max": 16383, "count": 93159},{"min": 16384, "max": 32767, "count": 0},{"min": 32768, "max": 65535, "count": 0},{"min": 65536, "max": 131071, "count": 1},{"min": 131072, "max": 262143, "count": 3},{"min": 262144, "max": 524287, "count": 93101}]}}}
+{"type": "map", "data": {"@send_requested": {"2848552,1": 48820323196}}}

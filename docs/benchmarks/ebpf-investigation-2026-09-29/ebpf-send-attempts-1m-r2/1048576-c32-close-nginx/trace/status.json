@@ -1,0 +1,46 @@
+{
+  "completed": true,
+  "usable": true,
+  "mode": "trace",
+  "kernel": "6.19.10-300.fc44.x86_64",
+  "machine": "x86_64",
+  "groups": [
+    "send-attempts"
+  ],
+  "duration_seconds": 24,
+  "front_port": 8987,
+  "origin_port": 9987,
+  "started_at": 1790648084.6507359,
+  "program_sha256": "63403de9b6f741167203b0eecca0f217a3fc0675545f286a6fd5216dad2cdc33",
+  "targets_before": [
+    {
+      "pid": 2849882,
+      "start_ticks": 93401284,
+      "state": "S",
+      "comm": "nginx",
+      "exe": "/usr/sbin/nginx"
+    }
+  ],
+  "bpftrace_version": "bpftrace v0.27.0",
+  "command": [
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+    "-f",
+    "json",
+    "-B",
+    "line",
+    "/tmp/rut-bounded-followup-20260928/ebpf-send-attempts-1m-r2/1048576-c32-close-nginx/trace/program.bt"
+  ],
+  "returncode": 0,
+  "targets_after": [
+    {
+      "pid": 2849882,
+      "start_ticks": 93401284,
+      "state": "S",
+      "comm": "nginx",
+      "exe": "/usr/sbin/nginx"
+    }
+  ],
+  "targets_unchanged": true,
+  "diagnostic_warnings": false,
+  "finished_at": 1790648110.2951696
+}
