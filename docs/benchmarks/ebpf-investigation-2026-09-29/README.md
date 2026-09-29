@@ -1150,3 +1150,22 @@ All 48 HTTP coordinates complete with valid formal measurements; 33 meet >=1.10.
 | proxy-keepalive | 128 | 1.2619 | pass |
 
 The static keepalive c1 ratio passes this run but prior runs showed bimodality/near-ties; this single formal pass does not erase that history. Both concurrent static keepalive and all proxy close 1 MiB coordinates remain below target. No full-matrix success is claimed.
+
+## Full-matrix checkpoint: HTTPS 16-byte coordinates
+
+All twelve coordinates have valid formal measurements, eleven meet >=1.10. Proxy keepalive c1 remains below target at 1.0568. Across the first 60 coordinates, 44 meet the target; the remaining 36 are still running.
+
+| Scenario | Concurrency | Rut/nginx median RPS | Target |
+|---|---:|---:|---|
+| static-close | 1 | 1.1882 | pass |
+| static-close | 32 | 1.3050 | pass |
+| static-close | 128 | 1.2965 | pass |
+| static-keepalive | 1 | 1.3146 | pass |
+| static-keepalive | 32 | 3.0120 | pass |
+| static-keepalive | 128 | 3.1075 | pass |
+| proxy-close | 1 | 1.1290 | pass |
+| proxy-close | 32 | 1.3186 | pass |
+| proxy-close | 128 | 1.3310 | pass |
+| proxy-keepalive | 1 | 1.0568 | below 1.10 |
+| proxy-keepalive | 32 | 1.3065 | pass |
+| proxy-keepalive | 128 | 1.5033 | pass |
