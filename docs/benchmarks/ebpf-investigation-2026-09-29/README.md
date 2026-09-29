@@ -1300,3 +1300,9 @@ Attempted eBPF uprobe/uretprobe attachment failed with libbpf perf-event -EACCES
 A separate temporary diagnostic binary logged only the first 24 consume calls per process. Both close and keepalive logs show HeaderSend consuming 146 of 16384 bytes, followed by BodySend with drain offset 146 and 16238 bytes. Thus the candidate path really executes. Occasional early Buffering consumes retain the old path. This is a bounded initial observation, not a whole-run hit-rate estimate; diagnostic RPS is not used as causal evidence. Logs and raw evidence are retained. Diagnostic logging was removed before reverting the candidate runtime and added test. build-rel still contains the rejected diagnostic binary until rebuilt.
 
 Reject the added buffer state/branch complexity without a measured benefit. Existing accepted runtime and no-huge-page constraint remain the baseline.
+
+## Body pump bitmap range experiment: rejected
+
+Track first/end ready words to skip out-of-range empty bitmap words. The end stays live during callback dispatch so newly published higher words are processed this drain; lower/self publications remain for the next drain. Existing order, re-publication, capacity, stale-slot/reuse and allocation-failure tests pass as part of all 1425 network tests / 371796 checks.
+
+All 28 causal samples pass preflight/warm/load checks. Candidate changes: 16 B c1 close +0.39%, c32 close -0.50%, c1 keepalive -0.17%; 1 KiB c1 close +0.33%, c32 close +0.61%; 64 KiB c1 close +0.14%, c1 keepalive +0.28%. Small mixed differences do not establish a useful throughput gain on this unreserved host. Reject the extra queue bounds/state without an established target gain; do not broaden testing just to pursue a favorable small fluctuation. Runtime source reverted; build-rel and frozen rut-pump-range still represent the rejected candidate until rebuilt. No baseline acceptance ratios change.

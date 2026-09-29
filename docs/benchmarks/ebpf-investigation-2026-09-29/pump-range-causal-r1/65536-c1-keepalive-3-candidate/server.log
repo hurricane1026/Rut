@@ -1,0 +1,5 @@
+Loaded program: /tmp/rut-bounded-followup-20260928/buffered-more-matrix-quick-r2/http-65536-proxy-keepalive/proxy.rut (opt O2)
+Backend: io_uring
+Listening on port 8987 with 1 shard(s)
+Draining connections (1s)...
+Shutdown complete.

@@ -1,0 +1,6 @@
+{
+  "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pump-range",
+  "sha256": "70e5d3611ff3b1750bca8418a83fc30d5c6080782735d080e69ebdd4e2ef2bda",
+  "source_revision": "163033f6442e585269f789f2f9c5033e96e4013b",
+  "patch": "pump-range.patch"
+}
