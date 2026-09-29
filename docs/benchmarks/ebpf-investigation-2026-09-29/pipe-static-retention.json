@@ -1,0 +1,53 @@
+{
+  "archive": "pipe-static-retention-evidence.tar.gz",
+  "archive_sha256": "2258a0c59b66455c35db1dec58a2e67d7601e88e75ede2e651d2e1f3e00a605e",
+  "baseline_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "body_preflights_passed": 32,
+  "candidate_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "cases": 4,
+  "interpretation": "64 KiB static close c1 near parity in both orders; 1 MiB static keepalive c128 near parity, c1 direction changes and c32 is lower in both orders with variable magnitude. No stable material candidate regression established; c32 remains a follow-up risk.",
+  "load_seconds": 6,
+  "pooled_ratios": {
+    "1m-c1-keepalive": 1.058179595443876,
+    "1m-c128-keepalive": 1.0056767482468603,
+    "1m-c32-keepalive": 0.9869264811486915,
+    "65536-c1-close": 0.9976011643348658
+  },
+  "purpose": "paired candidate versus accepted Rut baseline on static paths outside pipe admission",
+  "rounds": [
+    {
+      "name": "pipe-static-retention-r1",
+      "order": [
+        "candidate",
+        "baseline",
+        "baseline",
+        "candidate"
+      ],
+      "ratios": {
+        "1m-c1-keepalive": 1.0453727204996313,
+        "1m-c128-keepalive": 1.0019520560173707,
+        "1m-c32-keepalive": 0.9576640058387915,
+        "65536-c1-close": 0.9968925952170313
+      }
+    },
+    {
+      "name": "pipe-static-retention-r2",
+      "order": [
+        "baseline",
+        "candidate",
+        "candidate",
+        "baseline"
+      ],
+      "ratios": {
+        "1m-c1-keepalive": 0.9998168082772304,
+        "1m-c128-keepalive": 1.005759268964361,
+        "1m-c32-keepalive": 0.9925832284226616,
+        "65536-c1-close": 0.9972744824376418
+      }
+    }
+  ],
+  "samples": 32,
+  "status": "complete_valid_diagnostic",
+  "warmup_and_load_errors": 0,
+  "warmup_seconds": 2
+}

@@ -1611,3 +1611,16 @@ The user revised the target from a 10% lead to a 5% lead while the load was runn
 The intended pipe path has clear wins in HTTP 1 MiB proxy traffic: close c32/c128 reach 1.307/1.301; keepalive c1/c32/c128 reach 1.274/1.408/1.443. Close c1 reaches 1.085 and passes the revised target. Most remaining HTTP proxy c1 and all TLS cases are outside pipe admission. The weaker 1 MiB static keepalive results are also outside pipe admission; cross-run comparisons alone cannot attribute them to a candidate regression. Use paired candidate/accepted-baseline controls before drawing that conclusion. The next optimization work targets the 12 coordinates above, especially 64 KiB and small proxy c1; retain and test cumulative changes against the revised full matrix.
 
 `pipe-full-acceptance-5pct.json` contains the exact medians, candidate hash, conditions and archive checksum. `pipe-full-acceptance-5pct-evidence.tar.gz` contains the original matrix report, all 32 result/status/command files, 192 preflight records, generated configs and Rut fixtures, the launch-error record and full-run log. Private TLS key material is not archived.
+
+## Paired static-path retention check
+
+Two candidate/accepted-Rut comparisons, one in each order, cover the static paths that missed the revised target. Each case has two 6-second samples per engine per order, exact-body preflight, 2-second warmup and zero warmup/load errors. Ratios below compare the pipe candidate with accepted Rut, **not** with nginx.
+
+| Static case | Candidate / accepted Rut, first order | Reverse order | Pooled four-sample ratio |
+|---|---:|---:|---:|
+| HTTP 64 KiB close c1 | 0.9969 | 0.9973 | 0.9976 |
+| HTTP 1 MiB keepalive c1 | 1.0454 | 0.9998 | 1.0582 |
+| HTTP 1 MiB keepalive c32 | 0.9577 | 0.9926 | 0.9869 |
+| HTTP 1 MiB keepalive c128 | 1.0020 | 1.0058 | 1.0057 |
+
+The c1 direction changes between orders; one accepted-Rut sample was unusually low. The c32 candidate is lower in both orders but by different amounts, so a small overhead remains possible and deserves follow-up. The 64 KiB static c1 and 1 MiB c128 controls are near parity. These paired samples do not justify attributing the new nginx matrix's static gaps entirely to the pipe work, nor do they show that static paths meet the 5% target. Raw rows, warmup/load logs and server logs are in `pipe-static-retention.json` and `pipe-static-retention-evidence.tar.gz`.
