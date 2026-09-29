@@ -1,0 +1,24 @@
+{
+  "maps": {
+    "@sample_bytes": {
+      "2832462": 121511700
+    },
+    "@sample_first_ns": {
+      "2832462": 149101284
+    },
+    "@sample_requests": {
+      "2832462": 1850
+    },
+    "@sample_tail_ns": {
+      "2832462": 70944803
+    },
+    "@sample_total_ns": {
+      "2832462": 220046087
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [],
+  "tcp": []
+}

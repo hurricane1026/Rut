@@ -1,0 +1,42 @@
+[
+  {
+    "case": "65536-c1-close-nginx",
+    "requests_sampled": 1901,
+    "bytes_per_sample": 65682.0,
+    "first_us": 76.43611362440821,
+    "tail_us": 47.74246712256707,
+    "total_us": 124.17858074697527,
+    "rps": 5982.2,
+    "error_lines": []
+  },
+  {
+    "case": "65536-c1-close-rut-fin",
+    "requests_sampled": 1859,
+    "bytes_per_sample": 65682.0,
+    "first_us": 82.89850672404519,
+    "tail_us": 37.3357391070468,
+    "total_us": 120.234245831092,
+    "rps": 5855.05,
+    "error_lines": []
+  },
+  {
+    "case": "65536-c1-keepalive-nginx",
+    "requests_sampled": 2423,
+    "bytes_per_sample": 65686.99793644242,
+    "first_us": 75.85756789104417,
+    "tail_us": 39.7023916632274,
+    "total_us": 115.55995955427157,
+    "rps": 7807.3,
+    "error_lines": []
+  },
+  {
+    "case": "65536-c1-keepalive-rut-fin",
+    "requests_sampled": 2373,
+    "bytes_per_sample": 65687.0,
+    "first_us": 80.22678508217446,
+    "tail_us": 32.739699115044246,
+    "total_us": 112.96648419721872,
+    "rps": 7691.69,
+    "error_lines": []
+  }
+]

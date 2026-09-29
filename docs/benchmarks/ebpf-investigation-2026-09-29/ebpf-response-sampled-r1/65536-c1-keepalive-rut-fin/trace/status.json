@@ -1,0 +1,46 @@
+{
+  "completed": true,
+  "usable": true,
+  "mode": "trace",
+  "kernel": "6.19.10-300.fc44.x86_64",
+  "machine": "x86_64",
+  "groups": [
+    "response-sampled"
+  ],
+  "duration_seconds": 24,
+  "front_port": 8987,
+  "origin_port": 9987,
+  "started_at": 1790644509.2553372,
+  "program_sha256": "d8cf198974f8fb4b0093448f3f98ffe94b9a77a7547fc33603b847460e17649b",
+  "targets_before": [
+    {
+      "pid": 2833063,
+      "start_ticks": 93043719,
+      "state": "S",
+      "comm": "rut-combined-fi",
+      "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-combined-fin-ordered"
+    }
+  ],
+  "bpftrace_version": "bpftrace v0.27.0",
+  "command": [
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+    "-f",
+    "json",
+    "-B",
+    "line",
+    "/tmp/rut-bounded-followup-20260928/ebpf-response-sampled-r1/65536-c1-keepalive-rut-fin/trace/program.bt"
+  ],
+  "returncode": 0,
+  "targets_after": [
+    {
+      "pid": 2833063,
+      "start_ticks": 93043719,
+      "state": "S",
+      "comm": "rut-combined-fi",
+      "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-combined-fin-ordered"
+    }
+  ],
+  "targets_unchanged": true,
+  "diagnostic_warnings": false,
+  "finished_at": 1790644535.179117
+}

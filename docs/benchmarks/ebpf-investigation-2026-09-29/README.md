@@ -1242,3 +1242,11 @@ Evidence: `full-acceptance-matrix.json`, `full-acceptance-audit.json`, and `full
 The runtime binary hash is fixed throughout. Harness revision labels changed as documentation checkpoints were committed; the dirty flag includes the pre-existing untracked benchmark evidence directory. No runtime edits/builds/traces ran during this matrix. Host clocks are not locked; small differences retain that limitation.
 
 Next priorities: (1) uninstrumented HTTP 64 KiB c1 proxy deficit, using low-overhead tracing because prior per-call probes reversed ordering; (2) 1 MiB HTTP close and concurrent static keepalive plus HTTPS c128 close; (3) remaining small-response c1 latency. Existing rejected experiments remain rejected; no huge pages or global kernel tuning are introduced.
+
+## Sparse downstream stage tracing, both engine orders
+
+Randomly sample about 1/64 non-pipelined c1 requests. Unlike the earlier full-event stage tracing, this retains the uninstrumented throughput ordering in both orders: Rut/nginx close 0.9816/0.9787 and keepalive 0.9729/0.9852. All eight warmup/load pairs report zero errors and exact-body preflight passed.
+
+Rut front-recv-return to first downstream send-entry is longer: close +5.58/+6.46 us, keepalive +8.14/+4.37 us. This is a lead for further decomposition, not proof of the uninstrumented magnitude. Per-sampled-request tail probes still run more often for nginx, so shorter Rut tail/total probe intervals cannot establish a causal tail advantage. nginx keepalive sampled byte averages differ slightly from 65687 by integral 5-byte header differences; inspect close responses before interpreting that as truncation. Close averages and Rut keepalive averages match exactly.
+
+Raw data and scripts are in `ebpf-response-sampled-r1`, `ebpf-response-sampled-reverse-r1`, and the sampled trace drivers. A separate sparse first-send-only decomposition is next; no runtime change is accepted from these measurements alone.

@@ -1,0 +1,8 @@
+{"type": "attached_probes", "count": 10, "data": {"probes": 10}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@sample_bytes": {"2833737": 124861482}}}
+{"type": "map", "data": {"@sample_first_ns": {"2833737": 145305052}}}
+{"type": "map", "data": {"@sample_requests": {"2833737": 1901}}}
+{"type": "map", "data": {"@sample_tail_ns": {"2833737": 90758430}}}
+{"type": "map", "data": {"@sample_total_ns": {"2833737": 236063482}}}
