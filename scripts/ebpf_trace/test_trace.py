@@ -254,12 +254,19 @@ if mode != "truncated":
 
     def test_untrusted_output_parent_is_rejected(self):
         parent = self.root / "public-parent"
-        parent.mkdir(mode=0o755)
+        parent.mkdir(mode=0o777)
+        parent.chmod(0o777)
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()), \
                 mock.patch.object(trace.subprocess, "Popen") as popen:
             trace.main(["--pid", str(os.getpid()), "--bpftrace", str(self.fake),
                         "--output", str(parent / "output")])
             popen.assert_not_called()
+
+    def test_owned_nonwritable_parent_is_allowed(self):
+        parent = self.root / "owned-parent"
+        parent.mkdir(mode=0o755)
+        fd = trace.open_output_dir(parent / "output")
+        os.close(fd)
 
     def test_pinned_output_survives_display_path_replacement(self):
         display = self.root / "pinned"
@@ -268,9 +275,10 @@ if mode != "truncated":
             original = self.root / "original"
             display.rename(original)
             display.mkdir(mode=0o700)
+            (display / "status.json").write_text("forged\n")
             trace.secure_text(Path(f"/proc/self/fd/{fd}") / "status.json", "original\n")
-            self.assertTrue((original / "status.json").exists())
-            self.assertFalse((display / "status.json").exists())
+            self.assertEqual((original / "status.json").read_text(), "original\n")
+            self.assertEqual((display / "status.json").read_text(), "forged\n")
         finally:
             os.close(fd)
 

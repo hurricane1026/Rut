@@ -38,23 +38,25 @@ def open_output_dir(path):
     try:
         parent_stat = os.fstat(parent_fd)
         parent_mode = parent_stat.st_mode
-        trusted_owner = parent_stat.st_uid == os.geteuid() and not (parent_mode & 0o077)
-        sticky_directory = (parent_mode & 0o1000) and (parent_mode & 0o002)
-        if not (trusted_owner or sticky_directory):
+        trusted_owner = (parent_stat.st_uid == os.geteuid() and
+                         ((parent_mode & 0o022) == 0 or parent_mode & 0o1000))
+        if not trusted_owner:
             raise PermissionError("output parent is not a trusted directory")
         os.mkdir(name, mode=0o700, dir_fd=parent_fd)
         out_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                          dir_fd=parent_fd)
-        out_stat = os.fstat(out_fd)
-        entry_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if (out_stat.st_dev, out_stat.st_ino) != (entry_stat.st_dev, entry_stat.st_ino):
+        try:
+            out_stat = os.fstat(out_fd)
+            entry_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (out_stat.st_dev, out_stat.st_ino) != (entry_stat.st_dev, entry_stat.st_ino):
+                raise RuntimeError("output directory changed during creation")
+            if out_stat.st_uid != os.geteuid() or out_stat.st_mode & 0o077:
+                raise PermissionError("output directory is not private")
+            os.fchmod(out_fd, 0o700)
+            return out_fd
+        except BaseException:
             os.close(out_fd)
-            raise RuntimeError("output directory changed during creation")
-        if out_stat.st_uid != os.geteuid() or out_stat.st_mode & 0o077:
-            os.close(out_fd)
-            raise PermissionError("output directory is not private")
-        os.fchmod(out_fd, 0o700)
-        return out_fd
+            raise
     finally:
         os.close(parent_fd)
 
