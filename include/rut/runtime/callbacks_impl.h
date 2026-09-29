@@ -2084,6 +2084,22 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
     }
 }
 
+// Every owner the previous request in a pipelined burst held has retired:
+// its accounting, send, response-deadline, prebuilt-response, boundary and
+// upstream transport owners are neutral, exactly as when a keep-alive
+// connection re-arms Recv for a fresh request.
+inline bool http1_pipeline_predecessor_owners_are_settled(const Connection& conn) {
+    return conn.req_start_us == 0 && !conn.epoch_held && conn.send_progress == 0 &&
+           !conn.send_armed && conn.on_send == nullptr &&
+           conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
+           conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+           conn.http1_prebuilt_request_prefix_len == 0 &&
+           conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
+           !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
+           !conn.upstream_episode_quarantined && http1_pipeline_successor_tombstone_is_safe(conn) &&
+           http1_pipeline_successor_upstream_owners_are_neutral(conn);
+}
+
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn) {
     // Snapshot before transition_to_reading_header clears the previous callback
@@ -2091,15 +2107,7 @@ void pipeline_dispatch(Loop* loop, Connection& conn) {
     // predicate after a complete successor parse; fragmented reparses retain
     // this bit until that point.
     conn.http1_pipeline_boundary_owners_settled =
-        conn.pipeline_depth == 1 && conn.req_start_us == 0 && !conn.epoch_held &&
-        conn.send_progress == 0 && !conn.send_armed && conn.on_send == nullptr &&
-        conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
-        conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
-        conn.http1_prebuilt_request_prefix_len == 0 &&
-        conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
-        !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
-        !conn.upstream_episode_quarantined && http1_pipeline_successor_tombstone_is_safe(conn) &&
-        http1_pipeline_successor_upstream_owners_are_neutral(conn);
+        conn.pipeline_depth >= 1 && http1_pipeline_predecessor_owners_are_settled(conn);
     conn.transition_to_reading_header(&on_header_received<Loop>);
     // Refresh keepalive timer — synthetic dispatch skips the normal
     // EventLoop::dispatch() which calls timer.refresh().
@@ -2183,9 +2191,24 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // filter can reliably reject entries left by a close+reuse even if
     // the new request's req_start_us lands in the same microsecond.
     conn.handler_gen++;
-    if (conn.pipeline_depth == 1 && complete_pipeline_request && conn.handler_gen != 0 &&
-        conn.req_strict_h1_complete && !conn.req_malformed)
+    // A depth-1 successor with no bytes behind it keeps the dedicated
+    // generation-token path. A successor the token path cannot carry -- one
+    // with its own pipelined suffix, or one past depth 1 -- is re-based once
+    // its predecessor has retired every owner: it is then indistinguishable
+    // from a fresh keep-alive request whose bytes arrived early, so it runs at
+    // depth 0 and its suffix coalesces behind it. The burst advances one
+    // settled boundary at a time with no depth limit.
+    const bool successor_has_suffix = conn.req_initial_send_len != 0 && !conn.req_malformed &&
+                                      conn.recv_buf.len() > conn.req_initial_send_len;
+    if (complete_pipeline_request && (successor_has_suffix || conn.pipeline_depth >= 2) &&
+        conn.http1_pipeline_boundary_owners_settled &&
+        http1_pipeline_predecessor_owners_are_settled(conn)) {
+        conn.pipeline_depth = 0;
+        conn.http1_pipeline_boundary_owners_settled = false;
+    } else if (conn.pipeline_depth == 1 && complete_pipeline_request && conn.handler_gen != 0 &&
+               conn.req_strict_h1_complete && !conn.req_malformed) {
         conn.http1_pipeline_request_generation = conn.handler_gen;
+    }
     conn.req_start_us = monotonic_us();
     // Per-request proxy state must start clean on EVERY request. reset() runs
     // only at connection alloc, so on a keep-alive-reused connection these flags
