@@ -2865,6 +2865,7 @@ public:
 
     void try_admit_response_body_pipe(Connection& c) {
         if (!body_pipe_response_enabled || c.response_body_pipe || c.tls_active || c.h2 ||
+            c.pipeline_depth != 0 || c.http1_pipeline_request_generation != 0 ||
             c.protocol != ConnProtocol::Http11 ||
             c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
             c.response_read_deadline_post_commit_phase !=
