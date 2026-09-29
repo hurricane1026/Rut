@@ -1,0 +1,6 @@
+{
+  "source_base": "7787da53991a4d60769518c6ac57d7d0ec1bff44",
+  "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-recv-stage",
+  "sha256": "623a17d69e0727506be020c406c28fdbcf237d16477b3aba9b52ddbe8b717c4a",
+  "full_network_regression": "not run; rejected after clear causal throughput regression"
+}

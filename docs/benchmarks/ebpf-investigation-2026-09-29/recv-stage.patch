@@ -1,0 +1,60 @@
+diff --git a/include/rut/runtime/io_uring_backend.h b/include/rut/runtime/io_uring_backend.h
+index 7bfc2c99..cc4341ba 100644
+--- a/include/rut/runtime/io_uring_backend.h
++++ b/include/rut/runtime/io_uring_backend.h
+@@ -70,6 +70,10 @@ struct IoUringBackend {
+     // Kernel supports IORING_NOP_INJECT_RESULT (probed at init); required to
+     // complete a send that was written directly in full.
+     bool nop_inject_result = false;
++    // Experimental per-shard synchronous receive staging; never held by the kernel.
++    u8* direct_recv_stage = nullptr;
++    bool direct_recv_stage_attempted = false;
++    static constexpr u32 kDirectRecvStageSize = 512 * 1024;
+ 
+     // Provided buffer ring
+     io_uring_buf_ring* buf_ring = nullptr;
+diff --git a/src/runtime/io_uring_backend.cc b/src/runtime/io_uring_backend.cc
+index fb5132ee..873b88dd 100644
+--- a/src/runtime/io_uring_backend.cc
++++ b/src/runtime/io_uring_backend.cc
+@@ -558,6 +558,28 @@ bool IoUringBackend::add_recv_upstream_direct(
+     sqe->fd = fd;
+     sqe->addr = reinterpret_cast<u64>(dst);
+     sqe->len = len;
++    if (len >= 65536 && nop_inject_result) {
++        if (!direct_recv_stage_attempted) {
++            direct_recv_stage_attempted = true;
++            void* memory = mmap(nullptr,
++                                kDirectRecvStageSize,
++                                PROT_READ | PROT_WRITE,
++                                MAP_PRIVATE | MAP_ANONYMOUS,
++                                -1,
++                                0);
++            if (memory != MAP_FAILED) direct_recv_stage = static_cast<u8*>(memory);
++        }
++        if (direct_recv_stage) {
++            const u32 capacity = len < kDirectRecvStageSize ? len : kDirectRecvStageSize;
++            const ssize_t received = ::recv(fd, direct_recv_stage, capacity, MSG_DONTWAIT);
++            if (received > 0) {
++                __builtin_memcpy(dst, direct_recv_stage, static_cast<u32>(received));
++                sqe->opcode = IORING_OP_NOP;
++                sqe->rw_flags = IORING_NOP_INJECT_RESULT;
++                sqe->len = static_cast<u32>(received);
++            }
++        }
++    }
+     // msg_flags stays 0 (memset above): no MSG_WAITALL, see the declaration.
+     // No IOSQE_BUFFER_SELECT / buf_group: the kernel writes straight into
+     // dst, so this CQE never carries IORING_CQE_F_BUFFER. wait() recognizes
+@@ -2057,6 +2079,11 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
+ 
+ void IoUringBackend::shutdown() {
+     reset_downstream_recv_wait_state();
++    if (direct_recv_stage) {
++        munmap(direct_recv_stage, kDirectRecvStageSize);
++        direct_recv_stage = nullptr;
++    }
++    direct_recv_stage_attempted = false;
+     if (timer_fd >= 0) {
+         close(timer_fd);
+         timer_fd = -1;

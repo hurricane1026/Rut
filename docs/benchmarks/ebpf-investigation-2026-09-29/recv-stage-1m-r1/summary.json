@@ -1,0 +1,13 @@
+{
+  "completed_comparisons": [
+    {
+      "case": "1048576-c1-close",
+      "candidate_delta_percent": -7.635045050494194
+    },
+    {
+      "case": "1048576-c32-close",
+      "candidate_delta_percent": -10.423613720681713
+    }
+  ],
+  "status": "rejected; intentionally interrupted after c32; incomplete c128 excluded"
+}
