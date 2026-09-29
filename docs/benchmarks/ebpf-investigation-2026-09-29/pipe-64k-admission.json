@@ -1,0 +1,67 @@
+{
+  "change": "Lower pipe admission body threshold from 128 KiB to 64 KiB",
+  "baseline_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "candidate_sha256": "1b7d574ba70f6d7a88550552aaf6e7e9f226c6956fd7e877ef71eb5895804094",
+  "causal": {
+    "65536-c1-close-proxy": {
+      "candidate_rps": [
+        6038.194741575495,
+        5991.01806322111
+      ],
+      "baseline_rps": [
+        6000.429831626329,
+        5986.791941520331
+      ],
+      "median_ratio": 1.0035029827965651
+    },
+    "65536-c1-keepalive-proxy": {
+      "candidate_rps": [
+        7785.669083242343,
+        7750.298507731854
+      ],
+      "baseline_rps": [
+        7791.938248122961,
+        7807.657356878878
+      ],
+      "median_ratio": 0.9959211754176985
+    }
+  },
+  "ebpf": {
+    "65536-c1-close-rut-64k": {
+      "load_requests": 44130,
+      "copied_bytes_per_request": 65746.0,
+      "tcp_splice_read_calls": 0,
+      "splice_to_socket_calls": 0,
+      "trace_usable": true,
+      "body_preflight": true,
+      "zero_load_errors": true
+    },
+    "65536-c1-close-rut-pipe": {
+      "load_requests": 44426,
+      "copied_bytes_per_request": 65746.0,
+      "tcp_splice_read_calls": 0,
+      "splice_to_socket_calls": 0,
+      "trace_usable": true,
+      "body_preflight": true,
+      "zero_load_errors": true
+    },
+    "65536-c1-keepalive-rut-64k": {
+      "load_requests": 55011,
+      "copied_bytes_per_request": 65727.0,
+      "tcp_splice_read_calls": 0,
+      "splice_to_socket_calls": 0,
+      "trace_usable": true,
+      "body_preflight": true,
+      "zero_load_errors": true
+    },
+    "65536-c1-keepalive-rut-pipe": {
+      "load_requests": 54809,
+      "copied_bytes_per_request": 65727.0,
+      "tcp_splice_read_calls": 0,
+      "splice_to_socket_calls": 0,
+      "trace_usable": true,
+      "body_preflight": true,
+      "zero_load_errors": true
+    }
+  }
+}
