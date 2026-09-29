@@ -1544,3 +1544,21 @@ The first uninstrumented causal probe uses unchanged acceptance fixtures, 2-seco
 | c32 | 3039.0 | 2432.0 | 1.2496 |
 
 These are two samples per engine in two coordinates, **not** nginx comparisons, full acceptance, or proof that all paths improve. High-concurrency, keepalive and excluded-path controls are still required before retaining the optimization across the matrix. Formal acceptance remains 76/96 at the 1.10 target, with 20 unmet coordinates and 3 below parity. No huge pages or global kernel changes were used. Commands, hashes, failures, logs and scripts are retained in `pipe-input-validation.json` and `pipe-input-evidence.tar.gz`.
+
+
+## Concurrent keepalive admission correction and expanded controls
+
+The initial live pipe candidate failed the HTTP 1 MiB c32 keepalive warmup with 55 read errors. The driver stopped immediately; this is not a valid performance sample. GDB localized the closes to the next request's strict preflight: the prior response and pipe had already retired, but successive early requests accumulated pipeline depth 2 with no admitted successor generation. The existing strict policy supports only the depth-1 successor shape. Async pipe completion exposed this timing at load; the earlier sequential checks did not cover it.
+
+Pipe admission now requires depth 0 and generation 0. Already pipelined successors retain the ordinary send/receive path, and the strict depth/identity checks remain unchanged. The workload still includes every keepalive case. Candidate SHA256 `1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244` passes two repeated c32 and c128 keepalive checks with zero warmup/load errors, followed by the full 1438 network tests / 388644 checks, 9 focused tests / 16714 checks and 15 storage tests / 509 checks. This is empirical coverage of the observed failure, not a claim about every possible scheduling interleaving.
+
+Expanded uninstrumented candidate/baseline/baseline/candidate controls use the unchanged fixtures, 2-second warmup and 6-second load. Each engine has two samples per coordinate; all preflights and error counters pass. The baseline is the same accepted `271cd98c` executable used above.
+
+| HTTP 1 MiB proxy | Candidate median RPS | Baseline median RPS | Candidate / baseline |
+|---|---:|---:|---:|
+| close c128 | 3008.1 | 2318.4 | 1.2975 |
+| keepalive c1 | 2660.3 | 2481.9 | 1.0719 |
+| keepalive c32 | 2829.4 | 2394.4 | 1.1817 |
+| keepalive c128 | 2647.7 | 2303.2 | 1.1496 |
+
+These are Rut-to-Rut controls, not a fresh nginx acceptance matrix. Excluded-path controls and normalized receive-copy tracing are next, followed by the unchanged 96-coordinate gate. The formal 76/96 target result is not updated by these samples. Failure logs, debugger observations, successful measurements and validation are retained in `pipe-pipeline-guard-validation.json` and `pipe-pipeline-guard-evidence.tar.gz`.

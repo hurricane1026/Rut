@@ -1,0 +1,70 @@
+{
+  "candidate_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "superseded_candidate_sha256": "56501558e23bf4f19c2863408bce4f3e7936169c3857e0074f7ddeb76ddc03a6",
+  "baseline_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "failure": {
+    "case": "HTTP 1 MiB proxy keepalive c32",
+    "phase": "2-second warmup",
+    "read_errors": 55,
+    "accepted_sample": false,
+    "gdb_evidence": "successor preflight: profile 2, pipeline_stable 0, depth 2, generation 0; old response ended and pipe absent"
+  },
+  "change": "Restrict new pipe admission to pipeline_depth == 0 and http1_pipeline_request_generation == 0; retain ordinary transport for pipelined successors without relaxing strict policy.",
+  "verification": {
+    "network_passed": 1438,
+    "network_checks": 388644,
+    "network_log_sha256": "c839eca116bd605131861e68e51a6565b1eac17b110eb15d7a3f7e8a12c42831",
+    "focused_passed": 9,
+    "focused_checks": 16714,
+    "storage_passed": 15,
+    "storage_checks": 509,
+    "candidate_only_keepalive_repeats": "two 2-second warmups plus 6-second measurements each at c32 and c128; all error counters zero"
+  },
+  "large_control_results": [
+    {
+      "case": "1048576-c1-keepalive",
+      "candidate_median_rps": 2660.3208876127637,
+      "baseline_median_rps": 2481.9341330185116,
+      "candidate_over_baseline": 1.0718740889297087
+    },
+    {
+      "case": "1048576-c128-close",
+      "candidate_median_rps": 3008.0923274114402,
+      "baseline_median_rps": 2318.369681011432,
+      "candidate_over_baseline": 1.297503306763011
+    },
+    {
+      "case": "1048576-c128-keepalive",
+      "candidate_median_rps": 2647.6626774896895,
+      "baseline_median_rps": 2303.1816328189007,
+      "candidate_over_baseline": 1.1495674677854968
+    },
+    {
+      "case": "1048576-c32-keepalive",
+      "candidate_median_rps": 2829.4381794767532,
+      "baseline_median_rps": 2394.4464321751184,
+      "candidate_over_baseline": 1.1816669362306376
+    }
+  ],
+  "measurement": {
+    "order": [
+      "candidate",
+      "baseline",
+      "baseline",
+      "candidate"
+    ],
+    "warmup_seconds": 2,
+    "measurement_seconds": 6,
+    "samples_per_engine": 2,
+    "body_preflight": true,
+    "all_errors_zero": true,
+    "nginx_comparison": false,
+    "full_acceptance": false
+  },
+  "pending": [
+    "excluded-path control results",
+    "normalized eBPF receive-copy comparison",
+    "complete 96-coordinate acceptance"
+  ],
+  "formal_acceptance_unchanged": true
+}
