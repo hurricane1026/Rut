@@ -1,0 +1,88 @@
+{
+  "candidate_sha256": "1a84d3a3a42bbeb9e7f6ff91c6fce22f5b98e033c2a76382e1d7ffd360a30f9d",
+  "baseline_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "change": "Remove caller-side parser and ParsedResponse reset at three strict-header validation sites; parser.parse resets both on parseable input",
+  "protocol": "candidate/baseline/baseline/candidate and reverse; 2s warmup, 6s load, exact full-body preflight, zero wrk errors",
+  "runs": {
+    "parser-reset-64k-r1": {
+      "sample_count": 8,
+      "cases": {
+        "65536-c1-close-proxy": {
+          "candidate_median_rps": 5980.139413351893,
+          "baseline_median_rps": 5959.542421651396,
+          "ratio": 1.0034561364351846
+        },
+        "65536-c1-keepalive-proxy": {
+          "candidate_median_rps": 7796.346067333905,
+          "baseline_median_rps": 7862.10006335147,
+          "ratio": 0.9916365862189833
+        }
+      }
+    },
+    "parser-reset-64k-r2": {
+      "sample_count": 8,
+      "cases": {
+        "65536-c1-close-proxy": {
+          "candidate_median_rps": 6025.309781233656,
+          "baseline_median_rps": 6015.422279914313,
+          "ratio": 1.0016436919736056
+        },
+        "65536-c1-keepalive-proxy": {
+          "candidate_median_rps": 7887.170286931727,
+          "baseline_median_rps": 7884.4170348978205,
+          "ratio": 1.0003492017255962
+        }
+      }
+    },
+    "parser-reset-small-r1": {
+      "sample_count": 16,
+      "cases": {
+        "1024-c1-close-proxy": {
+          "candidate_median_rps": 7717.799907119641,
+          "baseline_median_rps": 7709.489709234088,
+          "ratio": 1.0010779180203846
+        },
+        "1024-c1-keepalive-proxy": {
+          "candidate_median_rps": 10869.057087405617,
+          "baseline_median_rps": 10894.878587396051,
+          "ratio": 0.9976299414643954
+        },
+        "16-c1-close-proxy": {
+          "candidate_median_rps": 7747.5928259184475,
+          "baseline_median_rps": 7795.944271879998,
+          "ratio": 0.9937978717811061
+        },
+        "16-c1-keepalive-proxy": {
+          "candidate_median_rps": 10826.089705916947,
+          "baseline_median_rps": 10844.262768850109,
+          "ratio": 0.9983241771874651
+        }
+      }
+    },
+    "parser-reset-small-r2": {
+      "sample_count": 16,
+      "cases": {
+        "1024-c1-close-proxy": {
+          "candidate_median_rps": 7725.014464705304,
+          "baseline_median_rps": 7729.466943370906,
+          "ratio": 0.9994239604492493
+        },
+        "1024-c1-keepalive-proxy": {
+          "candidate_median_rps": 10838.823305334143,
+          "baseline_median_rps": 10872.692586599278,
+          "ratio": 0.9968849223874057
+        },
+        "16-c1-close-proxy": {
+          "candidate_median_rps": 7767.996538927834,
+          "baseline_median_rps": 7764.70537056706,
+          "ratio": 1.0004238626198554
+        },
+        "16-c1-keepalive-proxy": {
+          "candidate_median_rps": 10872.282602807038,
+          "baseline_median_rps": 10915.892774540724,
+          "ratio": 0.9960048918916281
+        }
+      }
+    }
+  }
+}

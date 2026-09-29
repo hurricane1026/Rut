@@ -1693,3 +1693,18 @@ Reprofiled the restored accepted pipe binary (SHA256 `1b0bb18ded0fc0ec87e88ba258
 | post-commit stability | 2.67% | 3.11% |
 
 The same parser/proof/validation costs seen in the older accepted-runtime profile remain hot after the pipe addition. These percentages are userspace self cycles, not fractions of request latency; adding them does not predict a throughput gain. The 64 KiB eBPF comparison above also gives no evidence of extra receive-copy bytes versus nginx. The next causal change should target one of these repeated userspace computations while preserving strict validation semantics, then be measured on all short/64 KiB lagging coordinates. `pipe-current-64k-users.json` has the top symbols and provenance; `pipe-current-64k-users-evidence.tar.gz` SHA256 `0293e3b0a8bf89e03a4e462f8253830c8eb51a324a5f98b5e1c10be9936c3ecb` has the reports, scripts and logs. Raw perf.data remains in the local lab directory and is excluded from the archive because each file exceeds 130 MiB. No new nginx acceptance result is claimed.
+
+## Redundant response-parser reset control
+
+`HttpResponseParser::parse` resets its output on parseable input. At three strict raw/pinned-header validation sites, removed the immediately preceding parser/output resets; parse failure already short-circuits before any output read. Candidate SHA256 `1a84d3a3a42bbeb9e7f6ff91c6fce22f5b98e033c2a76382e1d7ffd360a30f9d` passed the full 1438 network tests / 388644 checks. Four paired runs total 48 valid measured samples, in both process orders with exact-body preflight, 2-second warmup, at least 5-second load and zero wrk errors.
+
+| HTTP proxy case | Candidate / pipe baseline, first order | Reverse order |
+|---|---:|---:|
+| 16 B close c1 | 0.9938 | 1.0004 |
+| 16 B keepalive c1 | 0.9983 | 0.9960 |
+| 1 KiB close c1 | 1.0011 | 0.9994 |
+| 1 KiB keepalive c1 | 0.9976 | 0.9969 |
+| 64 KiB close c1 | 1.0035 | 1.0016 |
+| 64 KiB keepalive c1 | 0.9916 | 1.0004 |
+
+The 64 KiB close improvement is small and repeats, but both short keepalive laggards regress in both orders; 64 KiB keepalive is also negative in the first order. Reject the change on the combined version and restore the runtime source. These paired Rut-to-Rut ratios do not update the nginx matrix. `parser-reset-reuse.json` holds exact medians/hashes; `parser-reset-reuse-evidence.tar.gz` SHA256 `12d3fd093a30554940a946642e72183fb312dfd786f3618894b1391ec7e5c0c0` contains all logs and raw rows. The formal result remains 84/96 at 1.05.
