@@ -1,0 +1,713 @@
+{
+  "candidate_sha256": "46fb2391880eafd27bc30ff62ec52e6874ce48252f0241c1c03759ffda2e5117",
+  "baseline_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "method": "paired 2 s warmup + 6 s load, two samples per binary, ABBA and BAAB orders, exact-body preflight and zero errors",
+  "tests": {
+    "buffer": "52 passed, 209 checks",
+    "network": "1460 passed, 391497 checks"
+  },
+  "controls": [
+    {
+      "run": "discard-prefix-paired-r1",
+      "case": "16-c1-close-proxy",
+      "ratio": 0.9996478590163728,
+      "candidate_mean_rps": 7717.771874372822,
+      "baseline_mean_rps": 7720.49057551817,
+      "samples": [
+        {
+          "case": "16-c1-close-proxy",
+          "engine": "candidate",
+          "rep": 0,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 47158,
+          "seconds": 6.099369,
+          "rps": 7731.6194511268295,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 146006016,
+          "user_us_per_request": 12.087026591458502,
+          "system_us_per_request": 53.86148691632385,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.12728773484880615,
+          "voluntary_per_request": 2.9866194495101572,
+          "involuntary_per_request": 0.011175198269646719
+        },
+        {
+          "case": "16-c1-close-proxy",
+          "engine": "baseline",
+          "rep": 1,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 47215,
+          "seconds": 6.100046,
+          "rps": 7740.10556641704,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 146067456,
+          "user_us_per_request": 11.64884041088637,
+          "system_us_per_request": 54.22005718521656,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.12350924494334427,
+          "voluntary_per_request": 2.9807052843376045,
+          "involuntary_per_request": 0.012199512866673727
+        },
+        {
+          "case": "16-c1-close-proxy",
+          "engine": "baseline",
+          "rep": 2,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 46973,
+          "seconds": 6.099696,
+          "rps": 7700.875584619299,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 145969152,
+          "user_us_per_request": 11.495965767568602,
+          "system_us_per_request": 54.71228152342835,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.20428388648798243,
+          "voluntary_per_request": 2.9790943733634214,
+          "involuntary_per_request": 0.011815298150001064
+        },
+        {
+          "case": "16-c1-close-proxy",
+          "engine": "candidate",
+          "rep": 3,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 46989,
+          "seconds": 6.099359,
+          "rps": 7703.924297618815,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 146006016,
+          "user_us_per_request": 11.704867096554512,
+          "system_us_per_request": 54.48083594032646,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.12514209708655216,
+          "voluntary_per_request": 2.9878269382195835,
+          "involuntary_per_request": 0.011151546106535572
+        }
+      ]
+    },
+    {
+      "run": "discard-prefix-paired-r1",
+      "case": "16-c1-keepalive-proxy",
+      "ratio": 1.001794236394558,
+      "candidate_mean_rps": 10915.460702757136,
+      "baseline_mean_rps": 10895.910862935,
+      "samples": [
+        {
+          "case": "16-c1-keepalive-proxy",
+          "engine": "candidate",
+          "rep": 0,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 66537,
+          "seconds": 6.099586,
+          "rps": 10908.44526169481,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 145952768,
+          "user_us_per_request": 9.769000706373896,
+          "system_us_per_request": 41.48067992244916,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.08152564738416221,
+          "voluntary_per_request": 1.9996994153628809,
+          "involuntary_per_request": 0.007229060522716684
+        },
+        {
+          "case": "16-c1-keepalive-proxy",
+          "engine": "baseline",
+          "rep": 1,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 66472,
+          "seconds": 6.099744,
+          "rps": 10897.506518306342,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 146001920,
+          "user_us_per_request": 9.778553375857504,
+          "system_us_per_request": 41.521242026718014,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.08061246840775063,
+          "voluntary_per_request": 1.99972920929113,
+          "involuntary_per_request": 0.005942351666867253
+        },
+        {
+          "case": "16-c1-keepalive-proxy",
+          "engine": "baseline",
+          "rep": 2,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 66452,
+          "seconds": 6.099695,
+          "rps": 10894.315207563657,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 145948672,
+          "user_us_per_request": 9.781496418467466,
+          "system_us_per_request": 41.68422319869981,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.08868605911033528,
+          "voluntary_per_request": 1.9999849515439716,
+          "involuntary_per_request": 0.007930536326972852
+        },
+        {
+          "case": "16-c1-keepalive-proxy",
+          "engine": "candidate",
+          "rep": 3,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 66619,
+          "seconds": 6.099258,
+          "rps": 10922.476143819462,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 145854464,
+          "user_us_per_request": 9.907083564748795,
+          "system_us_per_request": 41.279514853119984,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.08146067938576082,
+          "voluntary_per_request": 1.9998198712079136,
+          "involuntary_per_request": 0.008150827841906964
+        }
+      ]
+    },
+    {
+      "run": "discard-prefix-paired-r1",
+      "case": "65536-c1-close-proxy",
+      "ratio": 0.9982596483707922,
+      "candidate_mean_rps": 6012.553327264531,
+      "baseline_mean_rps": 6023.035526956646,
+      "samples": [
+        {
+          "case": "65536-c1-close-proxy",
+          "engine": "candidate",
+          "rep": 0,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 36013,
+          "seconds": 6.000227,
+          "rps": 6001.939593285388,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158720000,
+          "user_us_per_request": 16.93832782606281,
+          "system_us_per_request": 70.25240885235887,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.1264127953794463,
+          "voluntary_per_request": 2.911476411295921,
+          "involuntary_per_request": 0.015661011301474466
+        },
+        {
+          "case": "65536-c1-close-proxy",
+          "engine": "baseline",
+          "rep": 1,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 36856,
+          "seconds": 6.099736,
+          "rps": 6042.228712849212,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158728192,
+          "user_us_per_request": 16.82222704579987,
+          "system_us_per_request": 70.54482309528977,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.12496130887779465,
+          "voluntary_per_request": 2.8649337963967874,
+          "involuntary_per_request": 0.014217495116127632
+        },
+        {
+          "case": "65536-c1-close-proxy",
+          "engine": "baseline",
+          "rep": 2,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 36623,
+          "seconds": 6.099927,
+          "rps": 6003.842341064082,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158625792,
+          "user_us_per_request": 16.110094749201323,
+          "system_us_per_request": 71.26669033121263,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.12356565546241431,
+          "voluntary_per_request": 2.919695273462032,
+          "involuntary_per_request": 0.0158097370504874
+        },
+        {
+          "case": "65536-c1-close-proxy",
+          "engine": "candidate",
+          "rep": 3,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 36740,
+          "seconds": 6.099781,
+          "rps": 6023.167061243674,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158679040,
+          "user_us_per_request": 15.786608600979859,
+          "system_us_per_request": 70.76755579749592,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.11801377245508984,
+          "voluntary_per_request": 2.9227000544365813,
+          "involuntary_per_request": 0.015405552531301034
+        }
+      ]
+    },
+    {
+      "run": "discard-prefix-paired-r1",
+      "case": "65536-c1-keepalive-proxy",
+      "ratio": 0.9946069411919894,
+      "candidate_mean_rps": 7845.961106113022,
+      "baseline_mean_rps": 7888.504273567614,
+      "samples": [
+        {
+          "case": "65536-c1-keepalive-proxy",
+          "engine": "candidate",
+          "rep": 0,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 47618,
+          "seconds": 6.100043,
+          "rps": 7806.1744810651335,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158584832,
+          "user_us_per_request": 14.07030954681003,
+          "system_us_per_request": 58.59128900835818,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.07562944684783066,
+          "voluntary_per_request": 2.000252005544122,
+          "involuntary_per_request": 0.009702213448695872
+        },
+        {
+          "case": "65536-c1-keepalive-proxy",
+          "engine": "baseline",
+          "rep": 1,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 48156,
+          "seconds": 6.099527,
+          "rps": 7895.038418552783,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158646272,
+          "user_us_per_request": 14.536091037461583,
+          "system_us_per_request": 57.93670570645403,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.0879032311653792,
+          "voluntary_per_request": 1.9998131074009469,
+          "involuntary_per_request": 0.010819004900739265
+        },
+        {
+          "case": "65536-c1-keepalive-proxy",
+          "engine": "baseline",
+          "rep": 2,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 48078,
+          "seconds": 6.099744,
+          "rps": 7881.970128582445,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158527488,
+          "user_us_per_request": 14.559673863305463,
+          "system_us_per_request": 58.23869545322185,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.09366358833562127,
+          "voluntary_per_request": 2.0000831981363616,
+          "involuntary_per_request": 0.010066974499771205
+        },
+        {
+          "case": "65536-c1-keepalive-proxy",
+          "engine": "candidate",
+          "rep": 3,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 48099,
+          "seconds": 6.099485,
+          "rps": 7885.74773116091,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158601216,
+          "user_us_per_request": 13.30588993534169,
+          "system_us_per_request": 59.044886588078754,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.09192484251231833,
+          "voluntary_per_request": 2.000270275889312,
+          "involuntary_per_request": 0.010914987837584982
+        }
+      ]
+    },
+    {
+      "run": "discard-prefix-paired-64k-reverse-r1",
+      "case": "65536-c1-close-proxy",
+      "ratio": 1.0001092419941808,
+      "candidate_mean_rps": 6029.985559300763,
+      "baseline_mean_rps": 6029.326903606245,
+      "samples": [
+        {
+          "case": "65536-c1-close-proxy",
+          "engine": "baseline",
+          "rep": 0,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 36735,
+          "seconds": 6.099956,
+          "rps": 6022.174586177343,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158597120,
+          "user_us_per_request": 16.877637130801688,
+          "system_us_per_request": 70.50496801415544,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.14430798965564176,
+          "voluntary_per_request": 2.8852592895059206,
+          "involuntary_per_request": 0.01489043146862665
+        },
+        {
+          "case": "65536-c1-close-proxy",
+          "engine": "candidate",
+          "rep": 1,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 36253,
+          "seconds": 6.000255,
+          "rps": 6041.909885496533,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158568448,
+          "user_us_per_request": 15.446997489862907,
+          "system_us_per_request": 71.16652414972555,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.13059909524728988,
+          "voluntary_per_request": 2.8990152539100214,
+          "involuntary_per_request": 0.014840151159904008
+        },
+        {
+          "case": "65536-c1-close-proxy",
+          "engine": "candidate",
+          "rep": 2,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 36709,
+          "seconds": 6.099805,
+          "rps": 6018.061233104992,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158621696,
+          "user_us_per_request": 17.162003868261188,
+          "system_us_per_request": 69.73766651229944,
+          "minor_faults_per_request": 0.00021793020785093573,
+          "runqueue_us_per_request": 0.13481802827644446,
+          "voluntary_per_request": 2.9287640633087255,
+          "involuntary_per_request": 0.015527527309379171
+        },
+        {
+          "case": "65536-c1-close-proxy",
+          "engine": "baseline",
+          "rep": 3,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 36820,
+          "seconds": 6.099582,
+          "rps": 6036.479221035146,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158580736,
+          "user_us_per_request": 15.752308527973927,
+          "system_us_per_request": 71.42857142857143,
+          "minor_faults_per_request": 0.00021727322107550245,
+          "runqueue_us_per_request": 0.129981721890277,
+          "voluntary_per_request": 2.9009505703422054,
+          "involuntary_per_request": 0.015263443780554047
+        }
+      ]
+    },
+    {
+      "run": "discard-prefix-paired-64k-reverse-r1",
+      "case": "65536-c1-keepalive-proxy",
+      "ratio": 0.9980706586672126,
+      "candidate_mean_rps": 7880.686058644502,
+      "baseline_mean_rps": 7895.919983428914,
+      "samples": [
+        {
+          "case": "65536-c1-keepalive-proxy",
+          "engine": "baseline",
+          "rep": 0,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 48154,
+          "seconds": 6.099515,
+          "rps": 7894.726056088066,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158535680,
+          "user_us_per_request": 14.329027702786892,
+          "system_us_per_request": 58.1467790837729,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.08135367778377703,
+          "voluntary_per_request": 2.0000415334136314,
+          "involuntary_per_request": 0.009614985255638161
+        },
+        {
+          "case": "65536-c1-keepalive-proxy",
+          "engine": "candidate",
+          "rep": 1,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 47998,
+          "seconds": 6.09935,
+          "rps": 7869.363128857993,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158584832,
+          "user_us_per_request": 14.167256969040377,
+          "system_us_per_request": 58.33576399016626,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.1008309929580399,
+          "voluntary_per_request": 2.0002916788199507,
+          "involuntary_per_request": 0.010437934913954748
+        },
+        {
+          "case": "65536-c1-keepalive-proxy",
+          "engine": "candidate",
+          "rep": 2,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+          "requests": 48140,
+          "seconds": 6.099841,
+          "rps": 7892.00898843101,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158593024,
+          "user_us_per_request": 13.502285002077274,
+          "system_us_per_request": 58.78687162442875,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.08853616535105943,
+          "voluntary_per_request": 2.0003115911923555,
+          "involuntary_per_request": 0.00963855421686747
+        },
+        {
+          "case": "65536-c1-keepalive-proxy",
+          "engine": "baseline",
+          "rep": 3,
+          "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+          "requests": 48172,
+          "seconds": 6.09995,
+          "rps": 7897.113910769761,
+          "errors": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "body_check": true,
+          "rss_bytes": 158572544,
+          "user_us_per_request": 14.531262974341942,
+          "system_us_per_request": 57.70987295524371,
+          "minor_faults_per_request": 0.0,
+          "runqueue_us_per_request": 0.09039076642032716,
+          "voluntary_per_request": 2.000311384206593,
+          "involuntary_per_request": 0.011023000913393673
+        }
+      ]
+    }
+  ],
+  "ebpf": [
+    {
+      "run": "consume-remaining-64k-keep-r1",
+      "result": {
+        "requests": 61441,
+        "seconds": 8.000411,
+        "rps": 7679.730453847934,
+        "exact_body": true,
+        "zero_errors": true,
+        "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+        "server_pid": 3009974,
+        "counts": {
+          "bytes": 997678958,
+          "calls": 122882
+        },
+        "trace_ready": true,
+        "trace_exit_code": 0,
+        "trace_valid": true,
+        "per_request": {
+          "bytes": 16238.0,
+          "calls": 2.0
+        }
+      }
+    },
+    {
+      "run": "consume-remaining-64k-close-r1",
+      "result": {
+        "requests": 47897,
+        "seconds": 8.099913,
+        "rps": 5913.273389479615,
+        "exact_body": true,
+        "zero_errors": true,
+        "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-pinned-parser-cache",
+        "server_pid": 3010208,
+        "counts": {
+          "bytes": 777751486,
+          "calls": 95794
+        },
+        "trace_ready": true,
+        "trace_exit_code": 0,
+        "trace_valid": true,
+        "per_request": {
+          "bytes": 16238.0,
+          "calls": 2.0
+        }
+      }
+    },
+    {
+      "run": "discard-prefix-trace-keep-r1",
+      "result": {
+        "requests": 62660,
+        "seconds": 8.099762,
+        "rps": 7736.029774702022,
+        "exact_body": true,
+        "zero_errors": true,
+        "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-discard-bounded-header-prefix",
+        "server_pid": 3012025,
+        "counts": {
+          "bytes": 111798630,
+          "calls": 69545
+        },
+        "trace_ready": true,
+        "trace_exit_code": 0,
+        "trace_valid": true,
+        "per_request": {
+          "bytes": 1784.2105011171402,
+          "calls": 1.1098787105011172
+        }
+      }
+    }
+  ],
+  "archive_sha256": "5282d1323cc67e7908621005b00c9dcaee90926c6dd3e896133c9661e12f1be4"
+}

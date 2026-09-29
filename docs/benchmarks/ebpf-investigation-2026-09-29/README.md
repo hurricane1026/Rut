@@ -1841,3 +1841,20 @@ Rebuilt the restored runtime to the accepted binary SHA256 `f194e0a912c8a5162317
 | `HttpResponseParser::parse` | 1.72% | 1.63% |
 
 The retained response-header cache moved the parser below the leading costs; repeated proof, policy validation, dispatch, and data movement now warrant targeted causal experiments. The first close-run call-graph report was stopped because DWARF symbolization was unusually slow; a fresh close-run flat report completed and is used here. `pinned-cache-users.json` records the top self symbols and provenance. `pinned-cache-users-evidence.tar.gz` SHA256 `ecf118d40cb23ac8152667de7fa4551d7fb8f8a6b7f60caec279a0bd9ee9448a` contains both completed flat reports, drivers, load logs and process snapshots; raw `perf.data` files remain local. No huge pages or global kernel settings were used.
+
+## Rejected no-copy Bounded header prefix
+
+A PID-filtered eBPF return probe on `consume_upstream_sent` found exactly two calls per HTTP 64 KiB proxy c1 request in both connection modes: one returned zero and one returned 16,238 remaining bytes. The nonzero call followed the 146-byte raw response header send. Caller-address sampling attributed most of these copies to the Bounded release-header callback, with the rest in the ordinary response-header callback. All traced loads passed exact-body preflight and had zero errors. The traced RPS is diagnostic only.
+
+A candidate added a `Buffer` front offset and used it only for Bounded response headers up to 256 bytes, keeping the body suffix in place and restoring the base on reset. It passed 52 buffer tests / 209 checks and 1,460 network tests / 391,497 checks. Candidate SHA256 was `46fb2391880eafd27bc30ff62ec52e6874ce48252f0241c1c03759ffda2e5117`; baseline was the accepted response-header cache SHA256 `f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0`. Under the same eBPF probe, `consume_upstream_sent` calls fell from 2.00 to 1.11 per request and its returned nonzero bytes from 16,238 to about 1,784 per request. This verifies that most targeted copies were removed, while saying nothing by itself about uninstrumented throughput.
+
+Two-sample, 6-second paired Rut controls with exact-body preflight and zero errors gave candidate/baseline ratios:
+
+| HTTP proxy c1 | Candidate first | Baseline first |
+|---|---:|---:|
+| 16 B close | 0.9996 | — |
+| 16 B keepalive | 1.0018 | — |
+| 64 KiB close | 0.9983 | 1.0001 |
+| 64 KiB keepalive | 0.9946 | 0.9981 |
+
+The 64 KiB keepalive result is negative in both process orders, while close is approximately flat. The extra offset handling across `Buffer` calls likely consumed the saved copy cost, though these controls do not isolate that mechanism. The candidate was reverted. `discard-prefix-rejected.json` has all paired samples and trace counts; `discard-prefix-evidence.tar.gz` SHA256 `5282d1323cc67e7908621005b00c9dcaee90926c6dd3e896133c9661e12f1be4` contains drivers, raw logs, test results and the rejected patch. No nginx acceptance or full-matrix result is updated, and no huge pages were used.
