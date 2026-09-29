@@ -556,6 +556,14 @@ TEST(route_trie, insert_atomic_on_node_pool_exhaustion_midpath) {
     CHECK(!t.insert(Str{deep_path, dpi}, 0, 999));
     CHECK_EQ(t.node_count(), before);
 
+    // A failed parameter chain must not publish a partial parameter partition.
+    for (u32 i = 0; i < kDeepSegs; ++i) deep_path[i * 3 + 1] = ':';
+    CHECK(!t.insert(Str{deep_path, dpi}, kRouteMethodGet, 999));
+    CHECK_EQ(t.node_count(), before);
+    CHECK_EQ(canon_match(t, S("/unknown"), kRouteMethodGet), TrieNode::kInvalidRoute);
+    REQUIRE(t.insert(S("/:after"), kRouteMethodGet, 701));
+    CHECK_EQ(canon_match(t, S("/unknown"), kRouteMethodGet), 701u);
+
     // A short route must still fit. If rollback leaked, we'd have
     // burned through the remaining headroom and this would fail.
     CHECK(t.insert(S("/ok"), 0, 500));
@@ -601,6 +609,187 @@ TEST(route_trie, insert_atomic_on_child_cap_overflow) {
         CHECK(!t.insert(Str{overflow_paths[i], 3}, 0, 0));
     }
     CHECK_EQ(t.node_count(), saturated_count);
+}
+
+TEST(route_trie, deep_capture_path_and_truncated_output_preserve_bounds) {
+    RouteTrie t;
+    char route[193]{};
+    char request[129]{};
+    for (u32 i = 0; i < 64; ++i) {
+        route[3 * i] = '/';
+        route[3 * i + 1] = ':';
+        route[3 * i + 2] = 'p';
+        request[2 * i] = '/';
+        request[2 * i + 1] = 'x';
+    }
+    REQUIRE(t.insert({route, 192}, kRouteMethodGet, 17));
+    RouteParam params[4]{};
+    params[3].name_len = 123;
+    u32 count = 99;
+    CHECK_EQ(t.match_key({request + 1, 127}, kRouteMethodGet, params, &count, 3), 17u);
+    REQUIRE_EQ(count, 3u);
+    for (u32 i = 0; i < count; ++i) {
+        CHECK((Str{params[i].name, params[i].name_len}.eq(S("p"))));
+        CHECK((Str{params[i].value, params[i].value_len}.eq(S("x"))));
+    }
+    CHECK_EQ(params[3].name_len, 123u);
+    CHECK_EQ(t.match_key({request + 1, 127}, kRouteMethodGet, params, &count, 0), 17u);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(params[3].name_len, 123u);
+    CHECK_EQ(t.match_key({request + 1, 127}, kRouteMethodGet, nullptr, &count, 3), 17u);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(t.match_key({request + 1, 127}, kRouteMethodPost, params, &count, 3),
+             TrieNode::kInvalidRoute);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(t.match_key({request + 1, 127}, kRouteMethodGet), 17u);
+    // Exercise the same maximum-depth route after the chain becomes branching.
+    REQUIRE(t.insert(S("/literal"), kRouteMethodGet, 18));
+    CHECK_EQ(t.match_key({request + 1, 127}, kRouteMethodGet, params, &count, 3), 17u);
+    CHECK_EQ(count, 3u);
+    CHECK_EQ(t.match_key(S("literal"), kRouteMethodGet, params, &count, 3), 18u);
+    CHECK_EQ(count, 0u);
+}
+
+TEST(route_trie, method_eligibility_refreshes_after_clear_and_any_insert) {
+    RouteTrie t;
+    REQUIRE(t.insert(S("/users/:id"), kRouteMethodGet, 1));
+    CHECK_EQ(canon_match(t, S("/users/42"), kRouteMethodHead), TrieNode::kInvalidRoute);
+    REQUIRE(t.insert(S("/users/:id"), kRouteMethodAny, 2));
+    CHECK_EQ(canon_match(t, S("/users/42"), kRouteMethodHead), 2u);
+    CHECK_EQ(canon_match(t, S("/users/42"), kRouteMethodGet), 1u);
+    t.clear();
+    REQUIRE(t.insert(S("/users/:id"), kRouteMethodPost, 3));
+    CHECK_EQ(canon_match(t, S("/users/42"), kRouteMethodGet), TrieNode::kInvalidRoute);
+    CHECK_EQ(canon_match(t, S("/users/42"), kRouteMethodPost), 3u);
+}
+
+TEST(route_trie, complete_literal_shortcut_preserves_method_and_deeper_fallback) {
+    RouteTrie t;
+    REQUIRE(t.insert(S("/users/me"), kRouteMethodGet, 1));
+    REQUIRE(t.insert(S("/users/:id"), kRouteMethodPost, 2));
+    REQUIRE(t.insert(S("/users/other"), kRouteMethodGet, 3));
+    REQUIRE(t.insert(S("/users/:name/settings"), kRouteMethodGet, 4));
+    RouteParam params[2]{};
+    u32 count = 99;
+    CHECK_EQ(t.match_key(S("users/me"), kRouteMethodGet, params, &count, 2), 1u);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(t.match_key(S("users/me"), kRouteMethodPost, params, &count, 2), 2u);
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("id"))));
+    CHECK_EQ(t.match_key(S("users/me/settings"), kRouteMethodGet, params, &count, 2), 4u);
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("name"))));
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("me"))));
+}
+
+TEST(route_trie, chain_dispatch_keeps_prefix_method_and_capture_boundaries) {
+    RouteTrie t;
+    REQUIRE(t.insert(S("/users/:id"), kRouteMethodAny, 10));
+    REQUIRE(t.insert(S("/users/:id/books/:book"), kRouteMethodGet, 11));
+    RouteParam params[2]{};
+    u32 count = 99;
+    CHECK_EQ(t.match_key(S("users/alice/books/rut"), kRouteMethodGet, params, &count, 2), 11u);
+    REQUIRE_EQ(count, 2u);
+    CHECK((Str{params[1].value, params[1].value_len}.eq(S("rut"))));
+    CHECK_EQ(t.match_key(S("users/alice/books/rut"), kRouteMethodPost, params, &count, 2), 10u);
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("alice"))));
+    CHECK_EQ(t.match_key(S("users/alice/missing"), kRouteMethodGet, params, &count, 2), 10u);
+    CHECK_EQ(count, 1u);
+    // Adding a branch must switch to general matching without changing winners.
+    REQUIRE(t.insert(S("/users/me"), kRouteMethodAny, 12));
+    CHECK_EQ(t.match_key(S("users/alice/books/rut"), kRouteMethodGet, params, &count, 2), 11u);
+    CHECK_EQ(count, 2u);
+    CHECK_EQ(t.match_key(S("users/me"), kRouteMethodGet, params, &count, 2), 12u);
+    CHECK_EQ(count, 0u);
+}
+
+TEST(route_trie, compact_parameter_count_at_capacity) {
+    RouteTrie t;
+    char paths[129][7]{};
+    for (u32 i = 0; i < 129; ++i) {
+        paths[i][0] = '/';
+        paths[i][1] = ':';
+        paths[i][2] = 'p';
+        paths[i][3] = static_cast<char>('0' + i / 100);
+        paths[i][4] = static_cast<char>('0' + (i / 10) % 10);
+        paths[i][5] = static_cast<char>('0' + i % 10);
+        bool inserted = t.insert(Str{paths[i], 6}, kRouteMethodGet, static_cast<u16>(i));
+        CHECK_EQ(inserted, i < 128);
+    }
+    RouteParam param{};
+    u32 count = 0;
+    CHECK_EQ(t.match_key(S("value"), kRouteMethodGet, &param, &count, 1), 0u);
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{param.name, param.name_len}.eq(S("p000"))));
+}
+
+TEST(route_trie, subtree_methods_follow_successful_insertions) {
+    RouteTrie t;
+    REQUIRE(t.insert(S("/users/:id"), kRouteMethodGet, 1));
+    REQUIRE(t.insert(S("/users/:id/edit"), kRouteMethodPost, 2));
+    CHECK_EQ(t.match_key(S("users/a/edit"), kRouteMethodPost), 2u);
+    CHECK_EQ(t.match_key(S("users/a"), kRouteMethodPost), TrieNode::kInvalidRoute);
+    REQUIRE(t.insert(S("/users/me"), kRouteMethodGet, 3));
+    REQUIRE(t.insert(S("/:locale/admin"), kRouteMethodGet, 4));
+    CHECK_EQ(t.match_key(S("users/a/edit"), kRouteMethodPost), 2u);
+    REQUIRE(t.insert(S("/users/:id"), kRouteMethodAny, 5));
+    CHECK_EQ(t.match_key(S("users/me"), kRouteMethodPost), 5u);
+    CHECK_EQ(t.match_key(S("users/a/edit"), kRouteMethodPost), 2u);
+    CHECK_EQ(t.match_key(S("users/a/edit"), kRouteMethodGet), 1u);
+    t.clear();
+    REQUIRE(t.insert(S("/users/:id/edit"), kRouteMethodPost, 6));
+    CHECK_EQ(t.match_key(S("users/a/edit"), kRouteMethodGet), TrieNode::kInvalidRoute);
+    CHECK_EQ(t.match_key(S("users/a/edit"), kRouteMethodPost), 6u);
+}
+
+TEST(route_trie, streaming_chain_keeps_only_winning_captures) {
+    RouteTrie t;
+    REQUIRE(t.insert(S("/"), kRouteMethodAny, 1));
+    REQUIRE(t.insert(S("/a/:first"), kRouteMethodGet, 2));
+    REQUIRE(t.insert(S("/a/:first/b/:second"), kRouteMethodPost, 3));
+    RouteParam params[2]{};
+    u32 count = 99;
+    CHECK_EQ(t.match_key(S("//a///one/b/two///tail"), kRouteMethodGet, params, &count, 2), 2u);
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("one"))));
+    CHECK_EQ(t.match_key(S("a/one/b/two/tail"), kRouteMethodPost, params, &count, 1), 3u);
+    CHECK_EQ(count, 1u);
+    CHECK_EQ(t.match_key(S("a/one/b/two"), kRouteMethodDelete, params, &count, 2), 1u);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(t.match_key(S("a/one/b/two"), kRouteMethodPost, nullptr, &count, 2), 3u);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(t.match_key(S("a/one/b/two"), kRouteMethodPost, params, &count, 0), 3u);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(t.match_key(Str{nullptr, 0}, kRouteMethodGet, params, &count, 2), 1u);
+    CHECK_EQ(count, 0u);
+}
+
+TEST(route_trie, deterministic_branches_transition_to_backtracking) {
+    RouteTrie t;
+    REQUIRE(t.insert(S("/api"), kRouteMethodAny, 1));
+    REQUIRE(t.insert(S("/api/users/:id/profile"), kRouteMethodGet, 2));
+    REQUIRE(t.insert(S("/api/orders/:order"), kRouteMethodPost, 3));
+    RouteParam params[2]{};
+    u32 count = 0;
+    CHECK_EQ(t.match_key(S("api/users/alice/profile/tail"), kRouteMethodGet, params, &count, 2),
+             2u);
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{params[0].value, params[0].value_len}.eq(S("alice"))));
+    CHECK_EQ(t.match_key(S("api/orders/42"), kRouteMethodPost, params, &count, 2), 3u);
+    REQUIRE_EQ(count, 1u);
+    CHECK((Str{params[0].name, params[0].name_len}.eq(S("order"))));
+    CHECK_EQ(t.match_key(S("api/unknown"), kRouteMethodGet, params, &count, 2), 1u);
+    CHECK_EQ(count, 0u);
+    // A literal beside a parameter introduces alternatives, including when
+    // that literal matches the bytes but cannot accept the request method.
+    REQUIRE(t.insert(S("/api/users/me/profile"), kRouteMethodPost, 4));
+    CHECK_EQ(t.match_key(S("api/users/me/profile"), kRouteMethodGet, params, &count, 2), 2u);
+    CHECK_EQ(count, 1u);
+    CHECK_EQ(t.match_key(S("api/users/me/profile"), kRouteMethodPost, params, &count, 2), 4u);
+    CHECK_EQ(count, 0u);
+    CHECK_EQ(t.match_key(S("api/orders/42"), kRouteMethodPost, params, &count, 2), 3u);
+    CHECK_EQ(count, 1u);
 }
 
 int main(int argc, char** argv) {

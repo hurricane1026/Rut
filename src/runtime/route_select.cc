@@ -77,7 +77,9 @@ bool needs_segment_aware(const Str* paths, u32 n) {
     for (u32 i = 0; i < n; i++) {
         if (path_has_param_segment(paths[i])) return true;
     }
-    return has_boundary_sensitive_overlap(paths, n);
+    // Both scalar ART and specialized ART enforce segment boundaries.
+    // Literal prefix collisions no longer require parameter-aware dispatch.
+    return false;
 }
 
 }  // namespace rut

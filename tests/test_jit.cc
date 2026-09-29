@@ -21693,3 +21693,70 @@ TEST(jit, art_segment_boundary_at_unreadable_page) {
     CHECK_EQ(trie.match_canonical_key({end - 3, 3}, key), 1u);
     engine.shutdown();
 }
+
+TEST(jit, art_chunk_comparison_all_bytes_and_guard_page) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    REQUIRE(page_size > 128);
+    void* mapping = mmap(nullptr,
+                         static_cast<size_t>(page_size) * 2,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1,
+                         0);
+    REQUIRE(mapping != MAP_FAILED);
+    struct MappingGuard {
+        void* ptr;
+        size_t size;
+        ~MappingGuard() { munmap(ptr, size); }
+    } mapping_guard{mapping, static_cast<size_t>(page_size) * 2};
+    char* end = static_cast<char*>(mapping) + page_size;
+    REQUIRE(mprotect(end, static_cast<size_t>(page_size), PROT_NONE) == 0);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    struct EngineGuard {
+        JitEngine& engine;
+        ~EngineGuard() { engine.shutdown(); }
+    } engine_guard{engine};
+    const u32 lengths[] = {1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65};
+    for (u32 length : lengths) {
+        char route[66]{};
+        for (u32 i = 0; i < length; ++i) route[i] = static_cast<char>('a' + i % 26);
+        ArtTrie trie(ArtMatchMode::SegmentPrefix);
+        REQUIRE(trie.insert({route, length}, kRouteMethodGet, 23));
+        char symbol[64];
+        snprintf(symbol, sizeof(symbol), "chunk_guard_%u", length);
+        auto fn = art_jit_specialize(engine, trie, symbol);
+        REQUIRE(fn != nullptr);
+        char* target = end - length;
+        for (u32 i = 0; i < length; ++i) target[i] = route[i];
+        CHECK_EQ(fn(target, length, kRouteMethodGet), 23u);
+        CHECK_EQ(fn(target, length, kRouteMethodPost), TrieNode::kInvalidRoute);
+        // Every truncated request ends at the guard page; no wide overread.
+        for (u32 n = 0; n < length; ++n)
+            CHECK_EQ(fn(end - n, n, kRouteMethodGet), TrieNode::kInvalidRoute);
+        for (u32 i = 0; i < length; ++i) {
+            target[i] ^= 0x40;
+            CHECK_EQ(fn(target, length, kRouteMethodGet), TrieNode::kInvalidRoute);
+            target[i] ^= 0x40;
+        }
+    }
+}
+
+TEST(jit, literal_boundary_overlap_keeps_art_dispatch) {
+    const char* source =
+        "route GET \"/api\" { return 201 }\n"
+        "route GET \"/apix\" { return 202 }\n";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(configure_route_dispatch(*config, rir.module));
+    CHECK(config->dispatch_kind() == RouteConfig::DispatchKind::ArtJit);
+}

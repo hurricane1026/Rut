@@ -1,27 +1,8 @@
 #pragma once
 
-// route_select — minimal 2-way decision helpers for Phase 2 dispatch.
-//
-// Phase 2 architecture (PR #50):
-//   - ART (with optional JIT specialization): literal segment-prefix matching.
-//   - SegmentTrie: segment-aware matching for boundary-sensitive
-//     overlap (e.g., `/api` registered alongside `/apix`).
-//     Note: `:param`-style route paths require SegmentTrie. They are
-//     supported as dynamic segments with request-time parameter capture.
-//
-// The picker is a single boolean:
-//
-//   if (needs_segment_aware(paths, n)) cfg.use_segment_trie();
-//   else                               cfg.use_art();
-//
-// The earlier multi-dispatch RouteAnalysis + pick_dispatch
-// abstraction was retired in PR #50 round 5 once the spike data
-// (commit c694c19) showed JIT-specialized ART ran 5× faster than
-// ByteRadix on saas configs, making the fan-out gating obsolete.
-//
-// Tests in `tests/test_route_select.cc` cover the helpers' edge
-// cases (segment-aligned overlap, colon-mid-segment, insertion
-// order independence).
+// Route dispatch eligibility: ART handles literal segment-prefix routes,
+// including overlapping byte prefixes. SegmentTrie is required only for
+// dynamic parameter segments. Performance specialization remains inside ART.
 
 #include "rut/common/types.h"
 
@@ -39,10 +20,8 @@ bool path_has_param_segment(Str path);
 // build time so the cost is negligible.
 bool has_boundary_sensitive_overlap(const Str* paths, u32 n);
 
-// True iff the route set selects SegmentTrie — the
-// composition of the two checks above. Caller installs SegmentTrie
-// for true configs, ART (+JIT) for false. This is the entire
-// dispatch decision in Phase 2.
+// True iff any route needs parameter matching/capture. Literal boundary
+// collisions are handled directly by scalar and JIT ART.
 bool needs_segment_aware(const Str* paths, u32 n);
 
 }  // namespace rut

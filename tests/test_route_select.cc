@@ -96,14 +96,14 @@ TEST(route_select, has_boundary_sensitive_overlap_empty_or_disjoint) {
 // needs_segment_aware (composition)
 // ============================================================================
 
-TEST(route_select, needs_segment_aware_combines_both_signals) {
+TEST(route_select, needs_segment_aware_requires_parameters) {
     // (a) :param triggers it
     Str a[] = {S("/api/:id")};
     CHECK(needs_segment_aware(a, 1));
 
-    // (b) boundary-sensitive overlap triggers it
+    // (b) literal boundary overlap is supported by scalar and JIT ART
     Str b[] = {S("/api"), S("/apix")};
-    CHECK(needs_segment_aware(b, 2));
+    CHECK(!needs_segment_aware(b, 2));
 
     // (c) neither — pure byte-prefix-friendly config
     Str c[] = {S("/api/v1/users"), S("/api/v1/orders"), S("/admin")};

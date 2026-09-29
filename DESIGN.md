@@ -1824,6 +1824,22 @@ precedence rules so the compiler, simulator, and runtime agree on which route wi
 - Shipped literal routes match a complete segment prefix: `/api` matches `/api`
   and `/api/x`, but not `/apifoo`; `/` supplies the fallback. Production ART
   checks terminal boundaries in both scalar and specialized JIT dispatch.
+  Literal byte-prefix collisions therefore retain ART dispatch; only parameter
+  segments require SegmentTrie. JIT compressed edges use bounded unaligned
+  8/4/2/1-byte comparisons after a full-length check. SegmentTrie keeps a
+  depth-bounded DFS path only when nodes offer competing parameter alternatives.
+  Mutually exclusive literal siblings and sole parameter children use a direct
+  walk that reads segments on demand and stops at a leaf or mismatch. Captures
+  are emitted during that walk, with the count restricted to the winning prefix.
+  Parameter children are partitioned at build time, so lookup
+  does not scan literal siblings to discover parameter alternatives. A complete
+  all-literal match can terminate search immediately. Captures are materialized
+  only for the winning path in DFS when requested; these choices preserve route
+  precedence and method matching. Per-subtree method bitmaps skip parameter alternatives
+  that cannot accept the request method (including ANY fallback). Child count,
+  parameter count, and method bitmap share the original four-byte length
+  footprint; these indexes add no per-node memory. At startup shards share
+  the immutable RouteConfig rather than copying its trie per shard.
 - A literal segment outranks a parameter segment
 - A parameter segment outranks a catch-all segment
 - `*rest` matches the remainder of the path and must be the final segment

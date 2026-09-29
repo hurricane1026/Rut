@@ -80,8 +80,8 @@ struct TrieNode {
     // pre-trie linear scan already honored (Codex P1 on #41). Most
     // inner nodes use very little of this (gateway routes rarely
     // have wide fan-out past root); the wasted-slots memory is
-    // 128 × 2B − actual_children × 2B per node, tolerable at 512
-    // nodes total.
+    // 128 × 2B − actual_children × 2B per node. Lookup metadata
+    // shares the existing length field footprint below.
     static constexpr u32 kMaxChildren = 128;
 
     // Edge label: the path segment that leads INTO this node. Non-owning,
@@ -91,7 +91,27 @@ struct TrieNode {
     // Child node-pool indices. find_child scans these linearly with a full
     // segment compare — see the comment at the top of this file for why
     // we don't layer a separate first-byte index on top.
-    FixedVec<u16, kMaxChildren> children;
+    struct Children {
+        u16 data[kMaxChildren];
+        // 128 children fit in one byte. Reuse the old u32 length storage for
+        // all lookup metadata rather than enlarging every node in the pool.
+        u8 len = 0;
+        u8 param_count = 0;
+        u16 method_mask = 0;
+
+        bool push(u16 child) {
+            if (full()) return false;
+            data[len++] = child;
+            return true;
+        }
+        u16& operator[](u32 i) { return data[i]; }
+        const u16& operator[](u32 i) const { return data[i]; }
+        bool full() const { return len >= kMaxChildren; }
+        bool empty() const { return len == 0; }
+    };
+    static_assert(kMaxChildren <= 255);
+    static_assert(sizeof(Children) == sizeof(FixedVec<u16, kMaxChildren>));
+    Children children;
 
     // Per-method route index at this terminal. kInvalidRoute means "this
     // node is not terminal for that method". Slot 0 is "any"; other slots
@@ -116,6 +136,9 @@ struct TrieNode {
                                              kInvalidRoute,
                                              kInvalidRoute};
 };
+
+// Keep the established 64-bit node footprint; metadata must use existing space.
+static_assert(sizeof(void*) != 8 || sizeof(TrieNode) == 296);
 
 // ---------------------------------------------------------------------------
 // RouteTrie
@@ -188,6 +211,10 @@ public:
 
 private:
     FixedVec<TrieNode, kMaxNodes> nodes;
+    // Build-time method eligibility; bit zero means ANY. Published with nodes.
+    u16 method_mask_ = 0;
+    // True only when a node offers competing parameter/literal alternatives.
+    bool needs_backtracking_ = false;
 
     // Split `path` into segments according to the normalization policy.
     //   - Drop empty segments ("/api//v1" → ["api", "v1"], "/" → []).
@@ -214,13 +241,15 @@ private:
     // Str views point into the path portion of `path.ptr`.
     static u32 tokenize_segments(Str path, FixedVec<Str, kMaxPathSegments>& out);
 
-    // Linear-scan child lookup: walks `children` and compares the full
-    // segment via Str::eq. Returns the child's node-pool index, or
+    // Linear-scan child lookup: walks `children` from first_child and compares
+    // the full segment via Str::eq. Matching skips the parameter partition;
+    // insertion searches all children to reuse an existing parameter label.
+    // Returns the child's node-pool index, or
     // TrieNode::kInvalidNodeIdx if no child matches. See the comment
     // at the top of this file for why we don't layer a u8 first-byte
     // index on top — at our segment-length distribution it's a net
     // cost, not a savings.
-    u16 find_child(u16 parent, Str segment) const;
+    u16 find_child(u16 parent, Str segment, u32 first_child = 0) const;
 
     static bool is_param_segment(Str segment);
 };

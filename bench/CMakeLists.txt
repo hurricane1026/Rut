@@ -42,6 +42,10 @@ target_compile_options(bench_hpack PRIVATE -O3 -DNDEBUG)
 # JIT-specialized ART vs scalar ART, exercising both the direct JIT
 # function pointer and the productized RouteConfig dispatch paths.
 if(RUT_ENABLE_JIT)
+    add_executable(bench_routing_matrix routing/dispatch_matrix.cc)
+    target_link_libraries(bench_routing_matrix rut_runtime rut_jit)
+    target_include_directories(bench_routing_matrix PRIVATE ${PROJECT_SOURCE_DIR}/include ${LLVM_INCLUDE_DIRS})
+    target_compile_options(bench_routing_matrix PRIVATE -O3 -DNDEBUG ${SIMD_FLAGS})
     add_executable(bench_art_jit_spike bench_art_jit_spike.cc)
     target_link_libraries(bench_art_jit_spike rut_runtime rut_jit)
     target_include_directories(bench_art_jit_spike PRIVATE
