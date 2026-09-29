@@ -1729,3 +1729,30 @@ With no runtime source change, rechecked every coordinate that missed 1.05 in th
 | HTTPS | 1048576 | proxy close | 128 | 1.0223 | 1.0444 | 0.54% |
 
 The additional gain column is `1.05 / recheck_ratio - 1`, a required change relative to this recheck, not a sum of independent optimization estimates. HTTP 64 KiB proxy keepalive c1 remains the largest deficit (~7.1% required), followed by its close counterpart and 1 MiB static keepalive c1. Several others are within 1%, but still fail the stated target. `pipe-unmet-recheck.json` stores exact medians, hashes, validity and evidence paths. `pipe-unmet-recheck-evidence.tar.gz` SHA256 `aaf93ed744b70b3f9941c7086f6205707e01a27adb78861776c8306a3b500de0` contains all raw text evidence and drivers; no TLS private key is archived. A proposed native-streaming comparison produced no measurements because that diagnostic profile requires a 256 KiB keepalive response; it was not substituted for the strict 64 KiB acceptance scenario. No huge pages or global kernel changes were used.
+
+## Adaptive aligned prefix at one active connection
+
+Tested the previously rejected 16 KiB aligned static-file prefix behind a runtime `active_count() == 1` guard, aiming to preserve its earlier c1 benefit without applying it under c32/c128 load. The candidate passed the full network suite (1438 tests, 388644 checks). Four paired 6-second samples per case used candidate/baseline/baseline/candidate order, 2-second warmup, exact-body preflight and zero errors. Candidate/baseline median RPS ratios were 0.9871, 0.9924 and 0.9930 for 1 MiB static keepalive c1/c32/c128; close c1/c32 were 1.0154 and 1.0052. The c1 keepalive candidate samples were bimodal (4840 and 5904 RPS), so the attractive prior single-run gain did not repeat. Reject the candidate and restore the accepted source. These are Rut-to-Rut controls on the pre-rebase binary, not nginx acceptance results. The source patch, raw logs and full network test log are in `adaptive-file-prefix-active-count-evidence.tar.gz` (SHA256 `2451ebd386b915ae0a1fbbe1f54e0e28541751ef00467b6e58a1343bbdbfcfd3`); `adaptive-file-prefix-active-count.json` has hashes and exact medians. No huge pages were used.
+
+## Rebase onto main routing changes and targeted nginx recheck
+
+Rebased the performance branch on `d9c0de80` (main including #729 route segment boundaries and #733 route-structure traversal). The branch's initial 13 commits had the same tree as main's #725, so the rebase replayed the 121 subsequent commits. The newer contextual-enum syntax required restoring the converter's `proxy_buffering on` output to `.bounded`; generated-source fixtures and exact-length checks were updated accordingly. RouteTrie, route selector, ART, JIT, network, nginx parser and serve-loader tests pass. No huge pages or global kernel settings were used.
+
+The rebuilt Rut (`f98ae490e57774dae6adb9ceb20db84e13804bdd57409e4dd8020e0230b22c2d`) and converter (`2e19980ca539377c968bed8347d6b9dcf1907debbf8b5437d469a94c0de5659f`) were measured against the same pinned nginx on the twelve prior misses. All 72 measured samples were valid (3 per engine per coordinate, at least 5 seconds), all 60 exact-full-body preflights passed, and warmup/load errors were zero. Ratios below are median Rut RPS divided by median nginx RPS:
+
+| Coordinate | Before rebase | After rebase |
+|---|---:|---:|
+| HTTP 16 B proxy close c1 | 1.0249 | 1.0256 |
+| HTTP 16 B proxy keepalive c1 | 0.9997 | 0.9956 |
+| HTTP 1 KiB proxy close c1 | 1.0211 | 1.0146 |
+| HTTP 1 KiB proxy keepalive c1 | 1.0019 | 0.9999 |
+| HTTP 64 KiB proxy close c1 | 0.9921 | 0.9902 |
+| HTTP 64 KiB proxy keepalive c1 | 0.9805 | 0.9768 |
+| HTTP 64 KiB static close c1 | 1.0415 | 1.0395 |
+| HTTP 1 MiB static keepalive c1 | 0.9963 | 1.0224 |
+| HTTP 1 MiB static keepalive c32 | 1.0444 | 1.0488 |
+| HTTP 1 MiB static keepalive c128 | 1.0390 | 1.0279 |
+| HTTPS 64 KiB proxy keepalive c1 | 1.0250 | 1.0290 |
+| HTTPS 1 MiB proxy close c128 | 1.0444 | 1.0526 |
+
+Only the last coordinate reaches 1.05 in this targeted recheck; the other 11 remain below target. The original 84/96 complete-matrix result belongs to the pre-rebase binary and is not a full post-rebase acceptance result. These acceptance fixtures use one exact route, so the routing microbenchmark improvements in #733 cannot be directly translated into an end-to-end gain here. `rebased-main-733-unmet-recheck.json` contains exact medians and provenance; `rebased-main-733-unmet-recheck-evidence.tar.gz` SHA256 `badcf3eea3623aaf605931c785631b43902282bea520ae1c96168b89905c7f1f` contains raw runs and the driver. No TLS private key is archived.

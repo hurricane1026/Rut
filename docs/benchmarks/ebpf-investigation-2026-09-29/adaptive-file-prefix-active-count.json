@@ -1,0 +1,74 @@
+{
+  "comparison": "adaptive 16 KiB file prefix only with one active connection, versus accepted pipe baseline",
+  "status": "rejected: no stable keepalive gain",
+  "candidate_sha256": "c85492face199a4909b705e8baa4e2d9f628a5838a3ec8418dbe558d7b499edb",
+  "baseline_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "rules": "4 samples/case in candidate,baseline,baseline,candidate order; 2s warmup, 6s measured load, exact body, zero errors; no huge pages",
+  "cases": {
+    "1m-c1-keepalive": {
+      "candidate_rps": [
+        4840.447543018731,
+        5904.227450460948
+      ],
+      "baseline_rps": [
+        5468.089477112407,
+        5417.258406586679
+      ],
+      "candidate_median_rps": 5372.3374967398395,
+      "baseline_median_rps": 5442.673941849543,
+      "ratio": 0.9870768585696682
+    },
+    "1m-c32-keepalive": {
+      "candidate_rps": [
+        10694.812017076058,
+        10293.012797283647
+      ],
+      "baseline_rps": [
+        10868.78140513568,
+        10280.294822698299
+      ],
+      "candidate_median_rps": 10493.912407179852,
+      "baseline_median_rps": 10574.53811391699,
+      "ratio": 0.9923754866767157
+    },
+    "1m-c128-keepalive": {
+      "candidate_rps": [
+        10091.499305158639,
+        10252.519338078588
+      ],
+      "baseline_rps": [
+        10325.048053175002,
+        10163.084988483559
+      ],
+      "candidate_median_rps": 10172.009321618614,
+      "baseline_median_rps": 10244.066520829281,
+      "ratio": 0.9929659575068013
+    },
+    "1m-c1-close": {
+      "candidate_rps": [
+        3772.46258074216,
+        3743.767287359838
+      ],
+      "baseline_rps": [
+        3694.6036916199414,
+        3707.8743230932637
+      ],
+      "candidate_median_rps": 3758.114934050999,
+      "baseline_median_rps": 3701.2390073566025,
+      "ratio": 1.015366726272297
+    },
+    "1m-c32-close": {
+      "candidate_rps": [
+        7966.931354340284,
+        7874.527458073763
+      ],
+      "baseline_rps": [
+        7891.124643216469,
+        7868.756994804509
+      ],
+      "candidate_median_rps": 7920.729406207023,
+      "baseline_median_rps": 7879.94081901049,
+      "ratio": 1.0051762555244235
+    }
+  }
+}
