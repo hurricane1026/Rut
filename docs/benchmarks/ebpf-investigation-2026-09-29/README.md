@@ -1787,3 +1787,36 @@ On the frozen post-rebase baseline, removed `IORING_SETUP_COOP_TASKRUN | IORING_
 PID-filtered eBPF syscall trace on separate 8-second HTTP 64 KiB proxy keepalive c1 runs counted **500,790 `io_uring_enter` calls / 62,445 complete Rut requests = 8.020 per request**. The call distribution was 62,431 with zero submitted SQEs, 252,073 with one, and 186,286 with two; each requested at least one CQE. Pinned nginx's worker issued **242,283 `epoll_wait` calls / 60,554 complete requests = 4.001 per request**, along with 588,232 `readv` and 363,426 `writev` calls. Both preflights read the exact 65,536-byte body; measured loads had zero errors. These are separate, differently instrumented runs, and raw syscall counts are not a latency or throughput comparison. In particular nginx does substantially more vectored I/O calls, so 8 versus 4 waits alone cannot establish an io_uring penalty. `rebased-64k-event-syscalls.json` stores counts and provenance; `rebased-64k-event-syscalls-evidence.tar.gz` SHA256 `f99afdd2fb7dfc8c4d296e47cb5dd66261a671cf6ddb2bce299a82270d2548f8` contains the collectors and logs.
 
 Adding `IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN` to the current cooperative setup was also tested as a reversible candidate. Rut started on io_uring, then logged `Fatal I/O backend failure on shard 0 (errno=17)` during the first exact-body preflight; the client saw a reset. No performance samples were taken. The candidate was rejected and source/build restored to the frozen baseline SHA256. `defer-taskrun-preflight-evidence.tar.gz` SHA256 `7afe53eb9322d19892dd7300ef89aa02093ef9e5feb864eb699c1c226d723a4f` contains the attempted patch and preflight log. The specific failing operation has not been isolated, so this is not evidence that DEFER_TASKRUN is intrinsically unusable. No nginx acceptance result is updated and no huge pages were used.
+
+## Byte-exact pinned response-header parse reuse
+
+The post-rebase 64 KiB proxy keepalive eBPF entry probes counted about 10 request parses, 17 response parses and 35 coalesced-GET proof checks per completed request. On 16 B proxy keepalive the corresponding counts were exactly 10, 12 and 24 per request. A caller-address trace attributed eight of the 16 B response parses to `complete_content_length_pinned_header_is_stable`, which reparsed the same fixed response header during repeated post-commit checks. These traces use high-frequency uprobes and significantly perturb throughput; only their call counts and source attribution are used here.
+
+The retained candidate caches a successful syntax parse of a pinned header up to 256 bytes in shard-thread-local storage. Every reuse compares the entire current header byte-for-byte with the saved bytes and still runs all connection and policy checks; changed or larger headers use the original parser path. An added network regression changes a cached header in place, requires rejection, restores its bytes and requires acceptance. The complete network suite passes **1460 tests / 391497 checks**. A candidate eBPF count on 16 B keepalive records approximately **4 response parses/request**, down from 12, with request-parse and proof-check counts unchanged. The instrumented RPS is not used as a throughput result. Formatted source rebuilds to the exact measured candidate SHA256 `f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0`.
+
+Two paired 6-second Rut-to-Rut runs used opposite process orders, 2-second warmup, exact-body preflight and zero load errors. Candidate/baseline median RPS ratios were:
+
+| HTTP proxy c1 | Candidate-first order | Baseline-first order |
+|---|---:|---:|
+| 16 B close | 1.0069 | 1.0031 |
+| 16 B keepalive | 1.0099 | 1.0106 |
+| 1 KiB close | — | 1.0025 |
+| 1 KiB keepalive | — | 1.0124 |
+| 64 KiB close | 1.0094 | 1.0087 |
+| 64 KiB keepalive | 1.0098 | 1.0030 |
+
+An additional 64 KiB proxy keepalive c32 control measured **1.0059** candidate/baseline. The first c32 attempt used an obsolete pre-rebase fixture and failed before any load; it is excluded. These small positive controls justify retaining the candidate as a cumulative optimization, not claiming that any nginx coordinate passed.
+
+Formal pinned-nginx checks of seven lagging coordinates used three valid samples per engine per coordinate, at least 5 seconds per measured sample, exact-body preflights, and zero warmup/load errors. All seven still miss 1.05:
+
+| Coordinate | Candidate Rut/nginx |
+|---|---:|
+| HTTP 16 B proxy close c1 | 1.0254 |
+| HTTP 16 B proxy keepalive c1 | 1.0027 |
+| HTTP 1 KiB proxy close c1 | 1.0268 |
+| HTTP 1 KiB proxy keepalive c1 | 1.0097 |
+| HTTP 64 KiB proxy close c1 | 0.9939 |
+| HTTP 64 KiB proxy keepalive c1 | 0.9816 |
+| HTTPS 64 KiB proxy keepalive c1 | 1.0439 |
+
+`pinned-parser-cache-control.json` contains exact paired medians, eBPF counts and formal ratios. `pinned-parser-cache-evidence.tar.gz` SHA256 `3a0329e190c6de4c535701920669257e6cd2a22328571e9a9f8cc3c6de49ed9f` contains collectors, raw benchmark rows/logs, preflight records, test/build logs and the patch; TLS private keys, payload files and executables are excluded. This is not a complete post-rebase 96-coordinate matrix. Other unmet static/large/TLS coordinates were not rerun on this candidate, and no huge pages or global kernel settings were used.

@@ -1,0 +1,247 @@
+{
+  "experiment": "byte-exact syntax parse cache for strict pinned response headers up to 256 bytes",
+  "baseline_sha256": "f98ae490e57774dae6adb9ceb20db84e13804bdd57409e4dd8020e0230b22c2d",
+  "candidate_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "network_tests": "1460 passed, 0 failed, 391497 checks, 0 failed checks",
+  "paired_controls": {
+    "pinned-parser-cache-r1": {
+      "16-c1-close-proxy": {
+        "candidate_median_rps": 7787.792754698774,
+        "baseline_median_rps": 7734.501662880084,
+        "candidate_over_baseline": 1.0068900485307861,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      },
+      "16-c1-keepalive-proxy": {
+        "candidate_median_rps": 10974.710133150002,
+        "baseline_median_rps": 10866.830022030434,
+        "candidate_over_baseline": 1.009927468351015,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      },
+      "65536-c1-close-proxy": {
+        "candidate_median_rps": 6039.034992187494,
+        "baseline_median_rps": 5982.971466585552,
+        "candidate_over_baseline": 1.0093705152891088,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      },
+      "65536-c1-keepalive-proxy": {
+        "candidate_median_rps": 7881.393858133578,
+        "baseline_median_rps": 7805.197665749369,
+        "candidate_over_baseline": 1.0097622373765847,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      }
+    },
+    "pinned-parser-cache-r2": {
+      "1024-c1-close-proxy": {
+        "candidate_median_rps": 7747.943806588427,
+        "baseline_median_rps": 7728.809186857067,
+        "candidate_over_baseline": 1.002475752637793,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      },
+      "1024-c1-keepalive-proxy": {
+        "candidate_median_rps": 10944.97001596028,
+        "baseline_median_rps": 10810.564414189485,
+        "candidate_over_baseline": 1.0124328015283255,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      },
+      "16-c1-close-proxy": {
+        "candidate_median_rps": 7758.061117019457,
+        "baseline_median_rps": 7734.3932381920895,
+        "candidate_over_baseline": 1.0030600821678546,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      },
+      "16-c1-keepalive-proxy": {
+        "candidate_median_rps": 10941.482591832628,
+        "baseline_median_rps": 10826.960910686088,
+        "candidate_over_baseline": 1.01057745401422,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      },
+      "65536-c1-close-proxy": {
+        "candidate_median_rps": 6074.733169687268,
+        "baseline_median_rps": 6022.530614589349,
+        "candidate_over_baseline": 1.008667877083341,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      },
+      "65536-c1-keepalive-proxy": {
+        "candidate_median_rps": 7923.130886872881,
+        "baseline_median_rps": 7899.671179253564,
+        "candidate_over_baseline": 1.0029697068507013,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      }
+    },
+    "pinned-parser-cache-c32-r2": {
+      "65536-c32-keepalive-proxy": {
+        "candidate_median_rps": 15032.857595268466,
+        "baseline_median_rps": 14944.290443604445,
+        "candidate_over_baseline": 1.0059264875771954,
+        "all_exact_body": true,
+        "all_errors_zero": true
+      }
+    }
+  },
+  "traced_parser_counts": {
+    "rebased-parser-counts-16-r1": {
+      "requests": 71083,
+      "counts": {
+        "coalesced_proof": 1705992,
+        "request_parse": 710830,
+        "response_parse": 852996
+      },
+      "per_request": {
+        "coalesced_proof": 24.0,
+        "request_parse": 10.0,
+        "response_parse": 12.0
+      },
+      "trace_valid": true
+    },
+    "rebased-parser-counts-r1": {
+      "requests": 50394,
+      "counts": {
+        "coalesced_proof": 1765102,
+        "request_parse": 503940,
+        "response_parse": 857008
+      },
+      "per_request": {
+        "coalesced_proof": 35.0260348454181,
+        "request_parse": 10.0,
+        "response_parse": 17.006151525975316
+      },
+      "trace_valid": true
+    },
+    "candidate-parser-counts-16-r1": {
+      "requests": 73152,
+      "counts": {
+        "coalesced_proof": 1755648,
+        "request_parse": 731520,
+        "response_parse": 292617
+      },
+      "per_request": {
+        "coalesced_proof": 24.0,
+        "request_parse": 10.0,
+        "response_parse": 4.000123031496063
+      },
+      "trace_valid": true
+    }
+  },
+  "formal_nginx_acceptance": [
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "rut_over_nginx": 1.025400172861939,
+      "measurement_valid": true,
+      "performance_eligible": true,
+      "target_met": false,
+      "median_rps": {
+        "nginx": 7602.475177051867,
+        "rut": 7795.579360727585
+      },
+      "evidence": "pinned-parser-cache-http-proxy-acceptance-r1/http-16-proxy-close"
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 1.002720662801982,
+      "measurement_valid": true,
+      "performance_eligible": true,
+      "target_met": false,
+      "median_rps": {
+        "nginx": 10958.436179918826,
+        "rut": 10988.250389601426
+      },
+      "evidence": "pinned-parser-cache-http-proxy-acceptance-r1/http-16-proxy-keepalive"
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "rut_over_nginx": 1.026823183372246,
+      "measurement_valid": true,
+      "performance_eligible": true,
+      "target_met": false,
+      "median_rps": {
+        "nginx": 7572.606438421633,
+        "rut": 7775.727849525268
+      },
+      "evidence": "pinned-parser-cache-http-proxy-acceptance-r1/http-1024-proxy-close"
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0096666519030362,
+      "measurement_valid": true,
+      "performance_eligible": true,
+      "target_met": false,
+      "median_rps": {
+        "nginx": 10851.916418322495,
+        "rut": 10956.81811681926
+      },
+      "evidence": "pinned-parser-cache-http-proxy-acceptance-r1/http-1024-proxy-keepalive"
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "rut_over_nginx": 0.9938610540682836,
+      "measurement_valid": true,
+      "performance_eligible": true,
+      "target_met": false,
+      "median_rps": {
+        "nginx": 6086.635776256375,
+        "rut": 6049.270248319886
+      },
+      "evidence": "pinned-parser-cache-http-proxy-acceptance-r1/http-65536-proxy-close"
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 0.9815585895837617,
+      "measurement_valid": true,
+      "performance_eligible": true,
+      "target_met": false,
+      "median_rps": {
+        "nginx": 8067.547695716125,
+        "rut": 7918.770737606847
+      },
+      "evidence": "pinned-parser-cache-http-proxy-acceptance-r1/http-65536-proxy-keepalive"
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "rut_over_nginx": 1.0439347669894572,
+      "measurement_valid": true,
+      "performance_eligible": true,
+      "target_met": false,
+      "median_rps": {
+        "nginx": 5695.449640129501,
+        "rut": 5945.677892968778
+      },
+      "evidence": "pinned-parser-cache-https64k-acceptance-r1/https-65536-proxy-keepalive"
+    }
+  ],
+  "limits": [
+    "not a full post-rebase 96-coordinate matrix",
+    "eBPF tracer alters throughput; use counts only",
+    "separate formal nginx runs do not measure paired candidate/baseline speedup"
+  ]
+}
