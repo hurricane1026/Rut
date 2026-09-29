@@ -1647,3 +1647,16 @@ The 64 KiB keepalive gain repeats but is below 1%; the 64 KiB close gain from th
 Lowered only the pipe's declared-body admission threshold from 128 KiB to 64 KiB; the separate ordinary bulk-relay threshold remained 128 KiB. Candidate SHA256 `1b7d574ba70f6d7a88550552aaf6e7e9f226c6956fd7e877ef71eb5895804094` was compared with the unchanged pipe baseline `1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244`. Two 6-second samples per engine and scenario, 2-second warmup, exact-body preflight and zero errors gave candidate/baseline median RPS ratios of 1.0035 for HTTP 64 KiB proxy close c1 and 0.9959 for keepalive c1. These small opposite signs are not a throughput win.
 
 Usable PID-filtered kernel traces for both modes and both binaries recorded zero `tcp_splice_read` and zero `splice_to_socket` calls, with no trace loss/errors. Receive-copy-helper bytes per completed request were identical between binaries: 65,746 for close and 65,727 for keepalive. The lower threshold did not make the 64 KiB workload enter the pipe path. Other semantic admission gates or receive timing can prevent entry; the trace does not identify which gate prevented it. Revert the threshold change rather than retaining an ineffective condition. The raw logs, commands and traces are in `pipe-64k-admission-evidence.tar.gz` (SHA256 `f2312b350d7e7bc53f83cb63b6430f440fde57b77d984488296df888f38fc732`); `pipe-64k-admission.json` summarizes the valid measurements. No new nginx matrix was run; the 84/96 result at 1.05 remains current.
+
+## 64 KiB proxy receive-copy comparison with pinned nginx
+
+Trace the unchanged pipe candidate and pinned nginx at HTTP 64 KiB proxy c1 in close and keepalive modes. All four PID-filtered collectors became ready, ended normally and report no loss/errors; exact-body preflight and zero-error warmup/load checks pass. Every engine uses the same scenario fixture. Normalize copied bytes and inclusive receive-copy-helper time by completed 8-second load requests (small in-flight boundary error).
+
+| Mode | Engine | Copied bytes/request | Copy-helper us/request | Copy calls/request |
+|---|---|---:|---:|---:|
+| close | nginx | 65,746 | 6.09 | 11.86 |
+| close | Rut | 65,746 | 4.43 | 4.35 |
+| keepalive | nginx | 65,728 | 6.12 | 11.70 |
+| keepalive | Rut | 65,727 | 4.47 | 4.30 |
+
+At 64 KiB, Rut does not copy more response bytes through this helper, and its measured inclusive helper time is lower under tracing. This rules out *extra receive-copy bytes in this helper* as the explanation for the remaining 64 KiB acceptance gap. It does not rule out other copies, scheduling, parser/policy work, or changes induced by tracing. Per-call eBPF overhead differs across the engines, so instrumented RPS is **not** acceptance evidence. Investigate the repeated userspace response parsing and policy checks next. `pipe-64k-nginx-copy.json` records the normalized counters; raw traces and logs are in `pipe-64k-nginx-copy-evidence.tar.gz` SHA256 `539afe292bdd78fda305bd8a69097eb9e1cf68b0b4a6c757becc75141b3f113a`.

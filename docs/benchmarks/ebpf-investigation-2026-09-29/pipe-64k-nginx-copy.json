@@ -1,0 +1,43 @@
+{
+  "rut_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "pinned_nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "scope": "HTTP 64 KiB proxy c1 close and keepalive, strict converter, 2s warmup, 8s load, 12s PID-filtered rx-copy and relay-copies trace",
+  "cases": {
+    "65536-c1-close-nginx": {
+      "requests": 41054,
+      "copied_bytes_per_request": 65746.0,
+      "copy_helper_us_per_request": 6.089031129731573,
+      "copy_calls_per_request": 11.860086715058216,
+      "trace_usable": true,
+      "exact_body_preflight": true,
+      "zero_warmup_load_errors": true
+    },
+    "65536-c1-close-rut-pipe": {
+      "requests": 44106,
+      "copied_bytes_per_request": 65746.0,
+      "copy_helper_us_per_request": 4.432295810093865,
+      "copy_calls_per_request": 4.353738720355508,
+      "trace_usable": true,
+      "exact_body_preflight": true,
+      "zero_warmup_load_errors": true
+    },
+    "65536-c1-keepalive-nginx": {
+      "requests": 52224,
+      "copied_bytes_per_request": 65728.25855928309,
+      "copy_helper_us_per_request": 6.116940333946078,
+      "copy_calls_per_request": 11.69515931372549,
+      "trace_usable": true,
+      "exact_body_preflight": true,
+      "zero_warmup_load_errors": true
+    },
+    "65536-c1-keepalive-rut-pipe": {
+      "requests": 54652,
+      "copied_bytes_per_request": 65727.0,
+      "copy_helper_us_per_request": 4.474831259606236,
+      "copy_calls_per_request": 4.299879235892557,
+      "trace_usable": true,
+      "exact_body_preflight": true,
+      "zero_warmup_load_errors": true
+    }
+  }
+}
