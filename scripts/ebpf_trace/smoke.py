@@ -116,12 +116,14 @@ def main():
         parser.error("output must not be a symlink")
     output_fd = trace.open_output_dir(args.output)
     output = Path(f"/proc/self/fd/{output_fd}")
-    parent, child = multiprocessing.Pipe()
-    stop = multiprocessing.Event()
-    server = multiprocessing.Process(target=fixture, args=(child, stop))
     tracer = None
-    server.start()
+    server = None
+    stop = None
     try:
+        parent, child = multiprocessing.Pipe()
+        stop = multiprocessing.Event()
+        server = multiprocessing.Process(target=fixture, args=(child, stop))
+        server.start()
         if not parent.poll(10):
             raise RuntimeError("fixture did not start")
         front, origin = parent.recv()
@@ -129,8 +131,8 @@ def main():
                    "--pid", str(server.pid), "--front-port", str(front),
                    "--origin-port", str(origin), "--duration", "8",
                    "--groups", "tcp", "sched", "fault", "rx-copy", "stacks",
-                   "--bpftrace", args.bpftrace, "--output", str(output / "trace")]
-        tracer = subprocess.Popen(command, pass_fds=(output_fd,))
+                   "--bpftrace", args.bpftrace, "--output", str(args.output / "trace")]
+        tracer = subprocess.Popen(command)
         raw = output / "trace" / "trace.jsonl"
         deadline = time.monotonic() + 120
         while not attached(raw):
@@ -172,19 +174,23 @@ def main():
              "front_port": front, "origin_port": origin}, indent=2) + "\n")
         print(f"PASS: {transferred} echoed bytes checked; tracing evidence in {args.output}")
     finally:
-        if tracer is not None and tracer.poll() is None:
-            tracer.send_signal(signal.SIGINT)
-            try:
-                tracer.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                tracer.kill()
-                tracer.wait()
-        stop.set()
-        server.join(timeout=5)
-        if server.is_alive():
-            server.terminate()
-            server.join()
-        os.close(output_fd)
+        try:
+            if tracer is not None and tracer.poll() is None:
+                tracer.send_signal(signal.SIGINT)
+                try:
+                    tracer.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    tracer.kill()
+                    tracer.wait()
+            if stop is not None:
+                stop.set()
+            if server is not None:
+                server.join(timeout=5)
+                if server.is_alive():
+                    server.terminate()
+                    server.join()
+        finally:
+            os.close(output_fd)
 
 
 if __name__ == "__main__":

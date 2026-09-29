@@ -65,7 +65,7 @@ if mode == "exec":
 print(json.dumps({"type":"map", "data":{"@tcp_completed_calls":{"123,1,2":2}}}))
 print(json.dumps({"type":"map", "data":{"@tcp_elapsed_ns":{"123,1,2":6000}}}))
 print(json.dumps({"type":"hist", "data":{"@tcp_latency_us":{"123,1,2":[{"min":2,"max":3,"count":2}]}}}))
-if mode != "truncated":
+if mode not in ("truncated", "early-stop"):
     print(json.dumps({"type":"printf", "data":"RUT_TRACE_END\\n"}))
 ''')
         self.fake.chmod(0o755)
@@ -90,11 +90,20 @@ if mode != "truncated":
         self.assertEqual(result["tcp"][0]["mean_elapsed_us"], 3)
 
     def test_loss_warning_exec_and_missing_end_cannot_pass(self):
-        for mode in ("lost", "warning", "exec", "truncated", "attach-failure"):
+        for mode in ("lost", "warning", "exec", "truncated", "early-stop", "attach-failure"):
             with self.subTest(mode=mode):
                 rc, status, _ = self.run_trace(mode)
                 self.assertEqual(rc, 1)
                 self.assertFalse(status["usable"])
+
+    def test_changed_identity_before_arm_does_not_signal_tracer(self):
+        before = trace.process_identity(os.getpid())
+        changed = dict(before, exe=before["exe"] + "-changed")
+        with mock.patch.object(trace, "process_identity",
+                               side_effect=[before, changed]):
+            rc, status, _ = self.run_trace()
+        self.assertEqual(rc, 1)
+        self.assertFalse(status["armed"])
 
     def test_begin_marker_without_attached_event_is_not_ready(self):
         raw = self.root / "premature.jsonl"
