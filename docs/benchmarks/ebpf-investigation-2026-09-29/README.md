@@ -1129,3 +1129,24 @@ All twelve 64 KiB coordinates complete with valid formal measurements. Both prox
 | proxy-keepalive | 128 | 1.5545 | pass |
 
 The live full run continues through 1 MiB and HTTPS; this is not final acceptance.
+
+## Full-matrix checkpoint: HTTP complete, HTTPS pending
+
+All 48 HTTP coordinates complete with valid formal measurements; 33 meet >=1.10. 3 have a median below nginx. The remaining HTTPS half is still running.
+
+| HTTP 1 MiB scenario | Concurrency | Rut/nginx median RPS | Target |
+|---|---:|---:|---|
+| static-close | 1 | 1.0665 | below 1.10 |
+| static-close | 32 | 1.1810 | pass |
+| static-close | 128 | 1.1740 | pass |
+| static-keepalive | 1 | 1.1701 | pass |
+| static-keepalive | 32 | 1.0517 | below 1.10 |
+| static-keepalive | 128 | 1.0388 | below 1.10 |
+| proxy-close | 1 | 1.0431 | below 1.10 |
+| proxy-close | 32 | 1.0460 | below 1.10 |
+| proxy-close | 128 | 1.0006 | below 1.10 |
+| proxy-keepalive | 1 | 1.2137 | pass |
+| proxy-keepalive | 32 | 1.1987 | pass |
+| proxy-keepalive | 128 | 1.2619 | pass |
+
+The static keepalive c1 ratio passes this run but prior runs showed bimodality/near-ties; this single formal pass does not erase that history. Both concurrent static keepalive and all proxy close 1 MiB coordinates remain below target. No full-matrix success is claimed.
