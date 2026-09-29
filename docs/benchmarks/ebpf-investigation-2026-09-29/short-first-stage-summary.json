@@ -1,0 +1,46 @@
+{
+  "binary_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "note": "eBPF instrumented diagnostic, not formal acceptance RPS",
+  "samples": {
+    "16-c1-close-nginx": {
+      "sampled_requests": 2380,
+      "mean_us": {
+        "origin": 25.069678151260504,
+        "request": 33.46309075630252,
+        "response": 18.572952100840336,
+        "total": 77.10572100840336
+      },
+      "body_preflight_passed": true
+    },
+    "16-c1-close-rut-current": {
+      "sampled_requests": 2391,
+      "mean_us": {
+        "origin": 24.86604224173986,
+        "request": 34.31888498536177,
+        "response": 19.095063153492262,
+        "total": 78.2799903805939
+      },
+      "body_preflight_passed": true
+    },
+    "16-c1-keepalive-nginx": {
+      "sampled_requests": 3384,
+      "mean_us": {
+        "origin": 24.891856087470448,
+        "request": 33.86757033096927,
+        "response": 18.531386229314418,
+        "total": 77.29081264775414
+      },
+      "body_preflight_passed": true
+    },
+    "16-c1-keepalive-rut-current": {
+      "sampled_requests": 3274,
+      "mean_us": {
+        "origin": 24.49112095296274,
+        "request": 33.44619486866218,
+        "response": 19.87484483811851,
+        "total": 77.81216065974343
+      },
+      "body_preflight_passed": true
+    }
+  }
+}

@@ -1885,3 +1885,20 @@ The HTTPS 1 MiB proxy close c128 result differs from the earlier targeted 1.0526
 ## Completed post-rebase pinned-cache baseline
 
 After the unrelated compiler finished, a fresh run completed the three missing HTTPS 1 MiB proxy keepalive coordinates with three valid repeats per engine, at least five measured seconds per repeat, exact-body preflight and zero errors. Rut/nginx median RPS ratios were 1.2166 at c1, 1.3020 at c32 and 1.1761 at c128. `post-rebase-full-matrix-merged.json` retains the 93 original valid coordinates unchanged and replaces only the three invalid coordinates, with explicit source paths for both runs. Thus all **96 coordinates are valid**, **84 meet 1.05**, and **12 remain below target**, as listed above. The baseline does not establish an across-matrix win. The retry's commands, raw results, preflights, logs and host snapshots are in `post-rebase-final-three-evidence.tar.gz`, SHA256 `d41301ab55e8aa92e5d6115bf70bd3ea6944ab43bd9b502b64a5e0377131a5b4`; payloads, TLS private keys and executables are excluded. No huge pages or global kernel settings were used.
+
+## eBPF stage timing for 16-byte HTTP proxy c1
+
+With the retained binary, a random 1/64 sample of frontend receives was traced to the first upstream send, first upstream receive, and first downstream send. Each 20-second, single-connection run passed exact-body preflight and had zero errors. Averages in microseconds include kernel and scheduling time:
+
+| Mode and engine | Samples | Receive to upstream send | Upstream send to receive | Upstream receive to downstream send |
+|---|---:|---:|---:|---:|
+| Close nginx | 2,380 | 33.46 | 25.07 | 18.57 |
+| Close Rut | 2,391 | 34.32 | 24.87 | 19.10 |
+| Keepalive nginx | 3,384 | 33.87 | 24.89 | 18.53 |
+| Keepalive Rut | 3,274 | 33.45 | 24.49 | 19.87 |
+
+The repeatable direction in this diagnostic is a slower Rut response-processing interval, most clearly +1.34 µs for keepalive. The upstream wait is similar and Rut's pre-upstream interval is not consistently slower. These stages omit client connection setup, response drain and other work; traced RPS is not acceptance evidence. The timing does not by itself prove a specific function caused the gap. `short-first-stage-summary.json` gives exact averages; `short-first-stage-evidence.tar.gz` SHA256 `2da813c06aadaa5de3d5ab360d6df257eaec344e2786b427d01359d58094e633` contains collectors, raw trace maps and load logs. No huge pages or global kernel settings were used.
+
+## Static 1 MiB keepalive confirmation
+
+A separate three-repeat, exact-body, zero-error HTTP native-static run found Rut/nginx ratios of **1.0592 at c1**, **1.0509 at c32**, and **1.0424 at c128**. The original full-scan ratios were 1.1910, 1.0537 and 1.0263 respectively. The c128 miss persists, while c1's original wide nginx variation makes its apparent large margin unreliable. The merged baseline remains the full-scan report; this is a separate confirmation, not a substitution of its cells. `static-1m-keepalive-confirmation.json` records the medians. `static-1m-keepalive-confirmation-evidence.tar.gz` SHA256 `c5a642df81369bd1f069404de6ba7fedf6419e40df6cd0b14a22f271ab114693` retains raw samples, commands, preflights, logs and host snapshots, without payloads or executables. No huge pages or global kernel settings were used.

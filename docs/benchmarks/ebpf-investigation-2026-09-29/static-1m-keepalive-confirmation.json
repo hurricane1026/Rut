@@ -1,0 +1,42 @@
+{
+  "run": "/tmp/rut-bounded-followup-20260928/post-rebase-static-1m-keep-confirm-r1",
+  "binary_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "cells": [
+    {
+      "scenario": "static-keepalive",
+      "transport": "http",
+      "body_size": 1048576,
+      "concurrency": 1,
+      "median_rps": {
+        "nginx": 5085.814042055333,
+        "rut": 5387.0082327824475
+      },
+      "rut_over_nginx": 1.0592224151800471,
+      "target_met": true
+    },
+    {
+      "scenario": "static-keepalive",
+      "transport": "http",
+      "body_size": 1048576,
+      "concurrency": 32,
+      "median_rps": {
+        "nginx": 9896.598685541052,
+        "rut": 10400.399532284064
+      },
+      "rut_over_nginx": 1.0509064642056332,
+      "target_met": true
+    },
+    {
+      "scenario": "static-keepalive",
+      "transport": "http",
+      "body_size": 1048576,
+      "concurrency": 128,
+      "median_rps": {
+        "nginx": 9736.80492501524,
+        "rut": 10150.012249744012
+      },
+      "rut_over_nginx": 1.0424376710749523,
+      "target_met": false
+    }
+  ]
+}
