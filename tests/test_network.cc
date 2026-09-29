@@ -721,6 +721,11 @@ static u64 response_coalesced_phase1_handler(
         return jit::HandlerResult::make_forward_with_bundle(
                    0, static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost), 2)
             .pack();
+    // The converter's bodyless GET policy (retained header values).
+    if (response_coalesced_phase1_mutation_kind == 6)
+        return jit::HandlerResult::make_forward_with_bundle(
+                   0, static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab), 2)
+            .pack();
     return jit::HandlerResult::make_forward_with_bundle(
                0, static_cast<u16>(RequestPolicyId::Http11FixedStrip), 2)
         .pack();
@@ -42111,6 +42116,131 @@ TEST(response_read_deadline_coalesced_get_phase1,
     conn->clear_slots();
     loop->close_conn(*conn);
     close(downstream[1]);
+}
+
+TEST(response_read_deadline_coalesced_get_phase1,
+     retained_value_policy_rewrites_request_one_and_stashes_exact_successor) {
+    // rut-nginx-convert selects ID3 for every bodyless GET, so a pipelined pair
+    // on a converted proxy_pass route must coalesce exactly like ID1: rewrite
+    // only request 1 and carry the successor bytes verbatim into the stash.
+    struct ScopedPolicyKind {
+        explicit ScopedPolicyKind(u8 kind) { response_coalesced_phase1_mutation_kind = kind; }
+        ~ScopedPolicyKind() { response_coalesced_phase1_mutation_kind = 0; }
+    };
+    struct Vector {
+        u8 handler_kind;
+        u16 policy;
+        const char* upload;
+    };
+    // ID1 trims SP and HTAB around a retained value; ID3 trims only SP.
+    const Vector vectors[] = {
+        {0,
+         static_cast<u16>(RequestPolicyId::Http11FixedStrip),
+         "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Keep: v\r\n\r\n"},
+        {6,
+         static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab),
+         "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Keep: \tv\t\r\n\r\n"},
+    };
+    for (const Vector& vector : vectors) {
+        ScopedPolicyKind policy_kind{vector.handler_kind};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(install_representation200_exact(config, "/two"));
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        REQUIRE(config.add_jit_handler(
+            "/one", kRouteMethodGet, &response_coalesced_phase1_handler, false, 2));
+        REQUIRE(config.add_static("/two", kRouteMethodGet, 204));
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+        conn->fd = downstream[0];
+        static constexpr u8 kRequest1[] =
+            "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n"
+            "X-Keep:  \tv\t \r\n\r\n";
+        static constexpr u8 kSuccessor[] =
+            "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+        REQUIRE_EQ(conn->recv_buf.write(kRequest1, sizeof(kRequest1) - 1u), sizeof(kRequest1) - 1u);
+        REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
+                   sizeof(kSuccessor) - 1u);
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 backend_pending = loop->backend.pending;
+        conn->recv_armed = true;
+        conn->pending_ops = 1;
+        on_header_received<IoUringEventLoop>(
+            loop,
+            *conn,
+            {conn->id,
+             static_cast<i32>(sizeof(kRequest1) + sizeof(kSuccessor) - 2u),
+             0,
+             0,
+             IoEventType::Recv,
+             1});
+        REQUIRE(conn->upstream_connect_armed);
+        CHECK_EQ(conn->request_policy_id, vector.policy);
+        const u32 upload_len_expected = static_cast<u32>(__builtin_strlen(vector.upload));
+        REQUIRE_EQ(conn->req_initial_send_len, upload_len_expected);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), vector.upload, upload_len_expected), 0);
+        REQUIRE_EQ(conn->recv_buf.len(), upload_len_expected + sizeof(kSuccessor) - 1u);
+        CHECK_EQ(
+            __builtin_memcmp(
+                conn->recv_buf.data() + upload_len_expected, kSuccessor, sizeof(kSuccessor) - 1u),
+            0);
+        const u32 episode = conn->upstream_episode;
+        conn->upstream_connect_armed = false;
+        conn->pending_ops--;
+        on_upstream_connected<IoUringEventLoop>(
+            loop, *conn, {conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+        REQUIRE(conn->upstream_send_armed);
+        const u32 upload_len = loop->backend.upstream_send_state[conn->id].remaining;
+        REQUIRE_EQ(upload_len, upload_len_expected);
+        REQUIRE_EQ(upload_len, conn->response_read_deadline_upload.expected_upload_length);
+        loop->backend.upstream_send_state[conn->id].offset = upload_len;
+        loop->backend.upstream_send_state[conn->id].remaining = 0;
+        conn->upstream_send_armed = false;
+        conn->pending_ops--;
+        on_upstream_request_sent<IoUringEventLoop>(loop,
+                                                   *conn,
+                                                   {conn->id,
+                                                    static_cast<i32>(upload_len),
+                                                    0,
+                                                    0,
+                                                    IoEventType::UpstreamSend,
+                                                    0,
+                                                    0,
+                                                    episode});
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE(response_read_deadline_coalesced_get_phase1_stash_is_stable(
+            *conn, conn->response_read_deadline_upload));
+        CHECK_EQ(conn->pipeline_stash_len, sizeof(kSuccessor) - 1u);
+        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), kSuccessor, sizeof(kSuccessor) - 1u), 0);
+
+        conn->response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+        REQUIRE(try_prebuilt_strict_read_timeout(loop, *conn));
+        complete_prebuilt_d2_header(loop, *conn);
+        drain_prebuilt_d2_retirement(loop, *conn, kUpstreamOpRecv, false);
+        REQUIRE(conn->http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn->resp_status, 200u);
+        CHECK_EQ(conn->pipeline_depth, 1u);
+        CHECK_EQ(conn->recv_buf.len(), sizeof(kSuccessor) - 1u);
+
+        __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
+        loop->backend.pending = backend_pending;
+        loop->backend.upstream_send_state[conn->id] = {};
+        conn->upstream_recv_armed = false;
+        conn->recv_armed = false;
+        conn->pending_ops = 0;
+        conn->clear_slots();
+        loop->close_conn(*conn);
+        close(downstream[1]);
+    }
 }
 
 TEST(response_read_deadline_coalesced_get_phase1,

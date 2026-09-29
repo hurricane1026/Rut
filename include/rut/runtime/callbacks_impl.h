@@ -3899,8 +3899,9 @@ void handle_jit_outcome(Loop* loop,
                     !response_read_deadline_route_method_matches(
                         conn.response_read_deadline_method,
                         conn.response_read_deadline_route_method) ||
-                    (coalesced_get && outcome.request_policy_id !=
-                                          static_cast<u16>(RequestPolicyId::Http11FixedStrip)) ||
+                    (coalesced_get &&
+                     !bodyless_get_complete_content_length_request_policy_is_admitted(
+                         outcome.request_policy_id)) ||
                     !target_valid || !request_policy_valid || conn.target_transform_recorded ||
                     conn.req_path_overridden || conn.req_header_override_count != 0 ||
                     conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
@@ -6822,11 +6823,14 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     u64 measured_id3_length = 0;
 
     // ID3 is measured completely before scratch is touched.  This proves the
-    // parser-owned raw boundaries and both destination capacities up front;
-    // its exact profile also forbids a successor/read-ahead suffix.
+    // parser-owned raw boundaries and both destination capacities up front.
+    // Its exact profile forbids a read-ahead suffix, except the validated
+    // coalesced phase-1 successor, which is copied verbatim like ID1's.
     if (trim_sp_preserve_htab) {
-        if (len != parser.header_end || req.header_count > kMaxHeaders || req.has_content_length ||
-            req.chunked || req.method != HttpMethod::GET || body_len != 0)
+        if ((len != parser.header_end &&
+             !(coalesced_phase1 && parser.header_end == original_request_end)) ||
+            req.header_count > kMaxHeaders || req.has_content_length || req.chunked ||
+            req.method != HttpMethod::GET || body_len != 0)
             return false;
         auto decimal_len = [](u32 value) {
             u32 n = 1;
@@ -7026,7 +7030,9 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     const u64 request_end64 = static_cast<u64>(body_start) + body_len;
     if (request_end64 > len) return false;
     const u32 request_end = static_cast<u32>(request_end64);
-    if (request_policy_trims_sp_preserves_htab(policy_id) && len != request_end) return false;
+    if (request_policy_trims_sp_preserves_htab(policy_id) && len != request_end &&
+        !coalesced_phase1)
+        return false;
     if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
         return false;
     if (coalesced_phase1 &&
