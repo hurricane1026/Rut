@@ -394,12 +394,18 @@ class ToolsTest(unittest.TestCase):
         self.assertFalse(evaluate(rows[:-1])["target_met"])
         self.assertFalse(evaluate(rows, duration=1)["target_met"])
         for key, value in (("body_size", 16), ("transport", "http"), ("rep", 99),
-                           ("valid", False), ("errors", {"timeout": 1}), ("rps", 105)):
+                           ("valid", False), ("errors", {"timeout": 1}), ("rps", 104.9)):
             bad = copy.deepcopy(rows)
             for row in bad:
                 if row["engine"] == "rut":
                     row[key] = value
             self.assertFalse(evaluate(bad)["target_met"], key)
+        for row in rows:
+            if row["engine"] == "rut":
+                row["rps"] = 105
+        self.assertTrue(evaluate(rows)["target_met"])
+        self.assertFalse(assess(rows, "proxy-close", "https", 65536, 32, 3, 5,
+                                threshold=1.10)["target_met"])
 
     def test_matrix_requires_actual_measurement_duration(self):
         import copy

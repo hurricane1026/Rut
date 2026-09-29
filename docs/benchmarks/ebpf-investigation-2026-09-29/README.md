@@ -1586,3 +1586,28 @@ A separate eBPF comparison uses the same HTTP 1 MiB proxy-close c32 workload for
 | rut-pipe | 540703 | 57.13 | 6.01 |
 
 Candidate tracing also records 49003 tcp_splice_read and 48965 splice_to_socket calls under its target PID; neither ordinary Rut nor nginx records those calls. This supports a reduction in the amount of response data using the expensive receive-copy path. It does not prove that the residual copy has become as cheap per byte as nginx, and helper elapsed time is inclusive rather than pure memcpy CPU. Instrumented RPS is excluded from throughput claims. Complete evidence is in `pipe-controls-copy-validation.json` and `pipe-controls-copy-evidence.tar.gz`. The next gate is the unchanged full 96-coordinate nginx comparison.
+
+## Complete pipe-candidate matrix at the revised 5% target
+
+The first full-matrix launch failed before any measurements: an outer `taskset -c 6` narrowed the harness process affinity before it validated the server/origin/client CPUs 2/3/4/5. The replacement launch removed only that outer affinity; role pinning and the workload stayed intact. Its 32 child runs all completed with valid status and exit 0. The full matrix has 96 valid coordinates, 576 valid samples of at least 5 seconds, 192 exact-body preflights, and zero warmup/load errors. No benchmark containers or listeners remained after completion. It used native static bodies, converter-strict proxying, implicit downstream keepalive, the pinned nginx image and no huge pages or global kernel changes.
+
+The user revised the target from a 10% lead to a 5% lead while the load was running. The already-running matrix used the historical 1.10 target and exited 2 solely because that target was missed. Its **measurements were not changed**. Reassessment of the same raw samples at Rut/nginx median RPS >= 1.05 gives **84/96 passing and 12 unmet**, including 5 below parity. The matrix tool now accepts `--target-ratio` and defaults to 1.05 for future runs. Small repeatable changes can be retained and combined, with the combined version measured across the full matrix; percentages from separate experiments are not added as a substitute for measurement.
+
+| Transport | Body | Scenario | Concurrency | Rut/nginx |
+|---|---:|---|---:|---:|
+| HTTP | 16 B | proxy close | 1 | 1.0242 |
+| HTTP | 16 B | proxy keepalive | 1 | 0.9989 |
+| HTTP | 1 KiB | proxy close | 1 | 1.0292 |
+| HTTP | 1 KiB | proxy keepalive | 1 | 0.9972 |
+| HTTP | 64 KiB | proxy close | 1 | 0.9818 |
+| HTTP | 64 KiB | proxy keepalive | 1 | 0.9785 |
+| HTTP | 64 KiB | static close | 1 | 1.0420 |
+| HTTP | 1 MiB | static keepalive | 1 | 0.9909 |
+| HTTP | 1 MiB | static keepalive | 32 | 1.0365 |
+| HTTP | 1 MiB | static keepalive | 128 | 1.0334 |
+| HTTPS | 64 KiB | proxy keepalive | 1 | 1.0268 |
+| HTTPS | 1 MiB | proxy close | 128 | 1.0223 |
+
+The intended pipe path has clear wins in HTTP 1 MiB proxy traffic: close c32/c128 reach 1.307/1.301; keepalive c1/c32/c128 reach 1.274/1.408/1.443. Close c1 reaches 1.085 and passes the revised target. Most remaining HTTP proxy c1 and all TLS cases are outside pipe admission. The weaker 1 MiB static keepalive results are also outside pipe admission; cross-run comparisons alone cannot attribute them to a candidate regression. Use paired candidate/accepted-baseline controls before drawing that conclusion. The next optimization work targets the 12 coordinates above, especially 64 KiB and small proxy c1; retain and test cumulative changes against the revised full matrix.
+
+`pipe-full-acceptance-5pct.json` contains the exact medians, candidate hash, conditions and archive checksum. `pipe-full-acceptance-5pct-evidence.tar.gz` contains the original matrix report, all 32 result/status/command files, 192 preflight records, generated configs and Rut fixtures, the launch-error record and full-run log. Private TLS key material is not archived.

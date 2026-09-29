@@ -270,7 +270,8 @@ or malformed JSON and invalid sample shapes are recorded as `evidence_error` for
 that coordinate; later coordinates still run. It keeps
 running other cases to expose the complete gap. `matrix.json` records exact
 coordinates, commands, median ratios and validity. The overall target requires
-every cell to reach Rut/nginx >= 1.10; both the requested duration and every
+every cell to reach Rut/nginx >= 1.05 by default (`--target-ratio` can select
+another finite ratio >= 1); both the requested duration and every
 sample's measured `seconds` must be at least 5, with at least three repeats.
 Short but otherwise valid measurements remain visible without qualifying for
 performance acceptance. Exit 2 includes

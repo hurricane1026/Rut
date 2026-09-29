@@ -1,0 +1,145 @@
+{
+  "all_cell_status_complete_valid": true,
+  "artifact": "pipe-full-acceptance-5pct-evidence.tar.gz",
+  "artifact_sha256": "9208a30cb15e3ecc203d4ce6e6a350e859d886d2fae232716675ed3ce0818698",
+  "below_parity_coordinates": 5,
+  "candidate_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "candidate_source_commit": "864494c0",
+  "cell_exit_codes": [
+    0
+  ],
+  "coordinates": 96,
+  "matrix_run_source_commit": "3282415e",
+  "measurement_errors": 0,
+  "no_test_containers_or_listeners_after_run": true,
+  "original_matrix_target_ratio": 1.1,
+  "pinned_nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "preflights": 192,
+  "profiles": {
+    "duration_seconds": 5,
+    "keepalive_header": "implicit",
+    "proxy": "converter-strict",
+    "repeats": 3,
+    "static": "native-body",
+    "warmup_seconds": 2
+  },
+  "samples": 576,
+  "sampling_unchanged": true,
+  "status": "complete_valid_target_unmet",
+  "target_met_coordinates": 84,
+  "target_ratio": 1.05,
+  "target_unmet": [
+    {
+      "body_size": 16,
+      "concurrency": 1,
+      "nginx_median_rps": 7608.327526959192,
+      "ratio": 1.0242077887242707,
+      "rut_median_rps": 7792.508312276873,
+      "scenario": "proxy-close",
+      "transport": "http"
+    },
+    {
+      "body_size": 16,
+      "concurrency": 1,
+      "nginx_median_rps": 10933.076822759625,
+      "ratio": 0.9988940697595097,
+      "rut_median_rps": 10920.985602479732,
+      "scenario": "proxy-keepalive",
+      "transport": "http"
+    },
+    {
+      "body_size": 1024,
+      "concurrency": 1,
+      "nginx_median_rps": 7528.009178958911,
+      "ratio": 1.029227324182259,
+      "rut_median_rps": 7748.032743679365,
+      "scenario": "proxy-close",
+      "transport": "http"
+    },
+    {
+      "body_size": 1024,
+      "concurrency": 1,
+      "nginx_median_rps": 10830.194665077675,
+      "ratio": 0.9971759072638734,
+      "rut_median_rps": 10799.609190993193,
+      "scenario": "proxy-keepalive",
+      "transport": "http"
+    },
+    {
+      "body_size": 65536,
+      "concurrency": 1,
+      "nginx_median_rps": 13078.779580607566,
+      "ratio": 1.041989011058857,
+      "rut_median_rps": 13627.94460105405,
+      "scenario": "static-close",
+      "transport": "http"
+    },
+    {
+      "body_size": 65536,
+      "concurrency": 1,
+      "nginx_median_rps": 6106.813346275652,
+      "ratio": 0.981827330660273,
+      "rut_median_rps": 5995.836246614353,
+      "scenario": "proxy-close",
+      "transport": "http"
+    },
+    {
+      "body_size": 65536,
+      "concurrency": 1,
+      "nginx_median_rps": 8082.345017308806,
+      "ratio": 0.9784865612387781,
+      "rut_median_rps": 7908.465982731866,
+      "scenario": "proxy-keepalive",
+      "transport": "http"
+    },
+    {
+      "body_size": 1048576,
+      "concurrency": 1,
+      "nginx_median_rps": 5590.935750320167,
+      "ratio": 0.9909087225486155,
+      "rut_median_rps": 5540.107002201142,
+      "scenario": "static-keepalive",
+      "transport": "http"
+    },
+    {
+      "body_size": 1048576,
+      "concurrency": 32,
+      "nginx_median_rps": 10065.816408620889,
+      "ratio": 1.0365384234562542,
+      "rut_median_rps": 10433.605470991992,
+      "scenario": "static-keepalive",
+      "transport": "http"
+    },
+    {
+      "body_size": 1048576,
+      "concurrency": 128,
+      "nginx_median_rps": 9817.310224397355,
+      "ratio": 1.0333753368280076,
+      "rut_median_rps": 10144.966259881661,
+      "scenario": "static-keepalive",
+      "transport": "http"
+    },
+    {
+      "body_size": 65536,
+      "concurrency": 1,
+      "nginx_median_rps": 5693.6847047084975,
+      "ratio": 1.0268090571374764,
+      "rut_median_rps": 5846.327023279803,
+      "scenario": "proxy-keepalive",
+      "transport": "https"
+    },
+    {
+      "body_size": 1048576,
+      "concurrency": 128,
+      "nginx_median_rps": 574.1795681509808,
+      "ratio": 1.0222732683101106,
+      "rut_median_rps": 586.968423730591,
+      "scenario": "proxy-close",
+      "transport": "https"
+    }
+  ],
+  "target_unmet_coordinates": 12,
+  "threshold_changed_after_measurement": true,
+  "valid_coordinates": 96,
+  "warmup_errors": 0
+}

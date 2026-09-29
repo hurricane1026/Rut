@@ -48,6 +48,16 @@ def finite_nonnegative(value):
         return False
 
 
+def target_ratio(value):
+    try:
+        ratio = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("target ratio must be a finite number >= 1") from error
+    if not math.isfinite(ratio) or ratio < 1:
+        raise argparse.ArgumentTypeError("target ratio must be a finite number >= 1")
+    return ratio
+
+
 def sample_shape_valid(row):
     if not isinstance(row, dict) or type(row.get("valid")) is not bool:
         return False
@@ -80,7 +90,8 @@ def load_evidence(folder):
         return [], {}, f"{type(error).__name__}: {error}"
 
 
-def assess(rows, scenario, transport, size, concurrency, repeats, duration, static_profile=None):
+def assess(rows, scenario, transport, size, concurrency, repeats, duration,
+           static_profile=None, threshold=1.05):
     work, connection = scenario.split("-")
     if not isinstance(rows, list) or not all(sample_shape_valid(row) for row in rows):
         rows = []
@@ -114,7 +125,7 @@ def assess(rows, scenario, transport, size, concurrency, repeats, duration, stat
     return {"scenario": scenario, "transport": transport, "body_size": size,
             "concurrency": concurrency, "median_rps": engines, "rut_over_nginx": ratio,
             "measurement_valid": ratio is not None, "performance_eligible": eligible,
-            "target_met": eligible and ratio is not None and ratio >= 1.10}
+            "target_met": eligible and ratio is not None and ratio >= threshold}
 
 
 def main():
@@ -127,6 +138,8 @@ def main():
     parser.add_argument("--body-sizes", nargs="+", type=positive, default=[16, 1024, 65536, 1048576])
     parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=list(SCENARIOS))
     parser.add_argument("--concurrency", nargs="+", type=positive, default=[1, 32, 128])
+    parser.add_argument("--target-ratio", type=target_ratio, default=1.05,
+                        help="minimum Rut/nginx median RPS ratio for every coordinate (default: 1.05)")
     add_measurement_arguments(parser, full_duration=10)
     args, common = parser.parse_known_args()
     resolve_measurement_arguments(args)
@@ -140,7 +153,7 @@ def main():
         parser.error("output must be new or empty")
     args.output.mkdir(parents=True, exist_ok=True)
     coordinates = list(itertools.product(args.transports, args.body_sizes, args.scenarios))
-    report = {"complete": False, "target_met": False,
+    report = {"complete": False, "target_met": False, "target_ratio": args.target_ratio,
               "profile": args.profile, "static_profile": args.static_profile,
               "expected_cells": len(coordinates) * len(args.concurrency), "cells": []}
     print_measurement_budget(args, report["expected_cells"])
@@ -167,7 +180,7 @@ def main():
             completed = returncode in (0, 1) and status.get("complete") is True
             for concurrency in args.concurrency:
                 cell = assess(rows, scenario, transport, size, concurrency, args.repeats, args.duration,
-                              args.static_profile)
+                              args.static_profile, args.target_ratio)
                 if scenario.startswith("static-"):
                     cell["static_profile"] = args.static_profile
                 cell.update(exit_code=returncode, evidence=str(folder), command=command)
