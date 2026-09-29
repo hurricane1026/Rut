@@ -1,0 +1,6 @@
+{"mode":"copy","bytes":4294967296,"seconds":0.900195,"relay_cpu_seconds":0.635654,"gib_per_second":4.443483,"in_calls":14285,"out_calls":14285,"pipe_capacity":0,"body_verified":true,"worker_affinity_cpu":2}
+{"mode":"splice","bytes":4294967296,"seconds":0.609318,"relay_cpu_seconds":0.147289,"gib_per_second":6.564721,"in_calls":8705,"out_calls":8705,"pipe_capacity":524288,"body_verified":true,"worker_affinity_cpu":2}
+{"mode":"uring-splice","bytes":4294967296,"seconds":0.623169,"relay_cpu_seconds":0.211821,"gib_per_second":6.418800,"in_calls":8705,"out_calls":8705,"pipe_capacity":524288,"body_verified":true,"worker_affinity_cpu":2}
+{"mode":"uring-splice","bytes":4294967296,"seconds":0.615085,"relay_cpu_seconds":0.213679,"gib_per_second":6.503164,"in_calls":8705,"out_calls":8705,"pipe_capacity":524288,"body_verified":true,"worker_affinity_cpu":2}
+{"mode":"splice","bytes":4294967296,"seconds":0.606319,"relay_cpu_seconds":0.145376,"gib_per_second":6.597182,"in_calls":8705,"out_calls":8705,"pipe_capacity":524288,"body_verified":true,"worker_affinity_cpu":2}
+{"mode":"copy","bytes":4294967296,"seconds":0.919821,"relay_cpu_seconds":0.641807,"gib_per_second":4.348671,"in_calls":21976,"out_calls":21976,"pipe_capacity":0,"body_verified":true,"worker_affinity_cpu":2}

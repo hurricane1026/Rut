@@ -1,0 +1,2 @@
+{"ready":true,"pid":2871679}
+{"mode":"splice","bytes":68719476736,"seconds":10.117547,"relay_cpu_seconds":2.254381,"gib_per_second":6.325644,"in_calls":139279,"out_calls":139279,"pipe_capacity":524288,"body_verified":true,"worker_affinity_cpu":2}

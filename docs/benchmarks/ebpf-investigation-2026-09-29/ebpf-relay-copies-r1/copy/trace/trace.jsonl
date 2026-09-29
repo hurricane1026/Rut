@@ -1,0 +1,5 @@
+{"type": "attached_probes", "count": 8, "data": {"probes": 8}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@relay_copy_bytes": {"2871413": 68727865344}}}
+{"type": "map", "data": {"@relay_copy_calls": {"2871413": 1175992}}}

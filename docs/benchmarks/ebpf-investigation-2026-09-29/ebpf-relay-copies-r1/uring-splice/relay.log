@@ -1,0 +1,2 @@
+{"ready":true,"pid":2871901}
+{"mode":"uring-splice","bytes":68719476736,"seconds":9.672856,"relay_cpu_seconds":3.614074,"gib_per_second":6.616454,"in_calls":139285,"out_calls":139285,"pipe_capacity":524288,"body_verified":true,"worker_affinity_cpu":2}

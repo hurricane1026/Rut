@@ -1,0 +1,19 @@
+{
+  "kernel": "6.19.10-300.fc44.x86_64",
+  "binary_sha256": "75b5fabaeee3663212a5d8e09a73119802c2731cb1ec435224377700aa32780b",
+  "source_sha256": "fab4682566863f76642f938537ea4318f17697b1dc22d48c08acb3d52eb07082",
+  "build": "clang -O2 -Wall -Wextra splice-relay-probe.c",
+  "current_source_runs": [
+    "splice-relay-probe-r2.jsonl",
+    "ebpf-relay-copies-r1"
+  ],
+  "initial_run_note": "splice-relay-probe.jsonl precedes optional trace-gate support; r2 repeats timings using the archived current source and binary",
+  "cpu_assignment": {
+    "relay": 2,
+    "origin": 3,
+    "receiver": 4,
+    "io_wq_workers": 2
+  },
+  "untraced_measurement_bytes": 4294967296,
+  "warmup_bytes": 8388608
+}

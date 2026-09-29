@@ -1,0 +1,18 @@
+{
+  "maps": {
+    "@relay_splice_read_calls": {
+      "2871901": 139303
+    },
+    "@relay_splice_send_calls": {
+      "2871901": 139303
+    },
+    "@thread_exits": {
+      "2871901": 1
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [],
+  "tcp": []
+}

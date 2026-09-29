@@ -1,0 +1,2 @@
+{"ready":true,"pid":2871413}
+{"mode":"copy","bytes":68719476736,"seconds":13.621548,"relay_cpu_seconds":10.198311,"gib_per_second":4.698438,"in_calls":132657,"out_calls":132657,"pipe_capacity":0,"body_verified":true,"worker_affinity_cpu":2}

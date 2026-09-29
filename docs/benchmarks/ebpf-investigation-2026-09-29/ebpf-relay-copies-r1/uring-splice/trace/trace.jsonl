@@ -1,0 +1,6 @@
+{"type": "attached_probes", "count": 8, "data": {"probes": 8}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@relay_splice_read_calls": {"2871901": 139303}}}
+{"type": "map", "data": {"@relay_splice_send_calls": {"2871901": 139303}}}
+{"type": "map", "data": {"@thread_exits": {"2871901": 1}}}

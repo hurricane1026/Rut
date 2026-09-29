@@ -1,0 +1,29 @@
+[
+  {
+    "mode": "copy",
+    "trace_usable": true,
+    "verified_bytes": 68727865344,
+    "copy_helper_calls": 1175992,
+    "copy_helper_requested_bytes": 68727865344,
+    "splice_read_calls": 0,
+    "splice_send_calls": 0
+  },
+  {
+    "mode": "splice",
+    "trace_usable": true,
+    "verified_bytes": 68727865344,
+    "copy_helper_calls": 0,
+    "copy_helper_requested_bytes": 0,
+    "splice_read_calls": 139297,
+    "splice_send_calls": 139297
+  },
+  {
+    "mode": "uring-splice",
+    "trace_usable": true,
+    "verified_bytes": 68727865344,
+    "copy_helper_calls": 0,
+    "copy_helper_requested_bytes": 0,
+    "splice_read_calls": 139303,
+    "splice_send_calls": 139303
+  }
+]

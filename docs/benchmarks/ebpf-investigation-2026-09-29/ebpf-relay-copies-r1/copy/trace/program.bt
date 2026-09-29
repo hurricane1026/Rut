@@ -1,0 +1,26 @@
+BEGIN { @targets[2871413] = 1; printf("RUT_TRACE_READY\n"); }
+interval:s:24 { exit(); }
+
+rawtracepoint:sched_process_exec {
+    $task = (struct task_struct *)arg0;
+    if (@targets[$task->tgid]) {
+        @target_execs[$task->tgid] = count();
+        $ignored = delete(@targets[$task->tgid]);
+    }
+}
+rawtracepoint:sched_process_exit {
+    $task = (struct task_struct *)arg0;
+    if (@targets[$task->tgid]) {
+        @thread_exits[$task->tgid] = count();
+        
+        if ($task->pid == $task->tgid) { $ignored = delete(@targets[$task->tgid]); }
+    }
+}
+
+END { printf("RUT_TRACE_END\n"); clear(@targets); }
+fentry:skb_copy_datagram_iter /@targets[pid]/ {
+ @relay_copy_calls[pid]=count();
+ @relay_copy_bytes[pid]=sum(args.len);
+}
+fentry:tcp_splice_read /@targets[pid]/ { @relay_splice_read_calls[pid]=count(); }
+fentry:splice_to_socket /@targets[pid]/ { @relay_splice_send_calls[pid]=count(); }

@@ -1,0 +1,46 @@
+{
+  "completed": true,
+  "usable": true,
+  "mode": "trace",
+  "kernel": "6.19.10-300.fc44.x86_64",
+  "machine": "x86_64",
+  "groups": [
+    "relay-copies"
+  ],
+  "duration_seconds": 24,
+  "front_port": 8987,
+  "origin_port": 9987,
+  "started_at": 1790652588.5577648,
+  "program_sha256": "87539ec8cc0fdc5271c43148f16f5d69e5a2ef531e1d7d32eb9e37c7b931659c",
+  "targets_before": [
+    {
+      "pid": 2871413,
+      "start_ticks": 93851869,
+      "state": "S",
+      "comm": "splice-relay-pr",
+      "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/splice-relay-probe"
+    }
+  ],
+  "bpftrace_version": "bpftrace v0.27.0",
+  "command": [
+    "/tmp/rut-bounded-followup-20260928/ebpf-tools/bpftrace-container.py",
+    "-f",
+    "json",
+    "-B",
+    "line",
+    "/tmp/rut-bounded-followup-20260928/ebpf-relay-copies-r1/copy/trace/program.bt"
+  ],
+  "returncode": 0,
+  "targets_after": [
+    {
+      "pid": 2871413,
+      "start_ticks": 93851869,
+      "state": "S",
+      "comm": "splice-relay-pr",
+      "exe": "/tmp/rut-bounded-followup-20260928/ebpf-tools/splice-relay-probe"
+    }
+  ],
+  "targets_unchanged": true,
+  "diagnostic_warnings": false,
+  "finished_at": 1790652614.4149115
+}

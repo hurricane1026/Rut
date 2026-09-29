@@ -1,0 +1,15 @@
+{
+  "maps": {
+    "@relay_copy_bytes": {
+      "2871413": 68727865344
+    },
+    "@relay_copy_calls": {
+      "2871413": 1175992
+    }
+  },
+  "loss_or_errors": [],
+  "ready": true,
+  "ended": true,
+  "stdout_diagnostics": [],
+  "tcp": []
+}
