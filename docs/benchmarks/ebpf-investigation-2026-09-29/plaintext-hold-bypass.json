@@ -1,0 +1,39 @@
+{
+  "status": "rejected: 64 KiB keepalive did not improve and current timer behavior test failed",
+  "comparison": "plaintext Bounded responses bypass the small-release hold timer versus rebased accepted binary",
+  "candidate_sha256": "bc019feb92ebb309cfd24feec997e786f7cd5c5ba77096f714b00747c32b1c54",
+  "baseline_sha256": "f98ae490e57774dae6adb9ceb20db84e13804bdd57409e4dd8020e0230b22c2d",
+  "rules": "candidate,baseline,baseline,candidate; 2s warmup, >=5s load; exact body and zero errors",
+  "network_tests": "1459 passed, 1 failed (bounded_release_hold_timer_flushes_a_small_release expects the original plaintext hold behavior)",
+  "ebpf_trace": "uprobe attachment failed before measurement; no usable trace produced",
+  "cases": {
+    "65536-c1-close-proxy": {
+      "candidate_rps": [
+        6039.188079468679,
+        6040.183738307338
+      ],
+      "baseline_rps": [
+        6015.700987774987,
+        6039.466613508563
+      ],
+      "candidate_median_rps": 6039.685908888008,
+      "baseline_median_rps": 6027.583800641774,
+      "ratio": 1.0020077876387128
+    },
+    "65536-c1-keepalive-proxy": {
+      "candidate_rps": [
+        7845.221494636941,
+        7857.318390089104
+      ],
+      "baseline_rps": [
+        7861.696014420776,
+        7858.274648608904
+      ],
+      "candidate_median_rps": 7851.269942363022,
+      "baseline_median_rps": 7859.985331514839,
+      "ratio": 0.9988911697943159
+    }
+  },
+  "restored_binary_sha256": "f98ae490e57774dae6adb9ceb20db84e13804bdd57409e4dd8020e0230b22c2d",
+  "restored_network_tests": "1460 passed, 0 failed, 391493 checks, 0 failed checks"
+}
