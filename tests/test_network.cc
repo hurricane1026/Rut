@@ -43425,6 +43425,14 @@ TEST(response_read_deadline_coalesced_get_phase1,
         REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                    ResponseReadDeadlinePostCommitPhase::HeaderSend);
         REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        // The pinned-header syntax cache must detect an in-place mutation at
+        // the same address, then accept the restored bytes on the next check.
+        u8* pinned_header = const_cast<u8*>(conn.response_header_buf.data());
+        const u8 saved_first = pinned_header[0];
+        pinned_header[0] = static_cast<u8>('X');
+        CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+        pinned_header[0] = saved_first;
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
         CHECK_EQ(conn.pipeline_stash_len, sizeof(kSuccessor) - 1u);
         CHECK_EQ(conn.send_buf.len(), sizeof(kSuccessor) - 1u);
         CHECK_EQ(__builtin_memcmp(conn.send_buf.data(), kSuccessor, sizeof(kSuccessor) - 1u), 0);

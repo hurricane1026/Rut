@@ -383,16 +383,49 @@ inline bool complete_content_length_pinned_header_matches(
     u32 declared_body,
     CompleteContentLengthResponseClassification* out_classification = nullptr) {
     if (c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0) return false;
+    // Strict headers are normally checked several times while one response is
+    // delivered. Reuse only the syntax parse: compare every byte so a changed
+    // header is reparsed, and recheck all connection/policy fields below.
+    struct ParsedHeaderCache {
+        const u8* data;
+        u32 length;
+        u8 bytes[256];
+        ParsedResponse parsed;
+        bool valid;
+    };
+    static thread_local ParsedHeaderCache cache{};
+    const u8* data = c.response_header_buf.data();
+    const u32 length = c.response_header_buf.len();
+    const bool cacheable = length <= sizeof(cache.bytes);
+    const bool cache_hit = cacheable && cache.valid && cache.data == data &&
+                           cache.length == length &&
+                           __builtin_memcmp(cache.bytes, data, length) == 0;
     HttpResponseParser parser;
-    ParsedResponse parsed;
-    parser.reset();
-    parsed.reset();
-    if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
-            ParseStatus::Complete ||
-        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11)
-        return false;
+    ParsedResponse local_parsed;
+    const ParsedResponse* parsed = nullptr;
+    if (cache_hit) {
+        parsed = &cache.parsed;
+    } else {
+        cache.valid = false;
+        parser.reset();
+        ParsedResponse* destination = cacheable ? &cache.parsed : &local_parsed;
+        destination->reset();
+        if (parser.parse(data, length, destination) != ParseStatus::Complete ||
+            parser.header_end != length || destination->version != HttpVersion::Http11)
+            return false;
+        if (cacheable) {
+            __builtin_memcpy(cache.bytes, data, length);
+            cache.data = data;
+            cache.length = length;
+            cache.valid = true;
+            parsed = &cache.parsed;
+        } else {
+            parsed = &local_parsed;
+        }
+    }
+    if (parsed == nullptr) return false;
     return complete_content_length_parsed_header_matches(
-        c, parsed, declared_body, out_classification);
+        c, *parsed, declared_body, out_classification);
 }
 
 inline bool complete_content_length_raw_origin_matches_pinned(
