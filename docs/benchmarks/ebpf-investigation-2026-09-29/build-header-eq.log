@@ -1,0 +1,1192 @@
+[1/22] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/http2_conn.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/http2_conn.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/http2_conn.h:8:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/runtime/http2_conn.cc:420:76: warning: missing field 'raw_value' initializer [-Wmissing-field-initializers]
+  420 |                 req->headers[req->header_count++] = {Str{"host", 4}, kValue};
+      |                                                                            ^
+/home/hurricane/private/code/Rut-s1/src/runtime/http2_conn.cc:439:59: warning: missing field 'raw_value' initializer [-Wmissing-field-initializers]
+  439 |         req->headers[req->header_count++] = {kName, kValue};
+      |                                                           ^
+3 warnings generated.
+[2/22] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/timer_wheel.cc.o
+[3/22] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/shard.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/shard.cc:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/shard.h:10:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/event_loop.h:19:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+1 warning generated.
+[4/22] Building CXX object src/CMakeFiles/rut_compiler.dir/compiler/rir_printer.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/rir_printer.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_printer.h:3:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/rir.h:7:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/rir_printer.cc:647:13: warning: 8 enumeration values not explicitly handled in switch: 'ReqKeepAlive', 'ReqChunked', 'ReqHasContentLength'... [-Wswitch-enum]
+  647 |     switch (inst.op) {
+      |             ^~~~~~~
+2 warnings generated.
+[5/22] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/io_uring_backend.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/io_uring_backend.cc:7:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/response_read_deadline.h:7:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/runtime/io_uring_backend.cc:290:5: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  290 |     TRY_VOID(setup_buf_ring());
+      |     ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:453:44: note: expanded from macro 'TRY_VOID'
+  453 | #define TRY_VOID(expr) TRY_VOID_IMPL(expr, __COUNTER__)
+      |                                            ^
+2 warnings generated.
+[6/22] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/epoll_backend.cc.o
+[7/22] Building CXX object src/CMakeFiles/rut_jit.dir/jit/codegen.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:3:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/rir.h:7:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:549:17: warning: 13 enumeration values not explicitly handled in switch: 'Void', 'Bool', 'I32'... [-Wswitch-enum]
+  549 |         switch (ty->kind) {
+      |                 ^~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:684:17: warning: 4 enumeration values not explicitly handled in switch: 'CIDR', 'MediaType', 'Bytes'... [-Wswitch-enum]
+  684 |         switch (ty->kind) {
+      |                 ^~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:1538:25: warning: 90 enumeration values not explicitly handled in switch: 'ConstStr', 'ConstI32', 'ConstI64'... [-Wswitch-enum]
+ 1538 |                 switch (inst.op) {
+      |                         ^~~~~~~
+/home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:1564:21: warning: 88 enumeration values not explicitly handled in switch: 'ConstStr', 'ConstI32', 'ConstI64'... [-Wswitch-enum]
+ 1564 |             switch (inst.op) {
+      |                     ^~~~~~~
+/home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:1834:29: warning: 16 enumeration values not explicitly handled in switch: 'Void', 'Bool', 'F64'... [-Wswitch-enum]
+ 1834 |                     switch (policy_ty->kind) {
+      |                             ^~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:1889:29: warning: 16 enumeration values not explicitly handled in switch: 'Void', 'Bool', 'F64'... [-Wswitch-enum]
+ 1889 |                     switch (response_ty->kind) {
+      |                             ^~~~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:761:13: warning: 17 enumeration values not explicitly handled in switch: 'StrInterpolate', 'IpInCidr', 'HashHmacSha256'... [-Wswitch-enum]
+  761 |     switch (inst.op) {
+      |             ^~~~~~~
+/home/hurricane/private/code/Rut-s1/src/jit/codegen.cc:1970:21: warning: 79 enumeration values not explicitly handled in switch: 'ConstStr', 'ConstI32', 'ConstI64'... [-Wswitch-enum]
+ 1970 |             switch (blk.insts[ii].op) {
+      |                     ^~~~~~~~~~~~~~~~
+9 warnings generated.
+[8/22] Building CXX object src/CMakeFiles/rut_jit.dir/jit/runtime_helpers.cc.o
+[9/22] Building CXX object src/CMakeFiles/rut_compiler.dir/compiler/lower_rir.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/lower_rir.h:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir.h:6:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/lower_rir.h:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir.h:13:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:1067:21: warning: enumeration values 'Upstream', 'Import', and 'Using' not explicitly handled in switch [-Wswitch-enum]
+ 1067 |             switch (items[i].kind) {
+      |                     ^~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:221:13: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  221 |             TRY_VOID(grow_blocks(fn));
+      |             ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:453:44: note: expanded from macro 'TRY_VOID'
+  453 | #define TRY_VOID(expr) TRY_VOID_IMPL(expr, __COUNTER__)
+      |                                            ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:341:13: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  341 |             TRY_VOID(grow_insts(cur_block));
+      |             ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:453:44: note: expanded from macro 'TRY_VOID'
+  453 | #define TRY_VOID(expr) TRY_VOID_IMPL(expr, __COUNTER__)
+      |                                            ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:347:17: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  347 |                 TRY_VOID(grow_values(cur_func));
+      |                 ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:453:44: note: expanded from macro 'TRY_VOID'
+  453 | #define TRY_VOID(expr) TRY_VOID_IMPL(expr, __COUNTER__)
+      |                                            ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:404:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  404 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:405:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  405 |         auto [inst, vid] = TRY(emit(Opcode::ConstStr, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:411:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  411 |         auto* ty = TRY(make_type(TypeKind::I32));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:412:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  412 |         auto [inst, vid] = TRY(emit(Opcode::ConstI32, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:418:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  418 |         auto* ty = TRY(make_type(TypeKind::I64));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:419:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  419 |         auto [inst, vid] = TRY(emit(Opcode::ConstI64, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:425:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  425 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:426:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  426 |         auto [inst, vid] = TRY(emit(Opcode::ConstBool, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:432:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  432 |         auto* ty = TRY(make_type(TypeKind::Duration));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:433:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  433 |         auto [inst, vid] = TRY(emit(Opcode::ConstDuration, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:439:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  439 |         auto* ty = TRY(make_type(TypeKind::ByteSize));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:440:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  440 |         auto [inst, vid] = TRY(emit(Opcode::ConstByteSize, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:446:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  446 |         auto* ty = TRY(make_type(TypeKind::Method));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:447:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  447 |         auto [inst, vid] = TRY(emit(Opcode::ConstMethod, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:453:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  453 |         auto* ty = TRY(make_type(TypeKind::StatusCode));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:454:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  454 |         auto [inst, vid] = TRY(emit(Opcode::ConstStatus, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:462:23: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  462 |         auto* inner = TRY(make_type(TypeKind::Str));
+      |                       ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:463:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  463 |         auto* ty = TRY(make_type(TypeKind::Optional, inner));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:464:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  464 |         auto [inst, vid] = TRY(emit(Opcode::ReqHeader, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:470:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  470 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:471:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  471 |         auto [inst, vid] = TRY(emit(Opcode::ReqParam, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:477:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  477 |         auto* ty = TRY(make_type(TypeKind::Method));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:478:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  478 |         return TRY(emit(Opcode::ReqMethod, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:482:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  482 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:483:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  483 |         return TRY(emit(Opcode::ReqPath, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:487:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  487 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:488:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  488 |         return TRY(emit(Opcode::ReqPathOnly, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:492:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  492 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:493:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  493 |         return TRY(emit(Opcode::ReqBody, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:497:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  497 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:498:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  498 |         return TRY(emit(Opcode::ReqKeepAlive, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:502:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  502 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:503:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  503 |         return TRY(emit(Opcode::ReqChunked, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:507:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  507 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:508:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  508 |         return TRY(emit(Opcode::ReqHasContentLength, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:512:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  512 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:513:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  513 |         return TRY(emit(Opcode::ReqHttp10, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:517:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  517 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:518:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  518 |         return TRY(emit(Opcode::ReqHttp11, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:522:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  522 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:523:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  523 |         return TRY(emit(Opcode::ReqHttpVersion, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:527:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  527 |         auto* ty = TRY(make_type(TypeKind::I32));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:528:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  528 |         return TRY(emit(Opcode::ResumeEventKind, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:532:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  532 |         auto* ty = TRY(make_type(TypeKind::I32));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:533:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  533 |         return TRY(emit(Opcode::ResumeEventResult, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:537:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  537 |         auto* ty = TRY(make_type(TypeKind::I32));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:538:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  538 |         auto [inst, vid] = TRY(emit(Opcode::CtxLoadSlotI32, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:544:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  544 |         auto* ty = TRY(make_type(TypeKind::IP));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:545:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  545 |         return TRY(emit(Opcode::ReqRemoteAddr, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:549:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  549 |         auto* ty = TRY(make_type(TypeKind::ByteSize));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:550:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  550 |         return TRY(emit(Opcode::ReqContentLength, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:554:23: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  554 |         auto* inner = TRY(make_type(TypeKind::Str));
+      |                       ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:555:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  555 |         auto* ty = TRY(make_type(TypeKind::Optional, inner));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:556:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  556 |         auto [inst, vid] = TRY(emit(Opcode::ReqCookie, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:562:23: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  562 |         auto* inner = TRY(make_type(TypeKind::Str));
+      |                       ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:563:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  563 |         auto* ty = TRY(make_type(TypeKind::Optional, inner));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:564:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  564 |         auto [inst, vid] = TRY(emit(Opcode::ReqQuery, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:570:23: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  570 |         auto* inner = TRY(make_type(TypeKind::Str));
+      |                       ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:571:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  571 |         auto* ty = TRY(make_type(TypeKind::Optional, inner));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:572:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  572 |         return TRY(emit(Opcode::ReqQueryString, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:579:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  579 |         auto r = TRY(emit(Opcode::ReqSetHeader, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:588:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  588 |         auto r = TRY(emit(Opcode::ReqAddHeader, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:600:23: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  600 |         auto* inner = TRY(make_type(TypeKind::Str));
+      |                       ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:601:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  601 |         auto* ty = TRY(make_type(TypeKind::Optional, inner));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:602:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  602 |         auto r = TRY(emit(Opcode::RespHeader, ty, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:611:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  611 |         auto r = TRY(emit(Opcode::RespSetHeader, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:620:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  620 |         auto r = TRY(emit(Opcode::RespAddHeader, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:628:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  628 |         auto r = TRY(emit(Opcode::RespRemoveHeader, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:634:9: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  634 |         TRY_VOID(emit(Opcode::RespCommitHeaders, nullptr, loc));
+      |         ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:453:44: note: expanded from macro 'TRY_VOID'
+  453 | #define TRY_VOID(expr) TRY_VOID_IMPL(expr, __COUNTER__)
+      |                                            ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:640:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  640 |         auto r = TRY(emit(Opcode::ReqSetPath, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:649:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  649 |         auto r = TRY(emit(Opcode::ReqSetTargetTransform, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:656:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  656 |         auto r = TRY(emit(Opcode::CtxStoreSlotI32, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:668:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  668 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:669:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  669 |         auto [inst, vid] = TRY(emit(Opcode::StrHasPrefix, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:679:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  679 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:680:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  680 |         auto [inst, vid] = TRY(emit(Opcode::StrTrimPrefix, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:689:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  689 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:690:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  690 |         auto [inst, vid] = TRY(emit(Opcode::StrRegexMatch, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:698:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  698 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:699:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  699 |         auto r = TRY(emit(Opcode::StrInterpolate, ty, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:740:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  740 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:741:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  741 |         auto [inst, vid] = TRY(emit(cmp_op, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:771:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  771 |         auto* ty = TRY(make_type(both_i64 ? TypeKind::I64 : TypeKind::I32));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:772:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  772 |         auto [inst, vid] = TRY(emit(bit_op, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:803:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  803 |         auto* ty = TRY(make_type(both_i64 ? TypeKind::I64 : TypeKind::I32));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:804:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  804 |         auto [inst, vid] = TRY(emit(arith_op, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:813:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  813 |         auto* ty = TRY(make_type(TypeKind::I64));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:814:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  814 |         auto [inst, vid] = TRY(emit(Opcode::SextI64, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:823:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  823 |         auto* ty = TRY(make_type(TypeKind::I64));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:824:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  824 |         return TRY(emit(Opcode::TimeNowMicros, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:829:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  829 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:830:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  830 |         auto [inst, vid] = TRY(emit(Opcode::IpInCidr, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:841:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  841 |         auto* ty = TRY(make_type(TypeKind::Optional, inner_type));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:842:16: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  842 |         return TRY(emit(Opcode::OptNil, ty, loc)).vid;
+      |                ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:849:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  849 |         auto* ty = TRY(make_type(TypeKind::Optional, inner));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:850:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  850 |         auto [inst, vid] = TRY(emit(Opcode::OptWrap, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:858:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  858 |         auto* ty = TRY(make_type(TypeKind::Bool));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:859:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  859 |         auto [inst, vid] = TRY(emit(Opcode::OptIsNil, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:874:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  874 |         auto [inst, vid] = TRY(emit(Opcode::Select, then_ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:889:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  889 |         auto [inst, vid] = TRY(emit(Opcode::OptUnwrap, inner_type, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:917:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  917 |         auto [inst, vid] = TRY(emit(Opcode::StructField, field_type, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:936:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  936 |         auto* ty = TRY(make_type(TypeKind::Struct, nullptr, sd));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:937:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  937 |         auto [inst, vid] = TRY(emit(Opcode::StructCreate, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:959:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  959 |         auto [inst, vid] = TRY(emit(Opcode::BodyParse, target_type, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:975:27: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  975 |             auto* inner = TRY(make_type(TypeKind::I64));
+      |                           ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:976:29: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  976 |             opt_i64_cache = TRY(make_type(TypeKind::Optional, inner));
+      |                             ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:979:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  979 |         auto [inst, vid] = TRY(emit(Opcode::CacheGet, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:990:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  990 |         auto* ty = TRY(make_type(TypeKind::I64));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:991:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+  991 |         auto [inst, vid] = TRY(emit(Opcode::CacheSet, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1006:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1006 |         auto r = TRY(emit(Opcode::Br, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1017:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1017 |         auto r = TRY(emit(Opcode::Jmp, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1035:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1035 |         auto r = TRY(emit(Opcode::RetStatus, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1128:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1128 |         auto r = TRY(emit(Opcode::RetStatus, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1160:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1160 |         auto r = TRY(emit(Opcode::RetForward, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1188:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1188 |         auto r = TRY(emit(Opcode::RetForwardBundle, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1200:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1200 |         auto r = TRY(emit(Opcode::RetRedirect, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1211:20: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1211 |         auto* ty = TRY(make_type(TypeKind::Str));
+      |                    ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1212:28: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1212 |         auto [inst, vid] = TRY(emit(Opcode::YieldHttpGet, ty, loc));
+      |                            ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:1230:18: warning: '__COUNTER__' is a C2y extension [-Wc2y-extensions]
+ 1230 |         auto r = TRY(emit(Opcode::YieldTimer, nullptr, loc));
+      |                  ^
+/home/hurricane/private/code/Rut-s1/include/core/expected.h:450:34: note: expanded from macro 'TRY'
+  450 | #define TRY(expr) TRY_IMPL(expr, __COUNTER__)
+      |                                  ^
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/lower_rir.cc:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:711:17: warning: 88 enumeration values not explicitly handled in switch: 'ConstStr', 'ConstI32', 'ConstI64'... [-Wswitch-enum]
+  711 |         switch (op) {
+      |                 ^~
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:751:17: warning: 89 enumeration values not explicitly handled in switch: 'ConstStr', 'ConstI32', 'ConstI64'... [-Wswitch-enum]
+  751 |         switch (op) {
+      |                 ^~
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/rir_builder.h:782:17: warning: 87 enumeration values not explicitly handled in switch: 'ConstStr', 'ConstI32', 'ConstI64'... [-Wswitch-enum]
+  782 |         switch (op) {
+      |                 ^~
+127 warnings generated.
+[10/22] Building CXX object src/CMakeFiles/rut_loader.dir/serve_loader.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/serve_loader.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/serve_loader.h:27:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/lower_rir.h:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir.h:6:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/serve_loader.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/serve_loader.h:27:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/lower_rir.h:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir.h:13:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:1067:21: warning: enumeration values 'Upstream', 'Import', and 'Using' not explicitly handled in switch [-Wswitch-enum]
+ 1067 |             switch (items[i].kind) {
+      |                     ^~~~~~~~~~~~~
+2 warnings generated.
+[11/22] Building CXX object tests/CMakeFiles/test_http_parser.dir/test_http_parser.cc.o
+[12/22] Building CXX object src/CMakeFiles/rut.dir/main.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/main.cc:6:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/epoll_event_loop.h:13:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/event_loop.h:19:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/main.cc:7:
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:845:88: warning: '&&' within '||' [-Wlogical-op-parentheses]
+  845 |              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+      |               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~
+  846 |                   !bodyless_get_retained_policy ||
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:845:88: note: place parentheses around the '&&' expression to silence this warning
+  845 |              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+      |                                                                                        ^
+      |               (
+  846 |                   !bodyless_get_retained_policy ||
+      |                                                )
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4892:34: warning: '&&' within '||' [-Wlogical-op-parentheses]
+ 4892 |             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+      |              ~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4893 |                                      owner.expected_copy_end != 0) ||
+      |                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4892:34: note: place parentheses around the '&&' expression to silence this warning
+ 4892 |             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+      |                                  ^
+      |              (
+ 4893 |                                      owner.expected_copy_end != 0) ||
+      |                                                                   )
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4894:33: warning: '&&' within '||' [-Wlogical-op-parentheses]
+ 4893 |                                      owner.expected_copy_end != 0) ||
+      |                                                                    ~~
+ 4894 |              owner.saw_positive &&
+      |              ~~~~~~~~~~~~~~~~~~~^~
+ 4895 |                  (owner.positive_bytes > received ||
+      |                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4896 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4897 |                   owner.expected_copy_end != header + received)))
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4894:33: note: place parentheses around the '&&' expression to silence this warning
+ 4894 |              owner.saw_positive &&
+      |                                 ^
+      |              (
+ 4895 |                  (owner.positive_bytes > received ||
+ 4896 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
+ 4897 |                   owner.expected_copy_end != header + received)))
+      |                                                                
+      |                                                                )
+In file included from /home/hurricane/private/code/Rut-s1/src/main.cc:18:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/serve_loader.h:27:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/lower_rir.h:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir.h:13:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:1067:21: warning: enumeration values 'Upstream', 'Import', and 'Using' not explicitly handled in switch [-Wswitch-enum]
+ 1067 |             switch (items[i].kind) {
+      |                     ^~~~~~~~~~~~~
+5 warnings generated.
+[13/22] Building CXX object src/CMakeFiles/rut_compiler.dir/compiler/mir_build.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/mir_build.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir_build.h:3:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/hir.h:14:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:7:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/mir_build.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/mir_build.h:3:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/hir.h:14:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:1067:21: warning: enumeration values 'Upstream', 'Import', and 'Using' not explicitly handled in switch [-Wswitch-enum]
+ 1067 |             switch (items[i].kind) {
+      |                     ^~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/mir_build.cc:798:17: warning: 55 enumeration values not explicitly handled in switch: 'BoolLit', 'IntLit', 'StrLit'... [-Wswitch-enum]
+  798 |         switch (expr.kind) {
+      |                 ^~~~~~~~~
+3 warnings generated.
+[14/22] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/callbacks.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/callbacks.cc:4:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/callbacks_impl.h:7:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/callbacks_h2.h:18:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/http2_conn.h:8:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/route_table.h:15:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/runtime/rate_limit_key.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/runtime/callbacks.cc:15:
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:845:88: warning: '&&' within '||' [-Wlogical-op-parentheses]
+  845 |              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+      |               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~
+  846 |                   !bodyless_get_retained_policy ||
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:845:88: note: place parentheses around the '&&' expression to silence this warning
+  845 |              (!complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
+      |                                                                                        ^
+      |               (
+  846 |                   !bodyless_get_retained_policy ||
+      |                                                )
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4892:34: warning: '&&' within '||' [-Wlogical-op-parentheses]
+ 4892 |             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+      |              ~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4893 |                                      owner.expected_copy_end != 0) ||
+      |                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4892:34: note: place parentheses around the '&&' expression to silence this warning
+ 4892 |             (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+      |                                  ^
+      |              (
+ 4893 |                                      owner.expected_copy_end != 0) ||
+      |                                                                   )
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4894:33: warning: '&&' within '||' [-Wlogical-op-parentheses]
+ 4893 |                                      owner.expected_copy_end != 0) ||
+      |                                                                    ~~
+ 4894 |              owner.saw_positive &&
+      |              ~~~~~~~~~~~~~~~~~~~^~
+ 4895 |                  (owner.positive_bytes > received ||
+      |                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4896 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 4897 |                   owner.expected_copy_end != header + received)))
+      |                   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/include/rut/runtime/iouring_event_loop.h:4894:33: note: place parentheses around the '&&' expression to silence this warning
+ 4894 |              owner.saw_positive &&
+      |                                 ^
+      |              (
+ 4895 |                  (owner.positive_bytes > received ||
+ 4896 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
+ 4897 |                   owner.expected_copy_end != header + received)))
+      |                                                                
+      |                                                                )
+4 warnings generated.
+[15/22] Linking CXX static library src/librut_runtime.a
+[16/22] Linking CXX static library src/librut_jit.a
+[17/22] Linking CXX executable tests/test_http_parser
+[18/22] Building CXX object src/CMakeFiles/rut_compiler.dir/compiler/parser.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/parser.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/parser.h:3:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:7:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/parser.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/parser.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:1067:21: warning: enumeration values 'Upstream', 'Import', and 'Using' not explicitly handled in switch [-Wswitch-enum]
+ 1067 |             switch (items[i].kind) {
+      |                     ^~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/parser.cc:942:21: warning: 88 enumeration values not explicitly handled in switch: 'Ident', 'StringLit', 'IntLit'... [-Wswitch-enum]
+  942 |             switch (tok.type) {
+      |                     ^~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/parser.cc:5037:21: warning: 88 enumeration values not explicitly handled in switch: 'Ident', 'StringLit', 'IntLit'... [-Wswitch-enum]
+ 5037 |             switch (cur().type) {
+      |                     ^~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/parser.cc:5109:21: warning: 88 enumeration values not explicitly handled in switch: 'Ident', 'StringLit', 'IntLit'... [-Wswitch-enum]
+ 5109 |             switch (cur().type) {
+      |                     ^~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/parser.cc:5187:25: warning: 88 enumeration values not explicitly handled in switch: 'Ident', 'StringLit', 'IntLit'... [-Wswitch-enum]
+ 5187 |                 switch (cur().type) {
+      |                         ^~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/parser.cc:5496:17: warning: 84 enumeration values not explicitly handled in switch: 'Ident', 'StringLit', 'IntLit'... [-Wswitch-enum]
+ 5496 |         switch (p.cur().type) {
+      |                 ^~~~~~~~~~~~
+7 warnings generated.
+[19/22] Building CXX object src/CMakeFiles/rut_compiler.dir/compiler/analyze.cc.o
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/analyze.h:3:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:7:
+/home/hurricane/private/code/Rut-s1/include/rut/common/rate_limit_key_spec.h:130:21: warning: enumeration values 'Ip', 'Query', and 'Param' not explicitly handled in switch [-Wswitch-enum]
+  130 |             switch (k.comps[j].kind) {
+      |                     ^~~~~~~~~~~~~~~
+In file included from /home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:1:
+In file included from /home/hurricane/private/code/Rut-s1/include/rut/compiler/analyze.h:3:
+/home/hurricane/private/code/Rut-s1/include/rut/compiler/ast.h:1067:21: warning: enumeration values 'Upstream', 'Import', and 'Using' not explicitly handled in switch [-Wswitch-enum]
+ 1067 |             switch (items[i].kind) {
+      |                     ^~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:174:13: warning: 7 enumeration values not explicitly handled in switch: 'I64', 'Associated', 'Method'... [-Wswitch-enum]
+  174 |     switch (type) {
+      |             ^~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:477:13: warning: 4 enumeration values not explicitly handled in switch: 'Unknown', 'Associated', 'Array'... [-Wswitch-enum]
+  477 |     switch (type) {
+      |             ^~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:586:13: warning: 8 enumeration values not explicitly handled in switch: 'Unknown', 'Bool', 'Associated'... [-Wswitch-enum]
+  586 |     switch (type) {
+      |             ^~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:1459:21: warning: 12 enumeration values not explicitly handled in switch: 'Upstream', 'Import', 'TypeAlias'... [-Wswitch-enum]
+ 1459 |             switch (item.kind) {
+      |                     ^~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:3561:17: warning: 64 enumeration values not explicitly handled in switch: 'BoolLit', 'IntLit', 'StrLit'... [-Wswitch-enum]
+ 3561 |         switch (bit_kind) {
+      |                 ^~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:3613:13: warning: 64 enumeration values not explicitly handled in switch: 'BoolLit', 'IntLit', 'StrLit'... [-Wswitch-enum]
+ 3613 |     switch (kind) {
+      |             ^~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:3634:13: warning: 64 enumeration values not explicitly handled in switch: 'BoolLit', 'IntLit', 'StrLit'... [-Wswitch-enum]
+ 3634 |     switch (kind) {
+      |             ^~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:3675:13: warning: 29 enumeration values not explicitly handled in switch: 'BoolLit', 'IntLit', 'StrLit'... [-Wswitch-enum]
+ 3675 |     switch (expr.kind) {
+      |             ^~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:4771:13: warning: 88 enumeration values not explicitly handled in switch: 'Ident', 'StringLit', 'IntLit'... [-Wswitch-enum]
+ 4771 |     switch (static_cast<TokenType>(token_type)) {
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:6394:13: warning: 31 enumeration values not explicitly handled in switch: 'BoolLit', 'IntLit', 'StrLit'... [-Wswitch-enum]
+ 6394 |     switch (cond.kind) {  // mirror the operator when frame.len is on the right
+      |             ^~~~~~~~~
+/home/hurricane/private/code/Rut-s1/src/compiler/analyze.cc:14411:13: warning: 50 enumeration values not explicitly handled in switch: 'BoolLit', 'IntLit', 'StrLit'... [-Wswitch-enum]
+ 14411 |     switch (e.kind) {
+       |             ^~~~~~
+13 warnings generated.
+[20/22] Linking CXX static library src/librut_compiler.a
+[21/22] Linking CXX static library src/librut_loader.a
+[22/22] Linking CXX executable src/rut

@@ -1,0 +1,14 @@
+[
+  {
+    "case": "16-c32-close",
+    "candidate_delta_percent": 0.6124419209403653
+  },
+  {
+    "case": "65536-c1-close",
+    "candidate_delta_percent": -0.23892940499723458
+  },
+  {
+    "case": "65536-c1-keepalive",
+    "candidate_delta_percent": -1.2104437065793006
+  }
+]

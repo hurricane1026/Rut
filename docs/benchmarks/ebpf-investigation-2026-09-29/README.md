@@ -1395,3 +1395,22 @@ At c32, user CPU stays around 21 us/request but system CPU rises to about 303 fr
 ## Accepted build restored after receive controls
 
 After reverting both receive prototypes, `git diff 271cd98c -- include src` is empty. The rebuilt `build-rel/src/rut` SHA256 is `4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a`, exactly matching the frozen accepted `rut-combined-fin-ordered`. Rebuild succeeds; no new regression-suite claim is made. Docker benchmark containers and listeners 8987/9987 are cleared. The user-owned untracked bounded-laggards evidence was not changed.
+
+## Equal-byte-first ASCII comparison: rejected
+
+The alternative ASCII comparison accepts identical bytes immediately and only tests the ASCII letter/case relationship for different bytes. Exhaustive 256x256 byte pairs, punctuation boundaries and parser regression pass: 217 tests / 69394 checks. Both causal orders have clean exact-body preflight and warm/load errors. Changes:
+
+| Run | Case | Candidate change |
+|---|---|---:|
+| header-eq-causal-r1 | 16-c1-close | +0.728% |
+| header-eq-causal-r1 | 16-c32-close | +1.248% |
+| header-eq-causal-r1 | 16-c1-keepalive | +1.082% |
+| header-eq-causal-r1 | 1024-c1-close | +0.764% |
+| header-eq-causal-r1 | 1024-c32-close | +1.219% |
+| header-eq-causal-r1 | 65536-c1-close | -0.431% |
+| header-eq-causal-r1 | 65536-c1-keepalive | -1.838% |
+| header-eq-reverse-r1 | 16-c32-close | +0.612% |
+| header-eq-reverse-r1 | 65536-c1-close | -0.239% |
+| header-eq-reverse-r1 | 65536-c1-keepalive | -1.210% |
+
+Small-response initial gains do not generalize to the lagging 64 KiB targets. Both target deltas remain negative in reverse order, and the small c32 gain shrinks. Revert the comparison edit and its added test rather than retain a tradeoff against the target. No full network regression was run for this rejected candidate. Frozen binary remains evidence only.

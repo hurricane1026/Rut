@@ -1,0 +1,479 @@
+=== Util ===
+RUN: Util.ScanUriNoSpaceReturnsEnd
+  PASS: ScanUriNoSpaceReturnsEnd
+RUN: Util.ScanUriNoSpaceWithoutQueryReturnsEnd
+  PASS: ScanUriNoSpaceWithoutQueryReturnsEnd
+=== Corpus ===
+RUN: Corpus.ValidRequests
+  PASS: ValidRequests
+RUN: Corpus.InvalidRequests
+  PASS: InvalidRequests
+RUN: Corpus.InvalidControlCharHeaderValue
+  PASS: InvalidControlCharHeaderValue
+RUN: Corpus.ConnectionUpgradeSetsFlag
+  PASS: ConnectionUpgradeSetsFlag
+=== Incremental ===
+RUN: Incremental.ValidByteByByte
+  PASS: ValidByteByByte
+=== Split ===
+RUN: Split.ValidSplitAtEveryPosition
+  PASS: ValidSplitAtEveryPosition
+=== Combinatorial ===
+RUN: Combinatorial.MethodVersion
+  PASS: MethodVersion
+RUN: Combinatorial.MethodVersionHeaders
+  PASS: MethodVersionHeaders
+=== HeaderValue ===
+RUN: HeaderValue.ExtendedChars
+  PASS: ExtendedChars
+RUN: HeaderValue.Byte0xFF
+  PASS: Byte0xFF
+RUN: HeaderValue.TabInValue
+  PASS: TabInValue
+RUN: HeaderValue.EmptyValue
+  PASS: EmptyValue
+RUN: HeaderValue.LeadingTrailingOWS
+  PASS: LeadingTrailingOWS
+RUN: HeaderValue.PlusChars
+  PASS: PlusChars
+=== ContentLength ===
+RUN: ContentLength.WithLeadingZeroes
+  PASS: WithLeadingZeroes
+RUN: ContentLength.Zero
+  PASS: Zero
+RUN: ContentLength.AbsentHasNeutralFieldIdentity
+  PASS: AbsentHasNeutralFieldIdentity
+RUN: ContentLength.MaxU32
+  PASS: MaxU32
+RUN: ContentLength.Overflow
+  PASS: Overflow
+RUN: ContentLength.MaxU32PlusOne
+  PASS: MaxU32PlusOne
+RUN: ContentLength.MaxU32PlusFive
+  PASS: MaxU32PlusFive
+RUN: ContentLength.ElevenDigits
+  PASS: ElevenDigits
+RUN: ContentLength.MaxU32MinusOne
+  PASS: MaxU32MinusOne
+RUN: ContentLength.ManyLeadingZeroes
+  PASS: ManyLeadingZeroes
+RUN: ContentLength.AllZeroes
+  PASS: AllZeroes
+RUN: ContentLength.SpacesInMiddle
+  PASS: SpacesInMiddle
+RUN: ContentLength.Negative
+  PASS: Negative
+RUN: ContentLength.NonNumeric
+  PASS: NonNumeric
+RUN: ContentLength.CaseInsensitive
+  PASS: CaseInsensitive
+RUN: ContentLength.FunkyCase
+  PASS: FunkyCase
+=== Connection ===
+RUN: Connection.Http11DefaultKeepAlive
+  PASS: Http11DefaultKeepAlive
+RUN: Connection.Http10DefaultClose
+  PASS: Http10DefaultClose
+RUN: Connection.Http10ExplicitKeepAlive
+  PASS: Http10ExplicitKeepAlive
+RUN: Connection.Http11ExplicitClose
+  PASS: Http11ExplicitClose
+RUN: Connection.CaseInsensitive
+  PASS: CaseInsensitive
+=== TransferEncoding ===
+RUN: TransferEncoding.Chunked
+  PASS: Chunked
+RUN: TransferEncoding.ChunkedCaseInsensitive
+  PASS: ChunkedCaseInsensitive
+RUN: TransferEncoding.NotChunked
+  PASS: NotChunked
+=== HeaderEnd ===
+RUN: HeaderEnd.SimpleRequest
+  PASS: SimpleRequest
+RUN: HeaderEnd.WithHeaders
+  PASS: WithHeaders
+RUN: HeaderEnd.WithContentLength
+  PASS: WithContentLength
+=== Reuse ===
+RUN: Reuse.AcrossRequests
+  PASS: AcrossRequests
+RUN: Reuse.AfterError
+  PASS: AfterError
+=== Incomplete ===
+RUN: Incomplete.EmptyBuffer
+  PASS: EmptyBuffer
+RUN: Incomplete.PartialMethod
+  PASS: PartialMethod
+RUN: Incomplete.PartialRequestLine
+  PASS: PartialRequestLine
+RUN: Incomplete.PartialHeaders
+  PASS: PartialHeaders
+RUN: Incomplete.OneCRLF
+  PASS: OneCRLF
+RUN: Incomplete.HeaderNoFinalCRLF
+  PASS: HeaderNoFinalCRLF
+=== Edge ===
+RUN: Edge.LongUri
+  PASS: LongUri
+RUN: Edge.MaxHeaders
+  PASS: MaxHeaders
+RUN: Edge.TooManyHeaders
+  PASS: TooManyHeaders
+RUN: Edge.PercentEncoded
+  PASS: PercentEncoded
+RUN: Edge.LongHeaderValue
+  PASS: LongHeaderValue
+RUN: Edge.LongHeaderName
+  PASS: LongHeaderName
+=== InvalidRL ===
+RUN: InvalidRL.EmptyMethod
+  PASS: EmptyMethod
+RUN: InvalidRL.DoubleSpace
+  PASS: DoubleSpace
+RUN: InvalidRL.NoPath
+  PASS: NoPath
+RUN: InvalidRL.TruncatedVersion
+  PASS: TruncatedVersion
+RUN: InvalidRL.WrongProtocol
+  PASS: WrongProtocol
+RUN: InvalidRL.VersionLetters
+  PASS: VersionLetters
+=== InvalidHeader ===
+RUN: InvalidHeader.SystematicBadTokens
+  PASS: SystematicBadTokens
+=== URI ===
+RUN: URI.ValidPathChars
+  PASS: ValidPathChars
+RUN: URI.ControlCharsInvalid
+  PASS: ControlCharsInvalid
+=== Utility ===
+RUN: Utility.MethodStr
+  PASS: MethodStr
+=== HeaderParsing ===
+RUN: HeaderParsing.MultipleHeaders
+  PASS: MultipleHeaders
+RUN: HeaderParsing.LongUserAgent
+  PASS: LongUserAgent
+RUN: HeaderParsing.QuotesInValue
+  PASS: QuotesInValue
+RUN: HeaderParsing.ProxyAuth
+  PASS: ProxyAuth
+=== Methods ===
+RUN: Methods.AllNine
+  PASS: AllNine
+=== NginxURI ===
+RUN: NginxURI.IncompletePercentEncoding
+  PASS: IncompletePercentEncoding
+RUN: NginxURI.IncompletePercentOneDigit
+  PASS: IncompletePercentOneDigit
+RUN: NginxURI.AbsoluteFormSimple
+  PASS: AbsoluteFormSimple
+RUN: NginxURI.AbsoluteFormWithPort
+  PASS: AbsoluteFormWithPort
+RUN: NginxURI.AbsoluteFormWithQuery
+  PASS: AbsoluteFormWithQuery
+RUN: NginxURI.AbsoluteFormWithQueryAndFragment
+  PASS: AbsoluteFormWithQueryAndFragment
+RUN: NginxURI.AbsoluteFormPortQuery
+  PASS: AbsoluteFormPortQuery
+RUN: NginxURI.DotSegments
+  PASS: DotSegments
+RUN: NginxURI.DotSegmentSingle
+  PASS: DotSegmentSingle
+RUN: NginxURI.PercentEncodedControl
+  PASS: PercentEncodedControl
+RUN: NginxURI.RawControlCharInvalid
+  PASS: RawControlCharInvalid
+RUN: NginxURI.DELCharInvalid
+  PASS: DELCharInvalid
+=== NginxHeaders ===
+RUN: NginxHeaders.DuplicateContentLength
+  PASS: DuplicateContentLength
+RUN: NginxHeaders.DuplicateContentLengthSameValue
+  PASS: DuplicateContentLengthSameValue
+RUN: NginxHeaders.ContentLengthAndTransferEncodingConflict
+  PASS: ContentLengthAndTransferEncodingConflict
+RUN: NginxHeaders.DuplicateContentLengthZeroZero
+  PASS: DuplicateContentLengthZeroZero
+RUN: NginxHeaders.DuplicateContentLengthZeroNonzero
+  PASS: DuplicateContentLengthZeroNonzero
+RUN: NginxHeaders.TripleDuplicateContentLength
+  PASS: TripleDuplicateContentLength
+RUN: NginxHeaders.MaximumHeaderCountBoundsContentLengthCount
+  PASS: MaximumHeaderCountBoundsContentLengthCount
+RUN: NginxHeaders.TripleDuplicateContentLengthMismatch
+  PASS: TripleDuplicateContentLengthMismatch
+RUN: NginxHeaders.ContentLengthAfterOtherHeaders
+  PASS: ContentLengthAfterOtherHeaders
+RUN: NginxHeaders.TransferEncodingThenContentLength
+  PASS: TransferEncodingThenContentLength
+RUN: NginxHeaders.ContentLengthZeroWithChunked
+  PASS: ContentLengthZeroWithChunked
+RUN: NginxHeaders.TransferEncodingNonChunkedWithCL
+  PASS: TransferEncodingNonChunkedWithCL
+RUN: NginxHeaders.ChunkedInTokenList
+  PASS: ChunkedInTokenList
+RUN: NginxHeaders.ChunkedInTokenListWithCL
+  PASS: ChunkedInTokenListWithCL
+RUN: NginxHeaders.ConnectionCloseUpgrade
+  PASS: ConnectionCloseUpgrade
+RUN: NginxHeaders.ConnectionKeepAliveUpgrade
+  PASS: ConnectionKeepAliveUpgrade
+RUN: NginxHeaders.ConnectionTokenWithSpaces
+  PASS: ConnectionTokenWithSpaces
+RUN: NginxHeaders.ConnectionEmptyTokens
+  PASS: ConnectionEmptyTokens
+RUN: NginxHeaders.ConnectionCloseThenKeepAlive
+  PASS: ConnectionCloseThenKeepAlive
+RUN: NginxHeaders.ConnectionKeepAliveThenClose
+  PASS: ConnectionKeepAliveThenClose
+RUN: NginxHeaders.DuplicateHost
+  PASS: DuplicateHost
+RUN: NginxHeaders.UnderscoreInHeaderName
+  PASS: UnderscoreInHeaderName
+RUN: NginxHeaders.HyphenInHeaderName
+  PASS: HyphenInHeaderName
+RUN: NginxHeaders.NulInHeaderValue
+  PASS: NulInHeaderValue
+RUN: NginxHeaders.LargeNumberOfHeaders
+  PASS: LargeNumberOfHeaders
+=== NginxVersion ===
+RUN: NginxVersion.Http10
+  PASS: Http10
+RUN: NginxVersion.Http11
+  PASS: Http11
+RUN: NginxVersion.MajorVersion2
+  PASS: MajorVersion2
+RUN: NginxVersion.MajorVersion5
+  PASS: MajorVersion5
+RUN: NginxVersion.MajorVersion0
+  PASS: MajorVersion0
+RUN: NginxVersion.VersionLetters
+  PASS: VersionLetters
+RUN: NginxVersion.MissingSlash
+  PASS: MissingSlash
+RUN: NginxVersion.MissingDot
+  PASS: MissingDot
+RUN: NginxVersion.ExtraDigits
+  PASS: ExtraDigits
+=== NginxMethod ===
+RUN: NginxMethod.NginxMethods
+  PASS: NginxMethods
+RUN: NginxMethod.MethodCaseSensitive
+  PASS: MethodCaseSensitive
+=== NginxConnect ===
+RUN: NginxConnect.AuthorityForm
+  PASS: AuthorityForm
+RUN: NginxConnect.WithHeaders
+  PASS: WithHeaders
+RUN: NginxConnect.IPAddress
+  PASS: IPAddress
+=== NginxLong ===
+RUN: NginxLong.RequestLine200Chars
+  PASS: RequestLine200Chars
+RUN: NginxLong.HeaderValue200Chars
+  PASS: HeaderValue200Chars
+RUN: NginxLong.RequestLine2000Chars
+  PASS: RequestLine2000Chars
+=== NginxToken ===
+RUN: NginxToken.ValidTokenChars
+  PASS: ValidTokenChars
+RUN: NginxToken.DigitsInHeaderName
+  PASS: DigitsInHeaderName
+RUN: NginxToken.AllLowercase
+  PASS: AllLowercase
+RUN: NginxToken.AllUppercase
+  PASS: AllUppercase
+=== NginxKeepalive ===
+RUN: NginxKeepalive.Http10NoConnectionHeader
+  PASS: Http10NoConnectionHeader
+RUN: NginxKeepalive.Http10WithKeepAlive
+  PASS: Http10WithKeepAlive
+RUN: NginxKeepalive.Http11NoConnectionHeader
+  PASS: Http11NoConnectionHeader
+RUN: NginxKeepalive.Http11WithClose
+  PASS: Http11WithClose
+=== NginxRealistic ===
+RUN: NginxRealistic.ProxyRequest
+  PASS: ProxyRequest
+RUN: NginxRealistic.MultipartUpload
+  PASS: MultipartUpload
+RUN: NginxRealistic.WebSocketUpgrade
+  PASS: WebSocketUpgrade
+RUN: NginxRealistic.HealthCheck
+  PASS: HealthCheck
+RUN: NginxRealistic.GrpcRequest
+  PASS: GrpcRequest
+RUN: NginxRealistic.HSTSPreload
+  PASS: HSTSPreload
+=== NginxIncremental ===
+RUN: NginxIncremental.ProxyRequestByteByByte
+  PASS: ProxyRequestByteByByte
+RUN: NginxIncremental.WebSocketByteByByte
+  PASS: WebSocketByteByByte
+=== Smuggling ===
+RUN: Smuggling.CLCLDifferent
+  PASS: CLCLDifferent
+RUN: Smuggling.CLTEChunked
+  PASS: CLTEChunked
+RUN: Smuggling.TECLChunked
+  PASS: TECLChunked
+RUN: Smuggling.CLTEWithOtherHeaders
+  PASS: CLTEWithOtherHeaders
+RUN: Smuggling.CLZeroTEChunked
+  PASS: CLZeroTEChunked
+RUN: Smuggling.TEChunkedInList
+  PASS: TEChunkedInList
+=== TETokens ===
+RUN: TETokens.ChunkedOnly
+  PASS: ChunkedOnly
+RUN: TETokens.GzipChunked
+  PASS: GzipChunked
+RUN: TETokens.ChunkedGzip
+  PASS: ChunkedGzip
+RUN: TETokens.GzipOnly
+  PASS: GzipOnly
+RUN: TETokens.DeflateIdentity
+  PASS: DeflateIdentity
+RUN: TETokens.ChunkedWithSpaces
+  PASS: ChunkedWithSpaces
+RUN: TETokens.ChunkedCaseMixed
+  PASS: ChunkedCaseMixed
+RUN: TETokens.NotchunkedSubstring
+  PASS: NotchunkedSubstring
+RUN: TETokens.ChunkedExtSuffix
+  PASS: ChunkedExtSuffix
+=== TEFraming ===
+RUN: TEFraming.ConservativeOrderedClassificationAndReset
+  PASS: ConservativeOrderedClassificationAndReset
+=== ObsText ===
+RUN: ObsText.Latin1InValue
+  PASS: Latin1InValue
+RUN: ObsText.AllHighBytes
+  PASS: AllHighBytes
+RUN: ObsText.HighBytesInUriRejected
+  PASS: HighBytesInUriRejected
+=== IncrSplit ===
+RUN: IncrSplit.SplitInCRLFCRLF
+  PASS: SplitInCRLFCRLF
+RUN: IncrSplit.SplitInVersion
+  PASS: SplitInVersion
+RUN: IncrSplit.SplitInHeaderValue
+  PASS: SplitInHeaderValue
+RUN: IncrSplit.SplitBetweenHeaders
+  PASS: SplitBetweenHeaders
+=== HeaderValueEdge ===
+RUN: HeaderValueEdge.SingleChar
+  PASS: SingleChar
+RUN: HeaderValueEdge.OnlySpaces
+  PASS: OnlySpaces
+RUN: HeaderValueEdge.EqualsInValue
+  PASS: EqualsInValue
+RUN: HeaderValueEdge.SemicolonInValue
+  PASS: SemicolonInValue
+RUN: HeaderValueEdge.ColonInValue
+  PASS: ColonInValue
+RUN: HeaderValueEdge.VeryLongValue
+  PASS: VeryLongValue
+=== MultiSemantic ===
+RUN: MultiSemantic.CLThenConnection
+  PASS: CLThenConnection
+RUN: MultiSemantic.ConnectionThenCL
+  PASS: ConnectionThenCL
+RUN: MultiSemantic.TEGzipWithCLAllowed
+  PASS: TEGzipWithCLAllowed
+RUN: MultiSemantic.AllThreeNonConflicting
+  PASS: AllThreeNonConflicting
+=== URIChars ===
+RUN: URIChars.AtSign
+  PASS: AtSign
+RUN: URIChars.Tilde
+  PASS: Tilde
+RUN: URIChars.Semicolons
+  PASS: Semicolons
+RUN: URIChars.Brackets
+  PASS: Brackets
+RUN: URIChars.Braces
+  PASS: Braces
+RUN: URIChars.BackslashInURI
+  PASS: BackslashInURI
+RUN: URIChars.DoubleSlash
+  PASS: DoubleSlash
+RUN: URIChars.JustSlash
+  PASS: JustSlash
+RUN: URIChars.Asterisk
+  PASS: Asterisk
+RUN: URIChars.LongQueryString
+  PASS: LongQueryString
+=== HeaderCount ===
+RUN: HeaderCount.Exactly63
+  PASS: Exactly63
+RUN: HeaderCount.Exactly64
+  PASS: Exactly64
+RUN: HeaderCount.Exactly65Rejected
+  PASS: Exactly65Rejected
+=== response_parser ===
+RUN: response_parser.basic_200
+  PASS: basic_200
+RUN: response_parser.preserves_version_reason_raw_ows_and_cl_count
+  PASS: preserves_version_reason_raw_ows_and_cl_count
+RUN: response_parser.content_length_count_uses_complete_header_name
+  PASS: content_length_count_uses_complete_header_name
+RUN: response_parser.404
+  PASS: 404
+RUN: response_parser.chunked
+  PASS: chunked
+RUN: response_parser.connection_close
+  PASS: connection_close
+RUN: response_parser.incomplete
+  PASS: incomplete
+RUN: response_parser.no_headers
+  PASS: no_headers
+RUN: response_parser.content_length_body_split
+  PASS: content_length_body_split
+RUN: response_parser.http10_no_keepalive
+  PASS: http10_no_keepalive
+RUN: response_parser.connection_keepalive_explicit
+  PASS: connection_keepalive_explicit
+RUN: response_parser.multiple_headers
+  PASS: multiple_headers
+RUN: response_parser.duplicate_content_length_same_value
+  PASS: duplicate_content_length_same_value
+RUN: response_parser.duplicate_content_length_mismatch
+  PASS: duplicate_content_length_mismatch
+RUN: response_parser.invalid_version_prefix
+  PASS: invalid_version_prefix
+RUN: response_parser.invalid_version_digit
+  PASS: invalid_version_digit
+RUN: response_parser.malformed_status_codes_rejected
+  PASS: malformed_status_codes_rejected
+RUN: response_parser.empty_content_length_rejected
+  PASS: empty_content_length_rejected
+RUN: response_parser.trims_trailing_ows_in_header_value
+  PASS: trims_trailing_ows_in_header_value
+RUN: response_parser.malformed_reason_phrase_cr_without_lf
+  PASS: malformed_reason_phrase_cr_without_lf
+RUN: response_parser.malformed_header_terminator_cr_without_lf
+  PASS: malformed_header_terminator_cr_without_lf
+RUN: response_parser.invalid_header_name_with_full_terminator_errors
+  PASS: invalid_header_name_with_full_terminator_errors
+=== PathCanon ===
+RUN: PathCanon.canonical_view_matches_expected
+  PASS: canonical_view_matches_expected
+RUN: PathCanon.canon_view_lives_inside_recv_buffer
+  PASS: canon_view_lives_inside_recv_buffer
+RUN: PathCanon.leading_slash_run_collapsed
+  PASS: leading_slash_run_collapsed
+RUN: PathCanon.non_origin_form_leaves_canon_null
+  PASS: non_origin_form_leaves_canon_null
+=== request_parser ===
+RUN: request_parser.full_target_fragment_witness_survives_long_query_and_resets
+  PASS: full_target_fragment_witness_survives_long_query_and_resets
+=== response_parser ===
+RUN: response_parser.headers_truncated_flag
+  PASS: headers_truncated_flag
+=== http_header_compare ===
+RUN: http_header_compare.exhaustive_ascii_case_equivalence
+  PASS: exhaustive_ascii_case_equivalence
+
+217 passed, 0 failed, 69394 checks, 0 failed checks

@@ -1,0 +1,30 @@
+[
+  {
+    "case": "16-c1-close",
+    "candidate_delta_percent": 0.7280114745398913
+  },
+  {
+    "case": "16-c32-close",
+    "candidate_delta_percent": 1.2477063726164417
+  },
+  {
+    "case": "16-c1-keepalive",
+    "candidate_delta_percent": 1.0824936705902788
+  },
+  {
+    "case": "1024-c1-close",
+    "candidate_delta_percent": 0.7635405537076645
+  },
+  {
+    "case": "1024-c32-close",
+    "candidate_delta_percent": 1.218688058312467
+  },
+  {
+    "case": "65536-c1-close",
+    "candidate_delta_percent": -0.4305517508248369
+  },
+  {
+    "case": "65536-c1-keepalive",
+    "candidate_delta_percent": -1.8382173245045874
+  }
+]
