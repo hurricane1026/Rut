@@ -1,0 +1,46 @@
+[
+  {
+    "case": "1048576-c128-close-nginx",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "copied_mib": 43308.543771743774,
+    "wall_ns_us_per_mib": 48.894825237268385,
+    "soft_ns_us_per_mib": 0.09427255327536056,
+    "hard_ns_us_per_mib": 0.00010212765461039912,
+    "off_ns_us_per_mib": 0.0
+  },
+  {
+    "case": "1048576-c128-close-rut-fin",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "copied_mib": 45223.864921569824,
+    "wall_ns_us_per_mib": 114.49231327264161,
+    "soft_ns_us_per_mib": 2.984288521869112,
+    "hard_ns_us_per_mib": 0.0,
+    "off_ns_us_per_mib": 0.13627906439859555
+  },
+  {
+    "case": "1048576-c32-close-nginx",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "copied_mib": 43343.96951961517,
+    "wall_ns_us_per_mib": 48.691998803775874,
+    "soft_ns_us_per_mib": 0.07918151101612511,
+    "hard_ns_us_per_mib": 0.0,
+    "off_ns_us_per_mib": 6.549930778064109e-05
+  },
+  {
+    "case": "1048576-c32-close-rut-fin",
+    "usable": true,
+    "body_check": true,
+    "workload_errors": 0,
+    "copied_mib": 47088.95171260834,
+    "wall_ns_us_per_mib": 104.58169345233902,
+    "soft_ns_us_per_mib": 0.2427992678575324,
+    "hard_ns_us_per_mib": 0.0,
+    "off_ns_us_per_mib": 0.0032015153134027875
+  }
+]

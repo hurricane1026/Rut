@@ -1341,3 +1341,16 @@ For direct body recv lengths >=64 KiB, issue write-intent, high-locality prefetc
 - 1048576-c32-close: -16.27% throughput.
 
 User CPU rises sharply: c1 roughly 39–42 to 59–61 us/request, c32 roughly 21–23 to 91–93 us/request. The driver was intentionally interrupted after these controls; the incomplete c128 group and remaining unrun cases cannot support performance claims. Cleanup was checked: no running Docker containers or benchmark listeners. Revert the hint loop. A lower helper-copy time, if any, would not justify this total request regression; no candidate copy-time claim is made. Frozen binary and build-rel are rejected experiment artifacts until rebuilt.
+
+## Copy helper interruption attribution
+
+All four current accepted 1 MiB close runs pass exact-body preflight, warm/load zero-error checks and trace usability. Values below are microseconds per actual copied MiB.
+
+| Engine / concurrency | Helper wall time | Softirq handlers | Hardirq handlers | Off-CPU inside helper |
+|---|---:|---:|---:|---:|
+| nginx c128 | 48.895 | 0.094 | 0.0001 | 0 |
+| Rut c128 | 114.492 | 2.984 | 0 | 0.136 |
+| nginx c32 | 48.692 | 0.079 | <0.0001 | 0.0001 |
+| Rut c32 | 104.582 | 0.243 | 0 | 0.003 |
+
+Observed interruption spans are far smaller than the 56–66 us/MiB helper gap. They do not explain its main part. Softirq/hardirq/off-CPU components can overlap; no exact exclusive-copy CPU time is obtained by subtracting their sum. Handler tracepoints omit some interrupt entry/exit overhead, and additional probes change timing. Instrumented throughput is not acceptance evidence. Investigate destination reuse next; no runtime change is retained from this diagnostic.

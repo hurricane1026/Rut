@@ -1,0 +1,10 @@
+{"type": "attached_probes", "count": 15, "data": {"probes": 15}}
+{"type": "printf", "data": "RUT_TRACE_READY\n"}
+{"type": "printf", "data": "RUT_TRACE_END\n"}
+{"type": "map", "data": {"@ci_bytes": {"2855133": 45412299594}}}
+{"type": "map", "data": {"@ci_calls": {"2855133": 822783}}}
+{"type": "map", "data": {"@ci_hard_calls": {"2855133": 1}}}
+{"type": "map", "data": {"@ci_hard_ns": {"2855133": 4423}}}
+{"type": "map", "data": {"@ci_soft_calls": {"2855133,3": 10, "2855133,7": 43, "2855133,1": 1083, "2855133,9": 2834}}}
+{"type": "map", "data": {"@ci_soft_ns": {"2855133": 4082807}}}
+{"type": "map", "data": {"@ci_wall_ns": {"2855133": 2117563679}}}
