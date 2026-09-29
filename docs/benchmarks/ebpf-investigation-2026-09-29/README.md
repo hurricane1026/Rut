@@ -1660,3 +1660,20 @@ Trace the unchanged pipe candidate and pinned nginx at HTTP 64 KiB proxy c1 in c
 | keepalive | Rut | 65,727 | 4.47 | 4.30 |
 
 At 64 KiB, Rut does not copy more response bytes through this helper, and its measured inclusive helper time is lower under tracing. This rules out *extra receive-copy bytes in this helper* as the explanation for the remaining 64 KiB acceptance gap. It does not rule out other copies, scheduling, parser/policy work, or changes induced by tracing. Per-call eBPF overhead differs across the engines, so instrumented RPS is **not** acceptance evidence. Investigate the repeated userspace response parsing and policy checks next. `pipe-64k-nginx-copy.json` records the normalized counters; raw traces and logs are in `pipe-64k-nginx-copy-evidence.tar.gz` SHA256 `539afe292bdd78fda305bd8a69097eb9e1cf68b0b4a6c757becc75141b3f113a`.
+
+## Frontend POLL_FIRST controls
+
+The 64 KiB c1 close trace also shows about 0.69 extra frontend `tcp_recvmsg` calls/request for Rut, mostly `-EAGAIN`; keepalive does not show this pattern. [Linux's io_uring UAPI](https://github.com/torvalds/linux/blob/v6.19/include/uapi/linux/io_uring.h) defines `IORING_RECVSEND_POLL_FIRST` and `IORING_RECV_MULTISHOT` as independent receive flags, and [the multishot receive manual](https://man7.org/linux/man-pages/man3/io_uring_prep_recv_multishot.3.html) describes the initial poll behavior. Tested two variants on the existing pipe candidate: POLL_FIRST on every frontend multishot receive, then only on the first receive at direct and deferred accept. Both builds passed the full network suite: 1438 tests / 388644 checks. Candidate hashes are in `frontend-poll-first.json`.
+
+For the all-receive variant, usable PID-filtered TCP traces under HTTP 64 KiB proxy close c1 show frontend EAGAIN falling from 0.539/request to zero and receive calls from 1.539/request to 1.001/request. Inclusive traced frontend recv elapsed time falls from 2.756 to 1.041 us/request. This proves that the intended empty read was removed under tracing; it does not predict uninstrumented throughput.
+
+| HTTP proxy case | All-receive POLL_FIRST, first/reverse order | First-receive-only, first/reverse order |
+|---|---:|---:|
+| 64 KiB close c1 | 1.0038 / 0.9979 | 1.0010 / 1.0007 |
+| 64 KiB keepalive c1 | 1.0004 / 0.9960 | 1.0064 / 1.0024 |
+| 16 B close c1 | — | 0.9952 / 0.9992 |
+| 16 B keepalive c1 | — | 1.0006 / 0.9971 |
+| 1 KiB close c1 | — | 0.9946 / 1.0002 |
+| 1 KiB keepalive c1 | — | 0.9988 / 0.9985 |
+
+Each entry is candidate/accepted-pipe median RPS from two 6-second samples per engine, with 2-second warmup, exact-body preflight and zero errors. The global variant has no stable 64 KiB benefit. The first-receive-only variant has a sub-1% 64 KiB keepalive improvement in both orders but does not improve 64 KiB close and tends to lower the smaller keepalive cases; the smallest close cases also have negative first-order results. Since the first receive occurs before the response size is known, this change cannot be restricted to 64 KiB by that response property. Revert both variants: removing an empty read alone is insufficient to move the combined candidate toward passing every lagging coordinate. `frontend-poll-first.json` records medians and eBPF counters. All raw rows, logs and traces are in `frontend-poll-first-evidence.tar.gz` SHA256 `849c79504748ffc6906ed8f596a6e3bb270fa361bb9a76b46dead4a750060f94`. The formal nginx matrix remains 84/96 at 1.05.

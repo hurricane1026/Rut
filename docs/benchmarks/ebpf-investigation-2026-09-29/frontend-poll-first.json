@@ -1,0 +1,136 @@
+{
+  "baseline_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "all_frontend_receives_sha256": "7c03f438225ebcc46e22fec8d552416ff04ff78eb1516127cf1920cc2404632b",
+  "first_frontend_receive_sha256": "a5a217ef9af439e093f18e0dd6aa4c1b59c4e89226994da579626fdc19929fe8",
+  "protocol": "paired candidate/baseline/baseline/candidate and reverse; 2s warmup and 6s load; full-body preflight; zero wrk errors",
+  "runs": {
+    "frontend-poll-64k-r1": {
+      "sample_count": 8,
+      "cases": {
+        "65536-c1-close-proxy": {
+          "candidate_median_rps": 6015.037339877726,
+          "baseline_median_rps": 5992.45621085809,
+          "ratio": 1.0037682593289075
+        },
+        "65536-c1-keepalive-proxy": {
+          "candidate_median_rps": 7798.330121009749,
+          "baseline_median_rps": 7795.00690111879,
+          "ratio": 1.0004263267413505
+        }
+      }
+    },
+    "frontend-poll-64k-r2": {
+      "sample_count": 8,
+      "cases": {
+        "65536-c1-close-proxy": {
+          "candidate_median_rps": 5981.247933165605,
+          "baseline_median_rps": 5993.601868677082,
+          "ratio": 0.9979388127903457
+        },
+        "65536-c1-keepalive-proxy": {
+          "candidate_median_rps": 7873.314125659579,
+          "baseline_median_rps": 7904.918059277993,
+          "ratio": 0.9960019909907453
+        }
+      }
+    },
+    "frontend-first-poll-64k-r1": {
+      "sample_count": 8,
+      "cases": {
+        "65536-c1-close-proxy": {
+          "candidate_median_rps": 6024.639494971334,
+          "baseline_median_rps": 6018.589235928368,
+          "ratio": 1.001005261998418
+        },
+        "65536-c1-keepalive-proxy": {
+          "candidate_median_rps": 7802.486913035693,
+          "baseline_median_rps": 7752.7541847968,
+          "ratio": 1.0064148465246607
+        }
+      }
+    },
+    "frontend-first-poll-64k-r2": {
+      "sample_count": 8,
+      "cases": {
+        "65536-c1-close-proxy": {
+          "candidate_median_rps": 6001.374900013702,
+          "baseline_median_rps": 5997.153035993253,
+          "ratio": 1.0007039780367635
+        },
+        "65536-c1-keepalive-proxy": {
+          "candidate_median_rps": 7850.186291857019,
+          "baseline_median_rps": 7831.264068278186,
+          "ratio": 1.002416241287978
+        }
+      }
+    },
+    "frontend-first-poll-small-r1": {
+      "sample_count": 16,
+      "cases": {
+        "1024-c1-close-proxy": {
+          "candidate_median_rps": 7735.044479586673,
+          "baseline_median_rps": 7777.332292069761,
+          "ratio": 0.9945626841061932
+        },
+        "1024-c1-keepalive-proxy": {
+          "candidate_median_rps": 10778.329802722277,
+          "baseline_median_rps": 10791.679135464856,
+          "ratio": 0.9987629976229827
+        },
+        "16-c1-close-proxy": {
+          "candidate_median_rps": 7739.924458921474,
+          "baseline_median_rps": 7777.1648245393335,
+          "ratio": 0.9952115756245317
+        },
+        "16-c1-keepalive-proxy": {
+          "candidate_median_rps": 10950.176921281873,
+          "baseline_median_rps": 10943.693953916256,
+          "ratio": 1.0005923929701357
+        }
+      }
+    },
+    "frontend-first-poll-small-r2": {
+      "sample_count": 16,
+      "cases": {
+        "1024-c1-close-proxy": {
+          "candidate_median_rps": 7746.719854755741,
+          "baseline_median_rps": 7745.1150412110655,
+          "ratio": 1.000207203319271
+        },
+        "1024-c1-keepalive-proxy": {
+          "candidate_median_rps": 10850.565195352709,
+          "baseline_median_rps": 10866.952874134779,
+          "ratio": 0.9984919711190544
+        },
+        "16-c1-close-proxy": {
+          "candidate_median_rps": 7781.519942384257,
+          "baseline_median_rps": 7788.036905446161,
+          "ratio": 0.9991632085028582
+        },
+        "16-c1-keepalive-proxy": {
+          "candidate_median_rps": 10945.634387241244,
+          "baseline_median_rps": 10977.196532539048,
+          "ratio": 0.9971247535557692
+        }
+      }
+    }
+  },
+  "mechanism": {
+    "65536-c1-close-rut-pipe": {
+      "load_requests": 45758,
+      "front_recv_calls_per_request": 1.5390095720966825,
+      "front_eagain_per_request": 0.5386380523624285,
+      "front_recv_us_per_request": 2.755767231959439,
+      "trace_usable": true,
+      "zero_load_errors": true
+    },
+    "65536-c1-close-rut-poll": {
+      "load_requests": 45398,
+      "front_recv_calls_per_request": 1.0005286576501167,
+      "front_eagain_per_request": 0.0,
+      "front_recv_us_per_request": 1.041063901493458,
+      "trace_usable": true,
+      "zero_load_errors": true
+    }
+  }
+}
