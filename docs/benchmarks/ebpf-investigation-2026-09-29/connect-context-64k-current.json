@@ -1,0 +1,123 @@
+{
+  "scenario": "HTTP 64KiB converter-strict proxy c1, close and keepalive",
+  "binary_sha256": "f194e0a912c8a5162317a25b95cd4107ebdfdd3f90b7e71b5682828dd2ffdea0",
+  "note": "eBPF probe contexts; traced RPS is diagnostic, not acceptance",
+  "cases": {
+    "65536-c1-close-nginx": {
+      "connect_comm": {
+        "nginx": 48485
+      },
+      "connect_cpu": {
+        "2": 48485
+      },
+      "connect_tid": {
+        "3073961": 48485
+      },
+      "front_comm": {
+        "nginx": 48485
+      },
+      "front_cpu": {
+        "2": 48485
+      },
+      "front_tid": {
+        "3073961": 48485
+      },
+      "upsend_comm": {
+        "nginx": 48485
+      },
+      "upsend_cpu": {
+        "2": 48485
+      },
+      "upsend_tid": {
+        "3073961": 48485
+      }
+    },
+    "65536-c1-close-rut-current": {
+      "connect_comm": {
+        "rut-pinned-pars": 48047
+      },
+      "connect_cpu": {
+        "2": 48047
+      },
+      "connect_tid": {
+        "3074193": 48047
+      },
+      "front_comm": {
+        "rut-pinned-pars": 48047
+      },
+      "front_cpu": {
+        "2": 48047
+      },
+      "front_tid": {
+        "3074193": 48047
+      },
+      "upsend_comm": {
+        "rut-pinned-pars": 48047
+      },
+      "upsend_cpu": {
+        "2": 48047
+      },
+      "upsend_tid": {
+        "3074193": 48047
+      }
+    },
+    "65536-c1-keepalive-nginx": {
+      "connect_comm": {
+        "nginx": 63317
+      },
+      "connect_cpu": {
+        "2": 63317
+      },
+      "connect_tid": {
+        "3074583": 63317
+      },
+      "front_comm": {
+        "nginx": 63317
+      },
+      "front_cpu": {
+        "2": 63317
+      },
+      "front_tid": {
+        "3074583": 63317
+      },
+      "upsend_comm": {
+        "nginx": 63317
+      },
+      "upsend_cpu": {
+        "2": 63317
+      },
+      "upsend_tid": {
+        "3074583": 63317
+      }
+    },
+    "65536-c1-keepalive-rut-current": {
+      "connect_comm": {
+        "rut-pinned-pars": 62678
+      },
+      "connect_cpu": {
+        "2": 62678
+      },
+      "connect_tid": {
+        "3074843": 62678
+      },
+      "front_comm": {
+        "rut-pinned-pars": 62678
+      },
+      "front_cpu": {
+        "2": 62678
+      },
+      "front_tid": {
+        "3074843": 62678
+      },
+      "upsend_comm": {
+        "rut-pinned-pars": 62678
+      },
+      "upsend_cpu": {
+        "2": 62678
+      },
+      "upsend_tid": {
+        "3074843": 62678
+      }
+    }
+  }
+}
