@@ -1,0 +1,37 @@
+{
+  "runtime_commit": "271cd98c",
+  "binary": "/tmp/rut-bounded-followup-20260928/ebpf-tools/rut-combined-fin-ordered",
+  "binary_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "matrix_output": "/tmp/rut-bounded-followup-20260928/combined-fin-full-acceptance",
+  "status": "running; no completion claim",
+  "expected_cells": 96,
+  "repeats": 3,
+  "measurement_seconds": 5,
+  "warmup_seconds": 2,
+  "target_ratio": 1.1,
+  "transport": [
+    "http",
+    "https"
+  ],
+  "body_sizes": [
+    16,
+    1024,
+    65536,
+    1048576
+  ],
+  "concurrency": [
+    1,
+    32,
+    128
+  ],
+  "scenario": [
+    "static-close",
+    "static-keepalive",
+    "proxy-close",
+    "proxy-keepalive"
+  ],
+  "static_profile": "native-body",
+  "proxy_profile": "converter-strict",
+  "huge_pages": false,
+  "kernel_tuning": false
+}
