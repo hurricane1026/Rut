@@ -1,0 +1,108 @@
+{
+  "candidate_sha256": "647104707e3fdcb903b08bddf7ff30c9398887efddaae121665f00e46b1393d6",
+  "baseline_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "change": "Always inline RouteConfig::policy_bundle_id_is_valid on top of pipe-pipeline-guard",
+  "protocol": "candidate/baseline/baseline/candidate and reverse; 2 second warmup and 6 second measured run per sample; exact body preflight; zero wrk metrics errors; CPU 2 server, 3 origin, 4/5 client",
+  "runs": {
+    "policy-inline-combined-r2": {
+      "sample_count": 16,
+      "cases": {
+        "1m-c32-keepalive-proxy": {
+          "candidate_median_rps": 2792.600059311838,
+          "baseline_median_rps": 2795.1058111280427,
+          "ratio": 0.9991035216605294
+        },
+        "1m-c32-keepalive-static": {
+          "candidate_median_rps": 10349.91910855961,
+          "baseline_median_rps": 10379.831789723437,
+          "ratio": 0.9971181921085231
+        },
+        "65536-c1-close-proxy": {
+          "candidate_median_rps": 6043.189173677916,
+          "baseline_median_rps": 6026.109700563324,
+          "ratio": 1.0028342453030676
+        },
+        "65536-c1-keepalive-proxy": {
+          "candidate_median_rps": 7853.968021858986,
+          "baseline_median_rps": 7830.024682021478,
+          "ratio": 1.0030578881689203
+        }
+      }
+    },
+    "policy-inline-combined-r3": {
+      "sample_count": 16,
+      "cases": {
+        "1m-c32-keepalive-proxy": {
+          "candidate_median_rps": 2773.972687316672,
+          "baseline_median_rps": 2775.1877290367593,
+          "ratio": 0.9995621767466848
+        },
+        "1m-c32-keepalive-static": {
+          "candidate_median_rps": 10479.960067783055,
+          "baseline_median_rps": 10437.010285380318,
+          "ratio": 1.0041151422896362
+        },
+        "65536-c1-close-proxy": {
+          "candidate_median_rps": 6004.3967839995275,
+          "baseline_median_rps": 6004.394729443885,
+          "ratio": 1.0000003421753125
+        },
+        "65536-c1-keepalive-proxy": {
+          "candidate_median_rps": 7851.249710930948,
+          "baseline_median_rps": 7797.896523936128,
+          "ratio": 1.0068419973041511
+        }
+      }
+    },
+    "policy-inline-small-r1": {
+      "sample_count": 16,
+      "cases": {
+        "1024-c1-close-proxy": {
+          "candidate_median_rps": 7751.665902297038,
+          "baseline_median_rps": 7781.904456377317,
+          "ratio": 0.9961142475791388
+        },
+        "1024-c1-keepalive-proxy": {
+          "candidate_median_rps": 10823.214679817396,
+          "baseline_median_rps": 10872.271176937982,
+          "ratio": 0.995487925538075
+        },
+        "16-c1-close-proxy": {
+          "candidate_median_rps": 7729.727743047522,
+          "baseline_median_rps": 7764.446878297005,
+          "ratio": 0.995528447062143
+        },
+        "16-c1-keepalive-proxy": {
+          "candidate_median_rps": 10931.547084696043,
+          "baseline_median_rps": 10897.345715402385,
+          "ratio": 1.003138504566788
+        }
+      }
+    },
+    "policy-inline-small-r2": {
+      "sample_count": 16,
+      "cases": {
+        "1024-c1-close-proxy": {
+          "candidate_median_rps": 7721.674447531823,
+          "baseline_median_rps": 7743.893214271307,
+          "ratio": 0.9971308015071105
+        },
+        "1024-c1-keepalive-proxy": {
+          "candidate_median_rps": 10858.504904802396,
+          "baseline_median_rps": 10860.706510392109,
+          "ratio": 0.9997972870745006
+        },
+        "16-c1-close-proxy": {
+          "candidate_median_rps": 7770.8037187130685,
+          "baseline_median_rps": 7787.59947776628,
+          "ratio": 0.9978432687632224
+        },
+        "16-c1-keepalive-proxy": {
+          "candidate_median_rps": 10925.823527622051,
+          "baseline_median_rps": 10936.393426368639,
+          "ratio": 0.9990335114754465
+        }
+      }
+    }
+  }
+}

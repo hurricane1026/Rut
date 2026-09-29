@@ -1624,3 +1624,20 @@ Two candidate/accepted-Rut comparisons, one in each order, cover the static path
 | HTTP 1 MiB keepalive c128 | 1.0020 | 1.0058 | 1.0057 |
 
 The c1 direction changes between orders; one accepted-Rut sample was unusually low. The c32 candidate is lower in both orders but by different amounts, so a small overhead remains possible and deserves follow-up. The 64 KiB static c1 and 1 MiB c128 controls are near parity. These paired samples do not justify attributing the new nginx matrix's static gaps entirely to the pipe work, nor do they show that static paths meet the 5% target. Raw rows, warmup/load logs and server logs are in `pipe-static-retention.json` and `pipe-static-retention-evidence.tar.gz`.
+
+## Policy-validator inline on the combined pipe candidate
+
+Revisited the one-line `policy_bundle_id_is_valid` always-inline experiment on the current pipe candidate. The older standalone experiment found approximately +0.8% in 64 KiB proxy close c1; that result cannot be added to the pipe candidate's gains. Built candidate SHA256 `647104707e3fdcb903b08bddf7ff30c9398887efddaae121665f00e46b1393d6` against the unchanged pipe baseline SHA256 `1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244`. The network suite passed 1438 tests / 388644 checks. Four paired runs cover eight coordinates and 64 measured samples in both engine orders, each with exact-body preflight, 2-second warmup, at least 5-second load and zero wrk errors.
+
+| HTTP case | Candidate / pipe baseline, first order | Reverse order |
+|---|---:|---:|
+| 16 B proxy close c1 | 0.9955 | 0.9978 |
+| 16 B proxy keepalive c1 | 1.0031 | 0.9990 |
+| 1 KiB proxy close c1 | 0.9961 | 0.9971 |
+| 1 KiB proxy keepalive c1 | 0.9955 | 0.9998 |
+| 64 KiB proxy close c1 | 1.0028 | 1.0000 |
+| 64 KiB proxy keepalive c1 | 1.0031 | 1.0068 |
+| 1 MiB proxy keepalive c32 | 0.9991 | 0.9996 |
+| 1 MiB static keepalive c32 | 0.9971 | 1.0041 |
+
+The 64 KiB keepalive gain repeats but is below 1%; the 64 KiB close gain from the old standalone build does not repeat in the combined candidate. Both short-response close cases, also below the 1.05 nginx target, move downward in both orders. Reject the inline change on this combined version and restore the runtime source. This does **not** reject small improvements in general: retain them when the combined version shows a repeatable net improvement without harming other unmet coordinates, then rerun the full 96-coordinate matrix. `policy-inline-combined.json` contains medians and provenance. `policy-inline-combined-evidence.tar.gz` SHA256 `d0d6c43a68d756919e1717367a8f783bcda4927a8137a1c89db8d399ffec3c8f` contains all four raw runs, driver scripts, the applied patch and test log. No new nginx acceptance run was made; the current result remains 84/96 at 1.05.
