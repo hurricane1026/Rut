@@ -1,0 +1,72 @@
+{
+  "candidate_sha256": "1b0bb18ded0fc0ec87e88ba258ebb6d6a4ac65e6f6f7ca4de69b675ce010d244",
+  "baseline_sha256": "4225208941bcdcd9799d3928470aa4e8ea8ac79631b285b2d9704e609832629a",
+  "excluded_controls": [
+    {
+      "case": "http-16-c32-close",
+      "candidate_median_rps": 16798.876032923363,
+      "baseline_median_rps": 16739.77292454343,
+      "candidate_over_baseline": 1.0035306995289808
+    },
+    {
+      "case": "http-65536-c1-close",
+      "candidate_median_rps": 6022.727826545752,
+      "baseline_median_rps": 6003.705877090428,
+      "candidate_over_baseline": 1.0031683679788361
+    },
+    {
+      "case": "http-65536-c1-keepalive",
+      "candidate_median_rps": 7880.6883617780595,
+      "baseline_median_rps": 7862.57214117606,
+      "candidate_over_baseline": 1.0023041086652962
+    },
+    {
+      "case": "https-1048576-c32-keepalive",
+      "candidate_median_rps": 1150.574830793852,
+      "baseline_median_rps": 1147.8480784351755,
+      "candidate_over_baseline": 1.0023755341929865
+    }
+  ],
+  "control_scope": "two samples per engine; candidate/baseline/baseline/candidate; 2-second warmup and 6-second load; no instrumentation",
+  "tls_harness_failure": "The first TLS attempt omitted the positional port and certificate/key CLI arguments, so it listened on 8080. No load sample was collected. Corrected TLS-only control uses the acceptance harness arguments.",
+  "traces": [
+    {
+      "engine": "nginx",
+      "completed_requests": 16430,
+      "upstream_copy_bytes_per_request": 1048977.7447961047,
+      "upstream_copy_elapsed_us_per_request": 51.36364637857577,
+      "upstream_copy_calls_per_request": 19.00687766281193,
+      "splice_read_calls": 0,
+      "splice_send_calls": 0,
+      "trace_usable": true
+    },
+    {
+      "engine": "rut-fin",
+      "completed_requests": 18439,
+      "upstream_copy_bytes_per_request": 1049870.7798687564,
+      "upstream_copy_elapsed_us_per_request": 106.0444924345138,
+      "upstream_copy_calls_per_request": 10.38413146049135,
+      "splice_read_calls": 0,
+      "splice_send_calls": 0,
+      "trace_usable": true
+    },
+    {
+      "engine": "rut-pipe",
+      "completed_requests": 23161,
+      "upstream_copy_bytes_per_request": 540703.1094512327,
+      "upstream_copy_elapsed_us_per_request": 57.127070851863046,
+      "upstream_copy_calls_per_request": 6.013082336686671,
+      "splice_read_calls": 49003,
+      "splice_send_calls": 48965,
+      "trace_usable": true
+    }
+  ],
+  "trace_scope": "HTTP 1 MiB proxy-close c32; exact body preflight, 2-second warmup, 12-second observation around 8-second instrumented load; normalized by completed requests",
+  "limits": [
+    "Instrumented RPS is not performance evidence.",
+    "Helper elapsed time is inclusive, not pure memcpy CPU.",
+    "Trace/load boundary in-flight requests create small normalization error.",
+    "The copy path remains active for memory prefixes; this is not elimination of all copies."
+  ],
+  "full_acceptance_pending": true
+}

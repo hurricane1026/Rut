@@ -1562,3 +1562,27 @@ Expanded uninstrumented candidate/baseline/baseline/candidate controls use the u
 | keepalive c128 | 2647.7 | 2303.2 | 1.1496 |
 
 These are Rut-to-Rut controls, not a fresh nginx acceptance matrix. Excluded-path controls and normalized receive-copy tracing are next, followed by the unchanged 96-coordinate gate. The formal 76/96 target result is not updated by these samples. Failure logs, debugger observations, successful measurements and validation are retained in `pipe-pipeline-guard-validation.json` and `pipe-pipeline-guard-evidence.tar.gz`.
+
+
+## Excluded-path controls and normalized copy-path comparison
+
+The pipeline-guard candidate passes the uninstrumented excluded-path controls. Candidate/baseline median RPS ratios are shown below; each uses two samples per engine in candidate/baseline/baseline/candidate order, 2-second warmup and 6-second load. All body preflights and warmup/load error counters pass. Ratios this close to one do not establish small improvements on this unreserved host.
+
+| Control | Candidate / baseline |
+|---|---:|
+| http-16-c32-close | 1.0035 |
+| http-65536-c1-close | 1.0032 |
+| http-65536-c1-keepalive | 1.0023 |
+| https-1048576-c32-keepalive | 1.0024 |
+
+The first TLS attempt was a harness setup failure: omitted port/certificate arguments left the program listening on 8080. It produced no measurement and is retained separately. The corrected TLS-only run uses the existing acceptance startup arguments. No acceptance configuration or private key was changed or archived.
+
+A separate eBPF comparison uses the same HTTP 1 MiB proxy-close c32 workload for accepted Rut, candidate Rut and pinned nginx. Every collector reports complete/usable, stable target identity and no loss/errors. Each run has exact-body preflight, 2-second warmup, and a 12-second trace around an 8-second measured workload. The following receive-copy-helper totals are normalized by completed requests, with a small in-flight boundary error.
+
+| Engine | Copied bytes / request | Copy-helper elapsed us / request | Copy calls / request |
+|---|---:|---:|---:|
+| nginx | 1048978 | 51.36 | 19.01 |
+| rut-fin | 1049871 | 106.04 | 10.38 |
+| rut-pipe | 540703 | 57.13 | 6.01 |
+
+Candidate tracing also records 49003 tcp_splice_read and 48965 splice_to_socket calls under its target PID; neither ordinary Rut nor nginx records those calls. This supports a reduction in the amount of response data using the expensive receive-copy path. It does not prove that the residual copy has become as cheap per byte as nginx, and helper elapsed time is inclusive rather than pure memcpy CPU. Instrumented RPS is excluded from throughput claims. Complete evidence is in `pipe-controls-copy-validation.json` and `pipe-controls-copy-evidence.tar.gz`. The next gate is the unchanged full 96-coordinate nginx comparison.
