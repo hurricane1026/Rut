@@ -2385,6 +2385,17 @@ public:
     // Called only after all CQEs returned by the current backend.wait batch.
     // Public for focused production-dispatch tests; run() is the only runtime
     // scheduler.
+    // A deferred boundary resumes outside tls_process, so ciphertext the client
+    // sent while the previous request owned the connection is still encrypted
+    // in tls_in_buf. When the dispatched successor stopped at an incomplete
+    // header, decrypt that input now: no later Recv completion will carry it.
+    void resume_buffered_tls_request_input(Connection& c) {
+        if (c.fd < 0 || c.state != ConnState::ReadingHeader ||
+            c.tls_pending_on_recv != &on_header_received<Self>)
+            return;
+        (void)process_buffered_tls_input(c);
+    }
+
     void resume_deferred_http1_boundaries() {
         if (!http1_boundary_ready_pending) return;
         http1_boundary_ready_pending = false;
@@ -2461,6 +2472,7 @@ public:
                 epoch_leave();
                 c.epoch_held = false;
                 continue_http1_request_boundary<IoUringEventLoop>(this, c);
+                resume_buffered_tls_request_input(c);
                 continue;
             }
 
@@ -2494,6 +2506,7 @@ public:
                 continue;
             }
             continue_http1_request_boundary<IoUringEventLoop>(this, c);
+            resume_buffered_tls_request_input(c);
         }
     }
 

@@ -40937,6 +40937,132 @@ TEST(tls_iouring, coalesced_bodyless_get_stashes_successor_and_begins_tls_504) {
 void complete_staged_tls_prebuilt_send(ScopedTlsRawSendLoop& guard,
                                        Connection& conn,
                                        u32 raw_generation,
+                                       u32 cipher_len);
+void drain_staged_tls_prebuilt_retirement(IoUringEventLoop* loop,
+                                          Connection& conn,
+                                          bool cancel_first);
+
+TEST(tls_iouring, deferred_504_boundary_decrypts_successor_tail_buffered_during_upstream_wait) {
+    // Request 2 is split across TLS records: its head was decrypted with
+    // request 1, its tail arrived while request 1 waited on the origin and is
+    // still ciphertext in tls_in_buf. The deferred 504 boundary resumes outside
+    // tls_process, so it must decrypt that tail itself; otherwise request 2
+    // waits for a Recv that never comes.
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    static constexpr u8 kRequest1[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr u8 kRequest2[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    constexpr u32 kRequest1Len = sizeof(kRequest1) - 1u;
+    constexpr u32 kRequest2Len = sizeof(kRequest2) - 1u;
+    constexpr u32 kHeadLen = 12;
+
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(/*capacity=*/2));
+    IoUringEventLoop& loop = *guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodGet, &response_read_deadline_get_framing_selection_handler, false, 2));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+
+    PrebuiltD2Fixture fixture{};
+    Connection* conn_ptr = loop.alloc_conn();
+    REQUIRE(conn_ptr != nullptr);
+    Connection& conn = *conn_ptr;
+    fixture.conn = conn_ptr;
+    fixture.sq_tail_before = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    fixture.backend_pending_before = loop.backend.pending;
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn.fd = downstream[0];
+    fixture.peer_fd = downstream[1];
+    REQUIRE_EQ(conn.recv_buf.write(kRequest1, kRequest1Len), kRequest1Len);
+    REQUIRE_EQ(conn.recv_buf.write(kRequest2, kHeadLen), kHeadLen);
+    capture_request_metadata(conn);
+    conn.keep_alive = true;
+    conn.req_start_us = monotonic_us();
+    conn.handler_gen = 1;
+    conn.request_config = &config;
+    loop.tls_server = context.get();
+    REQUIRE(loop.tls_setup(conn));
+    REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+    conn.tls_handshake_complete = true;
+    conn.tls_pending_on_recv = &on_header_received<IoUringEventLoop>;
+    REQUIRE(prepare_response_read_deadline_preflight(&loop, conn, &config.routes[0], &config));
+    conn.tls_pending_on_recv = nullptr;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    outcome.policy_bundle_id = 2;
+    handle_jit_outcome<IoUringEventLoop>(
+        &loop, conn, outcome, &response_read_deadline_get_framing_selection_handler, false);
+    REQUIRE(conn.upstream_connect_armed);
+    fixture.episode = conn.upstream_episode;
+    loop.dispatch({conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, fixture.episode});
+    REQUIRE(conn.upstream_send_armed);
+    auto& send = loop.backend.upstream_send_state[conn.id];
+    const u32 sent_len = send.remaining;
+    send.offset = sent_len;
+    send.remaining = 0;
+    loop.dispatch({conn.id,
+                   static_cast<i32>(sent_len),
+                   0,
+                   0,
+                   IoEventType::UpstreamSend,
+                   0,
+                   0,
+                   fixture.episode});
+    REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    REQUIRE_EQ(conn.pipeline_stash_len, kHeadLen);
+
+    // The tail of request 2 arrives as its own TLS record and, with no pending
+    // request callback, stays encrypted in tls_in_buf.
+    REQUIRE_EQ(
+        SSL_write(client.ssl, kRequest2 + kHeadLen, static_cast<int>(kRequest2Len - kHeadLen)),
+        static_cast<int>(kRequest2Len - kHeadLen));
+    u8 cipher[4096];
+    const int cipher_len = BIO_read(SSL_get_wbio(client.ssl), cipher, sizeof(cipher));
+    REQUIRE_GT(cipher_len, 0);
+    REQUIRE_EQ(conn.tls_in_buf.write(cipher, static_cast<u32>(cipher_len)),
+               static_cast<u32>(cipher_len));
+
+    conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+    REQUIRE(try_prebuilt_strict_read_timeout(&loop, conn));
+    REQUIRE_EQ(conn.resp_status, 504u);
+    REQUIRE(conn.tls_out_inflight);
+    complete_staged_tls_prebuilt_send(
+        guard, conn, conn.tls_out_inflight_generation, conn.tls_out_inflight_len);
+    REQUIRE_GE(conn.fd, 0);
+    if (!conn.http1_boundary_ready) {
+        drain_staged_tls_prebuilt_retirement(&loop, conn, /*cancel_first=*/false);
+    }
+    REQUIRE(conn.http1_boundary_ready);
+    loop.resume_deferred_http1_boundaries();
+
+    // Request 2 was decrypted, parsed completely, re-based and forwarded.
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK_EQ(conn.handler_gen, 2u);
+    CHECK_EQ(conn.pipeline_depth, 0u);
+    CHECK_NE(conn.state, ConnState::ReadingHeader);
+    CHECK(conn.upstream_connect_armed);
+    cleanup_prebuilt_d2(&loop, fixture);
+}
+
+void complete_staged_tls_prebuilt_send(ScopedTlsRawSendLoop& guard,
+                                       Connection& conn,
+                                       u32 raw_generation,
                                        u32 cipher_len) {
     guard.loop->backend.send_state[conn.id].offset = cipher_len;
     guard.loop->backend.send_state[conn.id].remaining = 0;
