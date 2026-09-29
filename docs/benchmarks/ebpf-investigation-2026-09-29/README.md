@@ -1108,3 +1108,24 @@ The next twelve coordinates complete with valid measurements. Across the first 2
 | proxy-keepalive | 128 | 1.3512 | pass |
 
 The same live process continues through the 64 KiB, 1 MiB and HTTPS coordinates. This remains partial acceptance.
+
+## Full-matrix checkpoint: HTTP 64 KiB coordinates
+
+All twelve 64 KiB coordinates complete with valid formal measurements. Both proxy c1 modes remain below nginx; the static c1 modes lead but miss >=1.10.
+
+| Scenario | Concurrency | Rut/nginx median RPS | Target |
+|---|---:|---:|---|
+| static-close | 1 | 1.0359 | below 1.10 |
+| static-close | 32 | 1.1011 | pass |
+| static-close | 128 | 1.2023 | pass |
+| static-keepalive | 1 | 1.0631 | below 1.10 |
+| static-keepalive | 32 | 1.4067 | pass |
+| static-keepalive | 128 | 1.4372 | pass |
+| proxy-close | 1 | 0.9806 | below 1.10 |
+| proxy-close | 32 | 1.3702 | pass |
+| proxy-close | 128 | 1.4075 | pass |
+| proxy-keepalive | 1 | 0.9713 | below 1.10 |
+| proxy-keepalive | 32 | 1.4854 | pass |
+| proxy-keepalive | 128 | 1.5545 | pass |
+
+The live full run continues through 1 MiB and HTTPS; this is not final acceptance.
