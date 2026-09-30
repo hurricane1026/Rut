@@ -1017,7 +1017,8 @@ inline bool inspect_response_read_deadline_coalesced_get_phase1(const Connection
         !response_read_deadline_default_persistence_is_stable(conn) ||
         conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
         conn.req_client_has_te || conn.req_client_has_expect ||
-        conn.req_client_has_upgrade_header || conn.req_client_connection_count != 0 ||
+        conn.req_client_has_upgrade_header ||
+        !request_connection_restates_default_persistence(conn) ||
         conn.req_body_mode != BodyMode::None || conn.req_body_remaining != 0 ||
         conn.request_body_fully_buffered || conn.req_body_streamed || conn.req_malformed ||
         conn.req_wants_upgrade || conn.req_path_canon.ptr == nullptr || conn.pipeline_depth != 0 ||
@@ -1041,14 +1042,17 @@ inline bool inspect_response_read_deadline_coalesced_get_phase1(const Connection
         request.chunked || request.upgrade || request.has_upgrade_header)
         return false;
     u32 host_count = 0;
+    u32 connection_count = 0;
     for (u32 i = 0; i < request.header_count; ++i) {
         const Header& header = request.headers[i];
         const Str name = header.name;
         if (http_header_name_eq_ci(name.ptr, name.len, "host", 4)) {
             if (++host_count > 1 || header.value.len == 0) return false;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10)) {
+            if (!request_connection_field_restates_default_persistence(header, &connection_count))
+                return false;
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
                    http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "connection", 10) ||
                    http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
                    http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
                    http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7)) {
@@ -1084,6 +1088,7 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
         return false;
     u32 host_count = 0;
     u32 content_length_count = 0;
+    u32 connection_count = 0;
     const bool options = conn.req_method == static_cast<u8>(LogHttpMethod::Options);
     for (u32 i = 0; i < request.header_count; ++i) {
         const Header& header = request.headers[i];
@@ -1092,8 +1097,10 @@ inline bool inspect_response_read_deadline_fixed_upload_request(
             if (++host_count > 1 || header.value.len == 0) return false;
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
             if (++content_length_count > 1) return false;
-        } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10) ||
-                   http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10)) {
+            if (!request_connection_field_restates_default_persistence(header, &connection_count))
+                return false;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
                    http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
                    http_header_name_eq_ci(name.ptr, name.len, "expect", 6) ||
                    http_header_name_eq_ci(name.ptr, name.len, "upgrade", 7) ||
@@ -1171,7 +1178,8 @@ inline bool response_read_deadline_fixed_upload_route_stable(const Connection& c
         conn.req_header_end != proof.raw_header_end ||
         conn.req_content_length != proof.raw_content_length ||
         conn.req_initial_send_len != conn.recv_buf.len() ||
-        conn.req_body_mode != BodyMode::ContentLength || conn.req_client_connection_count != 0 ||
+        conn.req_body_mode != BodyMode::ContentLength ||
+        !request_connection_restates_default_persistence(conn) ||
         !conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
         conn.req_client_has_te || conn.req_client_has_expect ||
         conn.req_client_has_upgrade_header || conn.req_malformed || conn.req_wants_upgrade ||
@@ -1309,7 +1317,7 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
             conn.req_client_has_transfer_encoding || conn.req_client_has_te ||
             conn.req_client_has_expect || conn.req_client_has_upgrade_header ||
             conn.req_wants_upgrade || profile == ResponseReadDeadlineProfile::None ||
-            (conn.req_client_connection_count != 0 &&
+            (!request_connection_restates_default_persistence(conn) &&
              !(complete_buffering &&
                profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
                !conn.req_client_keep_alive && conn.req_client_connection_close &&
@@ -10026,8 +10034,8 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     // This is intentionally the complete bounded HEAD domain. Response-only
     // suppression keeps its original explicit-close shape. A paired failure
     // policy additionally admits the ordinary HTTP/1.1 default keep-alive
-    // shape (no Connection field); every explicit keep-alive/token-list shape
-    // still fails below.
+    // shape (no Connection field, or one that is exactly `keep-alive`); every
+    // other token-list shape still fails below.
     if (policy.head_mode != ResponsePolicyHeadMode::SuppressBody ||
         policy.connection != ResponsePolicyConnection::Request)
         return false;
@@ -10163,11 +10171,16 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
                     if (tok_end >= value_end) break;
                     tok = tok_end + 1;
                 }
-            } else if (connection_count > 1 || header.value.len != 5 ||
-                       !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5)) {
+            } else if (connection_count > 1 ||
+                       !((header.value.len == 5 &&
+                          http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5)) ||
+                         (paired_failure && http_connection_value_is_exact_keep_alive(
+                                                header.value.ptr, header.value.len)))) {
                 // Non-ID4 policies keep the original closed contract: at
                 // most one physical `Connection` field, and its value must
-                // be exactly the single literal token `close`.
+                // be exactly the single literal token `close`, or -- with a
+                // paired failure policy -- `keep-alive`, which restates the
+                // HTTP/1.1 default admitted below.
                 return false;
             }
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
@@ -10283,9 +10296,10 @@ inline bool response_policy_suppress_head_admitted(const Connection& conn,
     const bool explicit_close_shape =
         !conn.req_client_keep_alive && conn.req_client_connection_close &&
         conn.req_client_connection_close_exact && conn.req_client_connection_count == 1;
-    const bool default_keep_alive_shape =
-        paired_failure && conn.req_client_keep_alive && !conn.req_client_connection_close &&
-        !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0;
+    const bool default_keep_alive_shape = paired_failure && conn.req_client_keep_alive &&
+                                          !conn.req_client_connection_close &&
+                                          !conn.req_client_connection_close_exact &&
+                                          request_connection_restates_default_persistence(conn);
     // ID4 only: a `Connection` value validated above (every token either a
     // protected name -- fail closed -- or a safely nominated/persistence
     // token -- admitted; `connection_close_token_seen` set iff a `close`
@@ -10405,7 +10419,8 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
             buffering) &&
         conn.req_http_version == static_cast<u8>(HttpVersion::Http11) && conn.keep_alive &&
         conn.req_client_keep_alive && !conn.req_client_connection_close &&
-        !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0 &&
+        !conn.req_client_connection_close_exact &&
+        request_connection_restates_default_persistence(conn) &&
         conn.req_client_has_content_length && !conn.req_client_has_transfer_encoding &&
         !conn.req_client_has_te && !conn.req_client_has_expect &&
         !conn.req_client_has_upgrade_header && !conn.req_malformed && !conn.req_wants_upgrade &&
@@ -10444,7 +10459,8 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         response_read_deadline_fixed_upload_method_admitted(conn.req_method, buffering) &&
         conn.req_http_version == static_cast<u8>(HttpVersion::Http11) && conn.keep_alive &&
         conn.req_client_keep_alive && !conn.req_client_connection_close &&
-        !conn.req_client_connection_close_exact && conn.req_client_connection_count == 0 &&
+        !conn.req_client_connection_close_exact &&
+        request_connection_restates_default_persistence(conn) &&
         conn.req_client_has_content_length && !conn.req_client_has_transfer_encoding &&
         !conn.req_client_has_te && !conn.req_client_has_expect &&
         !conn.req_client_has_upgrade_header && !conn.req_malformed && !conn.req_wants_upgrade &&
@@ -10508,16 +10524,21 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
         return ResponseReadDeadlineProfile::None;
     u32 host_count = 0;
     u32 connection_count = 0;
+    u32 connection_keep_alive_count = 0;
     for (u32 i = 0; i < request.header_count; ++i) {
         const Str name = request.headers[i].name;
         if (http_header_name_eq_ci(name.ptr, name.len, "host", 4)) {
             if (++host_count > 1 || request.headers[i].value.len == 0)
                 return ResponseReadDeadlineProfile::None;
         } else if (http_header_name_eq_ci(name.ptr, name.len, "connection", 10)) {
-            if (++connection_count > 1 || request.headers[i].value.len != 5 ||
-                !http_header_name_eq_ci(
-                    request.headers[i].value.ptr, request.headers[i].value.len, "close", 5))
+            const Header& header = request.headers[i];
+            if (http_connection_value_is_exact_keep_alive(header.value.ptr, header.value.len)) {
+                ++connection_keep_alive_count;
+            } else if (header.value.len != 5 ||
+                       !http_header_name_eq_ci(header.value.ptr, header.value.len, "close", 5)) {
                 return ResponseReadDeadlineProfile::None;
+            }
+            if (++connection_count > 1) return ResponseReadDeadlineProfile::None;
         } else if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14) ||
                    http_header_name_eq_ci(name.ptr, name.len, "transfer-encoding", 17) ||
                    http_header_name_eq_ci(name.ptr, name.len, "te", 2) ||
@@ -10526,8 +10547,11 @@ inline ResponseReadDeadlineProfile classify_response_read_deadline_profile(
             return ResponseReadDeadlineProfile::None;
         }
     }
+    const bool raw_default_persistence =
+        connection_count == 0 || (connection_count == 1 && connection_keep_alive_count == 1);
+    const bool raw_exact_close = connection_count == 1 && connection_keep_alive_count == 0;
     if (host_count != 1 ||
-        !((default_persistence && connection_count == 0) || (exact_close && connection_count == 1)))
+        !((default_persistence && raw_default_persistence) || (exact_close && raw_exact_close)))
         return ResponseReadDeadlineProfile::None;
     return ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero;
 }
@@ -12595,7 +12619,8 @@ inline bool try_prebuilt_strict_parse_failure(Loop* loop, Connection& conn) {
             conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
             conn.req_method != static_cast<u8>(LogHttpMethod::Head) || !conn.keep_alive ||
             !conn.req_client_keep_alive || conn.req_client_connection_close ||
-            conn.req_client_connection_close_exact || conn.req_client_connection_count != 0 ||
+            conn.req_client_connection_close_exact ||
+            !request_connection_restates_default_persistence(conn) ||
             conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
             conn.req_client_has_te || conn.req_client_has_expect ||
             conn.req_client_has_upgrade_header || conn.req_malformed || conn.req_wants_upgrade ||

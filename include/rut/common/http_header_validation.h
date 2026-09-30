@@ -45,6 +45,13 @@ inline bool http_header_name_eq_ci(const char* a, u32 a_len, const char* b, u32 
     return true;
 }
 
+// True iff a (parser OWS-trimmed) Connection field value is exactly the single
+// token `keep-alive`, in any case. On an HTTP/1.1 request this only restates
+// the default persistence (RFC 9112 §9.3), so it carries no other meaning.
+inline bool http_connection_value_is_exact_keep_alive(const char* value, u32 len) {
+    return http_header_name_eq_ci(value, len, "keep-alive", 10);
+}
+
 // Names we don't let users set: they'd conflict with runtime-managed
 // framing / hop-by-hop handling. Content-Length is recomputed from
 // the body we actually send; Transfer-Encoding would contradict the
