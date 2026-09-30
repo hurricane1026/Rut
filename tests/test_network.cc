@@ -40788,6 +40788,180 @@ TEST(iouring_downstream_ring_empty, genuine_recv_errors_still_close) {
     }
 }
 
+// A pause cancel that loses the race to an -ENOBUFS terminal completes -ENOENT
+// (dropped), so the terminal must clear recv_pause_cancel_pending itself or the
+// flag outlives the recv and vetoes retirement/trim for the connection.
+TEST(iouring_downstream_ring_empty, pause_cancel_race_clears_flag_and_resume_arms_one_recv) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    Connection& conn = *f.raw.conns[0];
+    REQUIRE(loop->pause_recv(conn));  // queues the cancel SQE
+    REQUIRE(conn.recv_pause_cancel_pending);
+    loop->backend.pending = 0;  // never submit SQEs aimed at a socketpair end
+
+    f.terminal(-ENOBUFS);
+    CHECK_FALSE(conn.recv_pause_cancel_pending);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 0u);
+
+    // The re-arm pass parks behind the pause instead of arming.
+    loop->rearm_deferred_recvs(/*force=*/false);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK_EQ(loop->backend.pending, 0u);
+
+    // Resume: exactly one recv is armed.
+    conn.recv_paused_for_send = false;
+    loop->submit_recv(conn);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(loop->backend.pending, 1u);
+    CHECK_FALSE(conn.recv_pause_rearm_pending);
+    loop->backend.pending = 0;
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+}
+
+TEST(iouring_downstream_ring_empty, terminal_for_a_closed_connection_reclaims_the_slot) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    Connection& conn = *f.raw.conns[0];
+    const u32 id = conn.id;
+    loop->close_conn(conn);
+    REQUIRE_LT(loop->conns[id].fd, 0);
+    REQUIRE_EQ(loop->pending_free_count, 1u);  // recv still owned, slot deferred
+    loop->backend.pending = 0;
+    loop->conns[id].pending_ops = 1;  // only the recv target remains in flight
+    loop->conns[id].recv_armed = true;
+    const u32 free_before = loop->free_top;
+    f.terminal(-ENOBUFS);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
+}
+
+TEST(iouring_downstream_ring_empty, dropped_bytes_enobufs_is_not_a_ring_empty_terminal) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    Connection& conn = *f.raw.conns[0];
+    // recv_buf has no room: wait() copies nothing, drops the bytes and reports
+    // -ENOBUFS for a selected buffer. That is lossy, so it must still close.
+    u8 fill[256];
+    memset(fill, 'x', sizeof(fill));
+    while (conn.recv_buf.write_avail() > 0) {
+        const u32 avail = conn.recv_buf.write_avail();
+        const u32 n = avail < sizeof(fill) ? avail : static_cast<u32>(sizeof(fill));
+        REQUIRE_EQ(conn.recv_buf.write(fill, n), n);
+    }
+    static constexpr u8 kBytes[] = "GET / HTTP/1.1\r\n";
+    REQUIRE(f.raw.append_recv(conn, kBytes, sizeof(kBytes) - 1u, false));
+    IoEvent ev{};
+    REQUIRE_EQ(f.raw.wait(&ev, 1), 1u);
+    CHECK_EQ(ev.result, -ENOBUFS);
+    CHECK_EQ(ev.provided_ring_empty, 0u);
+    loop->dispatch(ev);
+    CHECK_LT(conn.fd, 0);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
+}
+
+TEST(iouring_downstream_ring_empty, rearm_pass_is_capped_and_resumes_so_all_are_reached) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    auto& backend = loop->backend;
+    // Park three connections in three different bitmap words so the scan order
+    // and the resume cursor are both observable.
+    constexpr u32 kSlots = 130;
+    constexpr u32 kParkedIds[3] = {3, 70, 129};
+    Connection* parked[3] = {};
+    for (u32 i = 0; i < kSlots; i++) {
+        Connection* c = loop->alloc_conn();
+        REQUIRE(c != nullptr);
+        c->recv_armed = false;
+        c->pending_ops = 0;
+        c->fd = -1;
+        for (u32 k = 0; k < 3; k++)
+            if (c->id == kParkedIds[k]) parked[k] = c;
+    }
+    for (u32 k = 0; k < 3; k++) {
+        REQUIRE(parked[k] != nullptr);
+        parked[k]->fd = static_cast<i32>(100 + k);  // only queued, never submitted
+        loop->defer_recv_rearm(*parked[k]);
+    }
+    REQUIRE_EQ(loop->recv_rearm_count, 3u);
+    backend.pending = 0;
+
+    // Leave only two buffers' worth of headroom: 2046 unharvested CQEs.
+    const u32 backlog = kProvidedBufCount - 2;
+    const u32 tail = f.raw.tail();
+    for (u32 i = 0; i < backlog; i++) {
+        auto& cqe = backend.cq_entries[(tail + i) & *backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({0, IoEventType::Timeout, 0});
+        cqe.res = 0;
+        cqe.flags = 0;
+    }
+    __atomic_store_n(backend.cq_tail, tail + backlog, __ATOMIC_RELEASE);
+
+    // Pass 1: capped at the two free buffers, scanned in id order.
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK_EQ(backend.pending, 2u);
+    CHECK(parked[0]->recv_armed);
+    CHECK(parked[1]->recv_armed);
+    CHECK_FALSE(parked[2]->recv_armed);
+    CHECK_EQ(loop->recv_rearm_count, 1u);
+    // Pass 2 reaches the remaining one; nothing is armed twice.
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK_EQ(backend.pending, 3u);
+    CHECK(parked[2]->recv_armed);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK_EQ(backend.pending, 3u);
+    for (u32 k = 0; k < 3; k++) CHECK_EQ(parked[k]->pending_ops, 1u);
+
+    backend.pending = 0;
+    __atomic_store_n(backend.cq_head, tail + backlog, __ATOMIC_RELEASE);
+    for (u32 k = 0; k < 3; k++) {
+        parked[k]->recv_armed = false;
+        parked[k]->pending_ops = 0;
+        parked[k]->fd = -1;
+    }
+}
+
+TEST(iouring_downstream_ring_empty, timer_tick_is_the_forced_backstop) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    auto& backend = loop->backend;
+    Connection& conn = *f.raw.conns[0];
+    f.terminal(-ENOBUFS);
+    REQUIRE_EQ(loop->recv_rearm_count, 1u);
+    const u32 tail = f.raw.tail();
+    const u32 backlog = kProvidedBufCount / 2;  // gate closed for the batch-end pass
+    for (u32 i = 0; i < backlog; i++) {
+        auto& cqe = backend.cq_entries[(tail + i) & *backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({0, IoEventType::Timeout, 0});
+        cqe.res = 0;
+        cqe.flags = 0;
+    }
+    __atomic_store_n(backend.cq_tail, tail + backlog, __ATOMIC_RELEASE);
+    loop->rearm_deferred_recvs(/*force=*/false);
+    REQUIRE_FALSE(conn.recv_armed);
+
+    IoEvent tick{};
+    tick.type = IoEventType::Timeout;
+    tick.result = 1;
+    loop->dispatch(tick);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
+    backend.pending = 0;
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+    __atomic_store_n(backend.cq_head, tail + backlog, __ATOMIC_RELEASE);
+}
+
 // Window bookkeeping tests.  These append terminal CQEs for arbitrary conn ids
 // straight into the CQ ring: a terminal recv owns no buffer and the backend only
 // decodes the token, so no live Connection is needed.
@@ -79873,8 +80047,8 @@ TEST(iouring_body_pump_ready_set, rejects_foreign_slots_and_rolls_back_bitmap_al
     CHECK_EQ(guard.loop->connection_capacity, 0u);
     CHECK_EQ(guard.loop->body_pump_ready_words.data(), nullptr);
 
-    // Six mmap-backed tables are allocated here: connections, free stack,
-    // pending-free, two send-state arrays, then the ready-word set.
+    // Seven mmap-backed tables are allocated here: connections, free stack,
+    // pending-free, two send-state arrays, the ready-word set, then the re-arm bitmap.
     {
         ScopedMemoryFault fail_ready_words(6);
         auto failed = guard.loop->init_slot_storage(65);
@@ -79889,6 +80063,21 @@ TEST(iouring_body_pump_ready_set, rejects_foreign_slots_and_rolls_back_bitmap_al
     CHECK_EQ(guard.loop->backend.upstream_send_state.data(), nullptr);
     CHECK_EQ(guard.loop->body_pump_ready_words.data(), nullptr);
     CHECK_FALSE(guard.loop->response_read_deadline_body_pump_pending);
+
+    // The seventh table (downstream re-arm bitmap) must roll back the six before it.
+    {
+        ScopedMemoryFault fail_rearm_words(7);
+        auto failed = guard.loop->init_slot_storage(65);
+        CHECK_FALSE(failed.has_value());
+    }
+    CHECK_EQ(guard.loop->connection_capacity, 0u);
+    CHECK_EQ(guard.loop->conns.data(), nullptr);
+    CHECK_EQ(guard.loop->free_stack.data(), nullptr);
+    CHECK_EQ(guard.loop->pending_free.data(), nullptr);
+    CHECK_EQ(guard.loop->backend.send_state.data(), nullptr);
+    CHECK_EQ(guard.loop->backend.upstream_send_state.data(), nullptr);
+    CHECK_EQ(guard.loop->body_pump_ready_words.data(), nullptr);
+    CHECK_EQ(guard.loop->recv_rearm_words.data(), nullptr);
 
     REQUIRE(guard.init(65));
     CHECK_EQ(guard.loop->body_pump_ready_words.size(), 2u);

@@ -12947,6 +12947,16 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
         REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &nofile), 0);
     }
     if (nofile.rlim_cur < need) SKIP("RLIMIT_NOFILE too low for the burst");
+    // The clients queue in the listen backlog before the shard starts.
+    {
+        i32 somaxconn = 0;
+        FILE* fp = fopen("/proc/sys/net/core/somaxconn", "r");
+        if (fp != nullptr) {
+            if (fscanf(fp, "%d", &somaxconn) != 1) somaxconn = 0;
+            fclose(fp);
+        }
+        if (somaxconn < static_cast<i32>(kClients + 1)) SKIP("net.core.somaxconn too small");
+    }
 
     RouteConfig cfg{};
     REQUIRE(cfg.add_static("/", kRouteMethodGet, 200));

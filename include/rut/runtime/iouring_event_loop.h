@@ -282,6 +282,7 @@ public:
     // count keeps the ordinary hot path from touching the bitmap.
     MappedArray<u64> recv_rearm_words;
     u32 recv_rearm_count = 0;
+    u32 recv_rearm_cursor = 0;  // word where the next capped pass resumes
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
         CompleteBody,
@@ -394,6 +395,7 @@ public:
             return core::make_unexpected(rearm_words.error());
         }
         recv_rearm_count = 0;
+        recv_rearm_cursor = 0;
         // conns[] is mapped but neither constructed nor reset (lazy pages);
         // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
         // the stack so pops ascend.
@@ -3027,13 +3029,27 @@ public:
     // again. Buffers are returned as wait() harvests, so only CQEs still queued
     // hold any: re-arm once fewer than half the ring's buffers can be pinned
     // that way. `force` (timer tick) skips that gate so a saturated CQ cannot
-    // starve a connection indefinitely. A recv that finds no SQE stays pending.
+    // starve a connection indefinitely. At most as many recvs are armed per pass
+    // as buffers can be free (a recv armed beyond that bounces straight back),
+    // and the next pass resumes from recv_rearm_cursor so every parked
+    // connection is reached. A recv that finds no SQE stays pending.
     void rearm_deferred_recvs(bool force) {
         if (recv_rearm_count == 0) return;
-        if (!force && backend.cq_unharvested() >= kProvidedBufCount / 2) return;
-        for (u32 w = 0; w < recv_rearm_words.size() && recv_rearm_count != 0; ++w) {
+        const u32 pinned = backend.cq_unharvested();
+        if (!force && pinned >= kProvidedBufCount / 2) return;
+        u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
+        if (budget == 0 && force) budget = 1;  // the backstop always makes progress
+        const u32 words = (slots_initialized + 63u) >> 6;
+        if (words == 0) return;
+        const u32 start = recv_rearm_cursor < words ? recv_rearm_cursor : 0;
+        for (u32 n = 0; n < words && recv_rearm_count != 0 && budget != 0; ++n) {
+            const u32 w = (start + n) % words;
             u64 bits = recv_rearm_words[w];
             while (bits != 0) {
+                if (budget == 0) {
+                    recv_rearm_cursor = w;  // resume inside this word
+                    return;
+                }
                 const u32 cid = (w << 6) + static_cast<u32>(__builtin_ctzll(bits));
                 bits &= bits - 1;
                 if (cid >= slots_initialized) {
@@ -3041,9 +3057,16 @@ public:
                     continue;
                 }
                 Connection& c = conns[cid];
-                if (c.fd >= 0 && !submit_recv_impl(c)) return;  // SQ full: retry later
+                if (c.fd >= 0) {
+                    if (!submit_recv_impl(c)) {
+                        recv_rearm_cursor = w;
+                        return;  // SQ full: retry later
+                    }
+                    budget--;
+                }
                 clear_deferred_recv(cid);
             }
+            recv_rearm_cursor = (w + 1u) % words;
         }
     }
 
@@ -6212,6 +6235,9 @@ public:
                         ev.result == -ENOBUFS && !ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         conn.recv_armed = false;
+                        // This terminal is the recv's final CQE: a racing pause cancel
+                        // completes -ENOENT (dropped), so nothing else would clear this.
+                        conn.recv_pause_cancel_pending = false;
                         if (conn.fd < 0) {
                             if (conn.pending_ops == 0) reclaim_slot(conn.id);
                             break;

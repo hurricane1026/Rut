@@ -412,7 +412,9 @@ struct IoUringBackend {
 
     // Completions the kernel has posted that wait() has not harvested yet. Each
     // positive recv among them still holds its provided buffer, so this bounds
-    // how many buffers are missing from the ring right now.
+    // how many buffers are missing from the ring right now. CQEs parked on the
+    // kernel overflow list also hold buffers and are not counted (only reachable
+    // with more than cq_ring_entries outstanding CQEs).
     u32 cq_unharvested() const {
         if (cq_head == nullptr || cq_tail == nullptr) return 0;
         return __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE) -
