@@ -12363,8 +12363,18 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
     REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
     const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     REQUIRE_GE(client, 0);
-    const i32 small = 4096;
-    REQUIRE_EQ(setsockopt(client, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)), 0);
+    // The sender's buffer alone is shrunk so the 4 MiB body cannot fit and
+    // sendfile(2) returns short. The client keeps its default receive buffer:
+    // a tiny client SO_RCVBUF on loopback (64K MSS) can leave the peer's
+    // window below the sender's MSS, and the kernel then transmits only from
+    // its ~200 ms persist timer, orders of magnitude slower than a
+    // drain/continue loop that burns 100000 rounds in ~0.1 s. So: no tiny
+    // client buffer, and a real wait for writability before each stand-in
+    // POLLOUT CQE. The receive timeout keeps a stalled transfer a test
+    // failure instead of a hung run.
+    const i32 small = 65536;
+    const timeval recv_timeout{10, 0};
+    REQUIRE_EQ(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout)), 0);
     REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     REQUIRE_GE(server, 0);
@@ -12462,18 +12472,41 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
     CHECK_EQ(backend.send_state[0].file_fd, file);
     CHECK_GT(backend.send_state[0].remaining, 0u);
 
+    // A POLLOUT CQE that arrives while the socket is still unwritable (the
+    // client has drained nothing) makes no progress: no completion, exactly
+    // one fresh POLL_ADD, and the offset never moves backwards.
+    {
+        const u32 offset_before = backend.send_state[0].offset;
+        guard.sq_head = guard.sq_tail;
+        backend.pending = 0;
+        REQUIRE(guard.push_send_cqe(kGen, POLLOUT));
+        IoEvent spurious{};
+        CHECK_EQ(backend.wait(&spurious, 1, guard.loop->conns, 1), 0u);
+        CHECK_EQ(guard.sq_tail, guard.sq_head + 1u);
+        CHECK_EQ(guard.sq_entries[(guard.sq_tail - 1) & guard.sq_mask].opcode, IORING_OP_POLL_ADD);
+        CHECK_GE(backend.send_state[0].offset, offset_before);
+        CHECK_EQ(backend.send_state[0].file_fd, file);
+    }
+
     std::vector<u8> got;
     got.reserve(kLen);
     u8 buf[65536];
     IoEvent done{};
+    u32 continuation_rounds = 0;
     for (u32 round = 0; round < 100000; ++round) {
         ssize_t n;
         while ((n = recv(client, buf, sizeof(buf), MSG_DONTWAIT)) > 0)
             got.insert(got.end(), buf, buf + n);
+        // The CQE below stands in for the kernel's POLLOUT completion, so
+        // wait for the socket to really be writable rather than spinning. A
+        // timeout fails the test now instead of after 100000 rounds.
+        pollfd pfd{server, POLLOUT, 0};
+        REQUIRE_EQ(poll(&pfd, 1, 5000), 1);
         guard.sq_head = guard.sq_tail;
         backend.pending = 0;
         REQUIRE(guard.push_send_cqe(kGen, POLLOUT));
         IoEvent ev{};
+        ++continuation_rounds;
         if (backend.wait(&ev, 1, guard.loop->conns, 1) == 1) {
             done = ev;
             break;
@@ -12481,6 +12514,8 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
         // Not finished: exactly one fresh POLLOUT poll was re-armed.
         CHECK_EQ(guard.sq_entries[(guard.sq_tail - 1) & guard.sq_mask].opcode, IORING_OP_POLL_ADD);
     }
+    // The body really went through POLLOUT continuations, not one send.
+    CHECK_GT(continuation_rounds, 1u);
     CHECK_EQ(done.type, IoEventType::Send);
     CHECK_EQ(done.result, static_cast<i32>(kLen - kOff));  // one completion, whole length
     CHECK_EQ(done.non_upstream_generation, kGen);
