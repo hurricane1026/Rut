@@ -4,6 +4,7 @@
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/response_read_deadline.h"
 
 #include <errno.h>
@@ -219,8 +220,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     // Note: SQPOLL requires CAP_SYS_NICE or io_uring_register credentials.
     // Omit for now, add as optimization later.
 
-    constexpr u32 kRingEntries = 16384;
-    ring_fd = io_uring_setup(kRingEntries, &params);
+    ring_fd = io_uring_setup(kIoUringSqEntries, &params);
     if (ring_fd < 0) {
         i32 err = -ring_fd;
         shutdown();

@@ -4,6 +4,10 @@
 #include "rut/runtime/connection_capacity.h"
 #ifdef __linux__
 #include "rut/runtime/epoll_event_loop.h"
+#include "rut/runtime/io_backend.h"
+#ifndef __APPLE__
+#include "rut/runtime/io_uring_memlock.h"
+#endif
 #include "rut/runtime/iouring_event_loop.h"
 #else
 #include "rut/runtime/kqueue_event_loop.h"
@@ -26,6 +30,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -116,6 +121,106 @@ static void write_error(const char* prefix, const rut::Error& err) {
     write_u32(static_cast<u32>(err.source));
     write_str(")\n");
 }
+
+#ifndef __APPLE__
+static void write_u64(u64 val) {
+    char buf[21];
+    i32 n = 0;
+    do {
+        buf[n++] = static_cast<char>('0' + val % 10);
+        val /= 10;
+    } while (val);
+    for (i32 i = n - 1; i >= 0; i--) (void)write(2, &buf[i], 1);
+}
+
+static void write_memlock_limit(rlim_t v) {
+    if (v == RLIM_INFINITY) {
+        write_str("unlimited");
+    } else {
+        write_u64(static_cast<u64>(v) / 1024);
+        write_str(" KiB");
+    }
+}
+
+// True when the effective capability set holds CAP_IPC_LOCK (bit 14), which
+// exempts io_uring memory from RLIMIT_MEMLOCK. Reads /proc/self/status.
+static bool has_cap_ipc_lock() {
+    const i32 fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[4096];
+    const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    static const char kKey[] = "CapEff:";
+    for (ssize_t i = 0; i + 7 < n; i++) {
+        if ((i == 0 || buf[i - 1] == '\n') && memcmp(buf + i, kKey, 7) == 0) {
+            u64 caps = 0;
+            for (const char* p = buf + i + 7; *p; p++) {
+                const char c = *p;
+                if (c == ' ' || c == '\t') continue;
+                u32 d;
+                if (c >= '0' && c <= '9')
+                    d = static_cast<u32>(c - '0');
+                else if (c >= 'a' && c <= 'f')
+                    d = static_cast<u32>(c - 'a' + 10);
+                else
+                    break;
+                caps = (caps << 4) | d;
+            }
+            return (caps >> 14) & 1;
+        }
+    }
+    return false;
+}
+
+// io_uring_setup / provided-buffer ring registration returning ENOMEM is
+// usually the per-user RLIMIT_MEMLOCK budget (see io_uring_memlock.h), not
+// kernel memory exhaustion. Explain it; startup behaviour is unchanged.
+static void report_io_uring_enomem(u32 failed_shard, u32 shard_count) {
+    struct rlimit rl{};
+    const bool have_limit = getrlimit(RLIMIT_MEMLOCK, &rl) == 0;
+    const bool exempt = has_cap_ipc_lock() || (have_limit && rl.rlim_cur == RLIM_INFINITY);
+    const u64 per_shard_kib =
+        io_uring_shard_locked_bytes(
+            kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, kLargeProvidedBufCount) /
+        1024;
+    write_str("io_uring ring creation failed with ENOMEM at shard ");
+    write_u32(failed_shard);
+    write_str("; ");
+    write_u32(failed_shard);
+    write_str(" shard(s) initialised before it\n");
+    if (exempt) {
+        write_str(
+            "RLIMIT_MEMLOCK is not the cause here (CAP_IPC_LOCK held or limit unlimited); "
+            "this is likely kernel memory exhaustion\n");
+    } else {
+        write_str(
+            "This usually means the locked-memory limit (RLIMIT_MEMLOCK) is exhausted: "
+            "io_uring ring memory is charged to it, shared by all processes of the user\n");
+    }
+    if (have_limit) {
+        write_str("  RLIMIT_MEMLOCK: soft ");
+        write_memlock_limit(rl.rlim_cur);
+        write_str(", hard ");
+        write_memlock_limit(rl.rlim_max);
+        write_str("\n");
+    }
+    write_str("  io_uring needs ");
+    write_u64(per_shard_kib);
+    write_str(" KiB per shard, ");
+    write_u64(per_shard_kib * shard_count);
+    write_str(" KiB for ");
+    write_u32(shard_count);
+    write_str(" shard(s)\n");
+    if (!exempt) {
+        write_str("  raise the limit: ulimit -l <KiB> in the launching shell, ");
+        write_str("systemd LimitMEMLOCK=, container --ulimit memlock=<bytes>\n");
+        write_str("  or grant CAP_IPC_LOCK\n");
+    }
+    write_str("  or run fewer shards: --shards N\n");
+}
+#endif
 
 enum class RunShardsOutcomeKind : u8 {
     Success,
@@ -265,6 +370,10 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             write_str("Failed to init shard ");
             write_u32(i);
             write_error("", rc.error());
+#ifndef __APPLE__
+            if (rc.error().source == Error::Source::IoUring && rc.error().code == ENOMEM)
+                report_io_uring_enomem(i, shard_count);
+#endif
             close(lfd);
             for (u32 j = 0; j < i; j++) {
                 shards[j].stop();
