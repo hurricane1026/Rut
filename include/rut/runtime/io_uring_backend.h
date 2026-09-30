@@ -143,11 +143,20 @@ struct IoUringBackend {
     // to the event loop and owns an independent pending-op count.
     // Dispatching the terminal can rearm or reuse the numeric connection slot,
     // so only records strictly before the frozen tail are known to belong to
-    // the old owner.  The fixed inventory is bounded by one wait batch.
+    // the old owner.
+    //
+    // A window stays live until head reaches its frozen tail, which can take
+    // several wait() calls (each returns at most kMaxEventsPerWait events), so
+    // the inventory is NOT bounded by one batch.  Every live window was
+    // recorded for a CQE consumed at most cq_ring_entries before the current
+    // head (its tail snapshot is at most that far ahead of the CQE, and head has
+    // not reached it yet), so cq_ring_entries slots always suffice.  The array is
+    // mmap'd in init() and only the first `count` slots are ever touched.
     struct DownstreamRecvTerminalWindow {
         u64 user_data = 0;
         u32 tail_exclusive = 0;
-    } downstream_recv_terminal_windows[kMaxEventsPerWait];
+    }* downstream_recv_terminal_windows = nullptr;
+    u32 downstream_recv_terminal_window_capacity = 0;
     u32 downstream_recv_terminal_window_count = 0;
     u32 downstream_recv_progress_head = 0;
     bool downstream_recv_progress_valid = false;
@@ -449,7 +458,8 @@ private:
 
     void reset_downstream_recv_wait_state() {
         deferred_downstream_recv = {};
-        for (auto& window : downstream_recv_terminal_windows) window = {};
+        for (u32 i = 0; i < downstream_recv_terminal_window_count; i++)
+            downstream_recv_terminal_windows[i] = {};
         downstream_recv_terminal_window_count = 0;
         downstream_recv_progress_head = 0;
         downstream_recv_progress_valid = false;

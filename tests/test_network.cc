@@ -40210,7 +40210,9 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     CHECK_FALSE(fixture.guard.loop->backend.downstream_recv_progress_valid);
 
     fixture.guard.loop->backend.deferred_downstream_recv = {31, 37, 41, true, true};
-    fixture.guard.loop->backend.downstream_recv_terminal_windows[0] = {31, 41};
+    // The window array is released by shutdown(); only stale bookkeeping can be
+    // left behind here, and init() must discard it before allocating a new array.
+    CHECK(fixture.guard.loop->backend.downstream_recv_terminal_windows == nullptr);
     fixture.guard.loop->backend.downstream_recv_terminal_window_count = 1;
     fixture.guard.loop->backend.downstream_recv_progress_head = 37;
     fixture.guard.loop->backend.downstream_recv_progress_valid = true;
