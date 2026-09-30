@@ -13127,9 +13127,11 @@ TEST(proxy_reuse, deferred_idle_return_state_released_iouring) {
     // Connection close while the return is pending: fd and pin stay parked (the drain
     // still owns them), then the drain pools the fd once and finishes the deferred free.
     {
-        auto& c = shard.loop->conns[3];
-        c.reset();
-        c.id = 3;
+        // Allocated for real: close_conn_impl/free_conn push the slot back on the free
+        // stack, which would overflow it for a slot that was never popped.
+        Connection* const slot = shard.loop->alloc_conn();
+        REQUIRE(slot != nullptr);
+        auto& c = *slot;
         i32 cli[2];
         i32 sv[2];
         REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
@@ -13164,9 +13166,11 @@ TEST(proxy_reuse, deferred_idle_return_state_released_iouring) {
     }
     // Connection close after the recv already drained: pooled at close, pin released.
     {
-        auto& c = shard.loop->conns[4];
-        c.reset();
-        c.id = 4;
+        // Allocated for real: close_conn_impl/free_conn push the slot back on the free
+        // stack, which would overflow it for a slot that was never popped.
+        Connection* const slot = shard.loop->alloc_conn();
+        REQUIRE(slot != nullptr);
+        auto& c = *slot;
         i32 cli[2];
         i32 sv[2];
         REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
@@ -13324,19 +13328,64 @@ struct BodyAwareKeepAliveUpstream {
     }
 };
 
-// Send `first` then `second` on one keep-alive client connection; both must be answered
-// with a 200 whose body is "hi". Afterwards (loop stopped, client still connected) no
-// connection may still carry a parked idle-return pin.
-static void expect_two_requests_answered_after_deferred_return(rut::test::TestCase* _tc,
-                                                               const char* first,
-                                                               u32 first_len,
-                                                               const char* second,
-                                                               u32 second_len) {
+// Everything one deferred-idle-return integration test owns. The destructor runs on
+// every exit path (a failed REQUIRE returns from the test body while the shard thread is
+// still running): the client and listen fds are closed, the shard is stopped and joined
+// before the program it executes is destroyed, so a regression fails cleanly instead of
+// tearing down a live shard.
+struct DeferredReturnRig {
     BodyAwareKeepAliveUpstream backend;
-    REQUIRE(backend.setup());
+    LoadedProgram program{};
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = -1;
+    u16 port = 0;
+    i32 client = -1;
+    bool shard_inited = false;
+    bool spawned = false;
+    bool ready = false;
+
+    DeferredReturnRig() = default;
+    DeferredReturnRig(const DeferredReturnRig&) = delete;
+    DeferredReturnRig& operator=(const DeferredReturnRig&) = delete;
+
+    ~DeferredReturnRig() {
+        if (client >= 0) close(client);
+        if (spawned) {
+            shard.stop();
+            shard.join();
+        }
+        if (shard_inited) shard.shutdown();
+        if (lfd >= 0) close(lfd);
+        program.destroy();
+    }
+
+    // True when any connection still carries a parked idle-return fd or pin. Only
+    // meaningful once the shard thread has been stopped and joined.
+    bool parked_state_left() const {
+        for (u32 i = 0; i < shard.loop->connection_capacity; i++) {
+            if (shard.loop->conns[i].idle_return_fd >= 0 ||
+                shard.loop->conns[i].idle_return_config != nullptr)
+                return true;
+        }
+        return false;
+    }
+
+    void stop_shard() {
+        if (!spawned) return;
+        shard.stop();
+        shard.join();
+        spawned = false;
+    }
+};
+
+// Bring the rig up (backend, program, io_uring shard, one connected client). Sets
+// rig.ready on success; on SKIP or a failed REQUIRE the caller returns and the rig's
+// destructor cleans up whatever was created.
+static void start_deferred_return_rig(rut::test::TestCase* _tc, DeferredReturnRig& rig) {
+    REQUIRE(rig.backend.setup());
 
     std::string source_text =
-        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(backend.port) + "\"\n";
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(rig.backend.port) + "\"\n";
     source_text += R"rut(
 route GET "/plain" {
   return forward(backend)
@@ -13387,6 +13436,29 @@ route GET "/guarded" {
       response_buffering: .completeContentLength)
   }
 }
+route GET "/gr" {
+  if req.pathOnly == "/gr" {
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close, status: 301,
+      reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
+      header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
+  } else {
+    return forward(backend,
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .request, server: "rut", date: .current, hide_headers: [] },
+      failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: .current,
+        connection: .request, body: b"bad" },
+      timeout_failure_policy: { version: .http11, status: 504,
+        reason: "Gateway Time-out", content_type: "text/plain", server: "rut",
+        date: .current, connection: .request, body: b"slow" },
+      response_read_timeout: 1s,
+      response_buffering: .completeContentLength)
+  }
+}
 )rut";
     struct TempSource {
         char path[64] = "/tmp/rut_deferred_idle_return_XXXXXX";
@@ -13411,44 +13483,59 @@ route GET "/guarded" {
     REQUIRE_EQ(close(source.fd), 0);
     source.fd = -1;
 
-    LoadedProgram program{};
-    struct ProgramGuard {
-        LoadedProgram& program;
-        ~ProgramGuard() { program.destroy(); }
-    } program_guard{program};
     LoadError load_error{};
-    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    const bool loaded = load_rut_program(source.path, rig.program, load_error, jit::OptLevel::O0);
     char load_message[512]{};
     if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
     REQUIRE_MSG(loaded, load_message);
     REQUIRE_EQ(unlink(source.path), 0);
     source.present = false;
 
-    Shard<IoUringEventLoop> shard;
-    i32 lfd = create_listen_socket(0).value_or(-1);
-    REQUIRE(lfd >= 0);
-    const u16 port = get_port(lfd);
-    if (!shard.init(0, lfd).has_value()) {
-        close(lfd);
+    rig.lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(rig.lfd >= 0);
+    rig.port = get_port(rig.lfd);
+    if (!rig.shard.init(0, rig.lfd).has_value())
         SKIP("io_uring queue init unavailable in this environment");
-    }
-    shard.route_config = &program.config;
-    shard.active_config = shard.route_config;
-    REQUIRE(shard.spawn(-1).has_value());
+    rig.shard_inited = true;
+    // The redirect branch needs a valid cleartext listener context (as run_shards() installs).
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    auto listener_context = derive_listener_context(rig.lfd, declared_listener);
+    REQUIRE(listener_context.has_value());
+    rig.shard.loop->listener_context = listener_context.value();
+    rig.shard.route_config = &rig.program.config;
+    rig.shard.active_config = rig.shard.route_config;
+    REQUIRE(rig.shard.spawn(-1).has_value());
+    rig.spawned = true;
     usleep(50000);
 
-    i32 c = connect_to(port);
-    REQUIRE_GE(c, 0);
-    set_socket_timeouts(c, 3);
+    rig.client = connect_to(rig.port);
+    REQUIRE_GE(rig.client, 0);
+    set_socket_timeouts(rig.client, 3);
+    rig.ready = true;
+}
+
+// Send `first` then `second` on one keep-alive client connection; both must be answered
+// with a 200 whose body is "hi". Afterwards (loop stopped, client still connected) no
+// connection may still carry a parked idle-return pin.
+static void expect_two_requests_answered_after_deferred_return(rut::test::TestCase* _tc,
+                                                               const char* first,
+                                                               u32 first_len,
+                                                               const char* second,
+                                                               u32 second_len) {
+    DeferredReturnRig rig;
+    start_deferred_return_rig(_tc, rig);
+    if (!rig.ready) return;
+
     const char* const reqs[2] = {first, second};
     const u32 lens[2] = {first_len, second_len};
     for (u32 i = 0; i < 2; i++) {
-        REQUIRE(send_all(c, reqs[i], lens[i]));
+        REQUIRE(send_all(rig.client, reqs[i], lens[i]));
         char buf[512];
         u32 have = 0;
         // Complete response = header block + the 2-byte "hi" body.
         while (have < 4 || !buf_contains(buf, have, "\r\n\r\nhi", 6)) {
-            const i32 n = recv_timeout(c, buf + have, sizeof(buf) - have, 3000);
+            const i32 n = recv_timeout(rig.client, buf + have, sizeof(buf) - have, 3000);
             // n == 0 is the bug: the gateway closed the connection with no response.
             REQUIRE_GT(n, 0);
             have += static_cast<u32>(n);
@@ -13456,21 +13543,49 @@ route GET "/guarded" {
         CHECK(buf_contains(buf, have, " 200 ", 5));
         // Let the deferred idle return of request 1 drain before request 2 is sent,
         // so the outcome does not depend on scheduling of the cancel CQE.
-        if (i == 0) REQUIRE(wait_for_idle_pool_count(shard, 1));
+        if (i == 0) REQUIRE(wait_for_idle_pool_count(rig.shard, 1));
     }
 
-    shard.stop();
-    shard.join();
-    bool parked_state_left = false;
-    for (u32 i = 0; i < shard.loop->connection_capacity; i++) {
-        if (shard.loop->conns[i].idle_return_fd >= 0 ||
-            shard.loop->conns[i].idle_return_config != nullptr)
-            parked_state_left = true;
+    rig.stop_shard();
+    CHECK_FALSE(rig.parked_state_left());
+}
+
+// The redirect branch of a guarded route has its own admission: it takes exactly a
+// `GET` HTTP/1.1 request with one Host and exactly one `Connection: close`; anything else
+// takes the documented 400/close fallback. After a body request went through the
+// deferred idle return, that redirect must still be served (301), not closed.
+TEST(proxy_reuse, deferred_return_post_body_then_guarded_redirect_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    DeferredReturnRig rig;
+    start_deferred_return_rig(_tc, rig);
+    if (!rig.ready) return;
+
+    static const char kPost[] = "POST /post HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    REQUIRE(send_all(rig.client, kPost, sizeof(kPost) - 1));
+    char buf[1024];
+    u32 have = 0;
+    while (have < 4 || !buf_contains(buf, have, "\r\n\r\nhi", 6)) {
+        const i32 n = recv_timeout(rig.client, buf + have, sizeof(buf) - have, 3000);
+        REQUIRE_GT(n, 0);
+        have += static_cast<u32>(n);
     }
-    CHECK_FALSE(parked_state_left);
-    close(c);
-    shard.shutdown();
-    close(lfd);
+    CHECK(buf_contains(buf, have, " 200 ", 5));
+    REQUIRE(wait_for_idle_pool_count(rig.shard, 1));  // deferred return drained
+
+    static const char kRedirect[] = "GET /gr HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(rig.client, kRedirect, sizeof(kRedirect) - 1));
+    have = 0;
+    // The redirect response is closed by the gateway: read to its body or to EOF.
+    while (!buf_contains(buf, have, "fixed", 5)) {
+        const i32 n = recv_timeout(rig.client, buf + have, sizeof(buf) - have, 3000);
+        // n == 0 with nothing read is the bug: closed without any response.
+        REQUIRE_GT(n, 0);
+        have += static_cast<u32>(n);
+    }
+    CHECK(buf_contains(buf, have, " 301 ", 5));
+
+    rig.stop_shard();
+    CHECK_FALSE(rig.parked_state_left());
 }
 
 #define DEFERRED_RETURN_SEQUENCE_TEST(name, first_literal, second_literal)              \

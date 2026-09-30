@@ -37734,6 +37734,71 @@ TEST(iouring_upstream_recv, one_shot_selector_is_narrow_and_episode_stable) {
     CHECK((excluded.ioprio & IORING_RECV_MULTISHOT) != 0);
 }
 
+// A deferred idle-pool return (multishot upstream recv still draining when the fd was
+// returned) demotes the one-shot upstream recv for the connection; once the drain has
+// resolved the parked fd and its config pin, a plain bodyless request must get the
+// one-shot primitive again.
+TEST(iouring_upstream_recv, one_shot_selector_restored_after_deferred_idle_return_drains) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    ScopedOneShotSelectorResources resources;
+    resources.loop = loop;
+    resources.conn = conn;
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+
+    RouteConfig cfg;
+    cfg.upstream_count = 1;
+    const RouteConfig* live_ptr = &cfg;
+    loop->config_ptr = &live_ptr;
+
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn->fd = downstream[0];
+    resources.peer_fd = downstream[1];
+    conn->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->upstream_fd, 0);
+    conn->state = ConnState::Proxying;
+    conn->request_config = &cfg;
+    conn->req_start_us = monotonic_us();
+    conn->upstream_attempts = 1;
+    conn->request_upload_complete = true;
+    conn->protocol = ConnProtocol::Http11;
+    conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+
+    // Plain bodyless request on a fresh connection: one-shot.
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+
+    // The previous request's fd is parked while its cancelled recv drains: demoted.
+    // (The parked fd is unrelated to this request's upstream_fd; use a socketpair end.)
+    i32 parked[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, parked), 0);
+    conn->idle_return_fd = parked[0];
+    conn->idle_return_uid = 3;
+    conn->idle_return_bidx = 0;
+    conn->idle_return_config = &cfg;
+    conn->upstream_recv_cancel_inflight = true;
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+    // Still draining: the parked state is untouched.
+    CHECK(loop->try_deferred_upstream_rearm(*conn));
+    CHECK_EQ(conn->idle_return_fd, parked[0]);
+    CHECK(conn->idle_return_config == &cfg);
+    CHECK_FALSE(loop->use_one_shot_upstream_recv(*conn));
+
+    // Drain completes: fd and pin are resolved and the one-shot recv is restored.
+    conn->upstream_recv_cancel_inflight = false;
+    conn->upstream_recv_terminal_stale = false;
+    CHECK(loop->try_deferred_upstream_rearm(*conn));
+    CHECK_EQ(conn->idle_return_fd, -1);
+    CHECK(conn->idle_return_config == nullptr);
+    CHECK(loop->use_one_shot_upstream_recv(*conn));
+    close(parked[1]);
+    // This loop has no upstream pool, so the drain closed the parked fd.
+    CHECK(::close(parked[0]) < 0);
+}
+
 struct OneShotRecvFixture {
     RouteConfig config;
     IoUringEventLoop* loop = nullptr;
