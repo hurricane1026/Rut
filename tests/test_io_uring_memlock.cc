@@ -123,10 +123,9 @@ TEST(io_uring_ring_sizes, matches_the_documented_rule) {
     CHECK_EQ(io_uring_ring_sizes(65536).cq_entries, 65536u);
     CHECK_EQ(io_uring_ring_sizes(1000000).cq_entries, 65536u);
     CHECK_EQ(io_uring_ring_sizes(kMaxConnectionCapacity).cq_entries, 65536u);
-    // SQ does not scale with the capacity: 16384 keeps it far below the old 16384.
+    // The SQ does not scale with the capacity (it was 16384 entries before sizing).
     CHECK_EQ(io_uring_ring_sizes(1).sq_entries, 1024u);
     CHECK_EQ(io_uring_ring_sizes(kDefaultConnectionCapacity).sq_entries, 1024u);
-    CHECK_LE(io_uring_ring_sizes(kDefaultConnectionCapacity).sq_entries, 4096u);
     CHECK_EQ(io_uring_ring_sizes(1000000).sq_entries, 1024u);
 }
 
@@ -147,7 +146,8 @@ TEST(io_uring_ring_sizes, powers_of_two_with_cq_at_least_sq) {
 
 static_assert(io_uring_next_pow2(0) == 1 && io_uring_next_pow2(1) == 1 &&
               io_uring_next_pow2(3) == 4 && io_uring_next_pow2(4096) == 4096 &&
-              io_uring_next_pow2(4097) == 8192);
+              io_uring_next_pow2(4097) == 8192 && io_uring_next_pow2(0x80000000u) == 0x80000000u &&
+              io_uring_next_pow2(0xFFFFFFFFu) == 0x80000000u);
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

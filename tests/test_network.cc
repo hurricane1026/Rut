@@ -36956,9 +36956,6 @@ struct ScopedIoUringLoopForRetirement {
         if (storage == MAP_FAILED) return false;
         loop = new (storage) IoUringEventLoop();
         initialized = init_iouring_loop_with_retry(*loop);
-        // These tests fake a full SQ; a flush-and-retry would hand the kernel
-        // entries it never saw and free nothing in the model.
-        if (initialized) loop->backend.disable_full_sq_flush = true;
         return initialized;
     }
 
@@ -36979,7 +36976,6 @@ TEST(iouring_full_sq, submit_recv_flushes_and_arms_instead_of_failing) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
-    loop->backend.disable_full_sq_flush = false;
     i32 filler[2] = {-1, -1};
     i32 peer[2] = {-1, -1};
     REQUIRE_EQ(rut::test::stream_socketpair(filler), 0);
@@ -37000,6 +36996,35 @@ TEST(iouring_full_sq, submit_recv_flushes_and_arms_instead_of_failing) {
     CHECK(conn->recv_armed);
     CHECK_EQ(loop->backend.failure_code(), 0);
     // Tear down: the conn's recv and the fillers complete when the sockets close.
+    loop->close_conn(*conn);
+    close(filler[0]);
+    close(filler[1]);
+    close(peer[1]);
+}
+
+// client_send() has about forty callers that drop its result. A send that finds the
+// SQ full must flush and arm, or the client gets no response and recv is never
+// re-armed until the keep-alive timeout.
+TEST(iouring_full_sq, submit_send_flushes_and_arms_instead_of_failing) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    i32 filler[2] = {-1, -1};
+    i32 peer[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(filler), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(peer), 0);
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = peer[0];
+    peer[0] = -1;
+    u32 queued = 0;
+    while (loop->backend.sq_has_room() && queued++ < 2u * loop->backend.sq_ring_entries)
+        REQUIRE(loop->backend.add_recv(filler[0], 0));
+    REQUIRE(!loop->backend.sq_has_room());
+    static const u8 kBytes[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    CHECK(loop->submit_send(*conn, kBytes, sizeof(kBytes) - 1u));
+    CHECK(conn->send_armed);
+    CHECK_EQ(loop->backend.failure_code(), 0);
     loop->close_conn(*conn);
     close(filler[0]);
     close(filler[1]);
@@ -38946,6 +38971,7 @@ TEST(iouring_upstream_relay, full_submission_queue_defers_the_recv_to_send_compl
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
+    loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
     constexpr u32 kSlice = SlicePool::kSliceSize;
     OneShotRecvFixture fixture;
     REQUIRE(stage_relay_body(fixture, loop, kSlice, 2u * kSlice));
@@ -39212,6 +39238,7 @@ TEST(iouring_upstream_recv, plaintext_body_rearm_failure_closes_connection) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
+    loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
     OneShotRecvFixture fixture;
     REQUIRE(fixture.stage(loop, /*plaintext=*/true));
     Connection& conn = *fixture.conn;
@@ -39305,6 +39332,7 @@ TEST(iouring_upstream_recv, ring_full_closes_initial_incomplete_and_tls_low_wate
             ScopedIoUringLoopForRetirement guard;
             if (!guard.init()) SKIP("io_uring unavailable");
             auto* loop = guard.loop;
+            loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
             OneShotRecvFixture fixture;
             REQUIRE(fixture.stage(loop));
             Connection& conn = *fixture.conn;
@@ -46753,6 +46781,7 @@ TEST(iouring_validated_failure_pipeline,
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
+    loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
     ShardMetrics metrics{};
     metrics.init();
     loop->metrics = &metrics;
@@ -52515,6 +52544,7 @@ TEST(response_read_deadline, fresh_arm_rejects_nonfresh_states_and_sq_pressure) 
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
+    loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
     RouteConfig config{};
     REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE(add_response_read_deadline_bundle(config));
@@ -53539,6 +53569,7 @@ TEST(response_read_deadline, terminal_incomplete_sq_full_closes_and_refreshed_ow
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
+        loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
         RouteConfig config{};
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_response_read_deadline_bundle(config));
@@ -64618,6 +64649,7 @@ TEST(response_buffering_runtime,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
+        loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
         RouteConfig config{};
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
@@ -67297,6 +67329,7 @@ TEST(response_read_deadline_get_positive_cl,
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
+        loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
         RouteConfig config{};
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
@@ -67980,6 +68013,7 @@ TEST(response_read_deadline_get_cl0, full_frame_send_errors_and_duplicates_do_no
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
         auto* loop = guard.loop;
+        loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
         RouteConfig config{};
         REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
         REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(config));
@@ -68017,6 +68051,7 @@ TEST(response_read_deadline_get_cl0, full_frame_send_errors_and_duplicates_do_no
                    sizeof(kResponse) - 1u);
         const IoEvent response =
             response_read_copy_event(conn, sizeof(kResponse) - 1u, true, 0, sizeof(kResponse) - 1u);
+        loop->backend.disable_full_sq_flush = true;  // this block fakes a full SQ
         const u32 old_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
         const u32 head = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
         __atomic_store_n(
@@ -68619,6 +68654,7 @@ TEST(iouring_final_response, full_submission_queue_writes_nothing_directly) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto* loop = guard.loop;
+    loop->backend.disable_full_sq_flush = true;  // this test fakes a full SQ
     if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
     static const char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     constexpr u32 kLen = sizeof(kResponse) - 1u;

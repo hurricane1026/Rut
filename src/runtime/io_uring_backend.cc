@@ -165,24 +165,29 @@ io_uring_sqe* IoUringBackend::get_sqe() {
     return sqe;
 }
 
-// get_sqe() for arms whose failure most callers cannot act on: when the SQ is
-// full, hand the queued SQEs to the kernel (which frees every slot it consumes)
-// and retry once, as cancel_by_user_data does. Used by the recv arms (downstream
-// and upstream: many callers ignore a false return, leaving the connection with
-// no recv until a timeout), accept, and wait()'s partial-send resubmits. The
-// send/connect submitters keep returning false on a full SQ: every caller fails
-// closed on that. nullptr only when the flush failed (the error is recorded and
-// stops the loop) or the kernel consumed nothing.
+// get_sqe() for submitters that cannot park the request: when the SQ is full,
+// hand the queued SQEs to the kernel (which frees every slot it consumes) and
+// retry once, retrying the enter on EINTR. Used by every arm a caller may
+// ignore or cannot defer (recvs, sends, connect, accept and its cancel, timers,
+// cancels, wait()'s resubmits); callers drop a false return in many places, so a
+// miss would leave the connection with nothing armed until a timeout. nullptr
+// only when the enter failed (the error is recorded and stops the loop) or the
+// kernel consumed nothing.
 io_uring_sqe* IoUringBackend::get_sqe_flushing() {
     io_uring_sqe* sqe = get_sqe();
     if (sqe) return sqe;
     if (disable_full_sq_flush) return nullptr;
     if (ring_fd >= 0 && pending > 0) {
-        const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-        if (flushed > 0)
-            pending -= static_cast<u32>(flushed);
-        else if (flushed < 0)
+        for (;;) {
+            const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+            if (flushed >= 0) {
+                pending -= static_cast<u32>(flushed);
+                break;
+            }
+            if (flushed == -EINTR) continue;
             record_enter_error(flushed);
+            break;
+        }
     }
     return get_sqe();
 }
@@ -699,8 +704,8 @@ bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32
 bool IoUringBackend::add_send(
     i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation, bool more_follows) {
     if (conn_id >= connection_capacity || connection_capacity == 0) return false;
-    io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return false;  // SQ full — don't record send_state without a submitted SQE
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;  // no SQE even after a flush: don't record send_state for it
     const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
 
     // Record send state only after acquiring SQE — if kernel returns partial,
@@ -736,7 +741,7 @@ bool IoUringBackend::add_send_file(i32 fd,
     if (conn_id >= connection_capacity || connection_capacity == 0 || fd < 0 || file_fd < 0 ||
         len == 0 || len > static_cast<u32>(INT32_MAX))
         return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;  // the completion must stay accountable
     off_t pos = static_cast<off_t>(file_off);
     const ssize_t n = ::sendfile(fd, file_fd, &pos, len);
@@ -860,7 +865,7 @@ bool IoUringBackend::flush_pending_nonblocking() {
 bool IoUringBackend::add_send_upstream(
     i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
     if (conn_id < connection_capacity) {
@@ -885,7 +890,7 @@ bool IoUringBackend::add_send_upstream(
 bool IoUringBackend::add_connect(
     i32 fd, u32 conn_id, const void* addr, u32 addr_len, u32 upstream_episode) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
@@ -904,23 +909,8 @@ bool IoUringBackend::add_connect(
 bool IoUringBackend::add_yield_timeout(u32 conn_id, Connection& conn, u32 ms) {
     if (connection_capacity == 0 || conn_id >= connection_capacity || conn.id != conn_id)
         return false;
-    io_uring_sqe* sqe = get_sqe();
-    if (!sqe) {
-        // SQ full — flush pending SQEs to make room, then retry once.
-        // Mirrors cancel_by_user_data's pattern. wait(ms) semantics
-        // require the timer to actually be scheduled; failing here would
-        // force the caller into the wheel fallback, which caps precision
-        // AND (for ms > 63000) wraps the deadline mod 64 seconds.
-        if (pending > 0) {
-            i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-            if (flushed > 0)
-                pending -= static_cast<u32>(flushed);
-            else if (flushed < 0)
-                record_enter_error(flushed);
-        }
-        sqe = get_sqe();
-        if (!sqe) return false;
-    }
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
 
     // Relative timeout; kernel reads &conn.yield_timespec asynchronously
     // so the storage must live on the Connection (not on the stack).
@@ -952,18 +942,8 @@ bool IoUringBackend::add_response_read_timer(u32 conn_id,
         conn.response_read_timer_generation >= kResponseReadTimerGenerationMask)
         return false;
 
-    io_uring_sqe* sqe = get_sqe();
-    if (!sqe) {
-        if (pending > 0) {
-            const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-            if (flushed > 0)
-                pending -= static_cast<u32>(flushed);
-            else if (flushed < 0)
-                record_enter_error(flushed);
-        }
-        sqe = get_sqe();
-        if (!sqe) return false;
-    }
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
 
     // Publish no owner until an SQE slot is secured. From this point onward
     // every operation is infallible and the kernel-stable timespec remains
@@ -997,18 +977,8 @@ bool IoUringBackend::cancel_response_read_timer(u32 conn_id, Connection& conn) {
         !conn.response_read_timer_owner_is_valid())
         return false;
 
-    io_uring_sqe* sqe = get_sqe();
-    if (!sqe) {
-        if (pending > 0) {
-            const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-            if (flushed > 0)
-                pending -= static_cast<u32>(flushed);
-            else if (flushed < 0)
-                record_enter_error(flushed);
-        }
-        sqe = get_sqe();
-        if (!sqe) return false;
-    }
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
 
     const u32 generation = conn.response_read_timer_owner_generation;
     memset(sqe, 0, sizeof(*sqe));
@@ -1067,19 +1037,8 @@ bool IoUringBackend::cancel_by_user_data(
     if (io_event_is_upstream(type) &&
         (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)))
         return false;
-    io_uring_sqe* sqe = get_sqe();
-    if (!sqe) {
-        // SQ ring full — flush pending SQEs to make room, then retry.
-        if (pending > 0) {
-            i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-            if (flushed > 0)
-                pending -= static_cast<u32>(flushed);
-            else if (flushed < 0)
-                record_enter_error(flushed);
-        }
-        sqe = get_sqe();
-        if (!sqe) return false;
-    }
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_ASYNC_CANCEL;

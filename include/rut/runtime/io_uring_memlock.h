@@ -34,16 +34,25 @@ namespace rut {
 // unconsumed completions measured at up to ~2 per live connection (burst of
 // keep-alive connections, close burst, Connection: close churn, proxied
 // requests), and the old fixed 16384 / 32768 pair had the same 2x ratio at the
-// default capacity. A transiently full CQ is safe (the kernel parks the excess
-// on its overflow list and wait() flushes it), just slower, so this is a
-// sizing target, not a hard bound. 65536 is IORING_MAX_CQ_ENTRIES; larger
-// requests fail EINVAL.
+// default capacity. This is a sizing target, not a bound. Single-shot
+// completions that find the CQ full go to the kernel's overflow list (flushed
+// by the next enter, which wait() issues when IORING_SQ_CQ_OVERFLOW is set) and
+// are not lost, but a MULTISHOT recv or accept that fires into a full CQ (or
+// behind a non-empty overflow list) posts one terminal CQE without F_MORE and is
+// dead. Correctness rests on every such terminal being re-armed: downstream
+// recv (generic accounting clears recv_armed; on_header_received re-arms on an
+// incomplete request, on_response_sent after a complete one, plus
+// handle_unhandled_recv and the mid-yield, boundary-deferred, pause and TLS
+// paths) and accept (on_accept_terminated -> rearm_accept). A full CQ therefore
+// costs extra re-arm SQEs, not connections. 65536 is IORING_MAX_CQ_ENTRIES;
+// larger requests fail EINVAL.
 // SQ: 1024, independent of capacity. wait() submits everything queued each
 // iteration and close-path cancels flush immediately, so occupancy is about
 // one batch of events (measured peak 256 = kMaxEventsPerWait at every
-// capacity), and the recv/accept arms flush and retry when it does fill (see
-// IoUringBackend::get_sqe_flushing). 1024 leaves 4x headroom over the
-// measured peak, i.e. four SQEs per event of a full batch.
+// capacity). A burst can still fill it (thousands of timeouts expiring in one
+// timer tick each queue a send), so every submitter that cannot park its request
+// flushes and retries when it does (IoUringBackend::get_sqe_flushing). 1024
+// leaves 4x headroom over the measured peak.
 static constexpr u32 kIoUringSqEntries = 1024;
 static constexpr u32 kMinIoUringCqEntries = 2048;
 static constexpr u32 kMaxIoUringCqEntries = 65536;
@@ -53,9 +62,10 @@ struct IoUringRingSizes {
     u32 cq_entries;
 };
 
+// Smallest power of two >= n; saturates at 2^31 (the largest u32 power of two).
 constexpr u32 io_uring_next_pow2(u32 n) {
     u32 p = 1;
-    while (p < n) p <<= 1;
+    while (p < n && p < (1u << 31)) p <<= 1;
     return p;
 }
 
