@@ -483,16 +483,27 @@ private:
         if (result < 0 && result != -EINTR) fatal_error.store(-result, std::memory_order_release);
     }
 
+    // conn_id of a window's token, via the same decode the CQE path uses.
+    static u32 terminal_window_conn_id(u64 user_data) {
+        u32 conn_id = 0;
+        IoEventType type = IoEventType::Count;
+        decode_user_data(user_data, conn_id, type);
+        return conn_id;
+    }
+
     void reset_downstream_recv_wait_state() {
         deferred_downstream_recv = {};
-        // Walk only the live windows: the side table is never cleared wholesale.
+        // Defensive: both current callers make the table clearing a no-op
+        // (init() runs it with the table not yet allocated, shutdown() unmaps the
+        // table right after).  It exists so a future caller that resets without
+        // unmapping stays correct.  Walks only the live windows, never the table.
         if (downstream_recv_terminal_windows != nullptr) {
             const u32 ring_mask = downstream_recv_terminal_window_capacity - 1u;
             for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
                 auto& window =
                     downstream_recv_terminal_windows[(downstream_recv_terminal_window_start + i) &
                                                      ring_mask];
-                const u32 conn_id = static_cast<u32>((window.user_data >> 8) & 0xFFFFFFu);
+                const u32 conn_id = terminal_window_conn_id(window.user_data);
                 if (downstream_recv_terminal_slots != nullptr &&
                     conn_id < downstream_recv_terminal_slot_capacity)
                     downstream_recv_terminal_slots[conn_id] = {};
