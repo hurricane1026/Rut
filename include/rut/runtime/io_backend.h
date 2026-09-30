@@ -11,7 +11,8 @@ namespace rut {
 // Required interface:
 //   i32  init(u32 shard_id, i32 listen_fd);  // returns 0 on success, -errno on failure
 //   static constexpr bool kAsyncIo;  // true for io_uring, false for epoll
-//   void add_accept();
+//   add_accept();  // return type differs: io_uring returns bool (false = not armed,
+//                  // caller retries on the next tick); level-triggered backends return void
 //   bool add_recv(i32 fd, u32 conn_id);          // false if SQ full (io_uring)
 //   bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode);
 //                                                // upstream recv (UpstreamRecv)
