@@ -6346,6 +6346,143 @@ TEST(uring, send_wait_into_upstream_wait_rearms_downstream_recv) {
     loop->shutdown();
 }
 
+// A streamed request body on io_uring: the multishot recv keeps appending to
+// recv_buf while the upstream connect/send drains it and no recv slot is set.
+namespace {
+// Proxying connection mid-upload: the initial request is being sent upstream (no
+// recv slot), `buffered` body bytes already sit in recv_buf, the multishot recv is
+// still armed.
+Connection* make_uploading_conn(IoUringEventLoop& loop, u32 buffered, u32 remaining) {
+    Connection* c = loop.alloc_conn();
+    if (c == nullptr) return nullptr;
+    c->fd = 42;
+    c->state = ConnState::Proxying;
+    c->keep_alive = true;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = remaining;
+    c->recv_armed = true;
+    c->pending_ops = 1;
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 i = 0; i < buffered; i++) dst[i] = static_cast<u8>(i);
+    c->recv_buf.commit(buffered);
+    c->set_slots(nullptr,
+                 nullptr,
+                 &on_early_upstream_recvd_send_inflight<IoUringEventLoop>,
+                 &on_upstream_request_sent<IoUringEventLoop>);
+    return c;
+}
+}  // namespace
+
+// Bytes that arrive behind an in-flight upload are kept, and once fewer than two
+// provided buffers of room remain the recv is paused (resumed by the send
+// completion) so the next CQE cannot overflow recv_buf.
+TEST(uring, request_body_recv_paused_before_recv_buf_fills) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+
+    // Plenty of room left (3000 of 16384 used): nothing to do, and the bytes stay
+    // even though this is a Connection: close request (they used to be reset).
+    Connection* c = make_uploading_conn(*loop, 3000, 40000);
+    REQUIRE(c != nullptr);
+    c->keep_alive = false;
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, 3000));
+    CHECK(!c->recv_paused_for_send);
+    CHECK_EQ(c->recv_buf.len(), 3000u);
+
+    // Only 7384 bytes of room left (< 2 * 4096): pause.
+    Connection* d = make_uploading_conn(*loop, 9000, 40000);
+    REQUIRE(d != nullptr);
+    IoEvent more_data = make_ev(d->id, IoEventType::Recv, 4096);
+    more_data.more = 1;  // multishot recv still live
+    loop->dispatch(more_data);
+    CHECK(d->recv_paused_for_send);
+    CHECK(d->recv_pause_cancel_pending);
+    CHECK_EQ(d->recv_buf.len(), 9000u);  // nothing dropped, nothing duplicated
+
+    // The same state without an upload in flight (body complete) is left alone.
+    Connection* e = make_uploading_conn(*loop, 9000, 0);
+    REQUIRE(e != nullptr);
+    loop->dispatch(make_ev(e->id, IoEventType::Recv, 4096));
+    CHECK(!e->recv_paused_for_send);
+
+    loop->shutdown();
+}
+
+// A CQE that did not fit recv_buf (the backend reports -ENOBUFS after dropping the
+// tail) can no longer be forwarded intact: the client gets 413 + close, not a
+// silent close, and later recv events do not cut that response short.
+TEST(uring, request_body_overflow_is_answered_with_413) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+
+    for (u32 via_body_slot = 0; via_body_slot < 2; via_body_slot++) {
+        Connection* c = make_uploading_conn(*loop, 16384, 40000);
+        REQUIRE(c != nullptr);
+        if (via_body_slot != 0) {
+            c->set_slots(&on_request_body_recvd<IoUringEventLoop>,
+                         nullptr,
+                         &on_early_upstream_recvd<IoUringEventLoop>,
+                         nullptr);
+        }
+        loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+        CHECK(c->fd >= 0);  // not closed
+        CHECK(c->req_body_overflow_rejected);
+        CHECK_EQ(c->state, ConnState::Sending);
+        CHECK_EQ(c->resp_status, static_cast<u16>(413));
+        CHECK(!c->keep_alive);
+        CHECK(buf_contains(reinterpret_cast<const char*>(c->send_buf.data()),
+                           c->send_buf.len(),
+                           "HTTP/1.1 413 Payload Too Large",
+                           30));
+        CHECK(buf_contains(reinterpret_cast<const char*>(c->send_buf.data()),
+                           c->send_buf.len(),
+                           "Connection: close",
+                           17));
+        // More events for the refused request (a second overflow, late data) must not
+        // close the connection before the 413 has been sent.
+        loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+        loop->dispatch(make_ev(c->id, IoEventType::Recv, 4096));
+        CHECK(c->fd >= 0);
+    }
+    loop->shutdown();
+}
+
+// After the in-flight chunk is sent, what arrived behind it is forwarded as the next
+// chunk, the recv pause is lifted, and the multishot recv is re-armed.
+TEST(uring, request_body_sent_forwards_surplus_and_resumes_recv) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+
+    // 6000 bytes are being sent; 3000 more arrived behind them. The recv was paused
+    // (cancel still in flight).
+    Connection* c = make_uploading_conn(*loop, 9000, 30000);
+    REQUIRE(c != nullptr);
+    c->upstream_fd = 99;
+    c->upstream_episode = 1;
+    c->req_initial_send_len = 6000;
+    c->req_body_streamed = true;
+    c->recv_paused_for_send = true;
+    c->recv_pause_cancel_pending = true;
+    c->set_slots(nullptr,
+                 nullptr,
+                 &on_early_upstream_recvd_send_inflight<IoUringEventLoop>,
+                 &on_request_body_sent<IoUringEventLoop>);
+    loop->dispatch(make_ev(c->id, IoEventType::UpstreamSend, 6000));
+
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<IoUringEventLoop>);  // next chunk out
+    CHECK_EQ(c->req_initial_send_len, 3000u);
+    CHECK_EQ(c->req_body_remaining, 30000u - 3000u);
+    CHECK_EQ(c->recv_buf.len(), 3000u);  // the sent prefix was dropped, the rest kept
+    const u8* p = c->recv_buf.data();
+    bool intact = true;
+    for (u32 i = 0; i < 3000; i++) intact = intact && p[i] == static_cast<u8>(6000 + i);
+    CHECK(intact);
+    CHECK(!c->recv_paused_for_send);
+    CHECK(c->recv_pause_rearm_pending);  // re-armed when the pause cancel completes
+    loop->shutdown();
+}
+
 // === Shard lifecycle ===
 
 // Shard init + shutdown without spawning a thread
@@ -21066,6 +21203,762 @@ TEST(route, forward_set_path_streaming_post_body) {
     }
     engine.shutdown();
     rir.destroy();
+}
+
+// ---- io_uring request-body forwarding ----
+//
+// The io_uring backend keeps a multishot recv armed on the client socket, so body
+// bytes that arrive while the gateway is still connecting to / sending the first
+// part to the origin are appended to recv_buf with no recv slot installed. They
+// are part of the request stream and must reach the origin. They used to be
+// discarded when streaming started (a hang for 4-16 KiB bodies) and after every
+// streamed chunk (a stall mid-upload).
+
+namespace {
+
+u8 req_body_byte(u32 i) {
+    return static_cast<u8>((i * 31u + (i >> 8)) & 0xFFu);
+}
+
+// Case-insensitive match of `name` (lowercase, ends with ':') at hdr[at..), which
+// must sit at the start of a header line.
+bool header_at(const u8* hdr, u32 at, u32 end, const char* name) {
+    u32 k = 0;
+    for (; name[k] != '\0'; k++) {
+        if (at + k >= end || (hdr[at + k] | 0x20) != static_cast<u8>(name[k])) return false;
+    }
+    return true;
+}
+
+// What the origin saw of one request.
+struct SeenRequest {
+    char path[24];
+    u32 body_len;
+    bool chunked;
+    bool complete;    // the whole body (incl. the terminating chunk) arrived
+    bool pattern_ok;  // body bytes matched req_body_byte(i) in order
+};
+
+// Incremental chunked-body decoder: counts payload bytes, validates framing.
+struct ChunkDecoder {
+    enum State : u8 { Size, SizeLf, Data, DataCr, DataLf, TrailerCr, TrailerLf, Done, Bad };
+    State st = Size;
+    u32 size = 0;
+    u32 left = 0;
+    bool have_digit = false;
+
+    // Returns true when `b` is a payload byte.
+    bool feed(u8 b) {
+        switch (st) {
+            case Size: {
+                u32 d = 16;
+                if (b >= '0' && b <= '9')
+                    d = static_cast<u32>(b - '0');
+                else if (b >= 'a' && b <= 'f')
+                    d = static_cast<u32>(b - 'a') + 10;
+                if (d < 16) {
+                    size = size * 16 + d;
+                    have_digit = true;
+                } else if (b == '\r' && have_digit) {
+                    st = SizeLf;
+                } else {
+                    st = Bad;
+                }
+                return false;
+            }
+            case SizeLf:
+                left = size;
+                st = b != '\n' ? Bad : size == 0 ? TrailerCr : Data;
+                return false;
+            case Data:
+                if (--left == 0) st = DataCr;
+                return true;
+            case DataCr:
+                st = b == '\r' ? DataLf : Bad;
+                return false;
+            case DataLf:
+                st = b == '\n' ? Size : Bad;
+                size = 0;
+                have_digit = false;
+                return false;
+            case TrailerCr:
+                st = b == '\r' ? TrailerLf : Bad;
+                return false;
+            case TrailerLf:
+                st = b == '\n' ? Done : Bad;
+                return false;
+            case Done:
+            case Bad:
+                return false;
+        }
+        return false;
+    }
+};
+
+// Origin that drains request bodies exactly (Content-Length or chunked), verifies
+// the byte pattern, and answers 200 once the request is complete. One request per
+// connection, connections served one after another.
+struct DrainingOrigin {
+    static constexpr u32 kMaxSeen = 16;
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+    std::atomic<u32> started_count{0};  // requests begun (accepted)
+    std::atomic<u32> body_seen{0};      // body bytes of the newest request so far
+    std::atomic<u32> seen_count{0};     // requests finished (recorded)
+    SeenRequest seen[kMaxSeen]{};
+
+    ~DrainingOrigin() { teardown(); }
+
+    static void parse_head(const u8* buf, u32 hdr_end, SeenRequest& rec, u32& cl) {
+        u32 p = 0;
+        while (p < hdr_end && buf[p] != ' ') p++;
+        u32 q = ++p;
+        while (q < hdr_end && buf[q] != ' ') q++;
+        for (u32 k = 0; p + k < q && k + 1 < sizeof(rec.path); k++)
+            rec.path[k] = static_cast<char>(buf[p + k]);
+        for (u32 k = 0; k + 2 < hdr_end; k++) {
+            if (buf[k] != '\n') continue;
+            if (header_at(buf, k + 1, hdr_end, "content-length:")) {
+                u32 v = 0;
+                for (u32 j = k + 16; j < hdr_end && buf[j] != '\r'; j++)
+                    if (buf[j] >= '0' && buf[j] <= '9') v = v * 10 + static_cast<u32>(buf[j] - '0');
+                cl = v;
+            } else if (header_at(buf, k + 1, hdr_end, "transfer-encoding:")) {
+                rec.chunked = true;
+            }
+        }
+    }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<DrainingOrigin*>(arg);
+        static u8 buf[65536];
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                usleep(1000);
+                continue;
+            }
+            const u32 idx = s->started_count.load(std::memory_order_acquire);
+            s->body_seen.store(0, std::memory_order_release);
+            s->started_count.fetch_add(1, std::memory_order_acq_rel);
+            SeenRequest rec{};
+            u32 len = 0;
+            u32 hdr_end = 0;
+            while (hdr_end == 0 && len < sizeof(buf)) {
+                const i32 n = recv_timeout(
+                    client, reinterpret_cast<char*>(buf) + len, sizeof(buf) - len, 15000);
+                if (n <= 0) break;
+                len += static_cast<u32>(n);
+                for (u32 k = 3; k < len; k++) {
+                    if (buf[k - 3] == '\r' && buf[k - 2] == '\n' && buf[k - 1] == '\r' &&
+                        buf[k] == '\n') {
+                        hdr_end = k + 1;
+                        break;
+                    }
+                }
+            }
+            if (hdr_end != 0) {
+                u32 cl = 0;
+                parse_head(buf, hdr_end, rec, cl);
+                rec.pattern_ok = true;
+                ChunkDecoder dec;
+                u32 off = hdr_end;
+                for (;;) {
+                    for (; off < len; off++) {
+                        if (rec.chunked ? dec.feed(buf[off]) : true) {
+                            if (buf[off] != req_body_byte(rec.body_len)) rec.pattern_ok = false;
+                            rec.body_len++;
+                        }
+                        if (!rec.chunked && rec.body_len >= cl) {
+                            off++;
+                            break;
+                        }
+                    }
+                    s->body_seen.store(rec.body_len, std::memory_order_release);
+                    const bool done =
+                        rec.chunked ? dec.st == ChunkDecoder::Done : rec.body_len >= cl;
+                    if (done || (rec.chunked && dec.st == ChunkDecoder::Bad)) {
+                        rec.complete = done;
+                        break;
+                    }
+                    const i32 n =
+                        recv_timeout(client, reinterpret_cast<char*>(buf), sizeof(buf), 15000);
+                    if (n <= 0) break;
+                    len = static_cast<u32>(n);
+                    off = 0;
+                }
+            }
+            if (idx < kMaxSeen) s->seen[idx] = rec;
+            s->seen_count.fetch_add(1, std::memory_order_acq_rel);
+            if (rec.complete) {
+                static const char kOk[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                (void)send_all(client, kOk, sizeof(kOk) - 1);
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+
+    bool wait_seen(u32 n, i32 ms) const {
+        for (i32 i = 0; i < ms; i++) {
+            if (seen_count.load(std::memory_order_acquire) >= n) return true;
+            usleep(1000);
+        }
+        return seen_count.load(std::memory_order_acquire) >= n;
+    }
+};
+
+// One request as it goes on the wire, with enough structure to know how much of
+// the body a given wire prefix carries.
+struct WireRequest {
+    static constexpr u32 kMax = (1u << 20) + 64u * 1024u;
+    static constexpr u32 kChunkPayload = 4096;
+    u8* data = nullptr;
+    u32 len = 0;
+    u32 hdr_len = 0;
+    u32 body_len = 0;
+    bool chunked = false;
+
+    // Body bytes carried by the first `off` wire bytes.
+    u32 body_in_prefix(u32 off) const {
+        if (off <= hdr_len) return 0;
+        if (!chunked) return off - hdr_len > body_len ? body_len : off - hdr_len;
+        // Fixed-size chunks: hex size line + payload + CRLF (the last may be shorter).
+        u32 body = 0;
+        u32 pos = hdr_len;
+        u32 left = body_len;
+        while (left > 0 && pos < off) {
+            const u32 pay = left > kChunkPayload ? kChunkPayload : left;
+            u32 hex = 1;
+            for (u32 v = pay; v >= 16; v >>= 4) hex++;
+            const u32 data_start = pos + hex + 2;
+            if (off > data_start) body += (off - data_start) > pay ? pay : (off - data_start);
+            pos = data_start + pay + 2;
+            left -= pay;
+        }
+        return body;
+    }
+};
+
+u32 put_str(u8* out, u32 at, const char* s) {
+    while (*s) out[at++] = static_cast<u8>(*s++);
+    return at;
+}
+
+u32 put_num(u8* out, u32 at, u32 v, u32 base) {
+    char tmp[12];
+    u32 n = 0;
+    do {
+        const u32 d = v % base;
+        tmp[n++] = static_cast<char>(d < 10 ? '0' + d : 'a' + (d - 10));
+        v /= base;
+    } while (v != 0);
+    while (n > 0) out[at++] = static_cast<u8>(tmp[--n]);
+    return at;
+}
+
+WireRequest build_post(u8* out, const char* path, u32 body_len, bool chunked) {
+    WireRequest r;
+    r.data = out;
+    r.body_len = body_len;
+    r.chunked = chunked;
+    u32 at = put_str(out, 0, "POST ");
+    at = put_str(out, at, path);
+    at = put_str(out, at, " HTTP/1.1\r\nHost: x\r\n");
+    if (chunked) {
+        at = put_str(out, at, "Transfer-Encoding: chunked\r\n\r\n");
+    } else {
+        at = put_str(out, at, "Content-Length: ");
+        at = put_num(out, at, body_len, 10);
+        at = put_str(out, at, "\r\n\r\n");
+    }
+    r.hdr_len = at;
+    u32 i = 0;
+    while (i < body_len) {
+        u32 pay = body_len - i;
+        if (chunked) {
+            if (pay > WireRequest::kChunkPayload) pay = WireRequest::kChunkPayload;
+            at = put_num(out, at, pay, 16);
+            at = put_str(out, at, "\r\n");
+        }
+        for (u32 k = 0; k < pay; k++) out[at + k] = req_body_byte(i + k);
+        at += pay;
+        i += pay;
+        if (chunked) at = put_str(out, at, "\r\n");
+    }
+    if (chunked) at = put_str(out, at, "0\r\n\r\n");
+    r.len = at;
+    return r;
+}
+
+// One response: its status (0 = none: EOF/reset/timeout) and whether the peer said
+// Connection: close.
+struct Reply {
+    u32 status = 0;
+    bool conn_close = false;
+    u32 total = 0;
+};
+
+Reply read_reply(i32 fd, i32 ms) {
+    Reply r;
+    char buf[2048];
+    const i64 deadline = test_mono_ms() + ms;
+    u32 body_off = 0;
+    u32 cl = 0;
+    while (r.total < sizeof(buf)) {
+        const i64 left = deadline - test_mono_ms();
+        if (left <= 0) break;
+        const i32 n =
+            recv_timeout(fd, buf + r.total, sizeof(buf) - r.total, static_cast<i32>(left));
+        if (n <= 0) break;
+        r.total += static_cast<u32>(n);
+        if (body_off == 0) {
+            for (u32 k = 3; k < r.total; k++) {
+                if (buf[k - 3] == '\r' && buf[k - 2] == '\n' && buf[k - 1] == '\r' &&
+                    buf[k] == '\n') {
+                    body_off = k + 1;
+                    break;
+                }
+            }
+            if (body_off != 0) {
+                if (r.total >= 12 && buf[9] >= '0' && buf[9] <= '9')
+                    r.status = static_cast<u32>((buf[9] - '0') * 100 + (buf[10] - '0') * 10 +
+                                                (buf[11] - '0'));
+                r.conn_close = buf_contains(buf, body_off, "Connection: close", 17);
+                for (u32 k = 0; k + 2 < body_off; k++) {
+                    if (buf[k] == '\n' &&
+                        header_at(
+                            reinterpret_cast<const u8*>(buf), k + 1, body_off, "content-length:")) {
+                        for (u32 j = k + 16; j < body_off && buf[j] != '\r'; j++)
+                            if (buf[j] >= '0' && buf[j] <= '9')
+                                cl = cl * 10 + static_cast<u32>(buf[j] - '0');
+                    }
+                }
+            }
+        }
+        if (body_off != 0 && r.total >= body_off + cl) break;
+    }
+    return r;
+}
+
+// Send `w` in `piece`-sized writes; before each next write wait until the origin has
+// consumed every body byte sent so far, so at most one piece is ever in flight.
+// Keeps the test deterministic on a loaded machine (no sleep-based pacing).
+bool send_synced(
+    i32 fd, const WireRequest& w, u32 piece, const DrainingOrigin& origin, u32 request_index) {
+    u32 sent = 0;
+    while (sent < w.len) {
+        u32 n = w.len - sent;
+        if (n > piece) n = piece;
+        if (!send_all(fd, reinterpret_cast<const char*>(w.data) + sent, n)) return false;
+        sent += n;
+        if (sent == w.len) break;
+        const u32 need = w.body_in_prefix(sent);
+        for (i32 t = 0; t < 80000; t++) {
+            if (origin.started_count.load(std::memory_order_acquire) > request_index &&
+                origin.body_seen.load(std::memory_order_acquire) >= need)
+                break;
+            usleep(250);
+        }
+    }
+    return true;
+}
+
+// Plain forward routes to a DrainingOrigin over a real io_uring shard.
+struct IoUringBodyProxy {
+    Shard<IoUringEventLoop> shard;
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    i32 lfd = -1;
+    u16 port = 0;
+    bool inited = false;
+    bool running = false;
+    TlsServerContext* tls = nullptr;  // terminate TLS on the listener when set
+
+    ~IoUringBodyProxy() { teardown(); }
+
+    // false: io_uring unavailable here (the caller skips).
+    bool setup(u16 origin_port, bool use_tls = false) {
+        if (use_tls) {
+            auto ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+            if (!ctx.has_value()) return false;
+            tls = ctx.value();
+        }
+        lfd = create_listen_socket(0).value_or(-1);
+        if (lfd < 0) return false;
+        auto init = shard.init(0, lfd);
+        for (u32 attempt = 0; !init && init.error().code == ENOMEM && attempt < 80; attempt++) {
+            usleep(25000);
+            init = shard.init(0, lfd);
+        }
+        if (!init) return false;
+        inited = true;
+        auto id = cfg.add_upstream("o", 0x7F000001, origin_port);
+        if (!id.has_value() || !cfg.add_proxy("/post", 0, id.value()) ||
+            !cfg.add_proxy("/next", 0, id.value()))
+            return false;
+        port = get_port(lfd);
+        shard.loop->config_ptr = &active;
+        if (tls != nullptr) shard.loop->tls_server = tls;
+        if (!shard.spawn(-1).has_value()) return false;
+        running = true;
+        return true;
+    }
+
+    void teardown() {
+        if (running) {
+            shard.stop();
+            shard.join();
+            running = false;
+        }
+        if (inited) {
+            shard.shutdown();
+            inited = false;
+        }
+        if (lfd >= 0) {
+            close(lfd);
+            lfd = -1;
+        }
+        if (tls != nullptr) {
+            destroy_tls_server_context(tls);
+            tls = nullptr;
+        }
+    }
+};
+
+// The socket timeouts beneath SSL_* (SO_RCVTIMEO/SO_SNDTIMEO) make the calls
+// non-restartable, so a signal landing on this thread (timers other tests in the
+// process arm) surfaces as EINTR. The TLS client helpers below retry exactly that.
+bool ssl_eintr(SSL* ssl, int rc) {
+    const int saved_errno = errno;
+    const int err = SSL_get_error(ssl, rc);
+    return saved_errno == EINTR &&
+           (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_SYSCALL);
+}
+
+int ssl_connect_retry_eintr(SSL* ssl) {
+    for (;;) {
+        const int rc = SSL_connect(ssl);
+        if (rc == 1 || !ssl_eintr(ssl, rc)) return rc;
+    }
+}
+
+int ssl_read_retry_eintr(SSL* ssl, char* buf, int len) {
+    for (;;) {
+        const int n = SSL_read(ssl, buf, len);
+        if (n > 0 || !ssl_eintr(ssl, n)) return n;
+    }
+}
+
+bool ssl_write_retry_eintr(SSL* ssl, const char* data, u32 len) {
+    u32 sent = 0;
+    while (sent < len) {
+        const int n = SSL_write(ssl, data + sent, static_cast<int>(len - sent));
+        if (n > 0) {
+            sent += static_cast<u32>(n);
+        } else if (!ssl_eintr(ssl, n)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+u8 g_wire_a[WireRequest::kMax];
+u8 g_wire_b[WireRequest::kMax];
+
+}  // namespace
+
+// Whole request in ONE write (the body lands in the socket before the gateway has
+// even connected upstream): bodies that fit recv_buf arrive intact.
+TEST(proxy_iouring_request_body, single_write_arrives_intact) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    struct Case {
+        u32 body;
+        bool chunked;
+    };
+    const Case cases[] = {{1000, false},
+                          {4060, false},
+                          {8192, false},
+                          {12000, false},
+                          {1000, true},
+                          {8192, true},
+                          {11000, true}};
+    u32 n_done = 0;
+    for (const auto& c : cases) {
+        const WireRequest w = build_post(g_wire_a, "/post", c.body, c.chunked);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        REQUIRE(send_all(fd, reinterpret_cast<const char*>(w.data), w.len));
+        const Reply r = read_reply(fd, 10000);
+        close(fd);
+        CHECK_EQ(r.status, 200u);
+        REQUIRE(origin.wait_seen(n_done + 1, 10000));
+        const SeenRequest& s = origin.seen[n_done];
+        CHECK_EQ(s.body_len, c.body);
+        CHECK(s.complete);
+        CHECK(s.pattern_ok);
+        CHECK_EQ(s.chunked, c.chunked);
+        n_done++;
+    }
+}
+
+// Larger bodies written in one burst can outrun recv_buf on io_uring (the backend
+// drops what does not fit). The contract: never hang and never close silently;
+// either the body arrives intact (200) or the client is refused with 413 + close.
+TEST(proxy_iouring_request_body, single_write_burst_is_answered) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    const u32 bodies[] = {20000, 65536, 300000};
+    for (u32 round = 0; round < 6; round++) {
+        const u32 body = bodies[round % 3];
+        const WireRequest w = build_post(g_wire_a, "/post", body, /*chunked=*/round >= 3);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        // The gateway may answer 413 and close while we are still writing.
+        (void)send_all(fd, reinterpret_cast<const char*>(w.data), w.len);
+        const Reply r = read_reply(fd, 10000);
+        close(fd);
+        CHECK(r.status == 200u || r.status == 413u);
+        if (r.status == 413u) CHECK(r.conn_close);
+        if (r.status == 200u) {
+            REQUIRE(origin.wait_seen(round + 1, 10000));
+            const SeenRequest& s = origin.seen[round];
+            CHECK_EQ(s.body_len, body);
+            CHECK(s.complete);
+            CHECK(s.pattern_ok);
+        }
+    }
+}
+
+// Bodies of any size stream through when the client does not outrun the gateway:
+// each next piece is sent once the origin consumed the previous one, so pieces land
+// behind chunks that are still in flight (the mid-stream path).
+TEST(proxy_iouring_request_body, synced_pieces_stream_large_bodies) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    struct Case {
+        u32 body;
+        bool chunked;
+        u32 piece;
+    };
+    const Case cases[] = {{20000, false, 6000},
+                          {65536, false, 8192},
+                          {1u << 20, false, 8192},
+                          {65536, true, 8192},
+                          {300000, true, 7000}};
+    u32 n_done = 0;
+    for (const auto& c : cases) {
+        const WireRequest w = build_post(g_wire_a, "/post", c.body, c.chunked);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        REQUIRE(send_synced(fd, w, c.piece, origin, n_done));
+        const Reply r = read_reply(fd, 20000);
+        close(fd);
+        CHECK_EQ(r.status, 200u);
+        REQUIRE(origin.wait_seen(n_done + 1, 10000));
+        const SeenRequest& s = origin.seen[n_done];
+        CHECK_EQ(s.body_len, c.body);
+        CHECK(s.complete);
+        CHECK(s.pattern_ok);
+        n_done++;
+    }
+}
+
+// TLS terminates in the io_uring loop: ciphertext lands in tls_in_buf, and while the
+// upload waits on the origin nothing decrypts it. The same contracts hold: a body
+// that does not outrun the gateway streams through intact; a burst that overflows is
+// refused with 413 (over TLS), never hung or closed silently.
+TEST(proxy_iouring_request_body, tls_upload) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port, /*use_tls=*/true))
+        SKIP("io_uring unavailable in this environment");
+
+    struct Case {
+        u32 body;
+        bool chunked;
+        bool synced;  // pieces paced on origin progress (else one burst)
+    };
+    const Case cases[] = {
+        {8192, false, false}, {60000, false, true}, {60000, true, true}, {120000, false, false}};
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    for (u32 round = 0; round < 4; round++) {
+        const Case& c = cases[round];
+        const WireRequest w = build_post(g_wire_a, "/post", c.body, c.chunked);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        set_socket_timeouts(fd, 5);
+        SSL* ssl = SSL_new(client_ctx);
+        REQUIRE(ssl != nullptr);
+        REQUIRE(SSL_set_fd(ssl, fd) == 1);
+        REQUIRE(ssl_connect_retry_eintr(ssl) == 1);
+        if (c.synced) {
+            constexpr u32 kPiece = 6000;
+            for (u32 sent = 0; sent < w.len;) {
+                u32 n = w.len - sent;
+                if (n > kPiece) n = kPiece;
+                REQUIRE(
+                    ssl_write_retry_eintr(ssl, reinterpret_cast<const char*>(w.data) + sent, n));
+                sent += n;
+                const u32 need = w.body_in_prefix(sent);
+                for (i32 t = 0; t < 80000 && sent < w.len; t++) {
+                    if (origin.started_count.load() > round && origin.body_seen.load() >= need)
+                        break;
+                    usleep(250);
+                }
+            }
+        } else {
+            (void)ssl_write_retry_eintr(ssl, reinterpret_cast<const char*>(w.data), w.len);
+        }
+        char buf[512];
+        const i32 n = ssl_read_retry_eintr(ssl, buf, sizeof(buf));
+        u32 status = 0;
+        if (n >= 12)
+            status =
+                static_cast<u32>((buf[9] - '0') * 100 + (buf[10] - '0') * 10 + (buf[11] - '0'));
+        SSL_free(ssl);
+        close(fd);
+        if (c.synced || c.body <= 8192) {
+            CHECK_EQ(status, 200u);
+        } else {
+            CHECK(status == 200u || status == 413u);
+        }
+        if (status == 200u) {
+            REQUIRE(origin.wait_seen(round + 1, 10000));
+            CHECK_EQ(origin.seen[round].body_len, c.body);
+            CHECK(origin.seen[round].complete);
+            CHECK(origin.seen[round].pattern_ok);
+        }
+    }
+    SSL_CTX_free(client_ctx);
+}
+
+// A slow sender (real pauses between pieces) was never affected; keep it covered.
+TEST(proxy_iouring_request_body, paced_sender_with_pauses) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    const WireRequest w = build_post(g_wire_a, "/post", 40000, false);
+    i32 fd = connect_to(proxy.port);
+    REQUIRE(fd >= 0);
+    for (u32 sent = 0; sent < w.len;) {
+        u32 n = w.len - sent;
+        if (n > 8192) n = 8192;
+        REQUIRE(send_all(fd, reinterpret_cast<const char*>(w.data) + sent, n));
+        sent += n;
+        usleep(10000);
+    }
+    const Reply r = read_reply(fd, 10000);
+    close(fd);
+    CHECK_EQ(r.status, 200u);
+    REQUIRE(origin.wait_seen(1, 10000));
+    CHECK_EQ(origin.seen[0].body_len, 40000u);
+    CHECK(origin.seen[0].complete);
+    CHECK(origin.seen[0].pattern_ok);
+}
+
+// Two requests with bodies on one keep-alive connection: the second must not be
+// disturbed by leftovers of the first, nor the first by the second.
+TEST(proxy_iouring_request_body, keep_alive_two_large_requests) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    const WireRequest a = build_post(g_wire_a, "/post", 9000, false);
+    const WireRequest b = build_post(g_wire_b, "/post", 50000, true);
+    i32 fd = connect_to(proxy.port);
+    REQUIRE(fd >= 0);
+    REQUIRE(send_all(fd, reinterpret_cast<const char*>(a.data), a.len));
+    Reply r = read_reply(fd, 10000);
+    CHECK_EQ(r.status, 200u);
+    CHECK(!r.conn_close);
+    REQUIRE(send_synced(fd, b, 8192, origin, 1));
+    r = read_reply(fd, 10000);
+    CHECK_EQ(r.status, 200u);
+    close(fd);
+    REQUIRE(origin.wait_seen(2, 10000));
+    CHECK_EQ(origin.seen[0].body_len, 9000u);
+    CHECK(origin.seen[0].pattern_ok);
+    CHECK_EQ(origin.seen[1].body_len, 50000u);
+    CHECK(origin.seen[1].complete);
+    CHECK(origin.seen[1].pattern_ok);
+}
+
+// A body followed by the next request in the same write: the successor's bytes
+// share recv_buf with the body's tail and must be served as its own request, not
+// forwarded as body.
+TEST(proxy_iouring_request_body, pipelined_successor_after_body) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    for (u32 round = 0; round < 2; round++) {
+        const u32 before = origin.seen_count.load();
+        const WireRequest w = build_post(g_wire_a, "/post", round == 0 ? 7000 : 10000, round == 1);
+        u32 total = put_str(
+            g_wire_a, w.len, "POST /next HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc");
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        REQUIRE(send_all(fd, reinterpret_cast<const char*>(g_wire_a), total));
+        const Reply r1 = read_reply(fd, 10000);
+        CHECK_EQ(r1.status, 200u);
+        const Reply r2 = read_reply(fd, 10000);
+        CHECK_EQ(r2.status, 200u);
+        close(fd);
+        REQUIRE(origin.wait_seen(before + 2, 10000));
+        CHECK_EQ(origin.seen[before].body_len, w.body_len);
+        CHECK(origin.seen[before].pattern_ok);
+        CHECK(origin.seen[before].complete);
+        CHECK_EQ(origin.seen[before + 1].body_len, 3u);  // "abc": its own request
+        CHECK_EQ(origin.seen[before + 1].path[1], 'n');  // /next
+    }
 }
 
 // forward() rejects an unknown kwarg and a duplicated set_path.

@@ -19422,6 +19422,177 @@ TEST(streaming, request_body_content_length_multi_chunk) {
     CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
 }
 
+// io_uring delivers downstream recv CQEs into recv_buf even while the connection
+// has no recv slot (upstream connect/send in flight), so bytes of the streamed body
+// can already sit behind the chunk being sent. Model that by appending to recv_buf
+// directly, as IoUringBackend::wait() does, and check the surplus is forwarded
+// rather than discarded (it was: the request hung with the body short).
+static bool append_recv_bytes(Connection& conn, const u8* data, u32 len) {
+    if (conn.recv_buf.write_avail() < len) return false;
+    u8* dst = conn.recv_buf.write_ptr();
+    for (u32 i = 0; i < len; i++) dst[i] = data[i];
+    conn.recv_buf.commit(len);
+    return true;
+}
+
+static u8 body_pattern_byte(u32 i) {
+    return static_cast<u8>((i * 31u + (i >> 8)) & 0xFFu);
+}
+
+// Bytes that arrived while the initial request send was in flight are forwarded as
+// the next body chunk, and so are bytes that arrive behind each later chunk.
+TEST(streaming, request_body_surplus_during_upload_is_forwarded) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    const char* req =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "Content-Length: 3000\r\n"
+        "\r\n";
+    u32 req_hdr_len = 0;
+    while (req[req_hdr_len]) req_hdr_len++;
+    constexpr u32 kInitialBody = 500;
+    u8 initial[1024];
+    for (u32 i = 0; i < req_hdr_len; i++) initial[i] = static_cast<u8>(req[i]);
+    for (u32 i = 0; i < kInitialBody; i++) initial[req_hdr_len + i] = body_pattern_byte(i);
+    conn->recv_buf.reset();
+    REQUIRE(append_recv_bytes(*conn, initial, req_hdr_len + kInitialBody));
+    loop.backend.inject(make_ev(conn->id, IoEventType::Recv, static_cast<i32>(req_hdr_len + 500)));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    REQUIRE_EQ(conn->req_body_mode, BodyMode::ContentLength);
+    REQUIRE_EQ(conn->req_body_remaining, 3000u - kInitialBody);
+
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    conn->state = ConnState::Proxying;
+    loop.submit_connect(*conn, nullptr, 0);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    const u32 initial_len = conn->req_initial_send_len;
+    CHECK_EQ(initial_len, req_hdr_len + kInitialBody);
+
+    // Two more body chunks arrive while the initial send is in flight.
+    u32 body_off = kInitialBody;
+    u8 chunk[1024];
+    for (u32 i = 0; i < 900; i++) chunk[i] = body_pattern_byte(body_off + i);
+    REQUIRE(append_recv_bytes(*conn, chunk, 900));
+    body_off += 900;
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(initial_len)));
+
+    // The surplus went out as the next chunk: it was neither dropped nor left waiting
+    // for a recv that the still-armed multishot would never deliver again.
+    CHECK_EQ(conn->on_upstream_send, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(conn->req_body_remaining, 3000u - kInitialBody - 900u);
+    auto* send_op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send_op != nullptr);
+    REQUIRE_EQ(send_op->send_len, 900u);
+    bool intact = true;
+    for (u32 i = 0; i < 900; i++)
+        intact = intact && send_op->send_buf[i] == body_pattern_byte(kInitialBody + i);
+    CHECK(intact);
+    CHECK_EQ(conn->recv_buf.len(), 900u);
+
+    // More arrives behind that chunk before its send completes.
+    for (u32 i = 0; i < 700; i++) chunk[i] = body_pattern_byte(body_off + i);
+    REQUIRE(append_recv_bytes(*conn, chunk, 700));
+    const u32 second_off = body_off;
+    body_off += 700;
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 900));
+    CHECK_EQ(conn->on_upstream_send, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(conn->req_body_remaining, 3000u - body_off);
+    send_op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send_op != nullptr);
+    REQUIRE_EQ(send_op->send_len, 700u);
+    intact = true;
+    for (u32 i = 0; i < 700; i++)
+        intact = intact && send_op->send_buf[i] == body_pattern_byte(second_off + i);
+    CHECK(intact);
+
+    // Nothing buffered behind this chunk: back to waiting for the client.
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 700));
+    CHECK_EQ(conn->on_recv, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+
+    // The rest arrives the ordinary way and completes the request.
+    const u32 rest = 3000u - body_off;
+    for (u32 i = 0; i < rest; i++) chunk[i] = body_pattern_byte(body_off + i);
+    inject_custom_recv(loop, *conn, IoEventType::Recv, chunk, rest);
+    CHECK_EQ(conn->req_body_remaining, 0u);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(rest)));
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
+}
+
+// A pipelined successor that arrives in the same burst as the tail of the body
+// belongs to the next request: only the body is forwarded, the successor is stashed.
+TEST(streaming, request_body_surplus_keeps_pipelined_successor_out_of_the_upload) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    const char* req =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "Content-Length: 1000\r\n"
+        "\r\n";
+    u32 req_hdr_len = 0;
+    while (req[req_hdr_len]) req_hdr_len++;
+    u8 initial[1024];
+    for (u32 i = 0; i < req_hdr_len; i++) initial[i] = static_cast<u8>(req[i]);
+    for (u32 i = 0; i < 300; i++) initial[req_hdr_len + i] = body_pattern_byte(i);
+    conn->recv_buf.reset();
+    REQUIRE(append_recv_bytes(*conn, initial, req_hdr_len + 300));
+    loop.backend.inject(make_ev(conn->id, IoEventType::Recv, static_cast<i32>(req_hdr_len + 300)));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    REQUIRE_EQ(conn->req_body_remaining, 700u);
+
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    conn->state = ConnState::Proxying;
+    loop.submit_connect(*conn, nullptr, 0);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    const u32 initial_len = conn->req_initial_send_len;
+
+    // The remaining 700 body bytes plus a whole successor request, in the buffer
+    // before the initial send completes.
+    const char* next = "GET /next HTTP/1.1\r\nHost: test\r\n\r\n";
+    u32 next_len = 0;
+    while (next[next_len]) next_len++;
+    u8 burst[1024];
+    for (u32 i = 0; i < 700; i++) burst[i] = body_pattern_byte(300 + i);
+    for (u32 i = 0; i < next_len; i++) burst[700 + i] = static_cast<u8>(next[i]);
+    REQUIRE(append_recv_bytes(*conn, burst, 700 + next_len));
+
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(initial_len)));
+    CHECK_EQ(conn->on_upstream_send, &on_request_body_sent<SmallLoop>);
+    CHECK_EQ(conn->req_body_remaining, 0u);
+    auto* send_op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send_op != nullptr);
+    CHECK_EQ(send_op->send_len, 700u);  // the body only, not the successor
+
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, 700));
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    REQUIRE_EQ(conn->pipeline_stash_len, static_cast<u16>(next_len));
+    bool stashed = true;
+    for (u32 i = 0; i < next_len; i++)
+        stashed = stashed &&
+                  conn->send_buf.data()[conn->retry_req_send_len + i] == static_cast<u8>(next[i]);
+    CHECK(stashed);
+}
+
 // After a chunked request completes, keep-alive resets req_body_mode to None.
 TEST(streaming, keep_alive_after_chunked_request_no_stale_state) {
     SmallLoop loop;
@@ -32126,9 +32297,12 @@ TEST(streaming, request_body_sent_chunked_not_done_continues) {
     c->req_chunk_parser.reset();
     // Chunk parser NOT complete → more body to stream
     c->req_body_remaining = 0;
+    // recv_buf holds exactly the chunk that was just sent (nothing buffered behind it).
+    c->req_initial_send_len = c->recv_buf.len();
     c->on_upstream_send = &on_request_body_sent<SmallLoop>;
     loop.backend.clear_ops();
-    loop.inject_and_dispatch(make_ev(c->id, IoEventType::UpstreamSend, 50));
+    loop.inject_and_dispatch(
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(c->req_initial_send_len)));
     // Should continue reading more body from client
     CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
 }

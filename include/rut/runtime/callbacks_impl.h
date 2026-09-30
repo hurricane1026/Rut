@@ -1553,6 +1553,8 @@ void resume_jit_handler(Loop* loop, Connection& conn);
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
 template <typename Loop>
+void respond_request_body_overflow(Loop* loop, Connection& conn);
+template <typename Loop>
 inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 
 template <typename Loop>
@@ -5138,6 +5140,37 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         close_conn_if_live(loop, conn);
 }
 
+// A downstream recv CQE did not fit in recv_buf while the request body was still
+// streaming upstream (io_uring: wait() copies min(nbytes, room) and drops the rest,
+// reporting -ENOBUFS). The body can no longer be forwarded intact, so refuse the
+// request: answer 413 and close, never forward a truncated body or close silently.
+// Same admission shape as respond_upstream_timeout (plain, policy-free proxying
+// before any response byte); anything else keeps the plain close.
+template <typename Loop>
+void respond_request_body_overflow(Loop* loop, Connection& conn) {
+    conn.req_body_overflow_rejected = true;
+    if (conn.state != ConnState::Proxying || conn.proxy_resp_started ||
+        conn.response_read_deadline_state != ResponseReadDeadlineState::None ||
+        conn.timeout_failure_policy_id != 0 || conn.failure_policy_suppress_body) {
+        loop->close_conn(conn);
+        return;
+    }
+    (void)detach_upstream_close(loop, conn);
+    conn.upstream_abandoned = true;
+    static const char k413[] =
+        "HTTP/1.1 413 Payload Too Large\r\n"
+        "Content-Length: 17\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Payload Too Large";
+    conn.send_buf.reset();
+    conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1);
+    conn.keep_alive = false;
+    conn.resp_status = 413;
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+}
+
 // forward(set_path:) — rewrite the request-line path in recv_buf in place from
 // conn.req_path_override before forwarding upstream. The path lives at the front
 // of the request (inside the initial-forward chunk), so the buffered bytes after
@@ -7374,6 +7407,38 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     }
 }
 
+// Continue the streamed request body after recv_buf[0, sent) went upstream.
+//
+// On io_uring the downstream multishot recv keeps delivering while the upstream
+// connect/send is in flight (no recv slot is set), and wait() has already
+// appended those CQEs to recv_buf behind the part being sent. They are request
+// stream bytes: drop only the sent prefix, never the whole buffer, and forward
+// what is already buffered as the next chunk instead of waiting for a recv that
+// the still-armed multishot will never re-deliver. epoll/kqueue read only when a
+// recv is submitted, so there the buffer is empty here and this is a plain re-arm.
+template <typename Loop>
+void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
+    conn.consume_request_receive_buffer(sent);
+    conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
+    // The recv was paused (handle_unhandled_recv) because recv_buf ran low on room
+    // while the send drained it; the space is back, let the client send again.
+    if (conn.recv_paused_for_send && conn.recv_buf.write_avail() >= kRequestBodyRecvHeadroom)
+        conn.recv_paused_for_send = false;
+    const u32 kBuffered = conn.recv_buf.len();
+    loop->submit_recv(conn);
+    loop->submit_recv_upstream(conn);
+    if (kBuffered > 0) {
+        IoEvent synth = {conn.id, static_cast<i32>(kBuffered), 0, 0, IoEventType::Recv, 0, 0, 0};
+        on_request_body_recvd<Loop>(loop, conn, synth);
+        return;
+    }
+    if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
+        // io_uring TLS: ciphertext that arrived while no recv slot was set waits in
+        // tls_in_buf and no further CQE is guaranteed to drive it.
+        (void)loop->process_buffered_tls_input(conn);
+    }
+}
+
 template <typename Loop>
 void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -7512,17 +7577,15 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     const bool response_mutation_snapshot = conn.response_mutations_snapshotted;
     if (kMoreReqBody) {
-        // Body streaming begins here: recv_buf is reset and refilled with body
-        // chunks, so the original headers+body are no longer replayable. Mark it so
-        // request_fully_resendable refuses any later reused-socket retry.
+        // Body streaming begins here: the sent prefix is dropped from recv_buf and
+        // the rest is refilled with body chunks, so the original headers+body are
+        // no longer replayable. Mark it so request_fully_resendable refuses any
+        // later reused-socket retry.
         conn.req_body_streamed = true;
         conn.request_upload_complete = false;
         reserve_response_mutation_snapshot(conn);
-        conn.reset_request_receive_buffer();
-        conn.set_slots(
-            &on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
-        loop->submit_recv(conn);
-        loop->submit_recv_upstream(conn);
+        continue_request_body<Loop>(
+            loop, conn, conn.retry_req_send_len == 0 ? conn.req_initial_send_len : 0);
         return;
     }
 
@@ -9185,6 +9248,12 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.reset_request_receive_buffer();
+        // Undo a recv pause from the upload (continue_request_body): successors
+        // and a client close are read again while the response is awaited.
+        if (conn.recv_paused_for_send) {
+            conn.recv_paused_for_send = false;
+            loop->submit_recv(conn);
+        }
         conn.upstream_start_us = monotonic_us();
         if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
         conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -9204,10 +9273,9 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.reset_request_receive_buffer();
-    conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
-    loop->submit_recv(conn);
-    loop->submit_recv_upstream(conn);
+    // Bytes the downstream recv appended while this chunk was in flight sit behind
+    // it in recv_buf: keep them (see continue_request_body).
+    continue_request_body<Loop>(loop, conn, conn.req_initial_send_len);
 }
 
 template <typename Loop>
@@ -9230,6 +9298,13 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result <= 0) {
+        // io_uring: the CQE did not fit in recv_buf and its tail was dropped.
+        if constexpr (requires(Loop* l, Connection& c) { l->pause_recv(c); }) {
+            if (ev.result == -ENOBUFS && conn.request_body_incomplete()) {
+                respond_request_body_overflow<Loop>(loop, conn);
+                return;
+            }
+        }
         loop->close_conn(conn);
         return;
     }

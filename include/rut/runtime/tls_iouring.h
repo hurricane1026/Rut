@@ -583,6 +583,13 @@ template <class Self>
 void tls_recv(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
     if (ev.result <= 0) {  // peer EOF or recv error
+        // -ENOBUFS: the backend dropped the tail of a CQE that did not fit tls_in_buf,
+        // which corrupts the record stream. A streamed request body is refused with
+        // 413 instead of a silent close.
+        if (ev.result == -ENOBUFS && c.request_body_incomplete()) {
+            respond_request_body_overflow<Self>(loop, c);
+            return;
+        }
         loop->close_conn(c);
         return;
     }

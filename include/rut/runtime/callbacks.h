@@ -139,6 +139,12 @@ void resume_jit_handler(Loop* loop, Connection& conn);
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
 
+// io_uring only: refuse a streamed request whose body overflowed recv_buf (the
+// backend had to drop bytes) with 413 + close instead of a silent close. Invoked
+// from the downstream recv dispatch; defined in callbacks_impl.h.
+template <typename Loop>
+void respond_request_body_overflow(Loop* loop, Connection& conn);
+
 template <typename Loop>
 bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 

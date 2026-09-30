@@ -24,6 +24,7 @@
 #include "rut/runtime/upstream_concurrency.h"
 #include <atomic>
 
+#include <errno.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #ifdef __linux__
@@ -154,8 +155,30 @@ public:
     // Handle client Recv when no on_recv handler is set.
     // Centralizes drain/EOF/ENOBUFS logic — written once, correct everywhere.
     void handle_unhandled_recv(Connection& conn, const IoEvent& ev) {
+        // Refused with 413 after a request-body overflow: the response is draining and
+        // the connection closes behind it; nothing more to read or to fail on.
+        if (conn.req_body_overflow_rejected) return;
         if (ev.result > 0) {
-            if (!conn.keep_alive) conn.reset_request_receive_buffer();
+            // A streamed request body is still being forwarded: these bytes (already
+            // appended to recv_buf by the backend) are its next chunk, which
+            // on_upstream_request_sent / on_request_body_sent pick up. Keep them.
+            const bool kBodyInFlight = conn.request_body_incomplete();
+            if constexpr (requires { self().pause_recv(conn); }) {
+                // io_uring: the multishot recv keeps filling recv_buf while the upstream
+                // send drains it, and a CQE that does not fit is lost. Pause before the
+                // buffer can overflow; continue_request_body resumes once it is free.
+                static_assert(kRequestBodyRecvHeadroom == 2 * kProvidedBufSize);
+                if (kBodyInFlight && !conn.recv_paused_for_send &&
+                    conn.recv_buf.write_avail() < kRequestBodyRecvHeadroom) {
+                    if (!self().pause_recv(conn)) {
+                        self().close_conn(conn);
+                        return;
+                    }
+                    if (!conn.recv_armed) conn.recv_pause_cancel_pending = false;
+                    return;
+                }
+            }
+            if (!conn.keep_alive && !kBodyInFlight) conn.reset_request_receive_buffer();
             // Re-arm only when io_uring multishot terminated (!recv_armed).
             // On epoll, recv_armed is always false but EPOLLIN is already
             // armed via EPOLLIN|EPOLLOUT from add_send — calling submit_recv
@@ -169,6 +192,15 @@ public:
             // which accounts the request and closes this connection; a client
             // that read it and reset must not pre-empt that completion.
             if (conn.direct_write_completion_pending) return;
+            if constexpr (requires { self().pause_recv(conn); }) {
+                // io_uring: a request-body CQE overflowed recv_buf, so its uncopied
+                // tail is gone. Answer 413 (and let that response drain) instead of
+                // a silent close.
+                if (ev.result == -ENOBUFS && conn.request_body_incomplete()) {
+                    respond_request_body_overflow(&self(), conn);
+                    return;
+                }
+            }
             self().close_conn(conn);  // -ENOBUFS: prevent busy-loop
             return;
         }
