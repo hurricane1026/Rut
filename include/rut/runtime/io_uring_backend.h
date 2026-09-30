@@ -29,9 +29,26 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 //   [*] IOSQE_BUFFER_SELECT       — kernel picks buffer from provided ring
 //   [ ] IORING_SETUP_SQPOLL       — kernel-side SQ polling (needs CAP_SYS_NICE)
 //   [ ] IORING_OP_SEND_ZC         — zero-copy send (future optimization)
-//   [*] IORING_SETUP_COOP_TASKRUN — cooperative task running
-// Ring setup runs before the shard thread starts, so SINGLE_ISSUER is intentionally
-// not used: submissions and enters may come from the spawned shard thread.
+//   [*] IORING_SETUP_COOP_TASKRUN — cooperative task running (+ TASKRUN_FLAG)
+//   [ ] IORING_SETUP_SINGLE_ISSUER — evaluated, not adopted (see below)
+//   [ ] IORING_SETUP_DEFER_TASKRUN — evaluated, ~5% slower on short connections
+//
+// wait() relies on IORING_SQ_TASKRUN (from TASKRUN_FLAG) so it never skips an
+// enter while task work is pending.
+//
+// SINGLE_ISSUER / DEFER_TASKRUN evaluation (Linux 7.2.7, x86-64, 1 shard; see
+// DESIGN.md 6.2). The ring is created before the shard thread exists, and
+// SINGLE_ISSUER binds the ring to the first submitting task, so adopting it needs
+// IORING_SETUP_R_DISABLED plus IORING_REGISTER_ENABLE_RINGS from the shard thread
+// (prototyped, works), with a fallback for kernels that reject the flags. Without
+// DEFER_TASKRUN it enforces a single submitter, not exclusive access: submitting
+// or registering from another thread fails with -EEXIST, so a loop can no longer
+// be driven from a second thread (e.g. test helpers that settle a stopped shard).
+// Throughput: SINGLE_ISSUER + COOP_TASKRUN was neutral; DEFER_TASKRUN was about
+// 5% slower on accept-heavy `Connection: close` (128 conns) and neutral on
+// keep-alive workloads. Not adopted; revisit only with a workload where
+// DEFER_TASKRUN is measured to win, and re-measure first. The one-shard =
+// one-ring = one-submitting-thread property already holds by construction.
 //
 struct IoUringBackend {
     SlicePool* response_pool = nullptr;

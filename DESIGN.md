@@ -4517,12 +4517,52 @@ io_uring features used:
 | `IORING_RECV_MULTISHOT` | One SQE continuously receives data per connection | 6.0 |
 | `IOSQE_BUFFER_SELECT` + provided buffer ring | Kernel auto-selects buffer on recv, idle connections hold no buffer | 5.19 / 6.0 |
 | `IORING_SETUP_SQPOLL` | Kernel-side SQ polling, reduces syscalls | 5.11 |
-| `IORING_SETUP_SINGLE_ISSUER` | Single-thread optimization | 6.0 |
+| `IORING_SETUP_SINGLE_ISSUER` | Single-thread optimization (evaluated, not adopted; see note below) | 6.0 |
 | `IORING_OP_SEND_ZC` | Zero-copy send | 6.0 |
 | `IORING_OP_LINK` | Chain multiple ops, single submission | 5.3 |
 | `IORING_SETUP_COOP_TASKRUN` | Cooperative task running, fewer interrupts | 6.0 |
 | Fixed file registration | Pre-register fds, skip kernel fd lookup | 5.1 |
 | Fixed buffer registration | Pre-register buffers, skip DMA mapping | 5.1 |
+
+**Ring setup flags in the implementation.** The `init()` sketch above is
+illustrative. The shipped ring uses `IORING_SETUP_COOP_TASKRUN |
+IORING_SETUP_TASKRUN_FLAG` only; `wait()` relies on `IORING_SQ_TASKRUN` to avoid
+skipping an enter while task work is pending.
+
+**Evaluated and not adopted: `SINGLE_ISSUER` / `DEFER_TASKRUN`.** Measured on
+Linux 7.2.7, x86-64, in this project only:
+
+- The ring is created before the shard thread exists, and `SINGLE_ISSUER` binds
+  the ring to the first submitting task. Using it requires creating the ring with
+  `IORING_SETUP_R_DISABLED` and calling `IORING_REGISTER_ENABLE_RINGS` from the
+  shard thread, with the init-time NOP probe and the initial timerfd read
+  submission moved after the enable. Prototyped and working (registering the
+  provided-buffer rings while disabled is accepted), and it needs a fallback mode
+  for kernels that reject the flags.
+- `DEFER_TASKRUN` (requires `SINGLE_ISSUER`, Linux 6.1+): about 5% slower on an
+  accept-heavy short-connection workload (`Connection: close`, 1 shard, 128 client
+  connections, static response; ~105k vs ~110k requests/s, lower in every one of 10
+  alternating rounds). Neutral within noise on static keep-alive (~433k rps) and
+  proxy keep-alive (~215k rps). A four-way comparison isolated the cost to
+  `DEFER_TASKRUN`; the cause was not profiled.
+- `SINGLE_ISSUER` alone (with `COOP_TASKRUN`): no measurable change (+0.75% on the
+  short-connection workload over 10 rounds, inside noise).
+- Without `DEFER_TASKRUN`, observed behaviour: from a thread other than the owner,
+  submissions (`io_uring_enter` with `to_submit > 0`), registrations and
+  `ENABLE_RINGS` fail with `-EEXIST`; a GETEVENTS-only enter and reads of the
+  mmap'd rings are still allowed. The binding persists after the owner thread
+  exits. It enforces a single submitter, not exclusive access.
+- Cost: a loop can no longer be driven from a second thread. Test helpers that
+  settle a stopped shard by calling `wait()`/`dispatch()` from the test thread
+  (`settle_stopped_iouring_shard` in `tests/test_integration.cc`, ~23 call sites)
+  fail with a sticky `-EEXIST` whenever the shard left a staged SQE (16 of 20
+  loaded runs failed vs 0 of 20 on main).
+
+Conclusion: not adopted. Revisit only with a workload where `DEFER_TASKRUN` is
+measured to win, and re-measure before enabling. The single-submitter property
+(one shard = one ring = one submitting thread) already holds by construction:
+the control plane's `stop()` only stores an atomic and `drain()` only touches the
+timerfd.
 
 ### 6.3 epoll Backend (Linux 3.9+)
 
