@@ -486,6 +486,7 @@ add_test(
             $<TARGET_FILE:rut>)
 set_tests_properties(test_cli_iouring_memlock PROPERTIES
     LABELS "cli"
+    RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77
     TIMEOUT 30)
 

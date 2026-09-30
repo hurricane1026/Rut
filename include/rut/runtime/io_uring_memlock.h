@@ -10,7 +10,10 @@
 // exhausted io_uring_setup / IORING_REGISTER_PBUF_RING fail with ENOMEM.
 //
 // The functions take sizes as inputs (no globals) so ring sizing can change
-// without touching the accounting.
+// without touching the accounting. The formulas assume power-of-two entry
+// counts (the kernel rounds requests up to one) and the default 64-byte SQE /
+// 16-byte CQE layout; SQE128, CQE32 and NO_SQARRAY are not covered because Rut
+// does not use them.
 
 #include "rut/common/types.h"
 
@@ -22,11 +25,14 @@ namespace rut {
 // sizes the CQ at twice this by default.
 static constexpr u32 kIoUringSqEntries = 16384;
 static constexpr u32 kIoUringCqEntries = kIoUringSqEntries * 2;
+static_assert((kIoUringSqEntries & (kIoUringSqEntries - 1)) == 0,
+              "io_uring SQ entries must be a power of two (the kernel rounds up)");
 
 namespace iouring_memlock_detail {
 static constexpr u64 kPage = 4096;
-// io_rings header (head/tail/mask/flags/overflow, cache-line separated) that
-// precedes the CQE array in the shared ring mapping.
+// Bytes before the CQE array in the shared ring mapping: params.cq_off.cqes as
+// reported by the kernel (sizeof(struct io_rings) on x86-64, 64-byte cache lines:
+// head/tail/mask/flags/overflow, each cache-line separated).
 static constexpr u64 kRingsHeaderBytes = 320;
 constexpr u64 round_up_page(u64 n) {
     return (n + kPage - 1) / kPage * kPage;
