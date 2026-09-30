@@ -4524,21 +4524,23 @@ io_uring features used:
 | Fixed file registration | Pre-register fds, skip kernel fd lookup | 5.1 |
 | Fixed buffer registration | Pre-register buffers, skip DMA mapping | 5.1 |
 
-**Ring setup flags in the implementation.** The `init()` sketch above is
-illustrative. The shipped ring uses `IORING_SETUP_COOP_TASKRUN |
-IORING_SETUP_TASKRUN_FLAG` only; `wait()` relies on `IORING_SQ_TASKRUN` to avoid
-skipping an enter while task work is pending.
+**Ring setup flags in the implementation.** The `init()` sketch and the feature
+table above describe the design target, not the shipped setup (SQPOLL, SEND_ZC,
+OP_LINK and fixed file/buffer registration are not enabled). The shipped ring
+uses `IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG` only; `wait()`
+relies on `IORING_SQ_TASKRUN` to avoid skipping an enter while task work is
+pending.
 
 **Evaluated and not adopted: `SINGLE_ISSUER` / `DEFER_TASKRUN`.** Measured on
 Linux 7.2.7, x86-64, in this project only:
 
-- The ring is created before the shard thread exists, and `SINGLE_ISSUER` binds
-  the ring to the first submitting task. Using it requires creating the ring with
-  `IORING_SETUP_R_DISABLED` and calling `IORING_REGISTER_ENABLE_RINGS` from the
-  shard thread, with the init-time NOP probe and the initial timerfd read
-  submission moved after the enable. Prototyped and working (registering the
-  provided-buffer rings while disabled is accepted), and it needs a fallback mode
-  for kernels that reject the flags.
+- The ring is created before the shard thread exists, so with plain
+  `SINGLE_ISSUER` the owning task would be fixed before that thread exists. Using
+  it requires creating the ring with `IORING_SETUP_R_DISABLED` and calling
+  `IORING_REGISTER_ENABLE_RINGS` from the shard thread, with the init-time NOP probe
+  and the initial timerfd read submission moved after the enable. Prototyped and
+  working (registering the provided-buffer rings while disabled is accepted), and
+  it needs a fallback mode for kernels that reject the flags.
 - `DEFER_TASKRUN` (requires `SINGLE_ISSUER`, Linux 6.1+): about 5% slower on an
   accept-heavy short-connection workload (`Connection: close`, 1 shard, 128 client
   connections, static response; ~105k vs ~110k requests/s, lower in every one of 10
@@ -4556,13 +4558,13 @@ Linux 7.2.7, x86-64, in this project only:
   settle a stopped shard by calling `wait()`/`dispatch()` from the test thread
   (`settle_stopped_iouring_shard` in `tests/test_integration.cc`, ~23 call sites)
   fail with a sticky `-EEXIST` whenever the shard left a staged SQE (16 of 20
-  loaded runs failed vs 0 of 20 on main).
+  loaded runs failed vs 0 of 20 without the flag).
 
 Conclusion: not adopted. Revisit only with a workload where `DEFER_TASKRUN` is
 measured to win, and re-measure before enabling. The single-submitter property
 (one shard = one ring = one submitting thread) already holds by construction:
-the control plane's `stop()` only stores an atomic and `drain()` only touches the
-timerfd.
+the control thread's `stop()` only stores an atomic and `drain()` only stores
+atomics and re-arms the timerfd; neither touches the ring.
 
 ### 6.3 epoll Backend (Linux 3.9+)
 
