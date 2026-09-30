@@ -1,4 +1,5 @@
-// Idle keep-alive buffer trim on the io_uring loop (IoUringEventLoop::sweep_idle_trim).
+// Idle keep-alive buffer trim on the io_uring loop (IoUringEventLoop::sweep_idle_trim),
+// which is driven from the timer wheel.
 //
 // Real-loop tests drive an actual IoUringEventLoop single-threaded against real
 // loopback sockets: the test thread alternates client I/O with backend.wait() +
@@ -204,6 +205,11 @@ struct TrimRig {
     }
 };
 
+// The contract under test (spelled out, not read from the loop's constant, so a change
+// to the loop's minimum idle age cannot silently move the goalposts): nothing is trimmed
+// before a connection has been idle this many wheel ticks.
+constexpr u32 kMinIdleTicks = 5;
+
 constexpr const char kReqA[] = "GET /a HTTP/1.1\r\nHost: x\r\n\r\n";
 constexpr const char kReqB[] = "GET /b HTTP/1.1\r\nHost: x\r\n\r\n";
 constexpr const char kReqBig[] = "GET /big HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -294,8 +300,8 @@ TEST(iouring_idle_trim, idle_keepalive_trimmed_once_then_serves_next_request) {
         r.tick();
         ticks++;
     }
-    CHECK_GE(ticks, IoUringEventLoop::kIdleTrimMinIdleTicks);
-    CHECK_LE(ticks, IoUringEventLoop::kIdleTrimMinIdleTicks + 2);
+    CHECK_GE(ticks, kMinIdleTicks);
+    CHECK_LE(ticks, kMinIdleTicks + 2);
     CHECK_EQ(r.loop->idle_trim_conns, 1u);
     CHECK_EQ(r.loop->idle_trim_madvise, 2u);
     CHECK_EQ(resident_pages(recv_slice, SlicePool::kSliceSize), 0u);
@@ -334,7 +340,7 @@ TEST(iouring_idle_trim, connection_active_every_tick_is_never_trimmed) {
     const i32 cli = r.connect_client();
     REQUIRE_GE(cli, 0);
     std::string resp;
-    for (u32 i = 0; i < 4 * IoUringEventLoop::kIdleTrimMinIdleTicks; i++) {
+    for (u32 i = 0; i < 4 * kMinIdleTicks; i++) {
         REQUIRE(r.exchange(cli, kReqA, resp));
         REQUIRE(r.wait_idle());
         r.tick();
@@ -446,12 +452,13 @@ TEST(iouring_idle_trim, connection_parked_in_wait_handler_is_not_trimmed) {
 }
 
 // ---------------------------------------------------------------------------
-// Synthetic connections: per-tick bounds and the eligibility table
+// Synthetic connections: wheel-driven budgets, exactly-once, eligibility table
 // ---------------------------------------------------------------------------
 
 namespace {
 
-// Stage a slot as a plain idle keep-alive connection with dirty slice pages.
+// Stage a slot as a plain idle keep-alive connection with dirty slice pages, armed
+// in the wheel the way accept / the last response event arms it.
 Connection* stage_idle(TrimRig& r, i32 fake_fd) {
     Connection* c = r.loop->alloc_conn();
     if (c == nullptr) return nullptr;
@@ -459,20 +466,38 @@ Connection* stage_idle(TrimRig& r, i32 fake_fd) {
     c->state = ConnState::ReadingHeader;
     c->on_recv = &on_header_received<IoUringEventLoop>;
     c->recv_armed = true;
+    c->pending_ops = 1;  // the multishot recv: all an idle connection has outstanding
     c->recv_slice[0] = 1;
     c->send_slice[0] = 1;
+    r.loop->timer.add(c, r.loop->keepalive_timeout);
     return c;
+}
+
+// Sweep counters before/after one injected tick.
+struct TickDelta {
+    u64 examined;
+    u64 trimmed;
+    u64 madvise;
+};
+
+TickDelta tick_delta(TrimRig& r, i32 n = 1) {
+    const u64 e = r.loop->idle_trim_examined;
+    const u64 t = r.loop->idle_trim_conns;
+    const u64 m = r.loop->idle_trim_madvise;
+    r.tick(n);
+    return {
+        r.loop->idle_trim_examined - e, r.loop->idle_trim_conns - t, r.loop->idle_trim_madvise - m};
 }
 
 }  // namespace
 
-TEST(iouring_idle_trim, sweep_respects_per_tick_slot_and_trim_bounds) {
-    constexpr u32 kCap = 3000;
-    constexpr u32 kLive = 2000;
-    static_assert(kLive > IoUringEventLoop::kIdleTrimMaxPerTick);
-    static_assert(kCap > IoUringEventLoop::kIdleTrimSlotsPerTick);
+TEST(iouring_idle_trim, burst_larger_than_budget_is_trimmed_exactly_once_over_later_ticks) {
+    constexpr u32 kLive = 3000;
+    static_assert(kLive > IoUringEventLoop::kIdleTrimMaxTrims);
+    static_assert(kLive > IoUringEventLoop::kIdleTrimMaxExamined);
     TrimRig r;
-    if (!r.init(kCap, false)) SKIP("io_uring unavailable");
+    if (!r.init(kLive + 8, false)) SKIP("io_uring unavailable");
+    r.loop->idle_trim_budget_ns = ~0ull >> 1;  // only the count caps apply
     Connection* sample = nullptr;
     for (u32 i = 0; i < kLive; i++) {
         Connection* c = stage_idle(r, 100000 + static_cast<i32>(i));
@@ -481,33 +506,246 @@ TEST(iouring_idle_trim, sweep_respects_per_tick_slot_and_trim_bounds) {
     }
     CHECK_EQ(resident_pages(sample->recv_slice, SlicePool::kSliceSize), 1u);
 
-    u64 max_trimmed_per_tick = 0;
-    u32 max_advance = 0;
-    u32 sweeps = 0;
-    for (; sweeps < 400 && r.loop->idle_trim_conns < kLive; sweeps++) {
-        const u64 before = r.loop->idle_trim_conns;
-        const u32 cursor_before = r.loop->idle_trim_cursor;
-        r.loop->sweep_idle_trim(1);
-        const u64 delta = r.loop->idle_trim_conns - before;
-        if (delta > max_trimmed_per_tick) max_trimmed_per_tick = delta;
-        const u32 advance = (r.loop->idle_trim_cursor + kCap - cursor_before) % kCap;
-        if (advance > max_advance) max_advance = advance;
-        // Nothing is trimmed on a first sighting, only after the idle threshold.
-        if (sweeps < IoUringEventLoop::kIdleTrimMinIdleTicks) CHECK_EQ(delta, 0u);
+    u64 max_examined = 0;
+    u64 max_trimmed = 0;
+    u32 first_trim_tick = 0;
+    u32 last_trim_tick = 0;
+    for (u32 t = 1; t <= 30; t++) {
+        const TickDelta d = tick_delta(r);
+        if (d.examined > max_examined) max_examined = d.examined;
+        if (d.trimmed > max_trimmed) max_trimmed = d.trimmed;
+        if (d.trimmed != 0) {
+            if (first_trim_tick == 0) first_trim_tick = t;
+            last_trim_tick = t;
+        }
+        // Nothing is examined before the minimum idle age.
+        if (t < kMinIdleTicks) CHECK_EQ(d.examined, 0u);
     }
+    CHECK_EQ(first_trim_tick, kMinIdleTicks);
     CHECK_EQ(r.loop->idle_trim_conns, static_cast<u64>(kLive));
     CHECK_EQ(r.loop->idle_trim_madvise, 2ull * kLive);
-    CHECK_LE(max_trimmed_per_tick, static_cast<u64>(IoUringEventLoop::kIdleTrimMaxPerTick));
-    CHECK_EQ(max_trimmed_per_tick, static_cast<u64>(IoUringEventLoop::kIdleTrimMaxPerTick));
-    CHECK_LE(max_advance, IoUringEventLoop::kIdleTrimSlotsPerTick);
-    CHECK_GE(sweeps, kLive / IoUringEventLoop::kIdleTrimMaxPerTick);
+    // Each connection was examined exactly once, under both caps every tick.
+    CHECK_EQ(r.loop->idle_trim_examined, static_cast<u64>(kLive));
+    CHECK_EQ(max_trimmed, static_cast<u64>(IoUringEventLoop::kIdleTrimMaxTrims));
+    CHECK_LE(max_examined, static_cast<u64>(IoUringEventLoop::kIdleTrimMaxExamined));
+    CHECK_EQ(last_trim_tick,
+             kMinIdleTicks +
+                 (kLive + IoUringEventLoop::kIdleTrimMaxTrims - 1) /
+                     IoUringEventLoop::kIdleTrimMaxTrims -
+                 1);
     CHECK_EQ(resident_pages(sample->recv_slice, SlicePool::kSliceSize), 0u);
     CHECK_EQ(resident_pages(sample->send_slice, SlicePool::kSliceSize), 0u);
+    // Further ticks (well before the 60 s expiry) examine nothing at all.
+    for (u32 t = 0; t < 20; t++) CHECK_EQ(tick_delta(r).examined, 0u);
+}
 
-    // Every connection was trimmed exactly once; further sweeps do nothing.
-    for (u32 i = 0; i < 100; i++) r.loop->sweep_idle_trim(1);
-    CHECK_EQ(r.loop->idle_trim_conns, static_cast<u64>(kLive));
-    CHECK_EQ(r.loop->idle_trim_madvise, 2ull * kLive);
+TEST(iouring_idle_trim,
+     time_budget_bounds_each_tick_and_a_burst_beyond_the_window_is_partly_trimmed) {
+    // A wall-clock budget already spent after the first node: every tick still makes
+    // progress (one node) but no more, so a burst larger than window * rate is only
+    // partly trimmed in this idle period — the documented limit — and never over.
+    constexpr u32 kLive = 100;
+    TrimRig r;
+    if (!r.init(kLive + 8, false)) SKIP("io_uring unavailable");
+    r.loop->idle_trim_budget_ns = 1;
+    for (u32 i = 0; i < kLive; i++) REQUIRE(stage_idle(r, 100000 + static_cast<i32>(i)) != nullptr);
+    for (u32 t = 1; t <= 55; t++) {
+        const TickDelta d = tick_delta(r);
+        CHECK_EQ(d.examined,
+                 t < kMinIdleTicks || t >= kMinIdleTicks + IoUringEventLoop::kIdleTrimAgeWindow
+                     ? 0u
+                     : 1u);
+        CHECK_LE(d.trimmed, 1u);
+    }
+    CHECK_EQ(r.loop->idle_trim_conns, static_cast<u64>(IoUringEventLoop::kIdleTrimAgeWindow));
+}
+
+TEST(iouring_idle_trim, capacity_does_not_change_when_or_what_the_sweep_touches) {
+    constexpr u32 kBigCap = 100000;
+    constexpr u32 kSmallCap = 64;
+    constexpr u32 kLive = 10;
+    u32 trim_tick[2] = {0, 0};
+    const u32 caps[2] = {kSmallCap, kBigCap};
+    for (u32 v = 0; v < 2; v++) {
+        TrimRig r;
+        if (!r.init(caps[v], false)) SKIP("io_uring unavailable");
+        for (u32 i = 0; i < kLive; i++) REQUIRE(stage_idle(r, 100000 + static_cast<i32>(i)));
+        // Bytes of never-allocated slots must be neither read (counted) nor written.
+        const u32 kWatch = 32;
+        // alloc_conn hands out the highest ids first, so the low ids stay untouched.
+        Connection* watch = &r.loop->conns[0];
+        u8 snapshot[kWatch * sizeof(Connection)];
+        memcpy(snapshot, static_cast<void*>(watch), sizeof(snapshot));
+        for (u32 t = 1; t <= 30; t++) {
+            r.tick();
+            if (trim_tick[v] == 0 && r.loop->idle_trim_conns == kLive) trim_tick[v] = t;
+        }
+        CHECK_EQ(r.loop->idle_trim_conns, static_cast<u64>(kLive));
+        // Only the live aged connections were ever examined.
+        CHECK_EQ(r.loop->idle_trim_examined, static_cast<u64>(kLive));
+        CHECK_EQ(memcmp(snapshot, static_cast<void*>(watch), sizeof(snapshot)), 0);
+    }
+    CHECK_EQ(trim_tick[0], kMinIdleTicks);
+    CHECK_EQ(trim_tick[1], trim_tick[0]);
+}
+
+TEST(iouring_idle_trim, rearm_gives_a_busy_connection_a_fresh_examination) {
+    // Ineligible when its list is visited (a send still in flight), then idle: the
+    // examination is not repeated under the same arming, but the completion that
+    // ends the send re-arms the timer, and the new arming is examined at its own
+    // age 5 — well inside the window.
+    TrimRig r;
+    if (!r.init(8, false)) SKIP("io_uring unavailable");
+    Connection* c = stage_idle(r, 100000);
+    REQUIRE(c != nullptr);
+    c->send_armed = true;
+    for (u32 i = 0; i < 8; i++) r.tick();  // ages 1..8: examined (busy) at age 5
+    CHECK_EQ(r.loop->idle_trim_examined, 1u);
+    CHECK_EQ(r.loop->idle_trim_conns, 0u);
+    c->send_armed = false;
+    for (u32 i = 0; i < 10; i++) r.tick();  // same arming: not examined again
+    CHECK_EQ(r.loop->idle_trim_examined, 1u);
+    CHECK_EQ(r.loop->idle_trim_conns, 0u);
+    r.loop->timer.refresh(c, r.loop->keepalive_timeout);  // the completion event
+    for (u32 i = 0; i < kMinIdleTicks - 1; i++) r.tick();
+    CHECK_EQ(r.loop->idle_trim_conns, 0u);
+    r.tick();
+    CHECK_EQ(r.loop->idle_trim_conns, 1u);
+    CHECK_EQ(r.loop->idle_trim_examined, 2u);
+}
+
+TEST(iouring_idle_trim, stalled_loop_ticking_several_times_at_once_still_trims) {
+    TrimRig r;
+    if (!r.init(8, false)) SKIP("io_uring unavailable");
+    Connection* a = stage_idle(r, 100000);  // armed now
+    REQUIRE(a != nullptr);
+    r.tick(3);  // a is 3 ticks old: too young
+    CHECK_EQ(r.loop->idle_trim_examined, 0u);
+    Connection* b = stage_idle(r, 100001);  // armed 3 ticks later than a
+    REQUIRE(b != nullptr);
+    r.tick(9);  // stall: a is 12, b is 9 old — both inside the window in one go
+    CHECK_EQ(r.loop->idle_trim_conns, 2u);
+    CHECK_EQ(resident_pages(a->recv_slice, SlicePool::kSliceSize), 0u);
+    CHECK_EQ(resident_pages(b->send_slice, SlicePool::kSliceSize), 0u);
+    r.tick(20);
+    CHECK_EQ(r.loop->idle_trim_examined, 2u);
+}
+
+TEST(iouring_idle_trim, wheel_cursor_wraps_and_each_idle_period_trims_once) {
+    TrimRig r;
+    if (!r.init(8, false)) SKIP("io_uring unavailable");
+    Connection* c = stage_idle(r, 100000);
+    REQUIRE(c != nullptr);
+    for (u32 period = 1; period <= 6; period++) {  // 6 x 40 ticks: several wheel laps
+        for (u32 t = 0; t < 40; t++) r.tick();
+        CHECK_EQ(r.loop->idle_trim_conns, static_cast<u64>(period));
+        CHECK_EQ(r.loop->idle_trim_madvise, 2ull * period);
+        c->recv_slice[0] = 1;  // dirty again, as a served request would
+        c->send_slice[0] = 1;
+        r.loop->timer.refresh(c, r.loop->keepalive_timeout);  // ...and re-arm
+    }
+    CHECK_GT(r.loop->timer.cursor, 2 * TimerWheel::kSlots);
+}
+
+TEST(iouring_idle_trim, unusable_timeouts_make_the_sweep_a_no_op_and_small_ones_clip_the_ages) {
+    TrimRig r;
+    if (!r.init(8, false)) SKIP("io_uring unavailable");
+    auto& loop = *r.loop;
+    // Timeouts that leave no age >= the minimum (or would wrap the wheel): no work,
+    // and nothing may be examined or trimmed.
+    const u32 unusable[] = {0, 1, kMinIdleTicks, TimerWheel::kSlots, 1000};
+    for (u32 v : unusable) {
+        loop.keepalive_timeout = v;
+        loop.upstream_timeout = v;
+        Connection* c = stage_idle(r, 100000);
+        REQUIRE(c != nullptr);
+        for (u32 t = 0; t < 8; t++) loop.sweep_idle_trim();
+        CHECK_EQ(loop.idle_trim_examined, 0u);
+        loop.timer.remove(c);
+        c->fd = -1;
+        loop.free_conn(*c);
+    }
+    // A timeout only a little above the minimum: the one usable age is honoured.
+    loop.keepalive_timeout = kMinIdleTicks + 2;
+    loop.upstream_timeout = loop.keepalive_timeout;
+    Connection* c = stage_idle(r, 100000);
+    REQUIRE(c != nullptr);
+    for (u32 t = 0; t < kMinIdleTicks + 1; t++) r.tick();
+    CHECK_EQ(loop.idle_trim_conns, 1u);
+    loop.timer.remove(c);
+    c->fd = -1;
+    loop.free_conn(*c);
+}
+
+TEST(iouring_idle_trim, discard_failure_does_not_mark_or_count_the_connection) {
+    TrimRig r;
+    if (!r.init(4, false)) SKIP("io_uring unavailable");
+    auto& loop = *r.loop;
+    Connection* c = stage_idle(r, 100000);
+    REQUIRE(c != nullptr);
+    // Rebind both buffers to memory the pool does not own: eligible (the binding is
+    // consistent) but discard_bound() refuses every slice.
+    alignas(4096) static u8 foreign[2][SlicePool::kSliceSize];
+    u8* const real_recv = c->recv_slice;
+    u8* const real_send = c->send_slice;
+    c->recv_slice = foreign[0];
+    c->send_slice = foreign[1];
+    c->recv_buf.bind(foreign[0], SlicePool::kSliceSize);
+    c->send_buf.bind(foreign[1], SlicePool::kSliceSize);
+    REQUIRE(loop.idle_trim_eligible(*c));
+    for (u32 t = 0; t < 8; t++) r.tick();
+    CHECK_EQ(loop.idle_trim_examined, 1u);
+    CHECK_EQ(loop.idle_trim_madvise, 0u);
+    CHECK_EQ(loop.idle_trim_conns, 0u);  // not counted as trimmed
+    c->recv_slice = real_recv;
+    c->send_slice = real_send;
+    c->recv_buf.bind(real_recv, SlicePool::kSliceSize);
+    c->send_buf.bind(real_send, SlicePool::kSliceSize);
+}
+
+TEST(iouring_idle_trim, rotation_keeps_expiry_refresh_and_remove_working) {
+    TrimRig r;
+    if (!r.init(8, true)) SKIP("io_uring unavailable");
+    REQUIRE(add_routes(r));
+    i32 cli[4];
+    std::string resp;
+    for (u32 i = 0; i < 4; i++) {
+        cli[i] = r.connect_client();
+        REQUIRE_GE(cli[i], 0);
+        REQUIRE(r.exchange(cli[i], kReqA, resp));
+    }
+    auto live = [&] {
+        u32 n = 0;
+        for (u32 i = 0; i < r.loop->connection_capacity; i++) n += r.loop->conns[i].fd >= 0;
+        return n;
+    };
+    // All four were armed at the same cursor, so they share one wheel list.
+    REQUIRE_EQ(live(), 4u);
+    const u32 c0 = r.loop->timer.cursor;
+    for (u32 t = 0; t < 8; t++) r.tick();  // rotates and trims all four
+    CHECK_EQ(r.loop->idle_trim_conns, 4u);
+
+    // Client 0 sends a request on its rotated node (timer.refresh), client 2 hangs
+    // up (timer.remove through close_conn); 1 and 3 keep their original deadline.
+    REQUIRE(r.exchange(cli[0], kReqA, resp));
+    const u32 c0_refresh = r.loop->timer.cursor;
+    ::close(cli[2]);
+    REQUIRE(r.pump([&] { return live() == 3u; }));
+    // 60 s keep-alive: alive through tick c0+59, expired by the tick that pops c0+60.
+    while (r.loop->timer.cursor < c0 + r.loop->keepalive_timeout) {
+        r.tick();
+        CHECK_EQ(live(), 3u);
+    }
+    r.tick();  // pops list c0 + 60
+    REQUIRE(r.pump([&] { return live() == 1u; }));
+    // The refreshed connection expires on its own, later deadline, not before.
+    while (r.loop->timer.cursor < c0_refresh + r.loop->keepalive_timeout) {
+        r.tick();
+        CHECK_EQ(live(), 1u);
+    }
+    r.tick();
+    REQUIRE(r.pump([&] { return live() == 0u; }));
+    for (u32 i = 0; i < 4; i++) ::close(cli[i]);
 }
 
 TEST(iouring_idle_trim, every_non_whitelisted_state_is_ineligible) {
@@ -613,6 +851,26 @@ TEST(iouring_idle_trim, every_non_whitelisted_state_is_ineligible) {
         {"idle-return fd",
          [](auto&, auto& c) { c.idle_return_fd = 7; },
          [](auto&, auto& c) { c.idle_return_fd = -1; }},
+        // Neutrality checks shared with submit_staged_local_response_impl: an upstream
+        // send can outlive upstream_send_armed, so its ledgers must veto the trim.
+        {"upstream send in backend",
+         [](auto& l, auto& c) { l.backend.upstream_send_state[c.id].remaining = 9; },
+         [](auto& l, auto& c) { l.backend.upstream_send_state[c.id].remaining = 0; }},
+        {"unaccounted in-flight op",
+         [](auto&, auto& c) { c.pending_ops = 2; },
+         [](auto&, auto& c) { c.pending_ops = 1; }},
+        {"upstream request incomplete",
+         [](auto&, auto& c) { c.upstream_request_incomplete = true; },
+         [](auto&, auto& c) { c.upstream_request_incomplete = false; }},
+        {"response mutations snapshotted",
+         [](auto&, auto& c) { c.response_mutations_snapshotted = true; },
+         [](auto&, auto& c) { c.response_mutations_snapshotted = false; }},
+        {"response-read deadline owner",
+         [](auto&, auto& c) { c.response_read_deadline_send_close_generation = 1; },
+         [](auto&, auto& c) { c.response_read_deadline_send_close_generation = 0; }},
+        {"backend failed",
+         [](auto& l, auto&) { l.backend.fatal_error.store(EPROTO); },
+         [](auto& l, auto&) { l.backend.fatal_error.store(0); }},
     };
     for (const Case& k : cases) {
         k.apply(loop, *c);
@@ -629,22 +887,6 @@ TEST(iouring_idle_trim, every_non_whitelisted_state_is_ineligible) {
         CHECK(!loop.idle_trim_eligible(*c));
     }
     CHECK(loop.idle_trim_eligible(*c));
-
-    // An ineligible sighting forgets the candidate mark: the idle period restarts.
-    loop.sweep_idle_trim(1);
-    CHECK_EQ(c->idle_trim_phase, IoUringEventLoop::kIdleTrimCandidate);
-    c->send_armed = true;
-    loop.sweep_idle_trim(1);
-    CHECK_EQ(c->idle_trim_phase, IoUringEventLoop::kIdleTrimNone);
-    c->send_armed = false;
-    for (u32 i = 0; i < 4; i++) loop.sweep_idle_trim(1);
-    CHECK_EQ(loop.idle_trim_conns, 0u);  // threshold measured from the restart
-    for (u32 i = 0; i < 4; i++) loop.sweep_idle_trim(1);
-    CHECK_EQ(loop.idle_trim_conns, 1u);
-    // A completed request since the trim re-arms it for a new idle period.
-    c->handler_gen++;
-    for (u32 i = 0; i < 12; i++) loop.sweep_idle_trim(1);
-    CHECK_EQ(loop.idle_trim_conns, 2u);
 }
 
 TEST(iouring_idle_trim, upstream_recv_slice_is_trimmed_only_when_quiet) {
@@ -659,31 +901,42 @@ TEST(iouring_idle_trim, upstream_recv_slice_is_trimmed_only_when_quiet) {
     c->upstream_recv_buf.bind(up, SlicePool::kSliceSize);
     up[0] = 1;
     static const u8 kByte = 0;
-    auto run_to_trim = [&] {
-        for (u32 i = 0; i < 12; i++) loop.sweep_idle_trim(1);
+    // One idle period: re-arm (as the last request event would), then age past 5.
+    auto run_period = [&] {
+        loop.timer.refresh(c, loop.keepalive_timeout);
+        for (u32 i = 0; i < 8; i++) r.tick();
     };
 
     // Buffered upstream bytes: client slices still trim, the upstream slice is left alone.
     REQUIRE_EQ(c->upstream_recv_buf.write(&kByte, 1), 1u);
-    run_to_trim();
+    run_period();
     CHECK_EQ(loop.idle_trim_conns, 1u);
     CHECK_EQ(loop.idle_trim_madvise, 2u);
     CHECK_EQ(resident_pages(up, SlicePool::kSliceSize), 1u);
 
     // Quiet upstream side: a later idle period trims it too.
     c->upstream_recv_buf.reset();
-    c->handler_gen++;
-    run_to_trim();
+    run_period();
     CHECK_EQ(loop.idle_trim_conns, 2u);
     CHECK_EQ(loop.idle_trim_madvise, 5u);  // 2 + (recv, send, upstream)
     CHECK_EQ(resident_pages(up, SlicePool::kSliceSize), 0u);
 
+    // upstream_send_len (a client send sourced from the upstream slice) is left
+    // stale after proxied responses: it must not stop the client slices from being
+    // trimmed, but it does keep the upstream slice itself.
+    up[0] = 1;
+    c->upstream_send_len = 266;
+    run_period();
+    CHECK_EQ(loop.idle_trim_conns, 3u);
+    CHECK_EQ(loop.idle_trim_madvise, 7u);  // + (recv, send)
+    CHECK_EQ(resident_pages(up, SlicePool::kSliceSize), 1u);
+    c->upstream_send_len = 0;
+
     // An outstanding direct upstream recv (kernel writes the slice) blocks everything.
     up[0] = 1;
     c->upstream_recv_direct_armed = true;
-    c->handler_gen++;
-    run_to_trim();
-    CHECK_EQ(loop.idle_trim_conns, 2u);
+    run_period();
+    CHECK_EQ(loop.idle_trim_conns, 3u);
     CHECK_EQ(resident_pages(up, SlicePool::kSliceSize), 1u);
     c->upstream_recv_direct_armed = false;
     c->upstream_recv_buf.bind(nullptr, 0);
@@ -703,7 +956,7 @@ TEST(iouring_idle_trim, non_empty_send_buffer_keeps_its_slice_untouched) {
     REQUIRE(c != nullptr);
     static const u8 kStale[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     REQUIRE_EQ(c->send_buf.write(kStale, sizeof(kStale) - 1), sizeof(kStale) - 1);
-    for (u32 i = 0; i < 12; i++) loop.sweep_idle_trim(1);
+    for (u32 i = 0; i < 12; i++) r.tick();
     CHECK_EQ(loop.idle_trim_conns, 1u);
     CHECK_EQ(loop.idle_trim_madvise, 1u);  // recv slice only
     CHECK_EQ(resident_pages(c->recv_slice, SlicePool::kSliceSize), 0u);

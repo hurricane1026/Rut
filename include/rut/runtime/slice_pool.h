@@ -11,10 +11,11 @@ namespace rut {
 // SlicePool — fixed-size (16KB) memory slice allocator with lazy commit.
 //
 // Per-shard pool of 16KB slices for network I/O buffers. Free/unaccepted slots
-// hold 0 slices and the pool retains only a bounded idle working set. The
-// io_uring/epoll loops bind a connection's receive and send slices at accept and
-// keep them until close; the io_uring loop returns the dirty pages of long-idle
-// keep-alive connections with discard_bound() (IoUringEventLoop::sweep_idle_trim).
+// hold 0 slices and the pool retains only a bounded idle working set. Every
+// event loop (io_uring, epoll, kqueue) binds a connection's receive and send
+// slices at accept and keeps them until close; the io_uring loop returns the
+// dirty pages of long-idle keep-alive connections with discard_bound()
+// (IoUringEventLoop::sweep_idle_trim).
 //
 // Memory strategy: reserve full VA range upfront (PROT_NONE — no physical
 // pages), then mprotect slices to PROT_READ|PROT_WRITE on first use. This

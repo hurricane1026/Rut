@@ -5922,34 +5922,57 @@ public:
     //
     // Every connection keeps its request-receive and send slices bound for its
     // whole life, so pages dirtied while serving a request stay resident however
-    // long the connection then sits idle (8-20 KiB per connection; ~2 GiB at 100K
-    // idle). A 1 Hz incremental sweep hands those pages back with MADV_DONTNEED
-    // for a connection that is provably at rest — bindings, pointers and
-    // capacities are untouched, the next request just re-faults zero pages.
+    // long the connection then sits idle (8-20 KiB per connection). Once a
+    // connection has been idle for a few seconds this hands those pages back with
+    // MADV_DONTNEED — bindings, pointers and capacities are untouched, the next
+    // request just re-faults zero pages.
     //
-    // Cost: kIdleTrimSlotsPerTick slot examinations per tick (a full sweep of the
-    // default 16384 slots is 16 ticks; measured ~10 us per tick over free slots,
-    // ~150 us over live ones) and at most kIdleTrimMaxPerTick connections trimmed
-    // per tick (2-3 madvise calls each, ~1 us per connection: <= ~0.6 ms per tick),
-    // so a mass-idle event spreads over several ticks instead of stalling the
-    // shard. Nothing is added to any request path: "no activity since the candidate
-    // pass" is read off handler_gen, which on_header_received already bumps once per
-    // complete request.
-    static constexpr u32 kIdleTrimSlotsPerTick = 1024;
-    static constexpr u32 kIdleTrimMaxPerTick = 512;
-    // A candidate is trimmed only once it has been idle this many ticks (seconds)
-    // and a later pass still finds it idle with an unchanged handler_gen; the
-    // default keep-alive timeout is 60 s, so a trimmed connection is one that
-    // would otherwise have held its dirty pages for most of that time.
+    // Driven from the timer wheel, not from a scan of the connection slots. A
+    // connection waiting in keep-alive sits in the wheel list that pops at
+    // (arm tick + keepalive_timeout), and the timer is re-armed by every request
+    // and response event, so "list whose expiry is `S - age` ticks away" is
+    // exactly "connections whose last activity was `age` ticks ago". Each tick
+    // visits the lists aged [kIdleTrimMinIdleTicks, +kIdleTrimAgeWindow), oldest
+    // first, and examines only the nodes it finds there: cost follows the
+    // connections that newly aged, not the slot capacity or the live population,
+    // and no slot is ever indexed by number — the wheel holds only live,
+    // allocated connections, so never-allocated slots are neither read nor written.
+    //
+    // Examined nodes are rotated to the tail of their list and stamped with the
+    // list's expiry tick (Connection::idle_trim_epoch); a walk stops at the first
+    // stamped node, so each connection is handled once per arming, a list longer
+    // than the per-tick budget is finished on the following ticks (the same list
+    // is visited again one age later), and handled nodes are never walked again.
+    // Reordering within a list is invisible to TimerWheel::tick(), which drains
+    // the whole list. A connection that was busy when examined is not retried under
+    // the same arming: whatever kept it busy ends with a dispatched completion,
+    // which re-arms its timer into a fresh list and so a fresh examination.
+    //
+    // Nothing is added to any request path. The sweep runs on the shard thread, so
+    // its per-tick work is bounded in time: it stops after kIdleTrimBudgetNs of
+    // wall clock (checked after every examined node), and also after
+    // kIdleTrimMaxExamined nodes or kIdleTrimMaxTrims trims, whichever comes first.
+    // Measured cost of a trim is 0.7-7 us (2 madvise calls freeing 2-5 dirty pages;
+    // it depends on how many pages the connection had resident), an examination of
+    // a non-trimmable node ~0.15-0.25 us, so the added stall is at most ~1.3 ms per
+    // tick and the trim rate ranges from ~170/s (7 us each) to the kIdleTrimMaxTrims
+    // cap. A list is revisited on each of kIdleTrimAgeWindow consecutive ticks, so a
+    // burst that goes idle within one second is trimmed completely when it is no
+    // larger than about window * rate (measured: 10000 connections took 10-25 ticks).
+    // Whatever remains when the window closes is simply not trimmed for that idle
+    // period; its next request starts a new one. The window (ages 5..44) closes 15
+    // ticks before the default 60 s keep-alive expiry; it is clipped for smaller
+    // timeouts (see sweep_idle_trim).
     static constexpr u32 kIdleTrimMinIdleTicks = 5;
-    static constexpr u8 kIdleTrimNone = 0;
-    static constexpr u8 kIdleTrimCandidate = 1;
-    static constexpr u8 kIdleTrimTrimmed = 2;
-    u32 idle_trim_cursor = 0;
-    u32 idle_trim_clock = 0;
+    static constexpr u32 kIdleTrimAgeWindow = 40;
+    static constexpr u32 kIdleTrimMaxExamined = 2048;
+    static constexpr u32 kIdleTrimMaxTrims = 1024;
+    static constexpr u64 kIdleTrimBudgetNs = 1200000;
+    u64 idle_trim_budget_ns = kIdleTrimBudgetNs;  // per-tick wall-clock budget (tests)
     // Observability / test counters; touched only by the sweep.
-    u64 idle_trim_conns = 0;    // connections trimmed
-    u64 idle_trim_madvise = 0;  // successful slice discards
+    u64 idle_trim_examined = 0;  // wheel nodes examined
+    u64 idle_trim_conns = 0;     // connections trimmed
+    u64 idle_trim_madvise = 0;   // successful slice discards
 
     // True only for plain HTTP/1.1 keep-alive at rest between requests: nothing
     // can still read or write the receive/send slice contents. The downstream
@@ -5983,10 +6006,27 @@ public:
         if (c.id >= connection_capacity) return false;
         const auto& send = backend.send_state[c.id];
         if (send.remaining != 0 || send.file_fd >= 0) return false;
+        // Neutrality checks shared with submit_staged_local_response_impl:
+        // detach_upstream_close / return_idle_upstream clear upstream_send_armed
+        // without waiting for the CQE, so an upstream IORING_OP_SEND that reads
+        // recv_buf/send_buf can outlive the flag; these ledgers still record it.
+        // (upstream_send_len is deliberately not here: it only describes a client
+        // send sourced from upstream_recv_buf and is left stale after every
+        // proxied response, so vetoing on it would exempt all proxied connections;
+        // idle_trim_upstream_slice_quiet applies it to that one slice.)
+        if (backend.upstream_send_state[c.id].remaining != 0 || c.upstream_request_incomplete ||
+            c.response_mutations_snapshotted || !c.response_read_deadline_owner_is_neutral() ||
+            backend.failure_code() != 0)
+            return false;
         // The downstream recv must be the armed multishot and not mid pause/rearm.
         if (!c.recv_armed || c.recv_paused_for_send || c.recv_pause_cancel_pending ||
             c.recv_pause_rearm_pending)
             return false;
+        // Backstop for any in-flight op the flags above failed to record: an idle
+        // plaintext connection has exactly that multishot recv outstanding
+        // (observed: pending_ops == 1 on idle keep-alive connections, both direct
+        // and after proxied exchanges).
+        if (c.pending_ops != 1u) return false;
         // No request in flight, no pending handler / yield / throttle / deadline.
         if (c.req_start_us != 0 || c.epoch_held || c.pending_handler_fn != nullptr ||
             c.yield_armed || c.yield_timeout_armed || c.throttle_paused ||
@@ -6019,57 +6059,88 @@ public:
     // touched and its presence (possible in-flight source) skips this slice too.
     [[nodiscard]] static bool idle_trim_upstream_slice_quiet(const Connection& c) {
         if (c.upstream_recv_slice == nullptr || c.upstream_relay_slice != nullptr ||
-            c.upstream_relay_send_len != 0 || c.upstream_recv_buf.is_released())
+            c.upstream_relay_send_len != 0 || c.upstream_send_len != 0 ||
+            c.upstream_recv_buf.is_released())
             return false;
         return c.upstream_recv_buf.data() == c.upstream_recv_slice &&
                c.upstream_recv_buf.len() == 0;
     }
 
-    // Examine one live slot; returns the number of connections trimmed (0 or 1).
-    u32 idle_trim_examine(Connection& c) {
-        if (!idle_trim_eligible(c)) {
-            c.idle_trim_phase = kIdleTrimNone;
-            return 0;
+    // Trim one examined connection; true only if at least one slice was released.
+    bool idle_trim_connection(Connection& c) {
+        if (!idle_trim_eligible(c)) return false;
+        bool any = false;
+        if (pool.discard_bound(c.recv_slice)) {
+            idle_trim_madvise++;
+            any = true;
         }
-        if (c.idle_trim_phase == kIdleTrimTrimmed && c.idle_trim_gen == c.handler_gen)
-            return 0;  // already clean for this idle period
-        if (c.idle_trim_phase == kIdleTrimCandidate && c.idle_trim_gen == c.handler_gen) {
-            if (idle_trim_clock - c.idle_trim_clock < kIdleTrimMinIdleTicks) return 0;
-            if (pool.discard_bound(c.recv_slice)) idle_trim_madvise++;
-            // A proxied request on a reused upstream socket leaves its retry-snapshot
-            // bytes in send_buf after completion (length kept, nothing will replay
-            // them); a non-empty send_buf is never touched, so that slice stays as is.
-            if (c.send_buf.len() == 0 && pool.discard_bound(c.send_slice)) idle_trim_madvise++;
-            if (idle_trim_upstream_slice_quiet(c) && pool.discard_bound(c.upstream_recv_slice))
-                idle_trim_madvise++;
-            c.idle_trim_phase = kIdleTrimTrimmed;
-            idle_trim_conns++;
-            return 1;
+        // A proxied request on a reused upstream socket leaves its retry-snapshot
+        // bytes in send_buf after completion (length kept, nothing will replay
+        // them); a non-empty send_buf is never touched, so that slice stays as is.
+        if (c.send_buf.len() == 0 && pool.discard_bound(c.send_slice)) {
+            idle_trim_madvise++;
+            any = true;
         }
-        // First sighting, or a request completed since the last mark: (re)start.
-        c.idle_trim_phase = kIdleTrimCandidate;
-        c.idle_trim_gen = c.handler_gen;
-        c.idle_trim_clock = idle_trim_clock;
-        return 0;
+        if (idle_trim_upstream_slice_quiet(c) && pool.discard_bound(c.upstream_recv_slice)) {
+            idle_trim_madvise++;
+            any = true;
+        }
+        if (any) idle_trim_conns++;
+        return any;
     }
 
-    void sweep_idle_trim(u32 ticks) {
-        idle_trim_clock += ticks;
-        // Single sweep bound; switch to the initialised-slot watermark if slots
-        // become lazily initialised (only fd/state-style fields valid on a reset
-        // slot are read before eligibility is established).
-        const u32 kBound = connection_capacity;
-        if (kBound == 0) return;
-        u32 cursor = idle_trim_cursor < kBound ? idle_trim_cursor : 0;
-        u32 budget = kBound < kIdleTrimSlotsPerTick ? kBound : kIdleTrimSlotsPerTick;
-        u32 trimmed = 0;
-        while (budget != 0 && trimmed < kIdleTrimMaxPerTick) {
-            Connection& c = conns[cursor];
-            if (++cursor == kBound) cursor = 0;
-            budget--;
-            if (c.fd >= 0) trimmed += idle_trim_examine(c);
+    // Walk the wheel list that pops at `expiry`, examining nodes not yet handled
+    // since it was filled. Returns false once a per-tick budget is exhausted.
+    bool idle_trim_walk_list(u32 expiry, u64 deadline_ns, u32& examined, u32& trimmed) {
+        ListNode* head = &timer.slots[expiry & (TimerWheel::kSlots - 1)];
+        ListNode* const last = head->prev;  // rotated nodes land after this one
+        if (last == head) return true;
+        const u32 stamp = expiry + 1;  // Connection::idle_trim_epoch 0 == never
+        const u64 node_offset = TimerWheel::timer_node_offset();
+        ListNode* node = head->next;
+        for (;;) {
+            if (examined == kIdleTrimMaxExamined || trimmed == kIdleTrimMaxTrims) return false;
+            auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - node_offset);
+            if (c->idle_trim_epoch == stamp) return true;  // reached the handled region
+            ListNode* const next = node->next;
+            const bool at_end = node == last;
+            c->idle_trim_epoch = stamp;
+            node->remove();
+            head->prev->insert_after(node);
+            examined++;
+            idle_trim_examined++;
+            if (idle_trim_connection(*c)) trimmed++;
+            // The time budget is checked after the node, so every tick makes progress.
+            if (monotonic_ns() >= deadline_ns) return false;
+            if (at_end) return true;
+            node = next;
         }
-        idle_trim_cursor = cursor;
+    }
+
+    // Once per timer tick, after TimerWheel::tick() has advanced the cursor. The
+    // keep-alive timer was armed `age` ticks ago iff its list pops at
+    // cursor + keepalive_timeout - age (add() files a node under cursor + timeout,
+    // tick() pops slot `cursor` and then increments it). Idle connections are
+    // armed with keepalive_timeout by accept and by every request/response event
+    // (a proxied exchange finishing while state is still Proxying re-arms with
+    // keepalive_timeout too: measured, they are found here). A timeout too small
+    // for the age range or too large for the wheel (it would wrap) contributes only
+    // the ages that fit, or nothing. A stalled loop that ticked several times at
+    // once ages every node by that much; the window is wider than any realistic
+    // stall, and a longer one only skips nodes that are about to expire anyway.
+    void sweep_idle_trim() {
+        const u32 timeout = keepalive_timeout;
+        if (timeout >= TimerWheel::kSlots || timeout <= kIdleTrimMinIdleTicks) return;
+        const u64 deadline_ns = monotonic_ns() + idle_trim_budget_ns;
+        u32 examined = 0;
+        u32 trimmed = 0;
+        for (u32 back = kIdleTrimAgeWindow; back-- != 0;) {
+            const u32 age = kIdleTrimMinIdleTicks + back;
+            if (age >= timeout) continue;
+            if (!idle_trim_walk_list(
+                    timer.cursor + (timeout - age), deadline_ns, examined, trimmed))
+                return;
+        }
     }
 
     void dispatch(const IoEvent& ev) {
@@ -6183,7 +6254,7 @@ public:
                         }
                     }
                 } else {
-                    sweep_idle_trim(static_cast<u32>(ticks));
+                    sweep_idle_trim();
                 }
                 break;
             }
