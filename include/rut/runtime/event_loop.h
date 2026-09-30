@@ -163,10 +163,16 @@ public:
             // appended to recv_buf by the backend) are its next chunk, which
             // on_upstream_request_sent / on_request_body_sent pick up. Keep them.
             const bool kBodyInFlight = conn.request_body_incomplete();
-            if constexpr (requires { self().pause_recv(conn); }) {
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
                 // io_uring: the multishot recv keeps filling recv_buf while the upstream
                 // send drains it, and a CQE that does not fit is lost. Pause before the
                 // buffer can overflow; continue_request_body resumes once it is free.
+                // Plaintext only: a TLS connection never reaches here (tls_recv owns its
+                // recv slot) and its overflow is in tls_in_buf, which this headroom does
+                // not watch. A TLS pause was measured to move the one-write threshold
+                // not at all (the burst is already queued), so TLS has no pause and
+                // overflows at ~33 KB of body (ciphertext in tls_in_buf) -> 413.
                 static_assert(kRequestBodyRecvHeadroom == 2 * kProvidedBufSize);
                 if (kBodyInFlight && !conn.recv_paused_for_send &&
                     conn.recv_buf.write_avail() < kRequestBodyRecvHeadroom) {
@@ -192,7 +198,8 @@ public:
             // which accounts the request and closes this connection; a client
             // that read it and reset must not pre-empt that completion.
             if (conn.direct_write_completion_pending) return;
-            if constexpr (requires { self().pause_recv(conn); }) {
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
                 // io_uring: a request-body CQE overflowed recv_buf, so its uncopied
                 // tail is gone. Answer 413 (and let that response drain) instead of
                 // a silent close.

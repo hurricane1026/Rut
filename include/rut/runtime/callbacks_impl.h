@@ -1555,6 +1555,8 @@ void respond_upstream_timeout(Loop* loop, Connection& conn);
 template <typename Loop>
 void respond_request_body_overflow(Loop* loop, Connection& conn);
 template <typename Loop>
+void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
 inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 
 template <typename Loop>
@@ -5140,14 +5142,38 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         close_conn_if_live(loop, conn);
 }
 
-// A downstream recv CQE did not fit in recv_buf while the request body was still
-// streaming upstream (io_uring: wait() copies min(nbytes, room) and drops the rest,
-// reporting -ENOBUFS). The body can no longer be forwarded intact, so refuse the
-// request: answer 413 and close, never forward a truncated body or close silently.
+// STOPGAP, not streaming. A downstream recv CQE did not fit in recv_buf while the
+// request body was still being forwarded upstream (io_uring: wait() copies
+// min(nbytes, room) and drops the rest, reporting -ENOBUFS), so the body can no
+// longer be forwarded intact. Answer 413 + Connection: close instead of hanging or
+// closing silently; never forward a truncated body.
+//
+// Effective limit on io_uring: a body that arrives faster than the upstream send
+// drains the 16 KiB recv_buf slice gets 413, e.g. a one-write client body above
+// ~16 KiB (curl --data-binary at 20 KB / 100 KB / 1 MiB -> 413), and a paced client
+// to a slow origin once a resume lets the multishot pull its whole backlog at once.
+// Bodies that fit (one write up to ~16 KiB) and uploads that stay paced below the
+// drain rate are forwarded byte-exact. Lossless streaming (a per-connection
+// parked-CQE FIFO in wait()) is tracked as a follow-up and will lift this ceiling.
+//
+// An upstream that already answered (early 401 and the like) keeps priority: its
+// buffered response is delivered through the existing early-response path and the
+// rest of the body is dropped, instead of being replaced by our 413. Best effort
+// only: the overflow CQE usually lands before the upstream's reply is read, in
+// which case the 413 still wins.
+//
 // Same admission shape as respond_upstream_timeout (plain, policy-free proxying
 // before any response byte); anything else keeps the plain close.
 template <typename Loop>
 void respond_request_body_overflow(Loop* loop, Connection& conn) {
+    if (conn.state == ConnState::Proxying && !conn.proxy_resp_started && !conn.upstream_abandoned &&
+        (conn.upstream_recv_buf.len() > 0 ||
+         conn.on_upstream_send == &on_body_send_with_early_response<Loop>)) {
+        // The upstream send completion (on_request_body_sent / on_upstream_request_sent /
+        // on_body_send_with_early_response) picks the buffered response up and marks
+        // the upload abandoned. Nothing more to forward, nothing to reject.
+        return;
+    }
     conn.req_body_overflow_rejected = true;
     if (conn.state != ConnState::Proxying || conn.proxy_resp_started ||
         conn.response_read_deadline_state != ResponseReadDeadlineState::None ||
@@ -7416,6 +7442,12 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
 // what is already buffered as the next chunk instead of waiting for a recv that
 // the still-armed multishot will never re-deliver. epoll/kqueue read only when a
 // recv is submitted, so there the buffer is empty here and this is a plain re-arm.
+//
+// Limit (stopgap, see respond_request_body_overflow): this only recovers bytes that
+// wait() managed to copy into the 16 KiB recv_buf. A body arriving faster than the
+// upstream send drains it overflows and the client gets 413; one-write bodies above
+// ~16 KiB and paced uploads to a slow origin hit this. Lossless streaming (a
+// parked-CQE FIFO in wait()) is a follow-up.
 template <typename Loop>
 void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
     conn.consume_request_receive_buffer(sent);
@@ -7584,8 +7616,11 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         conn.req_body_streamed = true;
         conn.request_upload_complete = false;
         reserve_response_mutation_snapshot(conn);
-        continue_request_body<Loop>(
-            loop, conn, conn.retry_req_send_len == 0 ? conn.req_initial_send_len : 0);
+        // The sent prefix is always recv_buf[0, req_initial_send_len): an incomplete body
+        // is never replayed from send_buf (request_body_replayable refuses it), and the
+        // reserve above may itself set retry_req_send_len for the mutation snapshot,
+        // which says nothing about how much of recv_buf went upstream.
+        continue_request_body<Loop>(loop, conn, conn.req_initial_send_len);
         return;
     }
 
@@ -9299,7 +9334,8 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     if (ev.result <= 0) {
         // io_uring: the CQE did not fit in recv_buf and its tail was dropped.
-        if constexpr (requires(Loop* l, Connection& c) { l->pause_recv(c); }) {
+        if constexpr (loop_backend_async_io<Loop>() &&
+                      requires(Loop* l, Connection& c) { l->pause_recv(c); }) {
             if (ev.result == -ENOBUFS && conn.request_body_incomplete()) {
                 respond_request_body_overflow<Loop>(loop, conn);
                 return;
@@ -9472,11 +9508,7 @@ void ws_stop_client_poll(Loop* loop, Connection& conn) {
 // Sync backends (epoll) leave the bytes in the socket, so pausing is safe.
 template <typename Loop>
 constexpr bool ws_loop_async() {
-    if constexpr (requires { decltype(Loop::backend)::kAsyncIo; }) {
-        return decltype(Loop::backend)::kAsyncIo;
-    } else {
-        return false;
-    }
+    return loop_backend_async_io<Loop>();
 }
 
 // Drive the bidirectional Close handshake: submit a Close frame on each peer's send slot

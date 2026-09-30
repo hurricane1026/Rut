@@ -49,6 +49,18 @@ enum class BodyMode : u8 {
 // upstream send completes and the sent prefix is dropped.
 inline constexpr u32 kRequestBodyRecvHeadroom = 8192;
 
+// True when the loop's backend completes recvs asynchronously into provided buffers
+// (io_uring: kAsyncIo). Gates the request-body pause / 413 logic, which only exists
+// there; a sync mock loop that merely defines pause_recv must not run it.
+template <typename Loop>
+constexpr bool loop_backend_async_io() {
+    if constexpr (requires { decltype(Loop::backend)::kAsyncIo; }) {
+        return decltype(Loop::backend)::kAsyncIo;
+    } else {
+        return false;
+    }
+}
+
 // Active wire protocol on a connection, fixed after the TLS handshake from the
 // ALPN result (plaintext connections stay Http11). Drives parse/serialize path.
 enum class ConnProtocol : u8 {
