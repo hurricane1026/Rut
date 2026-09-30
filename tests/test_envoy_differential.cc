@@ -2189,6 +2189,11 @@ struct EnvoyInstance {
             unexpected_exit_description =
                 reaped ? describe_wait_status(status)
                        : "no child status could be reaped (waitpid failed, e.g. ECHILD)";
+            // Both failed: the removal above and the teardown reap. The
+            // caller's abort-retry report uses this description, so docker's
+            // error must survive alongside the child status.
+            if (docker_cleanup_failed)
+                unexpected_exit_description += "; " + cleanup_failure_description();
             return false;
         }
         if (docker_cleanup_failed) {
@@ -8594,6 +8599,65 @@ bool self_test_docker_cleanup_failure_blocks_retry() {
                 if (!has_exit || !has_docker_error) {
                     std::cerr << "FAIL [self-test docker cleanup blocks retry]: the " << branch
                               << " description must name both the early exit and docker's "
+                                 "removal error, got \""
+                              << description << "\"\n";
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // Case 4: a failed removal AND an unexpected teardown status. The child is
+    // alive when stop() runs, answers SIGTERM by exiting 3 (not a status the
+    // clean-teardown check accepts), and the docker stub keeps failing: the
+    // description must still carry docker's error next to "exited 3".
+    {
+        const std::string stub_path = dir.path() + "/docker-fail-during-teardown";
+        if (!write_docker_stub(stub_path, 1, "Cannot connect to the Docker daemon")) {
+            std::cerr << "FAIL [self-test docker cleanup blocks retry]: could not write the "
+                         "docker stub (fail-during-teardown case)\n";
+            ok = false;
+        } else {
+            ScopedDockerBinOverride docker_override(stub_path);
+            // The handler is installed before fork() (and restored in the
+            // parent right after) so the child inherits it: installing it in
+            // the child would race stop()'s SIGTERM.
+            struct sigaction exit_3{};
+            exit_3.sa_handler = +[](int) { _exit(3); };
+            struct sigaction saved_term{};
+            sigaction(SIGTERM, &exit_3, &saved_term);
+            const pid_t child = fork();
+            if (child != 0) sigaction(SIGTERM, &saved_term, nullptr);
+            if (child < 0) {
+                std::cerr << "FAIL [self-test docker cleanup blocks retry]: fork failed "
+                             "(teardown case)\n";
+                ok = false;
+            } else if (child == 0) {
+                for (;;) pause();
+            } else {
+                EnvoyInstance envoy;
+                envoy.name = "rut-envoy-selftest-cleanup-blocks-retry-4";
+                envoy.launched = true;
+                envoy.pid = child;
+                if (envoy.stop()) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: stop() reported "
+                                 "success despite an unexpected teardown status and a failed "
+                                 "removal\n";
+                    ok = false;
+                }
+                if (!envoy.docker_cleanup_failed) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: "
+                                 "docker_cleanup_failed was not set for a removal that failed "
+                                 "during teardown\n";
+                    ok = false;
+                }
+                const std::string& description = envoy.unexpected_exit_description;
+                const bool has_exit = description.find("exited 3") != std::string::npos;
+                const bool has_docker_error =
+                    description.find("Cannot connect to the Docker daemon") != std::string::npos;
+                if (!has_exit || !has_docker_error) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: the teardown "
+                                 "description must name both the unexpected status and docker's "
                                  "removal error, got \""
                               << description << "\"\n";
                     ok = false;
