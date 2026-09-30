@@ -6565,12 +6565,12 @@ private:
             return;
         }
         switch (-result) {
-            // This one connection failed; the listener is fine.
+            // Immediate: the failing connection was consumed from the backlog,
+            // so the next accept makes progress.
             case ECONNABORTED:
             case EINTR:
             case EAGAIN:
             case EPROTO:
-            case EPERM:
             case ENOPROTOOPT:
             case ENETDOWN:
             case ENONET:
@@ -6580,14 +6580,16 @@ private:
                 rearm_accept();
                 return;
             // Permanent: the listener itself is unusable.
-            case ECANCELED:
             case EBADF:
             case ENOTSOCK:
             case EINVAL:
             case EOPNOTSUPP:
                 return;
-            // Resource exhaustion and unknown errors: immediate re-arm would
-            // spin (backlog still non-empty), so retry on the next tick.
+            // Deferred to the next tick: the backlog entry was not consumed
+            // (EMFILE/ENFILE/ENOBUFS/ENOMEM, LSM EPERM/EACCES), so an immediate
+            // re-arm would spin; or the cause is unknown. ECANCELED lands here
+            // too: our own close_listen() was filtered out above, so it is a
+            // kernel-side cancel (failed CQE post, io-wq cancel), not ours.
             default:
                 accept_rearm_pending = true;
                 return;

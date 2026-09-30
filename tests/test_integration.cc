@@ -7433,7 +7433,7 @@ TEST(shard, iouring_accept_rearms_after_emfile) {
     // The kernel snapshots RLIMIT_NOFILE when an accept SQE is prepared, so the
     // limit must be lowered before the shard arms its multishot accept. Lowest
     // free fd number == new soft limit: any further fd allocation fails.
-    const i32 probe = dup(0);
+    const i32 probe = dup(lfd);
     REQUIRE(probe >= 0);
     close(probe);
     struct rlimit tight = saved;
@@ -7445,12 +7445,15 @@ TEST(shard, iouring_accept_rearms_after_emfile) {
     // The kernel completes the handshake into the backlog; the shard's accept
     // fails with -EMFILE and the multishot request terminates.
     REQUIRE_EQ(connect(guard.fds[0], reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0);
-    usleep(200000);
+    // Prove the EMFILE path ran: while the limit is still tight the connection
+    // must NOT be served. (If the accept were armed late, or succeeded, this
+    // would be answered and the test would not be exercising re-arm at all.)
+    REQUIRE(send_all(guard.fds[0], HTTP_REQ, HTTP_REQ_LEN));
+    char buf[1024];
+    CHECK_EQ(recv_timeout(guard.fds[0], buf, sizeof(buf), 300), -EAGAIN);
     REQUIRE_EQ(setrlimit(RLIMIT_NOFILE, &saved), 0);
 
     // Re-armed on the next 1s tick: the queued connection is accepted and served.
-    REQUIRE(send_all(guard.fds[0], HTTP_REQ, HTTP_REQ_LEN));
-    char buf[1024];
     i32 n = recv_timeout(guard.fds[0], buf, sizeof(buf), 4000);
     REQUIRE_GT(n, 0);
     CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
