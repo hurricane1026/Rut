@@ -12358,8 +12358,16 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
     REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
     const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     REQUIRE_GE(client, 0);
+    // The sender's buffer alone is shrunk so the 4 MiB body cannot fit and
+    // sendfile(2) returns short. The client keeps its default receive buffer:
+    // a tiny SO_RCVBUF makes loopback TCP advertise a window below one MSS,
+    // and the sender can then sit in zero-window-probe backoff for minutes
+    // (POLLOUT never fires) however promptly the peer drains. That stalls
+    // the kernel, not the continuation under test. The timeout keeps a
+    // stalled transfer a test failure instead of a hung run.
     const i32 small = 4096;
-    REQUIRE_EQ(setsockopt(client, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)), 0);
+    const timeval recv_timeout{10, 0};
+    REQUIRE_EQ(setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout)), 0);
     REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     REQUIRE_GE(server, 0);
@@ -12465,6 +12473,10 @@ TEST(iouring_send, send_file_continues_on_pollout_and_completes_once) {
         ssize_t n;
         while ((n = recv(client, buf, sizeof(buf), MSG_DONTWAIT)) > 0)
             got.insert(got.end(), buf, buf + n);
+        // The CQE below stands in for the kernel's POLLOUT completion, so
+        // wait for the socket to really be writable rather than spinning.
+        pollfd pfd{server, POLLOUT, 0};
+        (void)poll(&pfd, 1, 1000);
         guard.sq_head = guard.sq_tail;
         backend.pending = 0;
         REQUIRE(guard.push_send_cqe(kGen, POLLOUT));
