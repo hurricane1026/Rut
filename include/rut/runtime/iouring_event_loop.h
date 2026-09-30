@@ -277,6 +277,11 @@ public:
     bool response_read_deadline_expiry_pending;
     bool response_read_deadline_body_pump_pending = false;
     MappedArray<u64> body_pump_ready_words;
+    // Downstream recvs that completed -ENOBUFS (provided ring empty): one bit
+    // per slot, re-armed by rearm_deferred_recvs() once buffers are back. The
+    // count keeps the ordinary hot path from touching the bitmap.
+    MappedArray<u64> recv_rearm_words;
+    u32 recv_rearm_count = 0;
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
         CompleteBody,
@@ -379,6 +384,16 @@ public:
             conns.destroy();
             return core::make_unexpected(ready_words.error());
         }
+        auto rearm_words = recv_rearm_words.init((capacity + 63u) / 64u);
+        if (!rearm_words) {
+            body_pump_ready_words.destroy();
+            backend.destroy_send_state_storage();
+            pending_free.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(rearm_words.error());
+        }
+        recv_rearm_count = 0;
         // conns[] is mapped but neither constructed nor reset (lazy pages);
         // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
         // the stack so pops ascend.
@@ -401,6 +416,8 @@ public:
         free_top = 0;
         response_read_deadline_body_pump_pending = false;
         body_pump_ready_words.destroy();
+        recv_rearm_words.destroy();
+        recv_rearm_count = 0;
         backend.destroy_send_state_storage();
         pending_free.destroy();
         free_stack.destroy();
@@ -537,6 +554,7 @@ public:
                 break;
             }
             dispatch_batch(events, n);
+            rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
             poll_command();
             // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
@@ -2888,6 +2906,8 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        // A recv waiting for buffers must not re-arm on a reused slot.
+        clear_deferred_recv(cid);
         // The h2 engine is a pool object, not a kernel buffer — safe to reclaim
         // now even with ops in flight (unlike the recv/send slices below).
         if (c.h2) {
@@ -2981,6 +3001,50 @@ public:
             deadline_send_close_cancel_owned;
         conns[cid].epoch_leave_deferred = epoch_leave_deferred;
         pending_free[pending_free_count++] = cid;
+    }
+
+    void defer_recv_rearm(const Connection& c) {
+        if (c.id >= connection_capacity || recv_rearm_words.data() == nullptr) return;
+        u64& word = recv_rearm_words[c.id >> 6];
+        const u64 bit = u64{1} << (c.id & 63u);
+        if ((word & bit) != 0) return;
+        word |= bit;
+        recv_rearm_count++;
+    }
+
+    void clear_deferred_recv(u32 cid) {
+        if (recv_rearm_count == 0 || cid >= connection_capacity) return;
+        u64& word = recv_rearm_words[cid >> 6];
+        const u64 bit = u64{1} << (cid & 63u);
+        if ((word & bit) == 0) return;
+        word &= ~bit;
+        recv_rearm_count--;
+    }
+
+    // Re-arm downstream recvs that completed with the provided ring empty. Their
+    // request bytes are still in the socket, so nothing was lost, but arming
+    // while the ring is still short of buffers would just complete -ENOBUFS
+    // again. Buffers are returned as wait() harvests, so only CQEs still queued
+    // hold any: re-arm once fewer than half the ring's buffers can be pinned
+    // that way. `force` (timer tick) skips that gate so a saturated CQ cannot
+    // starve a connection indefinitely. A recv that finds no SQE stays pending.
+    void rearm_deferred_recvs(bool force) {
+        if (recv_rearm_count == 0) return;
+        if (!force && backend.cq_unharvested() >= kProvidedBufCount / 2) return;
+        for (u32 w = 0; w < recv_rearm_words.size() && recv_rearm_count != 0; ++w) {
+            u64 bits = recv_rearm_words[w];
+            while (bits != 0) {
+                const u32 cid = (w << 6) + static_cast<u32>(__builtin_ctzll(bits));
+                bits &= bits - 1;
+                if (cid >= slots_initialized) {
+                    clear_deferred_recv(cid);
+                    continue;
+                }
+                Connection& c = conns[cid];
+                if (c.fd >= 0 && !submit_recv_impl(c)) return;  // SQ full: retry later
+                clear_deferred_recv(cid);
+            }
+        }
     }
 
     bool submit_recv_impl(Connection& c) {
@@ -6029,6 +6093,8 @@ public:
                 break;
             case IoEventType::Timeout: {
                 if (accept_rearm_pending) rearm_accept();
+                // Last resort for a recv the batch-end gate kept waiting.
+                rearm_deferred_recvs(/*force=*/true);
                 i32 ticks = ev.result > 0 ? ev.result : 1;
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
@@ -6134,6 +6200,23 @@ public:
                         }
                         conn.pending_ops--;
                         if (conn.fd < 0 && conn.pending_ops == 0) reclaim_slot(conn.id);
+                        break;
+                    }
+                    // The provided ring ran empty, so the kernel ended the multishot
+                    // recv before consuming any socket bytes: the request is still
+                    // in the socket and the peer did nothing wrong. Never close;
+                    // account the terminal and re-arm once buffers are back (see
+                    // rearm_deferred_recvs). Paused/boundary connections are
+                    // covered: submit_recv_impl parks the re-arm behind a pause.
+                    if (ev.type == IoEventType::Recv && ev.provided_ring_empty &&
+                        ev.result == -ENOBUFS && !ev.more) {
+                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        conn.recv_armed = false;
+                        if (conn.fd < 0) {
+                            if (conn.pending_ops == 0) reclaim_slot(conn.id);
+                            break;
+                        }
+                        defer_recv_rearm(conn);
                         break;
                     }
                     // A strict-retirement boundary may coexist with the

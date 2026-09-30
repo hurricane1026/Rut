@@ -410,6 +410,15 @@ struct IoUringBackend {
 
     i32 failure_code() const { return fatal_error.load(std::memory_order_acquire); }
 
+    // Completions the kernel has posted that wait() has not harvested yet. Each
+    // positive recv among them still holds its provided buffer, so this bounds
+    // how many buffers are missing from the ring right now.
+    u32 cq_unharvested() const {
+        if (cq_head == nullptr || cq_tail == nullptr) return 0;
+        return __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE) -
+               __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
+    }
+
     // Shutdown and unmap all resources.
     void shutdown();
 

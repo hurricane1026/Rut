@@ -40624,6 +40624,170 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     fixture.guard.loop->backend.shutdown();
 }
 
+// A downstream multishot recv that ends with -ENOBUFS (provided ring empty) has
+// consumed no socket bytes: the request is still queued in the socket. wait()
+// must flag it, and the loop must keep the connection open and re-arm the recv
+// only once buffers are back, exactly once.
+namespace {
+struct DownstreamRingEmptyFixture {
+    RawDownstreamRecvBatch raw;
+    i32 peer = -1;
+
+    bool init() {
+        if (!raw.init()) return false;
+        Connection& conn = *raw.conns[0];
+        i32 pair[2] = {-1, -1};
+        if (rut::test::stream_socketpair(pair) != 0) return false;
+        conn.fd = pair[0];  // real fd: a wrongful close_conn must not hit a stray descriptor
+        peer = pair[1];
+        conn.on_recv = &on_header_received<IoUringEventLoop>;
+        return true;
+    }
+
+    // Harvest one injected downstream terminal and dispatch it like run() does.
+    IoEvent terminal(i32 result) {
+        raw.append_terminal(*raw.conns[0], result);
+        IoEvent events[2]{};
+        if (raw.wait(events, 2) != 1u) return IoEvent{};
+        raw.guard.loop->dispatch(events[0]);
+        return events[0];
+    }
+
+    ~DownstreamRingEmptyFixture() {
+        if (peer >= 0) close(peer);
+        Connection& conn = *raw.conns[0];
+        if (conn.fd >= 0) {
+            close(conn.fd);
+            conn.fd = -1;
+        }
+        raw.guard.loop->recv_rearm_count = 0;
+    }
+};
+}  // namespace
+
+TEST(iouring_downstream_ring_empty, terminal_enobufs_is_flagged_and_rearmed_not_closed) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    Connection& conn = *f.raw.conns[0];
+    const i32 fd = conn.fd;
+
+    const IoEvent ev = f.terminal(-ENOBUFS);
+    CHECK_EQ(ev.type, IoEventType::Recv);
+    CHECK_EQ(ev.result, -ENOBUFS);
+    CHECK_EQ(ev.more, 0u);
+    CHECK_EQ(ev.provided_ring_empty, 1u);
+
+    // Not closed, terminal accounted, re-arm deferred (no SQE yet).
+    CHECK_EQ(conn.fd, fd);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(loop->recv_rearm_count, 1u);
+    CHECK_EQ(loop->backend.pending, 0u);
+
+    // Buffers are back (nothing queued in the CQ): re-arm once.
+    loop->rearm_deferred_recvs(/*force=*/false);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
+    CHECK_EQ(loop->backend.pending, 1u);
+
+    // Nothing left to do: a second pass must not arm again.
+    loop->rearm_deferred_recvs(/*force=*/false);
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(loop->backend.pending, 1u);
+    loop->backend.pending = 0;  // the SQE targets a socketpair end; never submit it
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+}
+
+TEST(iouring_downstream_ring_empty, rearm_waits_until_cq_backlog_no_longer_pins_the_ring) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    Connection& conn = *f.raw.conns[0];
+    f.terminal(-ENOBUFS);
+    REQUIRE_EQ(loop->recv_rearm_count, 1u);
+
+    // A queued CQ backlog of at least half the ring could still pin its buffers:
+    // re-arming now would only complete -ENOBUFS again. Leave those CQEs
+    // unharvested (their payload is irrelevant) and check the gate.
+    auto& backend = loop->backend;
+    const u32 tail = f.raw.tail();
+    const u32 backlog = kProvidedBufCount / 2;
+    for (u32 i = 0; i < backlog; i++) {
+        auto& cqe = backend.cq_entries[(tail + i) & *backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({0, IoEventType::Timeout, 0});
+        cqe.res = 0;
+        cqe.flags = 0;
+    }
+    __atomic_store_n(backend.cq_tail, tail + backlog, __ATOMIC_RELEASE);
+    REQUIRE_EQ(backend.cq_unharvested(), backlog);
+
+    loop->rearm_deferred_recvs(/*force=*/false);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(loop->recv_rearm_count, 1u);
+    CHECK_EQ(backend.pending, 0u);
+
+    // The timer-tick fallback re-arms regardless so a saturated CQ cannot starve it.
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
+    CHECK_EQ(backend.pending, 1u);
+    backend.pending = 0;
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+    __atomic_store_n(backend.cq_head, tail + backlog, __ATOMIC_RELEASE);
+}
+
+TEST(iouring_downstream_ring_empty, closed_or_paused_connection_is_never_armed_wrongly) {
+    {
+        // Closed while waiting: the slot is freed, its bit dropped, nothing armed.
+        DownstreamRingEmptyFixture f;
+        if (!f.init()) SKIP("io_uring unavailable");
+        auto* loop = f.raw.guard.loop;
+        Connection& conn = *f.raw.conns[0];
+        f.terminal(-ENOBUFS);
+        REQUIRE_EQ(loop->recv_rearm_count, 1u);
+        loop->close_conn(conn);
+        CHECK_EQ(loop->recv_rearm_count, 0u);
+        loop->backend.pending = 0;
+        loop->rearm_deferred_recvs(/*force=*/true);
+        CHECK_EQ(loop->backend.pending, 0u);
+    }
+    {
+        // Paused for a send: the re-arm is parked behind the pause, not armed.
+        DownstreamRingEmptyFixture f;
+        if (!f.init()) SKIP("io_uring unavailable");
+        auto* loop = f.raw.guard.loop;
+        Connection& conn = *f.raw.conns[0];
+        conn.recv_paused_for_send = true;
+        f.terminal(-ENOBUFS);
+        loop->rearm_deferred_recvs(/*force=*/false);
+        CHECK_FALSE(conn.recv_armed);
+        CHECK(conn.recv_pause_rearm_pending);
+        CHECK_EQ(loop->recv_rearm_count, 0u);
+        CHECK_EQ(loop->backend.pending, 0u);
+        conn.recv_paused_for_send = false;
+    }
+}
+
+TEST(iouring_downstream_ring_empty, genuine_recv_errors_still_close) {
+    // Only -ENOBUFS with an empty ring is benign: a peer reset or EOF keeps the
+    // original fatal semantics.
+    for (const i32 result : {-ECONNRESET, 0, -EIO}) {
+        DownstreamRingEmptyFixture f;
+        if (!f.init()) SKIP("io_uring unavailable");
+        auto* loop = f.raw.guard.loop;
+        Connection& conn = *f.raw.conns[0];
+        const IoEvent ev = f.terminal(result);
+        CHECK_EQ(ev.provided_ring_empty, 0u);
+        CHECK_LT(conn.fd, 0);
+        CHECK_EQ(loop->recv_rearm_count, 0u);
+    }
+}
+
 // Window bookkeeping tests.  These append terminal CQEs for arbitrary conn ids
 // straight into the CQ ring: a terminal recv owns no buffer and the backend only
 // decodes the token, so no live Connection is needed.

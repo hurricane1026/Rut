@@ -12925,6 +12925,83 @@ TEST(proxy_reuse, reused_upstream_response_leaves_send_buf_empty) {
     proxy.teardown();
 }
 
+#ifdef __linux__
+// Connection burst larger than the 2048-entry provided-buffer ring. Every client
+// has its request queued in the socket before the shard starts, so the shard
+// accepts and arms thousands of recvs while wait() harvests only kMaxEventsPerWait
+// CQEs per pass; each already-posted recv CQE keeps its buffer until harvested,
+// and the ring runs dry. The kernel then ends the affected multishot recvs with a
+// terminal -ENOBUFS even though the request is still unread in the socket. That
+// must never reset the client: the recv is re-armed once buffers are back and the
+// request is served. Two keep-alive rounds also prove the re-armed recv is usable.
+TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    constexpr u32 kClients = 3000;  // well past kProvidedBufCount (2048)
+    static_assert(kClients > kProvidedBufCount, "burst must outnumber the provided ring");
+    struct rlimit nofile{};
+    REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &nofile), 0);
+    const rlim_t need = 2 * kClients + 512;
+    if (nofile.rlim_cur < need) {
+        nofile.rlim_cur = nofile.rlim_max < need ? nofile.rlim_max : need;
+        (void)setrlimit(RLIMIT_NOFILE, &nofile);
+        REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &nofile), 0);
+    }
+    if (nofile.rlim_cur < need) SKIP("RLIMIT_NOFILE too low for the burst");
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/", kRouteMethodGet, 200));
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+
+    static constexpr char kReq[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::vector<i32> clients;
+    clients.reserve(kClients);
+    // The shard is not running, so the backlog (4096) holds every connection and
+    // the kernel queues each request in its socket.
+    for (u32 i = 0; i < kClients; i++) {
+        i32 c = connect_to(port);
+        if (c < 0) break;
+        set_socket_timeouts(c, 10);
+        if (!send_all(c, kReq, sizeof(kReq) - 1)) {
+            close(c);
+            break;
+        }
+        clients.push_back(c);
+    }
+    REQUIRE_EQ(clients.size(), static_cast<size_t>(kClients));
+    REQUIRE(shard.spawn(-1).has_value());
+
+    u32 served = 0;
+    u32 failed = 0;
+    for (u32 round = 0; round < 2; round++) {
+        if (round == 1) {
+            for (i32 c : clients)
+                if (!send_all(c, kReq, sizeof(kReq) - 1)) failed++;
+        }
+        for (i32 c : clients) {
+            char buf[512];
+            const i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
+            if (n > 0 && buf_contains(buf, static_cast<u32>(n), "HTTP/1.1 200", 12))
+                served++;
+            else
+                failed++;  // reset (-ECONNRESET), EOF or timeout
+        }
+    }
+    CHECK_EQ(failed, 0u);
+    CHECK_EQ(served, 2 * kClients);
+
+    for (i32 c : clients) close(c);
+    shard.stop();
+    shard.join();
+    shard.shutdown();
+    close(lfd);
+}
+#endif
+
 // io_uring variant of the reuse e2e (Shard wires the pool for both backends). Unlike
 // epoll's synchronous detach, io_uring defers the pool-return until the cancelled
 // multishot recv drains, so the test waits until the fd actually re-enters the pool
