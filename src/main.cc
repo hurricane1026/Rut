@@ -173,10 +173,16 @@ static void report_io_uring_enomem(u32 failed_shard, u32 shard_count, bool will_
     struct rlimit rl{};
     const bool have_limit = getrlimit(RLIMIT_MEMLOCK, &rl) == 0;
     const bool exempt = has_cap_ipc_lock() || (have_limit && rl.rlim_cur == RLIM_INFINITY);
-    const u64 per_shard_kib =
-        io_uring_shard_locked_bytes(
-            kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, kLargeProvidedBufCount) /
-        1024;
+    // The kernel charges whole host pages (16 KiB / 64 KiB on some arm64 and
+    // ppc64 kernels), so the estimate must use the runtime page size.
+    const long sys_page = sysconf(_SC_PAGESIZE);
+    const u64 page_bytes = sys_page > 0 ? static_cast<u64>(sys_page) : 4096;
+    const u64 per_shard_kib = io_uring_shard_locked_bytes(kIoUringSqEntries,
+                                                          kIoUringCqEntries,
+                                                          kProvidedBufCount,
+                                                          kLargeProvidedBufCount,
+                                                          page_bytes) /
+                              1024;
     const u64 total_kib = per_shard_kib * shard_count;
     write_str("io_uring ring creation failed with ENOMEM at shard ");
     write_u32(failed_shard);

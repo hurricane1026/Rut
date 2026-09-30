@@ -17,11 +17,27 @@ import sys
 import time
 
 SKIP = 77
-LIMIT_KIB = 64
-# Per-shard charge for the current ring constants. Keep in sync with
+# The kernel charges whole host pages, so the limit and the expected charge
+# both scale with the page size (4 KiB on x86-64; 16/64 KiB on some arm64/ppc64).
+PAGE = resource.getpagesize()
+# 16 pages: enough for the one-entry startup probe (2 pages), far below one shard.
+LIMIT_BYTES = 16 * PAGE
+
+
+def round_up_page(n):
+    return (n + PAGE - 1) // PAGE * PAGE
+
+
+# Per-shard charge for the current ring constants (SQ 16384 / CQ 32768, 2048 +
+# 1024 provided-buffer entries): 1652 KiB on 4 KiB pages. Keep in sync with
 # io_uring_shard_locked_bytes() in include/rut/runtime/io_uring_memlock.h
 # (unit-tested there against measured kernel values); update when ring sizes change.
-PER_SHARD_KIB = 1652
+PER_SHARD_KIB = (
+    round_up_page(16384 * 64)
+    + round_up_page(320 + 32768 * 16 + 16384 * 4)
+    + round_up_page(2048 * 16)
+    + round_up_page(1024 * 16)
+) // 1024
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
@@ -97,7 +113,7 @@ def require(output, needles):
 
 def limits():
     _, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
-    limit = LIMIT_KIB * 1024
+    limit = LIMIT_BYTES
     if hard != resource.RLIM_INFINITY and hard < limit:
         limit = hard
     return limit, hard

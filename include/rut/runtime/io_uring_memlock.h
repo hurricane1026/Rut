@@ -14,6 +14,11 @@
 // counts (the kernel rounds requests up to one) and the default 64-byte SQE /
 // 16-byte CQE layout; SQE128, CQE32 and NO_SQARRAY are not covered because Rut
 // does not use them.
+//
+// The kernel allocates and charges each region in whole pages of the host page
+// size (4 KiB on x86-64; 16 KiB or 64 KiB on some arm64 / ppc64 kernels), so
+// every function takes `page_bytes`: pass sysconf(_SC_PAGESIZE) for an estimate
+// of the running host.
 
 #include "rut/common/types.h"
 
@@ -29,43 +34,45 @@ static_assert((kIoUringSqEntries & (kIoUringSqEntries - 1)) == 0,
               "io_uring SQ entries must be a power of two (the kernel rounds up)");
 
 namespace iouring_memlock_detail {
-static constexpr u64 kPage = 4096;
 // Bytes before the CQE array in the shared ring mapping: params.cq_off.cqes as
 // reported by the kernel (sizeof(struct io_rings) on x86-64, 64-byte cache lines:
-// head/tail/mask/flags/overflow, each cache-line separated).
+// head/tail/mask/flags/overflow, each cache-line separated). Architectures with
+// wider cache lines have a larger header; with power-of-two entry counts the
+// CQE and SQ index arrays fill whole pages, so any header up to one page rounds
+// to the same result.
 static constexpr u64 kRingsHeaderBytes = 320;
-constexpr u64 round_up_page(u64 n) {
-    return (n + kPage - 1) / kPage * kPage;
+constexpr u64 round_up_page(u64 n, u64 page_bytes) {
+    return (n + page_bytes - 1) / page_bytes * page_bytes;
 }
 }  // namespace iouring_memlock_detail
 
 // SQE array + shared SQ/CQ ring mapping (header + CQEs + SQ index array), each
 // rounded up to pages as the kernel maps them.
-constexpr u64 io_uring_ring_locked_bytes(u32 sq_entries, u32 cq_entries) {
+constexpr u64 io_uring_ring_locked_bytes(u32 sq_entries, u32 cq_entries, u64 page_bytes) {
     using namespace iouring_memlock_detail;
-    const u64 sqes = round_up_page(static_cast<u64>(sq_entries) * sizeof(io_uring_sqe));
+    const u64 sqes = round_up_page(static_cast<u64>(sq_entries) * sizeof(io_uring_sqe), page_bytes);
     const u64 rings =
         round_up_page(kRingsHeaderBytes + static_cast<u64>(cq_entries) * sizeof(io_uring_cqe) +
-                      static_cast<u64>(sq_entries) * sizeof(u32));
+                          static_cast<u64>(sq_entries) * sizeof(u32),
+                      page_bytes);
     return sqes + rings;
 }
 
 // One registered provided-buffer ring: `entries` 16-byte io_uring_buf slots.
-constexpr u64 io_uring_pbuf_ring_locked_bytes(u32 entries) {
-    return iouring_memlock_detail::round_up_page(static_cast<u64>(entries) * 16);
+constexpr u64 io_uring_pbuf_ring_locked_bytes(u32 entries, u64 page_bytes) {
+    return iouring_memlock_detail::round_up_page(static_cast<u64>(entries) * 16, page_bytes);
 }
 
 // Total per-shard charge: the ring plus both provided-buffer rings.
-// Measured reference (Linux 7.2.7): SQ 16384 / CQ 32768 with 2048 + 1024
-// provided-buffer entries = 1652 KiB (1604 + 32 + 16). If the ring constants
-// change and this drifts from the kernel's accounting, the tests will say so.
-constexpr u64 io_uring_shard_locked_bytes(u32 sq_entries,
-                                          u32 cq_entries,
-                                          u32 pbuf_entries,
-                                          u32 large_pbuf_entries) {
-    return io_uring_ring_locked_bytes(sq_entries, cq_entries) +
-           io_uring_pbuf_ring_locked_bytes(pbuf_entries) +
-           io_uring_pbuf_ring_locked_bytes(large_pbuf_entries);
+// Measured reference (Linux 7.2.7, 4 KiB pages): SQ 16384 / CQ 32768 with
+// 2048 + 1024 provided-buffer entries = 1652 KiB (1604 + 32 + 16). If the ring
+// constants change and this drifts from the kernel's accounting, the tests
+// will say so.
+constexpr u64 io_uring_shard_locked_bytes(
+    u32 sq_entries, u32 cq_entries, u32 pbuf_entries, u32 large_pbuf_entries, u64 page_bytes) {
+    return io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes) +
+           io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes) +
+           io_uring_pbuf_ring_locked_bytes(large_pbuf_entries, page_bytes);
 }
 
 }  // namespace rut
