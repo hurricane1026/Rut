@@ -40229,6 +40229,241 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     CHECK_FALSE(fixture.guard.loop->backend.downstream_recv_progress_valid);
     fixture.guard.loop->backend.shutdown();
 }
+
+// Window bookkeeping tests.  These append terminal CQEs for arbitrary conn ids
+// straight into the CQ ring: a terminal recv owns no buffer and the backend only
+// decodes the token, so no live Connection is needed.
+static void raw_append_downstream_recv(RawDownstreamRecvBatch& fixture, u32 conn_id, i32 result) {
+    auto& backend = fixture.guard.loop->backend;
+    const u32 cursor = fixture.tail();
+    auto& cqe = backend.cq_entries[cursor & *backend.cq_ring_mask];
+    cqe.user_data = IoUringBackend::encode_user_data(conn_id, IoEventType::Recv, 0);
+    cqe.res = result;
+    cqe.flags = 0;
+    __atomic_store_n(backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+}
+
+static bool terminal_slot_live(RawDownstreamRecvBatch& fixture, u32 conn_id) {
+    return fixture.guard.loop->backend.downstream_recv_terminal_slots[conn_id].live != 0;
+}
+
+TEST(iouring_terminal_window, fifo_ring_wraps_across_many_add_expire_cycles) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    constexpr u32 kPerCycle = 1000;
+    // Strictly more windows than ring slots over the run, so `start` wraps.
+    const u32 cycles = backend.downstream_recv_terminal_window_capacity / kPerCycle + 4u;
+    REQUIRE(kPerCycle < backend.connection_capacity);
+    IoEvent events[kMaxEventsPerWait]{};
+    u64 total = 0;
+    bool wrapped = false;
+    for (u32 cycle = 0; cycle < cycles; cycle++) {
+        for (u32 id = 0; id < kPerCycle; id++) raw_append_downstream_recv(fixture, id, 0);
+        u32 got = 0;
+        // Each wait() freezes the tail at the end of the burst; the windows
+        // stay live over several waits (and, once the burst is drained, until
+        // the next wait() sees a CQE) and expire oldest first.
+        for (u32 attempt = 0; attempt < 64 && got < kPerCycle; attempt++) {
+            got += fixture.wait(events, kMaxEventsPerWait);
+            REQUIRE_EQ(backend.failure_code(), 0);
+            if (backend.downstream_recv_terminal_window_start +
+                    backend.downstream_recv_terminal_window_count >
+                backend.downstream_recv_terminal_window_capacity)
+                wrapped = true;
+        }
+        REQUIRE_EQ(got, kPerCycle);
+        total += got;
+    }
+    fixture.append_timeout(1);
+    CHECK_EQ(fixture.wait(events, kMaxEventsPerWait), 0u);  // boundary expires the last burst
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    CHECK(total > backend.downstream_recv_terminal_window_capacity);
+    CHECK(wrapped);
+    for (u32 id = 0; id < kPerCycle; id++) CHECK_FALSE(terminal_slot_live(fixture, id));
+    CHECK_EQ(backend.failure_code(), 0);
+}
+
+TEST(iouring_terminal_window, quarantines_only_the_terminal_token) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init(2)) SKIP("io_uring unavailable");
+    Connection& a = *fixture.conns[0];
+    Connection& b = *fixture.conns[1];
+    static constexpr u8 kStaleA[] = "stale-a";
+    static constexpr u8 kLiveB[] = "live-b";
+    fixture.append_terminal(a, 0);
+    REQUIRE(fixture.append_recv(a, kStaleA, sizeof(kStaleA) - 1u, true));
+    REQUIRE(fixture.append_recv(b, kLiveB, sizeof(kLiveB) - 1u, true));
+    IoEvent events[4]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    CHECK_EQ(events[0].conn_id, a.id);
+    CHECK(terminal_slot_live(fixture, a.id));
+    CHECK_FALSE(terminal_slot_live(fixture, b.id));
+    const u16 buffer_tail_before = fixture.buffer_tail();
+    // The stale record for A is consumed without an event; B's is published.
+    REQUIRE_EQ(fixture.wait(events, 4), 1u);
+    CHECK_EQ(events[0].conn_id, b.id);
+    CHECK_EQ(events[0].result, static_cast<i32>(sizeof(kLiveB) - 1u));
+    CHECK_EQ(a.recv_buf.len(), 0u);
+    CHECK_EQ(b.recv_buf.len(), sizeof(kLiveB) - 1u);
+    CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(buffer_tail_before + 2u));
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
+TEST(iouring_terminal_window, expired_window_does_not_block_a_fresh_terminal_for_the_token) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& conn = *fixture.conns[0];
+    fixture.append_terminal(conn, 0);
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK_EQ(backend.downstream_recv_terminal_slots[conn.id].tail_exclusive, fixture.head());
+
+    // The slot is reused after the frozen tail; its next terminal arrives only
+    // once the first window has expired (the boundary wait returns nothing).
+    fixture.append_terminal(conn, -ECONNRESET);
+    CHECK_EQ(fixture.wait(events, 2), 0u);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    CHECK_FALSE(terminal_slot_live(fixture, conn.id));
+    REQUIRE_EQ(fixture.wait(events, 2), 1u);
+    CHECK_EQ(events[0].result, -ECONNRESET);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK(terminal_slot_live(fixture, conn.id));
+    CHECK_EQ(backend.downstream_recv_terminal_slots[conn.id].tail_exclusive, fixture.head());
+    CHECK_EQ(backend.failure_code(), 0);
+}
+
+TEST(iouring_terminal_window, windows_with_different_frozen_tails_expire_in_order) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init(2)) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& a = *fixture.conns[0];
+    Connection& b = *fixture.conns[1];
+    IoEvent events[4]{};
+    fixture.append_terminal(a, 0);
+    fixture.append_terminal(b, 0);
+    fixture.append_timeout(1);
+    const u32 tail_a = fixture.tail();
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // A: frozen at the end of the first burst
+    fixture.append_timeout(2);
+    const u32 tail_b = fixture.tail();
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // B: frozen one CQE later
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 2u);
+    CHECK_EQ(backend.downstream_recv_terminal_slots[a.id].tail_exclusive, tail_a);
+    CHECK_EQ(backend.downstream_recv_terminal_slots[b.id].tail_exclusive, tail_b);
+    CHECK(tail_a != tail_b);
+
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // timeout 1: head reaches A's tail
+    CHECK_EQ(fixture.head(), tail_a);
+    CHECK_EQ(fixture.wait(events, 1), 0u);  // A expires alone, at the boundary
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK_FALSE(terminal_slot_live(fixture, a.id));
+    CHECK(terminal_slot_live(fixture, b.id));
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // timeout 2: head reaches B's tail
+    CHECK_EQ(fixture.head(), tail_b);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    fixture.append_timeout(3);
+    CHECK_EQ(fixture.wait(events, 1), 0u);  // B expires at the next loop top
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    CHECK_FALSE(terminal_slot_live(fixture, b.id));
+    CHECK_EQ(backend.failure_code(), 0);
+}
+
+TEST(iouring_terminal_window, shutdown_and_reinit_leave_no_stale_side_table_entry) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& conn = *fixture.conns[0];
+    fixture.append_terminal(conn, 0);
+    fixture.append_timeout(5);
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    REQUIRE(terminal_slot_live(fixture, conn.id));
+    const u32 conn_id = conn.id;
+
+    // shutdown() resets the wait state (walking the live window to clear its
+    // side-table entry) and frees both arrays; re-init starts clean.
+    const u32 capacity = backend.connection_capacity;
+    backend.shutdown();
+    fixture.guard.initialized = false;
+    CHECK(backend.downstream_recv_terminal_windows == nullptr);
+    CHECK(backend.downstream_recv_terminal_slots == nullptr);
+    CHECK_EQ(backend.downstream_recv_terminal_slot_capacity, 0u);
+    const auto reinit_result = backend.init(0, -1, capacity);
+    if (!reinit_result) SKIP("io_uring re-init unavailable");
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    REQUIRE(backend.downstream_recv_terminal_slots != nullptr);
+    CHECK_EQ(backend.downstream_recv_terminal_slot_capacity, capacity);
+    CHECK_FALSE(terminal_slot_live(fixture, conn_id));
+    // The old owner's window is gone: a terminal for the same token is a
+    // fresh event on the new ring, not quarantined.
+    fixture.append_terminal(conn, 0);
+    backend.pending = 0;
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, fixture.guard.loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(event.conn_id, conn_id);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    backend.shutdown();
+}
+
+TEST(iouring_terminal_window, corrupt_front_window_distance_fails_sticky) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& conn = *fixture.conns[0];
+    fixture.append_terminal(conn, 0);
+    fixture.append_timeout(1);
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK_EQ(backend.failure_code(), 0);
+    // A frozen tail further ahead of head than the CQ can hold is corruption.
+    const u32 bad_tail = fixture.head() + backend.cq_ring_entries + 1u;
+    backend.downstream_recv_terminal_windows[backend.downstream_recv_terminal_window_start]
+        .tail_exclusive = bad_tail;
+    backend.downstream_recv_terminal_slots[conn.id].tail_exclusive = bad_tail;
+    CHECK_EQ(fixture.wait(events, 2), 0u);
+    CHECK_EQ(backend.failure_code(), EPROTO);
+}
+
+TEST(iouring_terminal_window, side_table_covers_first_last_and_out_of_range_conn_ids) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    const u32 capacity = backend.connection_capacity;
+    REQUIRE_EQ(backend.downstream_recv_terminal_slot_capacity, capacity);
+    // conn 0, conn capacity-1 and one past the table, which has no table entry
+    // and is found by the scan fallback.
+    const u32 ids[3] = {0u, capacity - 1u, capacity};
+    for (u32 id : ids) raw_append_downstream_recv(fixture, id, 0);
+    // Duplicate terminals for the same tokens sit inside the first interval...
+    for (u32 id : ids) raw_append_downstream_recv(fixture, id, -ECONNRESET);
+    // ...and a terminal for a different token is not quarantined by them.
+    raw_append_downstream_recv(fixture, 1u, 0);
+    IoEvent events[8]{};
+    REQUIRE_EQ(fixture.wait(events, 3), 3u);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 3u);
+    CHECK_EQ(backend.downstream_recv_terminal_out_of_range_windows, 1u);
+    CHECK(terminal_slot_live(fixture, 0));
+    CHECK(terminal_slot_live(fixture, capacity - 1u));
+
+    REQUIRE_EQ(fixture.wait(events, 8), 1u);  // three duplicates consumed silently
+    CHECK_EQ(events[0].conn_id, 1u);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 4u);
+    CHECK_EQ(backend.failure_code(), 0);
+
+    // Boundary: every window expires and the table and counter are clear.
+    fixture.append_timeout(9);
+    CHECK_EQ(fixture.wait(events, 8), 0u);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    CHECK_EQ(backend.downstream_recv_terminal_out_of_range_windows, 0u);
+    CHECK_FALSE(terminal_slot_live(fixture, 0));
+    CHECK_FALSE(terminal_slot_live(fixture, 1));
+    CHECK_FALSE(terminal_slot_live(fixture, capacity - 1u));
+    CHECK_EQ(backend.failure_code(), 0);
+}
 #endif
 
 u32 g_boundary_current_callback_count = 0;
