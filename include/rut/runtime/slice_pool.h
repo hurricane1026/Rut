@@ -44,20 +44,21 @@ struct SlicePool {
         kOrdinarySlicesPerConnection + kMaxBufferedResponseSlices;
 
     // Bulk relay buffers: large buffers a connection borrows only while it
-    // relays a large proxied body, so the body moves in 256 KiB steps.
+    // relays a large proxied body, so the body moves in bulk-sized steps.
     // Reserved per connection (like the ordinary/response-chain slices
     // above) rather than as one pool-wide fixed set, bounded by a hard cap.
     // Separate VA region, faulted in on first use; free() routes a bulk
     // pointer here by address, so release sites need not know which kind
     // they hold. Exhaustion is not an error: callers keep slices.
-    static constexpr u32 kBulkSliceSize = 256 * 1024;
+    static constexpr u32 kBulkSliceSize = 512 * 1024;
     static constexpr u32 kBulkPerConnection = 4;  // bulk buffers reserved per connection
-    static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 1 GiB VA per pool
-    // Returned bulk buffers kept resident for reuse: at most 16 MiB of idle
-    // retention per pool, the size of the former fixed bulk set. Returns past
-    // this are discarded (MADV_DONTNEED), so a burst that touched many bulk
-    // buffers does not keep their pages resident afterwards.
-    static constexpr u32 kMaxCachedBulk = 64;
+    static constexpr u32 kMaxBulkSlices = 4096;   // hard cap: 2 GiB VA per pool
+    // Keep at most 64 MiB of idle bulk storage per shard. Larger blocks
+    // reduce downstream sends for large plaintext responses; retaining 128
+    // of these blocks preserves the previous idle byte budget. Active
+    // buffers are additional to this cache, and can increase the working set.
+    // Returns beyond this bound still use MADV_DONTNEED to shed burst memory.
+    static constexpr u32 kMaxCachedBulk = 128;
 
     static constexpr u32 capacity_for_connections(u32 connections) {
         constexpr u32 kMaxU32 = 0xFFFFFFFFu;
@@ -78,7 +79,7 @@ struct SlicePool {
 
     u8* base = nullptr;         // mmap'd region: max_count * kSliceSize bytes
     u32* free_stack = nullptr;  // mmap'd: free slice indices
-    u8* in_use_map = nullptr;   // mmap'd: 1 byte per slice (0=free, 1=in-use)
+    u8* in_use_map = nullptr;   // bit 0: in use; bit 1: uninitialized lease/dirty free slice
     u32 free_top = 0;
     // Cached indices occupy the top cached_count entries of free_stack.
     // Untouched/discarded indices remain below them, so reuse prefers hot pages.
@@ -102,7 +103,8 @@ struct SlicePool {
     u64* bulk_in_use = nullptr;  // mmap'd bitmap: bit i set while bulk buffer i is borrowed
     u32 bulk_free_top = 0;
     // Like cached_count: the top bulk_cached_count entries of bulk_free are
-    // resident, zeroed buffers; discarded/untouched indices sit below them.
+    // resident buffers with unspecified contents; discarded/untouched indices
+    // sit below them.
     u32 bulk_cached_count = 0;
     u32 bulk_max_count = 0;    // bulk buffers reserved for this pool (set at init)
     u64 bulk_base_size = 0;    // size of mmap'd bulk_base region
@@ -229,17 +231,29 @@ struct SlicePool {
         return {};
     }
 
-    // Allocate one 16KB slice. Grows committed region if empty.
-    // Returns pointer to slice, or nullptr if at max capacity.
-    u8* alloc() {
+    // Ordinary allocations retain their zero-filled contract, even after an
+    // uninitialized borrower. Only explicit byte buffers may skip clearing.
+    u8* alloc() { return alloc_impl(true); }
+    // The caller initializes metadata and publishes only bytes actually written.
+    // Like alloc(), grows the committed region as needed; null means exhausted.
+    u8* alloc_uninitialized() { return alloc_impl(false); }
+
+    u8* alloc_impl(bool clear) {
         if (free_top == 0 && !grow()) return nullptr;
         u32 idx = free_stack[--free_top];
         u8* ptr = base + static_cast<u64>(idx) * kSliceSize;
         if (cached_count != 0) --cached_count;
-        if (in_use_map) in_use_map[idx] = 1;
+        if (in_use_map) {
+            if (clear && (in_use_map[idx] & 2u)) __builtin_memset(ptr, 0, kSliceSize);
+            in_use_map[idx] = clear ? 1u : 3u;
+        }
         return ptr;
     }
 
+    // Bulk payload is uninitialized on reuse. Callers must initialize their
+    // metadata and publish only bytes actually written by a recv/copy; bytes
+    // outside that valid range may belong to a previous response. Ordinary
+    // slices retain their zero-on-return contract.
     // Borrow one bulk relay buffer, or null when none is available (including
     // when this pool was init'd with bulk_capacity == 0).
     u8* alloc_bulk() {
@@ -272,7 +286,7 @@ struct SlicePool {
     // traffic spikes. Only call once all asynchronous users have retired.
     void free(u8* ptr) {
         if (is_bulk(ptr)) {
-            free_bulk(ptr, kBulkSliceSize);
+            free_bulk(ptr);
             return;
         }
         if (!ptr || !base || !free_stack || count == 0) return;
@@ -281,12 +295,16 @@ struct SlicePool {
         if (offset % kSliceSize != 0) return;  // not slice-aligned
         if (free_top >= max_count) return;     // overflow guard
         u32 idx = static_cast<u32>(offset / kSliceSize);
-        if (in_use_map && !in_use_map[idx]) return;  // double-free detection
+        if (in_use_map && !(in_use_map[idx] & 1u)) return;  // double-free detection
+        const bool uninitialized = in_use_map && (in_use_map[idx] & 2u);
         if (in_use_map) in_use_map[idx] = 0;
         if (cached_count < cache_limit) {
-            // Preserve zero-filled reuse and clear the previous owner's bytes
-            // even while the slice is idle, including bytes beyond buffer length.
-            __builtin_memset(ptr, 0, kSliceSize);
+            // Record dirty bytes so a later ordinary allocation still clears
+            // them. An uninitialized byte-buffer lease can reuse them directly.
+            if (uninitialized)
+                in_use_map[idx] = 2u;
+            else
+                __builtin_memset(ptr, 0, kSliceSize);
             free_stack[free_top++] = idx;
             ++cached_count;
             return;
@@ -305,19 +323,6 @@ struct SlicePool {
         if (cached_count != 0) free_stack[free_top] = free_stack[boundary];
         free_stack[boundary] = idx;
         ++free_top;
-    }
-
-    // free() for a caller that knows nothing past the first `written` bytes
-    // was ever written since the buffer was handed out. A bulk buffer then
-    // re-zeroes only that prefix (the rest is still zero), which keeps a
-    // mostly-empty 256 KiB node from costing a full-buffer memset. Slices
-    // keep free()'s behavior.
-    void free_written(u8* ptr, u32 written) {
-        if (is_bulk(ptr)) {
-            free_bulk(ptr, written < kBulkSliceSize ? written : kBulkSliceSize);
-            return;
-        }
-        free(ptr);
     }
 
     // Number of available (free) slices.
@@ -389,7 +394,7 @@ private:
         return true;
     }
 
-    void free_bulk(u8* ptr, u32 dirty) {
+    void free_bulk(u8* ptr) {
         const u64 offset = static_cast<u64>(ptr - bulk_base);
         if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
@@ -398,21 +403,17 @@ private:
         const u64 bit = u64{1} << (idx & 63u);
         if ((word & bit) == 0) return;  // double-free detection
         word &= ~bit;
-        // Like slices, a returned buffer must not expose its owner's bytes.
+        // Retain hot relay storage without touching its payload. Its next
+        // owner establishes the valid range; capacity is never valid data.
         if (bulk_cached_count < kMaxCachedBulk) {
-            // Hot: zero in place, since MADV_DONTNEED would make every reuse
-            // fault its pages back in. Bytes past `dirty` are still zero from
-            // the previous return (or the fresh mapping).
-            __builtin_memset(ptr, 0, dirty);
             bulk_free[bulk_free_top++] = idx;
             ++bulk_cached_count;
             return;
         }
 #ifdef __linux__
-        // Private anonymous pages read back zero-filled after MADV_DONTNEED.
-        if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0) __builtin_memset(ptr, 0, dirty);
-#else
-        __builtin_memset(ptr, 0, dirty);
+        // Reclaim excess resident pages. Zero contents are incidental, not
+        // an allocation guarantee; a failed discard is safe to reuse too.
+        (void)madvise(ptr, kBulkSliceSize, MADV_DONTNEED);
 #endif
         // Below the cached suffix, as free() does for slices, so reuse keeps
         // preferring the resident buffers.

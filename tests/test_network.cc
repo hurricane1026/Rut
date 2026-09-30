@@ -3769,6 +3769,63 @@ TEST(response_buffering, bounded_aliases_complete_content_length_exactly) {
     }
 }
 
+TEST(response_buffering, bounded_release_bytes_matches_measured_nginx_boundaries) {
+    // H = 70 (raw upstream header length), B = kBoundedResponseBufferBytes =
+    // 4096. Measured byte-exact against the pinned nginx 1.29.7 image with
+    // proxy_buffering on (see nginx-proxy-buffering-release-rule memory
+    // note): origin sends H+n bytes then stalls past the 1s read timeout.
+    struct Case {
+        u32 n;
+        u32 want;
+    };
+    static constexpr u32 kHeader = 70;
+    static constexpr Case kCases[] = {
+        {3000, 0},
+        {4020, 0},
+        {4030, 4026},
+        {5000, 4026},
+        {9000, 8122},
+        {20000, 16314},
+        {100000, 98234},
+    };
+    for (const auto& c : kCases) {
+        CHECK_EQ(bounded_response_release_bytes(kHeader, c.n, /*complete=*/false), c.want);
+    }
+    // complete=true (full receipt, clean EOF, or expiry after a release)
+    // always releases everything received, regardless of buffer alignment.
+    for (const auto& c : kCases) {
+        CHECK_EQ(bounded_response_release_bytes(kHeader, c.n, /*complete=*/true), c.n);
+    }
+    // Below one whole buffer (header+n < 4096): always 0 — byte-identical to
+    // CompleteContentLength's "nothing until complete" behavior.
+    CHECK_EQ(bounded_response_release_bytes(kHeader, 0, false), 0u);
+    CHECK_EQ(bounded_response_release_bytes(kHeader, 4096u - kHeader - 1, false), 0u);
+    // Exactly one whole buffer, and one byte past it (still only the prior
+    // whole buffer is releasable).
+    CHECK_EQ(bounded_response_release_bytes(kHeader, 4096u - kHeader, false), 4096u - kHeader);
+    CHECK_EQ(bounded_response_release_bytes(kHeader, 4096u - kHeader + 1, false), 4096u - kHeader);
+    // Monotonic and never exceeds n as more bytes arrive.
+    u32 prev = 0;
+    for (u32 n = 0; n <= 20000; n += 37) {
+        const u32 released = bounded_response_release_bytes(kHeader, n, false);
+        CHECK_GE(released, prev);
+        CHECK_LE(released, n);
+        prev = released;
+    }
+}
+
+// Mutation check for the release formula: this test pins the exact boundary
+// (floor((H+n)/B)*B - H, clamped to [0, n]) one byte on each side of the
+// first crossing, so a broken formula (off-by-one, rounding instead of
+// floor, or omitting the header offset) fails here even though the coarser
+// measured cases above might still coincidentally pass.
+TEST(response_buffering, bounded_release_bytes_boundary_is_exact_to_the_byte) {
+    static constexpr u32 kHeader = 70;
+    CHECK_EQ(bounded_response_release_bytes(kHeader, 4025, false), 0u);
+    CHECK_EQ(bounded_response_release_bytes(kHeader, 4026, false), 4026u);
+    CHECK_EQ(bounded_response_release_bytes(kHeader, 4027, false), 4026u);
+}
+
 TEST(response_read_timeout, route_preflight_marker_fails_closed_for_every_nonzero_shape) {
     RouteConfig duration{};
     REQUIRE_EQ(duration.add_policy_bundle(0, 0, 0, 5), 1u);
@@ -15674,7 +15731,7 @@ TEST(slice_pool, buffered_response_capacity_covers_each_connection) {
     pool.destroy();
 }
 
-TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
+TEST(slice_pool, bulk_buffers_are_lazy_bounded_uninitialized_and_address_routed) {
     // 70 crosses one bulk_in_use bitmap word boundary (64 bits/word), so this
     // exercises the dynamic per-connection bitmap, not just a single word.
     constexpr u32 kTestBulk = 70;
@@ -15707,43 +15764,15 @@ TEST(slice_pool, bulk_buffers_are_lazy_bounded_zeroed_and_address_routed) {
     bool reused_first = false;
     for (u8* b : all) reused_first |= b == first;
     REQUIRE(reused_first);
-    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) {
-        if (first[i] != 0) {
-            CHECK_EQ(first[i], 0u);  // a returned buffer never exposes old bytes
-            break;
-        }
-    }
+    // Cached bulk storage retains bytes; callers must track valid lengths.
+    CHECK_EQ(first[0], 0xa5u);
+    CHECK_EQ(first[SlicePool::kBulkSliceSize - 1], 0xa5u);
     for (u8* b : all) pool.free(b);
     CHECK_EQ(pool.bulk_available(), kTestBulk);
     pool.free(slice);
     pool.destroy();
     CHECK_EQ(pool.bulk_base, nullptr);
     CHECK_FALSE(pool.is_bulk(first));
-}
-
-TEST(slice_pool, bulk_free_written_rezeroes_the_written_prefix) {
-    constexpr u32 kTestBulk = 4;
-    SlicePool pool;
-    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, kTestBulk).has_value());
-    u8* all[kTestBulk]{};
-    for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
-    u8* const target = all[0];
-    __builtin_memset(target, 0x3c, 4096);
-    pool.free_written(target, 4096);
-    for (u32 i = 1; i < kTestBulk; ++i) pool.free(all[i]);
-    for (u8*& b : all) REQUIRE((b = pool.alloc_bulk()) != nullptr);
-    bool found = false;
-    for (u8* b : all) found |= b == target;
-    REQUIRE(found);
-    bool all_zero = true;
-    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) all_zero &= target[i] == 0;
-    CHECK(all_zero);
-    // An overstated extent is clamped to the buffer.
-    pool.free_written(target, 0xFFFFFFFFu);
-    for (u8* b : all)
-        if (b != target) pool.free(b);
-    CHECK_EQ(pool.bulk_available(), kTestBulk);
-    pool.destroy();
 }
 
 // A burst that touches more bulk buffers than the resident cache holds must
@@ -15763,8 +15792,7 @@ TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
     CHECK_EQ(pool.bulk_cached_count, SlicePool::kMaxCachedBulk);
 
 #ifdef __linux__
-    // Only Linux discards with MADV_DONTNEED; elsewhere a discarded buffer is
-    // zeroed in place and stays resident.
+    // Only Linux discards excess bulk pages with MADV_DONTNEED.
     const u64 page = static_cast<u64>(sysconf(_SC_PAGESIZE));
     const u64 pages = SlicePool::kBulkSliceSize / page;
     unsigned char residency[SlicePool::kBulkSliceSize / 4096]{};
@@ -15787,7 +15815,7 @@ TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
     CHECK_EQ(released, kTestBulk - SlicePool::kMaxCachedBulk);
 #endif
 
-    // Reuse drains the resident set first, and every reused buffer reads zero.
+    // Reuse drains the resident set first without clearing retained bytes.
     u8* again[kTestBulk]{};
     for (u32 i = 0; i < kTestBulk; ++i) {
         REQUIRE((again[i] = pool.alloc_bulk()) != nullptr);
@@ -15796,9 +15824,10 @@ TEST(slice_pool, bulk_burst_discards_returns_beyond_the_resident_cache) {
             for (u32 j = 0; j < SlicePool::kMaxCachedBulk; ++j) hot |= again[i] == all[j];
             CHECK(hot);
         }
-        bool zero = true;
-        for (u32 byte = 0; byte < SlicePool::kBulkSliceSize; ++byte) zero &= again[i][byte] == 0;
-        CHECK(zero);
+        if (i < SlicePool::kMaxCachedBulk) {
+            CHECK_EQ(again[i][0], 0x5au);
+            CHECK_EQ(again[i][SlicePool::kBulkSliceSize - 1], 0x5au);
+        }
     }
     CHECK_EQ(pool.bulk_cached_count, 0u);
     CHECK_EQ(pool.alloc_bulk(), nullptr);
@@ -36228,6 +36257,8 @@ TEST(state_invariant, jit_event_helpers_map_runtime_events) {
                 break;
             case IoEventType::Accept:
             case IoEventType::ResponseReadTimer:
+            case IoEventType::BoundedHoldTimer:
+            case IoEventType::BodyPipeTransport:
             case IoEventType::Count:
                 break;
         }
@@ -36573,6 +36604,269 @@ struct ScopedIoUringLoopForRetirement {
         if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
     }
 };
+
+static IoEvent pipe_transport_event(u32 id, BodyPipeOperation operation, u32 serial, i32 result) {
+    IoEvent event{};
+    event.conn_id = id;
+    event.type = IoEventType::BodyPipeTransport;
+    event.aux = static_cast<u8>(operation);
+    event.non_upstream_generation = serial;
+    event.result = result;
+    return event;
+}
+
+TEST(iouring_body_pipe, target_and_cancel_both_pin_slot_across_reset_in_both_orders) {
+    for (bool target_first : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(1));
+        auto& loop = *guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(loop, 8));
+        auto* c = loop.alloc_conn();
+        REQUIRE(c != nullptr);
+        c->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        REQUIRE(c->fd >= 0 && c->upstream_fd >= 0);
+        REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+        auto* owner = c->response_body_pipe;
+        const i32 pipe_fd = owner->storage.read_fd;
+        owner->storage.sequence = 9;
+        REQUIRE(owner->own_target(BodyPipeOperation::InputReady, 9));
+        c->pending_ops = 1;
+        ::close(c->fd);
+        ::close(c->upstream_fd);
+        c->fd = c->upstream_fd = -1;
+        loop.free_conn(*c);
+        CHECK_EQ(loop.free_top, 0u);
+        CHECK_EQ(c->response_body_pipe, owner);
+        CHECK_EQ(c->pending_ops, 2u);
+        CHECK(owner->closing);
+        c->pending_ops = 0;  // independent owner guard must still refuse reuse
+        loop.reclaim_slot(c->id);
+        loop.reclaim_pending();
+        CHECK_EQ(loop.free_top, 0u);
+        CHECK_EQ(c->response_body_pipe, owner);
+        c->pending_ops = 2;
+        CHECK(!loop.release_response_body_pipe(*c));
+        CHECK(fcntl(pipe_fd, F_GETFD) >= 0);
+        auto target = pipe_transport_event(0, BodyPipeOperation::InputReady, 9, -ECANCELED);
+        auto cancel = pipe_transport_event(0, BodyPipeOperation::CancelInputReady, 9, 0);
+        auto stale = target;
+        stale.non_upstream_generation = 8;
+        loop.dispatch(stale);
+        CHECK_EQ(c->pending_ops, 2u);
+        loop.dispatch(target_first ? target : cancel);
+        CHECK_EQ(c->pending_ops, 1u);
+        CHECK_EQ(loop.free_top, 0u);
+        CHECK(fcntl(pipe_fd, F_GETFD) >= 0);
+        loop.dispatch(target_first ? target : cancel);  // duplicate
+        CHECK_EQ(c->pending_ops, 1u);
+        loop.dispatch(target_first ? cancel : target);
+        CHECK_EQ(loop.free_top, 1u);
+        CHECK_EQ(c->response_body_pipe, nullptr);
+        CHECK_EQ(fcntl(pipe_fd, F_GETFD), -1);
+        CHECK_EQ(errno, EBADF);
+        auto* reused = loop.alloc_conn();
+        REQUIRE(reused != nullptr);
+        CHECK_EQ(reused->response_body_pipe_sequence, 9u);
+        reused->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        reused->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        REQUIRE(reused->fd >= 0 && reused->upstream_fd >= 0);
+        REQUIRE(loop.allocate_response_body_pipe(*reused, 4096));
+        auto* fresh = reused->response_body_pipe;
+        REQUIRE_EQ(fresh->storage.sequence, 9u);
+        const u32 next = ++fresh->storage.sequence;
+        REQUIRE(fresh->own_target(BodyPipeOperation::InputReady, next));
+        reused->pending_ops = 1;
+        loop.dispatch(target);
+        loop.dispatch(cancel);
+        CHECK_EQ(reused->pending_ops, 1u);
+        CHECK_EQ(fresh->targets[2], next);
+        ::close(reused->fd);
+        ::close(reused->upstream_fd);
+        reused->fd = reused->upstream_fd = -1;
+        loop.free_conn(*reused);
+        loop.dispatch(pipe_transport_event(0, BodyPipeOperation::InputReady, next, -ECANCELED));
+        loop.dispatch(pipe_transport_event(0, BodyPipeOperation::CancelInputReady, next, 0));
+        CHECK_EQ(loop.free_top, 1u);
+    }
+}
+
+TEST(iouring_body_pipe, sq_full_close_retry_survives_reset_and_terminal_race) {
+    for (bool target_before_retry : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(1));
+        auto& loop = *guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(loop, 8));
+        auto* c = loop.alloc_conn();
+        REQUIRE(c != nullptr);
+        c->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        REQUIRE(c->fd >= 0 && c->upstream_fd >= 0);
+        REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+        auto* owner = c->response_body_pipe;
+        owner->storage.sequence = 3;
+        REQUIRE(owner->own_target(BodyPipeOperation::OutputReady, 3));
+        c->pending_ops = 1;
+        guard.sq_tail = 8;  // no SQ slot, no queued cancel
+        ::close(c->fd);
+        ::close(c->upstream_fd);
+        c->fd = c->upstream_fd = -1;
+        loop.free_conn(*c);
+        CHECK_EQ(c->pending_ops, 1u);
+        CHECK_EQ(loop.body_pipe_cancel_retry_count, 1u);
+        CHECK(owner->retry_registered);
+        CHECK_EQ(loop.free_top, 0u);
+        auto target = pipe_transport_event(0, BodyPipeOperation::OutputReady, 3, POLLOUT);
+        if (target_before_retry) {
+            loop.dispatch(target);
+            CHECK_EQ(loop.body_pipe_cancel_retry_count, 0u);
+            CHECK_EQ(loop.free_top, 1u);
+            loop.retry_body_pipe_cancels();
+            CHECK_EQ(loop.backend.pending, 0u);
+        } else {
+            guard.sq_head = 8;
+            loop.retry_body_pipe_cancels();
+            CHECK_EQ(loop.body_pipe_cancel_retry_count, 0u);
+            CHECK_EQ(c->pending_ops, 2u);
+            loop.dispatch(target);
+            CHECK_EQ(loop.free_top, 0u);
+            loop.dispatch(
+                pipe_transport_event(0, BodyPipeOperation::CancelOutputReady, 3, -ENOENT));
+            CHECK_EQ(loop.free_top, 1u);
+        }
+    }
+}
+
+TEST(iouring_body_pipe, late_positive_input_closes_only_after_its_cancel) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(1));
+    auto& loop = *guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(loop, 8));
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(c->fd >= 0 && c->upstream_fd >= 0);
+    REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+    auto* owner = c->response_body_pipe;
+    ResponseBodyPipe::Operation in{};
+    REQUIRE(owner->storage.reserve_input(4, &in));
+    REQUIRE(owner->storage.submit_input(in.serial));
+    REQUIRE(owner->own_target(BodyPipeOperation::Input, in.serial));
+    REQUIRE_EQ(write(owner->storage.write_fd, "late", 4), 4);
+    c->pending_ops = 1;
+    ::close(c->fd);
+    ::close(c->upstream_fd);
+    c->fd = c->upstream_fd = -1;
+    loop.free_conn(*c);
+    auto positive = pipe_transport_event(0, BodyPipeOperation::Input, in.serial, 4);
+    auto oversized = positive;
+    oversized.result = 5;
+    loop.dispatch(oversized);
+    CHECK_EQ(c->pending_ops, 2u);
+    CHECK_EQ(owner->storage.bytes, 0u);
+    loop.dispatch(positive);
+    CHECK_EQ(c->pending_ops, 1u);
+    CHECK_EQ(owner->storage.bytes, 4u);
+    CHECK_EQ(c->response_read_deadline_post_commit_origin_received, 0u);
+    CHECK_EQ(loop.free_top, 0u);
+    loop.dispatch(pipe_transport_event(0, BodyPipeOperation::CancelInput, in.serial, -ENOENT));
+    CHECK_EQ(loop.free_top, 1u);
+}
+
+TEST(iouring_body_pipe, real_poll_close_drains_and_forced_shutdown_releases_descriptors) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    int sockets[2];
+    REQUIRE_EQ(rut::test::nonblocking_socketpair(sockets), 0);
+    ScopedListenerTestFd peer(sockets[1]);
+    c->fd = sockets[0];
+    c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(c->upstream_fd >= 0);
+    REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+    auto* owner = c->response_body_pipe;
+    owner->storage.sequence = 1;
+    REQUIRE(loop.backend.add_body_pipe_poll(c->fd, c->id, 1, true));
+    REQUIRE(owner->own_target(BodyPipeOperation::InputReady, 1));
+    ++c->pending_ops;
+    const i32 pipe_fd = owner->storage.read_fd;
+    loop.close_conn(*c);
+    CHECK_EQ(c->response_body_pipe, owner);
+    for (u32 i = 0; i < 4 && c->response_body_pipe; ++i) {
+        IoEvent events[8]{};
+        const u32 count = loop.backend.wait(events, 8, loop.conns, loop.connection_capacity);
+        REQUIRE_EQ(loop.backend.failure_code(), 0);
+        loop.dispatch_batch(events, count);
+    }
+    CHECK_EQ(c->response_body_pipe, nullptr);
+    CHECK_EQ(fcntl(pipe_fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    c->upstream_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    REQUIRE(c->fd >= 0 && c->upstream_fd >= 0);
+    REQUIRE(loop.allocate_response_body_pipe(*c, 4096));
+    const i32 forced_read = c->response_body_pipe->storage.read_fd;
+    const i32 forced_write = c->response_body_pipe->storage.write_fd;
+    // Reserve without submission: forced ring teardown must still drop fds.
+    ResponseBodyPipe::Operation reserved{};
+    REQUIRE(c->response_body_pipe->storage.reserve_input(4, &reserved));
+    ::close(c->fd);
+    ::close(c->upstream_fd);
+    c->fd = c->upstream_fd = -1;
+    loop.shutdown();
+    guard.initialized = false;
+    CHECK_EQ(fcntl(forced_read, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_EQ(fcntl(forced_write, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+}
+
+TEST(iouring_byte_buffers, dirty_connection_reuse_resets_valid_lengths) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* first = loop->alloc_conn();
+    REQUIRE(first != nullptr);
+    __builtin_memset(first->recv_slice, 0xa5, SlicePool::kSliceSize);
+    __builtin_memset(first->send_slice, 0xa5, SlicePool::kSliceSize);
+    first->recv_buf.commit(7);
+    first->send_buf.commit(9);
+    loop->free_conn(*first);
+    Connection* next = loop->alloc_conn();
+    REQUIRE(next != nullptr);
+    CHECK_EQ(next->recv_buf.len(), 0u);
+    CHECK_EQ(next->send_buf.len(), 0u);
+    CHECK_EQ(next->recv_slice[100], 0xa5u);
+    CHECK_EQ(next->send_slice[100], 0xa5u);
+    static constexpr u8 request[] = "GET / HTTP/1.1\r\nHost: example\r\n\r\n";
+    REQUIRE_EQ(next->recv_buf.write(request, sizeof(request) - 1u), sizeof(request) - 1u);
+    ParsedRequest parsed;
+    HttpParser parser;
+    parser.reset();
+    parsed.reset();
+    CHECK_EQ(parser.parse(next->recv_buf.data(), next->recv_buf.len(), &parsed),
+             ParseStatus::Complete);
+    CHECK_EQ(parser.header_end, sizeof(request) - 1u);
+    CHECK_EQ(parsed.header_count, 1u);
+    loop->free_conn(*next);
+    // A declared TLS listener keeps ordinary zero-filled request/send leases.
+    loop->listener_context.transport = ListenerTransport::Tls;
+    Connection* tls = loop->alloc_conn();
+    REQUIRE(tls != nullptr);
+    for (u32 i = 0; i < SlicePool::kSliceSize; ++i) {
+        CHECK_EQ(tls->recv_slice[i], 0u);
+        CHECK_EQ(tls->send_slice[i], 0u);
+    }
+    loop->free_conn(*tls);
+}
 
 TEST(iouring_local_body_epoch, close_defers_leave_until_send_slot_reclaims) {
     ScopedIoUringLoopForRetirement guard;
@@ -37440,7 +37734,11 @@ TEST(iouring_upstream_recv, response_deadline_neutrality_inventory_is_exhaustive
                                                         reject_each);
     ResponseReadDeadlineUploadProof::visit_owner_fields(
         conn.response_read_deadline_first_batch_upload, reject_each);
-    CHECK_EQ(fields_tested, 72u);
+    // 72 pre-existing fields + the 5 Bounded-only fields
+    // (response_read_deadline_bounded_released/_header_sent/_read_ahead_paused/
+    // _pending_complete/_pending_clean_eof) added to
+    // visit_response_read_deadline_owner_fields.
+    CHECK_EQ(fields_tested, 77u);
 
     conn.response_read_deadline_post_commit_response_class =
         CompleteContentLengthResponseClass::CoherentSingleRange206;
@@ -43126,6 +43424,14 @@ TEST(response_read_deadline_coalesced_get_phase1,
         }
         REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
                    ResponseReadDeadlinePostCommitPhase::HeaderSend);
+        REQUIRE(response_read_deadline_post_commit_is_stable(conn));
+        // The pinned-header syntax cache must detect an in-place mutation at
+        // the same address, then accept the restored bytes on the next check.
+        u8* pinned_header = const_cast<u8*>(conn.response_header_buf.data());
+        const u8 saved_first = pinned_header[0];
+        pinned_header[0] = static_cast<u8>('X');
+        CHECK_FALSE(response_read_deadline_post_commit_is_stable(conn));
+        pinned_header[0] = saved_first;
         REQUIRE(response_read_deadline_post_commit_is_stable(conn));
         CHECK_EQ(conn.pipeline_stash_len, sizeof(kSuccessor) - 1u);
         CHECK_EQ(conn.send_buf.len(), sizeof(kSuccessor) - 1u);
@@ -62429,10 +62735,10 @@ static constexpr u8 kStrict304MetadataResponse[] =
     "\r\n";
 static_assert(sizeof(kStrict304MetadataResponse) - 1u == 120u);
 
-static IoEvent stage_strict_304_metadata_response(Connection& conn) {
+static IoEvent stage_strict_304_metadata_response(Connection& conn, bool more = true) {
     const u32 len = sizeof(kStrict304MetadataResponse) - 1u;
     if (conn.upstream_recv_buf.write(kStrict304MetadataResponse, len) != len) return {};
-    return response_read_copy_event(conn, len, true, 0, len);
+    return response_read_copy_event(conn, len, more, 0, len);
 }
 
 #ifdef __linux__
@@ -62753,6 +63059,131 @@ TEST(response_read_deadline_get_304_metadata,
             const u32 id = conn.id;
             const u32 episode = conn.upstream_episode;
             const IoEvent response = stage_strict_304_metadata_response(conn);
+            REQUIRE_GT(response.result, 0);
+            const IoEvent terminal{
+                id, terminal_result, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
+            const IoEvent events[2] = {terminal_first ? terminal : response,
+                                       terminal_first ? response : terminal};
+            loop->dispatch_batch(events, 2);
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_NE(loop->conns[id].http1_prebuilt_response_purpose,
+                     Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+            CHECK_FALSE(buf_has(loop->conns[id].response_header_buf.data(),
+                                loop->conns[id].response_header_buf.len(),
+                                "HTTP/1.1 304 Not Modified\r\n"));
+            release_closed_response_read_fixture(fixture);
+        }
+    }
+}
+
+// Bounded's header recv is one-shot (see add_response_read_recv), so its own
+// positive completion always carries !ev.more, unlike CCL's multishot header
+// recv whose ordinary positive completions carry more=true. Confirm the
+// shortcut still admits a keep-alive 304 rather than misreading the one-shot
+// recv's own terminal flag as an already-observed origin close (issue #529).
+TEST(response_read_deadline_get_304_metadata,
+     bounded_one_shot_header_recv_success_preserves_keep_alive) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    // response_read_deadline_identity_is_stable cross-checks the connection's
+    // cached buffering against the config bundle's, so both must agree.
+    REQUIRE(config.policy_bundle_id_is_valid(conn.response_read_deadline_bundle_id));
+    config.policy_bundles[conn.response_read_deadline_bundle_id - 1].response_buffering =
+        ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_first_batch_buffering = ForwardResponseBufferingMode::Bounded;
+    const IoEvent response = stage_strict_304_metadata_response(conn, /*more=*/false);
+    REQUIRE_EQ(response.result, static_cast<i32>(sizeof(kStrict304MetadataResponse) - 1u));
+    REQUIRE_FALSE(response.more);
+    loop->dispatch_batch(&response, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.resp_status, 304u);
+    CHECK_EQ(conn.http1_prebuilt_response_layout,
+             Http1PrebuiltResponseLayout::HeaderOnlyNoBodyStatus);
+    CHECK_EQ(conn.http1_prebuilt_response_purpose,
+             Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+    CHECK(buf_has(conn.response_header_buf.data(),
+                  conn.response_header_buf.len(),
+                  "Connection: keep-alive\r\n"));
+    CHECK_FALSE(
+        buf_has(conn.response_header_buf.data(), conn.response_header_buf.len(), "HTTP/1.1 200"));
+    // A one-shot recv is already fully retired by generic CQE accounting
+    // before this callback runs, so retirement tombstones trivially instead
+    // of owning a live kUpstreamOpRecv target the way CCL's multishot does.
+    CHECK_FALSE(conn.upstream_retirement_active);
+    CHECK_EQ(conn.upstream_retirement_target_owned, 0u);
+
+    drain_strict_304_timer_cancel(_tc, loop, conn, true);
+    complete_prebuilt_d2_header(loop, conn);
+    REQUIRE(conn.http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK_GE(conn.fd, 0);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     bounded_one_shot_incomplete_header_preserves_initial_timeout) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    REQUIRE(config.policy_bundle_id_is_valid(conn.response_read_deadline_bundle_id));
+    config.policy_bundles[conn.response_read_deadline_bundle_id - 1].response_buffering =
+        ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_first_batch_buffering = ForwardResponseBufferingMode::Bounded;
+    const u32 timer_generation = conn.response_read_timer_owner_generation;
+    static constexpr u8 kPartial[] = "HTTP/1.1 200 OK\r\nX-Progress: incomplete\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kPartial, sizeof(kPartial) - 1u),
+               sizeof(kPartial) - 1u);
+    const IoEvent progress = response_read_copy_event(
+        conn, sizeof(kPartial) - 1u, /*more=*/false, 0, sizeof(kPartial) - 1u);
+    loop->dispatch_batch(&progress, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK_EQ(conn.response_read_timer_owner_generation, timer_generation);
+    CHECK_EQ(conn.response_read_timer_phase, ResponseReadTimerPhase::Armed);
+    CHECK_EQ(conn.resp_status, 0u);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+// Same-batch safety must hold for Bounded too: prepare_response_read_deadline_batch
+// folds every UpstreamRecv CQE for this upstream_episode into the owner before
+// any dispatch runs, so a real close landing in the same wait() batch as the
+// one-shot header recv's positive completion is still visible via
+// owner.terminal_fault and must not be admitted as a keep-alive shortcut.
+TEST(response_read_deadline_get_304_metadata,
+     bounded_one_shot_clean_eof_or_recv_error_in_completion_batch_fails_closed) {
+    for (const i32 terminal_result : {0, -ECONNRESET}) {
+        for (const bool terminal_first : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            RouteConfig config{};
+            PrebuiltD2Fixture fixture{};
+            REQUIRE(stage_live_precise_get(loop, config, &fixture));
+            Connection& conn = *fixture.conn;
+            REQUIRE(config.policy_bundle_id_is_valid(conn.response_read_deadline_bundle_id));
+            config.policy_bundles[conn.response_read_deadline_bundle_id - 1].response_buffering =
+                ForwardResponseBufferingMode::Bounded;
+            conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+            conn.response_read_deadline_first_batch_buffering =
+                ForwardResponseBufferingMode::Bounded;
+            const u32 id = conn.id;
+            const u32 episode = conn.upstream_episode;
+            const IoEvent response = stage_strict_304_metadata_response(conn, /*more=*/false);
             REQUIRE_GT(response.result, 0);
             const IoEvent terminal{
                 id, terminal_result, 0, 0, IoEventType::UpstreamRecv, 0, 0, episode};
@@ -63644,15 +64075,15 @@ TEST(response_buffering_runtime, body_slices_remain_owned_until_deferred_send_re
         loop->free_conn_impl(*conn);
         if (pending) {
             CHECK_EQ(loop->free_top, free_before);
-            CHECK_EQ(loop->pool.in_use_map[index], 1u);
+            CHECK_EQ(loop->pool.in_use_map[index] & 1u, 1u);
             CHECK_EQ(loop->conns[id].response_body_tail.data(), bytes);
             CHECK_EQ(memcmp(bytes, body, sizeof(body)), 0);
             loop->reclaim_pending();
-            CHECK_EQ(loop->pool.in_use_map[index], 1u);
+            CHECK_EQ(loop->pool.in_use_map[index] & 1u, 1u);
             loop->conns[id].pending_ops = 0;
             loop->reclaim_pending();
         }
-        CHECK_EQ(loop->pool.in_use_map[index], 0u);
+        CHECK_EQ(loop->pool.in_use_map[index] & 1u, 0u);
         CHECK_EQ(loop->conns[id].response_body_tail.size, 0u);
         CHECK_EQ(loop->free_top, free_before + 1u);
         loop->reclaim_pending();
@@ -63793,6 +64224,190 @@ TEST(response_buffering_runtime,
         }
     }
 }
+
+// Regression test for issue #3: lifting Bounded's declared-body cap must not
+// let (header + declared_body) — a u32 raw-stream position elsewhere, e.g.
+// bounded_response_release_bytes and response_header_buf.len() + released —
+// overflow. The boundary is UINT32_MAX - SlicePool::kSliceSize: the largest
+// possible raw header is upstream_recv_buf's fixed SlicePool::kSliceSize
+// capacity (enforced by the raw_header_end <= upstream_recv_buf.capacity()
+// admission check alongside this cap), so that much headroom below
+// UINT32_MAX guarantees no admitted response can overflow it.
+TEST(response_buffering_runtime,
+     bounded_declared_body_cap_leaves_header_headroom_and_rejects_the_next_value) {
+    static constexpr u32 kCap = UINT32_MAX - SlicePool::kSliceSize;
+    REQUIRE_EQ(kCap,
+               complete_content_length_declared_body_cap(
+                   ForwardResponseBufferingMode::Bounded,
+                   CompleteContentLengthResponseClass::BoundedPositiveBody));
+    for (const u32 declared : {kCap, kCap + 1u}) {
+        const bool overflow = declared > kCap;
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::Bounded));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+        Connection& conn = *fixture.conn;
+        char header[64];
+        const int n = snprintf(
+            header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n", declared);
+        REQUIRE_GT(n, 0);
+        REQUIRE_LT(static_cast<u32>(n), sizeof(header));
+        const u32 len = static_cast<u32>(n);
+        REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(header), len), len);
+        const IoEvent response = response_read_copy_event(conn, len, true, 0, len);
+        const u32 id = conn.id;
+        loop->dispatch_batch(&response, 1);
+        if (overflow) {
+            CHECK_EQ(loop->conns[id].fd, -1);
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+            release_closed_response_read_fixture(fixture);
+        } else {
+            REQUIRE_GE(conn.fd, 0);
+            CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+                     ResponseReadDeadlinePostCommitPhase::Buffering);
+            CHECK_EQ(conn.response_read_deadline_post_commit_declared_body, declared);
+            CHECK_EQ(conn.response_body_tail.size, 0u);  // no eager body allocation
+            CHECK_EQ(loop->backend.send_state[id].remaining, 0u);
+            cleanup_prebuilt_d2(loop, fixture);
+        }
+    }
+}
+
+// Regression test for issue #4: a coherent single-range 206
+// (CompleteContentLengthResponseClass::CoherentSingleRange206) is
+// non-releasable under Bounded — try_advance_bounded_release is a no-op for
+// it, so bounded_released never advances. The 512 KiB read-ahead pause must
+// therefore never engage for this class: try_advance_bounded_release's
+// resume branch is unreachable for the same reason (it, too, no-ops
+// immediately for this class), so pausing here would stop arming reads and
+// never resume — a permanent hang, not a pause.
+TEST(response_buffering_runtime,
+     bounded_coherent_206_never_pauses_the_upstream_recv_past_the_read_ahead_threshold) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/5));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+    // A single-range 206 body whose first chunk alone crosses
+    // kBoundedReadAheadBytes (512 KiB) of unreleased bytes while the response
+    // is still incomplete (kChunk < kDeclared) — still fits
+    // CompleteContentLength's 1 MiB cap (issue #3's fix keeps this class at
+    // that cap even under Bounded).
+    static constexpr u32 kDeclared = 700000;
+    static constexpr u32 kChunk = 600000;
+    char header[128];
+    const int n = snprintf(header,
+                           sizeof(header),
+                           "HTTP/1.1 206 Partial Content\r\nContent-Length: %u\r\n"
+                           "Content-Range: bytes 0-%u/1000000\r\n\r\n",
+                           kDeclared,
+                           kDeclared - 1u);
+    REQUIRE_GT(n, 0);
+    REQUIRE_LT(static_cast<u32>(n), sizeof(header));
+    const u32 header_len = static_cast<u32>(n);
+    REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(header), header_len),
+               header_len);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(reinterpret_cast<const u8*>(header), header_len, &response),
+               ParseStatus::Complete);
+    REQUIRE_EQ(response.status_code, 206u);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent header_event = response_read_copy_event(conn, header_len, true, 0, header_len);
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_response_class,
+               CompleteContentLengthResponseClass::CoherentSingleRange206);
+    conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+    conn.response_read_deadline_progress_episode = conn.upstream_episode;
+    conn.response_read_deadline_progress_bytes =
+        conn.response_read_deadline_post_commit_origin_received;
+    loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    // One recv lands a still-incomplete chunk. bounded_released never
+    // advances for this class, so pre-fix this crosses the read-ahead
+    // threshold and pauses the recv with nothing ever able to resume it —
+    // and the response is not yet complete, so this cannot instead take the
+    // CompleteBody disposition.
+    static std::vector<u8> chunk(kChunk, 'x');
+    const u32 begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk.data(), kChunk));
+    const u32 end = conn.buffered_response_len();
+    IoEvent body_event =
+        response_read_copy_event(conn, static_cast<i32>(kChunk), /*more=*/false, begin, end);
+    body_event.sock_nonempty = 0;
+    loop->dispatch_batch(&body_event, 1);
+
+    // Fixed behavior: never paused, recv re-armed exactly as
+    // CompleteContentLength would — this class keeps the untouched,
+    // complete-buffered-only path.
+    CHECK_FALSE(conn.response_read_deadline_bounded_read_ahead_paused);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.response_read_deadline_bounded_released, 0u);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+#ifdef __linux__
+// Issue #5 evidence: before building any epoll-specific Bounded support,
+// establish whether CompleteContentLength with response_read_timeout
+// already fails on the epoll fallback today — a pre-existing limitation of
+// the explicit response-read-deadline machinery — or whether this is
+// something Bounded introduces. prepare_response_read_deadline_preflight_for_mode
+// (callbacks_impl.h) closes any route whose forward_preflight_mode can own
+// the runtime deadline unless Loop::kSupportsExplicitFirstResponseDeadline
+// is true; only IoUringEventLoop defines it (iouring_event_loop.h). This
+// gate is buffering-mode-agnostic — CompleteContentLength closes exactly the
+// same way Bounded would, so epoll-specific Bounded support is out of scope
+// (see callbacks.h's on_bounded_release_header_sent/_body_sent forward
+// declarations: "io_uring only").
+TEST(response_read_deadline_epoll_parity,
+     complete_content_length_response_read_timeout_route_closes_on_epoll_preflight) {
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodGet, &response_read_deadline_handler, false, /*preflight bundle=*/2));
+    REQUIRE_EQ(config.routes[0].forward_preflight_mode, ForwardPreflightMode::EagerDirect);
+
+    auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->init(0, -1).has_value());
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 sv[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(sv), 0);
+    conn->fd = sv[0];
+    conn->request_config = &config;
+
+    const bool admitted =
+        prepare_response_read_deadline_preflight(loop.get(), *conn, &config.routes[0], &config);
+
+    CHECK_FALSE(admitted);
+    CHECK_EQ(conn->fd, -1);
+    close(sv[1]);
+}
+#endif  // __linux__
 
 TEST(response_buffering_runtime,
      buffered_header_and_body_send_faults_close_without_publishing_failure_bytes) {
@@ -64368,6 +64983,1210 @@ TEST(response_buffering_runtime,
     }
 }
 
+// Coordinator-requested regression: a slow downstream client must not be cut
+// off after the configured response_read_timeout while the origin keeps
+// sending body bytes the client just hasn't drained yet (nginx does not
+// time out reads it is not performing). Bounded pauses the upstream recv
+// once unreleased body bytes reach kBoundedReadAheadBytes and — the fix
+// under test — suspends the wheel timer for the whole pause, resuming it
+// with a fresh full timeout once released bytes catch back up.
+TEST(response_buffering_runtime, wheel_timer_suspends_while_read_ahead_paused_and_resumes_fresh) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 2, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/2));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(kHeader, sizeof(kHeader) - 1u, &response), ParseStatus::Complete);
+    REQUIRE_EQ(response.status_code, 200u);
+    REQUIRE_EQ(response.content_length, 2000000u);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent header_event =
+        response_read_copy_event(conn, sizeof(kHeader) - 1u, true, 0, sizeof(kHeader) - 1u);
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::Buffering);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_response_class,
+               CompleteContentLengthResponseClass::BoundedPositiveBody);
+    REQUIRE_FALSE(conn.response_read_deadline_bounded_read_ahead_paused);
+    // begin_complete_content_length_buffering() is the raw commit primitive a
+    // real on_upstream_response callback invokes from inside dispatch(); in
+    // production, settle_response_read_deadline_batch() then runs in the same
+    // dispatch_batch() call (the owner for this commit event was captured
+    // during prepare(), while state was still Armed) and, seeing zero extra
+    // owner bytes here, promotes the connection straight back to Armed with a
+    // fresh timer — see the tail of its post_commit_at_start branch. This
+    // test calls the commit primitive directly (no wired callback/route to
+    // dispatch through), so it replicates that same tail by hand: without it,
+    // response_read_deadline_state is left at RefreshPending, and the next
+    // dispatch_batch() call below would refuse to create a batch owner for
+    // this connection at all (find_or_add_response_read_batch_owner only
+    // admits Armed/ExpiryPending/BodyComplete).
+    conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+    conn.response_read_deadline_progress_episode = conn.upstream_episode;
+    conn.response_read_deadline_progress_bytes =
+        conn.response_read_deadline_post_commit_origin_received;
+    loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    // A large chunk lands in one shot (as a direct/bulk recv would): well
+    // past kBoundedReadAheadBytes of it is still unreleased (nothing has
+    // been sent downstream yet in this test), so the batch that reports it
+    // must pause instead of re-arming the upstream recv.
+    static constexpr u32 kChunk = 530000;
+    static std::vector<u8> chunk(kChunk, 'x');
+    const u32 begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk.data(), kChunk));
+    const u32 end = conn.buffered_response_len();
+    REQUIRE_EQ(end - begin, kChunk);
+    const IoEvent bulk_event = response_read_copy_event(conn,
+                                                        static_cast<i32>(kChunk),
+                                                        /*more=*/false,
+                                                        begin,
+                                                        end);
+    loop->dispatch_batch(&bulk_event, 1);
+    CHECK(conn.response_read_deadline_bounded_read_ahead_paused);
+    CHECK_FALSE(conn.upstream_recv_armed);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+
+    // The configured timeout is 2s; tick the wheel forward far past that
+    // (and past a full 64-slot wrap) while still paused. A suspended timer
+    // must never expire the connection.
+    for (u32 i = 0; i < 200; i++) {
+        const IoEvent tick{0, 1, 0, 0, IoEventType::Timeout, 0};
+        loop->dispatch_batch(&tick, 1);
+    }
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    CHECK_GE(conn.fd, 0);
+
+    // The client finally drains enough (simulated: forge bounded_released to
+    // exactly what the release formula already allows, so resuming the recv
+    // is the only thing left to do). Unreleased now sits far below the
+    // resume threshold. Note this connection already has a real header-release
+    // Send in flight and forever uncompleted (send_armed stays true): the
+    // very first bulk_event dispatch above ran try_advance_bounded_release
+    // itself (unconditionally, before the pause check) and, seeing 530000
+    // bytes releasable, started that Send for real — this test never drains
+    // its completion, which is deliberate (only the timer-suspension behavior
+    // below is under test) but means the eventual expiry below resolves via
+    // an immediate close (a send owner is never neutral) rather than a
+    // flush-then-close of the already-released prefix.
+    const u32 header_len = conn.response_read_deadline_post_commit_raw_header_end;
+    // Forging released>0 without header_sent is an impossible real-world
+    // state (nothing releases before the header goes out) and trips
+    // start_complete_content_length_send's own defensive check
+    // (!bounded_header_sent) later, at the InactivityExpiry disposition this
+    // test drives to below — set it here to keep the forged state honest.
+    conn.response_read_deadline_bounded_header_sent = true;
+    conn.response_read_deadline_bounded_released =
+        bounded_response_release_bytes(header_len, end, /*complete=*/false);
+    REQUIRE(loop->try_advance_bounded_release(conn));
+    CHECK_FALSE(conn.response_read_deadline_bounded_read_ahead_paused);
+    CHECK(conn.upstream_recv_armed);
+
+    // Resuming must give a fresh full 2s timeout, not "whatever was left"
+    // (which would have already been due many times over during the pause):
+    // one tick short of it must still be Armed, and the tick that completes
+    // it must expire.
+    for (u32 i = 0; i < 1; i++) {
+        const IoEvent tick{0, 1, 0, 0, IoEventType::Timeout, 0};
+        loop->dispatch_batch(&tick, 1);
+    }
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    const IoEvent final_tick{0, 2, 0, 0, IoEventType::Timeout, 0};
+    loop->dispatch_batch(&final_tick, 1);
+    // resolve_response_read_deadline_expiries() drives InactivityExpiry
+    // resolution synchronously inside this dispatch_batch() call, so
+    // ExpiryPending is only ever a transient mid-call value, never the final
+    // one. Here start_complete_content_length_send finds the still-in-flight
+    // header-release Send from the bulk_event above (see the comment at the
+    // resume forging) and — correctly, matching every other "a send owner
+    // must be neutral" gate in this machinery — refuses rather than stomp on
+    // it; resolve_response_read_deadline_expiries has no deferral path for
+    // InactivityExpiry (unlike CompleteBody/CleanUpstreamEof), so it closes
+    // outright. Either resolution (flush-then-close, had the Send been idle,
+    // or this immediate close) satisfies "expiry after release must not keep
+    // the connection alive," which is what this asserts.
+    CHECK_LT(conn.fd, 0);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+// Companion to the pause/resume test above: a genuinely stalled origin (the
+// upstream recv stays armed and simply never reports more data — no
+// read-ahead pause in play) must still expire on schedule. This guards
+// against the suspension fix above accidentally becoming unconditional.
+TEST(response_buffering_runtime, genuinely_stalled_origin_still_expires_when_not_paused) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 2, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/2));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(kHeader, sizeof(kHeader) - 1u, &response), ParseStatus::Complete);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent header_event =
+        response_read_copy_event(conn, sizeof(kHeader) - 1u, true, 0, sizeof(kHeader) - 1u);
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::Buffering);
+    REQUIRE_FALSE(conn.response_read_deadline_bounded_read_ahead_paused);
+    CHECK(conn.upstream_recv_armed);
+    // See the identical fixup (and its rationale) in the pause/resume test
+    // above: begin_complete_content_length_buffering() alone leaves state at
+    // RefreshPending, but the dispatch_batch() calls below need it promoted
+    // back to Armed the way settle_response_read_deadline_batch()'s own tail
+    // would, or they can never (re-)admit a batch owner for this connection.
+    conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+    conn.response_read_deadline_progress_episode = conn.upstream_episode;
+    conn.response_read_deadline_progress_bytes =
+        conn.response_read_deadline_post_commit_origin_received;
+    loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    // No read-ahead pause here — well under kBoundedReadAheadBytes is
+    // buffered, so the origin is simply quiet, not intentionally throttled.
+    // TimerWheel::tick() checks the slot at its *current* cursor before
+    // advancing it, so a refresh at cursor C0 with an S-second timeout only
+    // matches on the (S+1)-th subsequent tick() call (calls 0..S-1 after the
+    // refresh check slots C0..C0+S-1; the S-th call, cursor==C0+S, is the
+    // match) — three tick()s for the 2s timeout armed above, not two.
+    for (u32 i = 0; i < 3; i++) {
+        const IoEvent tick{0, 1, 0, 0, IoEventType::Timeout, 0};
+        loop->dispatch_batch(&tick, 1);
+    }
+    CHECK_FALSE(conn.response_read_deadline_bounded_read_ahead_paused);
+    // See the identical BodyComplete-vs-ExpiryPending rationale in the
+    // pause/resume test above. No release ever happened here (bounded_released
+    // stayed 0), so this resolves through start_complete_content_length_send's
+    // ordinary (pre-existing, not Bounded-specific) InactivityExpiry-during-
+    // Buffering path, which — unlike CleanUpstreamEof — never selects any
+    // body at all (body_to_send stays 0): plain CCL/Bounded buffering never
+    // released anything to the client while collecting, so nothing has
+    // actually gone out yet, and this path sends only the pinned header
+    // before closing rather than relay a Content-Length-declared body it
+    // cannot actually complete.
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::BodyComplete);
+    CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 0u);
+    CHECK(conn.response_read_deadline_post_commit_close_after_drain);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+// Regression test for the release-coalescing fix: a positive UpstreamRecv CQE
+// that reports IORING_CQE_F_SOCK_NONEMPTY (surfaced as IoEvent::sock_nonempty
+// — see io_event.h) means the kernel already had more bytes queued in the
+// upstream socket when this recv drained it. try_advance_bounded_release must
+// not start a new release Send in that case — the imminent re-arm picks those
+// bytes up, and deferring until a recv actually drains the socket coalesces a
+// bursty/fast origin into one release Send instead of many small ones. A
+// drained read (sock_nonempty clear) must still release immediately, exactly
+// as before this fix — this both proves the deferral and guards against it
+// becoming unconditional.
+TEST(response_buffering_runtime, bounded_release_defers_while_socket_still_has_queued_bytes) {
+    for (const bool drained : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::Bounded));
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(
+            stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+        REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/5));
+        Connection& conn = *fixture.conn;
+        REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+        static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\n\r\n";
+        REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u),
+                   sizeof(kHeader) - 1u);
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        REQUIRE_EQ(parser.parse(kHeader, sizeof(kHeader) - 1u, &response), ParseStatus::Complete);
+        conn.resp_status = response.status_code;
+        REQUIRE(build_strict_response_headers(conn, config, response));
+        loop->timer.remove(&conn);
+        conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+        const IoEvent header_event =
+            response_read_copy_event(conn, sizeof(kHeader) - 1u, true, 0, sizeof(kHeader) - 1u);
+        REQUIRE(loop->begin_complete_content_length_buffering(
+            conn, header_event, parser.header_end, response.content_length));
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+                   ResponseReadDeadlinePostCommitPhase::Buffering);
+        REQUIRE_EQ(conn.response_read_deadline_post_commit_response_class,
+                   CompleteContentLengthResponseClass::BoundedPositiveBody);
+        REQUIRE_FALSE(conn.send_armed);
+        // Same RefreshPending -> Armed fixup as the pause/resume and
+        // genuinely-stalled tests above: begin_complete_content_length_buffering()
+        // alone leaves the connection unable to admit another batch owner.
+        conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+        conn.response_read_deadline_progress_episode = conn.upstream_episode;
+        conn.response_read_deadline_progress_bytes =
+            conn.response_read_deadline_post_commit_origin_received;
+        loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+        conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+        // One recv lands 25000 body bytes in a single CQE — already well past
+        // the first 4096-byte release boundary *and* past kBoundedMinReleaseBytes
+        // (so the separate size-based hold-back never engages here and this
+        // test isolates SOCK_NONEMPTY deferral specifically), so releasing
+        // unconditionally (the pre-fix behavior) would start a Send right
+        // here. Mark the CQE SOCK_NONEMPTY (more bytes already queued
+        // upstream) or not, per `drained`.
+        static constexpr u32 kChunk = 25000;
+        static std::vector<u8> chunk(kChunk, 'x');
+        const u32 begin = conn.buffered_response_len();
+        REQUIRE(conn.response_body_tail.append(loop->pool, chunk.data(), kChunk));
+        const u32 end = conn.buffered_response_len();
+        REQUIRE_EQ(end - begin, kChunk);
+        IoEvent body_event =
+            response_read_copy_event(conn, static_cast<i32>(kChunk), /*more=*/false, begin, end);
+        body_event.sock_nonempty = drained ? 0 : 1;
+
+        const u32 header_len = conn.response_read_deadline_post_commit_raw_header_end;
+        const u32 target = bounded_response_release_bytes(header_len, end, /*complete=*/false);
+        REQUIRE_GT(target, 0u);  // sanity: this chunk alone crosses a release boundary
+
+        loop->dispatch_batch(&body_event, 1);
+
+        if (drained) {
+            // A drained read releases immediately, exactly as before this fix.
+            // The first release is always the header.
+            CHECK(conn.send_armed);
+            CHECK(conn.on_send == &on_bounded_release_header_sent<IoUringEventLoop>);
+            CHECK_EQ(conn.upstream_send_len, header_len);
+            CHECK_FALSE(conn.response_read_deadline_bounded_header_sent);
+            CHECK_EQ(conn.response_read_deadline_bounded_released, 0u);
+        } else {
+            // More bytes were already queued upstream: defer. No Send starts;
+            // the recv simply re-arms to keep collecting, and the next
+            // (eventually drained) completion releases everything eligible in
+            // one Send instead of this chunk alone.
+            CHECK_FALSE(conn.send_armed);
+            CHECK(conn.on_send == nullptr);
+            CHECK_EQ(conn.response_read_deadline_bounded_released, 0u);
+            CHECK_FALSE(conn.response_read_deadline_bounded_header_sent);
+            CHECK(conn.upstream_recv_armed);
+            CHECK_FALSE(conn.response_read_deadline_bounded_read_ahead_paused);
+        }
+
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+// Regression test for the size-based release hold-back: a releasable amount
+// under kBoundedMinReleaseBytes, on an otherwise-ordinary drained recv
+// (sock_nonempty clear, so SOCK_NONEMPTY deferral never engages — this
+// isolates the size-based hold-back specifically), must not release
+// immediately. It must instead arm the bounded hold timer and release only
+// once that timer's -ETIME completion is observed, regardless of size.
+TEST(response_buffering_runtime, bounded_release_hold_timer_flushes_a_small_release) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/5));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(kHeader, sizeof(kHeader) - 1u, &response), ParseStatus::Complete);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent header_event =
+        response_read_copy_event(conn, sizeof(kHeader) - 1u, true, 0, sizeof(kHeader) - 1u);
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::Buffering);
+    conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+    conn.response_read_deadline_progress_episode = conn.upstream_episode;
+    conn.response_read_deadline_progress_bytes =
+        conn.response_read_deadline_post_commit_origin_received;
+    loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    // A 5000-byte chunk lands on a drained read: nginx's own release rule
+    // already allows releasing some of it (target > 0 — see
+    // bounded_response_release_bytes), but that releasable amount (4052
+    // bytes) is still well under kBoundedMinReleaseBytes, so — unlike the
+    // SOCK_NONEMPTY test above — this must be held regardless of the drain
+    // state.
+    static constexpr u32 kChunk = 5000;
+    static std::vector<u8> chunk(kChunk, 'x');
+    const u32 begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk.data(), kChunk));
+    const u32 end = conn.buffered_response_len();
+    IoEvent body_event =
+        response_read_copy_event(conn, static_cast<i32>(kChunk), /*more=*/false, begin, end);
+    body_event.sock_nonempty = 0;
+    loop->dispatch_batch(&body_event, 1);
+
+    CHECK_FALSE(conn.send_armed);
+    CHECK(conn.on_send == nullptr);
+    CHECK_EQ(conn.response_read_deadline_bounded_released, 0u);
+    CHECK(conn.response_read_deadline_bounded_hold_timer_armed);
+    const u32 generation = conn.response_read_deadline_bounded_hold_timer_owner_generation;
+    REQUIRE_NE(generation, 0u);
+
+    // The hold timer's own -ETIME completion must force the release through
+    // despite the amount still being small — this is the escape hatch that
+    // bounds how long a genuinely stalling origin's bytes are held.
+    IoEvent timer_event{};
+    timer_event.conn_id = conn.id;
+    timer_event.type = IoEventType::BoundedHoldTimer;
+    timer_event.result = -ETIME;
+    timer_event.non_upstream_generation = generation;
+    loop->dispatch_batch(&timer_event, 1);
+
+    CHECK(conn.send_armed);
+    CHECK(conn.on_send == &on_bounded_release_header_sent<IoUringEventLoop>);
+    CHECK_FALSE(conn.response_read_deadline_bounded_hold_timer_armed);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+// Companion: a response that completes (origin_received == declared) while
+// still small must release immediately, same as today — start_complete_content_length_send
+// drives CompleteBody directly and never consults try_advance_bounded_release,
+// so the hold-back can't apply even though the whole body is well under
+// kBoundedMinReleaseBytes.
+TEST(response_buffering_runtime, bounded_complete_response_never_holds_even_when_small) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/5));
+    Connection& conn = *fixture.conn;
+
+    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(kHeader, sizeof(kHeader) - 1u, &response), ParseStatus::Complete);
+    REQUIRE_EQ(response.content_length, 50u);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent header_event =
+        response_read_copy_event(conn, sizeof(kHeader) - 1u, true, 0, sizeof(kHeader) - 1u);
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+    conn.response_read_deadline_progress_episode = conn.upstream_episode;
+    conn.response_read_deadline_progress_bytes =
+        conn.response_read_deadline_post_commit_origin_received;
+    loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    // The whole (tiny) declared body arrives in one shot: origin_received
+    // reaches declared, so this is the CompleteBody disposition.
+    static constexpr u32 kChunk = 50;
+    static std::vector<u8> chunk(kChunk, 'x');
+    const u32 begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk.data(), kChunk));
+    const u32 end = conn.buffered_response_len();
+    IoEvent body_event =
+        response_read_copy_event(conn, static_cast<i32>(kChunk), /*more=*/false, begin, end);
+    body_event.sock_nonempty = 0;
+    loop->dispatch_batch(&body_event, 1);
+
+    CHECK(conn.send_armed);
+    CHECK_FALSE(conn.response_read_deadline_bounded_hold_timer_armed);
+    CHECK_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::BodyComplete);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+// Regression test for issue #2 (terminal handoff while the header release is
+// in flight): the origin can complete while the very first bounded release —
+// the header-only send from try_advance_bounded_release — is still
+// draining. At that instant response_read_deadline_bounded_header_sent is
+// still false and response_read_deadline_bounded_released is still 0, so a
+// fast-forward guard keyed on "released > 0" misses this window, falls
+// through to the ordinary HeaderSend path once the header send completes,
+// and resends the already-delivered header a second time (then desyncs
+// upstream_send_len against raw_header_end once it starts consuming body).
+TEST(response_buffering_runtime, bounded_complete_while_header_release_in_flight_fast_forwards) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/5));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 40000\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(kHeader, sizeof(kHeader) - 1u, &response), ParseStatus::Complete);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent header_event =
+        response_read_copy_event(conn, sizeof(kHeader) - 1u, true, 0, sizeof(kHeader) - 1u);
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_response_class,
+               CompleteContentLengthResponseClass::BoundedPositiveBody);
+    conn.response_read_deadline_progress_generation = conn.response_read_deadline_generation;
+    conn.response_read_deadline_progress_episode = conn.upstream_episode;
+    conn.response_read_deadline_progress_bytes =
+        conn.response_read_deadline_post_commit_origin_received;
+    loop->timer.refresh(&conn, conn.response_read_deadline_seconds);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+
+    // First chunk: 25000 bytes, drained — crosses a release boundary and
+    // exceeds kBoundedMinReleaseBytes, so it releases immediately: the
+    // header-only send arms right here (see try_advance_bounded_release).
+    static constexpr u32 kFirstChunk = 25000;
+    static std::vector<u8> chunk1(kFirstChunk, 'a');
+    u32 begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk1.data(), kFirstChunk));
+    u32 end = conn.buffered_response_len();
+    IoEvent body1 =
+        response_read_copy_event(conn, static_cast<i32>(kFirstChunk), /*more=*/false, begin, end);
+    body1.sock_nonempty = 0;
+    loop->dispatch_batch(&body1, 1);
+
+    REQUIRE(conn.send_armed);
+    REQUIRE(conn.on_send == &on_bounded_release_header_sent<IoUringEventLoop>);
+    REQUIRE_FALSE(conn.response_read_deadline_bounded_header_sent);
+    REQUIRE_EQ(conn.response_read_deadline_bounded_released, 0u);
+    REQUIRE(conn.upstream_recv_armed);
+
+    // Second chunk: the remaining 15000 bytes complete the declared 40000-byte
+    // body in a SEPARATE wait batch, while the header send above is still in
+    // flight (its own completion is never dispatched in between).
+    static constexpr u32 kSecondChunk = 15000;
+    static std::vector<u8> chunk2(kSecondChunk, 'b');
+    begin = conn.buffered_response_len();
+    REQUIRE(conn.response_body_tail.append(loop->pool, chunk2.data(), kSecondChunk));
+    end = conn.buffered_response_len();
+    IoEvent body2 =
+        response_read_copy_event(conn, static_cast<i32>(kSecondChunk), /*more=*/false, begin, end);
+    body2.sock_nonempty = 0;
+    loop->dispatch_batch(&body2, 1);
+
+    // The completion was proven but must defer: the header send is still the
+    // live owner, so the terminal disposition cannot run until it drains.
+    CHECK(conn.response_read_deadline_bounded_pending_complete);
+    CHECK(conn.send_armed);
+    CHECK(conn.on_send == &on_bounded_release_header_sent<IoUringEventLoop>);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::Buffering);
+
+    // The in-flight header send now completes, running
+    // finish_bounded_release_as_complete's deferred CompleteBody disposition.
+    complete_prebuilt_d2_header(loop, conn);
+
+    // Fixed behavior: fast-forward straight to WaitingBody for the full,
+    // still-unreleased body — never resend the header, never touch
+    // upstream_send_len as if it were about to consume raw header bytes
+    // again.
+    CHECK(conn.response_read_deadline_bounded_header_sent);
+    CHECK_FALSE(conn.response_read_deadline_bounded_pending_complete);
+    CHECK_EQ(conn.response_read_deadline_post_commit_phase,
+             ResponseReadDeadlinePostCommitPhase::WaitingBody);
+    CHECK_EQ(conn.response_read_deadline_post_commit_send_body, 40000u);
+    CHECK_EQ(conn.response_read_deadline_post_commit_downstream_submitted, 0u);
+    CHECK_EQ(conn.response_read_deadline_post_commit_downstream_completed, 0u);
+    CHECK_EQ(conn.resp_body_remaining, 40000u);
+    CHECK_EQ(conn.resp_body_sent, conn.response_header_buf.len());
+    CHECK(conn.response_read_deadline_post_commit_pump_pending);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+// Regression test for the 64 KiB send-count fix: when the whole declared
+// body fits in one bulk node (kBulkPayload), the *first* direct body recv
+// for a Bounded response must reserve a bulk node immediately, not the
+// ordinary "slice, then bulk once size crosses bulk_after" ramp
+// CompleteContentLength still uses. Measured with RUT_DEBUG_SEND_TRACE (see
+// the final report): this alone brings Bounded's downstream Send count and
+// sizes to match CompleteContentLength's exactly for a 64 KiB body, both
+// plain and over TLS.
+static bool stage_bounded_pipe_receive(IoUringEventLoop* loop,
+                                       RouteConfig& config,
+                                       PrebuiltD2Fixture& fixture,
+                                       u32 declared = 65536) {
+    if (!config.add_upstream("backend", 0x7F000001, 9000).has_value() ||
+        !add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::Bounded) ||
+        !stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, true) ||
+        !arm_staged_response_read_deadline(loop, fixture, 5))
+        return false;
+    auto& c = *fixture.conn;
+    u8 header[80];
+    const int length = snprintf(reinterpret_cast<char*>(header),
+                                sizeof(header),
+                                "HTTP/1.1 200 OK\r\nContent-Length: %u\r\n\r\n",
+                                declared);
+    if (length <= 0 || static_cast<u32>(length) >= sizeof(header)) return false;
+    const u32 header_len = static_cast<u32>(length);
+    static const u8 body[8192]{};
+    if (c.upstream_recv_buf.write(header, header_len) != header_len ||
+        c.upstream_recv_buf.write(body, sizeof(body)) != sizeof(body))
+        return false;
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    if (parser.parse(header, header_len, &response) != ParseStatus::Complete) return false;
+    c.resp_status = response.status_code;
+    if (!build_strict_response_headers(c, config, response)) return false;
+    loop->timer.remove(&c);
+    c.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    const IoEvent initial =
+        response_read_copy_event(c, c.upstream_recv_buf.len(), true, 0, c.upstream_recv_buf.len());
+    if (!loop->begin_complete_content_length_buffering(c, initial, parser.header_end, declared))
+        return false;
+    // Model the canonical header and every eligible prefix already sent.
+    // The header-relative release boundary leaves an ordinary-memory suffix.
+    c.response_read_deadline_bounded_header_sent = true;
+    c.response_read_deadline_bounded_released =
+        bounded_response_release_bytes(parser.header_end, sizeof(body), false);
+    const u32 suffix = sizeof(body) - c.response_read_deadline_bounded_released;
+    c.upstream_recv_buf.reset();
+    if (c.upstream_recv_buf.write(body, suffix) != suffix) return false;
+    c.state = ConnState::Sending;
+    c.response_read_deadline_progress_generation = c.response_read_deadline_generation;
+    c.response_read_deadline_progress_episode = c.upstream_episode;
+    c.response_read_deadline_progress_bytes = sizeof(body);
+    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+    c.upstream_recv_armed = false;
+    if (!loop->allocate_response_body_pipe(c, 65536)) return false;
+    c.upstream_recv_armed = true;
+    return response_body_pipe_receive_identity_is_current(c);
+}
+
+TEST(response_buffering_runtime, pipe_receive_has_distinct_batch_witness_and_ordered_prefix) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_bounded_pipe_receive(loop, config, fixture));
+    auto& c = *fixture.conn;
+    auto& owner = *c.response_body_pipe;
+    const u32 prefix = c.buffered_response_len();
+    REQUIRE_GT(prefix, 0u);
+    ResponseBodyPipe::Operation input{};
+    REQUIRE(owner.storage.reserve_input(4, &input));
+    REQUIRE(owner.storage.submit_input(input.serial));
+    REQUIRE(owner.own_target(BodyPipeOperation::Input, input.serial));
+    REQUIRE_EQ(write(owner.storage.write_fd, "pipe", 4), 4);
+    ScopedTlsRawSendLoop raw;
+    REQUIRE(raw.init());
+    auto& backend = raw.loop->backend;
+    backend.connection_capacity = loop->connection_capacity;
+    raw.cq_entries[0] = {
+        encode_body_pipe_token({c.id, input.serial, BodyPipeOperation::Input}), 4, 0};
+    raw.cq_tail = 1;
+    IoEvent event{};
+    const u32 pending = c.pending_ops;
+    REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+    REQUIRE_EQ(event.type, IoEventType::UpstreamRecv);
+    CHECK_EQ(event.copy_witness, IoEventCopyWitness::Pipe);
+    CHECK_EQ(event.copy_begin, prefix);
+    CHECK_EQ(event.copy_end, prefix + 4);
+    CHECK_EQ(c.pending_ops, pending);  // semantic dispatch still owns this count
+    CHECK_EQ(owner.targets[0], 0u);
+    CHECK_EQ(c.buffered_response_len(), prefix + 4);
+    CHECK_EQ(c.buffered_response_front_size(), prefix);
+    CHECK_EQ(c.buffered_response_data(), c.upstream_recv_buf.data());
+    CHECK(!c.buffered_response_front_is_pipe());
+    REQUIRE(response_read_body_storage_witness_is_current(c, event));
+    loop->prepare_response_read_deadline_batch(&event, 1);
+    REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
+    CHECK(loop->response_read_batch_owners[0].valid);
+    CHECK_EQ(loop->response_read_batch_owners[0].positive_bytes, 4u);
+    CHECK_EQ(loop->response_read_batch_owners[0].expected_copy_end, prefix + 4);
+    IoEvent forged = event;
+    ++forged.non_upstream_generation;
+    CHECK(!response_read_body_storage_witness_is_current(c, forged));
+    // Duplicate raw completion is not another committed body fragment.
+    raw.cq_entries[1] = raw.cq_entries[0];
+    raw.cq_tail = 2;
+    REQUIRE_EQ(backend.wait(&forged, 1, loop->conns, loop->connection_capacity), 1u);
+    CHECK_EQ(forged.type, IoEventType::BodyPipeTransport);
+    CHECK_EQ(c.buffered_response_len(), prefix + 4);
+    CHECK(!owner.retire(forged));
+    c.upstream_recv_buf.reset();
+    CHECK(c.buffered_response_front_is_pipe());
+    CHECK_EQ(c.buffered_response_front_size(), 4u);
+    CHECK_EQ(c.buffered_response_data(), nullptr);
+    CHECK_EQ(c.buffered_response_len(), 4u);
+    // Restore the valid prefix/Armed fixture before presenting a different
+    // batch. prepare() itself transitions the first one to BatchPending.
+    u8 prefix_bytes[4096]{};
+    REQUIRE_LE(prefix, sizeof(prefix_bytes));
+    REQUIRE_EQ(c.upstream_recv_buf.write(prefix_bytes, prefix), prefix);
+    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+    forged = event;
+    ++forged.non_upstream_generation;
+    loop->prepare_response_read_deadline_batch(&forged, 1);
+    REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
+    CHECK(!loop->response_read_batch_owners[0].valid);
+    CHECK_LT(c.fd, 0);
+    loop->response_read_batch_pin_count = 0;
+    loop->response_read_batch_event_count = 0;
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime, pipe_receive_rejects_stale_identity_and_declared_overrun) {
+    for (u32 variant = 0; variant < 7; ++variant) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_receive(loop, config, fixture));
+        auto& c = *fixture.conn;
+        auto& owner = *c.response_body_pipe;
+        ResponseBodyPipe::Operation input{};
+        REQUIRE(owner.storage.reserve_input(4, &input));
+        REQUIRE(owner.storage.submit_input(input.serial));
+        REQUIRE(owner.own_target(BodyPipeOperation::Input, input.serial));
+        REQUIRE_EQ(write(owner.storage.write_fd, "held", 4), 4);
+        if (variant == 0) ++owner.upstream_episode;
+        if (variant == 1) ++owner.deadline_generation;
+        if (variant == 2) owner.method = 0xff;
+        if (variant == 3) ++owner.downstream_fd;
+        if (variant == 4) c.response_read_deadline_bounded_header_sent = false;
+        if (variant == 5)
+            c.response_read_deadline_post_commit_declared_body =
+                c.response_read_deadline_post_commit_origin_received + 3;
+        if (variant == 6) c.tls_active = true;
+        ScopedTlsRawSendLoop raw;
+        REQUIRE(raw.init());
+        auto& backend = raw.loop->backend;
+        backend.connection_capacity = loop->connection_capacity;
+        raw.cq_entries[0] = {
+            encode_body_pipe_token({c.id, input.serial, BodyPipeOperation::Input}), 4, 0};
+        raw.cq_tail = 1;
+        IoEvent event{};
+        REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+        CHECK_EQ(event.type, IoEventType::BodyPipeTransport);
+        CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+        CHECK_EQ(owner.storage.bytes, 0u);
+        CHECK_EQ(owner.targets[0], input.serial);
+        // Custody can still retire on abort; rejected bytes were not published.
+        event.result = -ECANCELED;
+        REQUIRE(owner.retire(event));
+        c.tls_active = false;
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, pipe_eof_is_terminal_and_eagain_remains_transport_only) {
+    for (i32 result : {0, -EAGAIN}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_receive(loop, config, fixture));
+        auto& c = *fixture.conn;
+        auto& owner = *c.response_body_pipe;
+        ResponseBodyPipe::Operation input{};
+        REQUIRE(owner.storage.reserve_input(4, &input));
+        REQUIRE(owner.storage.submit_input(input.serial));
+        REQUIRE(owner.own_target(BodyPipeOperation::Input, input.serial));
+        ScopedTlsRawSendLoop raw;
+        REQUIRE(raw.init());
+        auto& backend = raw.loop->backend;
+        backend.connection_capacity = loop->connection_capacity;
+        raw.cq_entries[0] = {
+            encode_body_pipe_token({c.id, input.serial, BodyPipeOperation::Input}), result, 0};
+        raw.cq_tail = 1;
+        IoEvent event{};
+        REQUIRE_EQ(backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+        CHECK_EQ(event.copy_witness, IoEventCopyWitness::None);
+        CHECK_EQ(owner.storage.bytes, 0u);
+        if (result == 0) {
+            REQUIRE_EQ(event.type, IoEventType::UpstreamRecv);
+            loop->prepare_response_read_deadline_batch(&event, 1);
+            REQUIRE_EQ(loop->response_read_batch_owner_count, 1u);
+            CHECK(loop->response_read_batch_owners[0].valid);
+            CHECK(loop->response_read_batch_owners[0].clean_eof);
+        } else {
+            REQUIRE_EQ(event.type, IoEventType::BodyPipeTransport);
+            CHECK_EQ(owner.targets[0], input.serial);
+            REQUIRE(owner.retire(event));
+        }
+        loop->response_read_batch_pin_count = 0;
+        loop->response_read_batch_event_count = 0;
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+static bool stage_bounded_pipe_output(IoUringEventLoop* loop,
+                                      RouteConfig& config,
+                                      PrebuiltD2Fixture& fixture,
+                                      bool complete) {
+    if (!stage_bounded_pipe_receive(loop, config, fixture)) return false;
+    auto& c = *fixture.conn;
+    auto& p = *c.response_body_pipe;
+    c.upstream_recv_buf.reset();
+    c.upstream_recv_armed = false;
+    --c.pending_ops;  // retire the fixture's synthetic header receive owner
+    const u32 received = complete ? 65536 : 12288;
+    c.response_read_deadline_post_commit_origin_received = received;
+    c.response_read_deadline_progress_bytes = received;
+    c.response_read_deadline_bounded_released = received - 4096;
+    ResponseBodyPipe::Operation in{};
+    if (!p.storage.reserve_input(4096, &in) || in.limit != 4096 ||
+        !p.storage.submit_input(in.serial) || !p.own_target(BodyPipeOperation::Input, in.serial))
+        return false;
+    u8 bytes[4096];
+    __builtin_memset(bytes, 'p', sizeof(bytes));
+    if (write(p.storage.write_fd, bytes, sizeof(bytes)) != sizeof(bytes) ||
+        !p.retire(pipe_transport_event(c.id, BodyPipeOperation::Input, in.serial, sizeof(bytes))))
+        return false;
+    return response_read_deadline_post_commit_is_stable(c);
+}
+
+TEST(response_buffering_runtime, pipe_input_eagain_waits_without_deadline_progress) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(1));
+    auto* loop = guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(*loop, 16));
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_bounded_pipe_receive(loop, config, fixture));
+    auto& c = *fixture.conn;
+    auto& p = *c.response_body_pipe;
+    c.upstream_recv_armed = false;
+    --c.pending_ops;
+    loop->backend.body_pipe_workers_bound = true;
+    c.response_read_timer_last_progress_ns = 123;
+    const u32 progress = c.response_read_deadline_progress_bytes;
+    REQUIRE(loop->arm_response_read_body_recv(c));
+    const u32 first = p.targets[0];
+    REQUIRE_NE(first, 0u);
+    CHECK_FALSE(c.upstream_recv_direct_armed);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Input, first, -EAGAIN));
+    const u32 ready = p.targets[2];
+    REQUIRE_GT(ready, first);
+    CHECK(c.upstream_recv_armed);
+    CHECK_EQ(c.pending_ops, 2u);
+    CHECK_EQ(c.response_read_timer_last_progress_ns, 123u);
+    CHECK_EQ(c.response_read_deadline_progress_bytes, progress);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Input, first, -EAGAIN));
+    CHECK_EQ(c.pending_ops, 2u);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::InputReady, ready, POLLIN));
+    REQUIRE_GT(p.targets[0], ready);
+    CHECK_EQ(p.targets[2], 0u);
+    CHECK_EQ(c.pending_ops, 2u);
+    CHECK_EQ(c.response_read_timer_last_progress_ns, 123u);
+    CHECK_EQ(c.response_read_deadline_progress_bytes, progress);
+    // The fake SQ was never submitted. Retire its last synthetic target.
+    REQUIRE(
+        p.retire(pipe_transport_event(c.id, BodyPipeOperation::Input, p.targets[0], -ECANCELED)));
+    c.upstream_recv_armed = false;
+    --c.pending_ops;
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime, pipe_input_fallback_preserves_body_and_waits_for_output) {
+    for (bool output_active : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(1));
+        auto* loop = guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(*loop, 16));
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_output(loop, config, fixture, false));
+        auto& c = *fixture.conn;
+        auto& p = *c.response_body_pipe;
+        loop->backend.body_pipe_workers_bound = true;
+        const u32 progress = c.response_read_deadline_progress_bytes;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        const u32 released = c.response_read_deadline_bounded_released;
+        c.response_read_timer_last_progress_ns = 123;
+        u32 sent = 0;
+        u32 output_serial = 0;
+        if (output_active) {
+            sent = bounded_response_release_bytes(
+                       c.response_read_deadline_post_commit_raw_header_end, received, false) -
+                   released;
+            c.upstream_send_len = sent;
+            c.transition_to_sending(&on_bounded_release_body_sent<IoUringEventLoop>);
+            REQUIRE(loop->submit_response_body_pipe_send(c, sent, false));
+            output_serial = p.targets[1];
+        }
+        REQUIRE(loop->arm_response_read_body_recv(c));
+        const u32 input_serial = p.targets[0];
+        REQUIRE_NE(input_serial, 0u);
+        loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Input, input_serial, -EAGAIN));
+        REQUIRE_GE(c.fd, 0);
+        if (output_active) {
+            REQUIRE(p.fallback_pending);
+            CHECK(c.response_read_deadline_bounded_read_ahead_paused);
+            CHECK_FALSE(c.upstream_recv_armed);
+            CHECK_EQ(c.buffered_response_len(), 4096u);
+            u8 drained[4096];
+            REQUIRE_EQ(read(p.storage.read_fd, drained, sent), sent);
+            loop->dispatch(
+                pipe_transport_event(c.id, BodyPipeOperation::Output, output_serial, sent));
+        } else {
+            CHECK_EQ(c.response_read_timer_last_progress_ns, 123u);
+        }
+        REQUIRE_GE(c.fd, 0);
+        CHECK(p.input_disabled);
+        CHECK_FALSE(p.fallback_pending);
+        CHECK_FALSE(c.response_read_deadline_bounded_read_ahead_paused);
+        CHECK_EQ(p.storage.read_fd, -1);
+        CHECK_EQ(p.storage.write_fd, -1);
+        CHECK_EQ(c.buffered_response_len(), 4096u - sent);
+        CHECK_EQ(c.response_body_tail.size, 4096u - sent);
+        CHECK_EQ(c.response_read_deadline_progress_bytes, progress);
+        CHECK_EQ(c.response_read_deadline_post_commit_origin_received, received);
+        CHECK_EQ(c.response_read_deadline_bounded_released, released + sent);
+        REQUIRE(c.upstream_recv_direct_armed);
+        REQUIRE(c.upstream_recv_armed);
+        REQUIRE_EQ(c.pending_ops, 2u);
+        for (u32 i = 0; i < c.response_body_tail.front_size(); ++i)
+            CHECK_EQ(c.response_body_tail.data()[i], static_cast<u8>('p'));
+        // No kernel SQ submission occurred in this fake-ring test.
+        c.upstream_recv_direct_armed = c.upstream_recv_armed = false;
+        --c.pending_ops;
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, pipe_terminal_input_cancel_discards_late_suffix_only) {
+    for (bool cancel_first : {false, true}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(1));
+        auto* loop = guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(*loop, 16));
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_output(loop, config, fixture, false));
+        auto& c = *fixture.conn;
+        auto& p = *c.response_body_pipe;
+        loop->backend.body_pipe_workers_bound = true;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        REQUIRE(loop->arm_response_read_body_recv(c));
+        const u32 serial = p.targets[0];
+        REQUIRE(loop->stop_response_body_pipe_input(c));
+        CHECK_FALSE(c.upstream_recv_armed);
+        REQUIRE_EQ(c.pending_ops, 3u);
+        REQUIRE_EQ(p.cancels[0], serial);
+        const IoEvent cancel =
+            pipe_transport_event(c.id, BodyPipeOperation::CancelInput, serial, 0);
+        const IoEvent target = pipe_transport_event(c.id, BodyPipeOperation::Input, serial, 3);
+        REQUIRE_EQ(write(p.storage.write_fd, "new", 3), 3);
+        if (cancel_first) loop->dispatch(cancel);
+        loop->dispatch(target);
+        if (!cancel_first) loop->dispatch(cancel);
+        REQUIRE_GE(c.fd, 0);
+        CHECK_EQ(c.pending_ops, 1u);
+        CHECK_EQ(p.storage.bytes, 4099u);
+        CHECK_EQ(p.discarded_input_bytes, 3u);
+        CHECK_EQ(c.buffered_response_len(), 4096u);
+        CHECK_EQ(c.response_read_deadline_post_commit_origin_received, received);
+        CHECK_EQ(p.targets[0], 0u);
+        CHECK_EQ(p.cancels[0], 0u);
+        loop->dispatch(target);
+        loop->dispatch(cancel);
+        CHECK_EQ(c.pending_ops, 1u);
+        CHECK_EQ(c.buffered_response_len(), 4096u);
+        cleanup_prebuilt_d2(loop, fixture);
+    }
+}
+
+TEST(response_buffering_runtime, pipe_admission_preserves_an_inflight_memory_prefix) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(1));
+    auto* loop = guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(*loop, 16));
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_bounded_pipe_receive(loop, config, fixture, 1048576));
+    auto& c = *fixture.conn;
+    REQUIRE(loop->release_response_body_pipe(c));
+    c.upstream_recv_armed = false;
+    --c.pending_ops;
+    u8 next[4096]{};
+    REQUIRE_EQ(c.upstream_recv_buf.write(next, sizeof(next)), sizeof(next));
+    c.response_read_deadline_post_commit_origin_received += sizeof(next);
+    c.response_read_deadline_progress_bytes += sizeof(next);
+    REQUIRE(response_read_deadline_post_commit_is_stable(c));
+    const u8* prefix = c.buffered_response_data();
+    const u32 length = c.buffered_response_front_size();
+    REQUIRE_GT(length, 0u);
+    c.upstream_send_len = 4096;
+    c.transition_to_sending(&on_bounded_release_body_sent<IoUringEventLoop>);
+    c.send_armed = true;
+    loop->backend.body_pipe_workers_bound = true;
+    loop->body_pipe_response_enabled = true;
+    REQUIRE(loop->arm_response_read_body_recv(c));
+    REQUIRE(c.response_body_pipe != nullptr);
+    CHECK_EQ(c.buffered_response_data(), prefix);
+    CHECK_EQ(c.buffered_response_front_size(), length);
+    CHECK_FALSE(c.upstream_recv_direct_armed);
+    CHECK(c.upstream_recv_armed);
+    auto& p = *c.response_body_pipe;
+    REQUIRE_NE(p.targets[0], 0u);
+    REQUIRE(
+        p.retire(pipe_transport_event(c.id, BodyPipeOperation::Input, p.targets[0], -ECANCELED)));
+    c.upstream_recv_armed = false;
+    --c.pending_ops;
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime, pipe_partial_output_and_eagain_keep_one_logical_release) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(1));
+    auto* loop = guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(*loop, 16));
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_bounded_pipe_output(loop, config, fixture, false));
+    auto& c = *fixture.conn;
+    auto& p = *c.response_body_pipe;
+    loop->backend.body_pipe_workers_bound = true;
+    const u32 released = c.response_read_deadline_bounded_released;
+    const u32 length =
+        bounded_response_release_bytes(c.response_read_deadline_post_commit_raw_header_end,
+                                       c.response_read_deadline_post_commit_origin_received,
+                                       false) -
+        released;
+    c.upstream_send_len = length;
+    c.transition_to_sending(&on_bounded_release_body_sent<IoUringEventLoop>);
+    REQUIRE(loop->submit_response_body_pipe_send(c, length, false));
+    const u32 frame = p.send.serial;
+    const u32 first = p.targets[1];
+    char bytes[4096]{};
+    REQUIRE_EQ(read(p.storage.read_fd, bytes, 1000), 1000);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Output, first, 1000));
+    CHECK_EQ(p.send.completed, 1000u);
+    CHECK_EQ(c.buffered_response_len(), 4096u);
+    CHECK_EQ(c.response_read_deadline_bounded_released, released);
+    CHECK(c.send_armed);
+    const u32 second = p.targets[1];
+    REQUIRE_GT(second, first);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Output, first, 1000));
+    CHECK_EQ(p.send.completed, 1000u);  // duplicate cannot consume current owner
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Output, second, -EAGAIN));
+    const u32 ready = p.targets[3];
+    REQUIRE_GT(ready, second);
+    CHECK_EQ(p.send.serial, frame);
+    CHECK_EQ(c.buffered_response_len(), 4096u);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::OutputReady, ready, POLLOUT));
+    const u32 final = p.targets[1];
+    REQUIRE_GT(final, ready);
+    REQUIRE_EQ(read(p.storage.read_fd, bytes, length - 1000), length - 1000);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Output, final, length - 1000));
+    CHECK_GE(c.fd, 0);
+    CHECK_FALSE(c.send_armed);
+    CHECK_EQ(p.send.kind, ResponseBodyPipeOwner::SendKind::None);
+    CHECK_EQ(c.response_read_deadline_bounded_released, released + length);
+    CHECK_EQ(c.buffered_response_len(), 4096u - length);
+    loop->dispatch(pipe_transport_event(c.id, BodyPipeOperation::Output, final, length - 1000));
+    CHECK_EQ(c.response_read_deadline_bounded_released, released + length);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_buffering_runtime, pipe_real_output_uses_release_and_terminal_callbacks) {
+    for (u32 variant = 0; variant < 3; ++variant) {
+        const bool terminal = variant != 0;
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PrebuiltD2Fixture fixture{};
+        REQUIRE(stage_bounded_pipe_output(loop, config, fixture, terminal));
+        auto& c = *fixture.conn;
+        REQUIRE(loop->backend.bind_body_pipe_workers());
+        const u32 released = c.response_read_deadline_bounded_released;
+        u32 expected = 4096;
+        if (terminal) {
+            if (variant == 2) {
+                // Admit the GET policy used by the combined memory-send
+                // shortcut. A pipe tail must still use the body-only path.
+                c.response_read_deadline_route_method = kRouteMethodGet;
+                c.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+                c.response_read_deadline_upload.request_policy_id = c.request_policy_id;
+                REQUIRE(bodyless_get_complete_content_length_precise_buffering_is_stable(c));
+            }
+            c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+            REQUIRE(loop->start_complete_content_length_send(
+                c, IoUringEventLoop::CompleteContentLengthTerminalDisposition::CompleteBody));
+            loop->pump_response_read_deadline_bodies();
+        } else {
+            expected =
+                bounded_response_release_bytes(c.response_read_deadline_post_commit_raw_header_end,
+                                               c.response_read_deadline_post_commit_origin_received,
+                                               false) -
+                released;
+            c.upstream_send_len = expected;
+            c.transition_to_sending(&on_bounded_release_body_sent<IoUringEventLoop>);
+            REQUIRE(loop->submit_response_body_pipe_send(c, expected, false));
+        }
+        REQUIRE(c.send_armed);
+        for (u32 i = 0; i < 4 && c.send_armed; ++i) {
+            IoEvent events[8]{};
+            const u32 count = loop->backend.wait(events, 8, loop->conns, loop->connection_capacity);
+            REQUIRE_EQ(loop->backend.failure_code(), 0);
+            loop->dispatch_batch(events, count);
+        }
+        REQUIRE_GE(c.fd, 0);
+        CHECK_FALSE(c.send_armed);
+        u8 bytes[4096]{};
+        REQUIRE_EQ(recv(fixture.peer_fd, bytes, sizeof(bytes), MSG_DONTWAIT), expected);
+        for (u32 i = 0; i < expected; ++i) CHECK_EQ(bytes[i], static_cast<u8>('p'));
+        if (terminal) {
+            CHECK_EQ(c.response_body_pipe, nullptr);
+        } else {
+            REQUIRE(c.response_body_pipe != nullptr);
+            CHECK_EQ(c.response_body_pipe->send.kind, ResponseBodyPipeOwner::SendKind::None);
+            CHECK_EQ(c.response_read_deadline_bounded_released, released + expected);
+            CHECK_EQ(c.buffered_response_len(), 4096u - expected);
+        }
+        // Actual ring submissions were consumed; do not rewind the synthetic
+        // fixture's saved SQ position. Retire its dummy downstream recv only.
+        REQUIRE(c.recv_armed);
+        REQUIRE_EQ(c.pending_ops, 1u);
+        REQUIRE_FALSE(c.upstream_recv_armed);
+        REQUIRE_FALSE(c.upstream_connect_armed);
+        REQUIRE_FALSE(c.upstream_send_armed);
+        c.recv_armed = false;
+        --c.pending_ops;
+        loop->close_conn(c);
+        release_closed_response_read_fixture(fixture);
+    }
+}
+
+TEST(response_buffering_runtime, bounded_direct_body_recv_reserves_bulk_node_when_body_fits) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_strict_read_timeout(loop, &config, nullptr, 0, &fixture, /*get_profile=*/true));
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture, /*seconds=*/5));
+    Connection& conn = *fixture.conn;
+    REQUIRE_EQ(conn.response_read_deadline_buffering, ForwardResponseBufferingMode::Bounded);
+
+    // 65536 is comfortably under kBulkPayload (262128) but large enough that
+    // the *ordinary* ramp would need at least one slice-sized node
+    // (~16368 bytes) before ever reaching bulk_after.
+    static constexpr u8 kHeader[] = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(kHeader, sizeof(kHeader) - 1u, &response), ParseStatus::Complete);
+    REQUIRE_EQ(response.content_length, 65536u);
+    conn.resp_status = response.status_code;
+    REQUIRE(build_strict_response_headers(conn, config, response));
+    loop->timer.remove(&conn);
+    conn.response_read_deadline_state = ResponseReadDeadlineState::BatchPending;
+    // more=true: takes begin_complete_content_length_buffering's "recv
+    // already armed" branch, so it commits the header without itself
+    // arming the direct recv — leaving that call isolated below.
+    const IoEvent header_event = response_read_copy_event(
+        conn, sizeof(kHeader) - 1u, /*more=*/true, 0, sizeof(kHeader) - 1u);
+    conn.upstream_recv_armed = true;
+    REQUIRE(loop->begin_complete_content_length_buffering(
+        conn, header_event, parser.header_end, response.content_length));
+    conn.upstream_recv_armed = false;
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::Buffering);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_declared_body, 65536u);
+    REQUIRE(conn.response_body_tail.head == nullptr);
+
+    REQUIRE(loop->arm_response_read_direct_body_recv(conn));
+    REQUIRE(conn.response_body_tail.tail != nullptr);
+    CHECK(loop->pool.is_bulk(reinterpret_cast<const u8*>(conn.response_body_tail.tail)));
+    // The bulk node's whole capacity is reserved, not just enough for
+    // whatever the recv happens to return — this is what lets every
+    // subsequent release stay a single Send.
+    CHECK_GE(conn.response_body_tail.write_avail(loop->pool), 65536u);
+
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
 TEST(response_buffering_runtime, bounded_202_completion_wins_same_batch_timeout_in_either_order) {
     for (const bool timeout_first : {false, true}) {
         ScopedIoUringLoopForRetirement guard;
@@ -64512,6 +66331,68 @@ TEST(response_buffering_runtime,
         CHECK_EQ(loop->conns[id].response_header_buf.len(), 0u);
         release_closed_response_read_fixture(fixture);
     }
+}
+
+TEST(response_buffering_runtime, bounded_combined_final_write_accounts_after_peer_eof) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    if (!loop->backend.nop_inject_result) SKIP("IORING_NOP_INJECT_RESULT unsupported");
+    ShardMetrics metrics{};
+    metrics.init();
+    loop->metrics = &metrics;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::Bounded));
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(
+        stage_strict_read_timeout_method(loop, &config, nullptr, 0, &fixture, LogHttpMethod::Get));
+    Connection& conn = *fixture.conn;
+    conn.response_read_deadline_route_method = kRouteMethodGet;
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.response_read_deadline_upload.request_policy_id = conn.request_policy_id;
+    conn.keep_alive = false;
+    conn.req_keep_alive = true;
+    conn.req_client_keep_alive = false;
+    conn.req_client_connection_close = true;
+    conn.req_client_connection_close_exact = true;
+    conn.req_client_connection_count = 1;
+    conn.response_read_deadline_upload.downstream_close = true;
+    REQUIRE(arm_staged_response_read_deadline(loop, fixture));
+    static constexpr u8 kOrigin[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nAb9!";
+    constexpr u32 kOriginLen = sizeof(kOrigin) - 1;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kOrigin, kOriginLen), kOriginLen);
+    const IoEvent response = response_read_copy_event(conn, kOriginLen, false, 0, kOriginLen);
+    loop->dispatch_batch(&response, 1);
+    REQUIRE_EQ(conn.response_read_deadline_post_commit_phase,
+               ResponseReadDeadlinePostCommitPhase::CombinedSend);
+    REQUIRE(conn.direct_write_completion_pending);
+    REQUIRE(conn.send_armed);
+    REQUIRE(conn.response_read_deadline_send_owner_active);
+    CHECK_EQ(metrics.requests_total, 0u);
+    const u32 length = conn.response_read_deadline_send_len;
+    u8 wire[4096]{};
+    REQUIRE_LT(length, sizeof(wire));
+    REQUIRE_EQ(recv(fixture.peer_fd, wire, sizeof(wire), MSG_DONTWAIT),
+               static_cast<ssize_t>(length));
+    CHECK_EQ(__builtin_memcmp(wire, conn.response_header_buf.data(), length), 0);
+    CHECK_EQ(recv(fixture.peer_fd, wire, sizeof(wire), MSG_DONTWAIT), 0);
+    const u32 id = conn.id;
+    const IoEvent peer_eof{id, 0, 0, 0, IoEventType::Recv, 0};
+    loop->dispatch_batch(&peer_eof, 1);
+    CHECK_GE(conn.fd, 0);
+    CHECK(conn.direct_write_completion_pending);
+    CHECK_EQ(metrics.requests_total, 0u);
+    const IoEvent sent = exact_response_deadline_send_event(loop, conn);
+    loop->dispatch_batch(&sent, 1);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop->conns[id].fd, -1);
+    const u32 pending = loop->conns[id].pending_ops;
+    loop->dispatch_batch(&sent, 1);
+    CHECK_EQ(metrics.requests_total, 1u);
+    CHECK_EQ(loop->conns[id].pending_ops, pending);
+    cleanup_prebuilt_d2(loop, fixture);
 }
 
 TEST(response_buffering_runtime,

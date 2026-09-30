@@ -546,12 +546,11 @@ static inline ParseStatus apply_semantic_header_response(
         if (name_len == 14 && str_ci_eq(name + 1, "ontent-length", 13)) {
             auto cl = parse_uint(val, vlen);
             if (UNLIKELY(!cl)) return ParseStatus::Error;
-            if (UNLIKELY(resp->has_content_length)) {
-                if (resp->content_length != cl.value()) return ParseStatus::Error;
-                return ParseStatus::Complete;
-            }
+            if (UNLIKELY(resp->has_content_length && resp->content_length != cl.value()))
+                return ParseStatus::Error;
             resp->content_length = cl.value();
             resp->has_content_length = true;
+            if (resp->content_length_count != 255) resp->content_length_count++;
             return ParseStatus::Complete;
         }
         if (name_len == 10 && str_ci_eq(name + 1, "onnection", 9)) {
@@ -720,9 +719,6 @@ ParseStatus HttpResponseParser::parse(const u8* buf, u32 len, ParsedResponse* re
             ParseStatus sem = apply_semantic_header_response(
                 buf + name_start, name_len, buf + value_start, value_end - value_start, resp);
             if (UNLIKELY(sem == ParseStatus::Error)) return ParseStatus::Error;
-            if (name_len == 14 && str_ci_eq(buf + name_start + 1, "ontent-length", 13)) {
-                if (resp->content_length_count != 255) resp->content_length_count++;
-            }
         }
 
         pos += 2;  // skip \r\n

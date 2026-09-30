@@ -1,0 +1,13 @@
+Test project /home/hurricane/private/code/Rut-s1/build-rel
+    Start 27: test_network
+1/2 Test #27: test_network .....................   Passed   34.04 sec
+    Start 34: test_arena
+2/2 Test #34: test_arena .......................   Passed    0.01 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Label Time Summary:
+network    =  34.04 sec*proc (1 test)
+unit       =  34.04 sec*proc (2 tests)
+
+Total Test time (real) =  34.05 sec

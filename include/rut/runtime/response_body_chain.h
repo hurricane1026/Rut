@@ -9,7 +9,7 @@ namespace rut {
 // Nodes are sent in place and reclaimed after their send completion, one node
 // per send. A node is an ordinary slice or, once the body has proven larger
 // than one slice and the pool has one, a bulk relay buffer: a large body then
-// leaves in 256 KiB sends instead of 16 KiB ones.
+// leaves in bulk-sized sends instead of 16 KiB ones.
 struct ResponseBodyChain {
     static constexpr u32 kMaxBody = SlicePool::kMaxBufferedResponseBody;
     struct Node {
@@ -22,6 +22,11 @@ struct ResponseBodyChain {
     static constexpr u32 kPayload = sizeof(Node::bytes);
     static_assert(kPayload == SlicePool::kResponseBodyPayload);
     static constexpr u32 kHeader = SlicePool::kSliceSize - kPayload;
+    // Payload capacity of a bulk-allocated node — same fixed Node header,
+    // larger backing allocation. Used to decide whether a whole declared
+    // body can be reserved as a single bulk node up front (see
+    // arm_response_read_direct_body_recv's Bounded fast-path).
+    static constexpr u32 kBulkPayload = SlicePool::kBulkSliceSize - kHeader;
 
     // Payload of a node, which may extend past Node::bytes for a bulk node.
     static u8* payload(Node* node) { return reinterpret_cast<u8*>(node) + kHeader; }
@@ -50,8 +55,20 @@ struct ResponseBodyChain {
 
     // Reserve before publishing: allocation failure leaves the existing bytes
     // and length unchanged, as required by the receive copy witness.
-    bool append(SlicePool& pool, const u8* src, u32 len, u32 bulk_after = kBulkAfterPlaintext) {
-        if (len > kMaxBody - size || (owner && owner != &pool)) return false;
+    // `cap` bounds the *total* size this call will grow to — kMaxBody (1 MiB)
+    // for CompleteContentLength, which buffers a whole body before sending
+    // any of it, so its total buffered size is genuinely bounded by that
+    // constant. Bounded releases whole buffers as they arrive and pauses the
+    // upstream recv well under kBoundedReadAheadBytes, so it passes a cap
+    // sized off that window instead — see its call site — rather than the
+    // unrelated 1 MiB figure, which a large enough body/burst can otherwise
+    // hit before the pause below ever gets a chance to run.
+    bool append(SlicePool& pool,
+                const u8* src,
+                u32 len,
+                u32 bulk_after = kBulkAfterPlaintext,
+                u32 cap = kMaxBody) {
+        if (size >= cap || len > cap - size || (owner && owner != &pool)) return false;
         if (len == 0) return true;
         const u32 spare = tail ? payload_capacity(pool, tail) - tail->len : 0;
         u32 missing = len > spare ? len - spare : 0;
@@ -62,12 +79,12 @@ struct ResponseBodyChain {
             // has proven: once it outgrew `bulk_after` (or this append alone
             // needs more than one slice), prefer one bulk node over slices.
             u8* raw = (missing > kPayload || size >= bulk_after) ? pool.alloc_bulk() : nullptr;
-            if (!raw) raw = pool.alloc();
+            if (!raw) raw = pool.alloc_uninitialized();
             auto* node = reinterpret_cast<Node*>(raw);
             if (!node) {
                 while (first) {
                     Node* next = first->next;
-                    pool.free_written(reinterpret_cast<u8*>(first), kHeader);
+                    pool.free(reinterpret_cast<u8*>(first));
                     first = next;
                 }
                 return false;
@@ -103,13 +120,28 @@ struct ResponseBodyChain {
     }
 
     // The caller has completed all asynchronous users of the consumed bytes.
-    void consume(u32 len) {
+    //
+    // `tail_pinned` must be true when a direct recv (see reserve_tail() /
+    // write_ptr() / commit() below) is currently armed against this chain's
+    // tail node: that recv's destination is a raw pointer into the tail's
+    // reserved-but-not-yet-committed capacity (beyond `len`), captured at
+    // arm time and written by the kernel asynchronously. If consuming these
+    // bytes would otherwise free the tail node (its committed prefix fully
+    // drained), stop short and leave that node allocated instead — freeing
+    // it here would return memory the kernel is still actively writing
+    // into to the pool, which can then be handed to a completely different
+    // caller (silent corruption instead of a crash, since the reservation
+    // is by raw pointer with no separate liveness check). The node is safe
+    // to free once the in-flight commit() lands and a later consume() (with
+    // tail_pinned now false, or having moved on to a new tail) drains it.
+    void consume(u32 len, bool tail_pinned = false) {
         while (len != 0) {
             const u32 n = len < front_size() ? len : front_size();
             head->offset += n;
             size -= n;
             len -= n;
             if (head->offset == head->len) {
+                if (head == tail && tail_pinned) break;
                 Node* old = head;
                 head = head->next;
                 release_node(old);
@@ -146,7 +178,7 @@ struct ResponseBodyChain {
         if (tail && payload_capacity(pool, tail) > tail->len) return true;
         if (owner && owner != &pool) return false;
         u8* raw = size >= bulk_after ? pool.alloc_bulk() : nullptr;
-        if (!raw) raw = pool.alloc();
+        if (!raw) raw = pool.alloc_uninitialized();
         auto* node = reinterpret_cast<Node*>(raw);
         if (!node) return false;
         node->next = nullptr;
@@ -178,11 +210,9 @@ struct ResponseBodyChain {
     }
 
 private:
-    // Payload bytes are only ever written at [0, len), so that is all a
-    // bulk node has to re-zero on return.
-    void release_node(Node* node) {
-        owner->free_written(reinterpret_cast<u8*>(node), kHeader + node->len);
-    }
+    // Payload stays uninitialized between owners. append/reserve_tail
+    // reset node metadata, and only append/commit publish received bytes.
+    void release_node(Node* node) { owner->free(reinterpret_cast<u8*>(node)); }
 };
 
 }  // namespace rut

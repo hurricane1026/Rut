@@ -1180,6 +1180,13 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
             return libc_result(result);
         }
     }
+    if (number == __NR_io_uring_register && (int)arg1 == ring_view.fd &&
+        arg2 == IORING_REGISTER_IOWQ_AFF) {
+        /* The runtime pins its io-wq workers (body pipe splices) to the shard's
+         * CPU set. This never touches ring or provided-buffer identity, so it
+         * passes straight through. */
+        return libc_result(rut_gate_kernel_syscall(number, arg1, arg2, arg3, arg4, arg5, arg6));
+    }
     if (number == __NR_io_uring_register && (int)arg1 == ring_view.fd) {
         const struct io_uring_buf_reg* registration = (const struct io_uring_buf_reg*)arg3;
         struct io_uring_buf_reg registration_copy;

@@ -1,0 +1,7 @@
+=== response_parser ===
+RUN: response_parser.content_length_count_uses_complete_header_name
+    check: /home/hurricane/private/code/Rut-s1/tests/test_http_parser.cc:3742 -> (resp.content_length_count) == (0u)
+    check: /home/hurricane/private/code/Rut-s1/tests/test_http_parser.cc:3755 -> (resp.content_length_count) == (2u)
+  FAIL: content_length_count_uses_complete_header_name (/home/hurricane/private/code/Rut-s1/tests/test_http_parser.cc:3755: (resp.content_length_count) == (2u))
+
+0 passed, 1 failed, 7 checks, 2 failed checks, 215 skipped

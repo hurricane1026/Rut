@@ -2250,9 +2250,8 @@ response framed by exactly one `Content-Length`:
 
 - `"complete_content_length"`: the whole response (header and body) is
   buffered before any downstream byte is sent.
-- `"bounded"`: nginx's `proxy_buffering on` (nginx's default) release rule.
-  ⏳ pending: the mode is accepted, but the runtime still serves it exactly as
-  `"complete_content_length"`. With raw
+- `"bounded"`: nginx's `proxy_buffering on` release rule, which the nginx
+  converter emits for `proxy_buffering on` (nginx's default). With raw
   upstream header length `H`, after `n` body bytes have arrived the released
   body is `n` once the response is complete, and otherwise
   `max(0, floor((H + n) / 4096) * 4096 - H)`. That is, whole 4 KiB buffers of

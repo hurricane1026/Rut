@@ -116,6 +116,14 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 void pump_response_read_deadline_body(Loop* loop, Connection& conn);
 
+// Bounded response buffering (nginx proxy_buffering-on release rule) early
+// release: io_uring only, see IoUringEventLoop::try_advance_bounded_release.
+// Defined in callbacks_impl.h.
+template <typename Loop>
+void on_bounded_release_header_sent(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
+void on_bounded_release_body_sent(void* lp, Connection& conn, IoEvent ev);
+
 template <typename Loop>
 void on_request_body_sent(void* lp, Connection& conn, IoEvent ev);
 
@@ -226,6 +234,8 @@ extern template void on_response_body_recvd<IoUringEventLoop>(void*, Connection&
 extern template void on_response_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void pump_response_read_deadline_body<IoUringEventLoop>(IoUringEventLoop*,
                                                                         Connection&);
+extern template void on_bounded_release_header_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
+extern template void on_bounded_release_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_request_body_sent<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 extern template void on_jit_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);

@@ -18919,7 +18919,7 @@ static constexpr char kCanonicalGeneratedNginxRootGetForward[] =
     "</center>\\r\\n</body>\\r\\n</html>\\r\\n\"\n"
     "        },\n"
     "        response_read_timeout: 60s,\n"
-    "        response_buffering: .completeContentLength\n"
+    "        response_buffering: .bounded\n"
     "    )\n"
     "}\n";
 
@@ -19005,7 +19005,7 @@ static bool validate_bodyful_normalized_generated_source(const std::string& sour
         "upstream nginx_upstream at \"127.0.0.1:" + std::to_string(backend_port) + "\"";
     static constexpr char kDeadlineBuffering[] =
         "        response_read_timeout: 60s,\n"
-        "        response_buffering: .completeContentLength\n";
+        "        response_buffering: .bounded\n";
     if (count_source_literal(source, exact_route) != 1u ||
         count_source_literal(source, kCanonicalGeneratedNginxRootGetForward) != 1u ||
         count_source_literal(source, kDeadlineBuffering) != 1u ||
@@ -19108,7 +19108,7 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
     const std::string complete = canonical_generated_bodyful_exact_route("/a/b", "ok");
     static constexpr char kDeadlineBuffering[] =
         "        response_read_timeout: 60s,\n"
-        "        response_buffering: .completeContentLength\n";
+        "        response_buffering: .bounded\n";
     if (!validate_bodyful_normalized_generated_source(canonical, kFrontend, kBackend, error) ||
         !rejects_source(replace_once(canonical, selector, "route exact \"/a/b\"")) ||
         !rejects_source(canonical + complete) ||
@@ -19125,9 +19125,8 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
         !rejects_source(replace_once(canonical, kCanonicalGeneratedNginxRootGetForward, "")) ||
         !rejects_source(
             replace_once(canonical, "response_read_timeout: 60s", "response_read_timeout: 61s")) ||
-        !rejects_source(replace_once(canonical,
-                                     "response_buffering: .completeContentLength",
-                                     "response_buffering: .none")) ||
+        !rejects_source(
+            replace_once(canonical, "response_buffering: .bounded", "response_buffering: .none")) ||
         !rejects_source(canonical + kCanonicalGeneratedNginxRootGetForward) ||
         !rejects_source(replace_once(
             canonical, kDeadlineBuffering, std::string(kDeadlineBuffering) + kDeadlineBuffering))) {
@@ -41340,7 +41339,7 @@ static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect30
     "301 Moved Permanently",
     kExactLoopbackFixedRedirect301SourceBody,
     kExactLoopbackFixedRedirect301Body,
-    5821u};
+    5807u};
 static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect302Profile{
     302u,
     "#350",
@@ -41352,7 +41351,7 @@ static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect30
     "302 Found",
     kExactLoopbackFixedRedirect302SourceBody,
     kExactLoopbackFixedRedirect302Body,
-    5797u};
+    5783u};
 
 static const ExactLoopbackFixedRedirectProfile* exact_loopback_fixed_redirect_profile(u16 status) {
     if (status == 301u) return &kExactLoopbackFixedRedirect301Profile;
@@ -48393,7 +48392,7 @@ static bool validate_exact_loopback_action_generated_source(
         count_text(source, "        failure_policy: {\n") != 3u ||
         count_text(source, "        timeout_failure_policy: {\n") != 1u ||
         count_text(source, "        response_read_timeout: 60s,\n") != 1u ||
-        count_text(source, "        response_buffering: .completeContentLength\n") != 1u ||
+        count_text(source, "        response_buffering: .bounded\n") != 1u ||
         wildcard_listen_source_declarations(source, "unmatched") != 3u ||
         count_text(source, "unmatched OPTIONS {") != 1u ||
         count_text(source, "unmatched CONNECT {") != 1u ||
@@ -49227,7 +49226,7 @@ static bool validate_exact_loopback_conditional_get_structure(const std::string&
                                      statement.forward_response_read_timeout_seconds == 60u &&
                                      statement.has_forward_response_buffering &&
                                      statement.forward_response_buffering ==
-                                         rut::ForwardResponseBufferingMode::CompleteContentLength));
+                                         rut::ForwardResponseBufferingMode::Bounded));
     };
     if (!direct_id1(head, false) || !direct_id1(any, false) || get.kind != rut::AstStmtKind::If ||
         get.then_stmt == nullptr || get.else_stmt == nullptr || !direct_id1(*get.then_stmt, true) ||
@@ -49239,8 +49238,7 @@ static bool validate_exact_loopback_conditional_get_structure(const std::string&
         !get.else_stmt->has_forward_response_read_timeout ||
         get.else_stmt->forward_response_read_timeout_seconds != 60u ||
         !get.else_stmt->has_forward_response_buffering ||
-        get.else_stmt->forward_response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength) {
+        get.else_stmt->forward_response_buffering != rut::ForwardResponseBufferingMode::Bounded) {
         error = std::string(issue) +
                 " exact root AST did not contain HEAD/Any ID1 and GET then-ID1/else-ID3";
         return false;
@@ -49291,10 +49289,9 @@ static bool validate_exact_loopback_conditional_get_structure(const std::string&
                    (!require_timeout ||
                     (term.forward_timeout_failure_policy_id != 0u &&
                      term.forward_timeout_failure_policy_id <= ast->failure_policies.len)) &&
-                   (!require_timeout ||
-                    (term.forward_response_read_timeout_seconds == 60u &&
-                     term.forward_response_buffering ==
-                         rut::ForwardResponseBufferingMode::CompleteContentLength)) &&
+                   (!require_timeout || (term.forward_response_read_timeout_seconds == 60u &&
+                                         term.forward_response_buffering ==
+                                             rut::ForwardResponseBufferingMode::Bounded)) &&
                    (!require_timeout ||
                     rut::complete_content_length_buffering_policies_valid(
                         ast->response_policies[term.forward_response_policy_id - 1u],
@@ -49374,7 +49371,7 @@ static bool run_exact_loopback_conditional_get_mutation_self_checks(const std::s
         swapped,
         mutate_get(kRetained, kFixed),
         mutate_get("response_read_timeout: 60s", "response_read_timeout: 61s"),
-        mutate_get("response_buffering: .completeContentLength", "response_buffering: .none")};
+        mutate_get("response_buffering: .bounded", "response_buffering: .none")};
     for (const std::string& mutation : mutations) {
         std::string detail;
         if (mutation.empty() ||
@@ -49427,8 +49424,7 @@ static bool validate_wildcard_listen_generated_source(
         count_text(source, "        failure_policy: {\n") != expected_response_policy_count ||
         count_text(source, "        timeout_failure_policy: {\n") != expected_timeout_count ||
         count_text(source, "        response_read_timeout: 60s,\n") != expected_timeout_count ||
-        count_text(source, "        response_buffering: .completeContentLength\n") !=
-            expected_timeout_count ||
+        count_text(source, "        response_buffering: .bounded\n") != expected_timeout_count ||
         (conditional_get &&
          (count_text(source, "    if req.hasContentLength {\n") != 1u ||
           count_text(source, "retained_header_value: .trimSpPreserveHtab\n") != 1u)) ||
@@ -54227,8 +54223,7 @@ static bool validate_converter_request_length_source(const std::string& source,
             expected_content_length_branch_count ||
         count_text(source, "return forward(nginx_upstream,") != expected_forward_count ||
         count_text(source, "        response_read_timeout: 60s,\n") != expected_timeout_count ||
-        count_text(source, "        response_buffering: .completeContentLength\n") !=
-            expected_timeout_count ||
+        count_text(source, "        response_buffering: .bounded\n") != expected_timeout_count ||
         count_text(source, "        timeout_failure_policy: {\n") != expected_timeout_count ||
         (require_access_log && count_text(source, "format: downstreamRequestBytes") != 1u) ||
         (require_access_log && count_text(source, "publication: live") != 1u) ||
@@ -54663,7 +54658,7 @@ static bool validate_custom_hide_timeout_loaded_program(
                                   rg,
                                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
                                   static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
-                                  rut::ForwardResponseBufferingMode::CompleteContentLength);
+                                  rut::ForwardResponseBufferingMode::Bounded);
     const bool any_ok = predicate(*any,
                                   ra,
                                   static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
@@ -54801,7 +54796,7 @@ static bool validate_custom_hide_timeout_loaded_program(
                        mutated_get,
                        static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
                        static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
-                       rut::ForwardResponseBufferingMode::CompleteContentLength);
+                       rut::ForwardResponseBufferingMode::Bounded);
         const bool mutant_kept_route_result =
             mutated_get.action == rg.action && mutated_get.status_code == rg.status_code &&
             mutated_get.upstream_id == rg.upstream_id && mutated_get.next_state == rg.next_state;
@@ -54813,7 +54808,7 @@ static bool validate_custom_hide_timeout_loaded_program(
                       restored_get,
                       static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip),
                       static_cast<u16>(rut::ResponsePolicyHeadMode::Reject),
-                      rut::ForwardResponseBufferingMode::CompleteContentLength);
+                      rut::ForwardResponseBufferingMode::Bounded);
         if (!mutant_rejected || !mutant_kept_route_result || !restored_positive ||
             original_timeout != expected_timeout_seconds) {
             error = "#627 loaded 2s selected GET bundle timeout mutant was not rejected";
@@ -56252,7 +56247,7 @@ static bool validate_converter_request_length_fixed_body_source(const std::strin
         count_text(source, "    if req.hasContentLength {\n") != 1u ||
         count_text(source, "return forward(nginx_upstream,") != 4u ||
         count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
-        count_text(source, "        response_buffering: .completeContentLength\n") != 2u ||
+        count_text(source, "        response_buffering: .bounded\n") != 2u ||
         count_text(source, "        timeout_failure_policy: {\n") != 2u ||
         count_text(source, "format: downstreamRequestBytes") != 1u ||
         count_text(source, "publication: live") != 1u ||
@@ -57089,15 +57084,18 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
     const u32 routes =
         (source.rfind("route ", 0u) == 0u ? 1u : 0u) + count_text(source, "\nroute ");
     const u32 forwards = count_text(source, "return forward(nginx_upstream");
-    if (source.empty() || source.size() != 5260u || source.find('\0') != std::string::npos ||
+    if (source.empty() || source.size() != 5246u || source.find('\0') != std::string::npos ||
         source.size() + 1u > rut::nginx::RutSource::kCapacity ||
-        rut::nginx::RutSource::kCapacity - source.size() - 1u != 7518u ||
+        rut::nginx::RutSource::kCapacity - source.size() - 1u != 7532u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u || routes != 3u ||
         forwards != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "route \"/\" {") != 1u || count_text(source, "return redirect(") != 0u ||
         count_text(source, four_headers) != 3u || count_text(source, "X-Compat-Hidden") != 3u ||
         count_text(source, three_headers) != 0u ||
+        // The bodyless GET keeps nginx's default proxy_buffering release rule.
+        count_text(source, "response_buffering: .bounded") != 1u ||
+        source.find("response_buffering: .completeContentLength") != std::string::npos ||
         source.find("target_transform") != std::string::npos ||
         source.find("strip_prefix") != std::string::npos ||
         source.find("replace_prefix") != std::string::npos ||
@@ -57107,7 +57105,7 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
         source.find("nginx_compat") != std::string::npos ||
         source.find("workaround") != std::string::npos ||
         source.find("accessLog") != std::string::npos) {
-        error = "#373 generated source failed exact 5260-byte policy/route/ownership validation";
+        error = "#373 generated source failed exact 5246-byte policy/route/ownership validation";
         return false;
     }
     return true;
@@ -57572,7 +57570,7 @@ static bool capture_proxy_hide_header_generated_side(
 
     // Parse and lower the borrowed fragment, then destroy both borrowed input
     // and lower-buffer ownership before persistence.  Stage 4a's exact source
-    // validator remains the authority for the 5260-byte output.
+    // validator remains the authority for the 5246-byte output.
     {
         std::string borrowed = observation.fragment;
         const auto parsed = rut::nginx::parse({borrowed.data(), static_cast<u32>(borrowed.size())});
@@ -58235,7 +58233,7 @@ static bool validate_proxy_hide_header_generated_pair(const ProxyHideHeaderGener
                 return false;
             }
     if (first.child_pid <= 0 || second.child_pid <= 0 || first.child_pid == second.child_pid ||
-        first.source.size() != 5260u || second.source.size() != 5260u ||
+        first.source.size() != 5246u || second.source.size() != 5246u ||
         first.source.size() != second.source.size() ||
         first.rut_executable != second.rut_executable) {
         error = "#373 generated pair source size or PID identity failed";
@@ -59211,7 +59209,7 @@ static bool validate_positive_get_default_generated_source(const std::string& so
         wildcard_listen_source_declarations(source, "route") != 3u ||
         count_text(source, "return forward(nginx_upstream,") != 4u ||
         count_text(source, "        response_read_timeout: 60s,\n") != 2u ||
-        count_text(source, "        response_buffering: .completeContentLength\n") != 2u ||
+        count_text(source, "        response_buffering: .bounded\n") != 2u ||
         count_text(source, "        timeout_failure_policy: {\n") != 2u ||
         source.find("route POST ") != std::string::npos ||
         source.find("proxy_read_timeout") != std::string::npos ||
@@ -59308,7 +59306,7 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         count_text(source, "response_read_timeout: 1s") != 4u ||
         count_text(source, "response_read_timeout: 1s,\n") != 1u ||
         count_text(source, "response_read_timeout: 1s\n") != 3u ||
-        count_text(source, "response_buffering: .completeContentLength\n") != 1u ||
+        count_text(source, "response_buffering: .bounded\n") != 1u ||
         head_start == std::string::npos || get_start == std::string::npos ||
         any_start == std::string::npos || !(head_start < get_start && get_start < any_start) ||
         source.find("response_read_timeout: 60s") != std::string::npos ||
@@ -59388,7 +59386,7 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
         any_region.find(kAfterHostRequestPolicy) != std::string::npos ||
         any_region.find("content_length_position: .afterHost") != std::string::npos ||
         head_region.find("response_buffering:") != std::string::npos ||
-        count_text(get_region, "response_buffering: .completeContentLength\n") != 1u ||
+        count_text(get_region, "response_buffering: .bounded\n") != 1u ||
         any_region.find("response_buffering:") != std::string::npos ||
         !policy_suppresses_body("response_policy: {", content_length_head_region) ||
         !policy_suppresses_body("failure_policy: {", content_length_head_region) ||
@@ -59437,8 +59435,7 @@ static bool validate_explicit_timeout_head_generated_source(const std::string& s
             !forward.has_forward_response_read_timeout ||
             forward.forward_response_read_timeout_seconds != 1u ||
             !forward.has_forward_response_buffering ||
-            forward.forward_response_buffering !=
-                rut::ForwardResponseBufferingMode::CompleteContentLength) {
+            forward.forward_response_buffering != rut::ForwardResponseBufferingMode::Bounded) {
             error = "#270 exact GET AST lost its ID1/direct-forward timeout bundle";
             return false;
         }
@@ -59709,8 +59706,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
         !ast_forward.has_forward_response_read_timeout ||
         ast_forward.forward_response_read_timeout_seconds != 1u ||
         !ast_forward.has_forward_response_buffering ||
-        ast_forward.forward_response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength) {
+        ast_forward.forward_response_buffering != rut::ForwardResponseBufferingMode::Bounded) {
         error = "#271 inactivity exact GET AST lost ID1/1s/complete-buffering custody";
         return false;
     }
@@ -59737,7 +59733,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
             static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
         hir_get->control.direct_term.forward_response_read_timeout_seconds != 1u ||
         hir_get->control.direct_term.forward_response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength ||
+            rut::ForwardResponseBufferingMode::Bounded ||
         hir_get->control.direct_term.forward_response_policy_id == 0u ||
         hir_get->control.direct_term.forward_failure_policy_id == 0u ||
         hir_get->control.direct_term.forward_timeout_failure_policy_id == 0u) {
@@ -59767,7 +59763,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
             static_cast<u16>(rut::RequestPolicyId::Http11FixedStrip) ||
         mir_get->blocks[0].term.forward_response_read_timeout_seconds != 1u ||
         mir_get->blocks[0].term.forward_response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength ||
+            rut::ForwardResponseBufferingMode::Bounded ||
         mir_get->blocks[0].term.forward_response_policy_id == 0u ||
         mir_get->blocks[0].term.forward_failure_policy_id == 0u ||
         mir_get->blocks[0].term.forward_timeout_failure_policy_id == 0u) {
@@ -59815,7 +59811,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
     const auto& rir_bundle =
         rir.value.module.policy_bundles[rir_get->preflight_forward_policy_bundle_id - 1u];
     if (rir_bundle.response_read_timeout_seconds != 1u ||
-        rir_bundle.response_buffering != rut::ForwardResponseBufferingMode::CompleteContentLength ||
+        rir_bundle.response_buffering != rut::ForwardResponseBufferingMode::Bounded ||
         rir_bundle.response_policy_id == 0u || rir_bundle.failure_policy_id == 0u ||
         rir_bundle.timeout_failure_policy_id == 0u ||
         rir_bundle.response_policy_id > rir.value.module.response_policy_count ||
@@ -59869,7 +59865,7 @@ static bool validate_explicit_timeout_get_generated_provenance(const std::string
         cfg->policy_bundles[cfg_get->preflight_forward_policy_bundle_id - 1u]
                 .response_read_timeout_seconds != 1u ||
         cfg->policy_bundles[cfg_get->preflight_forward_policy_bundle_id - 1u].response_buffering !=
-            rut::ForwardResponseBufferingMode::CompleteContentLength) {
+            rut::ForwardResponseBufferingMode::Bounded) {
         error = "#271 inactivity generated O2 config lost exact GET endpoint/bundle custody";
         return false;
     }
@@ -82323,7 +82319,7 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#373 generated-side live self-check]: " << generated_error << "\n";
             return 1;
         }
-        std::cerr << "PASS: #373 independently parsed/lowered/persisted one exact 5260-byte "
+        std::cerr << "PASS: #373 independently parsed/lowered/persisted one exact 5246-byte "
                      "proxy_hide_header source and proved the generated ordinary-RUT public "
                      "io_uring side's exact 85-byte request, 66-byte rebuilt upstream, 219-byte "
                      "origin response, 176-byte hidden-header-filtered response/EOF, poison "
@@ -82343,7 +82339,7 @@ int main(int argc, char** argv) {
         }
         std::cerr
             << "PASS: #373 independently parsed/lowered/persisted both declaration orders into "
-               "two isolated 5260-byte ordinary-RUT sources and proved exact paired "
+               "two isolated 5246-byte ordinary-RUT sources and proved exact paired "
                "Date-normalized downstream/upstream wires, endpoint/resource/PID isolation, "
                "poison liveness, FIN/EOF/stability, disabled access and clean io_uring lifecycle; "
                "generated-pair witness only (no nginx/four-way equivalence claim)\n";
@@ -85513,7 +85509,7 @@ int main(int argc, char** argv) {
             << "PASS: #351 exact listen 127.0.0.1:<port>, exact /old fixed absolute return "
                "301 and minimal root proxy in exactly listen/exact/root and listen/root/exact "
                "orders traversed the genuine borrowed nginx parser/provenance model and "
-               "converter into canonical 5821-byte ordinary RUT. Two isolated pinned-nginx "
+               "converter into canonical 5807-byte ordinary RUT. Two isolated pinned-nginx "
                "1.29.7 sides and two independently generated public-CLI/JIT/io_uring RUT sides "
                "retained causal same-port non-listening .2 guards and quiet refusal probes. All "
                "four sides matched three exact Date-normalized 366-byte fixed-Location 301/"

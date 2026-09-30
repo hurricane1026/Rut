@@ -1,0 +1,7 @@
+{
+  "base": "f30cfb062f11e8c4cc5178ec7b4c6bf569960670",
+  "baseline_binary_sha256": "db18165f7420a10deb7ec74b5315bd39bfb6e9774c28f93a7859f5554acaf72e",
+  "candidate_binary_sha256": "de0ba69caf88cbe88789d81621d5ea90561cf6dda42a45b46730360f76ad18b6",
+  "kernel_symbols": "live kernel kallsyms snapshot collected in same session; raw addresses mapped offline to nearest text symbol",
+  "kernel": "6.19.10-300.fc44.x86_64"
+}

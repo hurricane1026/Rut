@@ -2,10 +2,12 @@
 
 #include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/runtime/body_pipe_transport.h"
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/mapped_array.h"
+#include "rut/runtime/response_body_pipe.h"
 #include <atomic>
 
 #include <errno.h>
@@ -70,6 +72,7 @@ struct IoUringBackend {
     // Kernel supports IORING_NOP_INJECT_RESULT (probed at init); required to
     // complete a send that was written directly in full.
     bool nop_inject_result = false;
+    bool body_pipe_workers_bound = false;
 
     // Provided buffer ring
     io_uring_buf_ring* buf_ring = nullptr;
@@ -204,6 +207,17 @@ struct IoUringBackend {
     // gap under the timeout) but fills `len` more slowly than the timeout
     // would be expired as idle.
     bool add_recv_upstream_direct(i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len);
+    // Pipe transport primitives. The event loop supplies authenticated owners;
+    // wait() emits raw BodyPipeTransport records, without committing bytes,
+    // refreshing deadlines, inventing copy witnesses or resubmitting partials.
+    // A failed SQ allocation leaves the reservation intact for caller rollback.
+    bool add_body_pipe_splice(i32 socket_fd, u32 conn_id, ResponseBodyPipe& pipe, bool input);
+    bool add_body_pipe_poll(i32 socket_fd, u32 conn_id, u32 serial, bool input);
+    bool cancel_body_pipe(u32 conn_id, u32 serial, BodyPipeOperation target);
+    // Call on the shard worker before enabling splice. Never allow io_wq to
+    // escape the shard's current CPU budget. Failure keeps the ordinary path.
+    bool bind_body_pipe_workers();
+
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.
@@ -321,6 +335,13 @@ struct IoUringBackend {
                                  u32 deadline_generation,
                                  u32 upstream_episode);
     bool cancel_response_read_timer(u32 conn_id, Connection& conn);
+
+    // Submit IORING_OP_TIMEOUT for the Bounded release hold-back (see
+    // kBoundedMinReleaseBytes / IoEventType::BoundedHoldTimer). Microsecond
+    // granularity. Ownership lives entirely on Connection, deliberately not
+    // pending_ops-accounted — mirrors add_response_read_timer above, minus a
+    // cancel path this timer never needs (see the field comment).
+    bool add_bounded_hold_timer(u32 conn_id, Connection& conn, u32 micros, u32 upstream_episode);
 
     // Cancel outstanding operations for a connection (by user_data match).
     // Only submits cancel SQEs for op types actually in flight.
