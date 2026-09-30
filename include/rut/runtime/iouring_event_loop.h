@@ -5918,6 +5918,160 @@ public:
         return false;
     }
 
+    // --- Idle keep-alive buffer trim ---
+    //
+    // Every connection keeps its request-receive and send slices bound for its
+    // whole life, so pages dirtied while serving a request stay resident however
+    // long the connection then sits idle (8-20 KiB per connection; ~2 GiB at 100K
+    // idle). A 1 Hz incremental sweep hands those pages back with MADV_DONTNEED
+    // for a connection that is provably at rest — bindings, pointers and
+    // capacities are untouched, the next request just re-faults zero pages.
+    //
+    // Cost: kIdleTrimSlotsPerTick slot examinations per tick (a full sweep of the
+    // default 16384 slots is 16 ticks; measured ~10 us per tick over free slots,
+    // ~150 us over live ones) and at most kIdleTrimMaxPerTick connections trimmed
+    // per tick (2-3 madvise calls each, ~1 us per connection: <= ~0.6 ms per tick),
+    // so a mass-idle event spreads over several ticks instead of stalling the
+    // shard. Nothing is added to any request path: "no activity since the candidate
+    // pass" is read off handler_gen, which on_header_received already bumps once per
+    // complete request.
+    static constexpr u32 kIdleTrimSlotsPerTick = 1024;
+    static constexpr u32 kIdleTrimMaxPerTick = 512;
+    // A candidate is trimmed only once it has been idle this many ticks (seconds)
+    // and a later pass still finds it idle with an unchanged handler_gen; the
+    // default keep-alive timeout is 60 s, so a trimmed connection is one that
+    // would otherwise have held its dirty pages for most of that time.
+    static constexpr u32 kIdleTrimMinIdleTicks = 5;
+    static constexpr u8 kIdleTrimNone = 0;
+    static constexpr u8 kIdleTrimCandidate = 1;
+    static constexpr u8 kIdleTrimTrimmed = 2;
+    u32 idle_trim_cursor = 0;
+    u32 idle_trim_clock = 0;
+    // Observability / test counters; touched only by the sweep.
+    u64 idle_trim_conns = 0;    // connections trimmed
+    u64 idle_trim_madvise = 0;  // successful slice discards
+
+    // True only for plain HTTP/1.1 keep-alive at rest between requests: nothing
+    // can still read or write the receive/send slice contents. The downstream
+    // multishot recv is the one op allowed outstanding — it lands in backend-owned
+    // provided buffers and IoUringBackend::wait() copies into recv_buf on this
+    // thread, so the kernel never references the connection's slice.
+    [[nodiscard]] bool idle_trim_eligible(const Connection& c) const {
+        if (c.fd < 0 || c.state != ConnState::ReadingHeader) return false;
+        if (c.on_recv != &on_header_received<IoUringEventLoop> || c.on_send != nullptr ||
+            c.on_upstream_recv != nullptr || c.on_upstream_send != nullptr)
+            return false;
+        // Protocol / transport: HTTP/1.1 plaintext only.
+        if (c.protocol != ConnProtocol::Http11 || c.tls_active || c.tls_engine.ssl != nullptr ||
+            c.tls_in_slice != nullptr || c.tls_out_slice != nullptr || c.h2 != nullptr ||
+            c.is_ws_tunnel || c.is_ws_terminate)
+            return false;
+        // Buffers: bound as allocated, nothing received, no live View, no stash or
+        // retry snapshot. (send_buf's own length is checked per slice at trim time.)
+        // is_released() first: Buffer::data() traps while a View is alive.
+        if (c.recv_buf.is_released() || c.send_buf.is_released()) return false;
+        if (c.recv_slice == nullptr || c.send_slice == nullptr ||
+            c.recv_buf.data() != c.recv_slice || c.send_buf.data() != c.send_slice ||
+            c.recv_buf.len() != 0 || c.pipeline_stash_len != 0 || c.retry_req_send_len != 0 ||
+            c.pipeline_depth != 0 || c.send_progress != 0)
+            return false;
+        // Sends: none in flight (an IORING_OP_SEND reads its slice asynchronously),
+        // no local body mid-stream.
+        if (c.send_armed || c.direct_write_completion_pending || c.local_body_remaining != 0 ||
+            c.local_body_send_len != 0 || c.local_body_cursor != nullptr)
+            return false;
+        if (c.id >= connection_capacity) return false;
+        const auto& send = backend.send_state[c.id];
+        if (send.remaining != 0 || send.file_fd >= 0) return false;
+        // The downstream recv must be the armed multishot and not mid pause/rearm.
+        if (!c.recv_armed || c.recv_paused_for_send || c.recv_pause_cancel_pending ||
+            c.recv_pause_rearm_pending)
+            return false;
+        // No request in flight, no pending handler / yield / throttle / deadline.
+        if (c.req_start_us != 0 || c.epoch_held || c.pending_handler_fn != nullptr ||
+            c.yield_armed || c.yield_timeout_armed || c.throttle_paused ||
+            c.request_policy_body_pending ||
+            c.response_read_deadline_state != ResponseReadDeadlineState::None ||
+            c.http1_boundary_deferred || c.http1_boundary_ready || c.http1_prebuilt_wait != 0 ||
+            c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None)
+            return false;
+        // No upstream episode of any kind: no upstream socket or pending pool return,
+        // no upstream op or cancel outstanding, no retirement/close ledger open.
+        if (c.upstream_fd >= 0 || c.idle_return_fd >= 0 || c.close_after_idle_return ||
+            c.upstream_connect_armed || c.upstream_recv_armed || c.upstream_send_armed ||
+            c.upstream_recv_direct_armed || c.upstream_recv_cancel_inflight ||
+            c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
+            c.upstream_recv_paused_for_send || c.upstream_recv_terminal_stale ||
+            c.upstream_recv_idle_stale_bytes || c.upstream_recv_close_quarantine ||
+            c.upstream_retirement_active || c.upstream_close_target_owned != 0 ||
+            c.upstream_close_cancel_owned != 0 || c.upstream_close_pause_cancel_owned ||
+            c.response_header_slice != nullptr || c.response_body_tail.size != 0 ||
+            c.throttle_pending_len != 0 || c.resp_fully_buffered)
+            return false;
+        return true;
+    }
+
+    // A proxied connection's upstream receive slice may be trimmed as well once the
+    // upstream side is quiescent (idle_trim_eligible already proved no upstream op
+    // or cancel is outstanding, so no recv — including the direct-into-slice kind —
+    // can still write it) and it holds no bytes. A bulk buffer swapped in for a
+    // large relay is refused by SlicePool::discard_bound; the relay slice is never
+    // touched and its presence (possible in-flight source) skips this slice too.
+    [[nodiscard]] static bool idle_trim_upstream_slice_quiet(const Connection& c) {
+        if (c.upstream_recv_slice == nullptr || c.upstream_relay_slice != nullptr ||
+            c.upstream_relay_send_len != 0 || c.upstream_recv_buf.is_released())
+            return false;
+        return c.upstream_recv_buf.data() == c.upstream_recv_slice &&
+               c.upstream_recv_buf.len() == 0;
+    }
+
+    // Examine one live slot; returns the number of connections trimmed (0 or 1).
+    u32 idle_trim_examine(Connection& c) {
+        if (!idle_trim_eligible(c)) {
+            c.idle_trim_phase = kIdleTrimNone;
+            return 0;
+        }
+        if (c.idle_trim_phase == kIdleTrimTrimmed && c.idle_trim_gen == c.handler_gen)
+            return 0;  // already clean for this idle period
+        if (c.idle_trim_phase == kIdleTrimCandidate && c.idle_trim_gen == c.handler_gen) {
+            if (idle_trim_clock - c.idle_trim_clock < kIdleTrimMinIdleTicks) return 0;
+            if (pool.discard_bound(c.recv_slice)) idle_trim_madvise++;
+            // A proxied request on a reused upstream socket leaves its retry-snapshot
+            // bytes in send_buf after completion (length kept, nothing will replay
+            // them); a non-empty send_buf is never touched, so that slice stays as is.
+            if (c.send_buf.len() == 0 && pool.discard_bound(c.send_slice)) idle_trim_madvise++;
+            if (idle_trim_upstream_slice_quiet(c) && pool.discard_bound(c.upstream_recv_slice))
+                idle_trim_madvise++;
+            c.idle_trim_phase = kIdleTrimTrimmed;
+            idle_trim_conns++;
+            return 1;
+        }
+        // First sighting, or a request completed since the last mark: (re)start.
+        c.idle_trim_phase = kIdleTrimCandidate;
+        c.idle_trim_gen = c.handler_gen;
+        c.idle_trim_clock = idle_trim_clock;
+        return 0;
+    }
+
+    void sweep_idle_trim(u32 ticks) {
+        idle_trim_clock += ticks;
+        // Single sweep bound; switch to the initialised-slot watermark if slots
+        // become lazily initialised (only fd/state-style fields valid on a reset
+        // slot are read before eligibility is established).
+        const u32 kBound = connection_capacity;
+        if (kBound == 0) return;
+        u32 cursor = idle_trim_cursor < kBound ? idle_trim_cursor : 0;
+        u32 budget = kBound < kIdleTrimSlotsPerTick ? kBound : kIdleTrimSlotsPerTick;
+        u32 trimmed = 0;
+        while (budget != 0 && trimmed < kIdleTrimMaxPerTick) {
+            Connection& c = conns[cursor];
+            if (++cursor == kBound) cursor = 0;
+            budget--;
+            if (c.fd >= 0) trimmed += idle_trim_examine(c);
+        }
+        idle_trim_cursor = cursor;
+    }
+
     void dispatch(const IoEvent& ev) {
         switch (ev.type) {
             case IoEventType::Accept:
@@ -6028,6 +6182,8 @@ public:
                             this->close_conn(conns[i]);
                         }
                     }
+                } else {
+                    sweep_idle_trim(static_cast<u32>(ticks));
                 }
                 break;
             }

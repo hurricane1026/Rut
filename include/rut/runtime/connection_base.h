@@ -623,6 +623,15 @@ struct ConnectionBase {
     // given slot is distinct (first use: 0 → 1; reuse: N → N+1; …).
     u32 handler_gen = 0;
 
+    // Idle-buffer trim bookkeeping (io_uring sweep only; see
+    // IoUringEventLoop::sweep_idle_trim). Written solely by the 1 Hz sweep, never on
+    // a request path; the "activity since" signal is handler_gen above. Phase:
+    // 0 = not idle-tracked, 1 = candidate (seen idle at idle_trim_clock), 2 = trimmed
+    // (pages returned; idle_trim_gen is the handler_gen of that idle period).
+    u32 idle_trim_gen;
+    u32 idle_trim_clock;
+    u8 idle_trim_phase;
+
     // Reserved for upstream I/O episode fencing. Deliberately preserved by
     // reset()/slot reuse; the transport slices will advance it before each
     // upstream episode so stale completions cannot match a later episode.
@@ -1610,7 +1619,8 @@ struct ConnectionBase {
 
     // Recv/send buffers — backed by SlicePool slices (16KB each).
     // Slices are allocated in EventLoop::alloc_conn_impl() and freed in free_conn_impl().
-    // Idle/free connections hold nullptr (zero buffer memory).
+    // Free connections hold nullptr; a live idle connection keeps its slices bound
+    // (the io_uring loop trims their dirty pages once idle for a few seconds).
     u8* recv_slice;
     // Capacity declared when recv_slice was installed by the owning loop.  Keep
     // this independent of Buffer's mutable binding so checked request metadata
@@ -1762,6 +1772,9 @@ struct ConnectionBase {
         ws_close_client_inflight = false;
         ws_close_upstream_need = false;
         ws_close_upstream_inflight = false;
+        idle_trim_gen = 0;
+        idle_trim_clock = 0;
+        idle_trim_phase = 0;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

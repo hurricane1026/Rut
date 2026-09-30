@@ -10,9 +10,11 @@ namespace rut {
 
 // SlicePool — fixed-size (16KB) memory slice allocator with lazy commit.
 //
-// Per-shard pool of 16KB slices for network I/O buffers. Connections borrow
-// slices on demand (recv/send), return them when done. Idle connections hold
-// 0 slices; the pool retains only a bounded idle working set.
+// Per-shard pool of 16KB slices for network I/O buffers. Free/unaccepted slots
+// hold 0 slices and the pool retains only a bounded idle working set. The
+// io_uring/epoll loops bind a connection's receive and send slices at accept and
+// keep them until close; the io_uring loop returns the dirty pages of long-idle
+// keep-alive connections with discard_bound() (IoUringEventLoop::sweep_idle_trim).
 //
 // Memory strategy: reserve full VA range upfront (PROT_NONE — no physical
 // pages), then mprotect slices to PROT_READ|PROT_WRITE on first use. This
@@ -305,6 +307,30 @@ struct SlicePool {
         if (cached_count != 0) free_stack[free_top] = free_stack[boundary];
         free_stack[boundary] = idx;
         ++free_top;
+    }
+
+    // Return the physical pages behind a slice that is currently BOUND (handed
+    // out by alloc(), not yet free()d) to the kernel, keeping it bound: the
+    // pointer, capacity and in_use_map entry are untouched and the next access
+    // simply re-faults zero pages. Only for a holder that knows the slice's bytes
+    // are dead and that no asynchronous reader/writer (an in-flight send or recv
+    // targeting it) remains — the pool cannot check either. Returns false, doing
+    // nothing, for a bulk buffer, a free or foreign pointer, or a non-Linux
+    // target (where MADV_DONTNEED need not zero the pages). Never touches
+    // free_stack/cached_count, so it cannot disturb the free path's zero-fill
+    // invariant: a trimmed slice is all-zero exactly like a freshly returned one.
+    bool discard_bound(u8* ptr) {
+#ifdef __linux__
+        if (!ptr || !base || !in_use_map || count == 0 || is_bulk(ptr)) return false;
+        if (ptr < base || ptr >= base + static_cast<u64>(count) * kSliceSize) return false;
+        const u64 offset = static_cast<u64>(ptr - base);
+        if (offset % kSliceSize != 0) return false;
+        if (!in_use_map[offset / kSliceSize]) return false;
+        return madvise(ptr, kSliceSize, MADV_DONTNEED) == 0;
+#else
+        (void)ptr;
+        return false;
+#endif
     }
 
     // free() for a caller that knows nothing past the first `written` bytes
