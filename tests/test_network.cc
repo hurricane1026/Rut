@@ -79205,7 +79205,7 @@ struct ScopedAcceptRearmLoop {
     // parked in the deferred-accept array; drop that too.
     void release_accepted(i32 fd) {
         loop->deferred_accept_count = 0;
-        for (u32 i = 0; i < loop->connection_capacity; i++) {
+        for (u32 i = 0; i < loop->slots_initialized; i++) {
             if (loop->conns[i].fd == fd) {
                 loop->timer.remove(&loop->conns[i]);
                 loop->conns[i].fd = -1;
@@ -79240,7 +79240,7 @@ struct ScopedAcceptRearmLoop {
     ~ScopedAcceptRearmLoop() {
         if (loop != nullptr) {
             if (initialized) {
-                for (u32 i = 0; i < loop->connection_capacity; i++)
+                for (u32 i = 0; i < loop->slots_initialized; i++)
                     loop->timer.remove(&loop->conns[i]);
                 loop->destroy_slot_storage();
             }
@@ -79298,7 +79298,7 @@ TEST(iouring_accept_rearm, terminal_cqe_with_valid_fd_still_rearms) {
         if (g.sq_entries[i & g.sq_mask].opcode == IORING_OP_ACCEPT) armed_accept = true;
     }
     CHECK(armed_accept);
-    for (u32 i = 0; i < g.loop->connection_capacity; i++) {
+    for (u32 i = 0; i < g.loop->slots_initialized; i++) {
         if (g.loop->conns[i].fd == sv[0]) {
             g.loop->timer.remove(&g.loop->conns[i]);
             g.loop->conns[i].fd = -1;
@@ -79386,17 +79386,17 @@ TEST(iouring_accept_rearm, wait_maps_cqe_f_more_to_event_more) {
     IoEvent ev{};
     // pending == 0 and a non-empty CQ: wait() harvests without io_uring_enter.
     g.push_accept_cqe(5, IORING_CQE_F_MORE);
-    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->slots_initialized), 1u);
     CHECK_EQ(ev.type, IoEventType::Accept);
     CHECK_EQ(ev.result, 5);
     CHECK_EQ(ev.more, 1);
     g.push_accept_cqe(-EMFILE, 0);
-    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->slots_initialized), 1u);
     CHECK_EQ(ev.type, IoEventType::Accept);
     CHECK_EQ(ev.result, -EMFILE);
     CHECK_EQ(ev.more, 0);
     g.push_accept_cqe(6, 0);  // terminal CQE that still carries a valid fd
-    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->slots_initialized), 1u);
     CHECK_EQ(ev.result, 6);
     CHECK_EQ(ev.more, 0);
 }
