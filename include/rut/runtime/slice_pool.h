@@ -11,11 +11,14 @@ namespace rut {
 // SlicePool — fixed-size (16KB) memory slice allocator with lazy commit.
 //
 // Per-shard pool of 16KB slices for network I/O buffers. Free/unaccepted slots
-// hold 0 slices and the pool retains only a bounded idle working set. Every
-// event loop (io_uring, epoll, kqueue) binds a connection's receive and send
-// slices at accept and keeps them until close; the io_uring loop returns the
-// dirty pages of long-idle keep-alive connections with discard_bound()
-// (IoUringEventLoop::sweep_idle_trim).
+// hold no slices and the pool retains only a bounded idle working set. Every
+// event loop (io_uring, epoll, kqueue) binds a live connection's receive and send
+// slices at accept and keeps them until close, so a live idle connection keeps two
+// slices bound (virtual reservation; physical pages only once touched). The
+// io_uring loop returns the dirty pages of connections idle for ~5 s or more
+// without unbinding anything: it validates each bound slice with
+// bound_slice_valid() and releases the batch with process_madvise(MADV_DONTNEED)
+// (IoUringEventLoop::sweep_idle_trim; discard_bound() is the single-slice form).
 //
 // Memory strategy: reserve full VA range upfront (PROT_NONE — no physical
 // pages), then mprotect slices to PROT_READ|PROT_WRITE on first use. This
@@ -310,26 +313,41 @@ struct SlicePool {
         ++free_top;
     }
 
+    // True iff `ptr` is a slice of this pool that is currently BOUND (handed out
+    // by alloc(), not yet free()d): slice-aligned, inside the ordinary slice area,
+    // marked in use, not a bulk buffer. On true the whole kSliceSize range at `ptr`
+    // is the caller's to release (see discard_bound). Always false off Linux, where
+    // MADV_DONTNEED need not zero the pages. Pure check; touches nothing.
+    bool bound_slice_valid(const u8* ptr) const {
+#ifdef __linux__
+        if (!ptr || !base || !in_use_map || count == 0 || is_bulk(ptr)) return false;
+        if (ptr < base || ptr >= base + static_cast<u64>(count) * kSliceSize) return false;
+        const u64 offset = static_cast<u64>(ptr - base);
+        if (offset % kSliceSize != 0) return false;
+        return in_use_map[offset / kSliceSize];
+#else
+        (void)ptr;
+        return false;
+#endif
+    }
+
     // Return the physical pages behind a slice that is currently BOUND (handed
     // out by alloc(), not yet free()d) to the kernel, keeping it bound: the
     // pointer, capacity and in_use_map entry are untouched and the next access
     // simply re-faults zero pages. Only for a holder that knows the slice's bytes
     // are dead and that no asynchronous reader/writer (an in-flight send or recv
     // targeting it) remains — the pool cannot check either. Returns false, doing
-    // nothing, for a bulk buffer, a free or foreign pointer, or a non-Linux
-    // target (where MADV_DONTNEED need not zero the pages). Never touches
-    // free_stack/cached_count, so it cannot disturb the free path's zero-fill
-    // invariant: a trimmed slice is all-zero exactly like a freshly returned one.
+    // nothing, when bound_slice_valid() is false (a bulk buffer, a free or foreign
+    // pointer, a non-Linux target). Never touches free_stack/cached_count, so it
+    // cannot disturb the free path's zero-fill invariant: a trimmed slice is
+    // all-zero exactly like a freshly returned one. A caller that releases many
+    // slices at once validates each with bound_slice_valid() and advises the
+    // ranges itself (IoUringEventLoop batches them with process_madvise).
     bool discard_bound(u8* ptr) {
+        if (!bound_slice_valid(ptr)) return false;
 #ifdef __linux__
-        if (!ptr || !base || !in_use_map || count == 0 || is_bulk(ptr)) return false;
-        if (ptr < base || ptr >= base + static_cast<u64>(count) * kSliceSize) return false;
-        const u64 offset = static_cast<u64>(ptr - base);
-        if (offset % kSliceSize != 0) return false;
-        if (!in_use_map[offset / kSliceSize]) return false;
         return madvise(ptr, kSliceSize, MADV_DONTNEED) == 0;
 #else
-        (void)ptr;
         return false;
 #endif
     }

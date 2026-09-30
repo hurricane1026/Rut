@@ -310,7 +310,14 @@ struct ConnectionBase {
     ConnState state;  // for debugging/metrics only
     u8 shard_id;
     u16 flags;
-    u32 timer_slot;
+    u16 timer_slot;
+    // Idle-buffer trim mark (io_uring sweep only; see IoUringEventLoop::
+    // sweep_idle_trim): this connection's timer node has been examined since it
+    // was last armed. Cleared by TimerWheel::add (every arm and re-arm goes
+    // through it), set only by the 1 Hz sweep. Kept beside timer_node so the clear
+    // lands on the cache line the arm already dirties (static_assert in
+    // timer_wheel.cc).
+    bool idle_trim_examined;
     ListNode timer_node;
     ListNode idle_node;
 
@@ -622,14 +629,6 @@ struct ConnectionBase {
     // counter must persist across slot reuse so every generation on a
     // given slot is distinct (first use: 0 → 1; reuse: N → N+1; …).
     u32 handler_gen = 0;
-
-    // Idle-buffer trim bookkeeping (io_uring sweep only; see
-    // IoUringEventLoop::sweep_idle_trim). The expiry tick (+1) of the timer-wheel
-    // list this connection was last examined in: "already handled while this list
-    // was filled". Written only by the 1 Hz sweep, never on a request path; a
-    // re-arm moves the node to a list with a different expiry tick, which
-    // invalidates the mark by itself.
-    u32 idle_trim_epoch;
 
     // Reserved for upstream I/O episode fencing. Deliberately preserved by
     // reset()/slot reuse; the transport slices will advance it before each
@@ -1771,7 +1770,7 @@ struct ConnectionBase {
         ws_close_client_inflight = false;
         ws_close_upstream_need = false;
         ws_close_upstream_inflight = false;
-        idle_trim_epoch = 0;
+        idle_trim_examined = false;
         handler_state = 0;
         pending_yield_kind = jit::YieldKind::Timer;
         resume_event_kind = jit::YieldKind::Timer;

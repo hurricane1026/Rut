@@ -33,7 +33,9 @@
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace rut {
@@ -51,6 +53,26 @@ namespace detail {
 
 inline bool injected_iouring_submit_failure(u8 operation) noexcept {
     return test_fail_iouring_submit != nullptr && test_fail_iouring_submit(operation);
+}
+
+// Optional test-binary hook for the idle-trim page release (see
+// IoUringEventLoop::sweep_idle_trim). Production binaries leave it unresolved.
+// Returns -1 to leave the step alone; any value >= 0 injects a fault:
+//   IdleTrimPidfdOpen / IdleTrimProbeAdvise: the probe step fails;
+//   IdleTrimBatchAdvise (arg = ranges in the chunk): only that many ranges are
+//     submitted to process_madvise (0: the whole call fails), so the return is
+//     short exactly as if an iovec further in were bad;
+//   IdleTrimSliceAdvise (arg = slice address): that per-slice madvise fails.
+enum IdleTrimPoint : u8 {
+    IdleTrimPidfdOpen = 1,
+    IdleTrimProbeAdvise = 2,
+    IdleTrimBatchAdvise = 3,
+    IdleTrimSliceAdvise = 4,
+};
+[[gnu::weak]] i64 test_idle_trim_inject(u8 point, u64 arg) noexcept;
+
+inline i64 idle_trim_inject(IdleTrimPoint point, u64 arg) noexcept {
+    return test_idle_trim_inject != nullptr ? test_idle_trim_inject(point, arg) : -1;
 }
 
 inline constexpr u8 kTestIoUringConnectSubmit = 1;
@@ -512,6 +534,7 @@ public:
             destroy_slot_storage();
             return core::make_unexpected(be.error());
         }
+        probe_idle_trim();  // idle-buffer trim is on only if this succeeds
         return {};
     }
 
@@ -602,6 +625,10 @@ public:
     void shutdown() {
         close_deferred_idle_return_fds();
         reclaim_pending();
+        if (idle_trim_pidfd >= 0) {
+            ::close(idle_trim_pidfd);
+            idle_trim_pidfd = -1;
+        }
         backend.shutdown();
         // No CQE can arrive after the backend is stopped.  Release any
         // deferred config epochs now so shutdown does not leave a shard pinned
@@ -5985,7 +6012,7 @@ public:
 
     // --- Idle keep-alive buffer trim ---
     //
-    // Every connection keeps its request-receive and send slices bound for its
+    // Every live connection keeps its request-receive and send slices bound for its
     // whole life, so pages dirtied while serving a request stay resident however
     // long the connection then sits idle (8-20 KiB per connection). Once a
     // connection has been idle for a few seconds this hands those pages back with
@@ -5996,48 +6023,144 @@ public:
     // connection waiting in keep-alive sits in the wheel list that pops at
     // (arm tick + keepalive_timeout), and the timer is re-armed by every request
     // and response event, so "list whose expiry is `S - age` ticks away" is
-    // exactly "connections whose last activity was `age` ticks ago". Each tick
-    // visits the lists aged [kIdleTrimMinIdleTicks, +kIdleTrimAgeWindow), oldest
-    // first, and examines only the nodes it finds there: cost follows the
-    // connections that newly aged, not the slot capacity or the live population,
-    // and no slot is ever indexed by number — the wheel holds only live,
-    // allocated connections, so never-allocated slots are neither read nor written.
+    // exactly "connections whose last activity was `age` ticks ago" for a
+    // connection armed with keepalive_timeout. Each tick visits the lists aged
+    // [kIdleTrimMinIdleTicks, +kIdleTrimAgeWindow), oldest first, and examines only
+    // the nodes it finds there: cost follows the connections that newly aged, not
+    // the slot capacity or the live population, and no slot is ever indexed by
+    // number — the wheel holds only live, allocated connections.
     //
-    // Examined nodes are rotated to the tail of their list and stamped with the
-    // list's expiry tick (Connection::idle_trim_epoch); a walk stops at the first
-    // stamped node, so each connection is handled once per arming, a list longer
-    // than the per-tick budget is finished on the following ticks (the same list
-    // is visited again one age later), and handled nodes are never walked again.
-    // Reordering within a list is invisible to TimerWheel::tick(), which drains
-    // the whole list. A connection that was busy when examined is not retried under
-    // the same arming: whatever kept it busy ends with a dispatched completion,
-    // which re-arms its timer into a fresh list and so a fresh examination.
+    // The age is inferred from the list, not recorded: a node armed with a
+    // shorter timeout (an upstream/deadline/wait timer re-arm) that lands in a
+    // visited list can be examined earlier than the nominal 5 s. That is a policy
+    // imprecision only; safety never depends on age, because idle_trim_eligible()
+    // re-evaluates the connection's whole state at examination time.
     //
-    // Nothing is added to any request path. The sweep runs on the shard thread, so
-    // its per-tick work is bounded in time: it stops after kIdleTrimBudgetNs of
-    // wall clock (checked after every examined node), and also after
-    // kIdleTrimMaxExamined nodes or kIdleTrimMaxTrims trims, whichever comes first.
-    // Measured cost of a trim is 0.7-7 us (2 madvise calls freeing 2-5 dirty pages;
-    // it depends on how many pages the connection had resident), an examination of
-    // a non-trimmable node ~0.15-0.25 us, so the added stall is at most ~1.3 ms per
-    // tick and the trim rate ranges from ~170/s (7 us each) to the kIdleTrimMaxTrims
-    // cap. A list is revisited on each of kIdleTrimAgeWindow consecutive ticks, so a
-    // burst that goes idle within one second is trimmed completely when it is no
-    // larger than about window * rate (measured: 10000 connections took 10-25 ticks).
-    // Whatever remains when the window closes is simply not trimmed for that idle
-    // period; its next request starts a new one. The window (ages 5..44) closes 15
-    // ticks before the default 60 s keep-alive expiry; it is clipped for smaller
-    // timeouts (see sweep_idle_trim).
+    // Examined nodes are rotated to the tail of their list and marked
+    // (Connection::idle_trim_examined); a walk stops at the first marked node, so
+    // a list longer than the per-tick budget is finished on the following ticks
+    // (the same list is visited again one age later) and handled nodes are never
+    // walked again. TimerWheel::add clears the mark on every arm and re-arm, so a
+    // re-armed node is always unexamined in its new list — with whatever timeout
+    // and expiry tick it picked, including one that lands back in the very list it
+    // was examined in. Reordering within a list is invisible to TimerWheel::tick(),
+    // which drains the whole list. A connection that was busy when examined is not
+    // retried under the same arming: whatever kept it busy ends with a dispatched
+    // completion, which re-arms its timer and so earns a fresh examination.
+    //
+    // Releasing is batched. madvise(MADV_DONTNEED) per slice sends TLB-shootdown
+    // IPIs to every CPU running another shard of this process, once per call. The
+    // examination therefore only validates (SlicePool::bound_slice_valid) and queues
+    // {ptr, 16 KiB} ranges; at the end of the tick's sweep — still on the shard
+    // thread, before dispatch resumes, so nothing can touch a queued slice in
+    // between — the queue is handed to process_madvise(pidfd-of-self,
+    // MADV_DONTNEED) in chunks of at most 1024 ranges (the kernel's iovec limit),
+    // which flushes TLBs about once per busy CPU per call instead of per range. The
+    // kernel stops at the first range it cannot advise and reports the bytes done;
+    // the un-advised remainder of that chunk is released with per-slice madvise, and
+    // a connection counts as trimmed only if one of its slices really was advised.
+    //
+    // Platform: needs process_madvise on the calling process (syscall: Linux 5.10;
+    // MADV_DONTNEED on self: observed working unprivileged on 7.2.7, minimum
+    // version not established). probe_idle_trim() proves it once at init; if pidfd_open or
+    // process_madvise is refused (ENOSYS, EPERM under seccomp/containers, EINVAL on
+    // an older kernel) the feature is OFF entirely and the sweep is a no-op —
+    // there is no per-slice mode, the shootdown cost would outweigh the memory.
+    //
+    // Nothing is added to any request path. Work per tick is bounded: the walk stops
+    // after kIdleTrimMaxExamined nodes, kIdleTrimMaxTrims queued connections
+    // (<= kIdleTrimMaxRanges = 1536 ranges, two flush calls), or when the wall clock
+    // plus the projected flush (queued ranges * kIdleTrimFlushNsPerRange) reaches
+    // kIdleTrimBudgetNs. Measured (Linux 7.2.7, 1 shard thread + 0-7 spinning
+    // threads, every page of every slice dirty): examination of 512 queued
+    // connections 0.03-0.11 ms, flush 0.35-0.55 us per range (512 connections,
+    // 1024-1536 ranges: 0.2-0.7 ms, one outlier 1.05 ms), so the added stall is
+    // ~1 ms worst case per tick against the 1.5 ms budget. Trim throughput is
+    // therefore at most 512 connections per tick; since a list is revisited on each
+    // of kIdleTrimAgeWindow (40) consecutive ticks, a burst that goes idle within one
+    // second is trimmed completely when it is no larger than ~40 * 512 = 20480
+    // connections (10000 connections took ~20 ticks). Whatever remains when the
+    // window closes is not trimmed for that idle period; its next request starts a
+    // new one. The window (ages 5..44) closes 15 ticks before the default 60 s
+    // keep-alive expiry; it is clipped for smaller timeouts (see sweep_idle_trim).
+    //
+    // Cost that remains: the release itself still costs the other shards a little
+    // — TODO-COST
     static constexpr u32 kIdleTrimMinIdleTicks = 5;
     static constexpr u32 kIdleTrimAgeWindow = 40;
     static constexpr u32 kIdleTrimMaxExamined = 2048;
-    static constexpr u32 kIdleTrimMaxTrims = 1024;
-    static constexpr u64 kIdleTrimBudgetNs = 1200000;
-    u64 idle_trim_budget_ns = kIdleTrimBudgetNs;  // per-tick wall-clock budget (tests)
+    static constexpr u32 kIdleTrimMaxTrims = 512;     // connections queued per tick
+    static constexpr u32 kIdleTrimSlicesPerConn = 3;  // recv, send, upstream recv
+    static constexpr u32 kIdleTrimMaxRanges = kIdleTrimMaxTrims * kIdleTrimSlicesPerConn;
+    static constexpr u32 kIdleTrimIovChunk = 1024;        // kernel UIO_MAXIOV per call
+    static constexpr u64 kIdleTrimBudgetNs = 1500000;     // examination + projected flush
+    static constexpr u64 kIdleTrimFlushNsPerRange = 700;  // upper end of the measured cost
+    u64 idle_trim_budget_ns = kIdleTrimBudgetNs;          // per-tick budget (tests)
+
+    // Feature state: the pidfd of this process when process_madvise(MADV_DONTNEED)
+    // on it was proven to work at init (probe_idle_trim), -1 when the feature is
+    // off. The sweep is a no-op while it is -1.
+    i32 idle_trim_pidfd = -1;
+    // Ranges queued by this tick's examination, flushed at the end of the sweep.
+    // idle_trim_first[k] is the index of the first range of the k-th queued
+    // connection (idle_trim_first[idle_trim_queued] == idle_trim_nranges).
+    struct iovec idle_trim_iov[kIdleTrimMaxRanges];
+    u16 idle_trim_first[kIdleTrimMaxTrims + 1];
+    u32 idle_trim_nranges = 0;
+    u32 idle_trim_queued = 0;
     // Observability / test counters; touched only by the sweep.
     u64 idle_trim_examined = 0;  // wheel nodes examined
-    u64 idle_trim_conns = 0;     // connections trimmed
-    u64 idle_trim_madvise = 0;   // successful slice discards
+    u64 idle_trim_conns = 0;     // connections with at least one slice released
+    u64 idle_trim_madvise = 0;   // slices released (batched or per slice)
+    u64 idle_trim_batches = 0;   // process_madvise calls issued
+    u64 idle_trim_fallback = 0;  // slices released by the per-slice fallback
+
+    // One-time capability probe (init): is process_madvise(MADV_DONTNEED) on this
+    // process usable? Holds a pidfd of self (pidfd_open(getpid()); PIDFD_SELF
+    // would save the fd but needs a 6.15+ kernel, pidfd_open works from 5.3 on)
+    // for the loop's lifetime and proves the call on one scratch page, including
+    // that the page reads back zero. Any failure (ENOSYS, EPERM from seccomp or a
+    // container profile, EINVAL on a kernel without DONTNEED-on-self) leaves the
+    // feature off. There is deliberately no per-slice mode as a feature: without
+    // the batched flush the per-range cross-CPU TLB shootdowns cost more than the
+    // memory is worth.
+    bool probe_idle_trim() {
+        if (idle_trim_pidfd >= 0) {
+            ::close(idle_trim_pidfd);
+            idle_trim_pidfd = -1;
+        }
+#if defined(SYS_pidfd_open) && defined(SYS_process_madvise)
+        if (detail::idle_trim_inject(detail::IdleTrimPidfdOpen, 0) >= 0) return false;
+        const long fd = syscall(SYS_pidfd_open, getpid(), 0u);
+        if (fd < 0) return false;
+        void* page = mmap(nullptr,
+                          SlicePool::kSliceSize,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS,
+                          -1,
+                          0);
+        if (page == MAP_FAILED) {
+            ::close(static_cast<i32>(fd));
+            return false;
+        }
+        *static_cast<volatile u8*>(page) = 1;
+        struct iovec iov = {page, SlicePool::kSliceSize};
+        const long r = detail::idle_trim_inject(detail::IdleTrimProbeAdvise, 0) >= 0
+                           ? -1
+                           : syscall(SYS_process_madvise, fd, &iov, 1ul, MADV_DONTNEED, 0u);
+        const bool ok =
+            r == static_cast<long>(SlicePool::kSliceSize) && *static_cast<volatile u8*>(page) == 0;
+        munmap(page, SlicePool::kSliceSize);
+        if (!ok) {
+            ::close(static_cast<i32>(fd));
+            return false;
+        }
+        idle_trim_pidfd = static_cast<i32>(fd);
+        return true;
+#else
+        return false;
+#endif
+    }
 
     // True only for plain HTTP/1.1 keep-alive at rest between requests: nothing
     // can still read or write the receive/send slice contents. The downstream
@@ -6131,52 +6254,111 @@ public:
                c.upstream_recv_buf.len() == 0;
     }
 
-    // Trim one examined connection; true only if at least one slice was released.
+    // Queue one examined connection's releasable slices; true if at least one was
+    // queued. Nothing is advised here: the ranges are released together by
+    // idle_trim_flush() at the end of the sweep.
     bool idle_trim_connection(Connection& c) {
         if (!idle_trim_eligible(c)) return false;
-        bool any = false;
-        if (pool.discard_bound(c.recv_slice)) {
-            idle_trim_madvise++;
-            any = true;
-        }
+        const u32 first = idle_trim_nranges;
+        u32 n = first;
+        if (pool.bound_slice_valid(c.recv_slice)) queue_trim_range(n++, c.recv_slice);
         // A proxied request on a reused upstream socket leaves its retry-snapshot
         // bytes in send_buf after completion (length kept, nothing will replay
         // them); a non-empty send_buf is never touched, so that slice stays as is.
-        if (c.send_buf.len() == 0 && pool.discard_bound(c.send_slice)) {
-            idle_trim_madvise++;
-            any = true;
-        }
-        if (idle_trim_upstream_slice_quiet(c) && pool.discard_bound(c.upstream_recv_slice)) {
-            idle_trim_madvise++;
-            any = true;
-        }
-        if (any) idle_trim_conns++;
-        return any;
+        if (c.send_buf.len() == 0 && pool.bound_slice_valid(c.send_slice))
+            queue_trim_range(n++, c.send_slice);
+        if (idle_trim_upstream_slice_quiet(c) && pool.bound_slice_valid(c.upstream_recv_slice))
+            queue_trim_range(n++, c.upstream_recv_slice);
+        if (n == first) return false;
+        idle_trim_first[idle_trim_queued++] = static_cast<u16>(first);
+        idle_trim_nranges = n;
+        return true;
     }
 
-    // Walk the wheel list that pops at `expiry`, examining nodes not yet handled
-    // since it was filled. Returns false once a per-tick budget is exhausted.
-    bool idle_trim_walk_list(u32 expiry, u64 deadline_ns, u32& examined, u32& trimmed) {
+    void queue_trim_range(u32 index, u8* slice) {
+        idle_trim_iov[index].iov_base = slice;
+        idle_trim_iov[index].iov_len = SlicePool::kSliceSize;
+    }
+
+    // One process_madvise(MADV_DONTNEED) call over `n` queued ranges; returns the
+    // bytes advised (the kernel stops at the first bad range and reports what it
+    // did so far), or -1.
+    long idle_trim_advise_batch(const struct iovec* iov, u32 n) {
+        const i64 inject = detail::idle_trim_inject(detail::IdleTrimBatchAdvise, n);
+        if (inject == 0) return -1;
+        if (inject > 0 && static_cast<u64>(inject) < n) n = static_cast<u32>(inject);
+        ++idle_trim_batches;
+        return syscall(SYS_process_madvise, idle_trim_pidfd, iov, n, MADV_DONTNEED, 0u);
+    }
+
+    bool idle_trim_advise_slice(const struct iovec& r) {
+        if (detail::idle_trim_inject(detail::IdleTrimSliceAdvise,
+                                     reinterpret_cast<u64>(r.iov_base)) >= 0)
+            return false;
+        return madvise(r.iov_base, r.iov_len, MADV_DONTNEED) == 0;
+    }
+
+    // Release everything queued this tick, synchronously on the shard thread and
+    // before dispatch resumes (nothing can touch a queued slice in between). One
+    // process_madvise call per chunk of at most kIdleTrimIovChunk ranges; a short
+    // or failed return leaves the un-advised remainder of that chunk to per-slice
+    // madvise. A connection counts as trimmed only if one of its slices was
+    // actually advised.
+    void idle_trim_flush() {
+        const u32 total = idle_trim_nranges;
+        u32 queued = idle_trim_queued;
+        idle_trim_nranges = 0;
+        idle_trim_queued = 0;
+        if (total == 0) return;
+        idle_trim_first[queued] = static_cast<u16>(total);
+        u32 conn = 0;       // connection owning range `i`
+        u32 counted = ~0u;  // last connection added to idle_trim_conns
+        for (u32 base = 0; base < total; base += kIdleTrimIovChunk) {
+            const u32 chunk = total - base < kIdleTrimIovChunk ? total - base : kIdleTrimIovChunk;
+            const long r = idle_trim_advise_batch(&idle_trim_iov[base], chunk);
+            // Whole ranges the kernel reports done; a partly advised range is redone.
+            const u32 advised =
+                r > 0 ? static_cast<u32>(static_cast<u64>(r) / SlicePool::kSliceSize) : 0;
+            for (u32 i = base; i < base + chunk; i++) {
+                while (idle_trim_first[conn + 1] <= i) ++conn;
+                bool ok = i - base < advised;
+                if (!ok) {
+                    ok = idle_trim_advise_slice(idle_trim_iov[i]);
+                    if (ok) ++idle_trim_fallback;
+                }
+                if (!ok) continue;
+                ++idle_trim_madvise;
+                if (conn != counted) {
+                    counted = conn;
+                    ++idle_trim_conns;
+                }
+            }
+        }
+    }
+
+    // Walk the wheel list that pops at `expiry`, examining nodes not yet examined
+    // since they were armed. Returns false once a per-tick budget is exhausted.
+    bool idle_trim_walk_list(u32 expiry, u64 deadline_ns, u32& examined, u32& queued) {
         ListNode* head = &timer.slots[expiry & (TimerWheel::kSlots - 1)];
         ListNode* const last = head->prev;  // rotated nodes land after this one
         if (last == head) return true;
-        const u32 stamp = expiry + 1;  // Connection::idle_trim_epoch 0 == never
         const u64 node_offset = TimerWheel::timer_node_offset();
         ListNode* node = head->next;
         for (;;) {
-            if (examined == kIdleTrimMaxExamined || trimmed == kIdleTrimMaxTrims) return false;
+            if (examined == kIdleTrimMaxExamined || queued == kIdleTrimMaxTrims) return false;
             auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - node_offset);
-            if (c->idle_trim_epoch == stamp) return true;  // reached the handled region
+            if (c->idle_trim_examined) return true;  // reached the examined region
             ListNode* const next = node->next;
             const bool at_end = node == last;
-            c->idle_trim_epoch = stamp;
+            c->idle_trim_examined = true;
             node->remove();
             head->prev->insert_after(node);
             examined++;
             idle_trim_examined++;
-            if (idle_trim_connection(*c)) trimmed++;
+            if (idle_trim_connection(*c)) queued++;
             // The time budget is checked after the node, so every tick makes progress.
-            if (monotonic_ns() >= deadline_ns) return false;
+            if (monotonic_ns() + idle_trim_nranges * kIdleTrimFlushNsPerRange >= deadline_ns)
+                return false;
             if (at_end) return true;
             node = next;
         }
@@ -6194,18 +6376,19 @@ public:
     // once ages every node by that much; the window is wider than any realistic
     // stall, and a longer one only skips nodes that are about to expire anyway.
     void sweep_idle_trim() {
+        if (idle_trim_pidfd < 0) return;
         const u32 timeout = keepalive_timeout;
         if (timeout >= TimerWheel::kSlots || timeout <= kIdleTrimMinIdleTicks) return;
         const u64 deadline_ns = monotonic_ns() + idle_trim_budget_ns;
         u32 examined = 0;
-        u32 trimmed = 0;
+        u32 queued = 0;
         for (u32 back = kIdleTrimAgeWindow; back-- != 0;) {
             const u32 age = kIdleTrimMinIdleTicks + back;
             if (age >= timeout) continue;
-            if (!idle_trim_walk_list(
-                    timer.cursor + (timeout - age), deadline_ns, examined, trimmed))
-                return;
+            if (!idle_trim_walk_list(timer.cursor + (timeout - age), deadline_ns, examined, queued))
+                break;
         }
+        idle_trim_flush();
     }
 
     void dispatch(const IoEvent& ev) {
