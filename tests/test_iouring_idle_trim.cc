@@ -1151,7 +1151,7 @@ TEST(iouring_idle_trim, batched_tick_advises_everything_in_one_call_up_to_the_ch
 
 TEST(iouring_idle_trim, short_batch_return_falls_back_to_per_slice_for_the_remainder) {
     InjectGuard guard;
-    constexpr u32 kConns = 300;                       // 600 ranges: one chunk
+    constexpr u32 kConns = 300;                        // 600 ranges: one chunk
     for (i64 allowed : {i64{100}, i64{1}, i64{-2}}) {  // short at 100, after 1, soft failure
         TrimRig r;
         if (!r.init(kConns + 8, false)) SKIP("io_uring or process_madvise unavailable");

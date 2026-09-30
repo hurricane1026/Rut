@@ -6116,7 +6116,7 @@ public:
     static constexpr u64 kIdleTrimBudgetNs = 1500000;     // examination + projected flush
     static constexpr u64 kIdleTrimFlushNsPerRange = 900;  // upper end of the measured 0.25-0.9 us
     static_assert(kIdleTrimMaxRanges <= 0xffffu, "idle_trim_first holds u16 range indices");
-    u64 idle_trim_budget_ns = kIdleTrimBudgetNs;          // per-tick budget (tests)
+    u64 idle_trim_budget_ns = kIdleTrimBudgetNs;  // per-tick budget (tests)
 
     // Feature state: the pidfd of this process when process_madvise(MADV_DONTNEED)
     // on it was proven to work at init (probe_idle_trim), -1 when the feature is
