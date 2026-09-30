@@ -17012,6 +17012,72 @@ TEST(response_headers, forward_mutation_release_keeps_pipeline_stash_and_serves_
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+// Depth-N pipelining: a burst whose stash holds TWO pipelined requests behind a
+// response-mutation snapshot. Releasing the snapshot at exchange completion must keep
+// the whole stash (offset = retry_req_send_len, length = both requests) until recovery
+// restores it, and recovery must hand the successor its own suffix in recv_buf.
+TEST(response_headers, forward_mutation_release_keeps_two_request_stash_until_recovery) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = false;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char req1[] = "GET /path HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char req2[] = "GET /two HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char req3[] = "GET /three HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len1 = sizeof(req1) - 1;
+    const u32 len2 = sizeof(req2) - 1;
+    const u32 len3 = sizeof(req3) - 1;
+    c->recv_buf.write(reinterpret_cast<const u8*>(req1), len1);
+    c->recv_buf.write(reinterpret_cast<const u8*>(req2), len2);
+    c->recv_buf.write(reinterpret_cast<const u8*>(req3), len3);
+    c->req_initial_send_len = len1;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len1)));
+    REQUIRE(c->response_mutations_snapshotted);
+    REQUIRE_EQ(c->retry_req_send_len, len1);
+    REQUIRE_EQ(c->pipeline_stash_len, len2 + len3);
+    REQUIRE_EQ(c->send_buf.len(), len1 + len2 + len3);
+
+    static const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+    REQUIRE_EQ(c->retry_req_send_len, len1);
+    REQUIRE_EQ(c->pipeline_stash_len, len2 + len3);
+
+    rut::drop_response_mutation_snapshot(*c);
+    CHECK_EQ(c->send_buf.len(), len1 + len2 + len3);
+    CHECK_EQ(__builtin_memcmp(c->send_buf.data() + len1, req2, len2), 0);
+    CHECK_EQ(__builtin_memcmp(c->send_buf.data() + len1 + len2, req3, len3), 0);
+
+    // Recovery restores both requests byte-exact, then resets send_buf.
+    const auto transition = rut::pipeline_recover(*c);
+    CHECK(transition == rut::PipelineTransitionResult::Advanced);
+    CHECK_EQ(c->pipeline_stash_len, 0u);
+    CHECK_EQ(c->retry_req_send_len, 0u);
+    CHECK_EQ(c->send_buf.len(), 0u);
+    REQUIRE_EQ(c->recv_buf.len(), len2 + len3);
+    CHECK_EQ(__builtin_memcmp(c->recv_buf.data(), req2, len2), 0);
+    CHECK_EQ(__builtin_memcmp(c->recv_buf.data() + len2, req3, len3), 0);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
 // A replayed request (dead pooled socket surfaced after the send) is sent byte-exact
 // from the send_buf snapshot, and the snapshot is dropped only once the replay is
 // answered — not before, or the replay would have nothing to send.

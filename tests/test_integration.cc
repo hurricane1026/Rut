@@ -42168,6 +42168,36 @@ static bool get_reply_starts_with(i32 fd,
     return length >= expected_len && memcmp(reply, expected, expected_len) == 0;
 }
 
+// Like get_reply_starts_with, but consumes the whole Content-Length response first: a
+// rewritten response may reach the client as separate header and body segments, and a
+// body byte left unread would prefix the next reply on the connection.
+static bool get_complete_reply_starts_with(i32 fd, const char* path, const char* expected) {
+    char request[128];
+    const int request_len =
+        snprintf(request, sizeof(request), "GET %s HTTP/1.1\r\nHost: client.example\r\n\r\n", path);
+    if (request_len <= 0 || !send_all(fd, request, static_cast<u32>(request_len))) return false;
+    char reply[1024];
+    u32 length = 0;
+    u32 total = 0;  // header + body bytes once the header is complete
+    for (u32 attempt = 0; attempt < 32; attempt++) {
+        const i32 got = recv_timeout(fd, reply + length, sizeof(reply) - 1 - length, 3000);
+        if (got <= 0) return false;
+        length += static_cast<u32>(got);
+        reply[length] = '\0';
+        if (total == 0) {
+            const char* end = strstr(reply, "\r\n\r\n");
+            if (end == nullptr) continue;
+            const char* cl = strstr(reply, "Content-Length: ");
+            const u32 body = cl != nullptr && cl < end ? static_cast<u32>(atoi(cl + 16)) : 0;
+            total = static_cast<u32>(end - reply) + 4 + body;
+        }
+        if (length >= total) break;
+    }
+    const u32 expected_len = static_cast<u32>(strlen(expected));
+    return total != 0 && length == total && length >= expected_len &&
+           memcmp(reply, expected, expected_len) == 0;
+}
+
 // Epoll: the neutrality check that gates a guarded redirect also runs on epoll. A
 // forward answered over a reused pooled upstream, then the guarded redirect on the
 // same client connection, used to close the connection with no reply.
@@ -42238,7 +42268,7 @@ TEST(route, public_ordinary_source_guarded_redirect_after_mutated_forward_epoll)
     REQUIRE(c >= 0);
     set_socket_timeouts(c, 3);
 
-    REQUIRE(get_reply_starts_with(c, "/mutated", "HTTP/1.1 200 "));
+    REQUIRE(get_complete_reply_starts_with(c, "/mutated", "HTTP/1.1 200 "));
     CHECK(get_reply_starts_with(c, "/old", "HTTP/1.1 301 ", "Connection: close\r\n"));
     close(c);
     proxy.teardown();
