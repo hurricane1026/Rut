@@ -6448,6 +6448,28 @@ TEST(uring, request_body_overflow_is_answered_with_413) {
     loop->shutdown();
 }
 
+// An upstream that already answered (early 401 and the like) keeps priority over the
+// 413: the overflow leaves the connection alone and its buffered response is delivered
+// by the upstream send completion, which abandons the rest of the body.
+TEST(uring, request_body_overflow_defers_to_an_early_upstream_response) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+
+    Connection* c = make_uploading_conn(*loop, 16384, 40000);
+    REQUIRE(c != nullptr);
+    c->upstream_fd = 99;
+    c->upstream_episode = 1;
+    // The upstream's response was detected while the body chunk send is in flight.
+    c->on_upstream_send = &on_body_send_with_early_response<IoUringEventLoop>;
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    CHECK(c->fd >= 0);                      // not closed
+    CHECK(!c->req_body_overflow_rejected);  // no 413 was queued
+    CHECK_EQ(c->state, ConnState::Proxying);
+    CHECK_EQ(c->send_buf.len(), 0u);
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<IoUringEventLoop>);
+    loop->shutdown();
+}
+
 // After the in-flight chunk is sent, what arrived behind it is forwarded as the next
 // chunk, the recv pause is lifted, and the multishot recv is re-armed.
 TEST(uring, request_body_sent_forwards_surplus_and_resumes_recv) {
@@ -21737,34 +21759,79 @@ TEST(proxy_iouring_request_body, single_write_arrives_intact) {
     }
 }
 
-// Larger bodies written in one burst can outrun recv_buf on io_uring (the backend
-// drops what does not fit). The contract: never hang and never close silently;
-// either the body arrives intact (200) or the client is refused with 413 + close.
-TEST(proxy_iouring_request_body, single_write_burst_is_answered) {
+// STOPGAP CONTRACT, pinned so the lossless follow-up (parked-CQE FIFO in wait())
+// must change it deliberately. A request (headers + body) written in ONE go is
+// forwarded byte-exact while it fits the 16 KiB recv_buf slice, and refused with
+// 413 + Connection: close as soon as it does not (it used to hang, or be closed
+// silently above 16 KiB). Independent of timing: below the slice nothing can be
+// dropped; above it the whole burst is already queued before the first send ends.
+TEST(proxy_iouring_request_body, single_write_ceiling_is_the_recv_buf_slice) {
+    constexpr u32 kSlice = 16384;  // SlicePool::kSliceSize: recv_buf capacity
     DrainingOrigin origin;
     REQUIRE(origin.setup());
     IoUringBodyProxy proxy;
     if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
 
+    // Largest body whose whole request is <= kSlice bytes on the wire.
+    u32 fit[2];
+    for (u32 chunked = 0; chunked < 2; chunked++) {
+        fit[chunked] = 16000;
+        while (build_post(g_wire_a, "/post", fit[chunked] + 1, chunked != 0).len <= kSlice)
+            fit[chunked]++;
+    }
+
+    // Up to the limit: byte-exact. (Refused requests come after: whether the origin
+    // even sees such a connection is timing dependent, so they must not shift the
+    // origin's record indices.)
+    u32 n_done = 0;
+    for (u32 round = 0; round < 3; round++) {
+        for (u32 chunked = 0; chunked < 2; chunked++) {
+            const WireRequest at = build_post(g_wire_a, "/post", fit[chunked], chunked != 0);
+            REQUIRE(at.len <= kSlice);
+            REQUIRE(at.len + 8 > kSlice);  // within a few bytes of the limit, not far below
+            i32 fd = connect_to(proxy.port);
+            REQUIRE(fd >= 0);
+            REQUIRE(send_all(fd, reinterpret_cast<const char*>(at.data), at.len));
+            const Reply r = read_reply(fd, 10000);
+            close(fd);
+            CHECK_EQ(r.status, 200u);
+            REQUIRE(origin.wait_seen(n_done + 1, 10000));
+            CHECK_EQ(origin.seen[n_done].body_len, fit[chunked]);
+            CHECK(origin.seen[n_done].complete);
+            CHECK(origin.seen[n_done].pattern_ok);
+            n_done++;
+        }
+    }
+    // One body byte more no longer fits: 413 and close, never a hang or an EOF.
+    for (u32 round = 0; round < 3; round++) {
+        for (u32 chunked = 0; chunked < 2; chunked++) {
+            const WireRequest over = build_post(g_wire_a, "/post", fit[chunked] + 1, chunked != 0);
+            REQUIRE(over.len > kSlice);
+            i32 fd = connect_to(proxy.port);
+            REQUIRE(fd >= 0);
+            (void)send_all(fd, reinterpret_cast<const char*>(over.data), over.len);
+            const Reply r = read_reply(fd, 10000);
+            CHECK_EQ(r.status, 413u);
+            CHECK(r.conn_close);
+            // ... and the connection really is closed behind it, not left open.
+            char tail[16];
+            const i64 t0 = test_mono_ms();
+            CHECK(recv_timeout(fd, tail, sizeof(tail), 5000) <= 0);
+            CHECK(test_mono_ms() - t0 < 4000);
+            close(fd);
+        }
+    }
+    // Much larger bursts behave the same (413, not a silent close).
     const u32 bodies[] = {20000, 65536, 300000};
-    for (u32 round = 0; round < 6; round++) {
-        const u32 body = bodies[round % 3];
-        const WireRequest w = build_post(g_wire_a, "/post", body, /*chunked=*/round >= 3);
+    for (u32 b : bodies) {
+        const WireRequest w = build_post(g_wire_a, "/post", b, false);
         i32 fd = connect_to(proxy.port);
         REQUIRE(fd >= 0);
-        // The gateway may answer 413 and close while we are still writing.
         (void)send_all(fd, reinterpret_cast<const char*>(w.data), w.len);
         const Reply r = read_reply(fd, 10000);
         close(fd);
-        CHECK(r.status == 200u || r.status == 413u);
-        if (r.status == 413u) CHECK(r.conn_close);
-        if (r.status == 200u) {
-            REQUIRE(origin.wait_seen(round + 1, 10000));
-            const SeenRequest& s = origin.seen[round];
-            CHECK_EQ(s.body_len, body);
-            CHECK(s.complete);
-            CHECK(s.pattern_ok);
-        }
+        CHECK_EQ(r.status, 413u);
+        CHECK(r.conn_close);
     }
 }
 
@@ -21808,7 +21875,8 @@ TEST(proxy_iouring_request_body, synced_pieces_stream_large_bodies) {
 // TLS terminates in the io_uring loop: ciphertext lands in tls_in_buf, and while the
 // upload waits on the origin nothing decrypts it. The same contracts hold: a body
 // that does not outrun the gateway streams through intact; a burst that overflows is
-// refused with 413 (over TLS), never hung or closed silently.
+// refused with 413 (over TLS), never hung or closed silently (stopgap, see
+// respond_request_body_overflow).
 TEST(proxy_iouring_request_body, tls_upload) {
     DrainingOrigin origin;
     REQUIRE(origin.setup());
@@ -21861,11 +21929,9 @@ TEST(proxy_iouring_request_body, tls_upload) {
                 static_cast<u32>((buf[9] - '0') * 100 + (buf[10] - '0') * 10 + (buf[11] - '0'));
         SSL_free(ssl);
         close(fd);
-        if (c.synced || c.body <= 8192) {
-            CHECK_EQ(status, 200u);
-        } else {
-            CHECK(status == 200u || status == 413u);
-        }
+        // The stopgap ceiling on TLS sits in tls_in_buf (ciphertext; ~33 KB of body
+        // measured), so a 120 KB burst is refused and everything else streams through.
+        CHECK_EQ(status, c.body == 120000 ? 413u : 200u);
         if (status == 200u) {
             REQUIRE(origin.wait_seen(round + 1, 10000));
             CHECK_EQ(origin.seen[round].body_len, c.body);
@@ -21958,6 +22024,296 @@ TEST(proxy_iouring_request_body, pipelined_successor_after_body) {
         CHECK(origin.seen[before].complete);
         CHECK_EQ(origin.seen[before + 1].body_len, 3u);  // "abc": its own request
         CHECK_EQ(origin.seen[before + 1].path[1], 'n');  // /next
+    }
+}
+
+// Forward routes compiled from source, one of them with a response-header mutation
+// chain, in front of a DrainingOrigin. The mutation snapshot sets retry_req_send_len
+// when body streaming starts; that must not change how much of recv_buf is treated
+// as already sent (the body used to be corrupted with the request headers replayed
+// inside it: the origin saw "...POST /mpost HTTP/1.1..." in the body).
+struct MutationBodySource {
+    FrontendRirModule rir{};
+    jit::JitEngine engine{};
+    RouteConfig cfg{};
+    bool engine_ready = false;
+
+    ~MutationBodySource() {
+        if (engine_ready) engine.shutdown();
+        rir.destroy();
+    }
+
+    bool compile(u16 origin_port) {
+        std::string source =
+            "upstream origin at \"127.0.0.1:" + std::to_string(origin_port) + "\"\n";
+        source += R"rut(
+func response_headers(_ req: i32, _ resp: Response) -> i32 {
+  resp.set("X-Stage", "after")
+  0
+}
+chain access { after response_headers(req, resp) }
+route POST "/post" {
+  return forward(origin)
+}
+route POST "/mpost" use chain access {
+  return forward(origin)
+}
+)rut";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        auto mir = build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        if (!lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!populate_route_config(cfg, rir.module)) return false;
+        return register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
+template <typename Loop>
+struct MutationBodyProxy {
+    Shard<Loop> shard;
+    MutationBodySource source;
+    i32 lfd = -1;
+    u16 port = 0;
+    bool inited = false;
+    bool running = false;
+
+    ~MutationBodyProxy() { teardown(); }
+
+    // false: the loop is unavailable here (the caller skips).
+    bool setup(u16 origin_port) {
+        if (!source.compile(origin_port)) return false;
+        lfd = create_listen_socket(0).value_or(-1);
+        if (lfd < 0) return false;
+        auto init = shard.init(0, lfd);
+        for (u32 attempt = 0; !init && init.error().code == ENOMEM && attempt < 80; attempt++) {
+            usleep(25000);
+            init = shard.init(0, lfd);
+        }
+        if (!init) return false;
+        inited = true;
+        port = get_port(lfd);
+        shard.route_config = &source.cfg;
+        if (!shard.spawn(-1).has_value()) return false;
+        running = true;
+        return true;
+    }
+
+    void teardown() {
+        if (running) {
+            shard.stop();
+            shard.join();
+            running = false;
+        }
+        if (inited) {
+            shard.shutdown();
+            inited = false;
+        }
+        if (lfd >= 0) {
+            close(lfd);
+            lfd = -1;
+        }
+    }
+};
+
+// Request bodies larger than the first read through the mutation route must arrive at
+// the origin byte-exact (Content-Length and chunked). One-write cases stay within one
+// recv_buf slice (the io_uring stopgap ceiling); larger bodies are paced on origin
+// progress. (Not one-write on epoll either: a fresh upstream connection with a
+// one-write body above one slice is closed by the epoll loop on origin/main too;
+// unrelated to this change.)
+struct MutationBodyCase {
+    const char* path;
+    u32 body;
+    bool chunked;
+    bool synced;  // pieces paced on origin progress, else one write
+};
+
+struct MutationBodyOutcome {
+    static constexpr u32 kMaxCases = 8;
+    u32 count = 0;
+    bool setup_failed = false;
+    bool io_failed = false;  // connect/send/record timeout: outcomes below are partial
+    u32 status[kMaxCases]{};
+    SeenRequest seen[kMaxCases]{};
+};
+
+constexpr MutationBodyCase kMutationBodyCases[] = {{"/mpost", 6000, false, false},
+                                                   {"/mpost", 12000, false, false},
+                                                   {"/mpost", 6000, true, false},
+                                                   {"/mpost", 11000, true, false},
+                                                   {"/post", 12000, false, false},  // no chain
+                                                   {"/mpost", 20000, false, true},
+                                                   {"/mpost", 20000, true, true},
+                                                   {"/mpost", 100000, false, true}};
+
+template <typename Loop>
+void run_mutation_route_bodies(MutationBodyOutcome& out) {
+    DrainingOrigin origin;
+    if (!origin.setup()) {
+        out.setup_failed = true;
+        return;
+    }
+    MutationBodyProxy<Loop> proxy;
+    if (!proxy.setup(origin.port)) {
+        out.setup_failed = true;
+        return;
+    }
+    for (const auto& c : kMutationBodyCases) {
+        const WireRequest w = build_post(g_wire_a, c.path, c.body, c.chunked);
+        i32 fd = connect_to(proxy.port);
+        bool sent = fd >= 0;
+        if (sent) {
+            sent = c.synced ? send_synced(fd, w, 7000, origin, out.count)
+                            : send_all(fd, reinterpret_cast<const char*>(w.data), w.len);
+        }
+        const Reply r = sent ? read_reply(fd, 20000) : Reply{};
+        if (fd >= 0) close(fd);
+        if (!sent || !origin.wait_seen(out.count + 1, 10000)) {
+            out.io_failed = true;
+            return;
+        }
+        out.status[out.count] = r.status;
+        out.seen[out.count] = origin.seen[out.count];
+        out.count++;
+    }
+}
+
+static void check_mutation_outcome(const MutationBodyOutcome& out, rut::test::TestCase* _tc) {
+    REQUIRE(!out.io_failed);
+    REQUIRE_EQ(out.count,
+               static_cast<u32>(sizeof(kMutationBodyCases) / sizeof(kMutationBodyCases[0])));
+    for (u32 i = 0; i < out.count; i++) {
+        const auto& c = kMutationBodyCases[i];
+        CHECK_EQ(out.status[i], 200u);
+        CHECK_EQ(out.seen[i].path[1], c.path[1]);
+        CHECK_EQ(out.seen[i].body_len, c.body);
+        CHECK(out.seen[i].complete);
+        CHECK(out.seen[i].pattern_ok);  // no header bytes replayed inside the body
+        CHECK_EQ(out.seen[i].chunked, c.chunked);
+    }
+}
+
+TEST(proxy_iouring_request_body, mutation_route_body_is_byte_exact_iouring) {
+    MutationBodyOutcome out;
+    run_mutation_route_bodies<IoUringEventLoop>(out);
+    if (out.setup_failed) SKIP("io_uring unavailable in this environment");
+    check_mutation_outcome(out, _tc);
+}
+
+TEST(proxy_iouring_request_body, mutation_route_body_is_byte_exact_epoll) {
+    MutationBodyOutcome out;
+    run_mutation_route_bodies<EpollEventLoop>(out);
+    REQUIRE(!out.setup_failed);
+    check_mutation_outcome(out, _tc);
+}
+
+// An origin that answers as soon as it has the headers (an early 401) and then
+// drains what the client still writes, closing after a quiet period.
+struct EarlyReplyOrigin {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~EarlyReplyOrigin() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<EarlyReplyOrigin*>(arg);
+        static u8 buf[65536];
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                usleep(1000);
+                continue;
+            }
+            u32 len = 0;
+            bool have_head = false;
+            while (!have_head && len < sizeof(buf)) {
+                const i32 n = recv_timeout(
+                    client, reinterpret_cast<char*>(buf) + len, sizeof(buf) - len, 5000);
+                if (n <= 0) break;
+                len += static_cast<u32>(n);
+                have_head = buf_contains(reinterpret_cast<char*>(buf), len, "\r\n\r\n", 4);
+            }
+            if (have_head) {
+                static const char k401[] =
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno";
+                (void)send_all(client, k401, sizeof(k401) - 1);
+                while (recv_timeout(client, reinterpret_cast<char*>(buf), sizeof(buf), 300) > 0) {
+                }
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// The upstream's early response (401 sent right after the headers) is what the
+// client must see: bodies within the ceiling always get it. Larger one-write bodies
+// overflow recv_buf before the gateway has even connected upstream, so the upstream
+// cannot have answered yet and the 413 wins; that is inherent to the stopgap and
+// only checked to be one of the two answers (never a hang or a silent close).
+TEST(proxy_iouring_request_body, early_upstream_response_beats_the_body) {
+    EarlyReplyOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    const u32 bodies[] = {4000, 12000, 15000, 40000, 300000};
+    for (u32 body : bodies) {
+        const WireRequest w = build_post(g_wire_a, "/post", body, false);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        (void)send_all(fd, reinterpret_cast<const char*>(w.data), w.len);
+        const Reply r = read_reply(fd, 10000);
+        close(fd);
+        if (w.len <= 16384) {
+            CHECK_EQ(r.status, 401u);
+        } else {
+            CHECK(r.status == 401u || r.status == 413u);
+        }
+        CHECK(r.conn_close);
     }
 }
 

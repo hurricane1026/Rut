@@ -19593,6 +19593,72 @@ TEST(streaming, request_body_surplus_keeps_pipelined_successor_out_of_the_upload
     CHECK(stashed);
 }
 
+// Chunked surplus: chunk framing that arrived behind the in-flight send must go
+// through the chunk parser (only payload-framed bytes are forwarded, and the
+// terminating chunk completes the request), not be forwarded blindly. Fails if the
+// surplus is forwarded without advancing the parser: the request never completes.
+TEST(streaming, request_body_chunked_surplus_advances_the_chunk_parser) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+
+    const char* req =
+        "POST /upload HTTP/1.1\r\n"
+        "Host: test\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5\r\nhello\r\n";
+    u32 req_len = 0;
+    while (req[req_len]) req_len++;
+    conn->recv_buf.reset();
+    REQUIRE(append_recv_bytes(*conn, reinterpret_cast<const u8*>(req), req_len));
+    loop.backend.inject(make_ev(conn->id, IoEventType::Recv, static_cast<i32>(req_len)));
+    IoEvent events[8];
+    u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
+    REQUIRE_EQ(conn->req_body_mode, BodyMode::Chunked);
+    REQUIRE(conn->req_chunk_parser.state != ChunkedParser::State::Complete);
+
+    conn->upstream_fd = 100;
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    conn->state = ConnState::Proxying;
+    loop.submit_connect(*conn, nullptr, 0);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    const u32 initial_len = conn->req_initial_send_len;
+    CHECK_EQ(initial_len, req_len);
+
+    // A whole chunk arrives while the initial send is in flight.
+    static const char kChunk2[] = "7\r\nabcdefg\r\n";
+    constexpr u32 kChunk2Len = sizeof(kChunk2) - 1;
+    REQUIRE(append_recv_bytes(*conn, reinterpret_cast<const u8*>(kChunk2), kChunk2Len));
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(initial_len)));
+    CHECK_EQ(conn->on_upstream_send, &on_request_body_sent<SmallLoop>);
+    auto* send_op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send_op != nullptr);
+    CHECK_EQ(send_op->send_len, kChunk2Len);
+    CHECK(conn->req_chunk_parser.state != ChunkedParser::State::Complete);
+    CHECK_EQ(conn->recv_buf.len(), kChunk2Len);
+
+    // The terminating chunk arrives behind that send: parsed, forwarded, request done.
+    static const char kLast[] = "0\r\n\r\n";
+    constexpr u32 kLastLen = sizeof(kLast) - 1;
+    REQUIRE(append_recv_bytes(*conn, reinterpret_cast<const u8*>(kLast), kLastLen));
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, kChunk2Len));
+    send_op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(send_op != nullptr);
+    CHECK_EQ(send_op->send_len, kLastLen);
+    CHECK(conn->req_chunk_parser.state == ChunkedParser::State::Complete);
+
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, kLastLen));
+    CHECK_EQ(conn->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
+}
+
 // After a chunked request completes, keep-alive resets req_body_mode to None.
 TEST(streaming, keep_alive_after_chunked_request_no_stale_state) {
     SmallLoop loop;
@@ -32303,8 +32369,10 @@ TEST(streaming, request_body_sent_chunked_not_done_continues) {
     loop.backend.clear_ops();
     loop.inject_and_dispatch(
         make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(c->req_initial_send_len)));
-    // Should continue reading more body from client
+    // Should continue reading more body from client; the sent chunk is gone from
+    // recv_buf (only the sent prefix is dropped, and nothing was behind it).
     CHECK_EQ(c->on_recv, &on_request_body_recvd<SmallLoop>);
+    CHECK_EQ(c->recv_buf.len(), 0u);
 }
 
 TEST(streaming, request_body_chunked_error_closes) {
