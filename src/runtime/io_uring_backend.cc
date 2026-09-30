@@ -465,10 +465,12 @@ void IoUringBackend::submit_timer_read() {
 
 // --- Operations ---
 
-void IoUringBackend::add_accept() {
-    if (ring_fd < 0) return;
+bool IoUringBackend::add_accept() {
+    // listen_fd < 0 means the listener was closed (close_listen()); never arm on
+    // -1 or a recycled fd number.
+    if (ring_fd < 0 || listen_fd < 0) return false;
     io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_ACCEPT;
@@ -479,6 +481,7 @@ void IoUringBackend::add_accept() {
 
     sqe_advance_tail(sq_tail);
     pending++;
+    return true;
 }
 
 bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
