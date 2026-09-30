@@ -147,11 +147,18 @@ struct IoUringBackend {
     //
     // A window stays live until head reaches its frozen tail, which can take
     // several wait() calls (each returns at most kMaxEventsPerWait events), so
-    // the inventory is NOT bounded by one batch.  Every live window was
-    // recorded for a CQE consumed at most cq_ring_entries before the current
-    // head (its tail snapshot is at most that far ahead of the CQE, and head has
-    // not reached it yet), so cq_ring_entries slots always suffice.  The array is
-    // mmap'd in init() and only the first `count` slots are ever touched.
+    // the inventory is NOT bounded by one batch.  Expiry runs at the loop top
+    // before every add, so head never steps past a live window's frozen tail.
+    // There is at most one live window per downstream token, and the token is a
+    // pure function of conn_id, so the true bound is
+    // min(connection_capacity, cq_ring_entries).  cq_ring_entries alone is a
+    // safe over-approximation: every live window was recorded for a CQE consumed
+    // less than that far behind head.  The array is mmap'd in init() and only
+    // the first `count` slots are ever touched.
+    //
+    // Lookup and expiry are linear in the number of live windows, so a burst of
+    // N terminals costs O(N^2) on the shard thread (~120 ms of wait() CPU at
+    // N=16000).  Tracked as a follow-up; the data structure is unchanged here.
     struct DownstreamRecvTerminalWindow {
         u64 user_data = 0;
         u32 tail_exclusive = 0;
