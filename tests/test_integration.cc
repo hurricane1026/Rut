@@ -5544,12 +5544,33 @@ TEST(uring, upstream_recv_cancel_on_closed_conn_reclaims_slot) {
 // fresh ids out in ascending order and advances the watermark. Slots at or above
 // the watermark are untouched zero pages and must never be read or acted on.
 
+// Number of resident pages in [first_untouched_page, end) of the conns mapping,
+// where the first untouched page is the first one past slot `used - 1`.
+static u32 resident_conn_pages_past(IoUringEventLoop& loop, u32 used) {
+    const u64 page = static_cast<u64>(sysconf(_SC_PAGESIZE));
+    const u64 bytes = static_cast<u64>(loop.connection_capacity) * sizeof(Connection);
+    const u64 first = (static_cast<u64>(used) * sizeof(Connection) - 1) / page + 1;
+    const u64 pages = (bytes + page - 1) / page;
+    if (first >= pages) return 0;
+    auto* vec = static_cast<unsigned char*>(
+        mmap(nullptr, pages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (vec == MAP_FAILED) return ~0u;
+    u32 resident = 0;
+    auto* base = reinterpret_cast<u8*>(loop.conns.data());
+    if (mincore(base + first * page, static_cast<size_t>((pages - first) * page), vec) != 0) {
+        munmap(vec, pages);
+        return ~0u;
+    }
+    for (u64 i = 0; i < pages - first; i++) resident += vec[i] & 1u;
+    munmap(vec, pages);
+    return resident;
+}
+
 // A fresh loop has touched no slot, and an idle loop can be shut down as-is.
 TEST(uring, lazy_slots_fresh_loop_has_zero_watermark) {
     auto loop = std::make_unique<IoUringEventLoop>();
-    if (!loop->init(0, -1)) {
-        CHECK(true);  // no io_uring here
-        return;
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
     }
     CHECK_EQ(loop->slots_initialized, 0u);
     CHECK_EQ(loop->conns.constructed(), 0u);
@@ -5564,9 +5585,8 @@ TEST(uring, lazy_slots_fresh_loop_has_zero_watermark) {
 // the capacity; freed slots are reused without advancing it.
 TEST(uring, lazy_slots_watermark_tracks_peak_and_survives_churn) {
     auto loop = std::make_unique<IoUringEventLoop>();
-    if (!loop->init(0, -1)) {
-        CHECK(true);
-        return;
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
     }
     Connection* held[8] = {};
     for (u32 i = 0; i < 5; i++) {
@@ -5625,9 +5645,8 @@ TEST(uring, lazy_slots_watermark_tracks_peak_and_survives_churn) {
 // of "fd 0", no state change anywhere.
 TEST(uring, lazy_slots_event_beyond_watermark_is_ignored) {
     auto loop = std::make_unique<IoUringEventLoop>();
-    if (!loop->init(0, -1)) {
-        CHECK(true);
-        return;
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
     }
     Connection* live = loop->alloc_conn();
     REQUIRE(live != nullptr);
@@ -5679,14 +5698,45 @@ TEST(uring, lazy_slots_event_beyond_watermark_is_ignored) {
     loop->shutdown();
 }
 
+// The response-read-deadline batch machinery (prepare/find_or_add/settle) is
+// keyed by event conn_ids. A never-allocated slot reads as "no deadline", so a
+// wrong bound would not create an owner; it would, however, read (fault in) the
+// untouched slot. Assert the batch neither creates owners/pins nor touches the
+// suffix pages.
+TEST(uring, lazy_slots_response_read_batch_ignores_unallocated_slots) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    Connection* live = loop->alloc_conn();
+    REQUIRE(live != nullptr);
+    REQUIRE_EQ(loop->slots_initialized, 1u);
+    REQUIRE_EQ(resident_conn_pages_past(*loop, 1), 0u);
+
+    const u32 kFar = loop->connection_capacity - 1u;
+    IoEvent batch[4];
+    batch[0] = make_ev(kFar, IoEventType::UpstreamRecv, 16);  // episode 0 == zero slot's
+    batch[1] = make_ev(kFar, IoEventType::Recv, 0);           // downstream terminal
+    batch[2] = make_ev(kFar, IoEventType::ResponseReadTimer, 0);
+    batch[3] = make_ev(kFar, IoEventType::UpstreamRecv, -ECANCELED);
+    loop->prepare_response_read_deadline_batch(batch, 4);
+    CHECK_EQ(loop->response_read_batch_owner_count, 0u);
+    CHECK_EQ(loop->response_read_batch_pin_count, 0u);
+    CHECK_EQ(resident_conn_pages_past(*loop, 1), 0u);
+    loop->settle_response_read_deadline_batch();
+    CHECK_EQ(resident_conn_pages_past(*loop, 1), 0u);
+    loop->response_read_batch_events = nullptr;
+    loop->response_read_batch_event_count = 0;
+    loop->shutdown();
+}
+
 // Forced drain/shutdown walks only [0, watermark): live clients and parked
 // upstream fds in the used prefix are closed, and the untouched suffix is left
 // alone.
 TEST(uring, lazy_slots_force_close_all_with_partial_array) {
     auto loop = std::make_unique<IoUringEventLoop>();
-    if (!loop->init(0, -1)) {
-        CHECK(true);
-        return;
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
     }
     i32 cli[3][2];
     for (auto& pair : cli) REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
@@ -5713,6 +5763,44 @@ TEST(uring, lazy_slots_force_close_all_with_partial_array) {
         // Each live client fd was closed by close_conn, never one from the suffix.
         CHECK(::fcntl(cli[i][0], F_GETFD) == -1);
     }
+    loop->shutdown();
+}
+
+// A drain tick over a partially used array closes the live clients, walks only
+// [0, watermark) (no fd 0 close, no page of the untouched suffix faulted in),
+// and leaves the loop with nothing active so run() can finish draining.
+TEST(uring, lazy_slots_drain_tick_with_partial_array) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    i32 cli[3][2];
+    for (auto& pair : cli) REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+    for (u32 i = 0; i < 3; i++) {
+        Connection* c = loop->alloc_conn();
+        REQUIRE(c != nullptr);
+        c->fd = cli[i][0];
+        c->state = ConnState::ReadingHeader;
+    }
+    REQUIRE_EQ(loop->slots_initialized, 3u);
+    REQUIRE(loop->connection_capacity > 64u);
+    REQUIRE_EQ(resident_conn_pages_past(*loop, 3), 0u);
+
+    struct stat fd0_before{};
+    const int fd0_before_rc = ::fstat(0, &fd0_before);
+
+    loop->drain(0);  // period 0: every ReadingHeader client closes on the first tick
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+
+    for (u32 i = 0; i < 3; i++) CHECK(::fcntl(cli[i][0], F_GETFD) == -1);  // closed by drain
+    CHECK_EQ(loop->active_count(), 0u);  // nothing left, run() would stop
+    CHECK_EQ(loop->slots_initialized, 3u);
+    CHECK_EQ(resident_conn_pages_past(*loop, 3), 0u);  // suffix never read or written
+    struct stat fd0_after{};
+    const int fd0_after_rc = ::fstat(0, &fd0_after);
+    CHECK_EQ(fd0_after_rc, fd0_before_rc);
+    if (fd0_before_rc == 0) CHECK_EQ(fd0_after.st_ino, fd0_before.st_ino);
+    for (auto& pair : cli) close(pair[1]);
     loop->shutdown();
 }
 
@@ -7585,6 +7673,13 @@ TEST(shard, iouring_lazy_slots_serve_and_watermark_tracks_peak) {
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     auto initialized = shard.init(0, lfd);
+    // A ring created right after another was closed can see a transient ENOMEM
+    // (the kernel releases the memlock charge asynchronously); retry briefly.
+    for (u32 attempt = 0; !initialized && initialized.error().code == ENOMEM && attempt < 40;
+         attempt++) {
+        usleep(25000);
+        initialized = shard.init(0, lfd);
+    }
     if (!initialized) {
         close(lfd);
         SKIP("io_uring cannot initialize in this environment");

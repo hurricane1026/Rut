@@ -36569,8 +36569,7 @@ struct ScopedIoUringLoopForRetirement {
                        0);
         if (storage == MAP_FAILED) return false;
         loop = new (storage) IoUringEventLoop();
-        auto result = loop->init(0, -1);
-        initialized = result.has_value();
+        initialized = init_iouring_loop_with_retry(*loop);
         return initialized;
     }
 
@@ -40216,7 +40215,14 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     fixture.guard.loop->backend.downstream_recv_terminal_window_count = 1;
     fixture.guard.loop->backend.downstream_recv_progress_head = 37;
     fixture.guard.loop->backend.downstream_recv_progress_valid = true;
-    const auto reinit_result = fixture.guard.loop->backend.init(0, -1);
+    auto reinit_result = fixture.guard.loop->backend.init(0, -1);
+    // A ring opened right after one was closed can see a transient ENOMEM (the
+    // kernel releases the memlock charge asynchronously); retry briefly.
+    for (u32 attempt = 0; !reinit_result && reinit_result.error().code == ENOMEM && attempt < 40;
+         attempt++) {
+        usleep(25000);
+        reinit_result = fixture.guard.loop->backend.init(0, -1);
+    }
     if (!reinit_result) {
         std::cerr << "FAIL test=iouring_downstream_recv_barrier.absolute_cq_positions_wrap_and_"
                      "shutdown_clears_state phase=reinit error_source="
@@ -40578,8 +40584,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                             : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();

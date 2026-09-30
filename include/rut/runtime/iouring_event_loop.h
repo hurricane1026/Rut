@@ -247,14 +247,19 @@ public:
     MappedArray<u32> free_stack;
     u32 free_top = 0;
     // Initialised-prefix watermark for `conns`. Slots [0, slots_initialized)
-    // have been constructed and reset() by alloc_conn_impl at least once and are
-    // valid to read; slots at or above it are untouched anonymous zero pages
-    // (conns is mapped with MappedArray::init_lazy; NOT a valid free
-    // slot: fds are -1 after reset(), 0 when zeroed) and must never be read.
+    // have each been constructed and reset() (id/shard_id set) and are valid to
+    // read; slots at or above it are untouched anonymous zero pages (conns is
+    // mapped with MappedArray::init_lazy). A zeroed slot is NOT a valid free
+    // slot: fds are -1 after reset() but 0 when zeroed, so it must never be read.
     // free_stack is seeded so fresh ids pop in ascending order, which keeps the
-    // never-used slots a suffix. Every id that can arrive from outside a live
-    // allocation (CQE conn_id, pending ids, all-slot walks) is bounded by this,
-    // not by connection_capacity, so an idle shard only pays for slots it used.
+    // never-used slots a suffix; initialize_slots_to() keeps the prefix property
+    // regardless of hand-out order.
+    // Bounded by the watermark: any index that can arrive without a live
+    // allocation behind it (CQE/event conn_ids, response-read batch owners and
+    // pins, the body-pump ready set, reclaim_slot arguments) and every walk over
+    // all slots. Allocated by construction (not bounded): Connection& c handed
+    // out by alloc_conn and the pending_free ids, which are only ever pushed from
+    // closed live slots.
     u32 slots_initialized = 0;
 
     // Pending-free list: slots closed during the current dispatch batch.
@@ -334,7 +339,7 @@ public:
     static constexpr u32 kCaptureSliceSize = 8192;
     u8* capture_region_ = nullptr;
 
-    core::Expected<void, Error> init_slot_storage(u32 capacity, u32 /*id*/ = 0) {
+    core::Expected<void, Error> init_slot_storage(u32 capacity) {
         if (!validate_connection_capacity(capacity))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
         if (connection_capacity != 0)
@@ -446,7 +451,7 @@ public:
                                      u32 capacity = kDefaultConnectionCapacity) {
         if (connection_capacity != 0)
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
-        auto slots = init_slot_storage(capacity, id);
+        auto slots = init_slot_storage(capacity);
         if (!slots) return core::make_unexpected(slots.error());
         shard_id = id;
         listen_fd = lfd;
@@ -2797,6 +2802,20 @@ public:
 
     // --- CRTP implementations (io_uring: async, with armed/pending_ops) ---
 
+    // Construct and reset() every slot in [slots_initialized, n) and advance the
+    // watermark. Cold path: only reached when a never-used slot is handed out.
+    void initialize_slots_to(u32 n) {
+        if (n > connection_capacity) n = connection_capacity;
+        if (n <= slots_initialized) return;
+        conns.construct_to(n);
+        for (u32 i = slots_initialized; i < n; i++) {
+            conns[i].reset();
+            conns[i].id = i;
+            conns[i].shard_id = static_cast<u8>(shard_id);
+        }
+        slots_initialized = n;
+    }
+
     Connection* alloc_conn_impl() {
         if (free_top == 0) return nullptr;
         u8* rs = pool.alloc();
@@ -2808,11 +2827,9 @@ public:
         }
         u32 id = free_stack[--free_top];
         // Fresh ids pop in ascending order, so a never-used slot is exactly
-        // the next one past the watermark; reset() below initialises it.
-        if (id >= slots_initialized) {
-            conns.construct_to(id + 1);
-            slots_initialized = id + 1;
-        }
+        // the next one past the watermark; initialize_slots_to also covers any
+        // gap so the prefix invariant does not depend on hand-out order.
+        if (id >= slots_initialized) initialize_slots_to(id + 1);
         // A free slot has drained every target and cancel completion. Failed
         // sends can leave unsent bytes in the backend proactor even after the
         // connection's close ledger drains; those bytes belong to the old fd.
