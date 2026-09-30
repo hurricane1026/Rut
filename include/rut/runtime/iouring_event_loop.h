@@ -6071,12 +6071,13 @@ public:
     // after kIdleTrimMaxExamined nodes, kIdleTrimMaxTrims queued connections
     // (<= kIdleTrimMaxRanges = 1536 ranges, two flush calls), or when the wall clock
     // plus the projected flush (queued ranges * kIdleTrimFlushNsPerRange) reaches
-    // kIdleTrimBudgetNs. Measured (Linux 7.2.7, 1 shard thread + 0-7 spinning
-    // threads, every page of every slice dirty): examination of 512 queued
-    // connections 0.03-0.11 ms, flush 0.35-0.55 us per range (512 connections,
-    // 1024-1536 ranges: 0.2-0.7 ms, one outlier 1.05 ms), so the added stall is
-    // ~1 ms worst case per tick against the 1.5 ms budget. Trim throughput is
-    // therefore at most 512 connections per tick; since a list is revisited on each
+    // kIdleTrimBudgetNs. Measured on Linux 7.2.7 (shared 32-CPU host, other load
+    // present): examining 512 connections 0.03-0.13 ms; flush 0.25-0.9 us per range
+    // (every page of every slice dirty, 0-7 busy threads: 0.35-0.55 us); a real
+    // 10000-connection burst (1 shard, two slices each) took 0.4-1.5 ms per tick in
+    // total, one tick in 20 took 3.0 ms (flush 2.5 ms, host interference); idle
+    // ticks cost ~2.4 us. So the added stall is ~1 ms typical per tick. Trim
+    // throughput is therefore at most 512 connections per tick; since a list is revisited on each
     // of kIdleTrimAgeWindow (40) consecutive ticks, a burst that goes idle within one
     // second is trimmed completely when it is no larger than ~40 * 512 = 20480
     // connections (10000 connections took ~20 ticks). Whatever remains when the
@@ -6084,8 +6085,15 @@ public:
     // new one. The window (ages 5..44) closes 15 ticks before the default 60 s
     // keep-alive expiry; it is clipped for smaller timeouts (see sweep_idle_trim).
     //
-    // Cost that remains: the release itself still costs the other shards a little
-    // — TODO-COST
+    // Cost that remains: the release itself still has a residual cost. Measured (20000 idle
+    // connections trimmed during a 12 s window, 2 shards, one load generator of 64 connections,
+    // throughput-limited by the client): -1.0% to -1.6% requests/s (18 alternating
+    // rounds, se ~0.5-0.6), mechanism not identified. With the load generators
+    // saturating the shards (2 and 4 shards, 20000 idle connections) no cost is
+    // measurable: 4 shards -0.13% (6 rounds, se 0.2), 2 shards -0.45% (2 clean
+    // rounds only). TLB shootdowns on the shard CPUs during the trim window fell
+    // from ~20-35k (2 shards) and ~100-113k (4 shards) with per-slice madvise to
+    // ~40 and ~125 with the batch (~25 without trimming), i.e. >99% removed.
     static constexpr u32 kIdleTrimMinIdleTicks = 5;
     static constexpr u32 kIdleTrimAgeWindow = 40;
     static constexpr u32 kIdleTrimMaxExamined = 2048;

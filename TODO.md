@@ -160,7 +160,7 @@ without presenting lossy or per-shard state as exact shared state.
 - [x] epoll partial-send proactor semantics and recv-buffer integration.
 - [x] io_uring timerfd timeout events and provided-buffer return path.
 - [x] Shard runtime integration: per-core EventLoop, TimerWheel, route table, upstream pool, SlicePool, and SlabPool.
-- [x] Connection buffers moved from inline storage to SlicePool-backed slices; idle/free connections hold zero buffer slices.
+- [x] Connection buffers moved from inline storage to SlicePool-backed slices; free slots hold no slices; live connections keep recv/send slices bound, and on io_uring the dirty pages of connections idle >= ~5 s are returned via batched `MADV_DONTNEED` (`process_madvise`) when available.
 - [x] Traffic replay now covers static/default paths and explicitly skips proxy routes through `replay_one`.
 - [x] Capture persistence now covers raw-header tail zeroing, corrupted/truncated entries, zeroed entries, and EINTR retry for capture read/write.
 - [x] Response parser rejects malformed status codes (`XYZ`, non-digit, `<100`, `>599`).
