@@ -712,6 +712,9 @@ public:
         // Request 1's callbacks are spent, and the resume validity check refuses a
         // connection that still advertises one. The io_uring TLS completion
         // (tls_on_out_drain -> proxy_stream_complete) reaches here with them set.
+        // For TLS this also nulls tls_pending_on_recv, so the tail tls_process in
+        // tls_on_out_drain cannot dispatch request 2 while parked; its ciphertext
+        // stays in tls_in_buf and is decrypted on resume.
         c.clear_slots();
         c.http1_boundary_deferred = true;
         c.http1_boundary_ready = false;

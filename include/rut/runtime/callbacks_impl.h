@@ -8806,14 +8806,9 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         return;
     }
 
-    if constexpr (requires(Loop* candidate, Connection& c) {
-                      candidate->defer_http1_request_boundary(c);
-                  }) {
-        if (loop->defer_http1_request_boundary(conn)) return;
-    }
-
-    // If this response was throttled, arm_throttle_timer pulled the connection off
-    // the keepalive wheel (the precise timer owned its wakeup). Now that the
+    // Runs before the boundary can park: a parked connection is reaped only by the
+    // keepalive wheel. If this response was throttled, arm_throttle_timer pulled
+    // the connection off the keepalive wheel (the precise timer owned its wakeup). Now that the
     // throttle pause is cleared (its timer tick is a no-op), restore the normal
     // keepalive deadline — otherwise an idle keep-alive client could hold the slot
     // open indefinitely (precise-timer path) or be closed at the short throttle
@@ -8822,6 +8817,12 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
     // header-read path has no other wakeup to re-arm it.
     if constexpr (requires { loop->timer.refresh(&conn, loop->keepalive_timeout); }) {
         if (kWasThrottled) loop->timer.refresh(&conn, loop->keepalive_timeout);
+    }
+
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->defer_http1_request_boundary(c);
+                  }) {
+        if (loop->defer_http1_request_boundary(conn)) return;
     }
 
     if (conn.pipeline_stash_len > 0 && conn.recv_buf.len() > 0) {
