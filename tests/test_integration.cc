@@ -20047,8 +20047,8 @@ route GET "/deadline" {
     }
 };
 
-// One GET on a keep-alive downstream connection against KeepAliveCountingUpstream's
-// fixed 2-byte body. True iff a 200 with the complete body came back (an EOF or a
+// One GET on a keep-alive downstream connection against the fixed 2-byte keep-alive
+// upstreams' body. True iff a 200 with the complete body came back (an EOF or a
 // short read, i.e. a silent close, is false).
 static bool get_two_byte_body_200(i32 fd, const char* path) {
     char request[128];
@@ -41926,6 +41926,175 @@ TEST(route, public_ordinary_source_deadline_forward_after_fresh_plain_forward_io
     REQUIRE(wait_for_idle_pool_count(shard, 1));
     CHECK_EQ(backend.accept_count.load(), 1);
     CHECK(get_two_byte_body_200(client.fd, "/deadline"));
+}
+
+// Compiler/JIT lifetime for plain forwards (one with a response-header mutation chain)
+// next to a guarded redirect route whose other branch is a deadline-owned forward.
+// That combination makes the route select its response after canonical route
+// selection, which requires a neutral connection on both io_uring and epoll.
+struct PublicForwardThenGuardedRedirectSourceResources : PublicResponseReadDeadlineSourceResources {
+    bool compile(u16 backend_port) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+        source += R"rut(
+func add_trace(_ req: i32, _ resp: Response) -> i32 {
+  resp.set("X-Request-Path", req.path)
+  0
+}
+chain observability { after add_trace(req, resp) }
+route GET "/plain" {
+  return forward(backend)
+}
+route GET "/mutated" use chain observability {
+  return forward(backend)
+}
+route GET "/old" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close, status: 301,
+      reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
+      header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
+  } else {
+    return forward(backend,
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .request, server: "deadline-test", date: .current,
+        hide_headers: [] },
+      failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+        content_type: "text/plain", server: "deadline-test", date: .current,
+        connection: .request, body: b"default failure\n" },
+      timeout_failure_policy: { version: .http11, status: 504,
+        reason: "First Response Deadline", content_type: "text/plain",
+        server: "deadline-test", date: .current, connection: .request,
+        body: b"configured deadline\n" },
+      response_read_timeout: 1s,
+      response_buffering: .completeContentLength)
+  }
+}
+)rut";
+
+        auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = rut::parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<rut::AstFile> ast_owned(ast.value());
+        auto hir = rut::analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+        auto mir = rut::build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<rut::MirModule> mir_owned(mir.value());
+        if (!rut::lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = rut::jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!rut::populate_route_config(cfg, rir.module)) return false;
+        return rut::register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
+// One GET on a keep-alive downstream connection; true iff the reply begins with
+// `expected` (an EOF, i.e. a silent close, is false). The guarded redirect admits only
+// a request that carries exactly one `Connection: close`.
+static bool get_reply_starts_with(i32 fd,
+                                  const char* path,
+                                  const char* expected,
+                                  const char* extra_headers = "") {
+    char request[192];
+    const int request_len = snprintf(request,
+                                     sizeof(request),
+                                     "GET %s HTTP/1.1\r\nHost: client.example\r\n%s\r\n",
+                                     path,
+                                     extra_headers);
+    if (request_len <= 0 || !send_all(fd, request, static_cast<u32>(request_len))) return false;
+    const u32 expected_len = static_cast<u32>(strlen(expected));
+    char reply[512];
+    u32 length = 0;
+    for (u32 attempt = 0; attempt < 16 && length < expected_len; attempt++) {
+        const i32 got = recv_timeout(fd, reply + length, sizeof(reply) - length, 3000);
+        if (got <= 0) return false;
+        length += static_cast<u32>(got);
+    }
+    return length >= expected_len && memcmp(reply, expected, expected_len) == 0;
+}
+
+// Epoll: the neutrality check that gates a guarded redirect also runs on epoll. A
+// forward answered over a reused pooled upstream, then the guarded redirect on the
+// same client connection, used to close the connection with no reply.
+TEST(route, public_ordinary_source_guarded_redirect_after_reused_forward_epoll) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+    PublicForwardThenGuardedRedirectSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    const RouteConfig* active = &resources.cfg;
+
+    // A redirect is built against the declared cleartext listener.
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, &declared_listener));
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 3);
+
+    REQUIRE(get_reply_starts_with(c, "/plain", "HTTP/1.1 200 "));
+    REQUIRE(get_reply_starts_with(c, "/plain", "HTTP/1.1 200 "));
+    CHECK_EQ(backend.accept_count.load(), 1);  // the second forward used the pooled socket
+    CHECK(get_reply_starts_with(c, "/old", "HTTP/1.1 301 ", "Connection: close\r\n"));
+    close(c);
+    proxy.teardown();
+}
+
+// Same, with a fresh upstream socket (no retry copy) as the control.
+TEST(route, public_ordinary_source_guarded_redirect_after_fresh_forward_epoll) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+    PublicForwardThenGuardedRedirectSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    const RouteConfig* active = &resources.cfg;
+
+    // A redirect is built against the declared cleartext listener.
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, &declared_listener));
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 3);
+
+    REQUIRE(get_reply_starts_with(c, "/plain", "HTTP/1.1 200 "));
+    CHECK_EQ(backend.accept_count.load(), 1);
+    CHECK(get_reply_starts_with(c, "/old", "HTTP/1.1 301 ", "Connection: close\r\n"));
+    close(c);
+    proxy.teardown();
+}
+
+// Epoll: a forward with a response-header mutation keeps its request snapshot in
+// send_buf until the exchange completes; the guarded redirect that follows on the same
+// connection needs it released.
+TEST(route, public_ordinary_source_guarded_redirect_after_mutated_forward_epoll) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+    PublicForwardThenGuardedRedirectSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    const RouteConfig* active = &resources.cfg;
+
+    // A redirect is built against the declared cleartext listener.
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, &declared_listener));
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 3);
+
+    REQUIRE(get_reply_starts_with(c, "/mutated", "HTTP/1.1 200 "));
+    CHECK(get_reply_starts_with(c, "/old", "HTTP/1.1 301 ", "Connection: close\r\n"));
+    close(c);
+    proxy.teardown();
 }
 
 TEST(route, public_ordinary_source_post_cl0_response_deadline_reuses_downstream_iouring) {

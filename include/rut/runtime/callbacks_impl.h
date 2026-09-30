@@ -7092,11 +7092,15 @@ inline void reserve_response_mutation_snapshot(Connection& conn) {
 }
 
 // A response byte is in hand, so the request will not be replayed: drop the
-// reused-upstream retry copy from send_buf. Idle send_buf must be empty (the
-// next deadline-owned forward's neutrality check requires it). Kept: a pipelined
-// stash (retry_req_send_len is then its offset; pipeline recovery restores the
-// stash and resets send_buf) and response-mutation values (needed until the
-// response headers are built; dropped at exchange completion below).
+// reused-upstream retry copy from send_buf. An idle connection must have an empty
+// send_buf: the neutrality check shared by every route that selects its forward or
+// local response after canonical route selection (deadline-owned forwards, guarded
+// redirects, request-framing routes; io_uring and epoll) closes the connection
+// otherwise. Kept: a pipelined stash (retry_req_send_len is then its offset;
+// pipeline recovery restores the stash and resets send_buf) and response-mutation
+// values (needed until the response headers are built). Completion-time release
+// (drop_response_mutation_snapshot, or on_response_sent / pipeline recovery) is what
+// guarantees the invariant; this is the early release for the common case.
 inline void drop_request_retry_snapshot(Connection& conn) {
     if (conn.pipeline_stash_len != 0) return;
     if (conn.retry_req_send_len != 0 && !conn.response_mutations_snapshotted) conn.send_buf.reset();
@@ -7104,7 +7108,8 @@ inline void drop_request_retry_snapshot(Connection& conn) {
 }
 
 // The proxied exchange is complete, so the response-mutation snapshot is dead.
-// A pipelined stash still owns send_buf until pipeline recovery.
+// A pipelined stash still owns send_buf until pipeline recovery; recovery reads
+// send_buf.data() + retry_req_send_len, so the length must keep covering it.
 inline void drop_response_mutation_snapshot(Connection& conn) {
     if (conn.pipeline_stash_len == 0) conn.send_buf.reset();
 }
@@ -13278,9 +13283,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
     if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
     // A response byte is now in hand, so the request will not be replayed. Drop
-    // the retry snapshot (marker and bytes) only when it is not also the offset
-    // to a stashed pipelined suffix; pipeline recovery clears that offset after
-    // copying.
+    // the retry snapshot (marker and bytes) unless send_buf is still owned: a
+    // stashed pipelined suffix keeps marker and bytes (the marker is its offset;
+    // pipeline recovery clears it after copying), and a live response-mutation
+    // snapshot loses only the marker (its bytes stay until exchange completion).
     drop_request_retry_snapshot(conn);
     record_reused_response_health();
     conn.resp_status = resp.status_code;
