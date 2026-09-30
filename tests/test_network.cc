@@ -9445,6 +9445,7 @@ struct ScopedTlsRawSendLoop {
         loop = new (storage) IoUringEventLoop();
         initialized = loop->init_slot_storage(capacity).has_value();
         if (initialized) {
+            test_initialize_slots(*loop, capacity);
             loop->timer.init();
             auto& backend = loop->backend;
             backend.sq_head = &sq_head;
@@ -36970,6 +36971,7 @@ struct StagedLocalSendFixture {
         if (loop_storage == MAP_FAILED) return false;
         loop = new (loop_storage) IoUringEventLoop();
         if (!loop->init_slot_storage(1).has_value()) return false;
+        test_initialize_slots(*loop, 1);
         loop->backend.sq_head = &sq_head;
         loop->backend.sq_tail = &sq_tail;
         loop->backend.sq_ring_mask = &sq_mask;
@@ -40576,8 +40578,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                             : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
@@ -78229,16 +78231,23 @@ TEST(connection_capacity, runtime_storage_bounds_and_backend_guards) {
         CHECK_EQ(iouring.connection_capacity, 32768u);
         CHECK_EQ(iouring.backend.send_state.size(), 32768u);
         CHECK_EQ(iouring.backend.upstream_send_state.size(), 32768u);
-        CHECK_EQ(iouring.conns[32767].fd, -1);
-        Connection* high = iouring.alloc_conn();
-        REQUIRE(high != nullptr);
-        CHECK_EQ(high->id, 32767u);
-        CHECK_EQ(high->fd, -1);
-        const u32 high_id = high->id;
-        iouring.free_conn(*high);
+        // Slots are lazy: nothing is constructed until first hand-out, and
+        // fresh ids come out in ascending order.
+        CHECK_EQ(iouring.slots_initialized, 0u);
+        CHECK_EQ(iouring.conns.constructed(), 0u);
+        Connection* first = iouring.alloc_conn();
+        REQUIRE(first != nullptr);
+        CHECK_EQ(first->id, 0u);
+        CHECK_EQ(first->fd, -1);
+        CHECK_EQ(iouring.slots_initialized, 1u);
+        const u32 first_id = first->id;
+        iouring.free_conn(*first);
         Connection* reused = iouring.alloc_conn();
         REQUIRE(reused != nullptr);
-        CHECK_EQ(reused->id, high_id);
+        CHECK_EQ(reused->id, first_id);
+        CHECK_EQ(iouring.slots_initialized, 1u);
+        // Backend-owned per-connection tables still span the full capacity.
+        const u32 high_id = 32767u;
         u32 sq_head = 0;
         u32 sq_tail = 0;
         u32 sq_mask = 3;
@@ -78360,6 +78369,8 @@ struct ScopedIoUringBodyPumpStorage {
         if (loop == nullptr && !construct()) return false;
         auto result = loop->init_slot_storage(capacity);
         initialized = result.has_value();
+        // These tests poke conns[i] without allocating; publish the slots.
+        if (initialized) test_initialize_slots(*loop, capacity);
         return initialized;
     }
 

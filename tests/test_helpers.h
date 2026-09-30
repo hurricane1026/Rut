@@ -1003,6 +1003,22 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     void dispatch(const IoEvent&) {}
 };
 
+// io_uring loops leave conns[] untouched until alloc_conn() hands a slot out
+// (see IoUringEventLoop::slots_initialized). Tests that poke conns[i] directly
+// without allocating call this first: it applies the same first-hand-out
+// initialisation to slots [slots_initialized, n) and advances the watermark.
+template <typename Loop>
+inline void test_initialize_slots(Loop& loop, u32 n) {
+    if (n > loop.connection_capacity) n = loop.connection_capacity;
+    loop.conns.construct_to(n);
+    for (u32 i = loop.slots_initialized; i < n; i++) {
+        loop.conns[i].reset();
+        loop.conns[i].id = i;
+        loop.conns[i].shard_id = static_cast<u8>(loop.shard_id);
+    }
+    if (n > loop.slots_initialized) loop.slots_initialized = n;
+}
+
 // ---- Real socket helpers ----
 
 #ifdef __APPLE__
