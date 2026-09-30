@@ -60,8 +60,9 @@ inline bool injected_iouring_submit_failure(u8 operation) noexcept {
 // Returns -1 to leave the step alone; any value >= 0 injects a fault:
 //   IdleTrimPidfdOpen / IdleTrimProbeAdvise: the probe step fails;
 //   IdleTrimBatchAdvise (arg = ranges in the chunk): only that many ranges are
-//     submitted to process_madvise (0: the whole call fails), so the return is
-//     short exactly as if an iovec further in were bad;
+//     submitted to process_madvise, so the return is short exactly as if an iovec
+//     further in were bad; 0 makes the call fail hard (-1, EPERM), -2 makes it
+//     fail softly (-1, EAGAIN);
 //   IdleTrimSliceAdvise (arg = slice address): that per-slice madvise fails.
 enum IdleTrimPoint : u8 {
     IdleTrimPidfdOpen = 1,
@@ -6076,7 +6077,13 @@ public:
     // (every page of every slice dirty, 0-7 busy threads: 0.35-0.55 us); a real
     // 10000-connection burst (1 shard, two slices each) took 0.4-1.5 ms per tick in
     // total, one tick in 20 took 3.0 ms (flush 2.5 ms, host interference); idle
-    // ticks cost ~2.4 us. So the added stall is ~1 ms typical per tick. Trim
+    // ticks cost ~2.4 us. So the added stall is ~1 ms typical per tick. The 1.5 ms
+    // budget is a target: the flush runs after the walk and cannot be interrupted, so
+    // the hard bound is the caps (2048 examinations plus up to 1536 ranges in two
+    // syscalls), realistically ~1.8 ms; host-interference outliers of ~3 ms were
+    // observed. A batch that fails hard (an errno other than EINTR/EAGAIN) finishes
+    // that tick per slice and then turns the feature off for the loop's life. The
+    // sweep is skipped while the shard is draining. Trim
     // throughput is therefore at most 512 connections per tick; since a list is revisited on each
     // of kIdleTrimAgeWindow (40) consecutive ticks, a burst that goes idle within one
     // second is trimmed completely when it is no larger than ~40 * 512 = 20480
@@ -6084,6 +6091,11 @@ public:
     // window closes is not trimmed for that idle period; its next request starts a
     // new one. The window (ages 5..44) closes 15 ticks before the default 60 s
     // keep-alive expiry; it is clipped for smaller timeouts (see sweep_idle_trim).
+    //
+    // Remaining proxied residual: a proxied connection's upstream receive slice is
+    // never trimmed, because idle_trim_upstream_slice_quiet vetoes on
+    // upstream_send_len, which stays stale after every proxied response (its recv
+    // and send slices do trim; measured plateau ~9.8 KB per proxied connection).
     //
     // Cost that remains: the release itself still has a residual cost. Measured (20000 idle
     // connections trimmed during a 12 s window, 2 shards, one load generator of 64 connections,
@@ -6102,7 +6114,8 @@ public:
     static constexpr u32 kIdleTrimMaxRanges = kIdleTrimMaxTrims * kIdleTrimSlicesPerConn;
     static constexpr u32 kIdleTrimIovChunk = 1024;        // kernel UIO_MAXIOV per call
     static constexpr u64 kIdleTrimBudgetNs = 1500000;     // examination + projected flush
-    static constexpr u64 kIdleTrimFlushNsPerRange = 700;  // upper end of the measured cost
+    static constexpr u64 kIdleTrimFlushNsPerRange = 900;  // upper end of the measured 0.25-0.9 us
+    static_assert(kIdleTrimMaxRanges <= 0xffffu, "idle_trim_first holds u16 range indices");
     u64 idle_trim_budget_ns = kIdleTrimBudgetNs;          // per-tick budget (tests)
 
     // Feature state: the pidfd of this process when process_madvise(MADV_DONTNEED)
@@ -6251,7 +6264,7 @@ public:
     // upstream side is quiescent (idle_trim_eligible already proved no upstream op
     // or cancel is outstanding, so no recv — including the direct-into-slice kind —
     // can still write it) and it holds no bytes. A bulk buffer swapped in for a
-    // large relay is refused by SlicePool::discard_bound; the relay slice is never
+    // large relay is refused by SlicePool::bound_slice_valid; the relay slice is never
     // touched and its presence (possible in-flight source) skips this slice too.
     [[nodiscard]] static bool idle_trim_upstream_slice_quiet(const Connection& c) {
         if (c.upstream_recv_slice == nullptr || c.upstream_relay_slice != nullptr ||
@@ -6292,10 +6305,13 @@ public:
     // bytes advised (the kernel stops at the first bad range and reports what it
     // did so far), or -1.
     long idle_trim_advise_batch(const struct iovec* iov, u32 n) {
+        ++idle_trim_batches;  // attempted calls, whether injected or real
         const i64 inject = detail::idle_trim_inject(detail::IdleTrimBatchAdvise, n);
-        if (inject == 0) return -1;
+        if (inject == 0 || inject == -2) {
+            errno = inject == 0 ? EPERM : EAGAIN;
+            return -1;
+        }
         if (inject > 0 && static_cast<u64>(inject) < n) n = static_cast<u32>(inject);
-        ++idle_trim_batches;
         return syscall(SYS_process_madvise, idle_trim_pidfd, iov, n, MADV_DONTNEED, 0u);
     }
 
@@ -6321,9 +6337,16 @@ public:
         idle_trim_first[queued] = static_cast<u16>(total);
         u32 conn = 0;       // connection owning range `i`
         u32 counted = ~0u;  // last connection added to idle_trim_conns
+        bool hard_failure = false;
         for (u32 base = 0; base < total; base += kIdleTrimIovChunk) {
             const u32 chunk = total - base < kIdleTrimIovChunk ? total - base : kIdleTrimIovChunk;
-            const long r = idle_trim_advise_batch(&idle_trim_iov[base], chunk);
+            long r = -1;
+            if (!hard_failure) {
+                r = idle_trim_advise_batch(&idle_trim_iov[base], chunk);
+                // EINTR / EAGAIN are transient: this tick falls back, the next tries
+                // the batch again. Anything else means the batch is refused for good.
+                if (r < 0 && errno != EINTR && errno != EAGAIN) hard_failure = true;
+            }
             // Whole ranges the kernel reports done; a partly advised range is redone.
             const u32 advised =
                 r > 0 ? static_cast<u32>(static_cast<u64>(r) / SlicePool::kSliceSize) : 0;
@@ -6341,6 +6364,15 @@ public:
                     ++idle_trim_conns;
                 }
             }
+        }
+        // The per-slice fallback for this tick is done (nothing queued is left
+        // un-advised). A batch that fails hard would otherwise be retried, and its
+        // remainder released per slice, every tick forever: that per-slice mode is
+        // exactly what the feature does not offer. Switch the feature off for the
+        // life of the loop.
+        if (hard_failure) {
+            ::close(idle_trim_pidfd);
+            idle_trim_pidfd = -1;
         }
     }
 

@@ -18,7 +18,7 @@ namespace rut {
 // io_uring loop returns the dirty pages of connections idle for ~5 s or more
 // without unbinding anything: it validates each bound slice with
 // bound_slice_valid() and releases the batch with process_madvise(MADV_DONTNEED)
-// (IoUringEventLoop::sweep_idle_trim; discard_bound() is the single-slice form).
+// (IoUringEventLoop::sweep_idle_trim).
 //
 // Memory strategy: reserve full VA range upfront (PROT_NONE — no physical
 // pages), then mprotect slices to PROT_READ|PROT_WRITE on first use. This
@@ -316,7 +316,7 @@ struct SlicePool {
     // True iff `ptr` is a slice of this pool that is currently BOUND (handed out
     // by alloc(), not yet free()d): slice-aligned, inside the ordinary slice area,
     // marked in use, not a bulk buffer. On true the whole kSliceSize range at `ptr`
-    // is the caller's to release (see discard_bound). Always false off Linux, where
+    // is the caller's to release (see below). Always false off Linux, where
     // MADV_DONTNEED need not zero the pages. Pure check; touches nothing.
     bool bound_slice_valid(const u8* ptr) const {
 #ifdef __linux__
@@ -331,26 +331,14 @@ struct SlicePool {
 #endif
     }
 
-    // Return the physical pages behind a slice that is currently BOUND (handed
-    // out by alloc(), not yet free()d) to the kernel, keeping it bound: the
-    // pointer, capacity and in_use_map entry are untouched and the next access
-    // simply re-faults zero pages. Only for a holder that knows the slice's bytes
-    // are dead and that no asynchronous reader/writer (an in-flight send or recv
-    // targeting it) remains — the pool cannot check either. Returns false, doing
-    // nothing, when bound_slice_valid() is false (a bulk buffer, a free or foreign
-    // pointer, a non-Linux target). Never touches free_stack/cached_count, so it
-    // cannot disturb the free path's zero-fill invariant: a trimmed slice is
-    // all-zero exactly like a freshly returned one. A caller that releases many
-    // slices at once validates each with bound_slice_valid() and advises the
-    // ranges itself (IoUringEventLoop batches them with process_madvise).
-    bool discard_bound(u8* ptr) {
-        if (!bound_slice_valid(ptr)) return false;
-#ifdef __linux__
-        return madvise(ptr, kSliceSize, MADV_DONTNEED) == 0;
-#else
-        return false;
-#endif
-    }
+    // Releasing a bound slice's physical pages (keeping it bound: pointer, capacity
+    // and in_use_map entry untouched, next access re-faults zero pages) is the
+    // caller's job once bound_slice_valid() holds, and only for a holder that knows
+    // the bytes are dead and that no asynchronous reader/writer (an in-flight send
+    // or recv targeting it) remains -- the pool can check neither. It never touches
+    // free_stack/cached_count, so the free path's zero-fill invariant holds: a
+    // released slice is all-zero exactly like a freshly returned one.
+    // IoUringEventLoop batches such ranges with process_madvise.
 
     // free() for a caller that knows nothing past the first `written` bytes
     // was ever written since the buffer was handed out. A bulk buffer then

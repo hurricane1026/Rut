@@ -17,6 +17,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
@@ -273,7 +274,7 @@ bool add_routes(TrimRig& r) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// SlicePool::discard_bound
+// SlicePool::bound_slice_valid
 // ---------------------------------------------------------------------------
 
 TEST(slice_pool_discard, returns_pages_of_a_bound_slice_and_keeps_it_bound) {
@@ -284,10 +285,12 @@ TEST(slice_pool_discard, returns_pages_of_a_bound_slice_and_keeps_it_bound) {
     __builtin_memset(s, 0x5a, SlicePool::kSliceSize);
     CHECK_EQ(resident_pages(s, SlicePool::kSliceSize), 4u);
     const u32 avail = pool.available();
-    CHECK(pool.discard_bound(s));
+    CHECK(pool.bound_slice_valid(s));
+    CHECK_EQ(madvise(s, SlicePool::kSliceSize, MADV_DONTNEED), 0);
     CHECK_EQ(resident_pages(s, SlicePool::kSliceSize), 0u);
     for (u32 i = 0; i < SlicePool::kSliceSize; i += 509) CHECK_EQ(s[i], 0u);
     CHECK_EQ(pool.available(), avail);  // still bound: free stack untouched
+    CHECK(pool.bound_slice_valid(s));
     // The slice stays fully usable and frees normally.
     s[7] = 1;
     pool.free(s);
@@ -305,15 +308,16 @@ TEST(slice_pool_discard, refuses_free_misaligned_foreign_and_bulk_pointers) {
     u8* s = pool.alloc();
     REQUIRE(s != nullptr);
     __builtin_memset(s, 1, SlicePool::kSliceSize);
-    CHECK(!pool.discard_bound(s + 16));  // not slice-aligned
-    CHECK(!pool.discard_bound(nullptr));
+    CHECK(pool.bound_slice_valid(s));
+    CHECK(!pool.bound_slice_valid(s + 16));  // not slice-aligned
+    CHECK(!pool.bound_slice_valid(nullptr));
     u8 local[8];
-    CHECK(!pool.discard_bound(local));  // foreign
+    CHECK(!pool.bound_slice_valid(local));  // foreign
     pool.free(s);
-    CHECK(!pool.discard_bound(s));  // free slice: not bound
+    CHECK(!pool.bound_slice_valid(s));  // free slice: not bound
     u8* bulk = pool.alloc_bulk();
     REQUIRE(bulk != nullptr);
-    CHECK(!pool.discard_bound(bulk));
+    CHECK(!pool.bound_slice_valid(bulk));
     pool.free(bulk);
     pool.destroy();
 }
@@ -1148,7 +1152,7 @@ TEST(iouring_idle_trim, batched_tick_advises_everything_in_one_call_up_to_the_ch
 TEST(iouring_idle_trim, short_batch_return_falls_back_to_per_slice_for_the_remainder) {
     InjectGuard guard;
     constexpr u32 kConns = 300;                       // 600 ranges: one chunk
-    for (i64 allowed : {i64{100}, i64{1}, i64{0}}) {  // short at 100, after 1, nothing at all
+    for (i64 allowed : {i64{100}, i64{1}, i64{-2}}) {  // short at 100, after 1, soft failure
         TrimRig r;
         if (!r.init(kConns + 8, false)) SKIP("io_uring or process_madvise unavailable");
         r.loop->idle_trim_budget_ns = ~0ull >> 1;
@@ -1164,12 +1168,92 @@ TEST(iouring_idle_trim, short_batch_return_falls_back_to_per_slice_for_the_remai
         // Everything was advised, the tail per slice; every connection counted once.
         CHECK_EQ(r.loop->idle_trim_conns, static_cast<u64>(kConns));
         CHECK_EQ(r.loop->idle_trim_madvise, 2ull * kConns);
-        CHECK_EQ(r.loop->idle_trim_fallback, 2ull * kConns - static_cast<u64>(allowed));
-        CHECK_EQ(r.loop->idle_trim_batches, allowed == 0 ? 0u : 1u);
+        CHECK_EQ(r.loop->idle_trim_fallback,
+                 2ull * kConns - static_cast<u64>(allowed < 0 ? 0 : allowed));
+        CHECK_EQ(r.loop->idle_trim_batches, 1u);  // attempted calls, injected or real
+        CHECK(r.loop->idle_trim_pidfd >= 0);      // a soft failure keeps the feature on
         CHECK_EQ(resident_pages(first->recv_slice, SlicePool::kSliceSize), 0u);
         CHECK_EQ(resident_pages(lastc->send_slice, SlicePool::kSliceSize), 0u);
         g_batch_allowed = -1;
     }
+}
+
+TEST(iouring_idle_trim, short_return_inside_the_second_chunk_advises_the_tail_per_slice) {
+    InjectGuard guard;
+    constexpr u32 kConns = IoUringEventLoop::kIdleTrimMaxTrims;
+    constexpr u32 kChunk = IoUringEventLoop::kIdleTrimIovChunk;
+    constexpr u32 kTotal = kConns * IoUringEventLoop::kIdleTrimSlicesPerConn;
+    static_assert(kTotal > kChunk + 10);
+    TrimRig r;
+    if (!r.init(kConns + 8, false)) SKIP("io_uring or process_madvise unavailable");
+    r.loop->idle_trim_budget_ns = ~0ull >> 1;
+    Connection* c0 = nullptr;
+    Connection* clast = nullptr;
+    for (u32 i = 0; i < kConns; i++) {
+        clast = stage_idle_with_upstream(r, 100000 + static_cast<i32>(i));
+        REQUIRE(clast != nullptr);
+        if (c0 == nullptr) c0 = clast;
+    }
+    // Only 10 ranges of every chunk are accepted: the first chunk is short too, and
+    // the second chunk's remainder starts at range kChunk + 10.
+    g_batch_allowed = 10;
+    CHECK_EQ(tick_to_first_trim(r), static_cast<u64>(kConns));
+    CHECK_EQ(r.loop->idle_trim_batches, 2u);
+    CHECK_EQ(r.loop->idle_trim_conns, static_cast<u64>(kConns));
+    CHECK_EQ(r.loop->idle_trim_madvise, static_cast<u64>(kTotal));
+    CHECK_EQ(r.loop->idle_trim_fallback, static_cast<u64>(kTotal - 20));
+    // The last connection's ranges are in the second chunk's per-slice remainder.
+    CHECK_EQ(resident_pages(clast->recv_slice, SlicePool::kSliceSize), 0u);
+    CHECK_EQ(resident_pages(clast->send_slice, SlicePool::kSliceSize), 0u);
+    CHECK_EQ(resident_pages(clast->upstream_recv_slice, SlicePool::kSliceSize), 0u);
+    CHECK_EQ(resident_pages(c0->recv_slice, SlicePool::kSliceSize), 0u);
+}
+
+TEST(iouring_idle_trim, hard_batch_failure_finishes_the_tick_then_turns_the_feature_off) {
+    InjectGuard guard;
+    TrimRig r;
+    constexpr u32 kConns = 8;
+    if (!r.init(kConns + 8, false)) SKIP("io_uring or process_madvise unavailable");
+    auto& loop = *r.loop;
+    Connection* c[kConns];
+    for (u32 i = 0; i < kConns; i++) {
+        c[i] = stage_idle(r, 100000 + static_cast<i32>(i));
+        REQUIRE(c[i] != nullptr);
+    }
+    g_batch_allowed = 0;  // process_madvise fails hard (EPERM)
+    tick_to_first_trim(r);
+    // That tick's queue was still released, per slice...
+    CHECK_EQ(loop.idle_trim_conns, static_cast<u64>(kConns));
+    CHECK_EQ(loop.idle_trim_madvise, 2ull * kConns);
+    CHECK_EQ(loop.idle_trim_fallback, 2ull * kConns);
+    CHECK_EQ(resident_pages(c[3]->recv_slice, SlicePool::kSliceSize), 0u);
+    // ...and the feature is now off for good: nothing is examined or written again.
+    CHECK_EQ(loop.idle_trim_pidfd, -1);
+    g_batch_allowed = -1;
+    const u64 batches = loop.idle_trim_batches;
+    const u64 examined = loop.idle_trim_examined;
+    loop.timer.refresh(c[0], loop.keepalive_timeout);
+    c[0]->recv_slice[0] = 1;
+    for (u32 t = 0; t < 12; t++) r.tick();
+    CHECK_EQ(loop.idle_trim_examined, examined);
+    CHECK_EQ(loop.idle_trim_batches, batches);
+    CHECK(!c[0]->idle_trim_examined);
+    CHECK_EQ(resident_pages(c[0]->recv_slice, SlicePool::kSliceSize), 1u);
+    // A transient failure (EAGAIN) is retried on the next tick instead.
+    TrimRig r2;
+    if (!r2.init(kConns + 8, false)) SKIP("io_uring or process_madvise unavailable");
+    Connection* d = stage_idle(r2, 100000);
+    REQUIRE(d != nullptr);
+    g_batch_allowed = -2;
+    tick_to_first_trim(r2);
+    CHECK(r2.loop->idle_trim_pidfd >= 0);
+    g_batch_allowed = -1;
+    r2.loop->timer.refresh(d, r2.loop->keepalive_timeout);
+    d->recv_slice[0] = 1;
+    const u64 b2 = r2.loop->idle_trim_batches;
+    for (u32 t = 0; t < kMinIdleTicks + 1; t++) r2.tick();
+    CHECK_EQ(r2.loop->idle_trim_batches, b2 + 1);
+    CHECK_EQ(resident_pages(d->recv_slice, SlicePool::kSliceSize), 0u);
 }
 
 TEST(iouring_idle_trim, connection_counts_only_if_a_slice_was_really_advised) {
@@ -1182,10 +1266,10 @@ TEST(iouring_idle_trim, connection_counts_only_if_a_slice_was_really_advised) {
         c[i] = stage_idle(r, 100000 + static_cast<i32>(i));
         REQUIRE(c[i] != nullptr);
     }
-    // The batch takes nothing; connection 1 loses both slices to a failing per-slice
+    // The batch fails softly; connection 1 loses both slices to a failing per-slice
     // madvise (not counted, its pages stay), connection 4 only its send slice (still
     // counted: one of its slices was advised).
-    g_batch_allowed = 0;
+    g_batch_allowed = -2;
     g_fail_slice_a = c[1]->recv_slice;
     g_fail_slice_b = c[1]->send_slice;
     tick_to_first_trim(r);
@@ -1259,6 +1343,118 @@ TEST(iouring_idle_trim, init_probes_once_and_shutdown_closes_the_pidfd) {
     CHECK_EQ(r.loop->idle_trim_pidfd, -1);
     CHECK_EQ(fcntl(fd2, F_GETFD), -1);
     CHECK_EQ(errno, EBADF);
+}
+
+namespace {
+
+constexpr char kUpstreamBody[] = "proxied-body-0123456789-abcdefghijklmnopqrstuvwxyz";
+
+// Minimal keep-alive HTTP upstream on its own thread: answers every request with a
+// fixed body and counts the requests it saw.
+struct TestUpstream {
+    i32 lfd = -1;
+    u16 port = 0;
+    volatile u32 requests = 0;
+    volatile bool stop = false;
+    pthread_t thread{};
+    bool started = false;
+
+    static void* run(void* arg) {
+        auto* u = static_cast<TestUpstream*>(arg);
+        i32 conns[8];
+        u32 n = 0;
+        static const char kResp[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 50\r\nConnection: keep-alive\r\n\r\n";
+        static_assert(sizeof(kUpstreamBody) - 1 == 50);
+        while (!u->stop) {
+            pollfd pfds[9];
+            pfds[0] = {u->lfd, POLLIN, 0};
+            for (u32 i = 0; i < n; i++) pfds[1 + i] = {conns[i], POLLIN, 0};
+            const u32 polled = n;
+            if (poll(pfds, 1 + polled, 50) <= 0) continue;
+            // Service the connections that were polled (their revents are valid),
+            // newest index first so dropping one does not shift an unserviced one.
+            for (u32 i = polled; i-- != 0;) {
+                bool drop = false;
+                if ((pfds[1 + i].revents & (POLLIN | POLLHUP)) != 0) {
+                    char buf[4096];
+                    const ssize_t got = recv(conns[i], buf, sizeof(buf), MSG_DONTWAIT);
+                    if (got <= 0) {
+                        drop = true;
+                    } else {
+                        // One request per recv in this test (no pipelining).
+                        __atomic_add_fetch(&u->requests, 1u, __ATOMIC_SEQ_CST);
+                        send(conns[i], kResp, sizeof(kResp) - 1, MSG_NOSIGNAL);
+                        send(conns[i], kUpstreamBody, sizeof(kUpstreamBody) - 1, MSG_NOSIGNAL);
+                    }
+                }
+                if (drop) {
+                    ::close(conns[i]);
+                    conns[i] = conns[--n];
+                }
+            }
+            if ((pfds[0].revents & POLLIN) != 0 && n < 8) {
+                const i32 c = accept(u->lfd, nullptr, nullptr);
+                if (c >= 0) conns[n++] = c;
+            }
+        }
+        for (u32 i = 0; i < n; i++) ::close(conns[i]);
+        return nullptr;
+    }
+
+    bool start() {
+        auto l = create_listen_socket(0);
+        if (!l.has_value()) return false;
+        lfd = l.value();
+        port = get_port(lfd);
+        started = pthread_create(&thread, nullptr, &run, this) == 0;
+        return started;
+    }
+
+    ~TestUpstream() {
+        stop = true;
+        if (started) pthread_join(thread, nullptr);
+        if (lfd >= 0) ::close(lfd);
+    }
+};
+
+}  // namespace
+
+TEST(iouring_idle_trim, proxied_connection_is_trimmed_and_serves_the_next_proxied_request) {
+    TestUpstream up;
+    REQUIRE(up.start());
+    TrimRig r;
+    if (!r.init(8, true)) SKIP("io_uring or process_madvise unavailable");
+    REQUIRE(add_routes(r));
+    auto id = r.cfg.add_upstream("b", 0x7F000001, up.port);
+    REQUIRE(id.has_value());
+    REQUIRE(r.cfg.add_proxy("/p", 0, id.value()));
+    const char kReqProxy[] = "GET /p HTTP/1.1\r\nHost: x\r\n\r\n";
+    const i32 cli = r.connect_client();
+    REQUIRE_GE(cli, 0);
+    std::string first;
+    REQUIRE(r.exchange(cli, kReqProxy, first));
+    CHECK(first.compare(0, 12, "HTTP/1.1 200") == 0);
+    CHECK_EQ(first.substr(first.size() - (sizeof(kUpstreamBody) - 1)), std::string(kUpstreamBody));
+    CHECK_EQ(up.requests, 1u);
+    REQUIRE(r.wait_idle());
+    Connection* c = r.live_conn();
+    REQUIRE(c != nullptr);
+    u8* const recv_slice = c->recv_slice;
+    u8* const send_slice = c->send_slice;
+    CHECK_GE(resident_pages(recv_slice, SlicePool::kSliceSize), 1u);
+    for (u32 t = 0; t < 12 && r.loop->idle_trim_conns == 0; t++) r.tick();
+    CHECK_EQ(r.loop->idle_trim_conns, 1u);
+    CHECK_EQ(resident_pages(recv_slice, SlicePool::kSliceSize), 0u);
+    CHECK_EQ(resident_pages(send_slice, SlicePool::kSliceSize), 0u);
+    CHECK(c->recv_slice == recv_slice && c->send_slice == send_slice);  // still bound
+    // The next proxied request on the same connection is served byte-exact, and the
+    // upstream saw exactly one more request.
+    std::string second;
+    REQUIRE(r.exchange(cli, kReqProxy, second));
+    CHECK(second == first);
+    CHECK_EQ(up.requests, 2u);
+    ::close(cli);
 }
 
 int main(int argc, char** argv) {
