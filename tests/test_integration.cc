@@ -47,6 +47,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 
 namespace rut {
 
@@ -5105,6 +5106,71 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     backend.shutdown();
 }
 
+// Many downstream peers closing at once: every armed multishot recv completes
+// with a terminal EOF CQE in the same CQ burst. A single wait() hands out at most
+// kMaxEventsPerWait events, so the terminal-CQE quarantine windows recorded for one
+// harvest stay live across several wait() calls and exceed one batch. Regression:
+// the fixed 256-slot window inventory overflowed and the shard died with EPROTO.
+TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
+    // Fails on the old 256-slot inventory from 257 terminals up; 600 fds fit the
+    // default 1024 soft limit.
+    constexpr u32 kPeers = 300;
+    IoUringBackend backend;
+    if (!backend.init(0, -1, kPeers)) SKIP("io_uring unavailable");
+
+    auto conns = std::make_unique<Connection[]>(kPeers);
+    auto local = std::make_unique<i32[]>(kPeers);
+    auto peer = std::make_unique<i32[]>(kPeers);
+    u32 made = 0;
+    for (; made < kPeers; ++made) {
+        i32 fds[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) != 0) break;
+        local[made] = fds[0];
+        peer[made] = fds[1];
+        conns[made].reset();
+        conns[made].id = made;
+        conns[made].fd = fds[0];
+    }
+
+    IoEvent events[kMaxEventsPerWait]{};
+    u32 armed = 0;
+    u32 peers_closed = 0;
+    u32 eofs = 0;
+    if (made == kPeers) {
+        for (; armed < kPeers; ++armed)
+            if (!backend.add_recv(local[armed], armed)) break;
+    }
+    // Submit the recvs without waiting for the 1s timerfd tick, then close all
+    // peers back to back so every terminal EOF lands in one CQ burst.
+    const bool ready = armed == kPeers && backend.flush_pending_nonblocking();
+    if (ready) {
+        for (; peers_closed < kPeers; ++peers_closed) close(peer[peers_closed]);
+        // The default 1s periodic timerfd wakes wait(), so the attempt cap is a
+        // hang guard; a healthy run drains all terminals in a handful of waits.
+        for (u32 attempt = 0; attempt < 64 && eofs < kPeers && backend.failure_code() == 0;
+             ++attempt) {
+            const u32 n = backend.wait(events, kMaxEventsPerWait, conns.get(), kPeers);
+            for (u32 i = 0; i < n; ++i)
+                if (events[i].type == IoEventType::Recv && events[i].result == 0 &&
+                    events[i].more == 0)
+                    ++eofs;
+        }
+    }
+    const i32 failure = backend.failure_code();
+
+    // Single exit path: release every fd and the backend whatever happened above.
+    for (u32 i = peers_closed; i < made; ++i) close(peer[i]);
+    for (u32 i = 0; i < made; ++i) close(local[i]);
+    backend.shutdown();
+
+    // Too-low RLIMIT_NOFILE: skip rather than shrink the burst.
+    if (made < kPeers) SKIP("RLIMIT_NOFILE too low for the close burst");
+    REQUIRE_EQ(armed, kPeers);
+    REQUIRE(ready);
+    CHECK_EQ(failure, 0);
+    CHECK_EQ(eofs, kPeers);
+}
+
 // Shrink both ends' socket buffers and write directly until EAGAIN, so a
 // subsequently submitted io_uring send on `fd` has nowhere to go and stays pending
 // (a CQE only arrives on cancel or once the peer drains). Returns bytes pre-filled.
@@ -7383,6 +7449,87 @@ TEST(shard, serves_http1_cleartext_iouring_cross_thread) {
     CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
 }
 }  // namespace
+
+// Multishot accept ends (without F_MORE) when the kernel hits EMFILE. The shard
+// must re-arm it on a later timer tick instead of silently never accepting again.
+// Uses the real kernel: lower the soft RLIMIT_NOFILE to the lowest free fd so the
+// next accept fails with EMFILE, connect, restore, and expect the connection that
+// was queued during exhaustion and a fresh one to both be served.
+TEST(shard, iouring_accept_rearms_after_emfile) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    struct rlimit saved{};
+    REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &saved), 0);
+    struct Guard {
+        Shard<IoUringEventLoop>& shard;
+        i32 listen_fd;
+        struct rlimit saved;
+        i32 fds[2] = {-1, -1};
+        ~Guard() {
+            setrlimit(RLIMIT_NOFILE, &saved);
+            for (i32 fd : fds)
+                if (fd >= 0) close(fd);
+            shard.stop();
+            shard.join();
+            shard.shutdown();
+            close(listen_fd);
+        }
+    } guard{shard, lfd, saved};
+    const u16 port = get_port(lfd);
+
+    // Pre-create both client sockets: no fd allocation is possible while limited.
+    for (i32& fd : guard.fds) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(fd >= 0);
+        set_socket_timeouts(fd, 4);
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = __builtin_bswap16(port);
+    addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
+
+    // The kernel snapshots RLIMIT_NOFILE when an accept SQE is prepared, so the
+    // limit must be lowered before the shard arms its multishot accept. Lowest
+    // free fd number == new soft limit: any further fd allocation fails.
+    const i32 probe = dup(lfd);
+    REQUIRE(probe >= 0);
+    close(probe);
+    struct rlimit tight = saved;
+    tight.rlim_cur = static_cast<rlim_t>(probe);
+    REQUIRE_EQ(setrlimit(RLIMIT_NOFILE, &tight), 0);
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(100000);  // let the initial multishot accept arm under the tight limit
+
+    // The kernel completes the handshake into the backlog; the shard's accept
+    // fails with -EMFILE and the multishot request terminates.
+    REQUIRE_EQ(connect(guard.fds[0], reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0);
+    // Prove the EMFILE path ran: while the limit is still tight the connection
+    // must NOT be served. (If the accept were armed late, or succeeded, this
+    // would be answered and the test would not be exercising re-arm at all.)
+    REQUIRE(send_all(guard.fds[0], HTTP_REQ, HTTP_REQ_LEN));
+    char buf[1024];
+    CHECK_EQ(recv_timeout(guard.fds[0], buf, sizeof(buf), 300), -EAGAIN);
+    REQUIRE_EQ(setrlimit(RLIMIT_NOFILE, &saved), 0);
+
+    // Re-armed on the next 1s tick: the queued connection is accepted and served.
+    i32 n = recv_timeout(guard.fds[0], buf, sizeof(buf), 4000);
+    REQUIRE_GT(n, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+
+    // And a fresh connection afterwards is accepted too (accept stays armed).
+    REQUIRE_EQ(connect(guard.fds[1], reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0);
+    REQUIRE(send_all(guard.fds[1], HTTP_REQ, HTTP_REQ_LEN));
+    n = recv_timeout(guard.fds[1], buf, sizeof(buf), 4000);
+    REQUIRE_GT(n, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+}
 
 // HTTP/2 over io_uring uses the identical callbacks_h2.h serving path as epoll;
 // only the I/O submission differs. Skipped where io_uring async socket ops don't

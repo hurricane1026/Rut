@@ -1254,10 +1254,7 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
         c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
         identity_method != static_cast<u8>(LogHttpMethod::Get) ||
         identity_route_method != kRouteMethodGet ||
-        !(c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) ||
-          (c.pipeline_stash_len == 0 &&
-           c.request_policy_id ==
-               static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab))) ||
+        !bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) ||
         proof.request_policy_id != c.request_policy_id || proof.handler_generation == 0 ||
         proof.handler_generation != c.handler_gen || proof.route_index >= cfg->route_count ||
         proof.route_fn == nullptr || proof.raw_header_end == 0 || proof.raw_content_length != 0 ||
@@ -1374,6 +1371,18 @@ inline bool response_read_deadline_tls_http11_engine_is_stable(const Connection&
            c.h2 == nullptr;
 }
 
+// The TLS bridge carries the same two depth-zero GET layouts as plaintext: an
+// exact request, or a coalesced request 1 whose pipelined successor sits in
+// the stash (re-proved in full by the phase-1 stash predicate).
+inline bool response_read_deadline_tls_get_layout_is_stable(const Connection& c,
+                                                            bool allow_retired_episode) {
+    return response_read_deadline_exact_get_layout_is_stable(c) ||
+           (c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
+            c.pipeline_stash_len != 0 &&
+            response_read_deadline_coalesced_get_phase1_stash_is_stable(
+                c, c.response_read_deadline_upload, allow_retired_episode));
+}
+
 // The end-to-end TLS bridge is limited to the two admitted depth-zero GET
 // request policies. Raw TLS send/receive ownership remains independent and is
 // checked by the phase-specific transport predicates.
@@ -1390,7 +1399,7 @@ inline bool response_read_deadline_tls_complete_get_profile_is_stable(const Conn
                c.response_read_deadline_buffering) &&
            c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
            c.response_read_deadline_route_method == kRouteMethodGet &&
-           response_read_deadline_exact_get_layout_is_stable(c) &&
+           response_read_deadline_tls_get_layout_is_stable(c, /*allow_retired_episode=*/true) &&
            bodyless_get_complete_content_length_request_policy_is_admitted(c.request_policy_id) &&
            c.response_read_deadline_upload.request_policy_id == c.request_policy_id;
 }
@@ -1766,7 +1775,12 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
     const bool current_successor = http1_pipeline_request_is_current_successor(c);
     const bool depth0_id3 = id3 && !current_successor && exact_get;
-    if (id3 && !depth0_id3 && !current_successor) return false;
+    // A coalesced request 1 keeps ID3 once its successor moved to the stash;
+    // the stash predicate re-proves the whole phase-1 identity.
+    const bool coalesced_id3 = id3 && !current_successor && c.pipeline_stash_len != 0 &&
+                               response_read_deadline_coalesced_get_phase1_stash_is_stable(
+                                   c, c.response_read_deadline_upload);
+    if (id3 && !depth0_id3 && !coalesced_id3 && !current_successor) return false;
     const bool id1_materialized =
         exact_get && c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
         !response_read_deadline_exact_get_id1_legacy_proof_is_neutral(
@@ -1815,8 +1829,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
         forward_response_buffering_uses_content_length_machinery(
             c.response_read_deadline_buffering) &&
         c.response_read_deadline_method == static_cast<u8>(LogHttpMethod::Get) &&
-        c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
-        c.pipeline_stash_len == 0 && response_read_deadline_tls_http11_engine_is_stable(c) &&
+        response_read_deadline_tls_get_layout_is_stable(c, /*allow_retired_episode=*/false) &&
+        response_read_deadline_tls_http11_engine_is_stable(c) &&
         (c.response_read_deadline_post_commit_phase == ResponseReadDeadlinePostCommitPhase::None ||
          response_read_deadline_tls_complete_get_profile_is_stable(c));
     const bool common_request =
@@ -2310,7 +2324,10 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
     const bool current_successor = http1_pipeline_request_is_current_successor(c);
     const bool depth0_id3 = id3 && !current_successor && exact_get;
-    if (id3 && !depth0_id3 && !current_successor) return false;
+    const bool coalesced_id3 = id3 && !current_successor && c.pipeline_stash_len != 0 &&
+                               response_read_deadline_coalesced_get_phase1_stash_is_stable(
+                                   c, c.response_read_deadline_upload, retired_buffered_send);
+    if (id3 && !depth0_id3 && !coalesced_id3 && !current_successor) return false;
     if (c.pipeline_stash_len != 0 && !response_read_deadline_coalesced_get_phase1_stash_is_stable(
                                          c, c.response_read_deadline_upload, retired_buffered_send))
         return false;
