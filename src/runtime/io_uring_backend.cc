@@ -210,11 +210,15 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     timer_fd = -1;
     timer_read_armed = false;
     fatal_error.store(0, std::memory_order_relaxed);
-    // mmap-zeroed storage skips member initializers; the window array is not
-    // allocated yet, so there is nothing to clear.
+    // mmap-zeroed storage skips member initializers; the window array and side
+    // table are not allocated yet, so there is nothing to clear.
     downstream_recv_terminal_windows = nullptr;
+    downstream_recv_terminal_slots = nullptr;
     downstream_recv_terminal_window_capacity = 0;
+    downstream_recv_terminal_window_start = 0;
     downstream_recv_terminal_window_count = 0;
+    downstream_recv_terminal_slot_capacity = 0;
+    downstream_recv_terminal_out_of_range_windows = 0;
     reset_downstream_recv_wait_state();
     // Setup io_uring with desired flags
     struct io_uring_params params;
@@ -293,8 +297,13 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     cq_ring_mask = reinterpret_cast<u32*>(cq_base + params.cq_off.ring_mask);
     cq_entries = reinterpret_cast<io_uring_cqe*>(cq_base + params.cq_off.cqes);
 
-    // Terminal-recv quarantine inventory (see the header): sized for the worst
-    // case of one window per CQ slot, demand-paged so an idle shard pays nothing.
+    // Terminal-recv quarantine inventory (see the header): a FIFO ring sized for
+    // the worst case of one window per CQ slot, plus an 8-byte-per-connection
+    // side table.  Both are demand-paged so an idle shard pays nothing.
+    if ((cq_ring_entries & (cq_ring_entries - 1u)) != 0 || cq_ring_entries == 0) {
+        shutdown();
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
+    }
     const u64 windows_sz = static_cast<u64>(cq_ring_entries) * sizeof(DownstreamRecvTerminalWindow);
     void* windows_mem =
         mmap(nullptr, windows_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -305,6 +314,16 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     }
     downstream_recv_terminal_windows = static_cast<DownstreamRecvTerminalWindow*>(windows_mem);
     downstream_recv_terminal_window_capacity = cq_ring_entries;
+    const u64 slots_sz = static_cast<u64>(connection_capacity) * sizeof(DownstreamRecvTerminalSlot);
+    void* slots_mem =
+        mmap(nullptr, slots_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (slots_mem == MAP_FAILED) {
+        i32 err = errno;
+        shutdown();
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
+    }
+    downstream_recv_terminal_slots = static_cast<DownstreamRecvTerminalSlot*>(slots_mem);
+    downstream_recv_terminal_slot_capacity = connection_capacity;
 
     // Setup provided buffer ring for zero-copy recv
     TRY_VOID(setup_buf_ring());
@@ -1211,33 +1230,63 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         return 0;
     }
 
-    auto terminal_window_index = [&](u64 user_data) -> i32 {
+    // Quarantine lookup, O(1).  Returns 0 and the frozen tail when `user_data`
+    // is inside a live window, -1 when it is not, -2 on a corrupt front window.
+    // Only an aux-0 downstream Recv token can own a window, so every other CQE
+    // skips the table.  A window whose tail equals head has reached its
+    // boundary and no longer quarantines anything.
+    const u32 ring_mask = downstream_recv_terminal_window_capacity - 1u;
+    auto terminal_window_lookup = [&](u64 user_data, u32& window_tail) -> i32 {
+        // Steady state: no live window, so never touch the side table.
+        if (downstream_recv_terminal_window_count == 0) return -1;
+        if (downstream_recv_terminal_window_count != 0 &&
+            downstream_recv_terminal_windows[downstream_recv_terminal_window_start].tail_exclusive -
+                    head >
+                cq_ring_entries)
+            return -2;
+        u32 token_conn = 0;
+        IoEventType token_type = IoEventType::Count;
+        u32 token_aux = 0;
+        decode_user_data(user_data, token_conn, token_type, token_aux);
+        if (token_type != IoEventType::Recv || token_aux != 0) return -1;
+        if (token_conn < downstream_recv_terminal_slot_capacity) {
+            const auto& slot = downstream_recv_terminal_slots[token_conn];
+            if (slot.live == 0 || slot.tail_exclusive == head) return -1;
+            window_tail = slot.tail_exclusive;
+            return 0;
+        }
+        if (downstream_recv_terminal_out_of_range_windows == 0) return -1;
         for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
-            const auto& window = downstream_recv_terminal_windows[i];
-            if (window.tail_exclusive - head > cq_ring_entries) return -2;
-            if (window.user_data == user_data && head != window.tail_exclusive)
-                return static_cast<i32>(i);
+            const auto& window =
+                downstream_recv_terminal_windows[(downstream_recv_terminal_window_start + i) &
+                                                 ring_mask];
+            if (window.user_data == user_data && window.tail_exclusive != head) {
+                window_tail = window.tail_exclusive;
+                return 0;
+            }
         }
         return -1;
     };
     auto expire_terminal_windows = [&]() {
         bool expired = false;
-        u32 retained = 0;
-        for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
-            const auto window = downstream_recv_terminal_windows[i];
+        while (downstream_recv_terminal_window_count != 0) {
+            auto& window = downstream_recv_terminal_windows[downstream_recv_terminal_window_start];
             if (window.tail_exclusive - head > cq_ring_entries) {
                 protocol_failure();
                 return false;
             }
-            if (window.tail_exclusive == head) {
-                expired = true;
-                continue;
-            }
-            downstream_recv_terminal_windows[retained++] = window;
+            if (window.tail_exclusive != head) break;
+            const u32 conn_id = terminal_window_conn_id(window.user_data);
+            if (conn_id < downstream_recv_terminal_slot_capacity)
+                downstream_recv_terminal_slots[conn_id] = {};
+            else if (downstream_recv_terminal_out_of_range_windows != 0)
+                downstream_recv_terminal_out_of_range_windows--;
+            window = {};
+            downstream_recv_terminal_window_start =
+                (downstream_recv_terminal_window_start + 1u) & ring_mask;
+            downstream_recv_terminal_window_count--;
+            expired = true;
         }
-        for (u32 i = retained; i < downstream_recv_terminal_window_count; i++)
-            downstream_recv_terminal_windows[i] = {};
-        downstream_recv_terminal_window_count = retained;
         // Reaching a frozen tail is an event-loop boundary.  Never classify a
         // CQE appended after it in the same wait invocation.
         return !expired;
@@ -1254,8 +1303,22 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             protocol_failure();
             return false;
         }
-        downstream_recv_terminal_windows[downstream_recv_terminal_window_count++] = {
-            user_data, tail_exclusive};
+        const u32 conn_id = terminal_window_conn_id(user_data);
+        if (conn_id < downstream_recv_terminal_slot_capacity) {
+            auto& slot = downstream_recv_terminal_slots[conn_id];
+            // One live window per token: a duplicate inside the window is
+            // quarantined, and one after it only arrives once it has expired.
+            if (slot.live != 0) {
+                protocol_failure();
+                return false;
+            }
+            slot = {tail_exclusive, 1};
+        } else {
+            downstream_recv_terminal_out_of_range_windows++;
+        }
+        downstream_recv_terminal_windows[(downstream_recv_terminal_window_start +
+                                          downstream_recv_terminal_window_count++) &
+                                         ring_mask] = {user_data, tail_exclusive};
         return true;
     };
 
@@ -1277,13 +1340,13 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             IoEventType deferred_type = IoEventType::Count;
             decode_user_data(
                 deferred.user_data, deferred_conn, deferred_type, deferred_aux, deferred_episode);
-            const i32 window = terminal_window_index(deferred.user_data);
+            u32 window_tail = 0;
+            const i32 window = terminal_window_lookup(deferred.user_data, window_tail);
             if (deferred.user_data != deferred_downstream_recv.user_data ||
                 deferred_type != IoEventType::Recv || deferred_aux != 0 || deferred.res <= 0 ||
                 !valid_positive_downstream_buffer(deferred) || window == -2 ||
                 (deferred_downstream_recv.prior_terminal &&
-                 (window < 0 || downstream_recv_terminal_windows[window].tail_exclusive !=
-                                    deferred_downstream_recv.frozen_tail)) ||
+                 (window < 0 || window_tail != deferred_downstream_recv.frozen_tail)) ||
                 (!deferred_downstream_recv.prior_terminal && window >= 0))
                 protocol_failure();
         }
@@ -1362,7 +1425,9 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             protocol_failure();
             break;
         }
-        const i32 quarantined_window = terminal_window_index(cqe->user_data);
+        u32 quarantined_tail = 0;
+        const i32 quarantined_window =
+            downstream_recv_target ? terminal_window_lookup(cqe->user_data, quarantined_tail) : -1;
         if (quarantined_window == -2) {
             protocol_failure();
             break;
@@ -1376,14 +1441,11 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             for (u32 i = 0; i < positive_downstream_token_count; i++)
                 positive_downstream_already_seen |= positive_downstream_tokens[i] == cqe->user_data;
             if (positive_downstream_already_seen) {
-                deferred_downstream_recv = {
-                    cqe->user_data,
-                    head,
-                    quarantined_window >= 0
-                        ? downstream_recv_terminal_windows[quarantined_window].tail_exclusive
-                        : tail,
-                    true,
-                    quarantined_window >= 0};
+                deferred_downstream_recv = {cqe->user_data,
+                                            head,
+                                            quarantined_window >= 0 ? quarantined_tail : tail,
+                                            true,
+                                            quarantined_window >= 0};
                 break;
             }
         }
@@ -2043,6 +2105,13 @@ void IoUringBackend::shutdown() {
                    sizeof(DownstreamRecvTerminalWindow));
         downstream_recv_terminal_windows = nullptr;
         downstream_recv_terminal_window_capacity = 0;
+    }
+    if (downstream_recv_terminal_slots != nullptr) {
+        munmap(downstream_recv_terminal_slots,
+               static_cast<u64>(downstream_recv_terminal_slot_capacity) *
+                   sizeof(DownstreamRecvTerminalSlot));
+        downstream_recv_terminal_slots = nullptr;
+        downstream_recv_terminal_slot_capacity = 0;
     }
     if (sqes_ptr != nullptr) {
         munmap(sqes_ptr, sqes_sz);

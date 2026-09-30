@@ -16790,6 +16790,365 @@ TEST(upstream_reuse, response_preserves_stash_offset_until_pipeline_recover) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+// The retry snapshot lives in send_buf only until a response byte proves the request
+// will not be replayed. Dropping just the marker left the copied request bytes behind,
+// so an idle keep-alive connection kept a non-empty send_buf and the next
+// deadline-owned forward failed its neutrality check and was closed without a reply.
+TEST(upstream_reuse, response_drops_retry_snapshot_from_send_buf) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get_req[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->req_initial_send_len = len;
+    c->upstream_recv_buf.reset();
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+    REQUIRE_EQ(c->retry_req_send_len, len);
+    REQUIRE_EQ(c->send_buf.len(), len);
+
+    static const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+
+    CHECK_EQ(c->retry_req_send_len, 0u);
+    CHECK_EQ(c->send_buf.len(), 0u);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A pipelined stash shares send_buf with the retry snapshot (layout [GET1 | GET2],
+// stash offset = retry_req_send_len). The response-byte drop must leave both the
+// marker and the length alone (this pins ownership, not memory contents); pipeline
+// recovery then restores GET2 and empties send_buf.
+TEST(upstream_reuse, response_keeps_pipeline_stash_then_recover_empties_send_buf) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char get1[] = "GET /one HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char get2[] = "GET /two HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len1 = sizeof(get1) - 1;
+    const u32 len2 = sizeof(get2) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get1), len1);
+    c->recv_buf.write(reinterpret_cast<const u8*>(get2), len2);
+    c->req_initial_send_len = len1;
+    c->upstream_recv_buf.reset();
+    loop.backend.clear_ops();
+
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len1)));
+    REQUIRE_EQ(c->pipeline_stash_len, len2);
+
+    static const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+
+    CHECK_EQ(c->retry_req_send_len, len1);  // stash offset survives the response byte
+    CHECK_EQ(c->pipeline_stash_len, len2);
+    REQUIRE_EQ(c->send_buf.len(), len1 + len2);
+    CHECK_EQ(__builtin_memcmp(c->send_buf.data(), get1, len1), 0);
+    CHECK_EQ(__builtin_memcmp(c->send_buf.data() + len1, get2, len2), 0);
+
+    REQUIRE(rut::pipeline_recover(*c) == rut::PipelineTransitionResult::Advanced);
+    CHECK_EQ(c->retry_req_send_len, 0u);
+    CHECK_EQ(c->pipeline_stash_len, 0u);
+    CHECK_EQ(c->send_buf.len(), 0u);
+    REQUIRE_EQ(c->recv_buf.len(), len2);
+    CHECK_EQ(__builtin_memcmp(c->recv_buf.data(), get2, len2), 0);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// Response-mutation values borrow from the request snapshot in send_buf, which is kept
+// past the first response byte (the headers are built afterwards). The exchange's
+// completion releases it, so the next request starts on an empty send_buf. This pins
+// the ownership invariant (marker and length), not memory contents: reset() only
+// changes the length.
+TEST(response_headers, forward_mutation_snapshot_released_at_exchange_completion) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = false;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char request[] = "GET /path HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(request) - 1;
+    c->recv_buf.write(reinterpret_cast<const u8*>(request), len);
+    c->req_initial_send_len = len;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+    REQUIRE(c->response_mutations_snapshotted);
+    REQUIRE_EQ(c->send_buf.len(), len);
+
+    static const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+
+    // First response byte: the marker is gone but the borrowed value is still backed.
+    CHECK_EQ(c->retry_req_send_len, 0u);
+    CHECK_EQ(c->send_buf.len(), len);
+    CHECK((mutation.value.eq(Str{"/path", 5})));
+
+    // The buffered response is now going out; its send completion ends the exchange.
+    c->keep_alive = true;
+    rut::on_proxy_response_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(c->send_buf.len())));
+    REQUIRE_EQ(c->fd, 42);  // still open: the request boundary was reached, not a close
+    CHECK_EQ(c->send_buf.len(), 0u);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A response-mutation snapshot and a pipelined stash can share send_buf (layout
+// [snapshot | second request], stash offset = retry_req_send_len). Releasing the
+// mutation snapshot at exchange completion must not shrink send_buf below the stash:
+// recovery reads send_buf.data() + retry_req_send_len for pipeline_stash_len bytes.
+// Pinned via the helper's length effect (reset() alone leaves the bytes in place),
+// then the whole completion must recover and serve the pipelined successor.
+TEST(response_headers, forward_mutation_release_keeps_pipeline_stash_and_serves_successor) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = false;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char req1[] = "GET /path HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char req2[] = "GET /two HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len1 = sizeof(req1) - 1;
+    const u32 len2 = sizeof(req2) - 1;
+    c->recv_buf.write(reinterpret_cast<const u8*>(req1), len1);
+    c->recv_buf.write(reinterpret_cast<const u8*>(req2), len2);
+    c->req_initial_send_len = len1;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len1)));
+    REQUIRE(c->response_mutations_snapshotted);
+    REQUIRE_EQ(c->retry_req_send_len, len1);
+    REQUIRE_EQ(c->pipeline_stash_len, len2);
+    REQUIRE_EQ(c->send_buf.len(), len1 + len2);
+
+    static const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+    REQUIRE_EQ(c->retry_req_send_len, len1);
+    REQUIRE_EQ(c->send_buf.len(), len1 + len2);
+
+    // The release itself leaves the stash-covering length and bytes alone.
+    rut::drop_response_mutation_snapshot(*c);
+    CHECK_EQ(c->send_buf.len(), c->retry_req_send_len + c->pipeline_stash_len);
+    CHECK_EQ(__builtin_memcmp(c->send_buf.data() + len1, req2, len2), 0);
+
+    // Completion recovers the second request from the stash and dispatches it.
+    c->keep_alive = true;
+    loop.backend.clear_ops();
+    rut::on_proxy_response_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::Send, static_cast<i32>(sizeof(resp) - 1)));
+    REQUIRE_EQ(c->fd, 42);
+    CHECK_EQ(c->pipeline_stash_len, 0u);
+    CHECK_EQ(c->retry_req_send_len, 0u);
+    const MockOp* op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(op != nullptr);  // the successor was answered
+    CHECK_GT(op->send_len, 0u);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// Depth-N pipelining: a burst whose stash holds TWO pipelined requests behind a
+// response-mutation snapshot. Releasing the snapshot at exchange completion must keep
+// the whole stash (offset = retry_req_send_len, length = both requests) until recovery
+// restores it, and recovery must hand the successor its own suffix in recv_buf.
+TEST(response_headers, forward_mutation_release_keeps_two_request_stash_until_recovery) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    c->upstream_reused = false;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    static const char req1[] = "GET /path HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char req2[] = "GET /two HTTP/1.1\r\nHost: x\r\n\r\n";
+    static const char req3[] = "GET /three HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len1 = sizeof(req1) - 1;
+    const u32 len2 = sizeof(req2) - 1;
+    const u32 len3 = sizeof(req3) - 1;
+    c->recv_buf.write(reinterpret_cast<const u8*>(req1), len1);
+    c->recv_buf.write(reinterpret_cast<const u8*>(req2), len2);
+    c->recv_buf.write(reinterpret_cast<const u8*>(req3), len3);
+    c->req_initial_send_len = len1;
+    auto& mutation = c->resp_header_mutations[c->resp_header_mutation_count++];
+    mutation.mode = ConnectionBase::RespHeaderMutationMode::Set;
+    mutation.name = {"X-Path", 6};
+    mutation.value = {reinterpret_cast<const char*>(c->recv_buf.data() + 4), 5};
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len1)));
+    REQUIRE(c->response_mutations_snapshotted);
+    REQUIRE_EQ(c->retry_req_send_len, len1);
+    REQUIRE_EQ(c->pipeline_stash_len, len2 + len3);
+    REQUIRE_EQ(c->send_buf.len(), len1 + len2 + len3);
+
+    static const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+    REQUIRE_EQ(c->retry_req_send_len, len1);
+    REQUIRE_EQ(c->pipeline_stash_len, len2 + len3);
+
+    rut::drop_response_mutation_snapshot(*c);
+    CHECK_EQ(c->send_buf.len(), len1 + len2 + len3);
+    CHECK_EQ(__builtin_memcmp(c->send_buf.data() + len1, req2, len2), 0);
+    CHECK_EQ(__builtin_memcmp(c->send_buf.data() + len1 + len2, req3, len3), 0);
+
+    // Recovery restores both requests byte-exact, then resets send_buf.
+    const auto transition = rut::pipeline_recover(*c);
+    CHECK(transition == rut::PipelineTransitionResult::Advanced);
+    CHECK_EQ(c->pipeline_stash_len, 0u);
+    CHECK_EQ(c->retry_req_send_len, 0u);
+    CHECK_EQ(c->send_buf.len(), 0u);
+    REQUIRE_EQ(c->recv_buf.len(), len2 + len3);
+    CHECK_EQ(__builtin_memcmp(c->recv_buf.data(), req2, len2), 0);
+    CHECK_EQ(__builtin_memcmp(c->recv_buf.data() + len2, req3, len3), 0);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
+// A replayed request (dead pooled socket surfaced after the send) is sent byte-exact
+// from the send_buf snapshot, and the snapshot is dropped only once the replay is
+// answered — not before, or the replay would have nothing to send.
+TEST(upstream_reuse, retry_replays_snapshot_byte_exact_then_response_drops_it) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 8080);
+    REQUIRE(uid.has_value());
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(uid.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    c->upstream_reused = true;
+    c->upstream_fd = dup(2);
+    REQUIRE(c->upstream_fd >= 0);
+    static const char get_req[] = "GET /stale HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 len = sizeof(get_req) - 1;
+    c->recv_buf.reset();
+    c->recv_buf.write(reinterpret_cast<const u8*>(get_req), len);
+    c->req_initial_send_len = len;
+    c->upstream_recv_buf.reset();
+    loop.backend.clear_ops();
+
+    // Reused socket: request sent, snapshot taken, recv_buf released.
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+    REQUIRE_EQ(c->retry_req_send_len, len);
+    REQUIRE_EQ(c->send_buf.len(), len);
+
+    // The pooled socket was dead: EOF with no response byte -> fresh connect.
+    loop.backend.clear_ops();
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
+    REQUIRE_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK_EQ(c->retry_req_send_len, len);
+    CHECK_EQ(c->send_buf.len(), len);
+
+    loop.backend.clear_ops();
+    rut::on_upstream_connected<SmallLoop>(
+        static_cast<void*>(&loop), *c, make_ev(c->id, IoEventType::UpstreamConnect, 0));
+    const MockOp* op = loop.backend.last_op(MockOp::Send);
+    REQUIRE(op != nullptr);
+    REQUIRE_EQ(op->send_len, len);
+    CHECK_EQ(__builtin_memcmp(op->send_buf, get_req, len), 0);
+
+    // The replay completes and its answer arrives.
+    rut::on_upstream_request_sent<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(len)));
+    CHECK_EQ(c->retry_req_send_len, len);  // still live until a response byte
+    static const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    c->upstream_recv_buf.reset();
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(resp), sizeof(resp) - 1);
+    rut::on_upstream_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(resp) - 1)));
+    CHECK_EQ(c->retry_req_send_len, 0u);
+    CHECK_EQ(c->send_buf.len(), 0u);
+    if (c->upstream_fd >= 0) close(c->upstream_fd);
+}
+
 // A fresh (non-reused) connection takes NO snapshot — there is nothing to retry —
 // and recv_buf is still released at request-sent (unchanged original lifecycle).
 TEST(upstream_reuse, request_sent_fresh_takes_no_snapshot) {
@@ -40263,6 +40622,241 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     CHECK_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 0u);
     CHECK_FALSE(fixture.guard.loop->backend.downstream_recv_progress_valid);
     fixture.guard.loop->backend.shutdown();
+}
+
+// Window bookkeeping tests.  These append terminal CQEs for arbitrary conn ids
+// straight into the CQ ring: a terminal recv owns no buffer and the backend only
+// decodes the token, so no live Connection is needed.
+static void raw_append_downstream_recv(RawDownstreamRecvBatch& fixture, u32 conn_id, i32 result) {
+    auto& backend = fixture.guard.loop->backend;
+    const u32 cursor = fixture.tail();
+    auto& cqe = backend.cq_entries[cursor & *backend.cq_ring_mask];
+    cqe.user_data = IoUringBackend::encode_user_data(conn_id, IoEventType::Recv, 0);
+    cqe.res = result;
+    cqe.flags = 0;
+    __atomic_store_n(backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
+}
+
+static bool terminal_slot_live(RawDownstreamRecvBatch& fixture, u32 conn_id) {
+    return fixture.guard.loop->backend.downstream_recv_terminal_slots[conn_id].live != 0;
+}
+
+TEST(iouring_terminal_window, fifo_ring_wraps_across_many_add_expire_cycles) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    constexpr u32 kPerCycle = 1000;
+    // Strictly more windows than ring slots over the run, so `start` wraps.
+    const u32 cycles = backend.downstream_recv_terminal_window_capacity / kPerCycle + 4u;
+    REQUIRE(kPerCycle < backend.connection_capacity);
+    IoEvent events[kMaxEventsPerWait]{};
+    u64 total = 0;
+    bool wrapped = false;
+    for (u32 cycle = 0; cycle < cycles; cycle++) {
+        for (u32 id = 0; id < kPerCycle; id++) raw_append_downstream_recv(fixture, id, 0);
+        u32 got = 0;
+        // Each wait() freezes the tail at the end of the burst; the windows
+        // stay live over several waits (and, once the burst is drained, until
+        // the next wait() sees a CQE) and expire oldest first.
+        for (u32 attempt = 0; attempt < 64 && got < kPerCycle; attempt++) {
+            got += fixture.wait(events, kMaxEventsPerWait);
+            REQUIRE_EQ(backend.failure_code(), 0);
+            if (backend.downstream_recv_terminal_window_start +
+                    backend.downstream_recv_terminal_window_count >
+                backend.downstream_recv_terminal_window_capacity)
+                wrapped = true;
+        }
+        REQUIRE_EQ(got, kPerCycle);
+        total += got;
+    }
+    fixture.append_timeout(1);
+    CHECK_EQ(fixture.wait(events, kMaxEventsPerWait), 0u);  // boundary expires the last burst
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    CHECK(total > backend.downstream_recv_terminal_window_capacity);
+    CHECK(wrapped);
+    for (u32 id = 0; id < kPerCycle; id++) CHECK_FALSE(terminal_slot_live(fixture, id));
+    CHECK_EQ(backend.failure_code(), 0);
+}
+
+TEST(iouring_terminal_window, quarantines_only_the_terminal_token) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init(2)) SKIP("io_uring unavailable");
+    Connection& a = *fixture.conns[0];
+    Connection& b = *fixture.conns[1];
+    static constexpr u8 kStaleA[] = "stale-a";
+    static constexpr u8 kLiveB[] = "live-b";
+    fixture.append_terminal(a, 0);
+    REQUIRE(fixture.append_recv(a, kStaleA, sizeof(kStaleA) - 1u, true));
+    REQUIRE(fixture.append_recv(b, kLiveB, sizeof(kLiveB) - 1u, true));
+    IoEvent events[4]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    CHECK_EQ(events[0].conn_id, a.id);
+    CHECK(terminal_slot_live(fixture, a.id));
+    CHECK_FALSE(terminal_slot_live(fixture, b.id));
+    const u16 buffer_tail_before = fixture.buffer_tail();
+    // The stale record for A is consumed without an event; B's is published.
+    REQUIRE_EQ(fixture.wait(events, 4), 1u);
+    CHECK_EQ(events[0].conn_id, b.id);
+    CHECK_EQ(events[0].result, static_cast<i32>(sizeof(kLiveB) - 1u));
+    CHECK_EQ(a.recv_buf.len(), 0u);
+    CHECK_EQ(b.recv_buf.len(), sizeof(kLiveB) - 1u);
+    CHECK_EQ(fixture.buffer_tail(), static_cast<u16>(buffer_tail_before + 2u));
+    CHECK_EQ(fixture.guard.loop->backend.failure_code(), 0);
+}
+
+TEST(iouring_terminal_window, expired_window_does_not_block_a_fresh_terminal_for_the_token) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& conn = *fixture.conns[0];
+    fixture.append_terminal(conn, 0);
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK_EQ(backend.downstream_recv_terminal_slots[conn.id].tail_exclusive, fixture.head());
+
+    // The slot is reused after the frozen tail; its next terminal arrives only
+    // once the first window has expired (the boundary wait returns nothing).
+    fixture.append_terminal(conn, -ECONNRESET);
+    CHECK_EQ(fixture.wait(events, 2), 0u);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    CHECK_FALSE(terminal_slot_live(fixture, conn.id));
+    REQUIRE_EQ(fixture.wait(events, 2), 1u);
+    CHECK_EQ(events[0].result, -ECONNRESET);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK(terminal_slot_live(fixture, conn.id));
+    CHECK_EQ(backend.downstream_recv_terminal_slots[conn.id].tail_exclusive, fixture.head());
+    CHECK_EQ(backend.failure_code(), 0);
+}
+
+TEST(iouring_terminal_window, windows_with_different_frozen_tails_expire_in_order) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init(2)) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& a = *fixture.conns[0];
+    Connection& b = *fixture.conns[1];
+    IoEvent events[4]{};
+    fixture.append_terminal(a, 0);
+    fixture.append_terminal(b, 0);
+    fixture.append_timeout(1);
+    const u32 tail_a = fixture.tail();
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // A: frozen at the end of the first burst
+    fixture.append_timeout(2);
+    const u32 tail_b = fixture.tail();
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // B: frozen one CQE later
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 2u);
+    CHECK_EQ(backend.downstream_recv_terminal_slots[a.id].tail_exclusive, tail_a);
+    CHECK_EQ(backend.downstream_recv_terminal_slots[b.id].tail_exclusive, tail_b);
+    CHECK(tail_a != tail_b);
+
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // timeout 1: head reaches A's tail
+    CHECK_EQ(fixture.head(), tail_a);
+    CHECK_EQ(fixture.wait(events, 1), 0u);  // A expires alone, at the boundary
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK_FALSE(terminal_slot_live(fixture, a.id));
+    CHECK(terminal_slot_live(fixture, b.id));
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);  // timeout 2: head reaches B's tail
+    CHECK_EQ(fixture.head(), tail_b);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    fixture.append_timeout(3);
+    CHECK_EQ(fixture.wait(events, 1), 0u);  // B expires at the next loop top
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    CHECK_FALSE(terminal_slot_live(fixture, b.id));
+    CHECK_EQ(backend.failure_code(), 0);
+}
+
+TEST(iouring_terminal_window, shutdown_and_reinit_leave_no_stale_side_table_entry) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& conn = *fixture.conns[0];
+    fixture.append_terminal(conn, 0);
+    fixture.append_timeout(5);
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    REQUIRE(terminal_slot_live(fixture, conn.id));
+    const u32 conn_id = conn.id;
+
+    // shutdown() resets the wait state (walking the live window to clear its
+    // side-table entry) and frees both arrays; re-init starts clean.
+    const u32 capacity = backend.connection_capacity;
+    backend.shutdown();
+    fixture.guard.initialized = false;
+    CHECK(backend.downstream_recv_terminal_windows == nullptr);
+    CHECK(backend.downstream_recv_terminal_slots == nullptr);
+    CHECK_EQ(backend.downstream_recv_terminal_slot_capacity, 0u);
+    const auto reinit_result = backend.init(0, -1, capacity);
+    if (!reinit_result) SKIP("io_uring re-init unavailable");
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    REQUIRE(backend.downstream_recv_terminal_slots != nullptr);
+    CHECK_EQ(backend.downstream_recv_terminal_slot_capacity, capacity);
+    CHECK_FALSE(terminal_slot_live(fixture, conn_id));
+    // The old owner's window is gone: a terminal for the same token is a
+    // fresh event on the new ring, not quarantined.
+    fixture.append_terminal(conn, 0);
+    backend.pending = 0;
+    IoEvent event{};
+    REQUIRE_EQ(backend.wait(&event, 1, fixture.guard.loop->conns, IoUringEventLoop::kMaxConns), 1u);
+    CHECK_EQ(event.conn_id, conn_id);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    backend.shutdown();
+}
+
+TEST(iouring_terminal_window, corrupt_front_window_distance_fails_sticky) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& conn = *fixture.conns[0];
+    fixture.append_terminal(conn, 0);
+    fixture.append_timeout(1);
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK_EQ(backend.failure_code(), 0);
+    // A frozen tail further ahead of head than the CQ can hold is corruption.
+    const u32 bad_tail = fixture.head() + backend.cq_ring_entries + 1u;
+    backend.downstream_recv_terminal_windows[backend.downstream_recv_terminal_window_start]
+        .tail_exclusive = bad_tail;
+    backend.downstream_recv_terminal_slots[conn.id].tail_exclusive = bad_tail;
+    CHECK_EQ(fixture.wait(events, 2), 0u);
+    CHECK_EQ(backend.failure_code(), EPROTO);
+}
+
+TEST(iouring_terminal_window, side_table_covers_first_last_and_out_of_range_conn_ids) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    const u32 capacity = backend.connection_capacity;
+    REQUIRE_EQ(backend.downstream_recv_terminal_slot_capacity, capacity);
+    // conn 0, conn capacity-1 and one past the table, which has no table entry
+    // and is found by the scan fallback.
+    const u32 ids[3] = {0u, capacity - 1u, capacity};
+    for (u32 id : ids) raw_append_downstream_recv(fixture, id, 0);
+    // Duplicate terminals for the same tokens sit inside the first interval...
+    for (u32 id : ids) raw_append_downstream_recv(fixture, id, -ECONNRESET);
+    // ...and a terminal for a different token is not quarantined by them.
+    raw_append_downstream_recv(fixture, 1u, 0);
+    IoEvent events[8]{};
+    REQUIRE_EQ(fixture.wait(events, 3), 3u);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 3u);
+    CHECK_EQ(backend.downstream_recv_terminal_out_of_range_windows, 1u);
+    CHECK(terminal_slot_live(fixture, 0));
+    CHECK(terminal_slot_live(fixture, capacity - 1u));
+
+    REQUIRE_EQ(fixture.wait(events, 8), 1u);  // three duplicates consumed silently
+    CHECK_EQ(events[0].conn_id, 1u);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 4u);
+    CHECK_EQ(backend.failure_code(), 0);
+
+    // Boundary: every window expires and the table and counter are clear.
+    fixture.append_timeout(9);
+    CHECK_EQ(fixture.wait(events, 8), 0u);
+    CHECK_EQ(backend.downstream_recv_terminal_window_count, 0u);
+    CHECK_EQ(backend.downstream_recv_terminal_out_of_range_windows, 0u);
+    CHECK_FALSE(terminal_slot_live(fixture, 0));
+    CHECK_FALSE(terminal_slot_live(fixture, 1));
+    CHECK_FALSE(terminal_slot_live(fixture, capacity - 1u));
+    CHECK_EQ(backend.failure_code(), 0);
 }
 #endif
 

@@ -7128,6 +7128,29 @@ inline void reserve_response_mutation_snapshot(Connection& conn) {
         conn.retry_req_send_len = conn.send_buf.len();
 }
 
+// A response byte is in hand, so the request will not be replayed: drop the
+// reused-upstream retry copy from send_buf. An idle connection must have an empty
+// send_buf: the neutrality check shared by every route that selects its forward or
+// local response after canonical route selection (deadline-owned forwards, guarded
+// redirects, request-framing routes; io_uring and epoll) closes the connection
+// otherwise. Kept: a pipelined stash (retry_req_send_len is then its offset;
+// pipeline recovery restores the stash and resets send_buf) and response-mutation
+// values (needed until the response headers are built). Completion-time release
+// (drop_response_mutation_snapshot, or on_response_sent / pipeline recovery) is what
+// guarantees the invariant; this is the early release for the common case.
+inline void drop_request_retry_snapshot(Connection& conn) {
+    if (conn.pipeline_stash_len != 0) return;
+    if (conn.retry_req_send_len != 0 && !conn.response_mutations_snapshotted) conn.send_buf.reset();
+    conn.retry_req_send_len = 0;
+}
+
+// The proxied exchange is complete, so the response-mutation snapshot is dead.
+// A pipelined stash still owns send_buf until pipeline recovery; recovery reads
+// send_buf.data() + retry_req_send_len, so the length must keep covering it.
+inline void drop_response_mutation_snapshot(Connection& conn) {
+    if (conn.pipeline_stash_len == 0) conn.send_buf.reset();
+}
+
 template <typename Loop>
 void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -8763,6 +8786,7 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
 
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
     loop->epoch_leave();
+    drop_response_mutation_snapshot(conn);
 
     // Mirror on_proxy_response_sent: during graceful drain, close the upstream
     // (close_conn closes upstream_fd) rather than parking it in the idle pool.
@@ -12989,7 +13013,7 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // retain the legacy snapshot release at response-byte admission.
         if (explicit_profile !=
             ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead) {
-            if (conn.pipeline_stash_len == 0) conn.retry_req_send_len = 0;
+            drop_request_retry_snapshot(conn);
         }
         const bool fixed_upload = response_read_deadline_profile_is_fixed_upload(explicit_profile);
         const bool fixed_upload_head =
@@ -13296,9 +13320,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
     if (explicit_first_batch || explicit_progress_batch) disarm_explicit_deadline();
     // A response byte is now in hand, so the request will not be replayed. Drop
-    // the snapshot marker only when it is not also the offset to a stashed
-    // pipelined suffix; pipeline recovery clears that offset after copying.
-    if (conn.pipeline_stash_len == 0) conn.retry_req_send_len = 0;
+    // the retry snapshot (marker and bytes) unless send_buf is still owned: a
+    // stashed pipelined suffix keeps marker and bytes (the marker is its offset;
+    // pipeline recovery clears it after copying), and a live response-mutation
+    // snapshot loses only the marker (its bytes stay until exchange completion).
+    drop_request_retry_snapshot(conn);
     record_reused_response_health();
     conn.resp_status = resp.status_code;
 
@@ -13848,6 +13874,7 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
 
     on_request_complete(loop, conn, conn.resp_status, conn.resp_body_sent);
     loop->epoch_leave();
+    drop_response_mutation_snapshot(conn);
 
     if (loop->is_draining()) {
         close_conn_after_complete_response(loop, conn);
