@@ -159,8 +159,11 @@ struct IoUringBackend {
                                      i32 listen_fd,
                                      u32 capacity = kDefaultConnectionCapacity);
 
-    // Submit a multishot accept on the listen socket.
-    void add_accept();
+    // Submit a multishot accept on the listen socket. Returns false if it could
+    // not be armed (no SQE, no ring, or listener closed); the caller retries.
+    // The kernel ends a multishot accept with a CQE lacking F_MORE, after which
+    // the caller must re-arm.
+    bool add_accept();
 
     // Submit a multishot recv with provided buffer selection.
     // No user buffer needed — kernel picks from provided ring.

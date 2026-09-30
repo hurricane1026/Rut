@@ -29,6 +29,7 @@
 #include "rut/runtime/upstream_pool.h"
 #include <atomic>
 
+#include <errno.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -316,6 +317,9 @@ public:
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     u32 upstream_timeout = kDefaultUpstreamTimeout;
     i32 listen_fd = -1;
+    // Multishot accept needs a deferred re-arm (resource exhaustion or no SQE);
+    // retried on the next 1s timer tick.
+    bool accept_rearm_pending = false;
 
     AccessLogRing* access_log = nullptr;
     SourceLiveAccessLogProducer* live_access_log = nullptr;
@@ -495,7 +499,7 @@ public:
     }
 
     void run() {
-        backend.add_accept();
+        rearm_accept();
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
         this->fire_due_timers();
@@ -5507,6 +5511,7 @@ public:
     void test_drain_response_read_deadline_body_pump_ready(Callback&& callback) {
         drain_response_read_deadline_body_pump_ready(static_cast<Callback&&>(callback));
     }
+    void test_close_listen() { close_listen(); }
 #endif
 
 public:
@@ -5988,6 +5993,7 @@ public:
                 }
                 break;
             case IoEventType::Timeout: {
+                if (accept_rearm_pending) rearm_accept();
                 i32 ticks = ev.result > 0 ? ev.result : 1;
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
@@ -6563,8 +6569,64 @@ private:
         }
     }
 
+    // Arm multishot accept; a failed arm (no SQE) retries on the next tick.
+    // Never arms once the listener is closed.
+    void rearm_accept() {
+        if (listen_fd < 0) {
+            accept_rearm_pending = false;
+            return;
+        }
+        accept_rearm_pending = !backend.add_accept();
+    }
+
+    // A multishot accept ends with a CQE lacking F_MORE (EMFILE/ENFILE/ENOMEM/
+    // ENOBUFS, ECONNABORTED, CQ overflow, cancel). Without a re-arm this shard
+    // never accepts again while the kernel keeps steering SO_REUSEPORT
+    // connections to it.
+    void on_accept_terminated(i32 result) {
+        if (listen_fd < 0) return;  // intentional close_listen(): stay down
+        if (result >= 0) {
+            rearm_accept();
+            return;
+        }
+        switch (-result) {
+            // Immediate: the failing connection was consumed from the backlog,
+            // so the next accept makes progress.
+            case ECONNABORTED:
+            case EINTR:
+            case EAGAIN:
+            case EPROTO:
+            case ENOPROTOOPT:
+            case ENETDOWN:
+            case ENONET:
+            case EHOSTDOWN:
+            case EHOSTUNREACH:
+            case ENETUNREACH:
+                rearm_accept();
+                return;
+            // Permanent: the listener itself is unusable.
+            case EBADF:
+            case ENOTSOCK:
+            case EINVAL:
+            case EOPNOTSUPP:
+                return;
+            // Deferred to the next tick: the backlog entry was not consumed
+            // (EMFILE/ENFILE/ENOBUFS/ENOMEM, LSM EPERM/EACCES), so an immediate
+            // re-arm would spin; or the cause is unknown. ECANCELED lands here
+            // too: our own close_listen() was filtered out above, so it is a
+            // kernel-side cancel (failed CQE post, io-wq cancel), not ours.
+            default:
+                accept_rearm_pending = true;
+                return;
+        }
+    }
+
     void on_accept(const IoEvent& ev) {
-        if (ev.result < 0) return;
+        if (ev.result >= 0) on_accepted_fd(ev);
+        if (!ev.more) on_accept_terminated(ev.result);
+    }
+
+    void on_accepted_fd(const IoEvent& ev) {
         Connection* c = this->alloc_conn();
         if (!c) {
             // Try reclaiming slots from stale CQEs.
@@ -6645,6 +6707,9 @@ private:
             backend.cancel_accept();
             ::close(listen_fd);
             listen_fd = -1;
+            // Keep the backend from ever re-arming on a closed/recycled fd.
+            backend.listen_fd = -1;
+            accept_rearm_pending = false;
         }
     }
 };

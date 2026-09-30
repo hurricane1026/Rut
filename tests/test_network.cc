@@ -79087,6 +79087,294 @@ TEST(iouring_body_pump_ready_set, rejects_foreign_slots_and_rolls_back_bitmap_al
     guard.loop->defer_response_read_deadline_body_pump(foreign);
     CHECK_FALSE(guard.loop->response_read_deadline_body_pump_pending);
 }
+
+// Multishot accept re-arm policy, driven through the real IoUringEventLoop
+// dispatch path with a fake SQ so armed SQEs are observable.
+namespace {
+struct ScopedAcceptRearmLoop {
+    void* storage = MAP_FAILED;
+    IoUringEventLoop* loop = nullptr;
+    bool initialized = false;
+    u32 sq_head = 0;
+    u32 sq_tail = 0;
+    u32 sq_mask = 7;
+    u32 sq_array[8]{};
+    io_uring_sqe sq_entries[8]{};
+    u32 cq_head = 0;
+    u32 cq_tail = 0;
+    u32 cq_mask = 7;
+    io_uring_cqe cq_entries[8]{};
+
+    bool init() {
+        storage = mmap(nullptr,
+                       sizeof(IoUringEventLoop),
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS,
+                       -1,
+                       0);
+        if (storage == MAP_FAILED) return false;
+        loop = new (storage) IoUringEventLoop();
+        initialized = loop->init_slot_storage(1).has_value();
+        if (!initialized) return false;
+        loop->timer.init();
+        auto& backend = loop->backend;
+        backend.sq_head = &sq_head;
+        backend.sq_tail = &sq_tail;
+        backend.sq_ring_mask = &sq_mask;
+        backend.sq_array = sq_array;
+        backend.sq_entries = sq_entries;
+        backend.sq_ring_entries = 8;
+        backend.cq_head = &cq_head;
+        backend.cq_tail = &cq_tail;
+        backend.cq_ring_mask = &cq_mask;
+        backend.cq_entries = cq_entries;
+        backend.cq_ring_entries = 8;
+        // Fake, non-negative so add_accept() arms. Any path that would call
+        // io_uring_enter on it (cancel_accept, wait with pending SQEs) must run with
+        // ring_fd == -1 instead, which those paths treat as "no ring" and skip.
+        backend.ring_fd = 0;
+        backend.listen_fd = 77;
+        loop->listen_fd = 77;
+        return true;
+    }
+
+    void accept_cqe(i32 result, bool more) {
+        IoEvent ev{};
+        ev.type = IoEventType::Accept;
+        ev.result = result;
+        ev.more = more ? 1 : 0;
+        loop->dispatch(ev);
+    }
+
+    // Accepted-fd cleanup for tests that hand a real socket end to the loop. The
+    // fixture has no slice pool, so alloc_conn() fails and the fd is normally
+    // parked in the deferred-accept array; drop that too.
+    void release_accepted(i32 fd) {
+        loop->deferred_accept_count = 0;
+        for (u32 i = 0; i < loop->connection_capacity; i++) {
+            if (loop->conns[i].fd == fd) {
+                loop->timer.remove(&loop->conns[i]);
+                loop->conns[i].fd = -1;
+            }
+        }
+        close(fd);
+    }
+
+    u32 count_accept_sqes() const {
+        u32 n = 0;
+        for (u32 i = 0; i < sq_tail; i++)
+            if (sq_entries[i & sq_mask].opcode == IORING_OP_ACCEPT) n++;
+        return n;
+    }
+
+    void push_accept_cqe(i32 result, u32 flags) {
+        const u32 tail = __atomic_load_n(&cq_tail, __ATOMIC_RELAXED);
+        io_uring_cqe& cqe = cq_entries[tail & cq_mask];
+        cqe.user_data = IoUringBackend::encode_user_data(0, IoEventType::Accept);
+        cqe.res = result;
+        cqe.flags = flags;
+        __atomic_store_n(&cq_tail, tail + 1, __ATOMIC_RELEASE);
+    }
+
+    void tick() {
+        IoEvent ev{};
+        ev.type = IoEventType::Timeout;
+        ev.result = 1;
+        loop->dispatch(ev);
+    }
+
+    ~ScopedAcceptRearmLoop() {
+        if (loop != nullptr) {
+            if (initialized) {
+                for (u32 i = 0; i < loop->connection_capacity; i++)
+                    loop->timer.remove(&loop->conns[i]);
+                loop->destroy_slot_storage();
+            }
+            loop->~IoUringEventLoop();
+        }
+        if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
+    }
+};
+}  // namespace
+
+TEST(iouring_accept_rearm, non_terminal_cqe_does_not_rearm) {
+    ScopedAcceptRearmLoop g;
+    REQUIRE(g.init());
+    // A live multishot accept delivering a connection (F_MORE set): the accept
+    // stays armed in the kernel, so nothing is re-armed.
+    int sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    close(sv[1]);
+    g.accept_cqe(sv[0], /*more=*/true);
+    CHECK_EQ(g.count_accept_sqes(), 0u);
+    CHECK_FALSE(g.loop->accept_rearm_pending);
+    g.release_accepted(sv[0]);
+}
+
+TEST(iouring_accept_rearm, transient_error_rearms_immediately) {
+    ScopedAcceptRearmLoop g;
+    REQUIRE(g.init());
+    const i32 errs[] = {ECONNABORTED, EINTR, EAGAIN, EPROTO, ENETDOWN, EHOSTUNREACH};
+    u32 expect = 0;
+    for (i32 e : errs) {
+        g.accept_cqe(-e, /*more=*/false);
+        expect++;
+        CHECK_EQ(g.sq_tail, expect);
+        CHECK_FALSE(g.loop->accept_rearm_pending);
+        const io_uring_sqe& sqe = g.sq_entries[(g.sq_tail - 1) & g.sq_mask];
+        CHECK_EQ(sqe.opcode, static_cast<u8>(IORING_OP_ACCEPT));
+        CHECK_EQ(sqe.fd, 77);
+        CHECK_EQ(sqe.ioprio, static_cast<u16>(IORING_ACCEPT_MULTISHOT));
+    }
+}
+
+TEST(iouring_accept_rearm, terminal_cqe_with_valid_fd_still_rearms) {
+    ScopedAcceptRearmLoop g;
+    REQUIRE(g.init());
+    // The fd must be consumed normally; a real socketpair end keeps ::close safe.
+    int sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    close(sv[1]);
+    // Only one connection slot exists and the fd belongs to no real peer; the
+    // accepted fd is handed to the normal accept path, then the accept re-arms.
+    g.accept_cqe(sv[0], /*more=*/false);
+    CHECK_FALSE(g.loop->accept_rearm_pending);
+    bool armed_accept = false;
+    for (u32 i = 0; i < g.sq_tail; i++) {
+        if (g.sq_entries[i & g.sq_mask].opcode == IORING_OP_ACCEPT) armed_accept = true;
+    }
+    CHECK(armed_accept);
+    for (u32 i = 0; i < g.loop->connection_capacity; i++) {
+        if (g.loop->conns[i].fd == sv[0]) {
+            g.loop->timer.remove(&g.loop->conns[i]);
+            g.loop->conns[i].fd = -1;
+        }
+    }
+    close(sv[0]);
+}
+
+TEST(iouring_accept_rearm, resource_exhaustion_defers_to_timer_tick) {
+    // EPERM (LSM denial leaves the backlog entry) and ECANCELED (not our
+    // close_listen(): kernel-side cancel) must defer too, never spin or stall.
+    const i32 errs[] = {
+        EMFILE, ENFILE, ENOBUFS, ENOMEM, EPERM, EACCES, ECANCELED, 9999 /* unknown */};
+    for (i32 e : errs) {
+        ScopedAcceptRearmLoop g;
+        REQUIRE(g.init());
+        g.accept_cqe(-e, /*more=*/false);
+        CHECK_EQ(g.sq_tail, 0u);  // no immediate re-arm (would spin)
+        CHECK(g.loop->accept_rearm_pending);
+        g.tick();
+        CHECK_EQ(g.sq_tail, 1u);
+        CHECK_FALSE(g.loop->accept_rearm_pending);
+        g.tick();  // armed: further ticks must not arm a second accept
+        CHECK_EQ(g.sq_tail, 1u);
+    }
+}
+
+TEST(iouring_accept_rearm, permanent_error_does_not_rearm) {
+    const i32 errs[] = {EBADF, ENOTSOCK, EINVAL, EOPNOTSUPP};
+    for (i32 e : errs) {
+        ScopedAcceptRearmLoop g;
+        REQUIRE(g.init());
+        g.accept_cqe(-e, /*more=*/false);
+        g.tick();
+        CHECK_EQ(g.sq_tail, 0u);
+        CHECK_FALSE(g.loop->accept_rearm_pending);
+    }
+}
+
+TEST(iouring_accept_rearm, full_sq_defers_rearm_to_timer_tick) {
+    ScopedAcceptRearmLoop g;
+    REQUIRE(g.init());
+    g.sq_tail = 8;  // SQ full (head == 0)
+    g.accept_cqe(-ECONNABORTED, /*more=*/false);
+    CHECK(g.loop->accept_rearm_pending);
+    g.sq_head = 8;  // kernel consumed everything
+    g.tick();
+    CHECK_EQ(g.sq_tail, 9u);
+    CHECK_FALSE(g.loop->accept_rearm_pending);
+}
+
+TEST(iouring_accept_rearm, terminal_cqe_with_fd_and_no_free_slot_defers_fd_and_rearms) {
+    ScopedAcceptRearmLoop g;
+    REQUIRE(g.init());
+    // No slice pool in this fixture, so alloc_conn() fails: every accepted fd
+    // takes the no-free-slot path.
+    REQUIRE(g.loop->alloc_conn() == nullptr);
+    int sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    close(sv[1]);
+    g.accept_cqe(sv[0], /*more=*/false);
+    CHECK_EQ(g.loop->deferred_accept_count, 1u);
+    CHECK_EQ(g.loop->deferred_accepts[0], sv[0]);
+    CHECK_EQ(g.count_accept_sqes(), 1u);  // re-armed despite the deferral
+    CHECK_FALSE(g.loop->accept_rearm_pending);
+    g.loop->deferred_accept_count = 0;
+    close(sv[0]);
+
+    // Deferral array full: the fd is closed (no leak) and the accept still re-arms.
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    close(sv[1]);
+    g.loop->deferred_accept_count = IoUringEventLoop::kMaxDeferredAccepts;
+    g.accept_cqe(sv[0], /*more=*/false);
+    CHECK_EQ(g.loop->deferred_accept_count, IoUringEventLoop::kMaxDeferredAccepts);
+    CHECK_EQ(fcntl(sv[0], F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_EQ(g.count_accept_sqes(), 2u);
+    g.loop->deferred_accept_count = 0;
+}
+
+TEST(iouring_accept_rearm, wait_maps_cqe_f_more_to_event_more) {
+    ScopedAcceptRearmLoop g;
+    REQUIRE(g.init());
+    auto& backend = g.loop->backend;
+    IoEvent ev{};
+    // pending == 0 and a non-empty CQ: wait() harvests without io_uring_enter.
+    g.push_accept_cqe(5, IORING_CQE_F_MORE);
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    CHECK_EQ(ev.type, IoEventType::Accept);
+    CHECK_EQ(ev.result, 5);
+    CHECK_EQ(ev.more, 1);
+    g.push_accept_cqe(-EMFILE, 0);
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    CHECK_EQ(ev.type, IoEventType::Accept);
+    CHECK_EQ(ev.result, -EMFILE);
+    CHECK_EQ(ev.more, 0);
+    g.push_accept_cqe(6, 0);  // terminal CQE that still carries a valid fd
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    CHECK_EQ(ev.result, 6);
+    CHECK_EQ(ev.more, 0);
+}
+
+TEST(iouring_accept_rearm, closed_listener_is_never_rearmed) {
+    ScopedAcceptRearmLoop g;
+    REQUIRE(g.init());
+    // Pending deferred retry plus a listener that is then intentionally closed.
+    g.accept_cqe(-EMFILE, /*more=*/false);
+    CHECK(g.loop->accept_rearm_pending);
+    // close_listen() without a real ring: emulate its state transition.
+    int fds[2];
+    REQUIRE_EQ(pipe(fds), 0);
+    g.loop->listen_fd = fds[0];
+    g.loop->backend.listen_fd = fds[0];
+    // ring_fd == -1 makes cancel_accept() a no-op, so no io_uring_enter is issued on
+    // the fake ring; the listener bookkeeping in close_listen() still runs.
+    g.loop->backend.ring_fd = -1;
+    g.loop->test_close_listen();
+    g.loop->backend.ring_fd = 0;
+    close(fds[1]);
+    CHECK_EQ(g.loop->listen_fd, -1);
+    CHECK_EQ(g.loop->backend.listen_fd, -1);
+    CHECK_FALSE(g.loop->backend.add_accept());
+    const u32 before = g.sq_tail;
+    g.accept_cqe(-ECANCELED, /*more=*/false);
+    g.accept_cqe(-ECONNABORTED, /*more=*/false);
+    g.accept_cqe(-EMFILE, /*more=*/false);
+    g.tick();
+    CHECK_EQ(g.sq_tail, before);
+    CHECK_FALSE(g.loop->accept_rearm_pending);
+}
 #endif  // __linux__
 
 int main(int argc, char** argv) {
