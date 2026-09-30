@@ -4,6 +4,7 @@
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/response_read_deadline.h"
 
 #include <errno.h>
@@ -209,18 +210,24 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     timer_fd = -1;
     timer_read_armed = false;
     fatal_error.store(0, std::memory_order_relaxed);
+    // mmap-zeroed storage skips member initializers; the window array is not
+    // allocated yet, so there is nothing to clear.
+    downstream_recv_terminal_windows = nullptr;
+    downstream_recv_terminal_window_capacity = 0;
+    downstream_recv_terminal_window_count = 0;
     reset_downstream_recv_wait_state();
     // Setup io_uring with desired flags
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
     // wait() consults IORING_SQ_TASKRUN before bypassing enter. Request the
     // notification so a busy visible CQ cannot hide cooperative task work.
+    // SINGLE_ISSUER / DEFER_TASKRUN were evaluated and not adopted; see the
+    // comment above IoUringBackend in io_uring_backend.h.
     params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
     // Note: SQPOLL requires CAP_SYS_NICE or io_uring_register credentials.
     // Omit for now, add as optimization later.
 
-    constexpr u32 kRingEntries = 16384;
-    ring_fd = io_uring_setup(kRingEntries, &params);
+    ring_fd = io_uring_setup(kIoUringSqEntries, &params);
     if (ring_fd < 0) {
         i32 err = -ring_fd;
         shutdown();
@@ -285,6 +292,19 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     cq_tail = reinterpret_cast<u32*>(cq_base + params.cq_off.tail);
     cq_ring_mask = reinterpret_cast<u32*>(cq_base + params.cq_off.ring_mask);
     cq_entries = reinterpret_cast<io_uring_cqe*>(cq_base + params.cq_off.cqes);
+
+    // Terminal-recv quarantine inventory (see the header): sized for the worst
+    // case of one window per CQ slot, demand-paged so an idle shard pays nothing.
+    const u64 windows_sz = static_cast<u64>(cq_ring_entries) * sizeof(DownstreamRecvTerminalWindow);
+    void* windows_mem =
+        mmap(nullptr, windows_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (windows_mem == MAP_FAILED) {
+        i32 err = errno;
+        shutdown();
+        return core::make_unexpected(Error::make(err, Error::Source::Mmap));
+    }
+    downstream_recv_terminal_windows = static_cast<DownstreamRecvTerminalWindow*>(windows_mem);
+    downstream_recv_terminal_window_capacity = cq_ring_entries;
 
     // Setup provided buffer ring for zero-copy recv
     TRY_VOID(setup_buf_ring());
@@ -465,10 +485,12 @@ void IoUringBackend::submit_timer_read() {
 
 // --- Operations ---
 
-void IoUringBackend::add_accept() {
-    if (ring_fd < 0) return;
+bool IoUringBackend::add_accept() {
+    // listen_fd < 0 means the listener was closed (close_listen()); never arm on
+    // -1 or a recycled fd number.
+    if (ring_fd < 0 || listen_fd < 0) return false;
     io_uring_sqe* sqe = get_sqe();
-    if (!sqe) return;
+    if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_ACCEPT;
@@ -479,6 +501,7 @@ void IoUringBackend::add_accept() {
 
     sqe_advance_tail(sq_tail);
     pending++;
+    return true;
 }
 
 bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
@@ -1227,7 +1250,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     };
     auto add_terminal_window = [&](u64 user_data, u32 tail_exclusive) {
         if (tail_exclusive - head > cq_ring_entries ||
-            downstream_recv_terminal_window_count >= kMaxEventsPerWait) {
+            downstream_recv_terminal_window_count >= downstream_recv_terminal_window_capacity) {
             protocol_failure();
             return false;
         }
@@ -2013,6 +2036,13 @@ void IoUringBackend::shutdown() {
         munmap(large_buf_ring,
                sizeof(io_uring_buf_ring) + kLargeProvidedBufCount * sizeof(io_uring_buf));
         large_buf_ring = nullptr;
+    }
+    if (downstream_recv_terminal_windows != nullptr) {
+        munmap(downstream_recv_terminal_windows,
+               static_cast<u64>(downstream_recv_terminal_window_capacity) *
+                   sizeof(DownstreamRecvTerminalWindow));
+        downstream_recv_terminal_windows = nullptr;
+        downstream_recv_terminal_window_capacity = 0;
     }
     if (sqes_ptr != nullptr) {
         munmap(sqes_ptr, sqes_sz);

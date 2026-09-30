@@ -29,9 +29,27 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 //   [*] IOSQE_BUFFER_SELECT       — kernel picks buffer from provided ring
 //   [ ] IORING_SETUP_SQPOLL       — kernel-side SQ polling (needs CAP_SYS_NICE)
 //   [ ] IORING_OP_SEND_ZC         — zero-copy send (future optimization)
-//   [*] IORING_SETUP_COOP_TASKRUN — cooperative task running
-// Ring setup runs before the shard thread starts, so SINGLE_ISSUER is intentionally
-// not used: submissions and enters may come from the spawned shard thread.
+//   [*] IORING_SETUP_COOP_TASKRUN — cooperative task running (+ TASKRUN_FLAG)
+//   [ ] IORING_SETUP_SINGLE_ISSUER — evaluated, not adopted (see below)
+//   [ ] IORING_SETUP_DEFER_TASKRUN — evaluated, ~5% slower on accept-heavy
+//                                    Connection: close (see below)
+//
+// wait() relies on IORING_SQ_TASKRUN (from TASKRUN_FLAG) so it never skips an
+// enter while task work is pending.
+//
+// SINGLE_ISSUER / DEFER_TASKRUN evaluation (Linux 7.2.7, x86-64, 1 shard; see
+// DESIGN.md §6.2). The ring is created before the shard thread exists, and
+// SINGLE_ISSUER fixes the owning task before that thread exists, so adopting it
+// needs IORING_SETUP_R_DISABLED plus IORING_REGISTER_ENABLE_RINGS from the shard
+// thread (prototyped, works), with a fallback for kernels that reject the flags.
+// Without DEFER_TASKRUN it enforces a single submitter, not exclusive access:
+// submitting or registering from another thread fails with -EEXIST, so a loop
+// can no longer be driven from a second thread (e.g. test helpers that settle a
+// stopped shard). Throughput: SINGLE_ISSUER + COOP_TASKRUN was neutral;
+// DEFER_TASKRUN was about 5% slower on accept-heavy `Connection: close` (128
+// conns) and neutral on keep-alive workloads. Not adopted; revisit only with a
+// workload where DEFER_TASKRUN is measured to win, and re-measure first. One
+// shard = one ring = one submitting thread already holds by construction.
 //
 struct IoUringBackend {
     SlicePool* response_pool = nullptr;
@@ -143,11 +161,27 @@ struct IoUringBackend {
     // to the event loop and owns an independent pending-op count.
     // Dispatching the terminal can rearm or reuse the numeric connection slot,
     // so only records strictly before the frozen tail are known to belong to
-    // the old owner.  The fixed inventory is bounded by one wait batch.
+    // the old owner.
+    //
+    // A window stays live until head reaches its frozen tail, which can take
+    // several wait() calls (each returns at most kMaxEventsPerWait events), so
+    // the inventory is NOT bounded by one batch.  Expiry runs at the loop top
+    // before every add, so head never steps past a live window's frozen tail.
+    // There is at most one live window per downstream token, and the token is a
+    // pure function of conn_id, so the true bound is
+    // min(connection_capacity, cq_ring_entries).  cq_ring_entries alone is a
+    // safe over-approximation: every live window was recorded for a CQE consumed
+    // less than that far behind head.  The array is mmap'd in init() and only
+    // the first `count` slots are ever touched.
+    //
+    // Lookup and expiry are linear in the number of live windows, so a burst of
+    // N terminals costs O(N^2) on the shard thread (~120 ms of wait() CPU at
+    // N=16000).  Tracked as a follow-up; the data structure is unchanged here.
     struct DownstreamRecvTerminalWindow {
         u64 user_data = 0;
         u32 tail_exclusive = 0;
-    } downstream_recv_terminal_windows[kMaxEventsPerWait];
+    }* downstream_recv_terminal_windows = nullptr;
+    u32 downstream_recv_terminal_window_capacity = 0;
     u32 downstream_recv_terminal_window_count = 0;
     u32 downstream_recv_progress_head = 0;
     bool downstream_recv_progress_valid = false;
@@ -159,8 +193,11 @@ struct IoUringBackend {
                                      i32 listen_fd,
                                      u32 capacity = kDefaultConnectionCapacity);
 
-    // Submit a multishot accept on the listen socket.
-    void add_accept();
+    // Submit a multishot accept on the listen socket. Returns false if it could
+    // not be armed (no SQE, no ring, or listener closed); the caller retries.
+    // The kernel ends a multishot accept with a CQE lacking F_MORE, after which
+    // the caller must re-arm.
+    bool add_accept();
 
     // Submit a multishot recv with provided buffer selection.
     // No user buffer needed — kernel picks from provided ring.
@@ -449,7 +486,8 @@ private:
 
     void reset_downstream_recv_wait_state() {
         deferred_downstream_recv = {};
-        for (auto& window : downstream_recv_terminal_windows) window = {};
+        for (u32 i = 0; i < downstream_recv_terminal_window_count; i++)
+            downstream_recv_terminal_windows[i] = {};
         downstream_recv_terminal_window_count = 0;
         downstream_recv_progress_head = 0;
         downstream_recv_progress_valid = false;

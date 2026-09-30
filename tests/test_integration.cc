@@ -47,6 +47,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
 
 namespace rut {
 
@@ -5105,6 +5107,71 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     backend.shutdown();
 }
 
+// Many downstream peers closing at once: every armed multishot recv completes
+// with a terminal EOF CQE in the same CQ burst. A single wait() hands out at most
+// kMaxEventsPerWait events, so the terminal-CQE quarantine windows recorded for one
+// harvest stay live across several wait() calls and exceed one batch. Regression:
+// the fixed 256-slot window inventory overflowed and the shard died with EPROTO.
+TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
+    // Fails on the old 256-slot inventory from 257 terminals up; 600 fds fit the
+    // default 1024 soft limit.
+    constexpr u32 kPeers = 300;
+    IoUringBackend backend;
+    if (!backend.init(0, -1, kPeers)) SKIP("io_uring unavailable");
+
+    auto conns = std::make_unique<Connection[]>(kPeers);
+    auto local = std::make_unique<i32[]>(kPeers);
+    auto peer = std::make_unique<i32[]>(kPeers);
+    u32 made = 0;
+    for (; made < kPeers; ++made) {
+        i32 fds[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) != 0) break;
+        local[made] = fds[0];
+        peer[made] = fds[1];
+        conns[made].reset();
+        conns[made].id = made;
+        conns[made].fd = fds[0];
+    }
+
+    IoEvent events[kMaxEventsPerWait]{};
+    u32 armed = 0;
+    u32 peers_closed = 0;
+    u32 eofs = 0;
+    if (made == kPeers) {
+        for (; armed < kPeers; ++armed)
+            if (!backend.add_recv(local[armed], armed)) break;
+    }
+    // Submit the recvs without waiting for the 1s timerfd tick, then close all
+    // peers back to back so every terminal EOF lands in one CQ burst.
+    const bool ready = armed == kPeers && backend.flush_pending_nonblocking();
+    if (ready) {
+        for (; peers_closed < kPeers; ++peers_closed) close(peer[peers_closed]);
+        // The default 1s periodic timerfd wakes wait(), so the attempt cap is a
+        // hang guard; a healthy run drains all terminals in a handful of waits.
+        for (u32 attempt = 0; attempt < 64 && eofs < kPeers && backend.failure_code() == 0;
+             ++attempt) {
+            const u32 n = backend.wait(events, kMaxEventsPerWait, conns.get(), kPeers);
+            for (u32 i = 0; i < n; ++i)
+                if (events[i].type == IoEventType::Recv && events[i].result == 0 &&
+                    events[i].more == 0)
+                    ++eofs;
+        }
+    }
+    const i32 failure = backend.failure_code();
+
+    // Single exit path: release every fd and the backend whatever happened above.
+    for (u32 i = peers_closed; i < made; ++i) close(peer[i]);
+    for (u32 i = 0; i < made; ++i) close(local[i]);
+    backend.shutdown();
+
+    // Too-low RLIMIT_NOFILE: skip rather than shrink the burst.
+    if (made < kPeers) SKIP("RLIMIT_NOFILE too low for the close burst");
+    REQUIRE_EQ(armed, kPeers);
+    REQUIRE(ready);
+    CHECK_EQ(failure, 0);
+    CHECK_EQ(eofs, kPeers);
+}
+
 // Shrink both ends' socket buffers and write directly until EAGAIN, so a
 // subsequently submitted io_uring send on `fd` has nowhere to go and stays pending
 // (a CQE only arrives on cancel or once the peer drains). Returns bytes pre-filled.
@@ -5269,6 +5336,7 @@ TEST(uring, upstream_recv_pause_cancel_wins_recv_first_rearms_on_cancel) {
         CHECK(true);  // no io_uring here — add_recv_upstream can't queue; skip
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
 
@@ -5294,6 +5362,7 @@ TEST(uring, upstream_recv_pause_cancel_cqe_first_rearms_on_recv) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
 
@@ -5320,6 +5389,7 @@ TEST(uring, upstream_recv_pause_cancel_first_armed_cleared_waits_for_recv) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.upstream_recv_armed = false;  // proxy_stream_complete cleared it; recv still in flight
@@ -5346,6 +5416,7 @@ TEST(uring, upstream_recv_pause_submit_in_window_remembers_rearm) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.upstream_recv_pause_rearm_pending = false;  // no re-arm requested yet
@@ -5372,6 +5443,7 @@ TEST(uring, upstream_recv_pause_cancel_loses_suppresses_stale_and_rearms) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.upstream_recv_terminal_stale = true;  // pause fired at body-done — terminal is stale
@@ -5395,6 +5467,7 @@ TEST(uring, upstream_recv_pause_active_response_terminal_is_delivered) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.resp_fully_buffered = false;                // body still streaming — bytes are real
@@ -5415,6 +5488,7 @@ TEST(uring, upstream_recv_stale_terminal_suppressed_after_resp_cleared) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.upstream_recv_terminal_stale = true;         // pause fired at body-done
@@ -5437,6 +5511,7 @@ TEST(uring, upstream_recv_stale_data_cqe_discarded_and_rolled_back) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.upstream_recv_terminal_stale = true;  // body-done pause
@@ -5472,6 +5547,7 @@ TEST(uring, upstream_recv_repause_after_body_done_upgrades_stale) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);                  // cancel already in flight
     conn.upstream_recv_terminal_stale = false;  // captured mid-body
@@ -5490,6 +5566,7 @@ TEST(uring, upstream_recv_pause_cancel_no_rearm_after_close) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     arm_paused_upstream(conn);
     conn.upstream_recv_armed = false;  // recv already drained; cancel still in flight
@@ -5511,6 +5588,7 @@ TEST(uring, upstream_recv_cancel_on_closed_conn_reclaims_slot) {
         CHECK(true);
         return;
     }
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     conn.fd = -1;  // already closed (close_conn ran)
     conn.upstream_fd = -1;
@@ -5526,6 +5604,288 @@ TEST(uring, upstream_recv_cancel_on_closed_conn_reclaims_slot) {
     loop->shutdown();
 }
 
+// ---- Lazy connection slots (IoUringEventLoop::slots_initialized) ----
+//
+// conns[] is mapped but neither constructed nor reset at init; alloc_conn hands
+// fresh ids out in ascending order and advances the watermark. Slots at or above
+// the watermark are untouched zero pages and must never be read or acted on.
+
+// Number of resident pages in [first_untouched_page, end) of the conns mapping,
+// where the first untouched page is the first one past slot `used - 1`.
+static u32 resident_conn_pages_past(IoUringEventLoop& loop, u32 used) {
+    const u64 page = static_cast<u64>(sysconf(_SC_PAGESIZE));
+    const u64 bytes = static_cast<u64>(loop.connection_capacity) * sizeof(Connection);
+    const u64 first = (static_cast<u64>(used) * sizeof(Connection) - 1) / page + 1;
+    const u64 pages = (bytes + page - 1) / page;
+    if (first >= pages) return 0;
+    auto* vec = static_cast<unsigned char*>(
+        mmap(nullptr, pages, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (vec == MAP_FAILED) return ~0u;
+    u32 resident = 0;
+    auto* base = reinterpret_cast<u8*>(loop.conns.data());
+    if (mincore(base + first * page, static_cast<size_t>((pages - first) * page), vec) != 0) {
+        munmap(vec, pages);
+        return ~0u;
+    }
+    for (u64 i = 0; i < pages - first; i++) resident += vec[i] & 1u;
+    munmap(vec, pages);
+    return resident;
+}
+
+// Residency is only meaningful at 4 KiB granularity. On a host where THP is
+// eligible (enabled=always, or a 2 MiB-aligned mapping under an environment that
+// madvises it) the first slot's fault maps a whole 2 MiB huge page and reports
+// ~511 neighbouring pages resident, which says nothing about the code under
+// test. Opt the array out before any slot is touched. Call right after init.
+static void disable_conn_hugepages(IoUringEventLoop& loop) {
+    const u64 bytes = static_cast<u64>(loop.connection_capacity) * sizeof(Connection);
+    (void)madvise(loop.conns.data(), static_cast<size_t>(bytes), MADV_NOHUGEPAGE);
+}
+
+// A fresh loop has touched no slot, and an idle loop can be shut down as-is.
+TEST(uring, lazy_slots_fresh_loop_has_zero_watermark) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    CHECK_EQ(loop->slots_initialized, 0u);
+    CHECK_EQ(loop->conns.constructed(), 0u);
+    CHECK_EQ(loop->free_top, loop->connection_capacity);
+    CHECK_EQ(loop->active_count(), 0u);
+    loop->force_close_all();  // walks [0, watermark) == nothing
+    CHECK_EQ(loop->slots_initialized, 0u);
+    loop->shutdown();
+}
+
+// The watermark tracks the peak number of simultaneously allocated slots, not
+// the capacity; freed slots are reused without advancing it.
+TEST(uring, lazy_slots_watermark_tracks_peak_and_survives_churn) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    Connection* held[8] = {};
+    for (u32 i = 0; i < 5; i++) {
+        held[i] = loop->alloc_conn();
+        REQUIRE(held[i] != nullptr);
+        CHECK_EQ(held[i]->id, i);  // fresh slots come out in ascending order
+        CHECK_EQ(held[i]->fd, -1);
+        CHECK_EQ(loop->slots_initialized, i + 1);
+    }
+    CHECK_EQ(loop->conns.constructed(), 5u);
+    CHECK_EQ(loop->active_count(), 5u);
+
+    // Free out of order; reuse comes from the freed ids and the watermark holds.
+    loop->free_conn(*held[3]);
+    loop->free_conn(*held[1]);
+    CHECK_EQ(loop->slots_initialized, 5u);
+    Connection* a = loop->alloc_conn();
+    Connection* b = loop->alloc_conn();
+    REQUIRE(a != nullptr);
+    REQUIRE(b != nullptr);
+    CHECK((a->id == 1u && b->id == 3u) || (a->id == 3u && b->id == 1u));
+    CHECK_EQ(loop->slots_initialized, 5u);
+
+    // Growing past the old peak takes the next fresh ids.
+    held[5] = loop->alloc_conn();
+    held[6] = loop->alloc_conn();
+    REQUIRE(held[5] != nullptr);
+    REQUIRE(held[6] != nullptr);
+    CHECK_EQ(held[5]->id, 5u);
+    CHECK_EQ(held[6]->id, 6u);
+    CHECK_EQ(loop->slots_initialized, 7u);
+
+    // Heavy alloc/free churn below the peak never advances or regresses it.
+    for (u32 round = 0; round < 200; round++) {
+        Connection* c1 = loop->alloc_conn();
+        Connection* c2 = loop->alloc_conn();
+        REQUIRE(c1 != nullptr);
+        REQUIRE(c2 != nullptr);
+        CHECK(c1->id < 9u && c2->id < 9u);
+        loop->free_conn(*c2);
+        loop->free_conn(*c1);
+    }
+    CHECK(loop->slots_initialized <= 9u);
+    const u32 settled = loop->slots_initialized;
+    for (u32 round = 0; round < 200; round++) {
+        Connection* c1 = loop->alloc_conn();
+        REQUIRE(c1 != nullptr);
+        loop->free_conn(*c1);
+    }
+    CHECK_EQ(loop->slots_initialized, settled);
+    loop->shutdown();
+}
+
+// CQEs naming a slot at or above the watermark refer to a slot that was never
+// allocated. They are dropped as stale: no read of the untouched slot, no close
+// of "fd 0", no state change anywhere.
+TEST(uring, lazy_slots_event_beyond_watermark_is_ignored) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    Connection* live = loop->alloc_conn();
+    REQUIRE(live != nullptr);
+    REQUIRE_EQ(live->id, 0u);
+    const i32 live_fd = 7;
+    live->fd = live_fd;  // never closed below: the events must not reach it
+    REQUIRE_EQ(loop->slots_initialized, 1u);
+
+    struct stat fd0_before{};
+    const int fd0_before_rc = ::fstat(0, &fd0_before);
+
+    const u32 kStale = 5;  // < capacity, >= watermark
+    REQUIRE(kStale < loop->connection_capacity);
+    const IoEventType kTypes[] = {IoEventType::Recv,
+                                  IoEventType::Send,
+                                  IoEventType::UpstreamConnect,
+                                  IoEventType::UpstreamRecv,
+                                  IoEventType::UpstreamSend,
+                                  IoEventType::HandlerTimer,
+                                  IoEventType::ResponseReadTimer};
+    const i32 kResults[] = {0, -ECANCELED, 64, -EPIPE};
+    const u32 free_top_before = loop->free_top;
+    IoEvent batch[sizeof(kTypes) / sizeof(kTypes[0]) * 4];
+    u32 n = 0;
+    for (IoEventType type : kTypes) {
+        for (i32 result : kResults) {
+            IoEvent ev = make_ev(kStale, type, result);
+            batch[n++] = ev;
+            loop->dispatch(ev);  // direct dispatch path
+        }
+    }
+    loop->dispatch_batch(batch, n);  // batch path (response-read deadline prepare/settle)
+
+    // Nothing moved: watermark, free list, pending list, the live slot, the
+    // never-allocated slot (still all zero bytes) and fd 0.
+    CHECK_EQ(loop->slots_initialized, 1u);
+    CHECK_EQ(loop->free_top, free_top_before);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(live->fd, live_fd);
+    CHECK_EQ(loop->conns.constructed(), 1u);
+    static const u8 zeros[sizeof(Connection)] = {};
+    CHECK_EQ(__builtin_memcmp(&loop->conns[kStale], zeros, sizeof(Connection)), 0);
+    struct stat fd0_after{};
+    const int fd0_after_rc = ::fstat(0, &fd0_after);
+    CHECK_EQ(fd0_after_rc, fd0_before_rc);
+    if (fd0_before_rc == 0) CHECK_EQ(fd0_after.st_ino, fd0_before.st_ino);
+
+    live->fd = -1;  // let shutdown treat the slot as closed
+    loop->shutdown();
+}
+
+// The response-read-deadline batch machinery (prepare/find_or_add/settle) is
+// keyed by event conn_ids. A never-allocated slot reads as "no deadline", so a
+// wrong bound would not create an owner; it would, however, read (fault in) the
+// untouched slot. Assert the batch neither creates owners/pins nor touches the
+// suffix pages.
+TEST(uring, lazy_slots_response_read_batch_ignores_unallocated_slots) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    disable_conn_hugepages(*loop);
+    Connection* live = loop->alloc_conn();
+    REQUIRE(live != nullptr);
+    REQUIRE_EQ(loop->slots_initialized, 1u);
+    // Delta, not absolute zero: the assertion is that the batch makes no further
+    // suffix page resident, whatever the environment already mapped.
+    const u32 suffix_before = resident_conn_pages_past(*loop, 1);
+    REQUIRE(suffix_before != ~0u);
+
+    const u32 kFar = loop->connection_capacity - 1u;
+    IoEvent batch[4];
+    batch[0] = make_ev(kFar, IoEventType::UpstreamRecv, 16);  // episode 0 == zero slot's
+    batch[1] = make_ev(kFar, IoEventType::Recv, 0);           // downstream terminal
+    batch[2] = make_ev(kFar, IoEventType::ResponseReadTimer, 0);
+    batch[3] = make_ev(kFar, IoEventType::UpstreamRecv, -ECANCELED);
+    loop->prepare_response_read_deadline_batch(batch, 4);
+    CHECK_EQ(loop->response_read_batch_owner_count, 0u);
+    CHECK_EQ(loop->response_read_batch_pin_count, 0u);
+    CHECK_EQ(resident_conn_pages_past(*loop, 1), suffix_before);
+    loop->settle_response_read_deadline_batch();
+    CHECK_EQ(resident_conn_pages_past(*loop, 1), suffix_before);
+    loop->response_read_batch_events = nullptr;
+    loop->response_read_batch_event_count = 0;
+    loop->shutdown();
+}
+
+// Forced drain/shutdown walks only [0, watermark): live clients and parked
+// upstream fds in the used prefix are closed, and the untouched suffix is left
+// alone.
+TEST(uring, lazy_slots_force_close_all_with_partial_array) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    i32 cli[3][2];
+    for (auto& pair : cli) REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+    i32 parked[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, parked), 0);
+
+    Connection* conns[3];
+    for (u32 i = 0; i < 3; i++) {
+        conns[i] = loop->alloc_conn();
+        REQUIRE(conns[i] != nullptr);
+        conns[i]->fd = cli[i][0];
+    }
+    conns[1]->idle_return_fd = parked[0];  // parked upstream fd on a live client
+    REQUIRE_EQ(loop->slots_initialized, 3u);
+
+    loop->force_close_all();
+
+    CHECK_EQ(loop->slots_initialized, 3u);
+    CHECK_EQ(conns[1]->idle_return_fd, -1);
+    CHECK(::close(parked[0]) < 0);  // closed by the walk
+    close(parked[1]);
+    for (u32 i = 0; i < 3; i++) {
+        close(cli[i][1]);
+        // Each live client fd was closed by close_conn, never one from the suffix.
+        CHECK(::fcntl(cli[i][0], F_GETFD) == -1);
+    }
+    loop->shutdown();
+}
+
+// A drain tick over a partially used array closes the live clients, walks only
+// [0, watermark) (no fd 0 close, no page of the untouched suffix faulted in),
+// and leaves the loop with nothing active so run() can finish draining.
+TEST(uring, lazy_slots_drain_tick_with_partial_array) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) {
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    disable_conn_hugepages(*loop);
+    i32 cli[3][2];
+    for (auto& pair : cli) REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+    for (u32 i = 0; i < 3; i++) {
+        Connection* c = loop->alloc_conn();
+        REQUIRE(c != nullptr);
+        c->fd = cli[i][0];
+        c->state = ConnState::ReadingHeader;
+    }
+    REQUIRE_EQ(loop->slots_initialized, 3u);
+    REQUIRE(loop->connection_capacity > 64u);
+    const u32 suffix_before = resident_conn_pages_past(*loop, 3);
+    REQUIRE(suffix_before != ~0u);
+
+    struct stat fd0_before{};
+    const int fd0_before_rc = ::fstat(0, &fd0_before);
+
+    loop->drain(0);  // period 0: every ReadingHeader client closes on the first tick
+    loop->dispatch(make_ev(0, IoEventType::Timeout, 1));
+
+    for (u32 i = 0; i < 3; i++) CHECK(::fcntl(cli[i][0], F_GETFD) == -1);  // closed by drain
+    CHECK_EQ(loop->active_count(), 0u);  // nothing left, run() would stop
+    CHECK_EQ(loop->slots_initialized, 3u);
+    CHECK_EQ(resident_conn_pages_past(*loop, 3), suffix_before);  // suffix never read or written
+    struct stat fd0_after{};
+    const int fd0_after_rc = ::fstat(0, &fd0_after);
+    CHECK_EQ(fd0_after_rc, fd0_before_rc);
+    if (fd0_before_rc == 0) CHECK_EQ(fd0_after.st_ino, fd0_before.st_ino);
+    for (auto& pair : cli) close(pair[1]);
+    loop->shutdown();
+}
+
 // Codex P1 (PR #160): if close_conn runs while idle_return_fd is waiting for the
 // previous upstream recv/cancel drain, do not submit a second close-path
 // UpstreamRecv cancel for a newer upstream_fd on the same conn_id. The original
@@ -5537,6 +5897,7 @@ TEST(uring, close_with_idle_return_drain_skips_second_upstream_recv_cancel) {
         return;
     }
 
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     conn.reset();
     conn.id = 0;
@@ -5589,6 +5950,7 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
         return;
     }
 
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     conn.fd = 42;
     conn.pending_ops = 1;
@@ -5642,6 +6004,7 @@ TEST(uring, tls_send_want_read_recv_survives_send_pause) {
         return;
     }
 
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     conn.fd = 42;
     conn.tls_active = true;
@@ -5693,6 +6056,7 @@ TEST(uring, send_wait_into_upstream_wait_rearms_downstream_recv) {
         return;
     }
 
+    test_initialize_slots(*loop, 1);
     Connection& conn = loop->conns[0];
     conn.fd = 42;
     conn.upstream_fd = 99;  // upstream_target_matches() needs fd >= 0
@@ -7382,7 +7746,149 @@ TEST(shard, serves_http1_cleartext_iouring_cross_thread) {
     REQUIRE_GT(n, 0);
     CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
 }
+
+// Lazy connection slots end to end: a fresh shard has touched no slot, N
+// concurrent clients are all served, and the watermark equals the peak
+// concurrency (not the capacity).
+TEST(shard, iouring_lazy_slots_serve_and_watermark_tracks_peak) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    auto initialized = shard.init(0, lfd);
+    // A ring created right after another was closed can see a transient ENOMEM
+    // (the kernel releases the memlock charge asynchronously); retry briefly.
+    for (u32 attempt = 0; !initialized && initialized.error().code == ENOMEM && attempt < 40;
+         attempt++) {
+        usleep(25000);
+        initialized = shard.init(0, lfd);
+    }
+    if (!initialized) {
+        close(lfd);
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    constexpr u32 kClients = 5;
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        i32 clients[kClients];
+        ShardGuard(Shard<IoUringEventLoop>& s, i32& l) : shard(s), listen_fd(l) {
+            for (auto& c : clients) c = -1;
+        }
+        ~ShardGuard() {
+            for (auto c : clients)
+                if (c >= 0) close(c);
+            shard.stop();
+            shard.join();
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } guard{shard, lfd};
+    CHECK_EQ(shard.loop->slots_initialized, 0u);
+    CHECK_EQ(shard.loop->conns.constructed(), 0u);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.spawn(-1).has_value());
+
+    // Keep every client open so the peak concurrent connection count is exact.
+    for (u32 i = 0; i < kClients; i++) {
+        i32 c = connect_to(port);
+        REQUIRE(c >= 0);
+        guard.clients[i] = c;
+        set_socket_timeouts(c, 2);
+        REQUIRE(send_all(c, HTTP_REQ, HTTP_REQ_LEN));
+        char buf[1024];
+        const i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        REQUIRE_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+    }
+    // Read the watermark only after the shard thread has stopped.
+    shard.stop();
+    shard.join();
+    CHECK_EQ(shard.loop->slots_initialized, kClients);
+    CHECK_EQ(shard.loop->conns.constructed(), kClients);
+    CHECK(shard.loop->slots_initialized < shard.loop->connection_capacity);
+}
 }  // namespace
+
+// Multishot accept ends (without F_MORE) when the kernel hits EMFILE. The shard
+// must re-arm it on a later timer tick instead of silently never accepting again.
+// Uses the real kernel: lower the soft RLIMIT_NOFILE to the lowest free fd so the
+// next accept fails with EMFILE, connect, restore, and expect the connection that
+// was queued during exhaustion and a fresh one to both be served.
+TEST(shard, iouring_accept_rearms_after_emfile) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring cannot initialize in this environment");
+    }
+    struct rlimit saved{};
+    REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &saved), 0);
+    struct Guard {
+        Shard<IoUringEventLoop>& shard;
+        i32 listen_fd;
+        struct rlimit saved;
+        i32 fds[2] = {-1, -1};
+        ~Guard() {
+            setrlimit(RLIMIT_NOFILE, &saved);
+            for (i32 fd : fds)
+                if (fd >= 0) close(fd);
+            shard.stop();
+            shard.join();
+            shard.shutdown();
+            close(listen_fd);
+        }
+    } guard{shard, lfd, saved};
+    const u16 port = get_port(lfd);
+
+    // Pre-create both client sockets: no fd allocation is possible while limited.
+    for (i32& fd : guard.fds) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(fd >= 0);
+        set_socket_timeouts(fd, 4);
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = __builtin_bswap16(port);
+    addr.sin_addr.s_addr = __builtin_bswap32(0x7F000001);
+
+    // The kernel snapshots RLIMIT_NOFILE when an accept SQE is prepared, so the
+    // limit must be lowered before the shard arms its multishot accept. Lowest
+    // free fd number == new soft limit: any further fd allocation fails.
+    const i32 probe = dup(lfd);
+    REQUIRE(probe >= 0);
+    close(probe);
+    struct rlimit tight = saved;
+    tight.rlim_cur = static_cast<rlim_t>(probe);
+    REQUIRE_EQ(setrlimit(RLIMIT_NOFILE, &tight), 0);
+    REQUIRE(shard.spawn(-1).has_value());
+    usleep(100000);  // let the initial multishot accept arm under the tight limit
+
+    // The kernel completes the handshake into the backlog; the shard's accept
+    // fails with -EMFILE and the multishot request terminates.
+    REQUIRE_EQ(connect(guard.fds[0], reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0);
+    // Prove the EMFILE path ran: while the limit is still tight the connection
+    // must NOT be served. (If the accept were armed late, or succeeded, this
+    // would be answered and the test would not be exercising re-arm at all.)
+    REQUIRE(send_all(guard.fds[0], HTTP_REQ, HTTP_REQ_LEN));
+    char buf[1024];
+    CHECK_EQ(recv_timeout(guard.fds[0], buf, sizeof(buf), 300), -EAGAIN);
+    REQUIRE_EQ(setrlimit(RLIMIT_NOFILE, &saved), 0);
+
+    // Re-armed on the next 1s tick: the queued connection is accepted and served.
+    i32 n = recv_timeout(guard.fds[0], buf, sizeof(buf), 4000);
+    REQUIRE_GT(n, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+
+    // And a fresh connection afterwards is accepted too (accept stays armed).
+    REQUIRE_EQ(connect(guard.fds[1], reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)), 0);
+    REQUIRE(send_all(guard.fds[1], HTTP_REQ, HTTP_REQ_LEN));
+    n = recv_timeout(guard.fds[1], buf, sizeof(buf), 4000);
+    REQUIRE_GT(n, 0);
+    CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+}
 
 // HTTP/2 over io_uring uses the identical callbacks_h2.h serving path as epoll;
 // only the I/O submission differs. Skipped where io_uring async socket ops don't
@@ -12723,6 +13229,7 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         close(lfd);
         SKIP("io_uring queue init unavailable in this environment");
     }
+    test_initialize_slots(*shard.loop, 5);
     RouteConfig cfg_a{};
     RouteConfig cfg_b{};
 
@@ -12846,6 +13353,7 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
     RouteConfig cfg{};
     shard.active_config = &cfg;
 
+    test_initialize_slots(*shard.loop, 3);
     // Live client (fd >= 0) with a parked upstream fd whose recv is still draining.
     auto& live = shard.loop->conns[0];
     live.reset();
@@ -20214,7 +20722,7 @@ struct ScopedIoUringProxyRequestCompletionBarrier {
 
         u32 live_count = 0;
         u32 matching_count = 0;
-        for (u32 i = 0; i < IoUringEventLoop::kMaxConns; i++) {
+        for (u32 i = 0; i < loop->slots_initialized; i++) {
             const Connection& conn = loop->conns[i];
             if (conn.fd < 0) continue;
             live_count++;
@@ -20290,8 +20798,8 @@ struct ScopedIoUringProxyRequestCompletionBarrier {
 
         while (loop->is_running()) {
             loop->retry_strict_upstream_retirement_cancels();
-            const u32 n = loop->backend.wait(
-                events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+            const u32 n =
+                loop->backend.wait(events, kMaxEventsPerWait, loop->conns, loop->slots_initialized);
             if (loop->backend.failure_code() != 0) {
                 loop->stop();
                 break;
@@ -21525,7 +22033,7 @@ route GET "/compiled-sentinel" { return 204 }
     CHECK_FALSE(capture_ring->pop(no_capture));
 
     bool all_connections_settled = true;
-    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+    for (u32 id = 0; id < shard.loop->slots_initialized; id++) {
         const Connection& conn = shard.loop->conns[id];
         all_connections_settled &=
             conn.fd == -1 && conn.upstream_fd == -1 && conn.pending_ops == 0 &&
@@ -22164,7 +22672,7 @@ route exact "/static" { return local_response({
     CHECK_FALSE(capture_ring->pop(no_capture));
 
     bool all_connections_settled = true;
-    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+    for (u32 id = 0; id < shard.loop->slots_initialized; id++) {
         const Connection& conn = shard.loop->conns[id];
         all_connections_settled &=
             conn.fd == -1 && conn.on_recv == nullptr && conn.on_send == nullptr &&
@@ -22489,7 +22997,7 @@ route exact "/static" { return local_response({
     CHECK_FALSE(capture_ring->pop(no_capture));
 
     bool all_connections_settled = true;
-    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+    for (u32 id = 0; id < shard.loop->slots_initialized; id++) {
         const Connection& conn = shard.loop->conns[id];
         all_connections_settled &=
             conn.fd == -1 && conn.on_recv == nullptr && conn.on_send == nullptr &&
@@ -22812,7 +23320,7 @@ route exact "/static" { return local_response({
     CHECK_FALSE(capture_ring->pop(no_capture));
 
     bool all_connections_settled = true;
-    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+    for (u32 id = 0; id < shard.loop->slots_initialized; id++) {
         const Connection& conn = shard.loop->conns[id];
         all_connections_settled &=
             conn.fd == -1 && conn.on_recv == nullptr && conn.on_send == nullptr &&
@@ -23138,7 +23646,7 @@ route exact "/static" { return local_response({
     CHECK_FALSE(capture_ring->pop(no_capture));
 
     bool all_connections_settled = true;
-    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+    for (u32 id = 0; id < shard.loop->slots_initialized; id++) {
         const Connection& conn = shard.loop->conns[id];
         all_connections_settled &=
             conn.fd == -1 && conn.on_recv == nullptr && conn.on_send == nullptr &&
@@ -23521,7 +24029,7 @@ route "/" {
     CHECK_FALSE(capture_ring->pop(no_capture));
 
     bool all_connections_settled = true;
-    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+    for (u32 id = 0; id < shard.loop->slots_initialized; id++) {
         const Connection& conn = shard.loop->conns[id];
         all_connections_settled &=
             conn.fd == -1 && conn.on_recv == nullptr && conn.on_send == nullptr &&
@@ -24479,7 +24987,7 @@ route GET "/fixed" {
     CHECK_EQ(shard.epoch.epoch.load(std::memory_order_acquire), kStaticQueryVectorCount * 2u);
 
     bool all_connections_settled = true;
-    for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++) {
+    for (u32 id = 0; id < shard.loop->slots_initialized; id++) {
         const Connection& conn = shard.loop->conns[id];
         all_connections_settled &=
             conn.fd == -1 && conn.pending_ops == 0 && conn.request_config == nullptr &&
@@ -32652,7 +33160,7 @@ TEST(route, ordinary_source_validated_failure_late_successor_iouring) {
                 const u32 sq_tail_before_wait =
                     __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
                 const u32 n = loop->backend.wait(
-                    events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+                    events, kMaxEventsPerWait, loop->conns, loop->slots_initialized);
                 if (loop->backend.failure_code() != 0) {
                     loop->stop();
                     break;
@@ -33250,7 +33758,7 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
                 const u32 sq_tail_before_wait =
                     __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
                 const u32 n = loop->backend.wait(
-                    events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+                    events, kMaxEventsPerWait, loop->conns, loop->slots_initialized);
                 if (loop->backend.failure_code() != 0) {
                     loop->stop();
                     break;
@@ -33937,7 +34445,7 @@ TEST(route, ordinary_source_coalesced_strict_get_successor_iouring) {
             while (loop->is_running()) {
                 loop->retry_strict_upstream_retirement_cancels();
                 const u32 n = loop->backend.wait(
-                    events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+                    events, kMaxEventsPerWait, loop->conns, loop->slots_initialized);
                 if (loop->backend.failure_code() != 0) {
                     loop->stop();
                     break;
@@ -34347,7 +34855,7 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
             while (loop->is_running()) {
                 loop->retry_strict_upstream_retirement_cancels();
                 const u32 n = loop->backend.wait(
-                    events, kMaxEventsPerWait, loop->conns, IoUringEventLoop::kMaxConns);
+                    events, kMaxEventsPerWait, loop->conns, loop->slots_initialized);
                 if (loop->backend.failure_code() != 0) {
                     loop->stop();
                     break;
@@ -34511,7 +35019,7 @@ TEST(route, ordinary_source_coalesced_exact_strict_get_successor_iouring) {
                             upstream_send.upstream_episode == 0 && upstream_send.generation == 0;
 
                         u32 armed_sends = 0;
-                        for (u32 id = 0; id < IoUringEventLoop::kMaxConns; id++)
+                        for (u32 id = 0; id < loop->slots_initialized; id++)
                             armed_sends += loop->conns[id].send_armed ? 1u : 0u;
                         const auto& send = loop->backend.send_state[self->conn_id];
                         self->exact_only_send_armed =
