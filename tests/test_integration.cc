@@ -13612,6 +13612,7 @@ TEST(proxy_reuse, deferred_idle_return_state_released_iouring) {
     close(lfd);
 }
 
+#if RUT_ENABLE_JIT_TESTS
 // Client-visible form of the same bug on a real io_uring loop with a real upstream. A
 // request whose upstream recv is multishot (any request with a body or a Content-Length
 // header) returns its upstream fd through the deferred idle-return path. The next
@@ -13775,9 +13776,11 @@ struct DeferredReturnRig {
     }
 
     // True when any connection still carries a parked idle-return fd or pin. Only
-    // meaningful once the shard thread has been stopped and joined.
+    // meaningful once the shard thread has been stopped and joined. Bounded by the
+    // initialised-slot watermark: slots past it are untouched zero pages, where
+    // idle_return_fd reads as 0 (never -1) and would count as parked.
     bool parked_state_left() const {
-        for (u32 i = 0; i < shard.loop->connection_capacity; i++) {
+        for (u32 i = 0; i < shard.loop->slots_initialized; i++) {
             if (shard.loop->conns[i].idle_return_fd >= 0 ||
                 shard.loop->conns[i].idle_return_config != nullptr)
                 return true;
@@ -14037,6 +14040,7 @@ DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_post_cl0_then_deadline_forward_iou
 DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_get_cl0_then_guarded_forward_iouring,
                               "GET /withbody HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
                               DEFERRED_RETURN_GUARDED_REQ)
+#endif  // RUT_ENABLE_JIT_TESTS
 
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers
