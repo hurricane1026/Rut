@@ -143,11 +143,27 @@ struct IoUringBackend {
     // to the event loop and owns an independent pending-op count.
     // Dispatching the terminal can rearm or reuse the numeric connection slot,
     // so only records strictly before the frozen tail are known to belong to
-    // the old owner.  The fixed inventory is bounded by one wait batch.
+    // the old owner.
+    //
+    // A window stays live until head reaches its frozen tail, which can take
+    // several wait() calls (each returns at most kMaxEventsPerWait events), so
+    // the inventory is NOT bounded by one batch.  Expiry runs at the loop top
+    // before every add, so head never steps past a live window's frozen tail.
+    // There is at most one live window per downstream token, and the token is a
+    // pure function of conn_id, so the true bound is
+    // min(connection_capacity, cq_ring_entries).  cq_ring_entries alone is a
+    // safe over-approximation: every live window was recorded for a CQE consumed
+    // less than that far behind head.  The array is mmap'd in init() and only
+    // the first `count` slots are ever touched.
+    //
+    // Lookup and expiry are linear in the number of live windows, so a burst of
+    // N terminals costs O(N^2) on the shard thread (~120 ms of wait() CPU at
+    // N=16000).  Tracked as a follow-up; the data structure is unchanged here.
     struct DownstreamRecvTerminalWindow {
         u64 user_data = 0;
         u32 tail_exclusive = 0;
-    } downstream_recv_terminal_windows[kMaxEventsPerWait];
+    }* downstream_recv_terminal_windows = nullptr;
+    u32 downstream_recv_terminal_window_capacity = 0;
     u32 downstream_recv_terminal_window_count = 0;
     u32 downstream_recv_progress_head = 0;
     bool downstream_recv_progress_valid = false;
@@ -452,7 +468,8 @@ private:
 
     void reset_downstream_recv_wait_state() {
         deferred_downstream_recv = {};
-        for (auto& window : downstream_recv_terminal_windows) window = {};
+        for (u32 i = 0; i < downstream_recv_terminal_window_count; i++)
+            downstream_recv_terminal_windows[i] = {};
         downstream_recv_terminal_window_count = 0;
         downstream_recv_progress_head = 0;
         downstream_recv_progress_valid = false;

@@ -5106,6 +5106,71 @@ TEST(uring, wait_copies_recv_into_conn_buffer) {
     backend.shutdown();
 }
 
+// Many downstream peers closing at once: every armed multishot recv completes
+// with a terminal EOF CQE in the same CQ burst. A single wait() hands out at most
+// kMaxEventsPerWait events, so the terminal-CQE quarantine windows recorded for one
+// harvest stay live across several wait() calls and exceed one batch. Regression:
+// the fixed 256-slot window inventory overflowed and the shard died with EPROTO.
+TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
+    // Fails on the old 256-slot inventory from 257 terminals up; 600 fds fit the
+    // default 1024 soft limit.
+    constexpr u32 kPeers = 300;
+    IoUringBackend backend;
+    if (!backend.init(0, -1, kPeers)) SKIP("io_uring unavailable");
+
+    auto conns = std::make_unique<Connection[]>(kPeers);
+    auto local = std::make_unique<i32[]>(kPeers);
+    auto peer = std::make_unique<i32[]>(kPeers);
+    u32 made = 0;
+    for (; made < kPeers; ++made) {
+        i32 fds[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) != 0) break;
+        local[made] = fds[0];
+        peer[made] = fds[1];
+        conns[made].reset();
+        conns[made].id = made;
+        conns[made].fd = fds[0];
+    }
+
+    IoEvent events[kMaxEventsPerWait]{};
+    u32 armed = 0;
+    u32 peers_closed = 0;
+    u32 eofs = 0;
+    if (made == kPeers) {
+        for (; armed < kPeers; ++armed)
+            if (!backend.add_recv(local[armed], armed)) break;
+    }
+    // Submit the recvs without waiting for the 1s timerfd tick, then close all
+    // peers back to back so every terminal EOF lands in one CQ burst.
+    const bool ready = armed == kPeers && backend.flush_pending_nonblocking();
+    if (ready) {
+        for (; peers_closed < kPeers; ++peers_closed) close(peer[peers_closed]);
+        // The default 1s periodic timerfd wakes wait(), so the attempt cap is a
+        // hang guard; a healthy run drains all terminals in a handful of waits.
+        for (u32 attempt = 0; attempt < 64 && eofs < kPeers && backend.failure_code() == 0;
+             ++attempt) {
+            const u32 n = backend.wait(events, kMaxEventsPerWait, conns.get(), kPeers);
+            for (u32 i = 0; i < n; ++i)
+                if (events[i].type == IoEventType::Recv && events[i].result == 0 &&
+                    events[i].more == 0)
+                    ++eofs;
+        }
+    }
+    const i32 failure = backend.failure_code();
+
+    // Single exit path: release every fd and the backend whatever happened above.
+    for (u32 i = peers_closed; i < made; ++i) close(peer[i]);
+    for (u32 i = 0; i < made; ++i) close(local[i]);
+    backend.shutdown();
+
+    // Too-low RLIMIT_NOFILE: skip rather than shrink the burst.
+    if (made < kPeers) SKIP("RLIMIT_NOFILE too low for the close burst");
+    REQUIRE_EQ(armed, kPeers);
+    REQUIRE(ready);
+    CHECK_EQ(failure, 0);
+    CHECK_EQ(eofs, kPeers);
+}
+
 // Shrink both ends' socket buffers and write directly until EAGAIN, so a
 // subsequently submitted io_uring send on `fd` has nowhere to go and stays pending
 // (a CQE only arrives on cancel or once the peer drains). Returns bytes pre-filled.
