@@ -646,12 +646,22 @@ public:
                c.upstream_close_pause_cancel_owned;
     }
 
+    // A deferred idle-pool return (return_idle_upstream) whose cancelled multishot
+    // recv has not drained yet: idle_return_fd/idle_return_config are still pinned,
+    // so the successor-neutrality predicates would reject request 2. Same condition
+    // as close_conn_impl's idle_return_recv_draining. try_deferred_upstream_rearm
+    // clears the pin and publishes readiness when the drain completes.
+    static bool idle_return_drain_blocks_boundary(const Connection& c) {
+        return c.idle_return_fd >= 0 && (c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
+                                         c.upstream_recv_pause_cancel_pending);
+    }
+
     void maybe_publish_http1_boundary_ready(Connection& c) {
         if (c.id >= connection_capacity || conns.data() == nullptr || &conns[c.id] != &c ||
             c.fd < 0 || !c.http1_boundary_deferred || c.http1_boundary_ready ||
             (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None &&
              c.http1_prebuilt_wait != 0) ||
-            strict_upstream_retirement_blocks_reclaim(c) ||
+            strict_upstream_retirement_blocks_reclaim(c) || idle_return_drain_blocks_boundary(c) ||
             !c.response_read_timer_owner_is_neutral())
             return;
         c.http1_boundary_ready = true;
@@ -691,7 +701,7 @@ public:
             return true;
         }
         if (!strict_upstream_retirement_blocks_reclaim(c) &&
-            c.response_read_timer_owner_is_neutral())
+            !idle_return_drain_blocks_boundary(c) && c.response_read_timer_owner_is_neutral())
             return false;
         if (c.http1_boundary_deferred || c.http1_boundary_ready) {
             // A duplicate rendezvous cannot be resumed safely. Keep it parked;
@@ -699,6 +709,10 @@ public:
             close_conn(c);
             return true;
         }
+        // Request 1's callbacks are spent, and the resume validity check refuses a
+        // connection that still advertises one. The io_uring TLS completion
+        // (tls_on_out_drain -> proxy_stream_complete) reaches here with them set.
+        c.clear_slots();
         c.http1_boundary_deferred = true;
         c.http1_boundary_ready = false;
         c.http1_boundary_successor_episode = c.upstream_episode;
@@ -2427,7 +2441,7 @@ public:
             c.http1_boundary_ready = false;
             if (!c.http1_boundary_deferred) continue;
             if (strict_upstream_retirement_blocks_reclaim(c) ||
-                !c.response_read_timer_owner_is_neutral())
+                idle_return_drain_blocks_boundary(c) || !c.response_read_timer_owner_is_neutral())
                 continue;
             const u32 expected_episode = c.http1_boundary_successor_episode;
 
@@ -5651,6 +5665,9 @@ public:
             if (kConfigStale || kStaleBytes || kDraining || !upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
+            // A request boundary parked behind this drain (defer_http1_request_boundary)
+            // is now ready: the pin is cleared, so request 2 sees a neutral connection.
+            maybe_publish_http1_boundary_ready(c);
         }
         // Deferred close: close_conn_impl tore the conn down (e.g. Connection: close)
         // while the deferred pool-return was still draining, leaving the slot allocated
