@@ -247,6 +247,21 @@ public:
     MappedArray<Connection> conns;
     MappedArray<u32> free_stack;
     u32 free_top = 0;
+    // Initialised-prefix watermark for `conns`. Slots [0, slots_initialized)
+    // have each been constructed and reset() (id/shard_id set) and are valid to
+    // read; slots at or above it are untouched anonymous zero pages (conns is
+    // mapped with MappedArray::init_lazy). A zeroed slot is NOT a valid free
+    // slot: fds are -1 after reset() but 0 when zeroed, so it must never be read.
+    // free_stack is seeded so fresh ids pop in ascending order, which keeps the
+    // never-used slots a suffix; initialize_slots_to() keeps the prefix property
+    // regardless of hand-out order.
+    // Bounded by the watermark: any index that can arrive without a live
+    // allocation behind it (CQE/event conn_ids, response-read batch owners and
+    // pins, the body-pump ready set, reclaim_slot arguments) and every walk over
+    // all slots. Allocated by construction (not bounded): Connection& c handed
+    // out by alloc_conn and the pending_free ids, which are only ever pushed from
+    // closed live slots.
+    u32 slots_initialized = 0;
 
     // Pending-free list: slots closed during the current dispatch batch.
     MappedArray<u32> pending_free;
@@ -328,7 +343,7 @@ public:
     static constexpr u32 kCaptureSliceSize = 8192;
     u8* capture_region_ = nullptr;
 
-    core::Expected<void, Error> init_slot_storage(u32 capacity, u32 id = 0) {
+    core::Expected<void, Error> init_slot_storage(u32 capacity) {
         if (!validate_connection_capacity(capacity))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
         if (connection_capacity != 0)
@@ -336,7 +351,7 @@ public:
                        ? core::Expected<void, Error>{}
                        : core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
         response_read_deadline_body_pump_pending = false;
-        auto c = conns.init(capacity);
+        auto c = conns.init_lazy(capacity);
         if (!c) return core::make_unexpected(c.error());
         auto f = free_stack.init(capacity);
         if (!f) {
@@ -364,14 +379,15 @@ public:
             conns.destroy();
             return core::make_unexpected(ready_words.error());
         }
+        // conns[] is mapped but neither constructed nor reset (lazy pages);
+        // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
+        // the stack so pops ascend.
         for (u32 i = 0; i < capacity; i++) {
-            conns[i].reset();
-            conns[i].id = i;
-            conns[i].shard_id = static_cast<u8>(id);
-            free_stack[i] = i;
+            free_stack[i] = capacity - 1 - i;
             pending_free[i] = 0;
         }
         free_top = capacity;
+        slots_initialized = 0;
         pending_free_count = 0;
         response_read_deadline_body_pump_pending = false;
         connection_capacity = capacity;
@@ -380,6 +396,7 @@ public:
 
     void destroy_slot_storage() {
         connection_capacity = 0;
+        slots_initialized = 0;
         pending_free_count = 0;
         free_top = 0;
         response_read_deadline_body_pump_pending = false;
@@ -411,7 +428,7 @@ public:
             }
             capture_region_ = static_cast<u8*>(region);
         }
-        for (u32 i = 0; i < connection_capacity; i++) {
+        for (u32 i = 0; i < slots_initialized; i++) {
             if (conns[i].fd >= 0 && !conns[i].capture_buf)
                 conns[i].capture_buf = capture_region_ + static_cast<u64>(i) * kCaptureSliceSize;
         }
@@ -438,7 +455,7 @@ public:
                                      u32 capacity = kDefaultConnectionCapacity) {
         if (connection_capacity != 0)
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
-        auto slots = init_slot_storage(capacity, id);
+        auto slots = init_slot_storage(capacity);
         if (!slots) return core::make_unexpected(slots.error());
         shard_id = id;
         listen_fd = lfd;
@@ -511,7 +528,7 @@ public:
 
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
+            u32 n = backend.wait(events, kMaxEventsPerWait, conns, slots_initialized);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -2240,7 +2257,7 @@ public:
     // the shard through the existing explicit fatal path.
     void retry_strict_upstream_retirement_cancels() {
         if (upstream_retirement_retry_count == 0) return;
-        for (u32 id = 0; id < connection_capacity && upstream_retirement_retry_count != 0; id++) {
+        for (u32 id = 0; id < slots_initialized && upstream_retirement_retry_count != 0; id++) {
             Connection& c = conns[id];
             if (!c.upstream_retirement_cancel_retry) continue;
             if (!c.upstream_retirement_active ||
@@ -2403,7 +2420,7 @@ public:
     void resume_deferred_http1_boundaries() {
         if (!http1_boundary_ready_pending) return;
         http1_boundary_ready_pending = false;
-        for (u32 id = 0; id < connection_capacity; id++) {
+        for (u32 id = 0; id < slots_initialized; id++) {
             Connection& c = conns[id];
             if (!c.http1_boundary_ready) continue;
 
@@ -2715,7 +2732,7 @@ public:
     }
 
     void pin_response_read_batch_slot(u32 cid) {
-        if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
+        if (cid >= slots_initialized || response_read_batch_reuse_pinned(cid) ||
             response_read_batch_pin_count >= kMaxEventsPerWait)
             return;
         response_read_batch_pins[response_read_batch_pin_count++] = cid;
@@ -2729,7 +2746,7 @@ public:
     }
 
     void reclaim_slot(u32 cid) {
-        if (cid >= connection_capacity || response_read_batch_reuse_pinned(cid) ||
+        if (cid >= slots_initialized || response_read_batch_reuse_pinned(cid) ||
             strict_upstream_retirement_blocks_reclaim(conns[cid]) ||
             !conns[cid].response_read_timer_owner_is_neutral())
             return;
@@ -2814,6 +2831,20 @@ public:
 
     // --- CRTP implementations (io_uring: async, with armed/pending_ops) ---
 
+    // Construct and reset() every slot in [slots_initialized, n) and advance the
+    // watermark. Cold path: only reached when a never-used slot is handed out.
+    void initialize_slots_to(u32 n) {
+        if (n > connection_capacity) n = connection_capacity;
+        if (n <= slots_initialized) return;
+        conns.construct_to(n);
+        for (u32 i = slots_initialized; i < n; i++) {
+            conns[i].reset();
+            conns[i].id = i;
+            conns[i].shard_id = static_cast<u8>(shard_id);
+        }
+        slots_initialized = n;
+    }
+
     Connection* alloc_conn_impl() {
         if (free_top == 0) return nullptr;
         u8* rs = pool.alloc();
@@ -2824,6 +2855,10 @@ public:
             return nullptr;
         }
         u32 id = free_stack[--free_top];
+        // Fresh ids pop in ascending order, so a never-used slot is exactly
+        // the next one past the watermark; initialize_slots_to also covers any
+        // gap so the prefix invariant does not depend on hand-out order.
+        if (id >= slots_initialized) initialize_slots_to(id + 1);
         // A free slot has drained every target and cancel completion. Failed
         // sends can leave unsent bytes in the backend proactor even after the
         // connection's close ledger drains; those bytes belong to the old fd.
@@ -3993,7 +4028,7 @@ public:
         for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
             if (response_read_batch_owners[i].conn_id == cid) return static_cast<u16>(i + 1);
         }
-        if (cid >= connection_capacity || response_read_batch_owner_count >= kMaxEventsPerWait)
+        if (cid >= slots_initialized || response_read_batch_owner_count >= kMaxEventsPerWait)
             return 0;
         const Connection& c = conns[cid];
         if (c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
@@ -4033,7 +4068,7 @@ public:
                 return static_cast<u16>(i + 1);
             }
         }
-        if (cid >= connection_capacity || response_read_batch_owner_count >= kMaxEventsPerWait)
+        if (cid >= slots_initialized || response_read_batch_owner_count >= kMaxEventsPerWait)
             return 0;
         const Connection& c = conns[cid];
         if (!c.response_read_timer_owner_is_valid()) return 0;
@@ -4071,7 +4106,7 @@ public:
         // terminal creates an entry without retaining a Connection pointer.
         for (u32 i = 0; i < count; ++i) {
             const IoEvent& ev = events[i];
-            if (ev.conn_id >= connection_capacity) continue;
+            if (ev.conn_id >= slots_initialized) continue;
             const Connection& c = conns[ev.conn_id];
             const bool current_upstream =
                 ev.type == IoEventType::UpstreamRecv && ev.upstream_episode == c.upstream_episode;
@@ -4084,7 +4119,7 @@ public:
 
         for (u32 i = 0; i < count; ++i) {
             const IoEvent& ev = events[i];
-            if (ev.conn_id >= connection_capacity) continue;
+            if (ev.conn_id >= slots_initialized) continue;
             u16 owner_index = 0;
             for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
                 if (response_read_batch_owners[oi].conn_id == ev.conn_id) {
@@ -5004,7 +5039,7 @@ public:
     void settle_response_read_deadline_batch() {
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
             auto& owner = response_read_batch_owners[oi];
-            if (owner.conn_id >= connection_capacity) continue;
+            if (owner.conn_id >= slots_initialized) continue;
             Connection& c = conns[owner.conn_id];
             const bool precise_complete_content_length =
                 c.response_read_deadline_post_commit_phase ==
@@ -5451,7 +5486,7 @@ public:
             close_conn(c);
             return true;
         };
-        for (u32 id = 0; id < connection_capacity; id++) {
+        for (u32 id = 0; id < slots_initialized; id++) {
             Connection& c = conns[id];
             if (c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending)
                 continue;
@@ -5496,7 +5531,7 @@ private:
                 body_pump_ready_words[word_index] &= ~bit_mask;
                 remaining_mask = bit == 63u ? 0 : (~u64{0} << (bit + 1u));
 
-                if (id >= connection_capacity) continue;
+                if (id >= slots_initialized) continue;
                 Connection& c = conns[id];
                 if (!c.response_read_deadline_post_commit_pump_pending) continue;
                 c.response_read_deadline_post_commit_pump_pending = false;
@@ -5963,7 +5998,7 @@ public:
                 // here and must each decrement. yield_armed can't gate this
                 // because free_conn_impl::reset() clears the flag when a
                 // close lands while the timer is in flight.
-                if (ev.conn_id < connection_capacity) {
+                if (ev.conn_id < slots_initialized) {
                     auto& c = conns[ev.conn_id];
                     if (c.pending_ops > 0) c.pending_ops--;
                     const bool matching_generation =
@@ -6053,7 +6088,7 @@ public:
                     u64 start = drain_start_.load(std::memory_order_relaxed);
                     u32 period = drain_period_.load(std::memory_order_relaxed);
                     u64 now = monotonic_secs();
-                    for (u32 i = 0; i < connection_capacity; i++) {
+                    for (u32 i = 0; i < slots_initialized; i++) {
                         if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
                             should_drain_close(i, start, now, period)) {
                             this->close_conn(conns[i]);
@@ -6067,7 +6102,7 @@ public:
             case IoEventType::UpstreamConnect:
             case IoEventType::UpstreamRecv:
             case IoEventType::UpstreamSend:
-                if (ev.conn_id < connection_capacity) {
+                if (ev.conn_id < slots_initialized) {
                     auto& conn = conns[ev.conn_id];
                     if (ev.type == IoEventType::Send && consume_tagged_send_close_event(conn, ev))
                         break;
@@ -6510,7 +6545,7 @@ public:
                 }
                 break;
             case IoEventType::ResponseReadTimer:
-                if (ev.conn_id < connection_capacity &&
+                if (ev.conn_id < slots_initialized &&
                     valid_response_read_timer_transport_event(ev)) {
                     auto& c = conns[ev.conn_id];
                     // Timer CQEs are settled after the complete wait batch so
@@ -6543,7 +6578,7 @@ private:
     using Self = IoUringEventLoop;
 
     void close_live_clients() {
-        for (u32 i = 0; i < connection_capacity; i++) {
+        for (u32 i = 0; i < slots_initialized; i++) {
             if (conns[i].fd >= 0) {
                 // A LIVE keep-alive client can also hold a parked idle_return_fd while
                 // its upstream recv cancel drains. close_conn takes the deferred path
@@ -6555,7 +6590,7 @@ private:
     }
 
     void close_deferred_idle_return_fds() {
-        for (u32 i = 0; i < connection_capacity; i++) {
+        for (u32 i = 0; i < slots_initialized; i++) {
             // A reusable upstream fd is parked in idle_return_fd awaiting a recv-cancel
             // drain that this forced shutdown will never deliver — close it directly so
             // it can't leak. Covers both a slot whose client fd was already closed

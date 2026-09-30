@@ -23,6 +23,17 @@ public:
     ~MappedArray() { destroy(); }
 
     core::Expected<void, Error> init(u32 count) {
+        auto mapped = init_lazy(count);
+        if (!mapped) return mapped;
+        construct_to(count);
+        return {};
+    }
+
+    // Maps the region but constructs nothing: untouched anonymous pages stay
+    // non-resident. The caller owns an initialised-prefix watermark and calls
+    // construct_to(n) before first use of element n-1; destroy() runs
+    // destructors only for the constructed prefix.
+    core::Expected<void, Error> init_lazy(u32 count) {
         if (count == 0 || static_cast<u64>(count) > static_cast<u64>(SIZE_MAX) / sizeof(T))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
         if (ptr_) {
@@ -38,11 +49,17 @@ public:
 
         ptr_ = static_cast<T*>(region);
         count_ = count;
-        // Value-initialize elements so default member initializers and object
-        // lifetimes are honored; zero-filled mmap memory alone is insufficient.
-        for (; constructed_ < count_; ++constructed_) new (&ptr_[constructed_]) T{};
         return {};
     }
+
+    // Value-initialize elements [constructed, n) so default member initializers
+    // and object lifetimes are honored; zero-filled mmap memory alone is
+    // insufficient. Constructs in index order, so the prefix is contiguous.
+    void construct_to(u32 n) {
+        if (n > count_) n = count_;
+        for (; constructed_ < n; ++constructed_) new (&ptr_[constructed_]) T{};
+    }
+    u32 constructed() const { return constructed_; }
 
     void destroy() {
         if (!ptr_) return;

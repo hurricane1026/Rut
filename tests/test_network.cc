@@ -9450,6 +9450,7 @@ struct ScopedTlsRawSendLoop {
         loop = new (storage) IoUringEventLoop();
         initialized = loop->init_slot_storage(capacity).has_value();
         if (initialized) {
+            test_initialize_slots(*loop, capacity);
             loop->timer.init();
             auto& backend = loop->backend;
             backend.sq_head = &sq_head;
@@ -36595,8 +36596,7 @@ struct ScopedIoUringLoopForRetirement {
                        0);
         if (storage == MAP_FAILED) return false;
         loop = new (storage) IoUringEventLoop();
-        auto result = loop->init(0, -1);
-        initialized = result.has_value();
+        initialized = init_iouring_loop_with_retry(*loop);
         return initialized;
     }
 
@@ -36997,6 +36997,7 @@ struct StagedLocalSendFixture {
         if (loop_storage == MAP_FAILED) return false;
         loop = new (loop_storage) IoUringEventLoop();
         if (!loop->init_slot_storage(1).has_value()) return false;
+        test_initialize_slots(*loop, 1);
         loop->backend.sq_head = &sq_head;
         loop->backend.sq_tail = &sq_tail;
         loop->backend.sq_ring_mask = &sq_mask;
@@ -40243,7 +40244,14 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     fixture.guard.loop->backend.downstream_recv_terminal_window_count = 1;
     fixture.guard.loop->backend.downstream_recv_progress_head = 37;
     fixture.guard.loop->backend.downstream_recv_progress_valid = true;
-    const auto reinit_result = fixture.guard.loop->backend.init(0, -1);
+    auto reinit_result = fixture.guard.loop->backend.init(0, -1);
+    // A ring opened right after one was closed can see a transient ENOMEM (the
+    // kernel releases the memlock charge asynchronously); retry briefly.
+    for (u32 attempt = 0; !reinit_result && reinit_result.error().code == ENOMEM && attempt < 40;
+         attempt++) {
+        usleep(25000);
+        reinit_result = fixture.guard.loop->backend.init(0, -1);
+    }
     if (!reinit_result) {
         std::cerr << "FAIL test=iouring_downstream_recv_barrier.absolute_cq_positions_wrap_and_"
                      "shutdown_clears_state phase=reinit error_source="
@@ -78800,16 +78808,23 @@ TEST(connection_capacity, runtime_storage_bounds_and_backend_guards) {
         CHECK_EQ(iouring.connection_capacity, 32768u);
         CHECK_EQ(iouring.backend.send_state.size(), 32768u);
         CHECK_EQ(iouring.backend.upstream_send_state.size(), 32768u);
-        CHECK_EQ(iouring.conns[32767].fd, -1);
-        Connection* high = iouring.alloc_conn();
-        REQUIRE(high != nullptr);
-        CHECK_EQ(high->id, 32767u);
-        CHECK_EQ(high->fd, -1);
-        const u32 high_id = high->id;
-        iouring.free_conn(*high);
+        // Slots are lazy: nothing is constructed until first hand-out, and
+        // fresh ids come out in ascending order.
+        CHECK_EQ(iouring.slots_initialized, 0u);
+        CHECK_EQ(iouring.conns.constructed(), 0u);
+        Connection* first = iouring.alloc_conn();
+        REQUIRE(first != nullptr);
+        CHECK_EQ(first->id, 0u);
+        CHECK_EQ(first->fd, -1);
+        CHECK_EQ(iouring.slots_initialized, 1u);
+        const u32 first_id = first->id;
+        iouring.free_conn(*first);
         Connection* reused = iouring.alloc_conn();
         REQUIRE(reused != nullptr);
-        CHECK_EQ(reused->id, high_id);
+        CHECK_EQ(reused->id, first_id);
+        CHECK_EQ(iouring.slots_initialized, 1u);
+        // Backend-owned per-connection tables still span the full capacity.
+        const u32 high_id = 32767u;
         u32 sq_head = 0;
         u32 sq_tail = 0;
         u32 sq_mask = 3;
@@ -78931,6 +78946,8 @@ struct ScopedIoUringBodyPumpStorage {
         if (loop == nullptr && !construct()) return false;
         auto result = loop->init_slot_storage(capacity);
         initialized = result.has_value();
+        // These tests poke conns[i] without allocating; publish the slots.
+        if (initialized) test_initialize_slots(*loop, capacity);
         return initialized;
     }
 
@@ -79188,7 +79205,7 @@ struct ScopedAcceptRearmLoop {
     // parked in the deferred-accept array; drop that too.
     void release_accepted(i32 fd) {
         loop->deferred_accept_count = 0;
-        for (u32 i = 0; i < loop->connection_capacity; i++) {
+        for (u32 i = 0; i < loop->slots_initialized; i++) {
             if (loop->conns[i].fd == fd) {
                 loop->timer.remove(&loop->conns[i]);
                 loop->conns[i].fd = -1;
@@ -79223,7 +79240,7 @@ struct ScopedAcceptRearmLoop {
     ~ScopedAcceptRearmLoop() {
         if (loop != nullptr) {
             if (initialized) {
-                for (u32 i = 0; i < loop->connection_capacity; i++)
+                for (u32 i = 0; i < loop->slots_initialized; i++)
                     loop->timer.remove(&loop->conns[i]);
                 loop->destroy_slot_storage();
             }
@@ -79281,7 +79298,7 @@ TEST(iouring_accept_rearm, terminal_cqe_with_valid_fd_still_rearms) {
         if (g.sq_entries[i & g.sq_mask].opcode == IORING_OP_ACCEPT) armed_accept = true;
     }
     CHECK(armed_accept);
-    for (u32 i = 0; i < g.loop->connection_capacity; i++) {
+    for (u32 i = 0; i < g.loop->slots_initialized; i++) {
         if (g.loop->conns[i].fd == sv[0]) {
             g.loop->timer.remove(&g.loop->conns[i]);
             g.loop->conns[i].fd = -1;
@@ -79369,17 +79386,17 @@ TEST(iouring_accept_rearm, wait_maps_cqe_f_more_to_event_more) {
     IoEvent ev{};
     // pending == 0 and a non-empty CQ: wait() harvests without io_uring_enter.
     g.push_accept_cqe(5, IORING_CQE_F_MORE);
-    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->slots_initialized), 1u);
     CHECK_EQ(ev.type, IoEventType::Accept);
     CHECK_EQ(ev.result, 5);
     CHECK_EQ(ev.more, 1);
     g.push_accept_cqe(-EMFILE, 0);
-    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->slots_initialized), 1u);
     CHECK_EQ(ev.type, IoEventType::Accept);
     CHECK_EQ(ev.result, -EMFILE);
     CHECK_EQ(ev.more, 0);
     g.push_accept_cqe(6, 0);  // terminal CQE that still carries a valid fd
-    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    REQUIRE_EQ(backend.wait(&ev, 1, g.loop->conns, g.loop->slots_initialized), 1u);
     CHECK_EQ(ev.result, 6);
     CHECK_EQ(ev.more, 0);
 }
