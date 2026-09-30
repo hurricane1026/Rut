@@ -12871,6 +12871,54 @@ TEST(proxy_reuse, reuses_idle_upstream_across_keepalive_requests) {
     proxy.teardown();
 }
 
+// Once a response byte arrives over a reused upstream, the retry copy of the forwarded
+// request is dead and must not stay in send_buf while the downstream connection idles
+// (the next request's state checks require an empty send_buf). Inspect the settled
+// loop after the last response: no retry marker, no stale bytes.
+TEST(proxy_reuse, reused_upstream_response_leaves_send_buf_empty) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, backend.port);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+    const RouteConfig* active = &cfg;
+
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true));
+
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    for (int i = 0; i < 3; i++) {
+        const char kReq[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+        REQUIRE(send_all(c, kReq, sizeof(kReq) - 1));
+        char buf[256];
+        i32 n = recv_timeout(c, buf, sizeof(buf), 2000);
+        REQUIRE_GT(n, 0);
+        CHECK(buf_contains(buf, static_cast<u32>(n), "200", 3));
+    }
+    usleep(50000);
+    CHECK_EQ(backend.accept_count.load(), 1);  // requests 2 and 3 used the pooled socket
+
+    // Settle the loop, then look at the idle keep-alive connection.
+    proxy.lt.stop();
+    proxy.loop_started = false;
+    u32 inspected = 0;
+    for (u32 i = 0; i < RealLoop::kMaxConns; i++) {
+        Connection& conn = proxy.loop->conns[i];
+        if (conn.fd < 0 || conn.downstream_completed_request_count < 3) continue;
+        inspected++;
+        CHECK_EQ(conn.retry_req_send_len, 0u);
+        CHECK_EQ(conn.pipeline_stash_len, 0u);
+        CHECK_EQ(conn.send_buf.len(), 0u);
+    }
+    CHECK_EQ(inspected, 1u);
+    close(c);
+    proxy.teardown();
+}
+
 // io_uring variant of the reuse e2e (Shard wires the pool for both backends). Unlike
 // epoll's synchronous detach, io_uring defers the pool-return until the cancelled
 // multishot recv drains, so the test waits until the fd actually re-enters the pool
@@ -20345,6 +20393,191 @@ route GET "/deadline" {
         return rut::register_jit_routes(cfg, rir.module, engine);
     }
 };
+
+// KeepAliveCountingUpstream serves one connection at a time, so a second gateway
+// connection (a deadline-owned forward never borrows a pooled socket) would wait for the
+// first to go idle. This variant gives every accepted connection its own worker thread
+// (at most kMaxWorkers), still answering each request with a fixed keep-alive 200.
+struct ConcurrentKeepAliveUpstream {
+    static constexpr u32 kMaxWorkers = 8;
+    struct Worker {
+        ConcurrentKeepAliveUpstream* owner;
+        i32 fd;
+        pthread_t thread;
+    };
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<int> accept_count{0};
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t accept_thread{};
+    Worker workers[kMaxWorkers]{};
+    u32 worker_count = 0;
+
+    ~ConcurrentKeepAliveUpstream() { teardown(); }
+
+    static void* serve(void* arg) {
+        auto* w = static_cast<Worker*>(arg);
+        static const char kResp[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi";
+        char buf[4096];
+        u32 have = 0;
+        while (w->owner->running.load(std::memory_order_acquire)) {
+            const i32 n = recv_timeout(w->fd, buf + have, sizeof(buf) - have, 5000);
+            if (n <= 0) break;
+            have += static_cast<u32>(n);
+            u32 scan = 0;
+            for (u32 i = 0; i + 4 <= have; i++) {
+                if (memcmp(buf + i, "\r\n\r\n", 4) == 0) {
+                    (void)send_all(w->fd, kResp, sizeof(kResp) - 1);
+                    scan = i + 4;
+                }
+            }
+            if (scan > 0) {
+                memmove(buf, buf + scan, have - scan);
+                have -= scan;
+            }
+        }
+        close(w->fd);
+        return nullptr;
+    }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<ConcurrentKeepAliveUpstream*>(arg);
+        while (s->running.load(std::memory_order_acquire)) {
+            const i32 c = accept(s->listen_fd, nullptr, nullptr);
+            if (c < 0) {
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                break;
+            }
+            if (s->worker_count == kMaxWorkers) {
+                close(c);
+                continue;
+            }
+            s->accept_count.fetch_add(1, std::memory_order_relaxed);
+            Worker& w = s->workers[s->worker_count];
+            w.owner = s;
+            w.fd = c;
+            if (pthread_create(&w.thread, nullptr, &serve, &w) != 0) {
+                close(c);
+                continue;
+            }
+            s->worker_count++;
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        started = (pthread_create(&accept_thread, nullptr, &run, this) == 0);
+        return started;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(accept_thread, nullptr);
+            started = false;
+        }
+        for (u32 i = 0; i < worker_count; i++) pthread_join(workers[i].thread, nullptr);
+        worker_count = 0;
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Compiler/JIT lifetime for a plain forward route next to a deadline-owned forward
+// route (a response_read_timeout forward behind a guard, which selects it only after
+// canonical route selection and so requires a neutral connection). Ordinary RUT
+// source; the two routes let one downstream connection mix both forward kinds.
+struct PublicPlainAndDeadlineForwardSourceResources : PublicResponseReadDeadlineSourceResources {
+    bool compile(u16 backend_port) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+        source += R"rut(
+route GET "/plain" {
+  return forward(backend)
+}
+route GET "/deadline" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close, status: 301,
+      reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
+      header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
+  } else {
+    return forward(backend,
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .request, server: "deadline-test", date: .current,
+        hide_headers: [] },
+      failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+        content_type: "text/plain", server: "deadline-test", date: .current,
+        connection: .request, body: b"default failure\n" },
+      timeout_failure_policy: { version: .http11, status: 504,
+        reason: "First Response Deadline", content_type: "text/plain",
+        server: "deadline-test", date: .current, connection: .request,
+        body: b"configured deadline\n" },
+      response_read_timeout: 1s,
+      response_buffering: .completeContentLength)
+  }
+}
+)rut";
+
+        auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = rut::parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<rut::AstFile> ast_owned(ast.value());
+        auto hir = rut::analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+        auto mir = rut::build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<rut::MirModule> mir_owned(mir.value());
+        if (!rut::lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = rut::jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!rut::populate_route_config(cfg, rir.module)) return false;
+        return rut::register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
+// One GET on a keep-alive downstream connection against the fixed 2-byte keep-alive
+// upstreams' body. True iff a 200 with the complete body came back (an EOF or a
+// short read, i.e. a silent close, is false).
+static bool get_two_byte_body_200(i32 fd, const char* path) {
+    char request[128];
+    const int request_len =
+        snprintf(request, sizeof(request), "GET %s HTTP/1.1\r\nHost: client.example\r\n\r\n", path);
+    if (request_len <= 0 || !send_all(fd, request, static_cast<u32>(request_len))) return false;
+    char response[1024];
+    u32 length = 0;
+    u32 header_end = 0;
+    for (u32 attempt = 0; attempt < 16 && length < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(fd, response + length, sizeof(response) - length, 3000);
+        if (got <= 0) return false;
+        length += static_cast<u32>(got);
+        for (u32 i = 0; header_end == 0 && i + 3 < length; i++)
+            if (memcmp(response + i, "\r\n\r\n", 4) == 0) header_end = i + 4;
+        if (header_end != 0 && length >= header_end + 2)
+            return length == header_end + 2 && memcmp(response, "HTTP/1.1 200 ", 13) == 0 &&
+                   memcmp(response + header_end, "hi", 2) == 0;
+    }
+    return false;
+}
 
 // Compiler/JIT lifetime for the bounded #271 entire-response commit barrier.
 // The source intentionally has no request policy: the admitted runtime shape
@@ -42097,6 +42330,309 @@ TEST(route, public_ordinary_source_get_cl0_response_deadline_reuses_downstream_i
             zero = backend.request_history[slot][i] == '\0';
         CHECK(zero);
     }
+}
+
+// A plain forward answered over a REUSED pooled upstream socket keeps a retry copy of
+// the forwarded request in send_buf until the response arrives. It must not outlive
+// that: the next deadline-owned forward on the same downstream connection requires an
+// empty send_buf, and used to be closed with no response when it found the stale copy.
+TEST(route, public_ordinary_source_deadline_forward_after_reused_plain_forward_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    ConcurrentKeepAliveUpstream backend;
+    REQUIRE(backend.setup());
+    PublicPlainAndDeadlineForwardSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 5);
+
+    // Request 1 dials the upstream; request 2 borrows that pooled socket back.
+    REQUIRE(get_two_byte_body_200(client.fd, "/plain"));
+    REQUIRE(wait_for_idle_pool_count(shard, 1));
+    REQUIRE(get_two_byte_body_200(client.fd, "/plain"));
+    REQUIRE(wait_for_idle_pool_count(shard, 1));
+    CHECK_EQ(backend.accept_count.load(), 1);  // request 2 really was a reused socket
+
+    // The deadline-owned forward on the same downstream connection is answered.
+    CHECK(get_two_byte_body_200(client.fd, "/deadline"));
+}
+
+// Control for the test above: the plain forward went over a FRESH upstream socket
+// (no retry copy is ever taken), and the deadline-owned forward that follows is
+// answered. Guards the fixture itself: a failure here is not the stale-copy bug.
+TEST(route, public_ordinary_source_deadline_forward_after_fresh_plain_forward_iouring) {
+    using namespace rut;
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    ConcurrentKeepAliveUpstream backend;
+    REQUIRE(backend.setup());
+    PublicPlainAndDeadlineForwardSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+
+    Shard<IoUringEventLoop> shard;
+    i32 listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listen_fd, 0);
+    struct ShardGuard {
+        Shard<IoUringEventLoop>& shard;
+        i32& listen_fd;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } shard_guard{shard, listen_fd};
+    const u16 port = get_port(listen_fd);
+    REQUIRE(shard.init(0, listen_fd).has_value());
+    shard.route_config = &resources.cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+    usleep(50000);
+
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client{connect_to(port)};
+    REQUIRE_GE(client.fd, 0);
+    set_socket_timeouts(client.fd, 5);
+
+    REQUIRE(get_two_byte_body_200(client.fd, "/plain"));
+    REQUIRE(wait_for_idle_pool_count(shard, 1));
+    CHECK_EQ(backend.accept_count.load(), 1);
+    CHECK(get_two_byte_body_200(client.fd, "/deadline"));
+}
+
+// Compiler/JIT lifetime for plain forwards (one with a response-header mutation chain)
+// next to a guarded redirect route whose other branch is a deadline-owned forward.
+// That combination makes the route select its response after canonical route
+// selection, which requires a neutral connection on both io_uring and epoll.
+struct PublicForwardThenGuardedRedirectSourceResources : PublicResponseReadDeadlineSourceResources {
+    bool compile(u16 backend_port) {
+        std::string source =
+            "upstream backend at \"127.0.0.1:" + std::to_string(backend_port) + "\"\n";
+        source += R"rut(
+func add_trace(_ req: i32, _ resp: Response) -> i32 {
+  resp.set("X-Request-Path", req.path)
+  0
+}
+chain observability { after add_trace(req, resp) }
+route GET "/plain" {
+  return forward(backend)
+}
+route GET "/mutated" use chain observability {
+  return forward(backend)
+}
+route GET "/old" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close, status: 301,
+      reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
+      header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
+  } else {
+    return forward(backend,
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .request, server: "deadline-test", date: .current,
+        hide_headers: [] },
+      failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+        content_type: "text/plain", server: "deadline-test", date: .current,
+        connection: .request, body: b"default failure\n" },
+      timeout_failure_policy: { version: .http11, status: 504,
+        reason: "First Response Deadline", content_type: "text/plain",
+        server: "deadline-test", date: .current, connection: .request,
+        body: b"configured deadline\n" },
+      response_read_timeout: 1s,
+      response_buffering: .completeContentLength)
+  }
+}
+)rut";
+
+        auto lexed = rut::lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = rut::parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<rut::AstFile> ast_owned(ast.value());
+        auto hir = rut::analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<rut::HirModule> hir_owned(hir.value());
+        auto mir = rut::build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<rut::MirModule> mir_owned(mir.value());
+        if (!rut::lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = rut::jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!rut::populate_route_config(cfg, rir.module)) return false;
+        return rut::register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
+// One GET on a keep-alive downstream connection; true iff the reply begins with
+// `expected` (an EOF, i.e. a silent close, is false). The guarded redirect admits only
+// a request that carries exactly one `Connection: close`.
+static bool get_reply_starts_with(i32 fd,
+                                  const char* path,
+                                  const char* expected,
+                                  const char* extra_headers = "") {
+    char request[192];
+    const int request_len = snprintf(request,
+                                     sizeof(request),
+                                     "GET %s HTTP/1.1\r\nHost: client.example\r\n%s\r\n",
+                                     path,
+                                     extra_headers);
+    if (request_len <= 0 || !send_all(fd, request, static_cast<u32>(request_len))) return false;
+    const u32 expected_len = static_cast<u32>(strlen(expected));
+    char reply[512];
+    u32 length = 0;
+    for (u32 attempt = 0; attempt < 16 && length < expected_len; attempt++) {
+        const i32 got = recv_timeout(fd, reply + length, sizeof(reply) - length, 3000);
+        if (got <= 0) return false;
+        length += static_cast<u32>(got);
+    }
+    return length >= expected_len && memcmp(reply, expected, expected_len) == 0;
+}
+
+// Like get_reply_starts_with, but consumes the whole Content-Length response first: a
+// rewritten response may reach the client as separate header and body segments, and a
+// body byte left unread would prefix the next reply on the connection.
+static bool get_complete_reply_starts_with(i32 fd, const char* path, const char* expected) {
+    char request[128];
+    const int request_len =
+        snprintf(request, sizeof(request), "GET %s HTTP/1.1\r\nHost: client.example\r\n\r\n", path);
+    if (request_len <= 0 || !send_all(fd, request, static_cast<u32>(request_len))) return false;
+    char reply[1024];
+    u32 length = 0;
+    u32 total = 0;  // header + body bytes once the header is complete
+    for (u32 attempt = 0; attempt < 32; attempt++) {
+        const i32 got = recv_timeout(fd, reply + length, sizeof(reply) - 1 - length, 3000);
+        if (got <= 0) return false;
+        length += static_cast<u32>(got);
+        reply[length] = '\0';
+        if (total == 0) {
+            const char* end = strstr(reply, "\r\n\r\n");
+            if (end == nullptr) continue;
+            const char* cl = strstr(reply, "Content-Length: ");
+            const u32 body = cl != nullptr && cl < end ? static_cast<u32>(atoi(cl + 16)) : 0;
+            total = static_cast<u32>(end - reply) + 4 + body;
+        }
+        if (length >= total) break;
+    }
+    const u32 expected_len = static_cast<u32>(strlen(expected));
+    return total != 0 && length == total && length >= expected_len &&
+           memcmp(reply, expected, expected_len) == 0;
+}
+
+// Epoll: the neutrality check that gates a guarded redirect also runs on epoll. A
+// forward answered over a reused pooled upstream, then the guarded redirect on the
+// same client connection, used to close the connection with no reply.
+TEST(route, public_ordinary_source_guarded_redirect_after_reused_forward_epoll) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+    PublicForwardThenGuardedRedirectSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    const RouteConfig* active = &resources.cfg;
+
+    // A redirect is built against the declared cleartext listener.
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, &declared_listener));
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 3);
+
+    REQUIRE(get_reply_starts_with(c, "/plain", "HTTP/1.1 200 "));
+    REQUIRE(get_reply_starts_with(c, "/plain", "HTTP/1.1 200 "));
+    CHECK_EQ(backend.accept_count.load(), 1);  // the second forward used the pooled socket
+    CHECK(get_reply_starts_with(c, "/old", "HTTP/1.1 301 ", "Connection: close\r\n"));
+    close(c);
+    proxy.teardown();
+}
+
+// Same, with a fresh upstream socket (no retry copy) as the control.
+TEST(route, public_ordinary_source_guarded_redirect_after_fresh_forward_epoll) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+    PublicForwardThenGuardedRedirectSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    const RouteConfig* active = &resources.cfg;
+
+    // A redirect is built against the declared cleartext listener.
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, &declared_listener));
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 3);
+
+    REQUIRE(get_reply_starts_with(c, "/plain", "HTTP/1.1 200 "));
+    CHECK_EQ(backend.accept_count.load(), 1);
+    CHECK(get_reply_starts_with(c, "/old", "HTTP/1.1 301 ", "Connection: close\r\n"));
+    close(c);
+    proxy.teardown();
+}
+
+// Epoll: a forward with a response-header mutation keeps its request snapshot in
+// send_buf until the exchange completes; the guarded redirect that follows on the same
+// connection needs it released.
+TEST(route, public_ordinary_source_guarded_redirect_after_mutated_forward_epoll) {
+    KeepAliveCountingUpstream backend;
+    REQUIRE(backend.setup());
+    PublicForwardThenGuardedRedirectSourceResources resources;
+    REQUIRE(resources.compile(backend.port));
+    const RouteConfig* active = &resources.cfg;
+
+    // A redirect is built against the declared cleartext listener.
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/true, &declared_listener));
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 3);
+
+    REQUIRE(get_complete_reply_starts_with(c, "/mutated", "HTTP/1.1 200 "));
+    CHECK(get_reply_starts_with(c, "/old", "HTTP/1.1 301 ", "Connection: close\r\n"));
+    close(c);
+    proxy.teardown();
 }
 
 TEST(route, public_ordinary_source_post_cl0_response_deadline_reuses_downstream_iouring) {
