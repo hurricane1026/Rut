@@ -1986,6 +1986,10 @@ struct EnvoyInstance {
                     launched = false;
                 } else {
                     docker_cleanup_failed = true;
+                    // launch_envoy_with_port_retry() reports this description
+                    // when it refuses to retry over a failed cleanup, so the
+                    // daemon's error must not be lost behind the exit status.
+                    unexpected_exit_description += "; " + cleanup_failure_description();
                 }
             }
             return false;
@@ -2017,6 +2021,10 @@ struct EnvoyInstance {
                     launched = false;
                 } else {
                     docker_cleanup_failed = true;
+                    // launch_envoy_with_port_retry() reports this description
+                    // when it refuses to retry over a failed cleanup, so the
+                    // daemon's error must not be lost behind the exit status.
+                    unexpected_exit_description += "; " + cleanup_failure_description();
                 }
             }
             return false;
@@ -2075,6 +2083,10 @@ struct EnvoyInstance {
                     launched = false;
                 } else {
                     docker_cleanup_failed = true;
+                    // launch_envoy_with_port_retry() reports this description
+                    // when it refuses to retry over a failed cleanup, so the
+                    // daemon's error must not be lost behind the exit status.
+                    unexpected_exit_description += "; " + cleanup_failure_description();
                 }
             }
             return false;
@@ -8519,6 +8531,71 @@ bool self_test_docker_cleanup_failure_blocks_retry() {
                 if (envoy.launched) {
                     std::cerr << "FAIL [self-test docker cleanup blocks retry]: launched was not "
                                  "cleared despite a successful removal\n";
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // Case 3: early exit AND a failed removal -- the description
+    // launch_envoy_with_port_retry() reports when it refuses to retry must
+    // carry docker's own error, not only the child's exit status. Driven
+    // through both early-exit branches that reach it: the precheck reap
+    // (an unreaped zombie) and ECHILD (already reaped by someone else).
+    {
+        const std::string stub_path = dir.path() + "/docker-fail-after-exit";
+        if (!write_docker_stub(stub_path, 1, "Cannot connect to the Docker daemon")) {
+            std::cerr << "FAIL [self-test docker cleanup blocks retry]: could not write the "
+                         "docker stub (fail-after-exit case)\n";
+            ok = false;
+        } else {
+            ScopedDockerBinOverride docker_override(stub_path);
+            for (const bool reap_first : {false, true}) {
+                const char* const branch = reap_first ? "ECHILD" : "precheck";
+                const pid_t child = fork();
+                if (child < 0) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: fork failed ("
+                              << branch << " case)\n";
+                    ok = false;
+                    continue;
+                }
+                if (child == 0) _exit(1);
+                if (reap_first) {
+                    int status = 0;
+                    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+                    }
+                } else {
+                    struct timespec settle{0, 50'000'000};
+                    nanosleep(&settle, nullptr);
+                }
+
+                EnvoyInstance envoy;
+                envoy.name = "rut-envoy-selftest-cleanup-blocks-retry-3";
+                envoy.launched = true;
+                envoy.pid = child;
+                if (envoy.stop()) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: stop() reported "
+                                 "success despite an early exit and a failed removal ("
+                              << branch << " case)\n";
+                    ok = false;
+                }
+                if (!envoy.docker_cleanup_failed) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: "
+                                 "docker_cleanup_failed was not set for a removal that failed "
+                                 "after an early exit ("
+                              << branch << " case)\n";
+                    ok = false;
+                }
+                const std::string& description = envoy.unexpected_exit_description;
+                const bool has_exit =
+                    description.find(reap_first ? "ECHILD" : "exited 1") != std::string::npos;
+                const bool has_docker_error =
+                    description.find("Cannot connect to the Docker daemon") != std::string::npos;
+                if (!has_exit || !has_docker_error) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: the " << branch
+                              << " description must name both the early exit and docker's "
+                                 "removal error, got \""
+                              << description << "\"\n";
                     ok = false;
                 }
             }
