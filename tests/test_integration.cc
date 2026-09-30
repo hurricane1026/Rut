@@ -13300,6 +13300,7 @@ TEST(proxy_reuse, deferred_idle_return_guards_iouring) {
         c.idle_return_config = &cfg_a;
         shard.loop->try_deferred_upstream_rearm(c);
         CHECK_EQ(c.idle_return_fd, -1);            // parked fd consumed
+        CHECK(c.idle_return_config == nullptr);    // pin consumed with the fd
         CHECK_EQ(shard.upstream->idle_count, 1u);  // pooled, not closed
         CHECK_EQ(shard.upstream->take_idle(5, 0), sv[0]);
         close(sv[0]);
@@ -13432,11 +13433,14 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
     deferred.idle_return_fd = up1[0];
     deferred.idle_return_uid = 11;
     deferred.idle_return_bidx = 0;
+    deferred.idle_return_config = &cfg;
 
     shard.loop->force_close_all();
 
     CHECK_EQ(live.idle_return_fd, -1);
     CHECK_EQ(deferred.idle_return_fd, -1);
+    CHECK(live.idle_return_config == nullptr);
+    CHECK(deferred.idle_return_config == nullptr);
     CHECK(::close(cli[0]) < 0);  // client fd closed by close_conn
     CHECK(::close(up0[0]) < 0);  // parked upstream fd closed (live-client case)
     CHECK(::close(up1[0]) < 0);  // parked upstream fd closed (deferred-close case)
@@ -13457,6 +13461,586 @@ TEST(proxy_reuse, force_close_all_closes_deferred_idle_fd_iouring) {
     close(up2[1]);
     close(lfd);
 }
+
+// The deferred idle-return pin (idle_return_config) is consumed together with the parked
+// fd. Left set after the drain, it made the connection non-neutral for the rest of its
+// life (http1_pipeline_successor_upstream_owners_are_neutral), so the next request that
+// needs a settled connection (deadline-owned forward, guarded redirect) was closed
+// without a response. Every resolution site must release the fd AND the pin exactly once.
+TEST(proxy_reuse, deferred_idle_return_state_released_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg_a{};
+    RouteConfig cfg_b{};
+    shard.active_config = &cfg_a;
+
+    // Drain pools the fd: fd and pin are both released, the connection is neutral again,
+    // and a second deferred return on the same connection works the same way.
+    {
+        auto& c = shard.loop->conns[0];
+        c.reset();
+        for (u32 round = 0; round < 2; round++) {
+            i32 sv[2];
+            REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+            c.idle_return_fd = sv[0];
+            c.idle_return_uid = 5;
+            c.idle_return_bidx = 0;
+            c.idle_return_config = &cfg_a;
+            CHECK_FALSE(http1_pipeline_successor_upstream_owners_are_neutral(c));
+            shard.loop->try_deferred_upstream_rearm(c);
+            CHECK_EQ(c.idle_return_fd, -1);
+            CHECK(c.idle_return_config == nullptr);
+            CHECK(http1_pipeline_successor_upstream_owners_are_neutral(c));
+            CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 1u);
+            CHECK_EQ(shard.upstream->take_idle(5, 0), sv[0]);
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
+    // Drain ends in close (config swapped under the parked fd): same release.
+    {
+        auto& c = shard.loop->conns[1];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 6;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_b;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK(c.idle_return_config == nullptr);
+        CHECK(http1_pipeline_successor_upstream_owners_are_neutral(c));
+        CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+        CHECK(::close(sv[0]) < 0);  // closed by the drain, not pooled
+        close(sv[1]);
+    }
+    // Drain ends in close (stale bytes): same release.
+    {
+        auto& c = shard.loop->conns[2];
+        c.reset();
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.upstream_recv_idle_stale_bytes = true;
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 7;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        shard.loop->try_deferred_upstream_rearm(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK(c.idle_return_config == nullptr);
+        CHECK(http1_pipeline_successor_upstream_owners_are_neutral(c));
+        CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+        CHECK(::close(sv[0]) < 0);
+        close(sv[1]);
+    }
+    // Connection close while the return is pending: fd and pin stay parked (the drain
+    // still owns them), then the drain pools the fd once and finishes the deferred free.
+    {
+        // Allocated for real: close_conn_impl/free_conn push the slot back on the free
+        // stack, which would overflow it for a slot that was never popped.
+        Connection* const slot = shard.loop->alloc_conn();
+        REQUIRE(slot != nullptr);
+        auto& c = *slot;
+        i32 cli[2];
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.fd = cli[0];
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 8;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        c.upstream_recv_cancel_inflight = true;  // cancelled recv has not drained yet
+        c.pending_ops = 1;
+        const u32 free_before = shard.loop->free_top;
+        shard.loop->close_conn_impl(c);
+        CHECK(c.close_after_idle_return);
+        CHECK_EQ(c.idle_return_fd, sv[0]);
+        CHECK(c.idle_return_config == &cfg_a);
+        CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+        CHECK_EQ(shard.loop->free_top, free_before);  // slot not freed yet
+        // The recv terminal lands: drain pools the fd and performs the postponed free.
+        c.upstream_recv_cancel_inflight = false;
+        c.pending_ops = 0;
+        CHECK(shard.loop->try_deferred_upstream_rearm(c));
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK(c.idle_return_config == nullptr);
+        CHECK_FALSE(c.close_after_idle_return);
+        CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 1u);
+        CHECK_EQ(shard.loop->free_top, free_before + 1u);  // freed exactly once
+        CHECK_EQ(shard.upstream->take_idle(8, 0), sv[0]);
+        close(sv[0]);
+        close(sv[1]);
+        close(cli[1]);
+    }
+    // Connection close after the recv already drained: pooled at close, pin released.
+    {
+        // Allocated for real: close_conn_impl/free_conn push the slot back on the free
+        // stack, which would overflow it for a slot that was never popped.
+        Connection* const slot = shard.loop->alloc_conn();
+        REQUIRE(slot != nullptr);
+        auto& c = *slot;
+        i32 cli[2];
+        i32 sv[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+        c.fd = cli[0];
+        c.idle_return_fd = sv[0];
+        c.idle_return_uid = 9;
+        c.idle_return_bidx = 0;
+        c.idle_return_config = &cfg_a;
+        const u32 free_before = shard.loop->free_top;
+        shard.loop->close_conn_impl(c);
+        CHECK_EQ(c.idle_return_fd, -1);
+        CHECK(c.idle_return_config == nullptr);
+        CHECK_FALSE(c.close_after_idle_return);
+        CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 1u);
+        CHECK_EQ(shard.loop->free_top, free_before + 1u);
+        CHECK_EQ(shard.upstream->take_idle(9, 0), sv[0]);
+        close(sv[0]);
+        close(sv[1]);
+        close(cli[1]);
+    }
+
+    shard.shutdown();
+    close(lfd);
+}
+
+#if RUT_ENABLE_JIT_TESTS
+// Client-visible form of the same bug on a real io_uring loop with a real upstream. A
+// request whose upstream recv is multishot (any request with a body or a Content-Length
+// header) returns its upstream fd through the deferred idle-return path. The next
+// request on the same client connection must still see a neutral connection: the
+// deadline-owned forward (direct and behind a canonical-selection guard) is closed
+// without a response otherwise.
+struct BodyAwareKeepAliveUpstream {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<u32> request_count{0};
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~BodyAwareKeepAliveUpstream() { teardown(); }
+
+    // One complete request: headers, then a Content-Length or chunked body.
+    static bool request_complete(const char* buf, u32 have, u32* consumed) {
+        u32 hdr_end = 0;
+        for (u32 i = 0; i + 4 <= have && hdr_end == 0; i++)
+            if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+                hdr_end = i + 4;
+        if (hdr_end == 0) return false;
+        u32 body_len = 0;
+        bool chunked = false;
+        for (u32 i = 0; i + 18 < hdr_end; i++) {
+            if (i > 0 && buf[i - 1] != '\n') continue;
+            if (strncasecmp(buf + i, "Content-Length:", 15) == 0)
+                body_len = static_cast<u32>(atoi(buf + i + 15));
+            if (strncasecmp(buf + i, "Transfer-Encoding:", 18) == 0) chunked = true;
+        }
+        if (chunked) {
+            // Test bodies are a single "5\r\nhello\r\n0\r\n\r\n" chunk train.
+            static const char kEnd[] = "0\r\n\r\n";
+            for (u32 i = hdr_end; i + 5 <= have; i++) {
+                if (memcmp(buf + i, kEnd, 5) == 0) {
+                    *consumed = i + 5;
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (have < hdr_end + body_len) return false;
+        *consumed = hdr_end + body_len;
+        return true;
+    }
+
+    // Several client connections can be live at once (the gateway parks the first in its
+    // idle pool while a deadline-owned forward dials a second one), so multiplex with poll.
+    static void* run(void* arg) {
+        auto* s = static_cast<BodyAwareKeepAliveUpstream*>(arg);
+        static const char kResp[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        constexpr u32 kMaxConns = 8;
+        struct Peer {
+            i32 fd = -1;
+            char buf[2048];
+            u32 have = 0;
+        } peers[kMaxConns];
+        while (s->running.load(std::memory_order_acquire)) {
+            pollfd pfds[kMaxConns + 1];
+            u32 map[kMaxConns + 1];
+            u32 n = 0;
+            pfds[n] = {s->listen_fd, POLLIN, 0};
+            map[n++] = kMaxConns;
+            for (u32 i = 0; i < kMaxConns; i++) {
+                if (peers[i].fd < 0) continue;
+                pfds[n] = {peers[i].fd, POLLIN, 0};
+                map[n++] = i;
+            }
+            if (poll(pfds, n, 20) <= 0) continue;
+            for (u32 k = 0; k < n; k++) {
+                if ((pfds[k].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+                if (map[k] == kMaxConns) {
+                    i32 c = accept(s->listen_fd, nullptr, nullptr);
+                    if (c < 0) continue;
+                    u32 slot = 0;
+                    while (slot < kMaxConns && peers[slot].fd >= 0) slot++;
+                    if (slot == kMaxConns) {
+                        close(c);
+                        continue;
+                    }
+                    peers[slot].fd = c;
+                    peers[slot].have = 0;
+                    continue;
+                }
+                Peer& p = peers[map[k]];
+                const i32 got =
+                    static_cast<i32>(recv(p.fd, p.buf + p.have, sizeof(p.buf) - p.have, 0));
+                if (got <= 0) {
+                    close(p.fd);
+                    p.fd = -1;
+                    continue;
+                }
+                p.have += static_cast<u32>(got);
+                u32 consumed = 0;
+                while (request_complete(p.buf, p.have, &consumed)) {
+                    s->request_count.fetch_add(1, std::memory_order_release);
+                    (void)send_all(p.fd, kResp, sizeof(kResp) - 1);
+                    memmove(p.buf, p.buf + consumed, p.have - consumed);
+                    p.have -= consumed;
+                }
+            }
+        }
+        for (u32 i = 0; i < kMaxConns; i++)
+            if (peers[i].fd >= 0) close(peers[i].fd);
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        started = (pthread_create(&thread, nullptr, &run, this) == 0);
+        return started;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// Everything one deferred-idle-return integration test owns. The destructor runs on
+// every exit path (a failed REQUIRE returns from the test body while the shard thread is
+// still running): the client and listen fds are closed, the shard is stopped and joined
+// before the program it executes is destroyed, so a regression fails cleanly instead of
+// tearing down a live shard.
+struct DeferredReturnRig {
+    BodyAwareKeepAliveUpstream backend;
+    LoadedProgram program{};
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = -1;
+    u16 port = 0;
+    i32 client = -1;
+    bool shard_inited = false;
+    bool spawned = false;
+    bool ready = false;
+
+    DeferredReturnRig() = default;
+    DeferredReturnRig(const DeferredReturnRig&) = delete;
+    DeferredReturnRig& operator=(const DeferredReturnRig&) = delete;
+
+    ~DeferredReturnRig() {
+        if (client >= 0) close(client);
+        if (spawned) {
+            shard.stop();
+            shard.join();
+        }
+        if (shard_inited) shard.shutdown();
+        if (lfd >= 0) close(lfd);
+        program.destroy();
+    }
+
+    // True when any connection still carries a parked idle-return fd or pin. Only
+    // meaningful once the shard thread has been stopped and joined. Bounded by the
+    // initialised-slot watermark: slots past it are untouched zero pages, where
+    // idle_return_fd reads as 0 (never -1) and would count as parked.
+    bool parked_state_left() const {
+        for (u32 i = 0; i < shard.loop->slots_initialized; i++) {
+            if (shard.loop->conns[i].idle_return_fd >= 0 ||
+                shard.loop->conns[i].idle_return_config != nullptr)
+                return true;
+        }
+        return false;
+    }
+
+    void stop_shard() {
+        if (!spawned) return;
+        shard.stop();
+        shard.join();
+        spawned = false;
+    }
+};
+
+// Bring the rig up (backend, program, io_uring shard, one connected client). Sets
+// rig.ready on success; on SKIP or a failed REQUIRE the caller returns and the rig's
+// destructor cleans up whatever was created.
+static void start_deferred_return_rig(rut::test::TestCase* _tc, DeferredReturnRig& rig) {
+    REQUIRE(rig.backend.setup());
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(rig.backend.port) + "\"\n";
+    source_text += R"rut(
+route GET "/plain" {
+  return forward(backend)
+}
+route POST "/post" {
+  return forward(backend)
+}
+route GET "/withbody" {
+  return forward(backend)
+}
+route GET "/direct" {
+  return forward(backend,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "nginx/1.29.7",
+      date: .current, hide_headers: ["Date", "Server"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "buffered-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
+      reason: "Response Read Deadline", content_type: "text/plain",
+      server: "buffered-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
+    response_read_timeout: 1s,
+    response_buffering: .completeContentLength)
+}
+route GET "/guarded" {
+  if req.pathOnly == "/old" {
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close, status: 301,
+      reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
+      header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
+  } else {
+    return forward(backend,
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .request, server: "rut", date: .current, hide_headers: [] },
+      failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: .current,
+        connection: .request, body: b"bad" },
+      timeout_failure_policy: { version: .http11, status: 504,
+        reason: "Gateway Time-out", content_type: "text/plain", server: "rut",
+        date: .current, connection: .request, body: b"slow" },
+      response_read_timeout: 1s,
+      response_buffering: .completeContentLength)
+  }
+}
+route GET "/gr" {
+  if req.pathOnly == "/gr" {
+    return redirect({scheme: .http, authority: .static,
+      static_authority: "redirect.example", port: .omit, path: .static,
+      query: .discard, date: .current, connection: .close, status: 301,
+      reason: "Moved Permanently", server: "nginx/1.29.7", content_type: "text/html",
+      header_order: .connectionThenLocation, target_path: "/new", body: b"fixed"})
+  } else {
+    return forward(backend,
+      request_policy: { version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+      response_policy: { version: .http11, framing: .contentLength,
+        connection: .request, server: "rut", date: .current, hide_headers: [] },
+      failure_policy: { version: .http11, status: 502, reason: "Bad Gateway",
+        content_type: "text/plain", server: "rut", date: .current,
+        connection: .request, body: b"bad" },
+      timeout_failure_policy: { version: .http11, status: 504,
+        reason: "Gateway Time-out", content_type: "text/plain", server: "rut",
+        date: .current, connection: .request, body: b"slow" },
+      response_read_timeout: 1s,
+      response_buffering: .completeContentLength)
+  }
+}
+)rut";
+    struct TempSource {
+        char path[64] = "/tmp/rut_deferred_idle_return_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    source.fd = mkstemp(source.path);
+    REQUIRE_GE(source.fd, 0);
+    source.present = true;
+    u32 written_total = 0;
+    while (written_total < source_text.size()) {
+        const ssize_t written = write(
+            source.fd, source_text.data() + written_total, source_text.size() - written_total);
+        if (written < 0 && errno == EINTR) continue;
+        REQUIRE_GT(written, 0);
+        written_total += static_cast<u32>(written);
+    }
+    REQUIRE_EQ(close(source.fd), 0);
+    source.fd = -1;
+
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, rig.program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE_EQ(unlink(source.path), 0);
+    source.present = false;
+
+    rig.lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(rig.lfd >= 0);
+    rig.port = get_port(rig.lfd);
+    if (!rig.shard.init(0, rig.lfd).has_value())
+        SKIP("io_uring queue init unavailable in this environment");
+    rig.shard_inited = true;
+    // The redirect branch needs a valid cleartext listener context (as run_shards() installs).
+    ListenerSpec declared_listener{};
+    declared_listener.port = 0;
+    auto listener_context = derive_listener_context(rig.lfd, declared_listener);
+    REQUIRE(listener_context.has_value());
+    rig.shard.loop->listener_context = listener_context.value();
+    rig.shard.route_config = &rig.program.config;
+    rig.shard.active_config = rig.shard.route_config;
+    REQUIRE(rig.shard.spawn(-1).has_value());
+    rig.spawned = true;
+    usleep(50000);
+
+    rig.client = connect_to(rig.port);
+    REQUIRE_GE(rig.client, 0);
+    set_socket_timeouts(rig.client, 3);
+    rig.ready = true;
+}
+
+// Send `first` then `second` on one keep-alive client connection; both must be answered
+// with a 200 whose body is "hi". Afterwards (loop stopped, client still connected) no
+// connection may still carry a parked idle-return pin.
+static void expect_two_requests_answered_after_deferred_return(rut::test::TestCase* _tc,
+                                                               const char* first,
+                                                               u32 first_len,
+                                                               const char* second,
+                                                               u32 second_len) {
+    DeferredReturnRig rig;
+    start_deferred_return_rig(_tc, rig);
+    if (!rig.ready) return;
+
+    const char* const reqs[2] = {first, second};
+    const u32 lens[2] = {first_len, second_len};
+    for (u32 i = 0; i < 2; i++) {
+        REQUIRE(send_all(rig.client, reqs[i], lens[i]));
+        char buf[512];
+        u32 have = 0;
+        // Complete response = header block + the 2-byte "hi" body.
+        while (have < 4 || !buf_contains(buf, have, "\r\n\r\nhi", 6)) {
+            const i32 n = recv_timeout(rig.client, buf + have, sizeof(buf) - have, 3000);
+            // n == 0 is the bug: the gateway closed the connection with no response.
+            REQUIRE_GT(n, 0);
+            have += static_cast<u32>(n);
+        }
+        CHECK(buf_contains(buf, have, " 200 ", 5));
+        // Let the deferred idle return of request 1 drain before request 2 is sent,
+        // so the outcome does not depend on scheduling of the cancel CQE.
+        if (i == 0) REQUIRE(wait_for_idle_pool_count(rig.shard, 1));
+    }
+
+    rig.stop_shard();
+    CHECK_FALSE(rig.parked_state_left());
+}
+
+// The redirect branch of a guarded route has its own admission: it takes exactly a
+// `GET` HTTP/1.1 request with one Host and exactly one `Connection: close`; anything else
+// takes the documented 400/close fallback. After a body request went through the
+// deferred idle return, that redirect must still be served (301), not closed.
+TEST(proxy_reuse, deferred_return_post_body_then_guarded_redirect_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    DeferredReturnRig rig;
+    start_deferred_return_rig(_tc, rig);
+    if (!rig.ready) return;
+
+    static const char kPost[] = "POST /post HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    REQUIRE(send_all(rig.client, kPost, sizeof(kPost) - 1));
+    char buf[1024];
+    u32 have = 0;
+    while (have < 4 || !buf_contains(buf, have, "\r\n\r\nhi", 6)) {
+        const i32 n = recv_timeout(rig.client, buf + have, sizeof(buf) - have, 3000);
+        REQUIRE_GT(n, 0);
+        have += static_cast<u32>(n);
+    }
+    CHECK(buf_contains(buf, have, " 200 ", 5));
+    REQUIRE(wait_for_idle_pool_count(rig.shard, 1));  // deferred return drained
+
+    static const char kRedirect[] = "GET /gr HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(rig.client, kRedirect, sizeof(kRedirect) - 1));
+    have = 0;
+    // The redirect response is closed by the gateway: read to its body or to EOF.
+    while (!buf_contains(buf, have, "fixed", 5)) {
+        const i32 n = recv_timeout(rig.client, buf + have, sizeof(buf) - have, 3000);
+        // n == 0 with nothing read is the bug: closed without any response.
+        REQUIRE_GT(n, 0);
+        have += static_cast<u32>(n);
+    }
+    CHECK(buf_contains(buf, have, " 301 ", 5));
+
+    rig.stop_shard();
+    CHECK_FALSE(rig.parked_state_left());
+}
+
+#define DEFERRED_RETURN_SEQUENCE_TEST(name, first_literal, second_literal)              \
+    TEST(proxy_reuse, name) {                                                           \
+        if (!iouring_socket_live())                                                     \
+            SKIP("io_uring async socket ops unavailable in this environment");          \
+        expect_two_requests_answered_after_deferred_return(_tc,                         \
+                                                           first_literal,               \
+                                                           sizeof(first_literal) - 1,   \
+                                                           second_literal,              \
+                                                           sizeof(second_literal) - 1); \
+    }
+
+#define DEFERRED_RETURN_DIRECT_REQ "GET /direct HTTP/1.1\r\nHost: x\r\n\r\n"
+#define DEFERRED_RETURN_GUARDED_REQ "GET /guarded HTTP/1.1\r\nHost: x\r\n\r\n"
+
+// Control: a bodyless GET uses a one-shot upstream recv and returns its fd synchronously.
+DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_control_plain_get_then_deadline_forward_iouring,
+                              "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n",
+                              DEFERRED_RETURN_DIRECT_REQ)
+DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_post_body_then_deadline_forward_iouring,
+                              "POST /post HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+                              DEFERRED_RETURN_DIRECT_REQ)
+DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_post_body_then_guarded_forward_iouring,
+                              "POST /post HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+                              DEFERRED_RETURN_GUARDED_REQ)
+DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_chunked_post_then_deadline_forward_iouring,
+                              "POST /post HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                              "5\r\nhello\r\n0\r\n\r\n",
+                              DEFERRED_RETURN_DIRECT_REQ)
+DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_post_cl0_then_deadline_forward_iouring,
+                              "POST /post HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+                              DEFERRED_RETURN_DIRECT_REQ)
+DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_get_cl0_then_guarded_forward_iouring,
+                              "GET /withbody HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+                              DEFERRED_RETURN_GUARDED_REQ)
+#endif  // RUT_ENABLE_JIT_TESTS
 
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
 // route; the runtime forwards a synthesized h1 request to a real upstream, buffers

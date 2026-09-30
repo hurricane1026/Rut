@@ -5630,10 +5630,14 @@ public:
         if (c.idle_return_fd >= 0 && kUpstreamRecvDrained) {
             const i32 fd = c.idle_return_fd;
             c.idle_return_fd = -1;
+            // The pin is consumed with the fd: left set, the connection would look
+            // non-neutral to every later request (successor-neutrality predicates).
+            const RouteConfig* const kParkedConfig = c.idle_return_config;
+            c.idle_return_config = nullptr;
             // A reload landed while the cancel drained: the pinned config no longer
             // matches the live one, so poll_command's pool drain already ran and this
             // fd's (uid, bidx) may now map to a different backend — close, don't pool.
-            const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
+            const bool kConfigStale = !config_ptr || *config_ptr != kParkedConfig;
             // Stale bytes the backend wrote after the framed response were copied into
             // upstream_recv_buf while the cancel drained (on_upstream_recv was cleared,
             // so they were silently consumed off the socket). take_idle's MSG_PEEK can't
@@ -5866,10 +5870,12 @@ public:
         if (c.idle_return_fd >= 0) {
             const i32 fd = c.idle_return_fd;
             c.idle_return_fd = -1;
+            const RouteConfig* const kParkedConfig = c.idle_return_config;
+            c.idle_return_config = nullptr;
             // Same refusals as the deferred drain in try_deferred_upstream_rearm: a
             // config swap (poll_command drained the pool) or surplus bytes copied into
             // upstream_recv_buf both desync reuse — close rather than pool.
-            const bool kConfigStale = !config_ptr || *config_ptr != c.idle_return_config;
+            const bool kConfigStale = !config_ptr || *config_ptr != kParkedConfig;
             const bool kStaleBytes =
                 c.buffered_response_len() != 0 || c.upstream_recv_idle_stale_bytes;
             const bool kDraining = is_draining();
@@ -6600,6 +6606,7 @@ private:
             if (conns[i].idle_return_fd >= 0) {
                 ::close(conns[i].idle_return_fd);
                 conns[i].idle_return_fd = -1;
+                conns[i].idle_return_config = nullptr;
             }
         }
     }

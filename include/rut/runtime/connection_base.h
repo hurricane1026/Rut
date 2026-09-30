@@ -353,6 +353,10 @@ struct ConnectionBase {
     // (upstream_id, backend_idx). try_deferred_upstream_rearm compares this against the
     // live config and CLOSES instead of pooling on mismatch. request_config can't be
     // reused: the keep-alive client repoints it on its next request while this drains.
+    // Pointer-identity token only (never dereferenced, no epoch held); cleared together
+    // with idle_return_fd at every site that resolves the parked fd. (The clear in
+    // close_conn_impl's already-drained branch is defensive: the slot's reset() clears it
+    // anyway when the slot is reused.)
     const RouteConfig* idle_return_config;
     // io_uring-only deferred close: close_conn was called on a conn whose deferred
     // idle-pool return (idle_return_fd) had not yet drained its cancelled recv. Rather
