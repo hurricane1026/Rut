@@ -4651,7 +4651,7 @@ struct EpollBackend {
 Model                    completion            readiness
 Syscalls per I/O         1 (batched)           2 (epoll_wait + recv/send)
 Accept                   multishot (1 SQE)     accept4() loop
-Idle conn buffer         0 ring buffer (+trim)  0 (alloc on readiness)
+Idle conn buffer         0 ring buffer (+trim) 0 (alloc on readiness)
 Zero-copy recv           yes                   no
 Zero-copy send           yes (SEND_ZC)         no (must copy to kernel)
 Kernel version           6.0+                  3.9+ (SO_REUSEPORT)
