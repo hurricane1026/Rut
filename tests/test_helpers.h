@@ -1003,6 +1003,29 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     void dispatch(const IoEvent&) {}
 };
 
+// The kernel releases a closed ring's memlock charge asynchronously, so a ring
+// created right after another was torn down can see a transient ENOMEM. Retry
+// briefly; a persistent failure still reports unavailable.
+template <typename Loop>
+inline bool init_iouring_loop_with_retry(Loop& loop) {
+    for (u32 attempt = 0; attempt < 40; attempt++) {
+        auto result = loop.init(0, -1);
+        if (result.has_value()) return true;
+        if (result.error().code != ENOMEM) return false;
+        usleep(25000);
+    }
+    return false;
+}
+
+// io_uring loops leave conns[] untouched until alloc_conn() hands a slot out
+// (see IoUringEventLoop::slots_initialized). Tests that poke conns[i] directly
+// without allocating call this first: it applies the same first-hand-out
+// initialisation to slots [slots_initialized, n) and advances the watermark.
+template <typename Loop>
+inline void test_initialize_slots(Loop& loop, u32 n) {
+    loop.initialize_slots_to(n);
+}
+
 // ---- Real socket helpers ----
 
 #ifdef __APPLE__

@@ -217,6 +217,19 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   complete its operations; if requests connect but never respond, force
   the epoll backend by running with TLS, or run on a host with working
   io_uring.
+- **io_uring ring memory counts against `RLIMIT_MEMLOCK`.** On recent
+  kernels each shard's ring costs about 1652 KiB (for the current ring sizes,
+  on 4 KiB pages; slightly more on 16 KiB / 64 KiB-page kernels, since the
+  charge is rounded to whole pages) of the per-user locked-memory budget,
+  shared by all processes of the user and not visible in `/proc`. With the
+  common 8 MiB default only four shards fit.
+  Plain HTTP with more shards (the default is one per CPU) stops at startup
+  with `Failed to init shard N (errno=12, source=2)` plus a diagnostic; with TLS
+  the same failure prints the diagnostic and falls back to epoll (TLS). If the
+  budget is already fully used, even the one-entry startup probe fails and Rut
+  silently runs on epoll. To keep io_uring, raise the limit (`ulimit -l <KiB>`,
+  systemd `LimitMEMLOCK=`, container `--ulimit memlock=<bytes>`), grant
+  `CAP_IPC_LOCK`, or run fewer shards. Rut never raises the limit itself.
 
 For what is and isn't implemented across the language and runtime, see
 `docs/core-capabilities.md`.
