@@ -721,6 +721,11 @@ static u64 response_coalesced_phase1_handler(
         return jit::HandlerResult::make_forward_with_bundle(
                    0, static_cast<u16>(RequestPolicyId::Http11FixedStripContentLengthAfterHost), 2)
             .pack();
+    // The converter's bodyless GET policy (retained header values).
+    if (response_coalesced_phase1_mutation_kind == 6)
+        return jit::HandlerResult::make_forward_with_bundle(
+                   0, static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab), 2)
+            .pack();
     return jit::HandlerResult::make_forward_with_bundle(
                0, static_cast<u16>(RequestPolicyId::Http11FixedStrip), 2)
         .pack();
@@ -24250,58 +24255,49 @@ struct PipelineCausalSmallLoop : SmallLoop {
     }
 };
 
-// 17 GETs pipelined. First 16 processed via recursion, 17th falls through to normal recv.
-TEST(pipeline, depth_limit_respected) {
+// A burst longer than kMaxPipelineDepth: every request that still has a
+// successor behind it re-bases to depth 0 once its predecessor retires, so the
+// depth counter never accumulates and the whole burst is served.
+TEST(pipeline, long_burst_rebases_each_settled_boundary_past_depth_limit) {
     SmallLoop loop;
     loop.setup();
     loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
     auto* conn = loop.find_fd(42);
     REQUIRE(conn != nullptr);
 
-    // Build 17 GET requests concatenated.
-    // Each "GET / HTTP/1.1\r\nHost: x\r\n\r\n" = 27 bytes.
-    // 17 * 27 = 459 bytes (fits in 4096 buffer).
-    const char* one_get = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-    u32 one_len = 27;
-    u32 total = one_len * 17;
-
+    static constexpr char kGet[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    constexpr u32 kGetLen = sizeof(kGet) - 1;
+    constexpr u32 kRequestCount = 40;
+    static_assert(kRequestCount > Connection::kMaxPipelineDepth + 1);
     conn->recv_buf.reset();
-    u8* dst = conn->recv_buf.write_ptr();
-    for (u32 r = 0; r < 17; r++) {
-        for (u32 i = 0; i < one_len; i++) dst[r * one_len + i] = static_cast<u8>(one_get[i]);
-    }
-    conn->recv_buf.commit(total);
-    IoEvent ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(total));
+    for (u32 r = 0; r < kRequestCount; r++)
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kGet), kGetLen), kGetLen);
+    IoEvent ev = make_ev(conn->id, IoEventType::Recv, static_cast<i32>(kGetLen * kRequestCount));
     loop.backend.inject(ev);
     IoEvent events[8];
     u32 n = loop.backend.wait(events, 8);
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
 
-    // First request processed, waiting for send completion.
+    // Request 1 is waiting for its send completion.
     CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
-
-    // Process sends for requests 1-16 (each send triggers pipeline dispatch of the next).
-    // Send 1 completes → pipeline dispatches request 2 (depth 0→1).
-    // Send 2 completes → pipeline dispatches request 3 (depth 1→2).
-    // ...
-    // Send 16 completes → pipeline dispatches request 17 (depth 15→16).
-    for (u32 r = 0; r < 16; r++) {
-        u32 send_len = conn->send_buf.len();
+    for (u32 r = 1; r < kRequestCount; r++) {
+        const u32 send_len = conn->send_buf.len();
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+        REQUIRE_GE(conn->fd, 0);
+        REQUIRE_EQ(conn->on_send, &on_response_sent<SmallLoop>);
+        // Requests with a successor behind them run at depth 0; only the last,
+        // suffix-free one keeps depth 1.
+        CHECK_EQ(conn->pipeline_depth, r + 1 == kRequestCount ? 1u : 0u);
+        CHECK_EQ(conn->handler_gen, r + 1);
     }
 
-    // After 16 sends, request 17 is being sent (depth = 16).
-    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
-    CHECK_EQ(conn->pipeline_depth, 16u);
-
-    // Complete request 17's send. pipeline_shift returns false (depth >= max).
-    u32 send_len = conn->send_buf.len();
+    // The last send drains the burst and re-arms an ordinary Recv.
+    const u32 send_len = conn->send_buf.len();
     loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
-
-    // Pipeline drained — falls through to normal recv re-arm.
     CHECK_EQ(conn->state, ConnState::ReadingHeader);
     CHECK_EQ(conn->on_recv, &on_header_received<SmallLoop>);
     CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_EQ(conn->recv_buf.len(), 0u);
 }
 
 TEST(pipeline, typed_transition_limit_rejects_without_mutating_or_dispatching) {
@@ -24358,7 +24354,9 @@ TEST(pipeline, typed_transition_limit_rejects_without_mutating_or_dispatching) {
     CHECK_EQ(conn->recv_buf.len(), sizeof(kNext) - 1 + 4u);
 }
 
-TEST(pipeline, seventeenth_successor_closes_before_dispatch) {
+// Past kMaxPipelineDepth, every request of a pipelined burst is served and
+// accounted exactly once; the depth limit no longer closes the connection.
+TEST(pipeline, burst_past_depth_limit_serves_and_accounts_every_request) {
     PipelineCausalSmallLoop loop;
     loop.setup();
     ShardMetrics metrics{};
@@ -24393,39 +24391,28 @@ TEST(pipeline, seventeenth_successor_closes_before_dispatch) {
     for (u32 i = 0; i < n; i++) loop.dispatch(events[i]);
     REQUIRE_EQ(conn->on_send, &on_response_sent<PipelineCausalSmallLoop>);
 
-    for (u32 i = 0; i < Connection::kMaxPipelineDepth; i++) {
+    for (u32 i = 1; i < kRequestCount; i++) {
         const u32 send_len = conn->send_buf.len();
         loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(send_len)));
+        REQUIRE_GE(conn->fd, 0);
+        CHECK_LE(conn->pipeline_depth, 1u);
     }
-    CHECK_EQ(conn->pipeline_depth, Connection::kMaxPipelineDepth);
-    CHECK_EQ(metrics.requests_total, Connection::kMaxPipelineDepth);
+    // requests_total counts completions; the last request is still in flight.
+    CHECK_EQ(metrics.requests_total, kRequestCount - 1u);
     CHECK_EQ(metrics.requests_active, 1u);
-    CHECK_EQ(access.available(), Connection::kMaxPipelineDepth);
-    CHECK_EQ(capture.available(), Connection::kMaxPipelineDepth);
-    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 33u);
-    const u32 handler_before_overflow = conn->handler_gen;
-    const u32 metadata_before_overflow = conn->req_metadata_episode;
-    const u32 recv_len_before_overflow = conn->recv_buf.len();
-    const u32 seventeenth_send_len = conn->send_buf.len();
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(seventeenth_send_len)));
-    CHECK_EQ(loop.close_count, 1u);
-    CHECK_EQ(loop.close_handler_gen, handler_before_overflow);
-    CHECK_EQ(loop.close_completed_requests, Connection::kMaxPipelineDepth + 1u);
-    CHECK_EQ(metrics.requests_total, Connection::kMaxPipelineDepth + 1u);
+    const u32 last_send_len = conn->send_buf.len();
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::Send, static_cast<i32>(last_send_len)));
+    CHECK_EQ(loop.close_count, 0u);
+    CHECK_GE(conn->fd, 0);
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_EQ(metrics.requests_total, kRequestCount);
     CHECK_EQ(metrics.requests_active, 0u);
-    CHECK_EQ(access.available(), Connection::kMaxPipelineDepth + 1u);
-    CHECK_EQ(capture.available(), Connection::kMaxPipelineDepth + 1u);
-    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 34u);
-    CHECK_EQ(loop.close_pipeline_depth, Connection::kMaxPipelineDepth);
-    CHECK_EQ(loop.close_recv_len, recv_len_before_overflow);
-    CHECK_EQ(loop.close_req_initial_send_len, kGetLen);
-    CHECK_EQ(loop.close_pipeline_stash_len, 0u);
-    CHECK_EQ(loop.close_metadata_episode, metadata_before_overflow);
-    CHECK_EQ(loop.close_upstream_attempts, 0u);
-    CHECK_EQ(loop.close_upstream_episode, 1u);
-    CHECK_EQ(loop.close_upstream_fd, -1);
-    CHECK(loop.close_deadline_neutral);
+    CHECK_EQ(access.available(), kRequestCount);
+    CHECK_EQ(capture.available(), kRequestCount);
+    // One epoch step at each request start and each completion.
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), 2u * kRequestCount);
+    loop.close_conn(*conn);
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 }
 
@@ -24861,19 +24848,22 @@ TEST(pipeline, request_generation_token_publishes_only_for_complete_depth_one) {
     REQUIRE_EQ(conn->handler_gen, 1u);
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
 
+    // Request 2 carries request 3 behind it, so once request 1 has retired it
+    // is re-based to depth 0 and never holds a token.
+    loop.backend.clear_ops();
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    REQUIRE_EQ(conn->pipeline_depth, 0u);
+    REQUIRE_EQ(conn->handler_gen, 2u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+
+    // Request 3 is a suffix-free depth-1 successor: the token path owns it.
     loop.backend.clear_ops();
     loop.inject_and_dispatch(
         make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
     REQUIRE_EQ(conn->pipeline_depth, 1u);
-    REQUIRE_EQ(conn->handler_gen, 2u);
-    CHECK_EQ(conn->http1_pipeline_request_generation, conn->handler_gen);
-
-    loop.backend.clear_ops();
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
-    REQUIRE_EQ(conn->pipeline_depth, 2u);
     REQUIRE_EQ(conn->handler_gen, 3u);
-    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, conn->handler_gen);
 }
 
 TEST(pipeline, fragmented_successor_defers_request_generation_token_until_complete) {
@@ -24895,12 +24885,14 @@ TEST(pipeline, fragmented_successor_defers_request_generation_token_until_comple
     REQUIRE_EQ(conn->handler_gen, 1u);
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
 
+    // Deliver the tail as the Recv completion itself: inject_and_dispatch would
+    // append its own mock bytes, which are a pipelined suffix behind request 2.
     static constexpr char kTail[] = "\r\n\r\n";
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1u),
                sizeof(kTail) - 1u);
-    loop.inject_and_dispatch(
-        make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kTail) - 1u)));
+    loop.dispatch(make_ev(conn->id, IoEventType::Recv, static_cast<i32>(sizeof(kTail) - 1u)));
     REQUIRE_EQ(conn->handler_gen, 2u);
+    CHECK_EQ(conn->pipeline_depth, 1u);
     CHECK_EQ(conn->http1_pipeline_request_generation, conn->handler_gen);
 }
 
@@ -40830,6 +40822,244 @@ TEST(tls_iouring, strict_bodyless_get_tls_preflight_reaches_precise_owner) {
     }
 }
 
+TEST(tls_iouring, coalesced_bodyless_get_stashes_successor_and_begins_tls_504) {
+    // A pipelined HTTPS request 1 is admitted through the TLS bridge as a
+    // coalesced depth-0 GET: only request 1 is rewritten and uploaded, request
+    // 2 moves to the stash, and the TLS read-timeout 504 still begins with that
+    // stash in place.
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    static constexpr u8 kRequest1[] =
+        "GET /one?q=1 HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr u8 kRequest2[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    constexpr u32 kRequest1Len = sizeof(kRequest1) - 1u;
+    constexpr u32 kRequest2Len = sizeof(kRequest2) - 1u;
+
+    for (const RequestPolicyId policy :
+         {RequestPolicyId::Http11FixedStrip, RequestPolicyId::Http11FixedTrimSpPreserveHtab}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init(/*capacity=*/2));
+        IoUringEventLoop& loop = *guard.loop;
+        ScopedTlsRawSendPool pool_guard;
+        REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+        RouteConfig config{};
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        REQUIRE(config.add_jit_handler(
+            "/one", kRouteMethodGet, &response_read_deadline_handler, false, 2));
+        TlsMemoryClientPeer client;
+        REQUIRE(client.init());
+
+        PrebuiltD2Fixture fixture{};
+        Connection* conn_ptr = loop.alloc_conn();
+        REQUIRE(conn_ptr != nullptr);
+        Connection& conn = *conn_ptr;
+        fixture.conn = conn_ptr;
+        fixture.sq_tail_before = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+        fixture.backend_pending_before = loop.backend.pending;
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+        conn.fd = downstream[0];
+        fixture.peer_fd = downstream[1];
+        REQUIRE_EQ(conn.recv_buf.write(kRequest1, kRequest1Len), kRequest1Len);
+        REQUIRE_EQ(conn.recv_buf.write(kRequest2, kRequest2Len), kRequest2Len);
+        capture_request_metadata(conn);
+        conn.keep_alive = true;
+        conn.req_start_us = monotonic_us();
+        conn.handler_gen = 1;
+        conn.request_config = &config;
+        loop.tls_server = context.get();
+        REQUIRE(loop.tls_setup(conn));
+        REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+        conn.tls_handshake_complete = true;
+        conn.tls_pending_on_recv = &on_header_received<IoUringEventLoop>;
+
+        REQUIRE(prepare_response_read_deadline_preflight(&loop, conn, &config.routes[0], &config));
+        CHECK_EQ(conn.response_read_deadline_upload.raw_total_length, kRequest1Len);
+        conn.tls_pending_on_recv = nullptr;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::Forward;
+        outcome.upstream_id = 0;
+        outcome.request_policy_id = static_cast<u16>(policy);
+        outcome.policy_bundle_id = 2;
+        handle_jit_outcome<IoUringEventLoop>(
+            &loop, conn, outcome, &response_read_deadline_handler, false);
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Validated);
+        REQUIRE(conn.upstream_connect_armed);
+        fixture.episode = conn.upstream_episode;
+        loop.dispatch({conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, fixture.episode});
+        REQUIRE(conn.upstream_send_armed);
+
+        auto& send = loop.backend.upstream_send_state[conn.id];
+        const char* expected_wire =
+            policy == RequestPolicyId::Http11FixedTrimSpPreserveHtab
+                ? "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: \t keep \t\r\n\r\n"
+                : "GET /one?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: keep\r\n\r\n";
+        const u32 expected_len = static_cast<u32>(__builtin_strlen(expected_wire));
+        REQUIRE_EQ(send.remaining, expected_len);
+        CHECK_EQ(__builtin_memcmp(send.src, expected_wire, expected_len), 0);
+        const u32 sent_len = send.remaining;
+        send.offset = sent_len;
+        send.remaining = 0;
+        loop.dispatch({conn.id,
+                       static_cast<i32>(sent_len),
+                       0,
+                       0,
+                       IoEventType::UpstreamSend,
+                       0,
+                       0,
+                       fixture.episode});
+        REQUIRE_GE(conn.fd, 0);
+        REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE_EQ(conn.pipeline_stash_len, kRequest2Len);
+        CHECK_EQ(__builtin_memcmp(conn.send_buf.data(), kRequest2, kRequest2Len), 0);
+        CHECK(response_read_deadline_tls_complete_get_profile_is_stable(conn));
+
+        // A coalesced layout is timed by the connection wheel, not the precise
+        // ring timer, so the wheel expiry enters ExpiryPending directly.
+        CHECK(conn.response_read_timer_owner_is_neutral());
+        conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+        REQUIRE(try_prebuilt_strict_read_timeout(&loop, conn));
+        REQUIRE_GE(conn.fd, 0);
+        CHECK_EQ(conn.resp_status, 504u);
+        CHECK_EQ(conn.http1_prebuilt_response_purpose,
+                 Http1PrebuiltResponsePurpose::ResponseReadTimeout);
+        CHECK_EQ(conn.pipeline_stash_len, kRequest2Len);
+        cleanup_prebuilt_d2(&loop, fixture);
+    }
+}
+
+void complete_staged_tls_prebuilt_send(ScopedTlsRawSendLoop& guard,
+                                       Connection& conn,
+                                       u32 raw_generation,
+                                       u32 cipher_len);
+void drain_staged_tls_prebuilt_retirement(IoUringEventLoop* loop,
+                                          Connection& conn,
+                                          bool cancel_first);
+
+TEST(tls_iouring, deferred_504_boundary_decrypts_successor_tail_buffered_during_upstream_wait) {
+    // Request 2 is split across TLS records: its head was decrypted with
+    // request 1, its tail arrived while request 1 waited on the origin and is
+    // still ciphertext in tls_in_buf. The deferred 504 boundary resumes outside
+    // tls_process, so it must decrypt that tail itself; otherwise request 2
+    // waits for a Recv that never comes.
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    static constexpr u8 kRequest1[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr u8 kRequest2[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    constexpr u32 kRequest1Len = sizeof(kRequest1) - 1u;
+    constexpr u32 kRequest2Len = sizeof(kRequest2) - 1u;
+    constexpr u32 kHeadLen = 12;
+
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init(/*capacity=*/2));
+    IoUringEventLoop& loop = *guard.loop;
+    ScopedTlsRawSendPool pool_guard;
+    REQUIRE(pool_guard.init(loop, /*capacity=*/12));
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodGet, &response_read_deadline_get_framing_selection_handler, false, 2));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+
+    PrebuiltD2Fixture fixture{};
+    Connection* conn_ptr = loop.alloc_conn();
+    REQUIRE(conn_ptr != nullptr);
+    Connection& conn = *conn_ptr;
+    fixture.conn = conn_ptr;
+    fixture.sq_tail_before = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    fixture.backend_pending_before = loop.backend.pending;
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn.fd = downstream[0];
+    fixture.peer_fd = downstream[1];
+    REQUIRE_EQ(conn.recv_buf.write(kRequest1, kRequest1Len), kRequest1Len);
+    REQUIRE_EQ(conn.recv_buf.write(kRequest2, kHeadLen), kHeadLen);
+    capture_request_metadata(conn);
+    conn.keep_alive = true;
+    conn.req_start_us = monotonic_us();
+    conn.handler_gen = 1;
+    conn.request_config = &config;
+    loop.tls_server = context.get();
+    REQUIRE(loop.tls_setup(conn));
+    REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+    conn.tls_handshake_complete = true;
+    conn.tls_pending_on_recv = &on_header_received<IoUringEventLoop>;
+    REQUIRE(prepare_response_read_deadline_preflight(&loop, conn, &config.routes[0], &config));
+    conn.tls_pending_on_recv = nullptr;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab);
+    outcome.policy_bundle_id = 2;
+    handle_jit_outcome<IoUringEventLoop>(
+        &loop, conn, outcome, &response_read_deadline_get_framing_selection_handler, false);
+    REQUIRE(conn.upstream_connect_armed);
+    fixture.episode = conn.upstream_episode;
+    loop.dispatch({conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, fixture.episode});
+    REQUIRE(conn.upstream_send_armed);
+    auto& send = loop.backend.upstream_send_state[conn.id];
+    const u32 sent_len = send.remaining;
+    send.offset = sent_len;
+    send.remaining = 0;
+    loop.dispatch({conn.id,
+                   static_cast<i32>(sent_len),
+                   0,
+                   0,
+                   IoEventType::UpstreamSend,
+                   0,
+                   0,
+                   fixture.episode});
+    REQUIRE_EQ(conn.response_read_deadline_state, ResponseReadDeadlineState::Armed);
+    REQUIRE_EQ(conn.pipeline_stash_len, kHeadLen);
+
+    // The tail of request 2 arrives as its own TLS record and, with no pending
+    // request callback, stays encrypted in tls_in_buf.
+    REQUIRE_EQ(
+        SSL_write(client.ssl, kRequest2 + kHeadLen, static_cast<int>(kRequest2Len - kHeadLen)),
+        static_cast<int>(kRequest2Len - kHeadLen));
+    u8 cipher[4096];
+    const int cipher_len = BIO_read(SSL_get_wbio(client.ssl), cipher, sizeof(cipher));
+    REQUIRE_GT(cipher_len, 0);
+    REQUIRE_EQ(conn.tls_in_buf.write(cipher, static_cast<u32>(cipher_len)),
+               static_cast<u32>(cipher_len));
+
+    conn.response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+    REQUIRE(try_prebuilt_strict_read_timeout(&loop, conn));
+    REQUIRE_EQ(conn.resp_status, 504u);
+    REQUIRE(conn.tls_out_inflight);
+    complete_staged_tls_prebuilt_send(
+        guard, conn, conn.tls_out_inflight_generation, conn.tls_out_inflight_len);
+    REQUIRE_GE(conn.fd, 0);
+    if (!conn.http1_boundary_ready) {
+        drain_staged_tls_prebuilt_retirement(&loop, conn, /*cancel_first=*/false);
+    }
+    REQUIRE(conn.http1_boundary_ready);
+    loop.resume_deferred_http1_boundaries();
+
+    // Request 2 was decrypted, parsed completely, re-based and forwarded.
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK_EQ(conn.handler_gen, 2u);
+    CHECK_EQ(conn.pipeline_depth, 0u);
+    CHECK_NE(conn.state, ConnState::ReadingHeader);
+    CHECK(conn.upstream_connect_armed);
+    cleanup_prebuilt_d2(&loop, fixture);
+}
+
 void complete_staged_tls_prebuilt_send(ScopedTlsRawSendLoop& guard,
                                        Connection& conn,
                                        u32 raw_generation,
@@ -42101,6 +42331,254 @@ TEST(response_read_deadline_coalesced_get_phase1,
     const std::string expected = expected_representation200_wire(false, false);
     REQUIRE_EQ(conn->send_buf.len(), static_cast<u32>(expected.size()));
     CHECK_EQ(__builtin_memcmp(normalized, expected.data(), expected.size()), 0);
+
+    __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending;
+    loop->backend.upstream_send_state[conn->id] = {};
+    conn->upstream_recv_armed = false;
+    conn->recv_armed = false;
+    conn->pending_ops = 0;
+    conn->clear_slots();
+    loop->close_conn(*conn);
+    close(downstream[1]);
+}
+
+TEST(response_read_deadline_coalesced_get_phase1,
+     retained_value_policy_rewrites_request_one_and_stashes_exact_successor) {
+    // rut-nginx-convert selects ID3 for every bodyless GET, so a pipelined pair
+    // on a converted proxy_pass route must coalesce exactly like ID1: rewrite
+    // only request 1 and carry the successor bytes verbatim into the stash.
+    struct ScopedPolicyKind {
+        explicit ScopedPolicyKind(u8 kind) { response_coalesced_phase1_mutation_kind = kind; }
+        ~ScopedPolicyKind() { response_coalesced_phase1_mutation_kind = 0; }
+    };
+    struct Vector {
+        u8 handler_kind;
+        u16 policy;
+        const char* upload;
+    };
+    // ID1 trims SP and HTAB around a retained value; ID3 trims only SP.
+    const Vector vectors[] = {
+        {0,
+         static_cast<u16>(RequestPolicyId::Http11FixedStrip),
+         "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Keep: v\r\n\r\n"},
+        {6,
+         static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab),
+         "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Keep: \tv\t\r\n\r\n"},
+    };
+    for (const Vector& vector : vectors) {
+        ScopedPolicyKind policy_kind{vector.handler_kind};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        REQUIRE(install_representation200_exact(config, "/two"));
+        REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+        REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+            config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+        REQUIRE(config.add_jit_handler(
+            "/one", kRouteMethodGet, &response_coalesced_phase1_handler, false, 2));
+        REQUIRE(config.add_static("/two", kRouteMethodGet, 204));
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+        conn->fd = downstream[0];
+        static constexpr u8 kRequest1[] =
+            "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n"
+            "X-Keep:  \tv\t \r\n\r\n";
+        static constexpr u8 kSuccessor[] =
+            "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+        REQUIRE_EQ(conn->recv_buf.write(kRequest1, sizeof(kRequest1) - 1u), sizeof(kRequest1) - 1u);
+        REQUIRE_EQ(conn->recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
+                   sizeof(kSuccessor) - 1u);
+        const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+        const u32 backend_pending = loop->backend.pending;
+        conn->recv_armed = true;
+        conn->pending_ops = 1;
+        on_header_received<IoUringEventLoop>(
+            loop,
+            *conn,
+            {conn->id,
+             static_cast<i32>(sizeof(kRequest1) + sizeof(kSuccessor) - 2u),
+             0,
+             0,
+             IoEventType::Recv,
+             1});
+        REQUIRE(conn->upstream_connect_armed);
+        CHECK_EQ(conn->request_policy_id, vector.policy);
+        const u32 upload_len_expected = static_cast<u32>(__builtin_strlen(vector.upload));
+        REQUIRE_EQ(conn->req_initial_send_len, upload_len_expected);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), vector.upload, upload_len_expected), 0);
+        REQUIRE_EQ(conn->recv_buf.len(), upload_len_expected + sizeof(kSuccessor) - 1u);
+        CHECK_EQ(
+            __builtin_memcmp(
+                conn->recv_buf.data() + upload_len_expected, kSuccessor, sizeof(kSuccessor) - 1u),
+            0);
+        const u32 episode = conn->upstream_episode;
+        conn->upstream_connect_armed = false;
+        conn->pending_ops--;
+        on_upstream_connected<IoUringEventLoop>(
+            loop, *conn, {conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+        REQUIRE(conn->upstream_send_armed);
+        const u32 upload_len = loop->backend.upstream_send_state[conn->id].remaining;
+        REQUIRE_EQ(upload_len, upload_len_expected);
+        REQUIRE_EQ(upload_len, conn->response_read_deadline_upload.expected_upload_length);
+        loop->backend.upstream_send_state[conn->id].offset = upload_len;
+        loop->backend.upstream_send_state[conn->id].remaining = 0;
+        conn->upstream_send_armed = false;
+        conn->pending_ops--;
+        on_upstream_request_sent<IoUringEventLoop>(loop,
+                                                   *conn,
+                                                   {conn->id,
+                                                    static_cast<i32>(upload_len),
+                                                    0,
+                                                    0,
+                                                    IoEventType::UpstreamSend,
+                                                    0,
+                                                    0,
+                                                    episode});
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE(response_read_deadline_coalesced_get_phase1_stash_is_stable(
+            *conn, conn->response_read_deadline_upload));
+        CHECK_EQ(conn->pipeline_stash_len, sizeof(kSuccessor) - 1u);
+        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), kSuccessor, sizeof(kSuccessor) - 1u), 0);
+
+        conn->response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+        REQUIRE(try_prebuilt_strict_read_timeout(loop, *conn));
+        complete_prebuilt_d2_header(loop, *conn);
+        drain_prebuilt_d2_retirement(loop, *conn, kUpstreamOpRecv, false);
+        REQUIRE(conn->http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+        CHECK_EQ(conn->resp_status, 200u);
+        CHECK_EQ(conn->pipeline_depth, 1u);
+        CHECK_EQ(conn->recv_buf.len(), sizeof(kSuccessor) - 1u);
+
+        __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
+        loop->backend.pending = backend_pending;
+        loop->backend.upstream_send_state[conn->id] = {};
+        conn->upstream_recv_armed = false;
+        conn->recv_armed = false;
+        conn->pending_ops = 0;
+        conn->clear_slots();
+        loop->close_conn(*conn);
+        close(downstream[1]);
+    }
+}
+
+TEST(response_read_deadline_coalesced_get_phase1,
+     three_request_burst_rebases_request_two_and_coalesces_request_three) {
+    // Requests 1 and 2 are deadline-owned ID3 forwards and request 3 is local.
+    // Once request 1 retires, request 2 still carries request 3 behind it: it
+    // must re-base to depth 0, forward with only its own bytes and stash
+    // request 3 exactly as request 1 stashed it.
+    struct ScopedPolicyKind {
+        ScopedPolicyKind() { response_coalesced_phase1_mutation_kind = 6; }
+        ~ScopedPolicyKind() { response_coalesced_phase1_mutation_kind = 0; }
+    } policy_kind;
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(install_representation200_exact(config, "/two"));
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
+        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
+    REQUIRE(config.add_jit_handler(
+        "/one", kRouteMethodGet, &response_coalesced_phase1_handler, false, 2));
+    REQUIRE(config.add_static("/two", kRouteMethodGet, 204));
+    const RouteConfig* active = &config;
+    loop->config_ptr = &active;
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn->fd = downstream[0];
+    static constexpr u8 kRequest1[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    static constexpr u8 kRequest2[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nConnection: keep-alive\r\n\r\n";
+    static constexpr u8 kRequest3[] =
+        "GET /two HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    static constexpr char kUpload[] = "GET /one HTTP/1.1\r\nHost: 127.0.0.1:9000\r\n\r\n";
+    constexpr u32 kUploadLen = sizeof(kUpload) - 1u;
+    REQUIRE_EQ(conn->recv_buf.write(kRequest1, sizeof(kRequest1) - 1u), sizeof(kRequest1) - 1u);
+    REQUIRE_EQ(conn->recv_buf.write(kRequest2, sizeof(kRequest2) - 1u), sizeof(kRequest2) - 1u);
+    REQUIRE_EQ(conn->recv_buf.write(kRequest3, sizeof(kRequest3) - 1u), sizeof(kRequest3) - 1u);
+    const u32 sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 backend_pending = loop->backend.pending;
+    conn->recv_armed = true;
+    conn->pending_ops = 1;
+    on_header_received<IoUringEventLoop>(
+        loop,
+        *conn,
+        {conn->id, static_cast<i32>(conn->recv_buf.len()), 0, 0, IoEventType::Recv, 1});
+
+    // Upload the current request and time it out, leaving its boundary ready.
+    auto upload_and_expire = [&](u32 expected_stash_len, const u8* expected_stash) {
+        REQUIRE(conn->upstream_connect_armed);
+        REQUIRE_EQ(conn->req_initial_send_len, kUploadLen);
+        CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kUpload, kUploadLen), 0);
+        const u32 episode = conn->upstream_episode;
+        conn->upstream_connect_armed = false;
+        conn->pending_ops--;
+        on_upstream_connected<IoUringEventLoop>(
+            loop, *conn, {conn->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, episode});
+        REQUIRE(conn->upstream_send_armed);
+        const u32 upload_len = loop->backend.upstream_send_state[conn->id].remaining;
+        REQUIRE_EQ(upload_len, kUploadLen);
+        loop->backend.upstream_send_state[conn->id].offset = upload_len;
+        loop->backend.upstream_send_state[conn->id].remaining = 0;
+        conn->upstream_send_armed = false;
+        conn->pending_ops--;
+        on_upstream_request_sent<IoUringEventLoop>(loop,
+                                                   *conn,
+                                                   {conn->id,
+                                                    static_cast<i32>(upload_len),
+                                                    0,
+                                                    0,
+                                                    IoEventType::UpstreamSend,
+                                                    0,
+                                                    0,
+                                                    episode});
+        REQUIRE_EQ(conn->response_read_deadline_state, ResponseReadDeadlineState::Armed);
+        REQUIRE(response_read_deadline_coalesced_get_phase1_stash_is_stable(
+            *conn, conn->response_read_deadline_upload));
+        REQUIRE_EQ(conn->pipeline_stash_len, expected_stash_len);
+        CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), expected_stash, expected_stash_len), 0);
+        conn->response_read_deadline_state = ResponseReadDeadlineState::ExpiryPending;
+        REQUIRE(try_prebuilt_strict_read_timeout(loop, *conn));
+        complete_prebuilt_d2_header(loop, *conn);
+        drain_prebuilt_d2_retirement(loop, *conn, kUpstreamOpRecv, false);
+        REQUIRE(conn->http1_boundary_ready);
+        loop->resume_deferred_http1_boundaries();
+    };
+
+    // Request 1: legacy, coalesced with requests 2 and 3 behind it.
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    u8 stash_2_and_3[sizeof(kRequest2) + sizeof(kRequest3)];
+    __builtin_memcpy(stash_2_and_3, kRequest2, sizeof(kRequest2) - 1u);
+    __builtin_memcpy(stash_2_and_3 + sizeof(kRequest2) - 1u, kRequest3, sizeof(kRequest3) - 1u);
+    upload_and_expire(sizeof(kRequest2) + sizeof(kRequest3) - 2u, stash_2_and_3);
+
+    // Request 2 re-based: depth 0, no token, its own upstream episode, and
+    // request 3 still behind it.
+    REQUIRE_GE(conn->fd, 0);
+    CHECK_EQ(conn->pipeline_depth, 0u);
+    CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
+    CHECK_EQ(conn->request_policy_id,
+             static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+    REQUIRE_EQ(conn->recv_buf.len(), kUploadLen + sizeof(kRequest3) - 1u);
+    CHECK_EQ(
+        __builtin_memcmp(conn->recv_buf.data() + kUploadLen, kRequest3, sizeof(kRequest3) - 1u), 0);
+    upload_and_expire(sizeof(kRequest3) - 1u, kRequest3);
+
+    // Request 3 is a suffix-free local successor and completes normally.
+    REQUIRE_GE(conn->fd, 0);
+    CHECK_EQ(conn->resp_status, 200u);
+    CHECK_EQ(conn->pipeline_depth, 1u);
+    CHECK_EQ(conn->recv_buf.len(), sizeof(kRequest3) - 1u);
 
     __atomic_store_n(loop->backend.sq_tail, sq_tail, __ATOMIC_RELEASE);
     loop->backend.pending = backend_pending;
@@ -44038,15 +44516,15 @@ TEST(http1_pipeline_generation_activation,
 
 TEST(http1_pipeline_generation_activation,
      strict_successor_id3_rejects_adversarial_callback_inputs_before_transport) {
-    enum class Forgery : u8 { WrongPolicy, ContentLengthZero, WrongDepth, TrailingThirdRequest };
+    // A depth-2 or suffix-carrying request two is no longer a forgery: once
+    // request 1 retires it re-bases to depth 0 (see
+    // settled_request_two_with_suffix_or_past_depth_one_rebases_to_depth_zero).
+    enum class Forgery : u8 { WrongPolicy, ContentLengthZero };
     static constexpr u8 kSuccessor[] =
         "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
     static constexpr u8 kContentLengthZero[] =
         "GET /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n";
-    for (const Forgery forgery : {Forgery::WrongPolicy,
-                                  Forgery::ContentLengthZero,
-                                  Forgery::WrongDepth,
-                                  Forgery::TrailingThirdRequest}) {
+    for (const Forgery forgery : {Forgery::WrongPolicy, Forgery::ContentLengthZero}) {
         ScopedBackendHealthReset health_reset{};
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
@@ -44073,10 +44551,6 @@ TEST(http1_pipeline_generation_activation,
                                     ? sizeof(kContentLengthZero) - 1u
                                     : sizeof(kSuccessor) - 1u;
         REQUIRE_EQ(conn.recv_buf.write(request, request_len), request_len);
-        if (forgery == Forgery::TrailingThirdRequest)
-            REQUIRE_EQ(conn.recv_buf.write(kSuccessor, sizeof(kSuccessor) - 1u),
-                       sizeof(kSuccessor) - 1u);
-        if (forgery == Forgery::WrongDepth) conn.pipeline_depth = 2;
         loop->backend.send_state[id].remaining = 0;
         loop->dispatch({id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0});
         CHECK_EQ(loop->conns[id].fd, -1);
@@ -44931,9 +45405,9 @@ TEST(http1_pipeline_generation_activation,
 
 TEST(http1_pipeline_generation_activation,
      out_of_domain_request_two_never_publishes_upstream_effect) {
+    // A request two that carries its own successor is in domain: it re-bases
+    // to depth 0 (settled_request_two_with_suffix_or_past_depth_one_...).
     static constexpr const char* kRejected[] = {
-        "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n"
-        "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n",
         "POST /one HTTP/1.1\r\nHost: client.example\r\n\r\n",
         "GET /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 0\r\n\r\n",
         "GET /one HTTP/1.1\r\nHost: client.example\r\nContent-Length: 1\r\n\r\nx",
@@ -44974,6 +45448,64 @@ TEST(http1_pipeline_generation_activation,
         CHECK_FALSE(loop->conns[id].upstream_recv_armed);
         CHECK_EQ(loop->backend.upstream_send_state[id].remaining, 0u);
         CHECK_EQ(loop->conns[id].response_read_deadline_upload.upload_episode, 0u);
+        cleanup_late_failure_fixture(loop, fixture);
+    }
+}
+
+TEST(http1_pipeline_generation_activation,
+     settled_request_two_with_suffix_or_past_depth_one_rebases_to_depth_zero) {
+    // Request 1 ends in a configured 502 and retires every owner before request
+    // two is admitted. A request two the depth-1 token path cannot carry -- it
+    // has its own pipelined successor, or it sits past depth 1 -- is then a
+    // fresh keep-alive request: it runs at depth 0, holds no token, forwards,
+    // and keeps its successor bytes behind it for the coalesced stash.
+    enum class Shape : u8 { OwnSuccessor, DepthTwo };
+    static constexpr u8 kRequestTwo[] =
+        "GET /one HTTP/1.1\r\nHost: client.example\r\nX-Test:\t keep \t\r\n\r\n";
+    static constexpr u8 kRequestThree[] = "GET /one HTTP/1.1\r\nHost: client.example\r\n\r\n";
+    for (const Shape shape : {Shape::OwnSuccessor, Shape::DepthTwo}) {
+        ScopedBackendHealthReset health_reset{};
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        PreconnectConnectSubmitFixture fixture{};
+        ScopedStrictId3SuccessorHandler strict_id3_handler_state{};
+        REQUIRE(stage_late_failure_response(loop,
+                                            config,
+                                            LateFailureSite::ConnectCompletion,
+                                            AsyncConnectFailureProfile::BodylessGet,
+                                            &fixture,
+                                            nullptr,
+                                            &strict_id3_successor_handler));
+        Connection& conn = *fixture.conn;
+        const u32 id = conn.id;
+        REQUIRE_EQ(conn.recv_buf.write(kRequestTwo, sizeof(kRequestTwo) - 1u),
+                   sizeof(kRequestTwo) - 1u);
+        if (shape == Shape::OwnSuccessor)
+            REQUIRE_EQ(conn.recv_buf.write(kRequestThree, sizeof(kRequestThree) - 1u),
+                       sizeof(kRequestThree) - 1u);
+        else
+            conn.pipeline_depth = 2;
+        loop->backend.send_state[id].remaining = 0;
+        const u32 response1_len = conn.response_header_buf.len();
+        loop->dispatch({id, static_cast<i32>(response1_len), 0, 0, IoEventType::Send, 0});
+        REQUIRE(conn.fd >= 0);
+        CHECK(conn.upstream_connect_armed);
+        CHECK_EQ(conn.pipeline_depth, 0u);
+        CHECK_EQ(conn.http1_pipeline_request_generation, 0u);
+        CHECK(http1_pipeline_request_is_legacy(conn));
+        CHECK_EQ(conn.request_policy_id,
+                 static_cast<u16>(RequestPolicyId::Http11FixedTrimSpPreserveHtab));
+        if (shape == Shape::OwnSuccessor) {
+            REQUIRE_EQ(conn.recv_buf.len(), conn.req_initial_send_len + sizeof(kRequestThree) - 1u);
+            CHECK_EQ(__builtin_memcmp(conn.recv_buf.data() + conn.req_initial_send_len,
+                                      kRequestThree,
+                                      sizeof(kRequestThree) - 1u),
+                     0);
+        } else {
+            CHECK_EQ(conn.recv_buf.len(), conn.req_initial_send_len);
+        }
         cleanup_late_failure_fixture(loop, fixture);
     }
 }
@@ -47586,7 +48118,9 @@ TEST(http1_pipeline_generation_activation,
     CHECK_EQ(conn.resp_status, 204u);
     CHECK_EQ(conn.state, ConnState::Sending);
     CHECK_EQ(conn.handler_gen, 18u);
-    CHECK_EQ(conn.pipeline_depth, 2u);
+    // The 504 retirement settled request 1's owners before the boundary
+    // resumed, so the next request re-bases to depth 0 instead of depth 2.
+    CHECK_EQ(conn.pipeline_depth, 0u);
     CHECK_EQ(conn.http1_pipeline_request_generation, 0u);
     CHECK_EQ(metrics.requests_total, 1u);
     CHECK_EQ(metrics.requests_active, 1u);
