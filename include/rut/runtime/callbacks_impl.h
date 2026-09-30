@@ -1011,8 +1011,9 @@ inline bool inspect_response_read_deadline_coalesced_get_phase1(const Connection
         conn.req_initial_send_len != conn.req_header_end ||
         conn.req_initial_send_len >= conn.recv_buf.len() ||
         conn.req_initial_send_len > conn.recv_buf.capacity() ||
-        conn.protocol != ConnProtocol::Http11 || conn.tls_active || conn.h2 != nullptr ||
-        conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+        conn.protocol != ConnProtocol::Http11 ||
+        (conn.tls_active && !response_read_deadline_tls_http11_engine_is_stable(conn)) ||
+        conn.h2 != nullptr || conn.req_method != static_cast<u8>(LogHttpMethod::Get) ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
         !response_read_deadline_default_persistence_is_stable(conn) ||
         conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
@@ -1287,7 +1288,10 @@ bool prepare_response_read_deadline_preflight_for_mode(Loop* loop,
                    conn.tls_pending_on_recv == nullptr);
         const bool tls_bodyless_get_precise_preflight =
             !conn.tls_active ||
-            (exact_bodyless_get_precise_preflight &&
+            ((exact_bodyless_get_precise_preflight ||
+              (complete_buffering && route->method == kRouteMethodGet &&
+               conn.recv_buf.len() > conn.req_initial_send_len &&
+               inspect_response_read_deadline_coalesced_get_phase1(conn))) &&
              response_read_deadline_tls_http11_engine_is_stable(conn) &&
              tls_recv_callback_is_current<Loop>(conn) && tls_preflight_pending_recv_stable &&
              conn.tls_raw_send_owner_is_neutral() && conn.tls_single_shot_send_owner_is_neutral() &&
@@ -2084,6 +2088,22 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
     }
 }
 
+// Every owner the previous request in a pipelined burst held has retired:
+// its accounting, send, response-deadline, prebuilt-response, boundary and
+// upstream transport owners are neutral, exactly as when a keep-alive
+// connection re-arms Recv for a fresh request.
+inline bool http1_pipeline_predecessor_owners_are_settled(const Connection& conn) {
+    return conn.req_start_us == 0 && !conn.epoch_held && conn.send_progress == 0 &&
+           !conn.send_armed && conn.on_send == nullptr &&
+           conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
+           conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
+           conn.http1_prebuilt_request_prefix_len == 0 &&
+           conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
+           !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
+           !conn.upstream_episode_quarantined && http1_pipeline_successor_tombstone_is_safe(conn) &&
+           http1_pipeline_successor_upstream_owners_are_neutral(conn);
+}
+
 template <typename Loop>
 void pipeline_dispatch(Loop* loop, Connection& conn) {
     // Snapshot before transition_to_reading_header clears the previous callback
@@ -2091,15 +2111,7 @@ void pipeline_dispatch(Loop* loop, Connection& conn) {
     // predicate after a complete successor parse; fragmented reparses retain
     // this bit until that point.
     conn.http1_pipeline_boundary_owners_settled =
-        conn.pipeline_depth == 1 && conn.req_start_us == 0 && !conn.epoch_held &&
-        conn.send_progress == 0 && !conn.send_armed && conn.on_send == nullptr &&
-        conn.response_read_deadline_owner_is_neutral() && conn.http1_prebuilt_wait == 0 &&
-        conn.http1_prebuilt_disposition == Http1RequestBufferDisposition::None &&
-        conn.http1_prebuilt_request_prefix_len == 0 &&
-        conn.http1_prebuilt_response_proof_is_neutral() && !conn.http1_boundary_deferred &&
-        !conn.http1_boundary_ready && conn.http1_boundary_successor_episode == 0 &&
-        !conn.upstream_episode_quarantined && http1_pipeline_successor_tombstone_is_safe(conn) &&
-        http1_pipeline_successor_upstream_owners_are_neutral(conn);
+        conn.pipeline_depth >= 1 && http1_pipeline_predecessor_owners_are_settled(conn);
     conn.transition_to_reading_header(&on_header_received<Loop>);
     // Refresh keepalive timer — synthetic dispatch skips the normal
     // EventLoop::dispatch() which calls timer.refresh().
@@ -2183,9 +2195,27 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // filter can reliably reject entries left by a close+reuse even if
     // the new request's req_start_us lands in the same microsecond.
     conn.handler_gen++;
-    if (conn.pipeline_depth == 1 && complete_pipeline_request && conn.handler_gen != 0 &&
-        conn.req_strict_h1_complete && !conn.req_malformed)
+    // A depth-1 successor with no bytes behind it keeps the dedicated
+    // generation-token path. A successor the token path cannot carry -- one
+    // with its own pipelined suffix, or one past depth 1 -- is re-based once
+    // its predecessor has retired every owner: it is then indistinguishable
+    // from a fresh keep-alive request whose bytes arrived early, so it runs at
+    // depth 0 and its suffix coalesces behind it. The burst advances one
+    // settled boundary at a time with no depth limit.
+    const bool successor_has_suffix = conn.req_initial_send_len != 0 && !conn.req_malformed &&
+                                      conn.recv_buf.len() > conn.req_initial_send_len;
+    // TLS has no depth-1 token path at all, so a settled TLS successor always
+    // re-bases.
+    if (complete_pipeline_request &&
+        (successor_has_suffix || conn.pipeline_depth >= 2 || conn.tls_active) &&
+        conn.http1_pipeline_boundary_owners_settled &&
+        http1_pipeline_predecessor_owners_are_settled(conn)) {
+        conn.pipeline_depth = 0;
+        conn.http1_pipeline_boundary_owners_settled = false;
+    } else if (conn.pipeline_depth == 1 && complete_pipeline_request && conn.handler_gen != 0 &&
+               conn.req_strict_h1_complete && !conn.req_malformed) {
         conn.http1_pipeline_request_generation = conn.handler_gen;
+    }
     conn.req_start_us = monotonic_us();
     // Per-request proxy state must start clean on EVERY request. reset() runs
     // only at connection alloc, so on a keep-alive-reused connection these flags
@@ -3899,8 +3929,9 @@ void handle_jit_outcome(Loop* loop,
                     !response_read_deadline_route_method_matches(
                         conn.response_read_deadline_method,
                         conn.response_read_deadline_route_method) ||
-                    (coalesced_get && outcome.request_policy_id !=
-                                          static_cast<u16>(RequestPolicyId::Http11FixedStrip)) ||
+                    (coalesced_get &&
+                     !bodyless_get_complete_content_length_request_policy_is_admitted(
+                         outcome.request_policy_id)) ||
                     !target_valid || !request_policy_valid || conn.target_transform_recorded ||
                     conn.req_path_overridden || conn.req_header_override_count != 0 ||
                     conn.req_header_override_overflow || conn.resp_header_mutation_count != 0 ||
@@ -3908,7 +3939,7 @@ void handle_jit_outcome(Loop* loop,
                     conn.resp_header_mutation_pending_overflow ||
                     conn.resp_header_mutation_overflow || conn.protocol != ConnProtocol::Http11 ||
                     (conn.tls_active &&
-                     (!bodyless_get_materialization ||
+                     (!(bodyless_get_materialization || coalesced_get) ||
                       !response_read_deadline_tls_http11_engine_is_stable(conn))) ||
                     !http1_pipeline_request_generation_jit_candidate_is_stable(
                         conn,
@@ -3929,8 +3960,9 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 tls_complete_get_deadline_outcome_valid =
-                    conn.tls_active && bodyless_get_materialization && request_policy_valid &&
-                    target_valid && response_read_deadline_tls_http11_engine_is_stable(conn);
+                    conn.tls_active && (bodyless_get_materialization || coalesced_get) &&
+                    request_policy_valid && target_valid &&
+                    response_read_deadline_tls_http11_engine_is_stable(conn);
                 if (fixed_upload) {
                     auto& proof = conn.response_read_deadline_upload;
                     if ((proof.upstream_id != 0xffffu &&
@@ -6822,11 +6854,14 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     u64 measured_id3_length = 0;
 
     // ID3 is measured completely before scratch is touched.  This proves the
-    // parser-owned raw boundaries and both destination capacities up front;
-    // its exact profile also forbids a successor/read-ahead suffix.
+    // parser-owned raw boundaries and both destination capacities up front.
+    // Its exact profile forbids a read-ahead suffix, except the validated
+    // coalesced phase-1 successor, which is copied verbatim like ID1's.
     if (trim_sp_preserve_htab) {
-        if (len != parser.header_end || req.header_count > kMaxHeaders || req.has_content_length ||
-            req.chunked || req.method != HttpMethod::GET || body_len != 0)
+        if ((len != parser.header_end &&
+             !(coalesced_phase1 && parser.header_end == original_request_end)) ||
+            req.header_count > kMaxHeaders || req.has_content_length || req.chunked ||
+            req.method != HttpMethod::GET || body_len != 0)
             return false;
         auto decimal_len = [](u32 value) {
             u32 n = 1;
@@ -7026,7 +7061,9 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     const u64 request_end64 = static_cast<u64>(body_start) + body_len;
     if (request_end64 > len) return false;
     const u32 request_end = static_cast<u32>(request_end64);
-    if (request_policy_trims_sp_preserves_htab(policy_id) && len != request_end) return false;
+    if (request_policy_trims_sp_preserves_htab(policy_id) && len != request_end &&
+        !coalesced_phase1)
+        return false;
     if (!append(data + body_start, body_len) || !append(data + request_end, len - request_end))
         return false;
     if (coalesced_phase1 &&

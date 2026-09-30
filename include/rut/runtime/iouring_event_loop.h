@@ -29,6 +29,7 @@
 #include "rut/runtime/upstream_pool.h"
 #include <atomic>
 
+#include <errno.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -316,6 +317,9 @@ public:
     u32 keepalive_timeout = kDefaultKeepaliveTimeout;
     u32 upstream_timeout = kDefaultUpstreamTimeout;
     i32 listen_fd = -1;
+    // Multishot accept needs a deferred re-arm (resource exhaustion or no SQE);
+    // retried on the next 1s timer tick.
+    bool accept_rearm_pending = false;
 
     AccessLogRing* access_log = nullptr;
     SourceLiveAccessLogProducer* live_access_log = nullptr;
@@ -495,7 +499,7 @@ public:
     }
 
     void run() {
-        backend.add_accept();
+        rearm_accept();
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
         this->fire_due_timers();
@@ -1599,8 +1603,20 @@ public:
                        c.http1_prebuilt_wait == 0 && c.http1_prebuilt_request_prefix_len == 0 &&
                        !c.http1_boundary_deferred && !c.http1_boundary_ready &&
                        c.http1_boundary_successor_episode == 0);
+        // A coalesced request 1 keeps its pipelined successor in the stash; the
+        // copied deadline proof re-proves that stash exactly as plaintext does.
+        const bool stash_stable =
+            c.pipeline_stash_len == 0 ||
+            response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable(
+                c,
+                c.http1_prebuilt_deadline_upload,
+                c.http1_prebuilt_deadline_profile,
+                bundle.response_buffering,
+                c.http1_prebuilt_deadline_bundle_id,
+                c.http1_prebuilt_deadline_method,
+                c.http1_prebuilt_deadline_route_method);
         return phase_state && c.pipeline_depth == 0 && c.http1_pipeline_request_generation == 0 &&
-               c.pipeline_stash_len == 0 &&
+               stash_stable &&
                forward_response_buffering_uses_content_length_machinery(
                    bundle.response_buffering) &&
                bodyless_get_complete_content_length_request_policy_is_admitted(
@@ -2373,6 +2389,17 @@ public:
     // Called only after all CQEs returned by the current backend.wait batch.
     // Public for focused production-dispatch tests; run() is the only runtime
     // scheduler.
+    // A deferred boundary resumes outside tls_process, so ciphertext the client
+    // sent while the previous request owned the connection is still encrypted
+    // in tls_in_buf. When the dispatched successor stopped at an incomplete
+    // header, decrypt that input now: no later Recv completion will carry it.
+    void resume_buffered_tls_request_input(Connection& c) {
+        if (c.fd < 0 || c.state != ConnState::ReadingHeader ||
+            c.tls_pending_on_recv != &on_header_received<Self>)
+            return;
+        (void)process_buffered_tls_input(c);
+    }
+
     void resume_deferred_http1_boundaries() {
         if (!http1_boundary_ready_pending) return;
         http1_boundary_ready_pending = false;
@@ -2449,6 +2476,7 @@ public:
                 epoch_leave();
                 c.epoch_held = false;
                 continue_http1_request_boundary<IoUringEventLoop>(this, c);
+                resume_buffered_tls_request_input(c);
                 continue;
             }
 
@@ -2482,6 +2510,7 @@ public:
                 continue;
             }
             continue_http1_request_boundary<IoUringEventLoop>(this, c);
+            resume_buffered_tls_request_input(c);
         }
     }
 
@@ -5482,6 +5511,7 @@ public:
     void test_drain_response_read_deadline_body_pump_ready(Callback&& callback) {
         drain_response_read_deadline_body_pump_ready(static_cast<Callback&&>(callback));
     }
+    void test_close_listen() { close_listen(); }
 #endif
 
 public:
@@ -5963,6 +5993,7 @@ public:
                 }
                 break;
             case IoEventType::Timeout: {
+                if (accept_rearm_pending) rearm_accept();
                 i32 ticks = ev.result > 0 ? ev.result : 1;
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
@@ -6538,8 +6569,64 @@ private:
         }
     }
 
+    // Arm multishot accept; a failed arm (no SQE) retries on the next tick.
+    // Never arms once the listener is closed.
+    void rearm_accept() {
+        if (listen_fd < 0) {
+            accept_rearm_pending = false;
+            return;
+        }
+        accept_rearm_pending = !backend.add_accept();
+    }
+
+    // A multishot accept ends with a CQE lacking F_MORE (EMFILE/ENFILE/ENOMEM/
+    // ENOBUFS, ECONNABORTED, CQ overflow, cancel). Without a re-arm this shard
+    // never accepts again while the kernel keeps steering SO_REUSEPORT
+    // connections to it.
+    void on_accept_terminated(i32 result) {
+        if (listen_fd < 0) return;  // intentional close_listen(): stay down
+        if (result >= 0) {
+            rearm_accept();
+            return;
+        }
+        switch (-result) {
+            // Immediate: the failing connection was consumed from the backlog,
+            // so the next accept makes progress.
+            case ECONNABORTED:
+            case EINTR:
+            case EAGAIN:
+            case EPROTO:
+            case ENOPROTOOPT:
+            case ENETDOWN:
+            case ENONET:
+            case EHOSTDOWN:
+            case EHOSTUNREACH:
+            case ENETUNREACH:
+                rearm_accept();
+                return;
+            // Permanent: the listener itself is unusable.
+            case EBADF:
+            case ENOTSOCK:
+            case EINVAL:
+            case EOPNOTSUPP:
+                return;
+            // Deferred to the next tick: the backlog entry was not consumed
+            // (EMFILE/ENFILE/ENOBUFS/ENOMEM, LSM EPERM/EACCES), so an immediate
+            // re-arm would spin; or the cause is unknown. ECANCELED lands here
+            // too: our own close_listen() was filtered out above, so it is a
+            // kernel-side cancel (failed CQE post, io-wq cancel), not ours.
+            default:
+                accept_rearm_pending = true;
+                return;
+        }
+    }
+
     void on_accept(const IoEvent& ev) {
-        if (ev.result < 0) return;
+        if (ev.result >= 0) on_accepted_fd(ev);
+        if (!ev.more) on_accept_terminated(ev.result);
+    }
+
+    void on_accepted_fd(const IoEvent& ev) {
         Connection* c = this->alloc_conn();
         if (!c) {
             // Try reclaiming slots from stale CQEs.
@@ -6620,6 +6707,9 @@ private:
             backend.cancel_accept();
             ::close(listen_fd);
             listen_fd = -1;
+            // Keep the backend from ever re-arming on a closed/recycled fd.
+            backend.listen_fd = -1;
+            accept_rearm_pending = false;
         }
     }
 };
