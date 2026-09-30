@@ -80,7 +80,7 @@ static constexpr u32 kCancelConnId = 0xFFFFFD;
 // --- Syscall wrappers (no liburing) ---
 
 static i32 io_uring_setup(u32 entries, struct io_uring_params* p) {
-    i32 ret = static_cast<i32>(syscall(__NR_io_uring_setup, entries, p));
+    i32 ret = static_cast<i32>(syscall(__NR_io_uring_setup, static_cast<long>(entries), p));
     return ret >= 0 ? ret : -errno;
 }
 

@@ -90,8 +90,6 @@ _Static_assert(RUT_GATE_PBUF_REG_RESERVED_OFFSET + RUT_GATE_PBUF_REG_RESERVED_SI
 #define RUT_GATE_UPSTREAM_CONNECT_EVENT 3U
 #define RUT_GATE_TIMEOUT_EVENT 6U
 #define RUT_GATE_TIMER_CONN_ID 0x00FFFFFEU
-#define RUT_GATE_RING_ENTRIES 16384U
-#define RUT_GATE_CQ_ENTRIES (RUT_GATE_RING_ENTRIES * 2U)
 #define RUT_GATE_PBUF_RING_SIZE \
     (sizeof(struct io_uring_buf_ring) + RUT_GATE_BUFFER_COUNT * sizeof(struct io_uring_buf))
 #define RUT_GATE_PBUF_DATA_SIZE ((size_t)RUT_GATE_BUFFER_COUNT * RUT_GATE_BUFFER_SIZE)
@@ -409,9 +407,10 @@ static int setup_params_valid(const struct io_uring_params* params) {
         RUT_GATE_IORING_FEAT_MIN_TIMEOUT | RUT_GATE_IORING_FEAT_RW_ATTR |
         RUT_GATE_IORING_FEAT_NO_IOWAIT;
     const uint32_t required_features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP;
-    if (params == 0 || params->sq_entries != RUT_GATE_RING_ENTRIES ||
-        params->cq_entries != RUT_GATE_CQ_ENTRIES ||
-        params->flags != (IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG) ||
+    if (params == 0 || gate == 0 || params->sq_entries != gate->expected_sq_entries ||
+        params->cq_entries != gate->expected_cq_entries ||
+        params->flags !=
+            (IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG | IORING_SETUP_CQSIZE) ||
         params->sq_thread_cpu != 0 || params->sq_thread_idle != 0 || params->wq_fd != 0 ||
         params->resv[0] != 0 || params->resv[1] != 0 || params->resv[2] != 0 ||
         (params->features & required_features) != required_features ||
@@ -445,7 +444,9 @@ static int setup_params_valid(const struct io_uring_params* params) {
 static int setup_request_valid(const struct io_uring_params* params) {
     struct io_uring_params expected;
     memset(&expected, 0, sizeof(expected));
-    expected.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
+    expected.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG | IORING_SETUP_CQSIZE;
+    if (gate == 0) return 0;
+    expected.cq_entries = gate->expected_cq_entries;
     return params != 0 && memcmp(params, &expected, sizeof(expected)) == 0;
 }
 
@@ -1135,7 +1136,9 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
         return libc_result(rut_gate_kernel_syscall(number, arg1, arg2, arg3, arg4, arg5, arg6));
     if (number == __NR_io_uring_setup) {
         const struct io_uring_params* parameters = (const struct io_uring_params*)arg2;
-        const int production_entries = arg1 == RUT_GATE_RING_ENTRIES;
+        /* io_uring_setup takes a u32 entry count; the upper half of the register is undefined
+         * when the caller passes a computed u32 through syscall()'s long varargs. */
+        const int production_entries = gate != 0 && (uint32_t)arg1 == gate->expected_sq_entries;
         const int production_request = production_entries && setup_request_valid(parameters);
         const long result = rut_gate_kernel_syscall(number, arg1, arg2, 0, 0, 0, 0);
         int failed_now = 0;

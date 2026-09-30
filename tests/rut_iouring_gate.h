@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define RUT_IOURING_GATE_MAGIC UINT64_C(0x525554494F475431)
-#define RUT_IOURING_GATE_VERSION UINT32_C(6)
+#define RUT_IOURING_GATE_VERSION UINT32_C(7)
 #define RUT_IOURING_GATE_CONNECT_JOURNAL_CAPACITY UINT32_C(4)
 
 enum rut_iouring_gate_error {
@@ -156,6 +156,10 @@ struct rut_iouring_gate {
     uint32_t hook_magic_ok;
     uint32_t hook_version;
     uint32_t hook_layout_size;
+    /* Ring sizes the harness expects the server to request (io_uring_ring_sizes() for the
+     * capacity it launches with); the preload follows these instead of a constant. */
+    uint32_t expected_sq_entries;
+    uint32_t expected_cq_entries;
     uint32_t target_pid;
     uint32_t target_peer_ipv4_be;
     uint16_t target_peer_port_be;
@@ -307,7 +311,7 @@ static inline int rut_iouring_gate_wait_until(struct rut_iouring_gate* gate,
 }
 
 #if defined(__cplusplus) && defined(__x86_64__)
-static_assert(sizeof(struct rut_iouring_gate) == 1456);
+static_assert(sizeof(struct rut_iouring_gate) == 1464);
 #elif defined(__x86_64__)
-_Static_assert(sizeof(struct rut_iouring_gate) == 1456, "RUT io_uring gate layout drift");
+_Static_assert(sizeof(struct rut_iouring_gate) == 1464, "RUT io_uring gate layout drift");
 #endif
