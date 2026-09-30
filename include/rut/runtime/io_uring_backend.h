@@ -149,22 +149,42 @@ struct IoUringBackend {
     // several wait() calls (each returns at most kMaxEventsPerWait events), so
     // the inventory is NOT bounded by one batch.  Expiry runs at the loop top
     // before every add, so head never steps past a live window's frozen tail.
-    // There is at most one live window per downstream token, and the token is a
-    // pure function of conn_id, so the true bound is
-    // min(connection_capacity, cq_ring_entries).  cq_ring_entries alone is a
-    // safe over-approximation: every live window was recorded for a CQE consumed
-    // less than that far behind head.  The array is mmap'd in init() and only
-    // the first `count` slots are ever touched.
+    // cq_ring_entries is a safe bound on the live windows: every one was
+    // recorded for a CQE consumed less than that far behind head.
     //
-    // Lookup and expiry are linear in the number of live windows, so a burst of
-    // N terminals costs O(N^2) on the shard thread (~120 ms of wait() CPU at
-    // N=16000).  Tracked as a follow-up; the data structure is unchanged here.
+    // Structure (lookup and expiry are O(1)):
+    //  - Windows are a FIFO ring over an mmap'd array of cq_ring_entries slots
+    //    (a power of two): `start` is the oldest live window, `count` the live
+    //    number.  Every window is appended with its wait() call's constant tail
+    //    snapshot and snapshots never decrease across calls, so the ring is
+    //    sorted by tail_exclusive and the expired windows are always a prefix.
+    //    Expiry pops the front while front.tail_exclusive == head; only the
+    //    front is distance-checked because head can never pass a later window
+    //    without first passing the front.
+    //  - Only an aux-0 downstream Recv CQE can match a window, and its token is
+    //    a pure function of conn_id, so a side table indexed by conn_id
+    //    (8 bytes per connection slot, mmap'd, demand-paged) records whether
+    //    that token has a live window and its frozen tail.  At most one window
+    //    is live per token: a duplicate terminal inside [head, frozen tail) is
+    //    quarantined without adding one, and one at or after the frozen tail
+    //    arrives only after the old window expired.  Adding a window for a
+    //    token whose entry is already live is therefore a protocol failure.
+    //  - A token whose conn_id is >= the side table size has no table entry;
+    //    `out_of_range_windows` counts such live windows and lookups for those
+    //    tokens scan the ring only while that counter is nonzero.
     struct DownstreamRecvTerminalWindow {
         u64 user_data = 0;
         u32 tail_exclusive = 0;
     }* downstream_recv_terminal_windows = nullptr;
-    u32 downstream_recv_terminal_window_capacity = 0;
+    struct DownstreamRecvTerminalSlot {
+        u32 tail_exclusive = 0;
+        u32 live = 0;
+    }* downstream_recv_terminal_slots = nullptr;
+    u32 downstream_recv_terminal_window_capacity = 0;  // power of two
+    u32 downstream_recv_terminal_window_start = 0;
     u32 downstream_recv_terminal_window_count = 0;
+    u32 downstream_recv_terminal_slot_capacity = 0;
+    u32 downstream_recv_terminal_out_of_range_windows = 0;
     u32 downstream_recv_progress_head = 0;
     bool downstream_recv_progress_valid = false;
 
@@ -465,9 +485,23 @@ private:
 
     void reset_downstream_recv_wait_state() {
         deferred_downstream_recv = {};
-        for (u32 i = 0; i < downstream_recv_terminal_window_count; i++)
-            downstream_recv_terminal_windows[i] = {};
+        // Walk only the live windows: the side table is never cleared wholesale.
+        if (downstream_recv_terminal_windows != nullptr) {
+            const u32 ring_mask = downstream_recv_terminal_window_capacity - 1u;
+            for (u32 i = 0; i < downstream_recv_terminal_window_count; i++) {
+                auto& window =
+                    downstream_recv_terminal_windows[(downstream_recv_terminal_window_start + i) &
+                                                     ring_mask];
+                const u32 conn_id = static_cast<u32>((window.user_data >> 8) & 0xFFFFFFu);
+                if (downstream_recv_terminal_slots != nullptr &&
+                    conn_id < downstream_recv_terminal_slot_capacity)
+                    downstream_recv_terminal_slots[conn_id] = {};
+                window = {};
+            }
+        }
+        downstream_recv_terminal_window_start = 0;
         downstream_recv_terminal_window_count = 0;
+        downstream_recv_terminal_out_of_range_windows = 0;
         downstream_recv_progress_head = 0;
         downstream_recv_progress_valid = false;
     }
