@@ -30330,20 +30330,20 @@ TEST(route, bounded_release_matches_measured_nginx_boundaries_reaches_production
     source_text += R"rut(
 route GET "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "bounded-test",
-      date: "current", hide_headers: ["Date", "Server", "Connection"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "bounded-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "bounded-test",
+      date: .current, hide_headers: ["Date", "Server", "Connection"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "bounded-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "bounded-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "bounded-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "bounded")
+    response_buffering: .bounded)
 }
 )rut";
 
@@ -30788,20 +30788,20 @@ TEST(route, bounded_large_body_fast_origin_completes_byte_exact_reaches_producti
     source_text += R"rut(
 route GET "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "bounded-test",
-      date: "current", hide_headers: ["Date", "Server", "Connection"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "bounded-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "bounded-test",
+      date: .current, hide_headers: ["Date", "Server", "Connection"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "bounded-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "bounded-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "bounded-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 5s,
-    response_buffering: "bounded")
+    response_buffering: .bounded)
 }
 )rut";
 
@@ -31085,20 +31085,20 @@ TEST(route, bounded_slow_client_and_genuine_stall_reaches_production_h1_iouring)
     source_text += R"rut(
 route GET "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "bounded-test",
-      date: "current", hide_headers: ["Date", "Server", "Connection"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "bounded-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "bounded-test",
+      date: .current, hide_headers: ["Date", "Server", "Connection"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "bounded-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "bounded-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "bounded-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "bounded")
+    response_buffering: .bounded)
 }
 )rut";
 
@@ -31390,20 +31390,20 @@ TEST(route,
     source_text += R"rut(
 route GET "/" {
   return forward(backend,
-    request_policy: { version: "HTTP/1.1", host: "upstream", connection: "omit",
-      strip_headers: ["Connection", "Keep-Alive", "TE", "Expect", "Upgrade"] },
-    response_policy: { version: "HTTP/1.1", framing: "content_length",
-      connection: "request", head_mode: "reject", server: "bounded-test",
-      date: "current", hide_headers: ["Date", "Server", "Connection"] },
-    failure_policy: { version: "HTTP/1.1", status: 502, reason: "Origin Failed",
-      content_type: "text/plain", server: "bounded-test", date: "current",
-      connection: "request", head_mode: "reject", body: b"default failure\n" },
-    timeout_failure_policy: { version: "HTTP/1.1", status: 504,
+    request_policy: { version: .http11, host: .upstream, connection: .omit,
+      strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] },
+    response_policy: { version: .http11, framing: .contentLength,
+      connection: .request, head_mode: .reject, server: "bounded-test",
+      date: .current, hide_headers: ["Date", "Server", "Connection"] },
+    failure_policy: { version: .http11, status: 502, reason: "Origin Failed",
+      content_type: "text/plain", server: "bounded-test", date: .current,
+      connection: .request, head_mode: .reject, body: b"default failure\n" },
+    timeout_failure_policy: { version: .http11, status: 504,
       reason: "Response Read Deadline", content_type: "text/plain",
-      server: "bounded-test", date: "current", connection: "request",
-      head_mode: "reject", body: b"configured deadline\n" },
+      server: "bounded-test", date: .current, connection: .request,
+      head_mode: .reject, body: b"configured deadline\n" },
     response_read_timeout: 1s,
-    response_buffering: "bounded")
+    response_buffering: .bounded)
 }
 )rut";
 

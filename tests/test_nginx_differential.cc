@@ -19125,9 +19125,8 @@ static bool run_bodyful_normalized_generated_self_checks(std::string& error) {
         !rejects_source(replace_once(canonical, kCanonicalGeneratedNginxRootGetForward, "")) ||
         !rejects_source(
             replace_once(canonical, "response_read_timeout: 60s", "response_read_timeout: 61s")) ||
-        !rejects_source(replace_once(canonical,
-                                     "response_buffering: .bounded",
-                                     "response_buffering: .none")) ||
+        !rejects_source(
+            replace_once(canonical, "response_buffering: .bounded", "response_buffering: .none")) ||
         !rejects_source(canonical + kCanonicalGeneratedNginxRootGetForward) ||
         !rejects_source(replace_once(
             canonical, kDeadlineBuffering, std::string(kDeadlineBuffering) + kDeadlineBuffering))) {
@@ -49425,8 +49424,7 @@ static bool validate_wildcard_listen_generated_source(
         count_text(source, "        failure_policy: {\n") != expected_response_policy_count ||
         count_text(source, "        timeout_failure_policy: {\n") != expected_timeout_count ||
         count_text(source, "        response_read_timeout: 60s,\n") != expected_timeout_count ||
-        count_text(source, "        response_buffering: .bounded\n") !=
-            expected_timeout_count ||
+        count_text(source, "        response_buffering: .bounded\n") != expected_timeout_count ||
         (conditional_get &&
          (count_text(source, "    if req.hasContentLength {\n") != 1u ||
           count_text(source, "retained_header_value: .trimSpPreserveHtab\n") != 1u)) ||
@@ -54225,8 +54223,7 @@ static bool validate_converter_request_length_source(const std::string& source,
             expected_content_length_branch_count ||
         count_text(source, "return forward(nginx_upstream,") != expected_forward_count ||
         count_text(source, "        response_read_timeout: 60s,\n") != expected_timeout_count ||
-        count_text(source, "        response_buffering: .bounded\n") !=
-            expected_timeout_count ||
+        count_text(source, "        response_buffering: .bounded\n") != expected_timeout_count ||
         count_text(source, "        timeout_failure_policy: {\n") != expected_timeout_count ||
         (require_access_log && count_text(source, "format: downstreamRequestBytes") != 1u) ||
         (require_access_log && count_text(source, "publication: live") != 1u) ||
@@ -57087,15 +57084,18 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
     const u32 routes =
         (source.rfind("route ", 0u) == 0u ? 1u : 0u) + count_text(source, "\nroute ");
     const u32 forwards = count_text(source, "return forward(nginx_upstream");
-    if (source.empty() || source.size() != 5260u || source.find('\0') != std::string::npos ||
+    if (source.empty() || source.size() != 5246u || source.find('\0') != std::string::npos ||
         source.size() + 1u > rut::nginx::RutSource::kCapacity ||
-        rut::nginx::RutSource::kCapacity - source.size() - 1u != 7518u ||
+        rut::nginx::RutSource::kCapacity - source.size() - 1u != 7532u ||
         count_text(source, listener) != 1u || count_text(source, upstream) != 1u || routes != 3u ||
         forwards != 3u || count_text(source, "route HEAD \"/\" {") != 1u ||
         count_text(source, "route GET \"/\" {") != 1u ||
         count_text(source, "route \"/\" {") != 1u || count_text(source, "return redirect(") != 0u ||
         count_text(source, four_headers) != 3u || count_text(source, "X-Compat-Hidden") != 3u ||
         count_text(source, three_headers) != 0u ||
+        // The bodyless GET keeps nginx's default proxy_buffering release rule.
+        count_text(source, "response_buffering: .bounded") != 1u ||
+        source.find("response_buffering: .completeContentLength") != std::string::npos ||
         source.find("target_transform") != std::string::npos ||
         source.find("strip_prefix") != std::string::npos ||
         source.find("replace_prefix") != std::string::npos ||
@@ -57105,7 +57105,7 @@ static bool validate_proxy_hide_header_generated_source(const std::string& sourc
         source.find("nginx_compat") != std::string::npos ||
         source.find("workaround") != std::string::npos ||
         source.find("accessLog") != std::string::npos) {
-        error = "#373 generated source failed exact 5260-byte policy/route/ownership validation";
+        error = "#373 generated source failed exact 5246-byte policy/route/ownership validation";
         return false;
     }
     return true;
@@ -57570,7 +57570,7 @@ static bool capture_proxy_hide_header_generated_side(
 
     // Parse and lower the borrowed fragment, then destroy both borrowed input
     // and lower-buffer ownership before persistence.  Stage 4a's exact source
-    // validator remains the authority for the 5260-byte output.
+    // validator remains the authority for the 5246-byte output.
     {
         std::string borrowed = observation.fragment;
         const auto parsed = rut::nginx::parse({borrowed.data(), static_cast<u32>(borrowed.size())});
@@ -58233,7 +58233,7 @@ static bool validate_proxy_hide_header_generated_pair(const ProxyHideHeaderGener
                 return false;
             }
     if (first.child_pid <= 0 || second.child_pid <= 0 || first.child_pid == second.child_pid ||
-        first.source.size() != 5260u || second.source.size() != 5260u ||
+        first.source.size() != 5246u || second.source.size() != 5246u ||
         first.source.size() != second.source.size() ||
         first.rut_executable != second.rut_executable) {
         error = "#373 generated pair source size or PID identity failed";
@@ -82319,7 +82319,7 @@ int main(int argc, char** argv) {
             std::cerr << "FAIL [#373 generated-side live self-check]: " << generated_error << "\n";
             return 1;
         }
-        std::cerr << "PASS: #373 independently parsed/lowered/persisted one exact 5260-byte "
+        std::cerr << "PASS: #373 independently parsed/lowered/persisted one exact 5246-byte "
                      "proxy_hide_header source and proved the generated ordinary-RUT public "
                      "io_uring side's exact 85-byte request, 66-byte rebuilt upstream, 219-byte "
                      "origin response, 176-byte hidden-header-filtered response/EOF, poison "
@@ -82339,7 +82339,7 @@ int main(int argc, char** argv) {
         }
         std::cerr
             << "PASS: #373 independently parsed/lowered/persisted both declaration orders into "
-               "two isolated 5260-byte ordinary-RUT sources and proved exact paired "
+               "two isolated 5246-byte ordinary-RUT sources and proved exact paired "
                "Date-normalized downstream/upstream wires, endpoint/resource/PID isolation, "
                "poison liveness, FIN/EOF/stability, disabled access and clean io_uring lifecycle; "
                "generated-pair witness only (no nginx/four-way equivalence claim)\n";
