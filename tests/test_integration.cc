@@ -5137,6 +5137,7 @@ TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
     u32 armed = 0;
     u32 peers_closed = 0;
     u32 eofs = 0;
+    bool out_of_range_seen = false;
     if (made == kPeers) {
         for (; armed < kPeers; ++armed)
             if (!backend.add_recv(local[armed], armed)) break;
@@ -5151,6 +5152,9 @@ TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
         for (u32 attempt = 0; attempt < 64 && eofs < kPeers && backend.failure_code() == 0;
              ++attempt) {
             const u32 n = backend.wait(events, kMaxEventsPerWait, conns.get(), kPeers);
+            // Real add_recv tokens are all in range: the linear fallback scan
+            // must stay off for the whole burst.
+            out_of_range_seen |= backend.downstream_recv_terminal_out_of_range_windows != 0;
             for (u32 i = 0; i < n; ++i)
                 if (events[i].type == IoEventType::Recv && events[i].result == 0 &&
                     events[i].more == 0)
@@ -5158,6 +5162,7 @@ TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
         }
     }
     const i32 failure = backend.failure_code();
+    out_of_range_seen |= backend.downstream_recv_terminal_out_of_range_windows != 0;
 
     // Single exit path: release every fd and the backend whatever happened above.
     for (u32 i = peers_closed; i < made; ++i) close(peer[i]);
@@ -5170,6 +5175,7 @@ TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
     REQUIRE(ready);
     CHECK_EQ(failure, 0);
     CHECK_EQ(eofs, kPeers);
+    CHECK_FALSE(out_of_range_seen);
 }
 
 // Shrink both ends' socket buffers and write directly until EAGAIN, so a

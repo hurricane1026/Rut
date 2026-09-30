@@ -1237,6 +1237,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     // boundary and no longer quarantines anything.
     const u32 ring_mask = downstream_recv_terminal_window_capacity - 1u;
     auto terminal_window_lookup = [&](u64 user_data, u32& window_tail) -> i32 {
+        // Steady state: no live window, so never touch the side table.
+        if (downstream_recv_terminal_window_count == 0) return -1;
         if (downstream_recv_terminal_window_count != 0 &&
             downstream_recv_terminal_windows[downstream_recv_terminal_window_start].tail_exclusive -
                     head >
@@ -1274,10 +1276,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 return false;
             }
             if (window.tail_exclusive != head) break;
-            const u32 conn_id = static_cast<u32>((window.user_data >> 8) & 0xFFFFFFu);
+            const u32 conn_id = terminal_window_conn_id(window.user_data);
             if (conn_id < downstream_recv_terminal_slot_capacity)
                 downstream_recv_terminal_slots[conn_id] = {};
-            else
+            else if (downstream_recv_terminal_out_of_range_windows != 0)
                 downstream_recv_terminal_out_of_range_windows--;
             window = {};
             downstream_recv_terminal_window_start =
@@ -1301,7 +1303,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             protocol_failure();
             return false;
         }
-        const u32 conn_id = static_cast<u32>((user_data >> 8) & 0xFFFFFFu);
+        const u32 conn_id = terminal_window_conn_id(user_data);
         if (conn_id < downstream_recv_terminal_slot_capacity) {
             auto& slot = downstream_recv_terminal_slots[conn_id];
             // One live window per token: a duplicate inside the window is

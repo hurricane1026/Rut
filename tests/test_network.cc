@@ -40802,6 +40802,26 @@ TEST(iouring_terminal_window, shutdown_and_reinit_leave_no_stale_side_table_entr
     backend.shutdown();
 }
 
+TEST(iouring_terminal_window, corrupt_front_window_distance_fails_sticky) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto& backend = fixture.guard.loop->backend;
+    Connection& conn = *fixture.conns[0];
+    fixture.append_terminal(conn, 0);
+    fixture.append_timeout(1);
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 1), 1u);
+    REQUIRE_EQ(backend.downstream_recv_terminal_window_count, 1u);
+    CHECK_EQ(backend.failure_code(), 0);
+    // A frozen tail further ahead of head than the CQ can hold is corruption.
+    const u32 bad_tail = fixture.head() + backend.cq_ring_entries + 1u;
+    backend.downstream_recv_terminal_windows[backend.downstream_recv_terminal_window_start]
+        .tail_exclusive = bad_tail;
+    backend.downstream_recv_terminal_slots[conn.id].tail_exclusive = bad_tail;
+    CHECK_EQ(fixture.wait(events, 2), 0u);
+    CHECK_EQ(backend.failure_code(), EPROTO);
+}
+
 TEST(iouring_terminal_window, side_table_covers_first_last_and_out_of_range_conn_ids) {
     RawDownstreamRecvBatch fixture;
     if (!fixture.init()) SKIP("io_uring unavailable");
