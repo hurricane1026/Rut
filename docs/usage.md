@@ -218,14 +218,18 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   the epoll backend by running with TLS, or run on a host with working
   io_uring.
 - **io_uring ring memory counts against `RLIMIT_MEMLOCK`.** On recent
-  kernels each shard costs about 1652 KiB (for the current ring sizes, on
-  4 KiB pages; slightly more on 16 KiB / 64 KiB-page kernels, since the
-  charge is rounded to whole pages) of the per-user locked-memory budget,
-  shared by all processes of the user and not visible in `/proc`. 1636 KiB
-  of that is required to start (the ring and the primary provided-buffer
-  ring); the last 16 KiB is the optional large-buffer ring, which a shard
-  silently starts without when the budget runs out there. With the common
-  8 MiB default only four shards fit.
+  kernels each shard's ring costs about 632 KiB at the default
+  `--max-connections-per-shard` of 16384 (on 4 KiB pages; slightly more on
+  16 KiB / 64 KiB-page kernels, since the charge is rounded to whole pages) of
+  the per-user locked-memory budget, shared by all processes of the user and
+  not visible in `/proc`. The rings are sized from that option: a 1024-entry
+  submission queue and a completion queue of twice the capacity, rounded up to
+  a power of two (minimum 2048, maximum 65536), so `--max-connections-per-shard
+  1024` costs about 152 KiB per shard. With the common 8 MiB default that is
+  twelve shards at the default capacity and over fifty at 1024 (other io_uring
+  processes of the same user share the budget). Startup's minimum accounts for
+  the required primary buffer ring and optional large-buffer rings retained by
+  earlier shards while later shards initialize.
   Plain HTTP with more shards (the default is one per CPU) stops at startup
   with `Failed to init shard N (errno=12, source=2)` plus a diagnostic; with TLS
   the same failure prints the diagnostic and falls back to epoll (TLS). If the

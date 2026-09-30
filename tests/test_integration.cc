@@ -24,6 +24,7 @@
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/tls.h"
@@ -5176,6 +5177,79 @@ TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
     CHECK_EQ(failure, 0);
     CHECK_EQ(eofs, kPeers);
     CHECK_FALSE(out_of_range_seen);
+}
+
+// The rings are sized from the connection capacity, not fixed. The default
+// capacity's 32768-entry CQ is larger than the kernel default for its SQ (2 x 1024),
+// so seeing it proves IORING_SETUP_CQSIZE reached io_uring_setup.
+TEST(uring, ring_sizes_follow_connection_capacity) {
+    static constexpr u32 kCapacities[] = {1, 1024, 4096, kDefaultConnectionCapacity};
+    for (const u32 capacity : kCapacities) {
+        const IoUringRingSizes expected = io_uring_ring_sizes(capacity);
+        IoUringBackend backend;
+        if (!backend.init(0, -1, capacity)) SKIP("io_uring unavailable");
+        CHECK_EQ(backend.sq_ring_entries, expected.sq_entries);
+        CHECK_EQ(backend.cq_ring_entries, expected.cq_entries);
+        CHECK_EQ(*backend.cq_ring_mask, expected.cq_entries - 1u);
+        backend.shutdown();
+    }
+    CHECK_EQ(io_uring_ring_sizes(kDefaultConnectionCapacity).cq_entries, 32768u);
+}
+
+// The recv and accept arms used to give up on a full SQ (add_recv and add_accept
+// return false, and most callers ignore it), so a burst larger than the ring left
+// connections with no recv armed until the keep-alive timeout. They now flush the
+// queued SQEs and retry, so a run of submissions longer than the ring all succeed.
+TEST(uring, full_sq_recv_submission_flushes_and_retries) {
+    IoUringBackend backend;
+    if (!backend.init(0, -1, 4)) SKIP("io_uring unavailable");
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    const u32 n = backend.sq_ring_entries + 64;
+    u32 ok = 0;
+    for (u32 i = 0; i < n; ++i)
+        if (backend.add_recv(fds[0], i % 4)) ++ok;
+    CHECK_EQ(ok, n);
+    CHECK_EQ(backend.failure_code(), 0);
+    CHECK_LE(backend.pending, backend.sq_ring_entries);
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(uring, full_sq_accept_submission_flushes_and_retries) {
+    const i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    IoUringBackend backend;
+    if (!backend.init(0, listener, 4)) {
+        close(listener);
+        SKIP("io_uring unavailable");
+    }
+    const u32 n = backend.sq_ring_entries + 64;
+    u32 ok = 0;
+    for (u32 i = 0; i < n; ++i)
+        if (backend.add_accept()) ++ok;
+    CHECK_EQ(ok, n);
+    CHECK_EQ(backend.failure_code(), 0);
+    backend.shutdown();
+    close(listener);
+}
+
+// Sends and connects are the opposite contract: every caller fails closed on a
+// false return, so a full SQ is reported, not flushed, and no send state is recorded.
+TEST(uring, full_sq_send_submission_fails_cleanly_without_send_state) {
+    IoUringBackend backend;
+    if (!backend.init(0, -1, 4)) SKIP("io_uring unavailable");
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    while (backend.sq_has_room()) REQUIRE(backend.add_recv(fds[0], 1));
+    static const u8 byte = 'x';
+    CHECK_FALSE(backend.add_send(fds[0], 0, &byte, 1, 1));
+    CHECK_EQ(backend.send_state[0].remaining, 0u);
+    CHECK_EQ(backend.failure_code(), 0);
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
 }
 
 // Shrink both ends' socket buffers and write directly until EAGAIN, so a

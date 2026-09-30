@@ -1,6 +1,7 @@
 // Locked-memory accounting for one io_uring shard. The 4 KiB-page reference
 // values were measured on Linux 7.2.7 (x86-64) by creating rings / registering
 // provided-buffer rings and watching the per-user locked-memory charge.
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_uring_memlock.h"
 #include "test.h"
@@ -40,18 +41,35 @@ TEST(io_uring_memlock, startup_minimum_saturates_on_overflow) {
     CHECK_EQ(io_uring_startup_min_locked_bytes(2, 1, max), max);
 }
 
-// The large ring is optional at startup (setup_extra_buf_ring), so the
-// required figure excludes it and the all-rings figure adds it back.
-TEST(io_uring_memlock, current_constants_cost_1636_kib_required_1652_kib_all_rings) {
+// The default capacity gets SQ 1024 / CQ 32768 (was SQ 16384 / CQ 32768 =
+// 1652 KiB per shard); capacity 1024 gets SQ 1024 / CQ 2048.
+TEST(io_uring_memlock, default_capacity_costs_632_kib_per_shard) {
+    const IoUringRingSizes sizes = io_uring_ring_sizes(kDefaultConnectionCapacity);
+    CHECK_EQ(
+        io_uring_shard_locked_bytes(
+            sizes.sq_entries, sizes.cq_entries, kProvidedBufCount, kLargeProvidedBufCount, kPage4K),
+        632 * kKiB);
+}
+
+TEST(io_uring_memlock, small_capacity_costs_152_kib_per_shard) {
+    const IoUringRingSizes sizes = io_uring_ring_sizes(1024);
+    CHECK_EQ(
+        io_uring_shard_locked_bytes(
+            sizes.sq_entries, sizes.cq_entries, kProvidedBufCount, kLargeProvidedBufCount, kPage4K),
+        152 * kKiB);
+}
+
+TEST(io_uring_memlock, default_capacity_costs_632_kib_required_648_kib_with_primary_ring) {
+    const IoUringRingSizes sizes = io_uring_ring_sizes(kDefaultConnectionCapacity);
     CHECK_EQ(io_uring_shard_required_locked_bytes(
-                 kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, kPage4K),
-             1636 * kKiB);
-    CHECK_EQ(io_uring_shard_locked_bytes(kIoUringSqEntries,
-                                         kIoUringCqEntries,
+                 sizes.sq_entries, sizes.cq_entries, kProvidedBufCount, kPage4K),
+             616 * kKiB);
+    CHECK_EQ(io_uring_shard_locked_bytes(sizes.sq_entries,
+                                         sizes.cq_entries,
                                          kProvidedBufCount,
                                          kLargeProvidedBufCount,
                                          kPage4K),
-             1652 * kKiB);
+             632 * kKiB);
 }
 
 // --- 16 KiB / 64 KiB pages: derived from the kernel's whole-page rounding,
@@ -73,26 +91,63 @@ TEST(io_uring_memlock, pbuf_ring_never_costs_less_than_one_page) {
     CHECK_EQ(io_uring_pbuf_ring_locked_bytes(1024, kPage64K), 64 * kKiB);
 }
 
-TEST(io_uring_memlock, current_constants_cost_more_on_larger_pages) {
-    CHECK_EQ(io_uring_shard_required_locked_bytes(
-                 kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, kPage16K),
-             1648 * kKiB);
-    CHECK_EQ(io_uring_shard_locked_bytes(kIoUringSqEntries,
-                                         kIoUringCqEntries,
+TEST(io_uring_memlock, default_capacity_costs_more_on_larger_pages) {
+    const IoUringRingSizes sizes = io_uring_ring_sizes(kDefaultConnectionCapacity);
+    // SQEs 64 KiB + rings 528704 bytes rounded up, plus the provided-buffer rings.
+    CHECK_EQ(io_uring_shard_locked_bytes(sizes.sq_entries,
+                                         sizes.cq_entries,
                                          kProvidedBufCount,
                                          kLargeProvidedBufCount,
                                          kPage16K),
-             1664 * kKiB);
-    CHECK_EQ(io_uring_shard_required_locked_bytes(
-                 kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, kPage64K),
-             1728 * kKiB);
-    CHECK_EQ(io_uring_shard_locked_bytes(kIoUringSqEntries,
-                                         kIoUringCqEntries,
+             (64 + 528 + 32 + 16) * kKiB);
+    CHECK_EQ(io_uring_shard_locked_bytes(sizes.sq_entries,
+                                         sizes.cq_entries,
                                          kProvidedBufCount,
                                          kLargeProvidedBufCount,
                                          kPage64K),
-             1792 * kKiB);
+             (64 + 576 + 64 + 64) * kKiB);
 }
+
+// --- Ring sizing from the connection capacity ---
+
+TEST(io_uring_ring_sizes, matches_the_documented_rule) {
+    // CQ is 2 x capacity rounded up to a power of two, floored at 2048.
+    CHECK_EQ(io_uring_ring_sizes(1).cq_entries, 2048u);
+    CHECK_EQ(io_uring_ring_sizes(1024).cq_entries, 2048u);
+    CHECK_EQ(io_uring_ring_sizes(1025).cq_entries, 4096u);
+    CHECK_EQ(io_uring_ring_sizes(4096).cq_entries, 8192u);
+    // The default capacity keeps the 32768-entry CQ the fixed sizing gave it.
+    CHECK_EQ(io_uring_ring_sizes(kDefaultConnectionCapacity).cq_entries, 32768u);
+    // The kernel's IORING_MAX_CQ_ENTRIES caps larger capacities.
+    CHECK_EQ(io_uring_ring_sizes(32768).cq_entries, 65536u);
+    CHECK_EQ(io_uring_ring_sizes(65536).cq_entries, 65536u);
+    CHECK_EQ(io_uring_ring_sizes(1000000).cq_entries, 65536u);
+    CHECK_EQ(io_uring_ring_sizes(kMaxConnectionCapacity).cq_entries, 65536u);
+    // SQ does not scale with the capacity: 16384 keeps it far below the old 16384.
+    CHECK_EQ(io_uring_ring_sizes(1).sq_entries, 1024u);
+    CHECK_EQ(io_uring_ring_sizes(kDefaultConnectionCapacity).sq_entries, 1024u);
+    CHECK_LE(io_uring_ring_sizes(kDefaultConnectionCapacity).sq_entries, 4096u);
+    CHECK_EQ(io_uring_ring_sizes(1000000).sq_entries, 1024u);
+}
+
+TEST(io_uring_ring_sizes, powers_of_two_with_cq_at_least_sq) {
+    static constexpr u32 caps[] = {
+        1,     2,     3,     255,   256,   1023,  1024,  1025,  4095,    4096,
+        16383, 16384, 16385, 32767, 32768, 32769, 65535, 65536, 1000000, kMaxConnectionCapacity};
+    for (const u32 cap : caps) {
+        const IoUringRingSizes s = io_uring_ring_sizes(cap);
+        CHECK_EQ(s.sq_entries & (s.sq_entries - 1), 0u);
+        CHECK_EQ(s.cq_entries & (s.cq_entries - 1), 0u);
+        CHECK_GE(s.cq_entries, s.sq_entries);
+        CHECK_LE(s.cq_entries, kMaxIoUringCqEntries);
+        // Never below twice the capacity until the kernel limit binds.
+        if (cap <= kMaxIoUringCqEntries / 2) CHECK_GE(s.cq_entries, 2 * cap);
+    }
+}
+
+static_assert(io_uring_next_pow2(0) == 1 && io_uring_next_pow2(1) == 1 &&
+              io_uring_next_pow2(3) == 4 && io_uring_next_pow2(4096) == 4096 &&
+              io_uring_next_pow2(4097) == 8192);
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);

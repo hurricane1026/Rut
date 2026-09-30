@@ -28,20 +28,26 @@ def round_up_page(n):
     return (n + PAGE - 1) // PAGE * PAGE
 
 
-# Per-shard charges for the current ring constants (SQ 16384 / CQ 32768, 2048
-# primary + 1024 optional large provided-buffer entries): 1636 KiB required to
-# start and 1652 KiB with every ring, on 4 KiB pages. For sequential startup,
-# the advertised minimum for two shards is 2*1636 + 16 = 3288 KiB because the
-# first shard can retain its optional ring while the second starts. Keep in sync with
-# io_uring_shard_required_locked_bytes() / io_uring_shard_locked_bytes() in
-# include/rut/runtime/io_uring_memlock.h (unit-tested there against measured
-# kernel values); update when ring sizes change.
+# Ring sizes at the default --max-connections-per-shard (16384): SQ 1024 and
+# CQ = 2 x capacity = 32768 (io_uring_ring_sizes() in
+# include/rut/runtime/io_uring_memlock.h), with 2048 + 1024 provided-buffer
+# entries. Per-shard charge: 632 KiB on 4 KiB pages. Keep in sync with
+# io_uring_shard_locked_bytes() (unit-tested there against measured kernel
+# values); update when ring sizes change.
+SQ_ENTRIES = 1024
+CQ_ENTRIES = 32768
+CAPACITY = 16384
+PER_SHARD_KIB = (
+    round_up_page(SQ_ENTRIES * 64)
+    + round_up_page(320 + CQ_ENTRIES * 16 + SQ_ENTRIES * 4)
+    + round_up_page(2048 * 16)
+    + round_up_page(1024 * 16)
+) // 1024
 REQUIRED_PER_SHARD_KIB = (
-    round_up_page(16384 * 64)
-    + round_up_page(320 + 32768 * 16 + 16384 * 4)
+    round_up_page(SQ_ENTRIES * 64)
+    + round_up_page(320 + CQ_ENTRIES * 16 + SQ_ENTRIES * 4)
     + round_up_page(2048 * 16)
 ) // 1024
-PER_SHARD_KIB = REQUIRED_PER_SHARD_KIB + round_up_page(1024 * 16) // 1024
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
@@ -130,7 +136,8 @@ def common_needles(limit, hard):
         "RLIMIT_MEMLOCK",
         f"soft {limit // 1024} KiB",
         f"at least {required_total} KiB for 2 shard(s) to start ({REQUIRED_PER_SHARD_KIB} KiB per "
-        f"shard), {total} KiB ({PER_SHARD_KIB} KiB per shard) with the optional large-buffer ring",
+        f"shard), {total} KiB ({PER_SHARD_KIB} KiB per shard: "
+        f"SQ {SQ_ENTRIES} / CQ {CQ_ENTRIES} entries for --max-connections-per-shard {CAPACITY})",
         "plus whatever this user's other io_uring processes hold",
         "0 shard(s) initialised before it",
         f"ulimit -l {total} (KiB",
@@ -138,6 +145,7 @@ def common_needles(limit, hard):
         f"--ulimit memlock={total * 1024}",
         "CAP_IPC_LOCK",
         "--shards N",
+        "smaller --max-connections-per-shard",
     ]
     if hard == resource.RLIM_INFINITY or hard > limit:
         needles.append("soft limit can be raised up to the hard limit")

@@ -76,6 +76,10 @@ struct IoUringBackend {
     u32* cq_ring_mask = nullptr;
     io_uring_cqe* cq_entries = nullptr;
     u32 cq_ring_entries = 0;
+    // Test seam (zero = flush, as the storage is mmap-zeroed): fixtures that fake a
+    // full SQ by moving sq_tail and pending past what the kernel was given model a
+    // flush that frees nothing; this keeps get_sqe_flushing() out of the kernel.
+    bool disable_full_sq_flush = false;
 
     // Mapped regions (for cleanup)
     void* sq_ring_ptr = nullptr;
@@ -486,6 +490,8 @@ private:
 
     // Get next available SQE. Returns nullptr if SQ is full.
     io_uring_sqe* get_sqe();
+    // get_sqe(), flushing the queued SQEs and retrying once when the SQ is full.
+    io_uring_sqe* get_sqe_flushing();
 
     // Setup provided buffer ring via io_uring_register.
     core::Expected<void, Error> setup_buf_ring();

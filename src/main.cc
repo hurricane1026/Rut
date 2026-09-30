@@ -169,7 +169,10 @@ static bool has_cap_ipc_lock() {
 // usually the per-user RLIMIT_MEMLOCK budget (see io_uring_memlock.h), not
 // kernel memory exhaustion. Explain it; startup behaviour is unchanged.
 // will_fall_back: the caller retries on epoll (TLS), so the remedies are optional.
-static void report_io_uring_enomem(u32 failed_shard, u32 shard_count, bool will_fall_back) {
+static void report_io_uring_enomem(u32 failed_shard,
+                                   u32 shard_count,
+                                   u32 connection_capacity,
+                                   bool will_fall_back) {
     struct rlimit rl{};
     const bool have_limit = getrlimit(RLIMIT_MEMLOCK, &rl) == 0;
     const bool exempt = has_cap_ipc_lock() || (have_limit && rl.rlim_cur == RLIM_INFINITY);
@@ -177,16 +180,15 @@ static void report_io_uring_enomem(u32 failed_shard, u32 shard_count, bool will_
     // ppc64 kernels), so the estimate must use the runtime page size.
     const long sys_page = sysconf(_SC_PAGESIZE);
     const u64 page_bytes = sys_page > 0 ? static_cast<u64>(sys_page) : 4096;
-    // Two figures: what a shard needs to start at all (ring + primary buffer
-    // ring), and what it needs for every ring. The large buffer ring is
-    // optional -- when its registration fails the shard starts without it and
-    // nothing says so -- so the suggested limit covers all rings while the
-    // minimum stays honest.
+    const IoUringRingSizes sizes = io_uring_ring_sizes(connection_capacity);
+    // The primary provided-buffer ring is required to start a shard; the large
+    // ring is optional. Earlier shards can retain that optional ring while later
+    // shards start, so the advertised startup minimum includes that overlap.
     const u64 required_per_shard_bytes = io_uring_shard_required_locked_bytes(
-        kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, page_bytes);
+        sizes.sq_entries, sizes.cq_entries, kProvidedBufCount, page_bytes);
     const u64 required_per_shard_kib = required_per_shard_bytes / 1024;
-    const u64 per_shard_kib = io_uring_shard_locked_bytes(kIoUringSqEntries,
-                                                          kIoUringCqEntries,
+    const u64 per_shard_kib = io_uring_shard_locked_bytes(sizes.sq_entries,
+                                                          sizes.cq_entries,
                                                           kProvidedBufCount,
                                                           kLargeProvidedBufCount,
                                                           page_bytes) /
@@ -230,9 +232,13 @@ static void report_io_uring_enomem(u32 failed_shard, u32 shard_count, bool will_
     write_u64(total_kib);
     write_str(" KiB (");
     write_u64(per_shard_kib);
-    write_str(
-        " KiB per shard) with the optional large-buffer ring, plus whatever this user's other "
-        "io_uring processes hold\n");
+    write_str(" KiB per shard: SQ ");
+    write_u32(sizes.sq_entries);
+    write_str(" / CQ ");
+    write_u32(sizes.cq_entries);
+    write_str(" entries for --max-connections-per-shard ");
+    write_u32(connection_capacity);
+    write_str("), plus whatever this user's other io_uring processes hold\n");
     if (will_fall_back)
         write_str("  falling back to epoll (TLS); to keep io_uring:\n");
     else
@@ -250,7 +256,7 @@ static void report_io_uring_enomem(u32 failed_shard, u32 shard_count, bool will_
         }
         write_str("  or grant CAP_IPC_LOCK\n");
     }
-    write_str("  or run fewer shards: --shards N\n");
+    write_str("  or run fewer shards (--shards N) or a smaller --max-connections-per-shard\n");
 }
 #endif
 
@@ -404,7 +410,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             write_error("", rc.error());
 #ifdef __linux__
             if (rc.error().source == Error::Source::IoUring && rc.error().code == ENOMEM)
-                report_io_uring_enomem(i, shard_count, tls_server != nullptr);
+                report_io_uring_enomem(i, shard_count, connection_capacity, tls_server != nullptr);
 #endif
             close(lfd);
             for (u32 j = 0; j < i; j++) {

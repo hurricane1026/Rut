@@ -165,6 +165,28 @@ io_uring_sqe* IoUringBackend::get_sqe() {
     return sqe;
 }
 
+// get_sqe() for arms whose failure most callers cannot act on: when the SQ is
+// full, hand the queued SQEs to the kernel (which frees every slot it consumes)
+// and retry once, as cancel_by_user_data does. Used by the recv arms (downstream
+// and upstream: many callers ignore a false return, leaving the connection with
+// no recv until a timeout), accept, and wait()'s partial-send resubmits. The
+// send/connect submitters keep returning false on a full SQ: every caller fails
+// closed on that. nullptr only when the flush failed (the error is recorded and
+// stops the loop) or the kernel consumed nothing.
+io_uring_sqe* IoUringBackend::get_sqe_flushing() {
+    io_uring_sqe* sqe = get_sqe();
+    if (sqe) return sqe;
+    if (disable_full_sq_flush) return nullptr;
+    if (ring_fd >= 0 && pending > 0) {
+        const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+        if (flushed > 0)
+            pending -= static_cast<u32>(flushed);
+        else if (flushed < 0)
+            record_enter_error(flushed);
+    }
+    return get_sqe();
+}
+
 static void sqe_advance_tail(u32* sq_tail) {
     u32 tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
     __atomic_store_n(sq_tail, tail + 1, __ATOMIC_RELEASE);
@@ -227,11 +249,15 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     // notification so a busy visible CQ cannot hide cooperative task work.
     // SINGLE_ISSUER / DEFER_TASKRUN were evaluated and not adopted; see the
     // comment above IoUringBackend in io_uring_backend.h.
-    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
+    params.flags = IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG | IORING_SETUP_CQSIZE;
+    // Rings scale with the connection capacity (see io_uring_memlock.h) instead
+    // of a fixed 16384 / 32768 pair that cost 1.6 MiB of RLIMIT_MEMLOCK per shard.
+    const IoUringRingSizes sizes = io_uring_ring_sizes(capacity);
+    params.cq_entries = sizes.cq_entries;
     // Note: SQPOLL requires CAP_SYS_NICE or io_uring_register credentials.
     // Omit for now, add as optimization later.
 
-    ring_fd = io_uring_setup(kIoUringSqEntries, &params);
+    ring_fd = io_uring_setup(sizes.sq_entries, &params);
     if (ring_fd < 0) {
         i32 err = -ring_fd;
         shutdown();
@@ -508,7 +534,7 @@ bool IoUringBackend::add_accept() {
     // listen_fd < 0 means the listener was closed (close_listen()); never arm on
     // -1 or a recycled fd number.
     if (ring_fd < 0 || listen_fd < 0) return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
@@ -525,7 +551,7 @@ bool IoUringBackend::add_accept() {
 
 bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
     if (conn_id >= connection_capacity || connection_capacity == 0) return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
@@ -544,7 +570,7 @@ bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
 
 bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
@@ -569,7 +595,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
         max_len == 0 || max_len > upstream_once_max_len())
         return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
@@ -591,7 +617,7 @@ bool IoUringBackend::add_recv_upstream_direct(
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
         dst == nullptr || len == 0)
         return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
@@ -617,7 +643,7 @@ bool IoUringBackend::add_first_response_recv(i32 fd,
                                              bool separate_body_ring) {
     if (fd < 0 || conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode))
         return false;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
 
     memset(sqe, 0, sizeof(*sqe));
@@ -1006,7 +1032,7 @@ bool IoUringBackend::cancel_response_read_timer(u32 conn_id, Connection& conn) {
 
 void IoUringBackend::cancel_accept() {
     if (ring_fd < 0) return;
-    io_uring_sqe* sqe = get_sqe();
+    io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return;
 
     memset(sqe, 0, sizeof(*sqe));
@@ -1912,7 +1938,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     }
                 }
                 if (result == 0 && ss.remaining > 0) {
-                    io_uring_sqe* sqe = get_sqe();
+                    io_uring_sqe* sqe = get_sqe_flushing();
                     if (sqe) {
                         memset(sqe, 0, sizeof(*sqe));
                         sqe->opcode = IORING_OP_POLL_ADD;
@@ -1969,7 +1995,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 ss.remaining -= nw;
                 if (ss.remaining > 0) {
                     // Partial — re-submit remaining bytes
-                    io_uring_sqe* sqe = get_sqe();
+                    io_uring_sqe* sqe = get_sqe_flushing();
                     if (sqe) {
                         memset(sqe, 0, sizeof(*sqe));
                         sqe->opcode = IORING_OP_SEND;

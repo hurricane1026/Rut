@@ -36956,6 +36956,9 @@ struct ScopedIoUringLoopForRetirement {
         if (storage == MAP_FAILED) return false;
         loop = new (storage) IoUringEventLoop();
         initialized = init_iouring_loop_with_retry(*loop);
+        // These tests fake a full SQ; a flush-and-retry would hand the kernel
+        // entries it never saw and free nothing in the model.
+        if (initialized) loop->backend.disable_full_sq_flush = true;
         return initialized;
     }
 
@@ -36967,6 +36970,41 @@ struct ScopedIoUringLoopForRetirement {
         if (storage != MAP_FAILED) munmap(storage, sizeof(IoUringEventLoop));
     }
 };
+
+// With the smaller rings a full SQ is reachable, and several submit_recv callers
+// (accept, pipeline and TLS continuations) cannot act on a false return: the
+// connection would sit with no recv armed until the keep-alive timeout. The
+// backend flushes the queued SQEs and retries, so the arm succeeds.
+TEST(iouring_full_sq, submit_recv_flushes_and_arms_instead_of_failing) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    loop->backend.disable_full_sq_flush = false;
+    i32 filler[2] = {-1, -1};
+    i32 peer[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(filler), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(peer), 0);
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = peer[0];
+    peer[0] = -1;
+    // Saturate the SQ with real queued recvs (never flushed: each add only flushes
+    // when it finds the ring full, and the loop stops at the first full ring).
+    u32 queued = 0;
+    while (loop->backend.sq_has_room() && queued < 2u * loop->backend.sq_ring_entries) {
+        REQUIRE(loop->backend.add_recv(filler[0], 0));
+        ++queued;
+    }
+    REQUIRE(!loop->backend.sq_has_room());
+    CHECK(loop->submit_recv(*conn));
+    CHECK(conn->recv_armed);
+    CHECK_EQ(loop->backend.failure_code(), 0);
+    // Tear down: the conn's recv and the fillers complete when the sockets close.
+    loop->close_conn(*conn);
+    close(filler[0]);
+    close(filler[1]);
+    close(peer[1]);
+}
 
 TEST(iouring_local_body_epoch, close_defers_leave_until_send_slot_reclaims) {
     ScopedIoUringLoopForRetirement guard;

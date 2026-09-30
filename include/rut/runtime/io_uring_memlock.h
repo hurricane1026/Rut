@@ -26,12 +26,47 @@
 
 namespace rut {
 
-// SQ entries requested from io_uring_setup by IoUringBackend::init. The kernel
-// sizes the CQ at twice this by default.
-static constexpr u32 kIoUringSqEntries = 16384;
-static constexpr u32 kIoUringCqEntries = kIoUringSqEntries * 2;
-static_assert((kIoUringSqEntries & (kIoUringSqEntries - 1)) == 0,
-              "io_uring SQ entries must be a power of two (the kernel rounds up)");
+// Ring sizes requested from io_uring_setup, derived from the per-shard
+// connection capacity (IoUringBackend::init passes both to the kernel and the
+// startup diagnostic feeds them to the charge functions below).
+//
+// CQ: 2 x capacity, rounded up to a power of two, within [2048, 65536]. Peak
+// unconsumed completions measured at up to ~2 per live connection (burst of
+// keep-alive connections, close burst, Connection: close churn, proxied
+// requests), and the old fixed 16384 / 32768 pair had the same 2x ratio at the
+// default capacity. A transiently full CQ is safe (the kernel parks the excess
+// on its overflow list and wait() flushes it), just slower, so this is a
+// sizing target, not a hard bound. 65536 is IORING_MAX_CQ_ENTRIES; larger
+// requests fail EINVAL.
+// SQ: 1024, independent of capacity. wait() submits everything queued each
+// iteration and close-path cancels flush immediately, so occupancy is about
+// one batch of events (measured peak 256 = kMaxEventsPerWait at every
+// capacity), and the recv/accept arms flush and retry when it does fill (see
+// IoUringBackend::get_sqe_flushing). 1024 leaves 4x headroom over the
+// measured peak, i.e. four SQEs per event of a full batch.
+static constexpr u32 kIoUringSqEntries = 1024;
+static constexpr u32 kMinIoUringCqEntries = 2048;
+static constexpr u32 kMaxIoUringCqEntries = 65536;
+
+struct IoUringRingSizes {
+    u32 sq_entries;
+    u32 cq_entries;
+};
+
+constexpr u32 io_uring_next_pow2(u32 n) {
+    u32 p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+constexpr IoUringRingSizes io_uring_ring_sizes(u32 capacity) {
+    // Widen before doubling so a huge capacity cannot wrap.
+    const u64 want = static_cast<u64>(capacity) * 2;
+    u32 cq = kMaxIoUringCqEntries;
+    if (want < kMaxIoUringCqEntries) cq = io_uring_next_pow2(static_cast<u32>(want));
+    if (cq < kMinIoUringCqEntries) cq = kMinIoUringCqEntries;
+    return {kIoUringSqEntries, cq};
+}
 
 namespace iouring_memlock_detail {
 constexpr u64 saturating_add(u64 a, u64 b) {
