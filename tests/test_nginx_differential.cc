@@ -41339,7 +41339,7 @@ static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect30
     "301 Moved Permanently",
     kExactLoopbackFixedRedirect301SourceBody,
     kExactLoopbackFixedRedirect301Body,
-    5821u};
+    5807u};
 static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect302Profile{
     302u,
     "#350",
@@ -41351,7 +41351,7 @@ static constexpr ExactLoopbackFixedRedirectProfile kExactLoopbackFixedRedirect30
     "302 Found",
     kExactLoopbackFixedRedirect302SourceBody,
     kExactLoopbackFixedRedirect302Body,
-    5797u};
+    5783u};
 
 static const ExactLoopbackFixedRedirectProfile* exact_loopback_fixed_redirect_profile(u16 status) {
     if (status == 301u) return &kExactLoopbackFixedRedirect301Profile;
@@ -85509,7 +85509,7 @@ int main(int argc, char** argv) {
             << "PASS: #351 exact listen 127.0.0.1:<port>, exact /old fixed absolute return "
                "301 and minimal root proxy in exactly listen/exact/root and listen/root/exact "
                "orders traversed the genuine borrowed nginx parser/provenance model and "
-               "converter into canonical 5821-byte ordinary RUT. Two isolated pinned-nginx "
+               "converter into canonical 5807-byte ordinary RUT. Two isolated pinned-nginx "
                "1.29.7 sides and two independently generated public-CLI/JIT/io_uring RUT sides "
                "retained causal same-port non-listening .2 guards and quiet refusal probes. All "
                "four sides matched three exact Date-normalized 366-byte fixed-Location 301/"
