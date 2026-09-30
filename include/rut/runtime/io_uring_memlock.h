@@ -63,15 +63,31 @@ constexpr u64 io_uring_pbuf_ring_locked_bytes(u32 entries, u64 page_bytes) {
     return iouring_memlock_detail::round_up_page(static_cast<u64>(entries) * 16, page_bytes);
 }
 
-// Total per-shard charge: the ring plus both provided-buffer rings.
+// Per-shard charge a shard cannot start without: the ring plus the primary
+// provided-buffer ring (IoUringBackend::init fails on either). The large
+// provided-buffer ring is optional -- setup_extra_buf_ring leaves it absent
+// when registration fails and recvs fall back to the primary ring -- so it is
+// excluded here and only counted by io_uring_shard_locked_bytes.
+// Measured reference (Linux 7.2.7, 4 KiB pages): SQ 16384 / CQ 32768 with 2048
+// provided-buffer entries = 1636 KiB (1604 + 32).
+constexpr u64 io_uring_shard_required_locked_bytes(u32 sq_entries,
+                                                   u32 cq_entries,
+                                                   u32 pbuf_entries,
+                                                   u64 page_bytes) {
+    return io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes) +
+           io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes);
+}
+
+// Total per-shard charge with every ring registered: the required charge plus
+// the optional large provided-buffer ring. This is what a limit should cover
+// so no ring is silently skipped.
 // Measured reference (Linux 7.2.7, 4 KiB pages): SQ 16384 / CQ 32768 with
 // 2048 + 1024 provided-buffer entries = 1652 KiB (1604 + 32 + 16). If the ring
 // constants change and this drifts from the kernel's accounting, the tests
 // will say so.
 constexpr u64 io_uring_shard_locked_bytes(
     u32 sq_entries, u32 cq_entries, u32 pbuf_entries, u32 large_pbuf_entries, u64 page_bytes) {
-    return io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes) +
-           io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes) +
+    return io_uring_shard_required_locked_bytes(sq_entries, cq_entries, pbuf_entries, page_bytes) +
            io_uring_pbuf_ring_locked_bytes(large_pbuf_entries, page_bytes);
 }
 

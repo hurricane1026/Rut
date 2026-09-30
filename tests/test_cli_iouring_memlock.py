@@ -28,16 +28,18 @@ def round_up_page(n):
     return (n + PAGE - 1) // PAGE * PAGE
 
 
-# Per-shard charge for the current ring constants (SQ 16384 / CQ 32768, 2048 +
-# 1024 provided-buffer entries): 1652 KiB on 4 KiB pages. Keep in sync with
-# io_uring_shard_locked_bytes() in include/rut/runtime/io_uring_memlock.h
-# (unit-tested there against measured kernel values); update when ring sizes change.
-PER_SHARD_KIB = (
+# Per-shard charges for the current ring constants (SQ 16384 / CQ 32768, 2048
+# primary + 1024 optional large provided-buffer entries): 1636 KiB required to
+# start and 1652 KiB with every ring, on 4 KiB pages. Keep in sync with
+# io_uring_shard_required_locked_bytes() / io_uring_shard_locked_bytes() in
+# include/rut/runtime/io_uring_memlock.h (unit-tested there against measured
+# kernel values); update when ring sizes change.
+REQUIRED_PER_SHARD_KIB = (
     round_up_page(16384 * 64)
     + round_up_page(320 + 32768 * 16 + 16384 * 4)
     + round_up_page(2048 * 16)
-    + round_up_page(1024 * 16)
 ) // 1024
+PER_SHARD_KIB = REQUIRED_PER_SHARD_KIB + round_up_page(1024 * 16) // 1024
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 
@@ -121,10 +123,12 @@ def limits():
 
 def common_needles(limit, hard):
     total = PER_SHARD_KIB * 2
+    required_total = REQUIRED_PER_SHARD_KIB * 2
     needles = [
         "RLIMIT_MEMLOCK",
         f"soft {limit // 1024} KiB",
-        f"at least {total} KiB for 2 shard(s) ({PER_SHARD_KIB} KiB per shard)",
+        f"at least {required_total} KiB for 2 shard(s) to start ({REQUIRED_PER_SHARD_KIB} KiB per "
+        f"shard), {total} KiB ({PER_SHARD_KIB} KiB per shard) with the optional large-buffer ring",
         "plus whatever this user's other io_uring processes hold",
         "0 shard(s) initialised before it",
         f"ulimit -l {total} (KiB",

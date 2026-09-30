@@ -177,12 +177,22 @@ static void report_io_uring_enomem(u32 failed_shard, u32 shard_count, bool will_
     // ppc64 kernels), so the estimate must use the runtime page size.
     const long sys_page = sysconf(_SC_PAGESIZE);
     const u64 page_bytes = sys_page > 0 ? static_cast<u64>(sys_page) : 4096;
+    // Two figures: what a shard needs to start at all (ring + primary buffer
+    // ring), and what it needs for every ring. The large buffer ring is
+    // optional -- when its registration fails the shard starts without it and
+    // nothing says so -- so the suggested limit covers all rings while the
+    // minimum stays honest.
+    const u64 required_per_shard_kib =
+        io_uring_shard_required_locked_bytes(
+            kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, page_bytes) /
+        1024;
     const u64 per_shard_kib = io_uring_shard_locked_bytes(kIoUringSqEntries,
                                                           kIoUringCqEntries,
                                                           kProvidedBufCount,
                                                           kLargeProvidedBufCount,
                                                           page_bytes) /
                               1024;
+    const u64 required_total_kib = required_per_shard_kib * shard_count;
     const u64 total_kib = per_shard_kib * shard_count;
     write_str("io_uring ring creation failed with ENOMEM at shard ");
     write_u32(failed_shard);
@@ -207,12 +217,18 @@ static void report_io_uring_enomem(u32 failed_shard, u32 shard_count, bool will_
         write_str("\n");
     }
     write_str("  io_uring needs at least ");
-    write_u64(total_kib);
+    write_u64(required_total_kib);
     write_str(" KiB for ");
     write_u32(shard_count);
-    write_str(" shard(s) (");
+    write_str(" shard(s) to start (");
+    write_u64(required_per_shard_kib);
+    write_str(" KiB per shard), ");
+    write_u64(total_kib);
+    write_str(" KiB (");
     write_u64(per_shard_kib);
-    write_str(" KiB per shard), plus whatever this user's other io_uring processes hold\n");
+    write_str(
+        " KiB per shard) with the optional large-buffer ring, plus whatever this user's other "
+        "io_uring processes hold\n");
     if (will_fall_back)
         write_str("  falling back to epoll (TLS); to keep io_uring:\n");
     else
