@@ -5566,6 +5566,16 @@ static u32 resident_conn_pages_past(IoUringEventLoop& loop, u32 used) {
     return resident;
 }
 
+// Residency is only meaningful at 4 KiB granularity. On a host where THP is
+// eligible (enabled=always, or a 2 MiB-aligned mapping under an environment that
+// madvises it) the first slot's fault maps a whole 2 MiB huge page and reports
+// ~511 neighbouring pages resident, which says nothing about the code under
+// test. Opt the array out before any slot is touched. Call right after init.
+static void disable_conn_hugepages(IoUringEventLoop& loop) {
+    const u64 bytes = static_cast<u64>(loop.connection_capacity) * sizeof(Connection);
+    (void)madvise(loop.conns.data(), static_cast<size_t>(bytes), MADV_NOHUGEPAGE);
+}
+
 // A fresh loop has touched no slot, and an idle loop can be shut down as-is.
 TEST(uring, lazy_slots_fresh_loop_has_zero_watermark) {
     auto loop = std::make_unique<IoUringEventLoop>();
@@ -5708,10 +5718,14 @@ TEST(uring, lazy_slots_response_read_batch_ignores_unallocated_slots) {
     if (!init_iouring_loop_with_retry(*loop)) {
         SKIP("io_uring cannot initialize in this environment");
     }
+    disable_conn_hugepages(*loop);
     Connection* live = loop->alloc_conn();
     REQUIRE(live != nullptr);
     REQUIRE_EQ(loop->slots_initialized, 1u);
-    REQUIRE_EQ(resident_conn_pages_past(*loop, 1), 0u);
+    // Delta, not absolute zero: the assertion is that the batch makes no further
+    // suffix page resident, whatever the environment already mapped.
+    const u32 suffix_before = resident_conn_pages_past(*loop, 1);
+    REQUIRE(suffix_before != ~0u);
 
     const u32 kFar = loop->connection_capacity - 1u;
     IoEvent batch[4];
@@ -5722,9 +5736,9 @@ TEST(uring, lazy_slots_response_read_batch_ignores_unallocated_slots) {
     loop->prepare_response_read_deadline_batch(batch, 4);
     CHECK_EQ(loop->response_read_batch_owner_count, 0u);
     CHECK_EQ(loop->response_read_batch_pin_count, 0u);
-    CHECK_EQ(resident_conn_pages_past(*loop, 1), 0u);
+    CHECK_EQ(resident_conn_pages_past(*loop, 1), suffix_before);
     loop->settle_response_read_deadline_batch();
-    CHECK_EQ(resident_conn_pages_past(*loop, 1), 0u);
+    CHECK_EQ(resident_conn_pages_past(*loop, 1), suffix_before);
     loop->response_read_batch_events = nullptr;
     loop->response_read_batch_event_count = 0;
     loop->shutdown();
@@ -5774,6 +5788,7 @@ TEST(uring, lazy_slots_drain_tick_with_partial_array) {
     if (!init_iouring_loop_with_retry(*loop)) {
         SKIP("io_uring cannot initialize in this environment");
     }
+    disable_conn_hugepages(*loop);
     i32 cli[3][2];
     for (auto& pair : cli) REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
     for (u32 i = 0; i < 3; i++) {
@@ -5784,7 +5799,8 @@ TEST(uring, lazy_slots_drain_tick_with_partial_array) {
     }
     REQUIRE_EQ(loop->slots_initialized, 3u);
     REQUIRE(loop->connection_capacity > 64u);
-    REQUIRE_EQ(resident_conn_pages_past(*loop, 3), 0u);
+    const u32 suffix_before = resident_conn_pages_past(*loop, 3);
+    REQUIRE(suffix_before != ~0u);
 
     struct stat fd0_before{};
     const int fd0_before_rc = ::fstat(0, &fd0_before);
@@ -5795,7 +5811,7 @@ TEST(uring, lazy_slots_drain_tick_with_partial_array) {
     for (u32 i = 0; i < 3; i++) CHECK(::fcntl(cli[i][0], F_GETFD) == -1);  // closed by drain
     CHECK_EQ(loop->active_count(), 0u);  // nothing left, run() would stop
     CHECK_EQ(loop->slots_initialized, 3u);
-    CHECK_EQ(resident_conn_pages_past(*loop, 3), 0u);  // suffix never read or written
+    CHECK_EQ(resident_conn_pages_past(*loop, 3), suffix_before);  // suffix never read or written
     struct stat fd0_after{};
     const int fd0_after_rc = ::fstat(0, &fd0_after);
     CHECK_EQ(fd0_after_rc, fd0_before_rc);
