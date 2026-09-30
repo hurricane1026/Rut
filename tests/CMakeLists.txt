@@ -476,6 +476,30 @@ set_tests_properties(test_cli_connection_capacity PROPERTIES
     TIMEOUT 45)
 endif()
 
+# io_uring ring memory vs RLIMIT_MEMLOCK: the startup diagnostic. Skips (77)
+# when the limit cannot take effect (CAP_IPC_LOCK, no io_uring).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+add_test(
+    NAME test_cli_iouring_memlock
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_iouring_memlock.py
+            $<TARGET_FILE:rut>)
+set_tests_properties(test_cli_iouring_memlock PROPERTIES
+    LABELS "cli"
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 30)
+
+add_executable(test_io_uring_memlock test_io_uring_memlock.cc
+    ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+target_include_directories(test_io_uring_memlock PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_io_uring_memlock COMMAND test_io_uring_memlock)
+set_tests_properties(test_io_uring_memlock PROPERTIES LABELS "unit")
+endif()
+
 set(RUT_TLS_TESTDATA_DIR ${CMAKE_CURRENT_BINARY_DIR}/testdata)
 set(RUT_TLS_TEST_CERT ${RUT_TLS_TESTDATA_DIR}/localhost_cert.pem)
 set(RUT_TLS_TEST_KEY ${RUT_TLS_TESTDATA_DIR}/localhost_key.pem)
