@@ -158,6 +158,11 @@ public:
         // Refused with 413 after a request-body overflow: the response is draining and
         // the connection closes behind it; nothing more to read or to fail on.
         if (conn.req_body_overflow_rejected) return;
+        // The origin response owns the connection after an early response
+        // abandoned the request body. Late downstream CQEs belong to the
+        // discarded upload; consume them without rearming or truncating the
+        // queued response send.
+        if (conn.req_body_abandoned) return;
         if (ev.result > 0) {
             // A streamed request body is still being forwarded: these bytes (already
             // appended to recv_buf by the backend) are its next chunk, which

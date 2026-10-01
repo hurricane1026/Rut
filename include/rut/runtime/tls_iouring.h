@@ -582,6 +582,7 @@ inline bool tls_recv_callback_is_current(const Connection& c) {
 template <class Self>
 void tls_recv(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
+    if (c.req_body_abandoned) return;
     // A prior body overflow already committed the 413 response. Late TLS CQEs
     // belong to that drain and must not re-enter overflow handling or TLS parsing.
     if (c.req_body_overflow_rejected) return;
