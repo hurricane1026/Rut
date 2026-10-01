@@ -9472,7 +9472,8 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
                       requires(Loop* l, Connection& c) { l->pause_recv(c); }) {
             const bool final_body_send_inflight = final_request_body_send_inflight<Loop>(conn);
             if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
-                (conn.request_body_incomplete() || final_body_send_inflight)) {
+                (conn.request_body_incomplete() || final_body_send_inflight ||
+                 completed_request_waiting_response_owner<Loop>(conn))) {
                 respond_request_body_overflow<Loop>(loop, conn);
                 return;
             }

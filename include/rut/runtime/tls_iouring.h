@@ -682,7 +682,8 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         // 413 instead of a silent close.
         if (ev.result == -ENOBUFS &&
             (c.request_body_incomplete() || final_request_body_send_inflight<Self>(c) ||
-             initial_request_send_owner<Self>(c))) {
+             initial_request_send_owner<Self>(c) ||
+             completed_request_waiting_response_owner<Self>(c))) {
             respond_request_body_overflow<Self>(loop, c);
             return;
         }
