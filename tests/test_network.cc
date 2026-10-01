@@ -40449,6 +40449,32 @@ TEST(iouring_downstream_recv, pause_cancel_positive_terminal_race_rearms_once) {
     }
 }
 
+TEST(iouring_downstream_recv, positive_target_then_headroom_pause_keeps_cancel_owner) {
+    RawDownstreamRecvBatch fixture;
+    if (!fixture.init()) SKIP("io_uring unavailable");
+    auto* loop = fixture.guard.loop;
+    Connection& conn = *fixture.conns[0];
+    REQUIRE(loop->pause_recv(conn));
+    REQUIRE(conn.recv_pause_cancel_pending);
+    conn.req_body_mode = BodyMode::ContentLength;
+    conn.req_body_remaining = 1;
+    conn.recv_buf.commit(conn.recv_buf.write_avail() - kRequestBodyRecvHeadroom + 1);
+    conn.recv_armed = true;
+    conn.pending_ops = 2;
+    loop->dispatch({conn.id, 1, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(conn.recv_armed);
+    CHECK(conn.recv_pause_cancel_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
+    conn.recv_paused_for_send = false;
+    loop->handle_unhandled_recv(conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK(conn.recv_pause_cancel_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
+    loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    CHECK_FALSE(conn.recv_pause_cancel_pending);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+}
+
 TEST(iouring_downstream_recv, pause_cancel_close_drains_each_owner_once) {
     for (const bool cancel_first : {false, true}) {
         RawDownstreamRecvBatch fixture;
