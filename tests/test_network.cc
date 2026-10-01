@@ -75792,7 +75792,6 @@ TEST(request_body_overflow, final_body_send_inflight_preserves_successor_overflo
     loop.handle_unhandled_recv(*c, make_ev(c->id, IoEventType::Recv, -ENOBUFS));
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK_FALSE(c->keep_alive);
-    loop.close_conn(*c);
 }
 
 TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
@@ -75847,7 +75846,6 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
 
     loop->dispatch({c->id, 3, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
     CHECK_EQ(c->recv_buf.len(), 0u);  // the damaged successor is discarded after completion
-    loop->close_conn(*c);
     close(downstream[1]);
     close(upstream[1]);
 }
