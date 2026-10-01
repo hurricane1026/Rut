@@ -33418,6 +33418,31 @@ TEST(early_response, client_data_in_recv_buf_not_lost) {
 }
 
 // P1a: Client Recv during proxy response send must not close connection.
+TEST(early_response, streaming_response_owner_survives_lossy_successor) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_proxy_conn(loop);
+    REQUIRE(c != nullptr);
+    c->state = ConnState::Sending;
+    c->req_body_lossy_successor = true;
+    c->req_body_abandoned = true;
+    c->proxy_resp_started = true;
+    c->send_armed = true;
+    c->recv_armed = true;
+    c->on_send = &on_response_body_sent<SmallLoop>;
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(c->send_buf.write(kResponse, sizeof(kResponse) - 1), sizeof(kResponse) - 1);
+    loop.backend.send_state[c->id] = {
+        c->send_buf.data(), c->fd, 0, sizeof(kResponse) - 1, IoEventType::Send, 0};
+    const u8* source = loop.backend.send_state[c->id].src;
+    loop.dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_EQ(c->fd, 42);
+    CHECK(c->send_armed);
+    CHECK_EQ(loop.backend.send_state[c->id].src, source);
+    CHECK_EQ(loop.backend.send_state[c->id].remaining, sizeof(kResponse) - 1);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+}
+
 TEST(early_response, client_recv_during_response_send) {
     SmallLoop loop;
     loop.setup();
