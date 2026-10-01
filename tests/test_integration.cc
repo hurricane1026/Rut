@@ -7561,18 +7561,32 @@ TEST(tls_iouring, abandoned_positive_want_read_discards_real_tls_plaintext) {
 
     REQUIRE(SSL_write(cl.ssl, kNextRequest, sizeof(kNextRequest) - 1) ==
             static_cast<int>(sizeof(kNextRequest) - 1));
-    const int cipher_len = BIO_read(
-        cl.wbio, conn.tls_in_buf.write_ptr(), static_cast<int>(conn.tls_in_buf.write_avail()));
+    u8 peer_ciphertext[4096]{};
+    const int cipher_len = BIO_read(cl.wbio, peer_ciphertext, sizeof(peer_ciphertext));
     REQUIRE_GT(cipher_len, 0);
-    conn.tls_in_buf.commit(static_cast<u32>(cipher_len));
+    constexpr u32 kPrefixLen = 1;
+    REQUIRE_LE(kPrefixLen, static_cast<u32>(cipher_len));
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>(peer_ciphertext), kPrefixLen),
+               kPrefixLen);
     conn.recv_armed = false;  // this positive CQE has already consumed the raw recv owner
     tls_recv<TlsIouringHarness>(
-        &loop, conn, IoEvent{conn.id, cipher_len, 0, 0, IoEventType::Recv, 0, 0, 0});
+        &loop, conn, IoEvent{conn.id, kPrefixLen, 0, 0, IoEventType::Recv, 0, 0, 0});
     CHECK_FALSE(loop.closed);
     CHECK(conn.tls_out_inflight);
-    CHECK_EQ(conn.tls_in_buf.len(), static_cast<u32>(cipher_len));
+    CHECK_EQ(conn.tls_in_buf.len(), kPrefixLen);
     CHECK_EQ(conn.recv_buf.len(), 0u);
     CHECK_FALSE(g_tls_iouring_logical_send_called);
+    CHECK_EQ(conn.tls_pending_on_recv, &tls_resume_pending_send_recv<TlsIouringHarness>);
+    const u32 suffix_len = static_cast<u32>(cipher_len) - kPrefixLen;
+    REQUIRE_LE(suffix_len, conn.tls_in_buf.write_avail());
+    REQUIRE_EQ(conn.tls_in_buf.write(peer_ciphertext + kPrefixLen, suffix_len), suffix_len);
+    tls_recv<TlsIouringHarness>(
+        &loop,
+        conn,
+        IoEvent{conn.id, static_cast<i32>(suffix_len), 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_in_buf.len(), static_cast<u32>(cipher_len));
+    CHECK_EQ(conn.tls_pending_on_recv, &tls_resume_pending_send_recv<TlsIouringHarness>);
 
     u32 drain_generation = raw_generation;
     for (u32 drains = 0; drains < 4 && !g_tls_iouring_logical_send_called; drains++) {
