@@ -5970,19 +5970,20 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     CHECK(conn.recv_armed);
     CHECK(conn.recv_pause_cancel_pending);
     CHECK(!conn.recv_pause_rearm_pending);
-    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.pending_ops, 2u);
 
     CHECK(loop->submit_recv(conn));
     CHECK(conn.recv_pause_rearm_pending);
     CHECK(conn.recv_armed);
-    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.pending_ops, 2u);
 
     conn.on_send = &verify_send_pause_cleared;
-    conn.pending_ops = 1;
+    // Model the send that completes while both recv owners remain in flight.
+    conn.pending_ops++;
     conn.send_armed = true;
     g_send_pause_cleared = false;
     loop->dispatch(make_ev(conn.id, IoEventType::Send, 1));
-    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(conn.pending_ops, 2u);
     CHECK(!conn.send_armed);
     CHECK(!conn.recv_paused_for_send);
     CHECK(g_send_pause_cleared);
@@ -5991,12 +5992,11 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     CHECK(conn.recv_pause_rearm_pending);
     CHECK(conn.recv_armed);
 
-    conn.pending_ops = 1;
     loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
     CHECK(conn.recv_pause_cancel_pending);
     CHECK(!conn.recv_armed);
     CHECK(conn.recv_pause_rearm_pending);
-    CHECK_EQ(conn.pending_ops, 1u);  // pause cancel remains the second owner
+    CHECK_EQ(conn.pending_ops, 1u);  // pause cancel remains after target drains
     loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
     CHECK(!conn.recv_pause_cancel_pending);
     CHECK(conn.recv_armed);

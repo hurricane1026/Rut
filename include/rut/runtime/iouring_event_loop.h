@@ -1372,10 +1372,10 @@ private:
             c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None ||
             c.http1_prebuilt_request_prefix_len != 0 || c.http1_boundary_successor_episode != 0 ||
             c.upstream_fd < 0 || c.send_armed || c.yield_armed || c.yield_timeout_armed ||
-            c.recv_paused_for_send || c.recv_pause_cancel_pending || c.recv_pause_rearm_pending ||
-            c.upstream_recv_paused_for_send || c.upstream_recv_pause_cancel_pending ||
-            c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-            c.upstream_recv_terminal_stale)
+            c.recv_paused_for_send || c.recv_pause_cancel_pending || c.recv_pause_target_inflight ||
+            c.recv_pause_rearm_pending || c.upstream_recv_paused_for_send ||
+            c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
+            c.upstream_recv_cancel_inflight || c.upstream_recv_terminal_stale)
             return false;
 
         const auto& downstream_send = backend.send_state[c.id];
@@ -5787,6 +5787,9 @@ public:
         if (!backend.pause_recv(c.fd, c.id)) return false;
         c.recv_pause_cancel_pending = true;
         c.recv_pause_target_inflight = true;
+        // Keep the cancel SQE as an independent lifetime owner. Its CQE may
+        // arrive before or after the target recv terminal.
+        c.pending_ops++;
         return true;
     }
 
@@ -6279,7 +6282,8 @@ public:
                         conn.recv_armed = false;
                         if (conn.recv_pause_target_inflight) {
                             conn.recv_pause_target_inflight = false;
-                            if (conn.recv_pause_cancel_pending) conn.recv_pause_rearm_pending = true;
+                            if (conn.recv_pause_cancel_pending)
+                                conn.recv_pause_rearm_pending = true;
                         }
                         if (conn.fd < 0) {
                             if (conn.pending_ops == 0) reclaim_slot(conn.id);
