@@ -9385,10 +9385,7 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         // io_uring: the CQE did not fit in recv_buf and its tail was dropped.
         if constexpr (loop_backend_async_io<Loop>() &&
                       requires(Loop* l, Connection& c) { l->pause_recv(c); }) {
-            const bool final_body_send_inflight =
-                conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0 &&
-                conn.upstream_send_armed && conn.on_upstream_send == &on_request_body_sent<Loop> &&
-                !conn.upstream_abandoned;
+            const bool final_body_send_inflight = final_request_body_send_inflight<Loop>(conn);
             if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
                 (conn.request_body_incomplete() || final_body_send_inflight)) {
                 respond_request_body_overflow<Loop>(loop, conn);

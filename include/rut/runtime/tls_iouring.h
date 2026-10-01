@@ -589,7 +589,8 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         // -ENOBUFS: the backend dropped the tail of a CQE that did not fit tls_in_buf,
         // which corrupts the record stream. A streamed request body is refused with
         // 413 instead of a silent close.
-        if (ev.result == -ENOBUFS && c.request_body_incomplete()) {
+        if (ev.result == -ENOBUFS &&
+            (c.request_body_incomplete() || final_request_body_send_inflight<Self>(c))) {
             respond_request_body_overflow<Self>(loop, c);
             return;
         }
