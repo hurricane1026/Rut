@@ -14096,7 +14096,19 @@ TEST(tls_iouring, raw_response_owner_mismatch_fails_closed_before_loss_admission
     conn.proxy_resp_started = true;
     conn.tls_active = true;
     static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xCA, 0xFE};
-    REQUIRE_NE(stage_tls_raw_send_target(loop, conn, kCiphertext, sizeof(kCiphertext), false), 0u);
+    REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+    REQUIRE_NE(
+        stage_tls_raw_send_target(loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false),
+        0u);
+    REQUIRE(conn.next_non_upstream_send_generation(conn.tls_send_owner_generation));
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kCiphertext;
+    conn.tls_send_len = sizeof(kCiphertext);
+    conn.tls_send_off = 0;
+    conn.tls_pending_on_send = &on_response_sent<IoUringEventLoop>;
+    REQUIRE(tls_single_shot_send_owner_is_current<IoUringEventLoop>(conn));
+    REQUIRE(loop.tls_ciphertext_send_is_current(conn));
     conn.tls_pending_on_send = nullptr;
     IoEvent overflow{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0};
     overflow.provided_ring_empty = 0;
