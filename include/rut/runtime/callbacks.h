@@ -120,6 +120,16 @@ template <typename Loop>
 void on_request_body_sent(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
+inline bool final_request_body_send_inflight(const Connection& conn) {
+    const bool complete =
+        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state == ChunkedParser::State::Complete);
+    return conn.state == ConnState::Proxying && complete && conn.upstream_send_armed &&
+           conn.on_upstream_send == &on_request_body_sent<Loop> && !conn.upstream_abandoned;
+}
+
+template <typename Loop>
 void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>

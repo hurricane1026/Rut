@@ -5167,10 +5167,7 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
 template <typename Loop>
 void respond_request_body_overflow(Loop* loop, Connection& conn) {
     bool complete_early_response = false;
-    const bool final_body_send_inflight =
-        conn.state == ConnState::Proxying && conn.req_body_mode == BodyMode::ContentLength &&
-        conn.req_body_remaining == 0 && conn.upstream_send_armed &&
-        conn.on_upstream_send == &on_request_body_sent<Loop> && !conn.upstream_abandoned;
+    const bool final_body_send_inflight = final_request_body_send_inflight<Loop>(conn);
     if (conn.upstream_recv_buf.len() > 0) {
         HttpResponseParser parser;
         ParsedResponse response;
