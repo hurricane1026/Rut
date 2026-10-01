@@ -7704,6 +7704,7 @@ TEST(tls_iouring, overflow_rejected_positive_want_read_discards_real_tls_plainte
     const u32 raw_len = conn.tls_out_inflight_len;
     const u32 raw_generation = conn.tls_out_inflight_generation;
     REQUIRE_GT(raw_len, 0u);
+    conn.tls_pending_on_recv = nullptr;
     conn.state = ConnState::Sending;
     conn.req_body_lossy_successor = true;
     conn.proxy_resp_started = true;
@@ -7718,6 +7719,7 @@ TEST(tls_iouring, overflow_rejected_positive_want_read_discards_real_tls_plainte
     CHECK_EQ(conn.tls_out_inflight_len, response_length);
     CHECK_EQ(loop.backend.send_state[conn.id].src, response_source);
     CHECK_EQ(loop.backend.send_state[conn.id].remaining, response_length);
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
 
     REQUIRE(SSL_write(cl.ssl, kNextRequest, sizeof(kNextRequest) - 1) ==
             static_cast<int>(sizeof(kNextRequest) - 1));
