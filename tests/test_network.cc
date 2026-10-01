@@ -70786,12 +70786,24 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
         REQUIRE(harvest_http1_boundary_recv(loop, *conn, nullptr, 0, -ENOBUFS, true, &error));
         const u32 pending_before = conn->pending_ops;
         loop->dispatch(error);
+        Connection& parked = loop->conns[id];
+        // F_MORE means the multishot target is still live. Ring exhaustion is
+        // recoverable and must leave the parked boundary and its target owner
+        // intact; an actual terminal is required to close the connection.
+        CHECK_GE(parked.fd, 0);
+        CHECK(parked.http1_boundary_deferred);
+        CHECK_FALSE(parked.http1_boundary_ready);
+        CHECK(parked.recv_armed);
+        CHECK_EQ(parked.handler_gen, 0u);
+        CHECK_EQ(parked.pending_ops, pending_before);
+        IoEvent terminal{};
+        REQUIRE(harvest_http1_boundary_recv(loop, parked, nullptr, 0, 0, false, &terminal));
+        loop->dispatch(terminal);
         Connection& closed = loop->conns[id];
         CHECK_EQ(closed.fd, -1);
         CHECK_FALSE(closed.http1_boundary_deferred);
         CHECK_FALSE(closed.http1_boundary_ready);
         CHECK_EQ(closed.handler_gen, 0u);
-        CHECK_GE(closed.pending_ops, pending_before);  // target stayed owned; cancel may add one
         constexpr u32 kOld = 101;
         loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
         loop->dispatch(
