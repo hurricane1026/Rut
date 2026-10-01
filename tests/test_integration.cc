@@ -6920,6 +6920,38 @@ struct TlsIouringHarness : SmallLoop {
     void disarm_yield_timer(Connection& /*conn*/) {}
 };
 
+TEST(tls_iouring, connect_owner_overflow_preserves_tls_request_prefix) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[128];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.recv_slice = loop.recv_storage[0];
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\nNEXT";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(conn);
+    conn.state = ConnState::Proxying;
+    conn.upstream_fd = 43;
+    conn.upstream_connect_armed = true;
+    conn.recv_armed = true;
+    conn.pending_ops = 2;
+    conn.on_upstream_send = &on_upstream_connected<TlsIouringHarness>;
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_FALSE(conn.req_body_overflow_rejected);
+    CHECK(conn.req_body_lossy_successor);
+    CHECK_FALSE(conn.keep_alive);
+    CHECK_EQ(conn.req_initial_send_len, sizeof(kRequest) - 1 - 4u);
+    CHECK(__builtin_memcmp(conn.recv_buf.data(), kRequest, conn.req_initial_send_len) == 0);
+}
+
 TEST(tls_iouring, late_recv_after_body_overflow_preserves_413_send) {
     TlsIouringHarness loop;
     Connection& conn = loop.conns[0];
