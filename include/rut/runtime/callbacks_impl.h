@@ -5197,6 +5197,34 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         conn.keep_alive = false;
         return;
     }
+    const bool intermediate_body_send_owner =
+        conn.state == ConnState::Proxying && conn.upstream_send_armed &&
+        conn.on_upstream_send == &on_request_body_sent<Loop> && !conn.upstream_abandoned &&
+        conn.req_initial_send_len <= conn.recv_buf.len();
+    if (intermediate_body_send_owner) {
+        const u8* suffix = conn.recv_buf.data() + conn.req_initial_send_len;
+        const u32 suffix_len = conn.recv_buf.len() - conn.req_initial_send_len;
+        bool complete_suffix = false;
+        if (conn.req_body_mode == BodyMode::ContentLength) {
+            complete_suffix = conn.req_body_remaining <= suffix_len;
+        } else if (conn.req_body_mode == BodyMode::Chunked) {
+            ChunkedParser probe = conn.req_chunk_parser;
+            u32 pos = 0;
+            while (pos < suffix_len && probe.state != ChunkedParser::State::Complete) {
+                u32 consumed = 0, out_start = 0, out_len = 0;
+                const ChunkStatus status =
+                    probe.feed(suffix + pos, suffix_len - pos, &consumed, &out_start, &out_len);
+                pos += consumed;
+                if (status == ChunkStatus::Error || consumed == 0) break;
+            }
+            complete_suffix = probe.state == ChunkedParser::State::Complete;
+        }
+        if (complete_suffix) {
+            conn.req_body_lossy_successor = true;
+            conn.keep_alive = false;
+            return;
+        }
+    }
     // The final request-body send owns completion of the origin response even
     // when recv_buf contains only a partial or empty response prefix. Preserve
     // that owner so on_request_body_sent can finish the response and close.
