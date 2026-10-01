@@ -14446,8 +14446,13 @@ TEST(proxy_reuse, client_close_with_pipelined_request_after_deferred_return_free
         if (i % 3 != 0) usleep(i * 7);
         close(fd);
     }
-    for (u32 waited = 0; waited < 3000 && rig.shard.loop->active_count() != 0; waited++)
-        usleep(1000);
+    // Allow normal close processing to run for the original bounded interval. active_count()
+    // reads free_top, which is mutated by the shard thread and is not synchronized for polling.
+    for (u32 waited = 0; waited < 3000; waited++) usleep(1000);
+    // Stop and join before inspecting loop-owned slot state.
+    rig.shard.stop();
+    rig.shard.join();
+    rig.spawned = false;
     CHECK_EQ(rig.shard.loop->active_count(), 0u);
 
     rig.stop_shard();
