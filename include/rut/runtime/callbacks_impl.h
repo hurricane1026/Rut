@@ -5233,6 +5233,11 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         conn.keep_alive = false;
         return;
     }
+    if (initial_connect_request_owner<Loop>(conn)) {
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        return;
+    }
     // The body counters are advanced only when the in-flight send completes. If
     // the copied prefix already contains this request's complete Content-Length,
     // preserve that request and close after its response; only the pipelined
@@ -9467,6 +9472,11 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result <= 0) {
+        if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+            preserved_response_drain_owner<Loop>(conn)) {
+            conn.reset_request_receive_buffer();
+            return;
+        }
         // io_uring: the CQE did not fit in recv_buf and its tail was dropped.
         if constexpr (loop_backend_async_io<Loop>() &&
                       requires(Loop* l, Connection& c) { l->pause_recv(c); }) {

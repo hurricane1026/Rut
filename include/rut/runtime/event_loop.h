@@ -206,6 +206,11 @@ public:
             return;
         }
         if (ev.result < 0) {
+            if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+                preserved_response_drain_owner<Derived>(conn)) {
+                conn.reset_request_receive_buffer();
+                return;
+            }
             // A response written directly still awaits its Send completion,
             // which accounts the request and closes this connection; a client
             // that read it and reset must not pre-empt that completion.
@@ -220,7 +225,8 @@ public:
                 if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
                     (conn.request_body_incomplete() || final_body_send_inflight ||
                      initial_request_send_owner<Derived>(conn) ||
-                     completed_request_waiting_response_owner<Derived>(conn))) {
+                     completed_request_waiting_response_owner<Derived>(conn) ||
+                     initial_connect_request_owner<Derived>(conn))) {
                     respond_request_body_overflow(&self(), conn);
                     return;
                 }
