@@ -162,7 +162,10 @@ public:
         // abandoned the request body. Late downstream CQEs belong to the
         // discarded upload; consume them without rearming or truncating the
         // queued response send.
-        if (conn.req_body_abandoned) return;
+        if (conn.req_body_abandoned) {
+            conn.recv_buf.reset();
+            return;
+        }
         if (ev.result > 0) {
             // A streamed request body is still being forwarded: these bytes (already
             // appended to recv_buf by the backend) are its next chunk, which

@@ -6449,13 +6449,20 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     c->state = ConnState::Sending;
     c->send_armed = true;
     c->on_send = &on_response_sent<IoUringEventLoop>;
+    c->pending_ops = 2;
     const u32 response_len = c->send_buf.len();
+    static constexpr char kLate[] = "discard-me";
+    REQUIRE(c->recv_buf.write(reinterpret_cast<const u8*>(kLate), sizeof(kLate) - 1) ==
+            sizeof(kLate) - 1);
     loop->dispatch(make_ev(c->id, IoEventType::Recv, 4096));
     loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
     CHECK(c->fd >= 0);
     CHECK_EQ(c->send_buf.len(), response_len);
+    CHECK_EQ(c->recv_buf.len(), 0u);
     CHECK(c->send_armed);
     CHECK_EQ(c->state, ConnState::Sending);
+    loop->dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(response_len)));
+    CHECK(c->fd < 0 || c->pending_ops != 0);
     loop->shutdown();
 }
 
