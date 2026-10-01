@@ -76651,6 +76651,48 @@ TEST(request_body_overflow, iouring_full_cl_retry_send_first_preserves_prefix) {
     close(upstream[1]);
 }
 
+TEST(request_body_overflow, iouring_connect_owner_requires_exact_bodyless_boundary) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    downstream[0] = -1;
+    upstream[0] = -1;
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    static constexpr char kBytes[] = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\nNEXT";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kBytes), sizeof(kBytes) - 1),
+               sizeof(kBytes) - 1);
+    capture_request_metadata(*c);
+    REQUIRE_EQ(c->req_initial_send_len, sizeof(kBytes) - 1 - 4u);
+    c->state = ConnState::Proxying;
+    c->upstream_connect_armed = true;
+    c->recv_armed = true;
+    c->pending_ops = 2;
+    c->on_upstream_send = &on_upstream_connected<IoUringEventLoop>;
+    c->upstream_episode = 1;
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->keep_alive);
+    CHECK_GE(c->fd, 0);
+    c->upstream_connect_armed = false;
+    loop->dispatch({c->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, c->upstream_episode});
+    CHECK_GE(c->fd, 0);
+    CHECK_EQ(c->on_upstream_send, &on_upstream_request_sent<IoUringEventLoop>);
+    CHECK_EQ(loop->backend.upstream_send_state[c->id].remaining, c->req_initial_send_len);
+    CHECK(__builtin_memcmp(
+              loop->backend.upstream_send_state[c->id].src, kBytes, c->req_initial_send_len) == 0);
+    close(downstream[1]);
+    close(upstream[1]);
+}
+
 TEST(request_body_overflow, iouring_bodyless_initial_owner_preserves_response) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

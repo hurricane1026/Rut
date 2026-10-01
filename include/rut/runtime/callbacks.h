@@ -155,17 +155,16 @@ inline bool preserved_response_drain_owner(const Connection& conn) {
            conn.on_send == &on_proxy_response_sent<Loop>;
 }
 
+// Strictly prove the current HTTP/1 request boundary before admitting a
+// lossy successor while the initial upstream connect owns the request.
+bool ordinary_local_response_request_boundary_reusable(const Connection& conn);
+
 template <typename Loop>
 inline bool initial_connect_request_owner(const Connection& conn) {
-    const bool complete =
-        conn.req_body_mode == BodyMode::None ||
-        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0) ||
-        (conn.req_body_mode == BodyMode::Chunked &&
-         conn.req_chunk_parser.state == ChunkedParser::State::Complete);
     return conn.state == ConnState::Proxying && conn.upstream_connect_armed &&
            conn.upstream_fd >= 0 && !conn.upstream_abandoned && !conn.proxy_resp_started &&
-           conn.on_upstream_send == &on_upstream_connected<Loop> && complete &&
-           conn.req_initial_send_len != 0 && conn.req_initial_send_len <= conn.recv_buf.len();
+           conn.on_upstream_send == &on_upstream_connected<Loop> &&
+           ordinary_local_response_request_boundary_reusable(conn);
 }
 
 template <typename Loop>
