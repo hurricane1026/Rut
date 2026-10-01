@@ -6480,7 +6480,7 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     CHECK_FALSE(c->recv_pause_cancel_pending);
     CHECK_FALSE(c->recv_pause_target_inflight);
     CHECK_FALSE(c->recv_armed);
-    CHECK_EQ(c->recv_pause_rearm_pending, false);
+    CHECK(c->recv_pause_rearm_pending);
     loop->dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(response_len)));
     CHECK(c->fd < 0 || c->pending_ops != 0);
     loop->shutdown();
