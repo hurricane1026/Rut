@@ -6927,7 +6927,11 @@ TEST(tls_iouring, late_recv_after_body_overflow_preserves_413_send) {
     conn.id = 0;
     conn.fd = 42;
     conn.req_body_overflow_rejected = true;
+    u8 tls_in_storage[64];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
     conn.send_armed = true;
+    conn.recv_armed = true;
     conn.pending_ops = 1;
     conn.send_slice = loop.send_storage[0];
     conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
@@ -6944,6 +6948,35 @@ TEST(tls_iouring, late_recv_after_body_overflow_preserves_413_send) {
     CHECK_EQ(conn.fd, 42);
     CHECK(conn.send_armed);
     CHECK_EQ(conn.send_buf.len(), send_len);
+}
+
+TEST(tls_iouring, overflow_owned_recv_error_closes_but_unowned_late_input_is_ignored) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.req_body_overflow_rejected = true;
+    conn.send_armed = true;
+    conn.pending_ops = 1;
+    conn.send_slice = loop.send_storage[0];
+    conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
+    static constexpr char k413[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
+    REQUIRE_EQ(conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1),
+               sizeof(k413) - 1);
+    const u32 send_len = conn.send_buf.len();
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("late"), 4), 4u);
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 1, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.send_buf.len(), send_len);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK(loop.recv_paused);
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK(loop.closed);
+    CHECK_FALSE(conn.tls_active);
 }
 
 TEST(tls_iouring, abandoned_late_recv_discards_ciphertext_and_clears_want_read) {

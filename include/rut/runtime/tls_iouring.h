@@ -672,6 +672,7 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
             }
             return;
         }
+        tls_discard_abandoned_input<Self>(loop, c);
         return;
     }
     if (ev.result <= 0) {  // peer EOF or recv error

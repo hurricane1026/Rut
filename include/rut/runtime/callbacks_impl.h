@@ -5230,8 +5230,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
             const ChunkStatus status =
                 probe.feed(suffix + pos, suffix_len - pos, &consumed, &out_start, &out_len);
             pos += consumed;
-            if (status == ChunkStatus::Error || (status == ChunkStatus::NeedMore && consumed == 0))
-                break;
+            if (status == ChunkStatus::Error || consumed == 0) break;
         }
         if (probe.state == ChunkedParser::State::Complete) {
             // Keep the live parser at the pre-CQE boundary. The completion
