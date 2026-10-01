@@ -6424,7 +6424,9 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     c->upstream_send_armed = true;
     c->pending_ops = 2;
     c->on_upstream_send = &on_request_body_sent<IoUringEventLoop>;
-    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    IoEvent late_loss = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
+    late_loss.more = 1;
+    loop->dispatch(late_loss);
     CHECK(c->fd >= 0);
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK_FALSE(c->keep_alive);
@@ -6441,8 +6443,7 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
     Connection* c = make_uploading_conn(*loop, 0, 40000);
     REQUIRE(c != nullptr);
-    static constexpr char kResponse[] =
-        "HTTP/1.1 401 Unauthorized\\r\\nContent-Length: 0\\r\\n\\r\\n";
+    static constexpr char kResponse[] = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
     REQUIRE(c->send_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1) ==
             sizeof(kResponse) - 1);
     c->req_body_abandoned = true;
@@ -6466,7 +6467,9 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     CHECK(c->recv_pause_cancel_pending);
     CHECK(c->recv_pause_target_inflight);
     const u32 pending_after_cancel = c->pending_ops;
-    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    IoEvent late_loss_again = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
+    late_loss_again.more = 1;
+    loop->dispatch(late_loss_again);
     CHECK_EQ(c->pending_ops, pending_after_cancel);
     CHECK_EQ(c->recv_buf.len(), 0u);
     CHECK_EQ(c->state, ConnState::Sending);
