@@ -76531,6 +76531,24 @@ TEST(request_body_overflow, iouring_full_cl_initial_owner_send_first_clears_succ
     CHECK_GE(c->fd, 0);
     CHECK_FALSE(c->upstream_send_armed);
     CHECK_EQ(c->on_upstream_recv, &on_upstream_response<IoUringEventLoop>);
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(c->upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1), sizeof(kResponse) - 1);
+    loop->dispatch({c->id,
+                    static_cast<i32>(sizeof(kResponse) - 1),
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    0,
+                    c->upstream_episode});
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_proxy_response_sent<IoUringEventLoop>);
+    CHECK_EQ(c->resp_status, static_cast<u16>(200));
+    const u32 response_send_len = c->send_buf.len();
+    loop->backend.send_state[c->id] = {
+        c->send_buf.data(), c->fd, response_send_len, 0, IoEventType::Send, 0};
+    loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
+    CHECK_EQ(c->fd, -1);
     close(downstream[1]);
     close(upstream[1]);
 }
