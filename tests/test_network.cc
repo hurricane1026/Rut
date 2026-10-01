@@ -76740,6 +76740,37 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
                 const auto& send = loop->backend.upstream_send_state[c->id];
                 CHECK_EQ(send.remaining, c->req_initial_send_len);
                 CHECK(__builtin_memcmp(send.src, request, c->req_initial_send_len) == 0);
+                loop->backend.upstream_send_state[c->id].offset = c->req_initial_send_len;
+                loop->backend.upstream_send_state[c->id].remaining = 0;
+                loop->dispatch({c->id,
+                                static_cast<i32>(c->req_initial_send_len),
+                                0,
+                                0,
+                                IoEventType::UpstreamSend,
+                                0,
+                                0,
+                                c->upstream_episode});
+                static constexpr u8 kResponse[] =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                REQUIRE_EQ(c->upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1),
+                           sizeof(kResponse) - 1);
+                loop->dispatch({c->id,
+                                static_cast<i32>(sizeof(kResponse) - 1),
+                                0,
+                                0,
+                                IoEventType::UpstreamRecv,
+                                0,
+                                0,
+                                c->upstream_episode});
+                CHECK_EQ(c->state, ConnState::Sending);
+                CHECK_EQ(c->resp_status, static_cast<u16>(200));
+                const u32 response_len = sizeof(kResponse) - 1;
+                CHECK_EQ(loop->backend.send_state[c->id].src, c->upstream_recv_buf.data());
+                loop->backend.send_state[c->id].offset = response_len;
+                loop->backend.send_state[c->id].remaining = 0;
+                loop->dispatch(
+                    {c->id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0, 0, 0});
+                CHECK_EQ(c->fd, -1);
             }
             close(downstream[1]);
             close(upstream[1]);
