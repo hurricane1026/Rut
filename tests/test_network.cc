@@ -76235,9 +76235,13 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_proxy_response_sent<IoUringEventLoop>);
     CHECK_EQ(c->resp_status, static_cast<u16>(200));
-    const u32 response_send_len = c->send_buf.len();
+    const u32 response_send_len = sizeof(kResponse) - 1u;
+    CHECK_EQ(c->upstream_send_len, response_send_len);
     loop->backend.send_state[c->id] = {
-        c->send_buf.data(), c->fd, response_send_len, 0, IoEventType::Send, 0};
+        c->upstream_recv_buf.data(), c->fd, response_send_len, 0, IoEventType::Send, 0};
+    CHECK_EQ(loop->backend.send_state[c->id].src, c->upstream_recv_buf.data());
+    loop->backend.send_state[c->id].offset = response_send_len;
+    loop->backend.send_state[c->id].remaining = 0;
     loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
     CHECK_EQ(c->fd, -1);
     close(downstream[1]);
@@ -76544,9 +76548,13 @@ TEST(request_body_overflow, iouring_full_cl_initial_owner_send_first_clears_succ
     CHECK_EQ(c->state, ConnState::Sending);
     CHECK_EQ(c->on_send, &on_proxy_response_sent<IoUringEventLoop>);
     CHECK_EQ(c->resp_status, static_cast<u16>(200));
-    const u32 response_send_len = c->send_buf.len();
+    const u32 response_send_len = sizeof(kResponse) - 1u;
+    CHECK_EQ(c->upstream_send_len, response_send_len);
     loop->backend.send_state[c->id] = {
-        c->send_buf.data(), c->fd, response_send_len, 0, IoEventType::Send, 0};
+        c->upstream_recv_buf.data(), c->fd, response_send_len, 0, IoEventType::Send, 0};
+    CHECK_EQ(loop->backend.send_state[c->id].src, c->upstream_recv_buf.data());
+    loop->backend.send_state[c->id].offset = response_send_len;
+    loop->backend.send_state[c->id].remaining = 0;
     loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
     CHECK_EQ(c->fd, -1);
     close(downstream[1]);
