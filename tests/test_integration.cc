@@ -6455,7 +6455,9 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     static constexpr char kLate[] = "discard-me";
     REQUIRE(c->recv_buf.write(reinterpret_cast<const u8*>(kLate), sizeof(kLate) - 1) ==
             sizeof(kLate) - 1);
-    loop->dispatch(make_ev(c->id, IoEventType::Recv, 4096));
+    IoEvent late_positive = make_ev(c->id, IoEventType::Recv, 4096);
+    late_positive.more = 1;
+    loop->dispatch(late_positive);
     loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
     CHECK(c->fd >= 0);
     CHECK_EQ(c->send_buf.len(), response_len);
