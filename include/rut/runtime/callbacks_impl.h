@@ -5304,6 +5304,16 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
+    if constexpr (requires(Loop* candidate, Connection& c) { candidate->pause_recv(c); }) {
+        // Plaintext io_uring still has a live multishot client recv here. Cancel
+        // it before publishing 413 so repeated overflow CQEs cannot keep the
+        // request alive or refresh its timeout. TLS owns its receive path and
+        // may need WANT_READ while producing the 413, so leave it untouched.
+        if (!conn.uses_iouring_tls() && conn.recv_armed && !loop->pause_recv(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
     (void)detach_upstream_close(loop, conn);
     conn.upstream_abandoned = true;
     static const char k413[] =

@@ -76722,7 +76722,7 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
         c->pending_ops = 2;
         c->on_upstream_send = &on_upstream_connected<IoUringEventLoop>;
         c->upstream_episode = 1;
-        loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+        loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0});
         if (incomplete) {
             CHECK_GE(c->fd, 0);
             CHECK(c->req_body_overflow_rejected);
@@ -76731,6 +76731,8 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
             CHECK_EQ(c->state, ConnState::Sending);
             CHECK_EQ(c->resp_status, static_cast<u16>(413));
             CHECK_EQ(c->on_upstream_send, nullptr);
+            CHECK(c->recv_pause_cancel_pending);
+            CHECK(c->recv_pause_target_inflight);
             CHECK(c->upstream_connect_armed);
             CHECK(buf_contains(reinterpret_cast<const char*>(c->send_buf.data()),
                                c->send_buf.len(),
@@ -76744,6 +76746,24 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
             CHECK_EQ(loop->backend.send_state[c->id].src, c->send_buf.data());
             CHECK_EQ(loop->backend.send_state[c->id].offset, 0u);
             CHECK_EQ(loop->backend.send_state[c->id].remaining, response_len);
+            loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0, c->upstream_episode});
+            CHECK_EQ(c->state, ConnState::Sending);
+            CHECK_EQ(c->resp_status, static_cast<u16>(413));
+            CHECK(c->send_armed);
+            CHECK_EQ(loop->backend.send_state[c->id].src, c->send_buf.data());
+            CHECK_EQ(loop->backend.send_state[c->id].offset, 0u);
+            CHECK_EQ(loop->backend.send_state[c->id].remaining, response_len);
+            loop->dispatch({c->id,
+                            -ECANCELED,
+                            0,
+                            0,
+                            IoEventType::Recv,
+                            0,
+                            kPauseCancelAux,
+                            c->upstream_episode});
+            loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0, c->upstream_episode});
+            CHECK_FALSE(c->recv_pause_cancel_pending);
+            CHECK_FALSE(c->recv_pause_target_inflight);
             const u32 pending_before_connect_cancel = c->pending_ops;
             loop->dispatch(
                 {c->id, -ECANCELED, 0, 0, IoEventType::UpstreamConnect, 0, 0, c->upstream_episode});
@@ -76808,6 +76828,48 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
         close(downstream[1]);
         close(upstream[1]);
     }
+}
+
+TEST(request_body_overflow, lossy_successor_late_recv_during_response_body_is_discarded) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    c->state = ConnState::Sending;
+    c->req_body_lossy_successor = true;
+    c->proxy_resp_started = true;
+    c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
+    c->keep_alive = false;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 5;
+    c->resp_status = 200;
+    CHECK_FALSE(c->send_armed);
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("stale"), 5), 5u);
+
+    loop.handle_unhandled_recv(*c, make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    CHECK_GE(c->fd, 0);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("stale"), 5), 5u);
+    loop.handle_unhandled_recv(*c, make_ev(c->id, IoEventType::Recv, 1));
+    CHECK_GE(c->fd, 0);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>("hello"), 5), 5u);
+    c->upstream_send_len = 5;
+    c->resp_body_sent = 5;
+    c->resp_body_remaining = 0;
+    c->pending_ops = 0;
+    c->transition_to_sending(&on_response_body_sent<SmallLoop>);
+    client_send(&loop, *c, c->upstream_recv_buf.data(), 5);
+    // SmallLoop's mock backend records the send but does not mutate the
+    // connection ownership bit like the production backend.
+    c->send_armed = true;
+    CHECK(c->send_armed);
+    CHECK_EQ(c->on_send, &on_response_body_sent<SmallLoop>);
+    loop.dispatch(make_ev(c->id, IoEventType::Send, 5));
+    CHECK_FALSE(c->send_armed);
+    CHECK_EQ(c->resp_body_remaining, 0u);
+    loop.close_conn(*c);
+    CHECK_EQ(c->fd, -1);
 }
 
 TEST(request_body_overflow, iouring_connect_owner_upgrade_rejects_lossy_successor) {

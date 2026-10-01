@@ -160,6 +160,18 @@ inline bool preserved_response_drain_owner(const Connection& conn) {
            response_owner;
 }
 
+template <typename Loop>
+inline bool preserved_response_late_recv_owner(const Connection& conn) {
+    const bool response_owner = conn.on_send == &on_proxy_response_sent<Loop> ||
+                                conn.on_send == &on_response_sent<Loop> ||
+                                conn.on_send == &on_response_header_sent<Loop> ||
+                                conn.on_send == &on_response_body_sent<Loop> ||
+                                conn.on_send == &on_complete_response_sent<Loop> ||
+                                conn.on_upstream_recv == &on_response_body_recvd<Loop>;
+    return conn.state == ConnState::Sending && conn.req_body_lossy_successor &&
+           !conn.upstream_request_incomplete && conn.proxy_resp_started && response_owner;
+}
+
 // Strictly prove the current HTTP/1 request boundary before admitting a
 // lossy successor while the initial upstream connect owns the request.
 bool ordinary_local_response_request_boundary_reusable(const Connection& conn);

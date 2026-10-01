@@ -171,6 +171,21 @@ public:
             }
             return;
         }
+        // A lossy successor may race the response header/body transition. Once
+        // the origin response owns the connection, discard that late client CQE
+        // even while no downstream send is armed between body chunks.
+        if (preserved_response_late_recv_owner<Derived>(conn) &&
+            (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty))) {
+            conn.reset_request_receive_buffer();
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
+                if (conn.recv_armed && !conn.recv_pause_cancel_pending &&
+                    !self().pause_recv(conn)) {
+                    self().close_conn(conn);
+                }
+            }
+            return;
+        }
         if (ev.result > 0) {
             // A streamed request body is still being forwarded: these bytes (already
             // appended to recv_buf by the backend) are its next chunk, which
