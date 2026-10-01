@@ -76222,6 +76222,24 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     CHECK_GE(c->fd, 0);
     CHECK_FALSE(c->upstream_send_armed);
     CHECK_EQ(c->on_upstream_recv, &on_upstream_response<IoUringEventLoop>);
+    static constexpr u8 kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(c->upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1), sizeof(kResponse) - 1);
+    loop->dispatch({c->id,
+                    static_cast<i32>(sizeof(kResponse) - 1),
+                    0,
+                    0,
+                    IoEventType::UpstreamRecv,
+                    0,
+                    0,
+                    c->upstream_episode});
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_proxy_response_sent<IoUringEventLoop>);
+    CHECK_EQ(c->resp_status, static_cast<u16>(200));
+    const u32 response_send_len = c->send_buf.len();
+    loop->backend.send_state[c->id] = {
+        c->send_buf.data(), c->fd, response_send_len, 0, IoEventType::Send, 0};
+    loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
+    CHECK_EQ(c->fd, -1);
     close(downstream[1]);
     close(upstream[1]);
 }
@@ -76516,6 +76534,30 @@ TEST(request_body_overflow, iouring_full_cl_initial_owner_send_first_clears_succ
     close(downstream[1]);
     close(upstream[1]);
 }
+
+TEST(request_body_overflow, completed_response_owner_negative_upload_rejects_overflow) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    c->fd = downstream[0];
+    downstream[0] = -1;
+    c->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(c->upstream_fd, 0);
+    c->state = ConnState::Proxying;
+    c->req_body_mode = BodyMode::None;
+    c->request_upload_complete = false;
+    c->on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+    c->recv_armed = true;
+    c->pending_ops = 1;
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_EQ(c->fd, -1);
+    close(downstream[1]);
+}
+
 TEST(request_body_overflow, iouring_full_cl_retry_send_first_preserves_prefix) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
