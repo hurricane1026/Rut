@@ -75795,6 +75795,63 @@ TEST(request_body_overflow, final_body_send_inflight_preserves_successor_overflo
     loop.close_conn(*c);
 }
 
+TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    downstream[0] = -1;
+    upstream[0] = -1;
+    REQUIRE(loop->alloc_upstream_buf(*c));
+
+    static constexpr char kBodyAndSuccessor[] = "abcdefNEXT";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kBodyAndSuccessor),
+                                 sizeof(kBodyAndSuccessor) - 1),
+               sizeof(kBodyAndSuccessor) - 1);
+    c->state = ConnState::Proxying;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_content_length = 6;
+    c->req_header_end = 0;
+    c->req_body_remaining = 3;  // "def" remains after the in-flight "abc" send.
+    c->req_body_streamed = true;
+    c->req_initial_send_len = 3;
+    c->keep_alive = true;
+    c->upstream_episode = 1;
+    c->upstream_send_armed = true;
+    c->recv_armed = true;
+    c->pending_ops = 2;
+    c->on_upstream_send = &on_request_body_sent<IoUringEventLoop>;
+    loop->backend.upstream_send_state[c->id] = {
+        c->recv_buf.data(), c->upstream_fd, 0, 3, IoEventType::UpstreamSend, c->upstream_episode};
+
+    // The lossy CQE is for a successor read, while the current request is fully
+    // buffered.  Its response must wait for the current body send to drain.
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->keep_alive);
+    CHECK_EQ(c->req_body_remaining, 3u);
+
+    loop->dispatch({c->id, 3, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
+    const auto& suffix_send = loop->backend.upstream_send_state[c->id];
+    REQUIRE_EQ(suffix_send.src, c->recv_buf.data());
+    CHECK_EQ(suffix_send.remaining, 3u);
+    CHECK_EQ(__builtin_memcmp(suffix_send.src, "def", 3), 0);
+    CHECK_EQ(c->req_body_remaining, 0u);
+
+    loop->dispatch({c->id, 3, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
+    CHECK_EQ(c->recv_buf.len(), 0u);  // the damaged successor is discarded after completion
+    loop->close_conn(*c);
+    close(downstream[1]);
+    close(upstream[1]);
+}
+
 // State 7: Body chunk recv → send to upstream {up_recv=early_inflight, up_send=body_sent}
 TEST(state_transition, body_recvd_to_body_sent) {
     SmallLoop loop;
