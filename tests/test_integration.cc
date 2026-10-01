@@ -13857,19 +13857,14 @@ TEST(proxy_reuse, idle_return_cancel_failure_keeps_boundary_parked_until_termina
     c.http1_boundary_deferred = false;
     c.http1_boundary_ready = false;
     shard.loop->http1_boundary_ready_pending = false;
+    close(cli[0]);
     close(cli[1]);
     close(upstream[1]);
     c.fd = -1;
-    shard.loop->shutdown();
-    close(lfd);
+    shard.loop->free_conn(c);
 
     // Repeat the failed cancel, but close the downstream before the old recv terminal.
-    Shard<IoUringEventLoop> closed_shard;
-    lfd = create_listen_socket(0).value_or(-1);
-    REQUIRE(lfd >= 0);
-    REQUIRE(closed_shard.init(0, lfd).has_value());
-    closed_shard.active_config = &cfg;
-    Connection* const closed_slot = closed_shard.loop->alloc_conn();
+    Connection* const closed_slot = shard.loop->alloc_conn();
     REQUIRE(closed_slot != nullptr);
     auto& closed = *closed_slot;
     REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
@@ -13879,31 +13874,33 @@ TEST(proxy_reuse, idle_return_cancel_failure_keeps_boundary_parked_until_termina
     closed.upstream_fd = upstream[0];
     closed.upstream_recv_armed = true;
     closed.pending_ops = 1;
-    const u32 closed_tail = __atomic_load_n(closed_shard.loop->backend.sq_tail, __ATOMIC_ACQUIRE);
-    const u32 closed_pending = closed_shard.loop->backend.pending;
-    const i32 closed_ring_fd = closed_shard.loop->backend.ring_fd;
-    const u32 closed_head = __atomic_load_n(closed_shard.loop->backend.sq_head, __ATOMIC_ACQUIRE);
-    closed_shard.loop->backend.ring_fd = -1;
-    __atomic_store_n(closed_shard.loop->backend.sq_tail,
-                     closed_head + closed_shard.loop->backend.sq_ring_entries,
+    const u32 closed_id = closed.id;
+    const u32 closed_tail = __atomic_load_n(shard.loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 closed_pending = shard.loop->backend.pending;
+    const i32 closed_ring_fd = shard.loop->backend.ring_fd;
+    const u32 closed_head = __atomic_load_n(shard.loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    shard.loop->backend.ring_fd = -1;
+    __atomic_store_n(shard.loop->backend.sq_tail,
+                     closed_head + shard.loop->backend.sq_ring_entries,
                      __ATOMIC_RELEASE);
-    closed_shard.loop->return_idle_upstream(closed, 6, 0);
-    closed_shard.loop->backend.ring_fd = closed_ring_fd;
-    __atomic_store_n(closed_shard.loop->backend.sq_tail, closed_tail, __ATOMIC_RELEASE);
-    closed_shard.loop->backend.pending = closed_pending;
-    REQUIRE(closed_shard.loop->defer_http1_request_boundary(closed));
-    const u32 free_before_close = closed_shard.loop->free_top;
-    closed_shard.loop->close_conn_impl(closed);
+    shard.loop->return_idle_upstream(closed, 6, 0);
+    shard.loop->backend.ring_fd = closed_ring_fd;
+    __atomic_store_n(shard.loop->backend.sq_tail, closed_tail, __ATOMIC_RELEASE);
+    shard.loop->backend.pending = closed_pending;
+    REQUIRE(shard.loop->defer_http1_request_boundary(closed));
+    const u32 free_before_close = shard.loop->free_top;
+    shard.loop->close_conn_impl(closed);
     CHECK_FALSE(closed.http1_boundary_deferred);
-    CHECK_FALSE(closed_shard.loop->http1_boundary_ready_pending);
+    CHECK_FALSE(shard.loop->http1_boundary_ready_pending);
     const IoEvent closed_old_recv{
         closed.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, closed.upstream_episode};
-    closed_shard.loop->dispatch(closed_old_recv);
-    CHECK_FALSE(closed_shard.loop->http1_boundary_ready_pending);
-    CHECK_EQ(closed_shard.loop->free_top, free_before_close + 1u);
+    shard.loop->dispatch(closed_old_recv);
+    CHECK_EQ(closed.id, closed_id);  // the terminal was dispatched to the reallocated slot
+    CHECK_FALSE(shard.loop->http1_boundary_ready_pending);
+    CHECK_EQ(shard.loop->free_top, free_before_close + 1u);
     close(cli[1]);
     close(upstream[1]);
-    closed_shard.shutdown();
+    shard.shutdown();
     close(lfd);
 }
 
