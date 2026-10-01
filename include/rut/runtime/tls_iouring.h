@@ -677,6 +677,13 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {  // peer EOF or recv error
+        if (ev.result == -ENOBUFS && !ev.provided_ring_empty && c.state == ConnState::Sending &&
+            c.req_body_lossy_successor && !c.upstream_request_incomplete && c.tls_active &&
+            c.send_armed && c.proxy_resp_started && c.on_send == &on_proxy_response_sent<Self> &&
+            c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
+            tls_discard_abandoned_input<Self>(loop, c);
+            return;
+        }
         // -ENOBUFS: the backend dropped the tail of a CQE that did not fit tls_in_buf,
         // which corrupts the record stream. A streamed request body is refused with
         // 413 instead of a silent close.
