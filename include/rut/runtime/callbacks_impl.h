@@ -2377,7 +2377,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             conn.resp_status = kLen > 0 ? 200 : 500;
             conn.transition_to_sending(&on_response_sent<Loop>);
             if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len()))
-                loop->close_conn(conn);
+                close_conn_if_live(loop, conn);
             return;
         }
     }
@@ -5134,7 +5134,8 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
     conn.keep_alive = false;
     conn.resp_status = 504;
     conn.transition_to_sending(&on_response_sent<Loop>);
-    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len())) loop->close_conn(conn);
+    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len()))
+        close_conn_if_live(loop, conn);
 }
 
 // forward(set_path:) — rewrite the request-line path in recv_buf in place from
