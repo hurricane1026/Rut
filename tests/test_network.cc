@@ -14052,8 +14052,9 @@ TEST(tls_iouring, raw_response_owner_first_loss_discards_late_positive) {
     conn.proxy_resp_started = true;
     static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xCA, 0xFE};
     REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
-    REQUIRE_NE(stage_tls_raw_send_target(loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false),
-               0u);
+    REQUIRE_NE(
+        stage_tls_raw_send_target(loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false),
+        0u);
     conn.tls_active = true;
     conn.tls_pending_on_send = &on_response_sent<IoUringEventLoop>;
     REQUIRE(conn.next_non_upstream_send_generation(conn.tls_send_owner_generation));
