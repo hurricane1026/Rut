@@ -5213,8 +5213,11 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         conn.req_header_end <= conn.recv_buf.len() &&
         conn.req_content_length <= conn.recv_buf.len() - conn.req_header_end) {
         conn.req_body_remaining = 0;
-        conn.request_body_fully_buffered = true;
-        conn.request_upload_complete = true;
+        // The initial upstream send still owns completion. Keep the buffered
+        // current-request bytes available for that send and discard any lossy
+        // successor after its completion; do not publish upload completion yet.
+        conn.request_body_fully_buffered = false;
+        conn.request_upload_complete = false;
         conn.keep_alive = false;
         return;
     }
