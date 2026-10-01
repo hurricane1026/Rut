@@ -6448,6 +6448,7 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     c->req_body_abandoned = true;
     c->state = ConnState::Sending;
     c->send_armed = true;
+    c->recv_armed = true;
     c->on_send = &on_response_sent<IoUringEventLoop>;
     c->pending_ops = 2;
     const u32 response_len = c->send_buf.len();
@@ -6460,7 +6461,19 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     CHECK_EQ(c->send_buf.len(), response_len);
     CHECK_EQ(c->recv_buf.len(), 0u);
     CHECK(c->send_armed);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    const u32 pending_after_cancel = c->pending_ops;
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    CHECK_EQ(c->pending_ops, pending_after_cancel);
+    CHECK_EQ(c->recv_buf.len(), 0u);
     CHECK_EQ(c->state, ConnState::Sending);
+    loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(c->recv_pause_cancel_pending);
+    CHECK_FALSE(c->recv_pause_target_inflight);
+    CHECK_FALSE(c->recv_armed);
+    CHECK_EQ(c->recv_pause_rearm_pending, false);
     loop->dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(response_len)));
     CHECK(c->fd < 0 || c->pending_ops != 0);
     loop->shutdown();
