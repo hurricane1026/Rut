@@ -76029,6 +76029,12 @@ TEST(request_body_overflow, iouring_chunked_initial_send_forwards_terminator_onl
         {c->id, static_cast<i32>(suffix_send.remaining), 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
     CHECK(c->request_upload_complete);
     CHECK_EQ(c->pipeline_stash_len, 0u);
+    CHECK_EQ(c->req_chunk_parser.state, ChunkedParser::State::Complete);
+    CHECK_FALSE(c->upstream_send_armed);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<IoUringEventLoop>);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK_GE(c->fd, 0);
+    CHECK_FALSE(c->keep_alive);
     close(downstream[1]);
     close(upstream[1]);
 }

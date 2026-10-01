@@ -299,7 +299,7 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     // only input CQE has already been consumed.
     if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> && c.tls_in_buf.len() > 0) {
         tls_process<Self>(loop, c);
-        if (c.tls_active && c.req_body_abandoned &&
+        if (c.tls_active && (c.req_body_abandoned || c.req_body_overflow_rejected) &&
             c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
             tls_discard_abandoned_input<Self>(loop, c);
         }
@@ -374,11 +374,11 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         c.tls_pending_on_recv = &tls_resume_pending_handler_recv<Self>;
     if (c.tls_engine.ssl && (!c.tls_engine.handshake_done || c.tls_in_buf.len() > 0)) {
         tls_process<Self>(loop, c);  // continue handshake or drain deferred ciphertext
-        if (c.tls_active && c.req_body_abandoned &&
+        if (c.tls_active && (c.req_body_abandoned || c.req_body_overflow_rejected) &&
             c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
             tls_discard_abandoned_input<Self>(loop, c);
     } else if (!c.recv_armed && loop) {
-        if (c.req_body_abandoned) {
+        if (c.req_body_abandoned || c.req_body_overflow_rejected) {
             tls_discard_abandoned_input<Self>(loop, c);
             return;
         }
@@ -426,7 +426,7 @@ void tls_process(Self* loop, Connection& c) {
     }
 
     if (!c.tls_pending_on_recv) {
-        if (c.req_body_abandoned) {
+        if (c.req_body_abandoned || c.req_body_overflow_rejected) {
             tls_discard_abandoned_input<Self>(loop, c);
             return;
         }
@@ -550,7 +550,7 @@ void tls_process(Self* loop, Connection& c) {
             if (single_shot) {
                 if (c.tls_out_inflight || c.tls_out_buf.len() != 0) return;
                 if (!tls_finish_single_shot_send<Self>(loop, c)) return;
-                if (c.req_body_abandoned) {
+                if (c.req_body_abandoned || c.req_body_overflow_rejected) {
                     tls_discard_abandoned_input<Self>(loop, c);
                 }
                 // Completion callbacks own pipeline_shift / request-boundary
