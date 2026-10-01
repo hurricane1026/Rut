@@ -40465,6 +40465,7 @@ TEST(iouring_downstream_recv, positive_target_then_headroom_pause_keeps_cancel_o
     IoEvent events[2]{};
     REQUIRE_EQ(fixture.wait(events, 2), 2u);
     REQUIRE_EQ(events[0].aux, 0u);
+    REQUIRE_EQ(events[1].aux, kPauseCancelAux);
     loop->dispatch(events[0]);
     CHECK(conn.recv_pause_cancel_pending);
     CHECK_FALSE(conn.recv_pause_target_inflight);
