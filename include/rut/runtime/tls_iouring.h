@@ -653,9 +653,16 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         tls_discard_abandoned_input<Self>(loop, c);
         return;
     }
-    // A prior body overflow already committed the 413 response. Late TLS CQEs
-    // belong to that drain and must not re-enter overflow handling or TLS parsing.
-    if (c.req_body_overflow_rejected) return;
+    // A prior body overflow already committed the 413 response. A recv owned by
+    // the pending TLS send continuation still has to feed that send; unrelated
+    // late upload CQEs remain discarded.
+    if (c.req_body_overflow_rejected) {
+        if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> && ev.result > 0) {
+            tls_process<Self>(loop, c);
+            return;
+        }
+        return;
+    }
     if (ev.result <= 0) {  // peer EOF or recv error
         // -ENOBUFS: the backend dropped the tail of a CQE that did not fit tls_in_buf,
         // which corrupts the record stream. A streamed request body is refused with

@@ -5219,6 +5219,27 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         conn.keep_alive = false;
         return;
     }
+    if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::Chunked &&
+        conn.req_initial_send_len <= conn.recv_buf.len()) {
+        ChunkedParser probe = conn.req_chunk_parser;
+        const u8* suffix = conn.recv_buf.data() + conn.req_initial_send_len;
+        const u32 suffix_len = conn.recv_buf.len() - conn.req_initial_send_len;
+        u32 pos = 0;
+        while (pos < suffix_len && probe.state != ChunkedParser::State::Complete) {
+            u32 consumed = 0, out_start = 0, out_len = 0;
+            const ChunkStatus status =
+                probe.feed(suffix + pos, suffix_len - pos, &consumed, &out_start, &out_len);
+            pos += consumed;
+            if (status == ChunkStatus::Error || (status == ChunkStatus::NeedMore && consumed == 0))
+                break;
+        }
+        if (probe.state == ChunkedParser::State::Complete) {
+            conn.req_chunk_parser = probe;
+            conn.req_body_lossy_successor = true;
+            conn.keep_alive = false;
+            return;
+        }
+    }
     conn.req_body_overflow_rejected = true;
     if (conn.state != ConnState::Proxying || conn.proxy_resp_started ||
         conn.response_read_deadline_state != ResponseReadDeadlineState::None ||
