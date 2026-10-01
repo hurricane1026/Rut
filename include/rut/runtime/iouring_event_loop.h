@@ -300,6 +300,12 @@ public:
     bool response_read_deadline_expiry_pending;
     bool response_read_deadline_body_pump_pending = false;
     MappedArray<u64> body_pump_ready_words;
+    // Downstream recvs that completed -ENOBUFS (provided ring empty): one bit
+    // per slot, re-armed by rearm_deferred_recvs() once buffers are back. The
+    // count keeps the ordinary hot path from touching the bitmap.
+    MappedArray<u64> recv_rearm_words;
+    u32 recv_rearm_count = 0;
+    u32 recv_rearm_cursor = 0;  // word where the next capped pass resumes
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
         CompleteBody,
@@ -402,6 +408,17 @@ public:
             conns.destroy();
             return core::make_unexpected(ready_words.error());
         }
+        auto rearm_words = recv_rearm_words.init((capacity + 63u) / 64u);
+        if (!rearm_words) {
+            body_pump_ready_words.destroy();
+            backend.destroy_send_state_storage();
+            pending_free.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(rearm_words.error());
+        }
+        recv_rearm_count = 0;
+        recv_rearm_cursor = 0;
         // conns[] is mapped but neither constructed nor reset (lazy pages);
         // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
         // the stack so pops ascend.
@@ -424,6 +441,8 @@ public:
         free_top = 0;
         response_read_deadline_body_pump_pending = false;
         body_pump_ready_words.destroy();
+        recv_rearm_words.destroy();
+        recv_rearm_count = 0;
         backend.destroy_send_state_storage();
         pending_free.destroy();
         free_stack.destroy();
@@ -561,6 +580,7 @@ public:
                 break;
             }
             dispatch_batch(events, n);
+            rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
             poll_command();
             // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
@@ -1398,10 +1418,10 @@ private:
             c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None ||
             c.http1_prebuilt_request_prefix_len != 0 || c.http1_boundary_successor_episode != 0 ||
             c.upstream_fd < 0 || c.send_armed || c.yield_armed || c.yield_timeout_armed ||
-            c.recv_paused_for_send || c.recv_pause_cancel_pending || c.recv_pause_rearm_pending ||
-            c.upstream_recv_paused_for_send || c.upstream_recv_pause_cancel_pending ||
-            c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-            c.upstream_recv_terminal_stale)
+            c.recv_paused_for_send || c.recv_pause_cancel_pending || c.recv_pause_target_inflight ||
+            c.recv_pause_rearm_pending || c.upstream_recv_paused_for_send ||
+            c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
+            c.upstream_recv_cancel_inflight || c.upstream_recv_terminal_stale)
             return false;
 
         const auto& downstream_send = backend.send_state[c.id];
@@ -2383,7 +2403,14 @@ public:
                 c.upstream_retirement_cancel_owned == 0 &&
                 c.upstream_retirement_cancel_retry == 0) {
                 c.upstream_retirement_active = false;
-                if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
+                if (c.fd < 0) {
+                    // A closed slot has no successor rendezvous to publish.
+                    // Clear the boundary owner at the exact final retirement
+                    // transition, before any reclamation decision.
+                    c.http1_boundary_deferred = false;
+                    c.http1_boundary_ready = false;
+                    c.http1_boundary_successor_episode = 0;
+                } else if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
                     if (!prebuilt_http1_response_is_complete(c)) {
                         close_conn(c);
                         return true;
@@ -2934,6 +2961,8 @@ public:
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
         timer.remove(&c);
+        // A recv waiting for buffers must not re-arm on a reused slot.
+        clear_deferred_recv(cid);
         // The h2 engine is a pool object, not a kernel buffer — safe to reclaim
         // now even with ops in flight (unlike the recv/send slices below).
         if (c.h2) {
@@ -3029,10 +3058,91 @@ public:
         pending_free[pending_free_count++] = cid;
     }
 
+    void defer_recv_rearm(const Connection& c) {
+        if (c.id >= connection_capacity || recv_rearm_words.data() == nullptr) return;
+        u64& word = recv_rearm_words[c.id >> 6];
+        const u64 bit = u64{1} << (c.id & 63u);
+        if ((word & bit) != 0) return;
+        word |= bit;
+        recv_rearm_count++;
+    }
+
+    void clear_deferred_recv(u32 cid) {
+        if (recv_rearm_count == 0 || cid >= connection_capacity) return;
+        u64& word = recv_rearm_words[cid >> 6];
+        const u64 bit = u64{1} << (cid & 63u);
+        if ((word & bit) == 0) return;
+        word &= ~bit;
+        recv_rearm_count--;
+    }
+
+    // Re-arm downstream recvs that completed with the provided ring empty. Their
+    // request bytes are still in the socket, so nothing was lost, but arming
+    // while the ring is still short of buffers would just complete -ENOBUFS
+    // again. Buffers are returned as wait() harvests, so only CQEs still queued
+    // hold any: re-arm once fewer than half the ring's buffers can be pinned
+    // that way. `force` (timer tick) skips that gate so a saturated CQ cannot
+    // starve a connection indefinitely. At most as many recvs are armed per pass
+    // as buffers can be free (a recv armed beyond that bounces straight back),
+    // and the next pass resumes from recv_rearm_cursor so every parked
+    // connection is reached. A recv that finds no SQE stays pending.
+    void rearm_deferred_recvs(bool force) {
+        if (recv_rearm_count == 0) return;
+        const u32 pinned = backend.cq_unharvested();
+        if (!force && pinned >= kProvidedBufCount / 2) return;
+        u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
+        if (budget == 0 && force) budget = 1;  // the backstop always makes progress
+        const u32 words = (slots_initialized + 63u) >> 6;
+        if (words == 0) return;
+        const u32 start = recv_rearm_cursor < words ? recv_rearm_cursor : 0;
+        for (u32 n = 0; n < words && recv_rearm_count != 0 && budget != 0; ++n) {
+            const u32 w = (start + n) % words;
+            u64 bits = recv_rearm_words[w];
+            u64 retained = 0;
+            while (bits != 0) {
+                if (budget == 0) {
+                    recv_rearm_cursor = w;  // resume inside this word
+                    return;
+                }
+                const u32 cid = (w << 6) + static_cast<u32>(__builtin_ctzll(bits));
+                const u64 bit = u64{1} << (cid & 63u);
+                bits &= ~bit;
+                if (cid >= slots_initialized) {
+                    clear_deferred_recv(cid);
+                    continue;
+                }
+                Connection& c = conns[cid];
+                if (c.fd >= 0) {
+                    const bool was_armed = c.recv_armed;
+                    if (!submit_recv_impl(c)) {
+                        recv_rearm_cursor = w;
+                        return;  // SQ full: retry later
+                    }
+                    if (!was_armed && !c.recv_armed) {
+                        // A pause/cancel rendezvous accepted the request but
+                        // deliberately did not submit a successor yet. Keep
+                        // the bitmap bit until the owner CQE or resume path
+                        // makes the re-arm legal.
+                        retained |= bit;
+                        continue;
+                    }
+                    budget--;
+                }
+                clear_deferred_recv(cid);
+            }
+            recv_rearm_words[w] |= retained;
+            recv_rearm_cursor = (w + 1u) % words;
+        }
+    }
+
     bool submit_recv_impl(Connection& c) {
         const bool tls_send_needs_recv =
             c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>;
         if (c.recv_paused_for_send && !tls_send_needs_recv) {
+            c.recv_pause_rearm_pending = true;
+            return true;
+        }
+        if (c.recv_pause_cancel_pending || c.recv_pause_target_inflight) {
             c.recv_pause_rearm_pending = true;
             return true;
         }
@@ -5739,9 +5849,18 @@ public:
         c.recv_paused_for_send = true;
         if (c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>)
             return true;
-        c.recv_pause_cancel_pending = true;
+        if (c.recv_pause_cancel_pending || c.recv_pause_target_inflight) {
+            c.recv_pause_rearm_pending = true;
+            return true;
+        }
         if (!c.recv_armed) return true;
-        return backend.pause_recv(c.fd, c.id);
+        if (!backend.pause_recv(c.fd, c.id)) return false;
+        c.recv_pause_cancel_pending = true;
+        c.recv_pause_target_inflight = true;
+        // Keep the cancel SQE as an independent lifetime owner. Its CQE may
+        // arrive before or after the target recv terminal.
+        c.pending_ops++;
+        return true;
     }
 
     [[nodiscard]] bool local_body_send_holds_epoch(const Connection& c) const {
@@ -6510,6 +6629,8 @@ public:
                 break;
             case IoEventType::Timeout: {
                 if (accept_rearm_pending) rearm_accept();
+                // Last resort for a recv the batch-end gate kept waiting.
+                rearm_deferred_recvs(/*force=*/true);
                 i32 ticks = ev.result > 0 ? ev.result : 1;
                 const i32 max_ticks = static_cast<i32>(TimerWheel::kSlots);
                 if (ticks > max_ticks) ticks = max_ticks;
@@ -6619,6 +6740,55 @@ public:
                         if (conn.fd < 0 && conn.pending_ops == 0) reclaim_slot(conn.id);
                         break;
                     }
+                    // The provided ring ran empty, so the kernel ended the multishot
+                    // recv before consuming any socket bytes: the request is still
+                    // in the socket and the peer did nothing wrong. Never close;
+                    // account the terminal and re-arm once buffers are back (see
+                    // rearm_deferred_recvs). Paused/boundary connections are
+                    // covered: submit_recv_impl parks the re-arm behind a pause.
+                    if (ev.type == IoEventType::Recv && ev.aux == kPauseCancelAux) {
+                        // This CQE owns only the cancel SQE. The recv target has
+                        // an independent owner and may drain before or after it.
+                        if (conn.pending_ops == 0) {
+                            backend.fatal_error.store(EPROTO, std::memory_order_release);
+                            running_.store(false, std::memory_order_release);
+                            break;
+                        }
+                        conn.pending_ops--;
+                        conn.recv_pause_cancel_pending = false;
+                        if (conn.recv_pause_target_inflight) conn.recv_pause_rearm_pending = true;
+                        if (conn.fd < 0) {
+                            if (conn.pending_ops == 0) reclaim_slot(conn.id);
+                            break;
+                        }
+                        if (conn.recv_pause_rearm_pending && !conn.recv_pause_target_inflight &&
+                            !conn.recv_paused_for_send) {
+                            conn.recv_pause_rearm_pending = false;
+                            if (!submit_recv_impl(conn)) {
+                                close_conn(conn);
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    if (ev.type == IoEventType::Recv && ev.provided_ring_empty &&
+                        ev.result == -ENOBUFS) {
+                        // F_MORE means the multishot recv is still live.
+                        if (ev.more) break;
+                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        conn.recv_armed = false;
+                        if (conn.recv_pause_target_inflight) {
+                            conn.recv_pause_target_inflight = false;
+                            if (conn.recv_pause_cancel_pending)
+                                conn.recv_pause_rearm_pending = true;
+                        }
+                        if (conn.fd < 0) {
+                            if (conn.pending_ops == 0) reclaim_slot(conn.id);
+                            break;
+                        }
+                        defer_recv_rearm(conn);
+                        break;
+                    }
                     // A strict-retirement boundary may coexist with the
                     // long-lived downstream multishot recv. wait() has already
                     // copied positive provided-buffer bytes into recv_buf; keep
@@ -6633,13 +6803,28 @@ public:
                         if (!ev.more) {
                             if (conn.pending_ops > 0) conn.pending_ops--;
                             conn.recv_armed = false;
+                            if (conn.recv_pause_target_inflight)
+                                conn.recv_pause_target_inflight = false;
                         }
                         if (ev.result <= 0) {
+                            // EOF/error terminates the parked boundary. Clear the
+                            // rendezvous before teardown and again after deferred
+                            // free bookkeeping so no late retirement CQE can publish it.
+                            conn.http1_boundary_deferred = false;
+                            conn.http1_boundary_ready = false;
+                            conn.http1_boundary_successor_episode = 0;
                             this->close_conn(conn);
+                            conn.http1_boundary_deferred = false;
+                            conn.http1_boundary_ready = false;
+                            conn.http1_boundary_successor_episode = 0;
                             break;
                         }
-                        if (!ev.more && !this->submit_recv_impl(conn)) {
-                            this->close_conn(conn);
+                        if (!ev.more) {
+                            if (conn.recv_pause_cancel_pending) {
+                                conn.recv_pause_rearm_pending = true;
+                            } else if (!this->submit_recv_impl(conn)) {
+                                this->close_conn(conn);
+                            }
                         }
                         break;
                     }
@@ -6664,17 +6849,26 @@ public:
                     // best-effort liveness/buffer-pressure defence, not a hard
                     // data barrier the residual in-flight CQE could breach.
                     if (ev.type == IoEventType::Recv && ev.result == -ECANCELED &&
-                        conn.recv_pause_cancel_pending) {
-                        const bool needs_recv_rearm = conn.recv_pause_rearm_pending;
-                        conn.recv_pause_rearm_pending = false;
-                        conn.recv_pause_cancel_pending = false;
+                        (conn.recv_pause_cancel_pending || conn.recv_pause_target_inflight ||
+                         conn.recv_pause_rearm_pending)) {
+                        // Both the target recv and its pause cancel own a
+                        // pending operation. Either CQE may arrive first; the
+                        // last owner is the only one allowed to re-arm.
+                        if (conn.recv_pause_target_inflight) {
+                            conn.recv_pause_target_inflight = false;
+                            if (conn.pending_ops > 0) conn.pending_ops--;
+                        }
+                        conn.recv_pause_rearm_pending = true;
                         conn.recv_armed = false;
-                        if (conn.pending_ops > 0) conn.pending_ops--;
-                        if (needs_recv_rearm && !conn.recv_paused_for_send) {
+                        if (!conn.recv_pause_cancel_pending && !conn.recv_pause_target_inflight &&
+                            !conn.recv_paused_for_send && conn.fd >= 0) {
+                            conn.recv_pause_rearm_pending = false;
                             if (!this->submit_recv_impl(conn)) {
                                 this->close_conn(conn);
                                 break;
                             }
+                        } else {
+                            conn.recv_pause_rearm_pending = true;
                         }
                         break;
                     }
@@ -6801,7 +6995,14 @@ public:
                     // Async CQE accounting: decrement pending_ops on final CQE.
                     if (!ev.more) {
                         if (conn.pending_ops > 0) conn.pending_ops--;
-                        if (ev.type == IoEventType::Recv) conn.recv_armed = false;
+                        if (ev.type == IoEventType::Recv) {
+                            conn.recv_armed = false;
+                            if (conn.recv_pause_target_inflight) {
+                                conn.recv_pause_target_inflight = false;
+                                if (conn.recv_pause_cancel_pending)
+                                    conn.recv_pause_rearm_pending = true;
+                            }
+                        }
                         if (ev.type == IoEventType::Send) {
                             conn.send_armed = false;
                             conn.direct_write_completion_pending = false;

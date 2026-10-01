@@ -670,7 +670,7 @@ bool IoUringBackend::add_first_response_recv(i32 fd,
 bool IoUringBackend::pause_recv(i32 fd, u32 conn_id) {
     if (fd < 0 || conn_id >= connection_capacity) return false;
     return cancel_by_user_data(
-        encode_user_data(conn_id, IoEventType::Recv), kCancelConnId, IoEventType::Recv);
+        encode_user_data(conn_id, IoEventType::Recv), conn_id, IoEventType::Recv, kPauseCancelAux);
 }
 
 // Pause the multishot upstream recv by cancelling it by user_data (recv-only — it
@@ -1393,7 +1393,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         const bool downstream_recv_target = type == IoEventType::Recv && aux == 0;
         const bool downstream_recv_close_cancel =
             type == IoEventType::Recv && aux == kDownstreamCloseCancelAux;
-        if (type == IoEventType::Recv && !downstream_recv_target && !downstream_recv_close_cancel) {
+        const bool downstream_recv_pause_cancel =
+            type == IoEventType::Recv && aux == kPauseCancelAux;
+        if (type == IoEventType::Recv && !downstream_recv_target && !downstream_recv_close_cancel &&
+            !downstream_recv_pause_cancel) {
             protocol_failure();
             break;
         }
@@ -1401,6 +1404,11 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // but it never owns a selected buffer or F_MORE.  Only the aux-0 recv
         // target can expose future payload and participate in the barrier.
         if (downstream_recv_close_cancel &&
+            (cqe->flags & (IORING_CQE_F_BUFFER | IORING_CQE_F_MORE)) != 0) {
+            protocol_failure();
+            break;
+        }
+        if (downstream_recv_pause_cancel &&
             (cqe->flags & (IORING_CQE_F_BUFFER | IORING_CQE_F_MORE)) != 0) {
             protocol_failure();
             break;
@@ -2020,10 +2028,16 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         events[count].upstream_episode = upstream_episode;
         events[count].non_upstream_generation =
             (type == IoEventType::Send || type == IoEventType::ResponseReadTimer) ? aux : 0;
-        // Selected-buffer completions were handled above, so an UpstreamRecv
-        // -ENOBUFS here is the kernel reporting an empty provided ring.
+        // Selected-buffer completions were handled above, so a recv -ENOBUFS
+        // here is the kernel reporting an empty provided ring. The downstream
+        // target (aux 0) is flagged too when the multishot ended (no F_MORE):
+        // its request bytes are still in the socket, so the loop must re-arm it
+        // rather than treat it as fatal.
         events[count].provided_ring_empty =
-            type == IoEventType::UpstreamRecv && cqe->res == -ENOBUFS ? 1 : 0;
+            cqe->res == -ENOBUFS &&
+                    (type == IoEventType::UpstreamRecv || (type == IoEventType::Recv && aux == 0))
+                ? 1
+                : 0;
         if (type == IoEventType::UpstreamRecv && conns != nullptr && conn_id < max_conns &&
             conns[conn_id].response_read_deadline_state == ResponseReadDeadlineState::Armed &&
             conns[conn_id].response_read_deadline_owner_generation != 0 &&

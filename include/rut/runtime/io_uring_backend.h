@@ -274,7 +274,7 @@ struct IoUringBackend {
                                  bool separate_body_ring = false);
 
     // Pause downstream recv while a send wait is pending.
-    // Uses a silent cancel CQE so the event loop does not have to special-case it.
+    // The cancel completion is tagged so ownership is retained until it drains.
     bool pause_recv(i32 fd, u32 conn_id);
     // Cancel the multishot upstream recv by user_data (recv-only). The cancel's own
     // completion is tagged kPauseCancelAux so dispatch re-arms only once it drains.
@@ -413,6 +413,17 @@ struct IoUringBackend {
     u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
 
     i32 failure_code() const { return fatal_error.load(std::memory_order_acquire); }
+
+    // Completions the kernel has posted that wait() has not harvested yet. Each
+    // positive recv among them still holds its provided buffer, so this bounds
+    // how many buffers are missing from the ring right now. CQEs parked on the
+    // kernel overflow list also hold buffers and are not counted (only reachable
+    // with more than cq_ring_entries outstanding CQEs).
+    u32 cq_unharvested() const {
+        if (cq_head == nullptr || cq_tail == nullptr) return 0;
+        return __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE) -
+               __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
+    }
 
     // Shutdown and unmap all resources.
     void shutdown();

@@ -1471,6 +1471,9 @@ struct ConnectionBase {
     bool upstream_send_armed;
     bool recv_paused_for_send;
     bool recv_pause_cancel_pending;
+    // Independent ownership for the recv target while its pause cancel drains.
+    // The cancel CQE and the target terminal may arrive in either order.
+    bool recv_pause_target_inflight;
     // True when code asked to recv during a send-wait pause window and the
     // read should be re-armed after the cancel CQE drains.
     bool recv_pause_rearm_pending;
@@ -1887,6 +1890,7 @@ struct ConnectionBase {
         upstream_send_armed = false;
         recv_paused_for_send = false;
         recv_pause_cancel_pending = false;
+        recv_pause_target_inflight = false;
         recv_pause_rearm_pending = false;
         upstream_recv_paused_for_send = false;
         upstream_recv_pause_cancel_pending = false;

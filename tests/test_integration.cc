@@ -6197,19 +6197,27 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     CHECK(conn.recv_armed);
     CHECK(conn.recv_pause_cancel_pending);
     CHECK(!conn.recv_pause_rearm_pending);
-    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.pending_ops, 2u);
+    const u32 pause_sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    // Repeated WebSocket receive CQEs while the first cancel is pending must
+    // coalesce onto the existing cancel owner.
+    CHECK(loop->pause_recv(conn));
+    CHECK(conn.recv_pause_cancel_pending);
+    CHECK_EQ(conn.pending_ops, 2u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), pause_sq_tail);
 
     CHECK(loop->submit_recv(conn));
     CHECK(conn.recv_pause_rearm_pending);
     CHECK(conn.recv_armed);
-    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(conn.pending_ops, 2u);
 
     conn.on_send = &verify_send_pause_cleared;
-    conn.pending_ops = 1;
+    // Model the send that completes while both recv owners remain in flight.
+    conn.pending_ops++;
     conn.send_armed = true;
     g_send_pause_cleared = false;
     loop->dispatch(make_ev(conn.id, IoEventType::Send, 1));
-    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK_EQ(conn.pending_ops, 2u);
     CHECK(!conn.send_armed);
     CHECK(!conn.recv_paused_for_send);
     CHECK(g_send_pause_cleared);
@@ -6218,13 +6226,34 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     CHECK(conn.recv_pause_rearm_pending);
     CHECK(conn.recv_armed);
 
-    conn.pending_ops = 1;
     loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+    CHECK(conn.recv_pause_cancel_pending);
+    CHECK(!conn.recv_armed);
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 1u);  // pause cancel remains after target drains
+    loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
     CHECK(!conn.recv_pause_cancel_pending);
     CHECK(conn.recv_armed);
     CHECK(!conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 1u);
     CHECK(!conn.recv_paused_for_send);
+
+    // The cancel-first ordering must keep the target owner until its own
+    // terminal CQE; that late terminal cannot consume a successor recv.
+    conn.recv_armed = true;
+    conn.recv_pause_cancel_pending = true;
+    conn.recv_pause_target_inflight = true;
+    conn.recv_pause_rearm_pending = true;
+    conn.pending_ops = 2;
+    loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    CHECK_FALSE(conn.recv_pause_cancel_pending);
+    CHECK(conn.recv_pause_target_inflight);
+    CHECK_EQ(conn.pending_ops, 1u);
+    loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+    CHECK_FALSE(conn.recv_pause_target_inflight);
+    CHECK(conn.recv_armed);
+    CHECK_FALSE(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
 
     loop->shutdown();
 }
@@ -13151,6 +13180,164 @@ TEST(proxy_reuse, reused_upstream_response_leaves_send_buf_empty) {
     close(c);
     proxy.teardown();
 }
+
+#ifdef __linux__
+// Connection burst larger than the 2048-entry provided-buffer ring. Every client
+// has its request queued in the socket before the shard starts, so the shard
+// accepts and arms thousands of recvs while wait() harvests only kMaxEventsPerWait
+// CQEs per pass; each already-posted recv CQE keeps its buffer until harvested,
+// and the ring runs dry. The kernel then ends the affected multishot recvs with a
+// terminal -ENOBUFS even though the request is still unread in the socket. That
+// must never reset the client: the recv is re-armed once buffers are back and the
+// request is served. Two keep-alive rounds also prove the re-armed recv is usable.
+TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    constexpr u32 kClients = 3000;  // well past kProvidedBufCount (2048)
+    static_assert(kClients > kProvidedBufCount, "burst must outnumber the provided ring");
+    struct rlimit nofile{};
+    REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &nofile), 0);
+    const rlim_t need = 2 * kClients + 512;
+    if (nofile.rlim_cur < need) {
+        nofile.rlim_cur = nofile.rlim_max < need ? nofile.rlim_max : need;
+        (void)setrlimit(RLIMIT_NOFILE, &nofile);
+        REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &nofile), 0);
+    }
+    if (nofile.rlim_cur < need) SKIP("RLIMIT_NOFILE too low for the burst");
+    // The clients queue in the listen backlog before the shard starts.
+    {
+        i32 somaxconn = 0;
+        FILE* fp = fopen("/proc/sys/net/core/somaxconn", "r");
+        if (fp != nullptr) {
+            if (fscanf(fp, "%d", &somaxconn) != 1) somaxconn = 0;
+            fclose(fp);
+        }
+        if (somaxconn < static_cast<i32>(kClients + 1)) SKIP("net.core.somaxconn too small");
+    }
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_static("/", kRouteMethodGet, 200));
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    auto shard_init = shard.init(0, lfd);
+    if (!shard_init.has_value()) {
+        close(lfd);
+        REQUIRE(shard_init.has_value());
+    }
+    shard.route_config = &cfg;
+    std::vector<i32> clients;
+    clients.reserve(kClients);
+
+    struct BurstCleanup {
+        Shard<IoUringEventLoop>* shard;
+        std::vector<i32>* clients;
+        i32 listener;
+        bool spawned = false;
+        ~BurstCleanup() {
+            for (i32 c : *clients)
+                if (c >= 0) close(c);
+            if (spawned) {
+                shard->stop();
+                shard->join();
+            }
+            shard->shutdown();
+            if (listener >= 0) close(listener);
+        }
+    } cleanup{&shard, nullptr, lfd};
+
+    static constexpr char kReq[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    cleanup.clients = &clients;
+    // The shard is not running, so the backlog (4096) holds every connection and
+    // the kernel queues each request in its socket.
+    for (u32 i = 0; i < kClients; i++) {
+        i32 c = connect_to(port);
+        if (c < 0) break;
+        set_socket_timeouts(c, 10);
+        if (!send_all(c, kReq, sizeof(kReq) - 1)) {
+            close(c);
+            break;
+        }
+        clients.push_back(c);
+    }
+    REQUIRE_EQ(clients.size(), static_cast<size_t>(kClients));
+    REQUIRE(shard.spawn(-1).has_value());
+    cleanup.spawned = true;
+
+    const u64 burst_deadline_us = monotonic_us() + 120000000;
+    u32 served = 0;
+    u32 failed = 0;
+    for (u32 round = 0; round < 2; round++) {
+        if (round == 1) {
+            for (i32 c : clients)
+                if (!send_all(c, kReq, sizeof(kReq) - 1)) failed++;
+        }
+        std::vector<pollfd> pollfds(kClients);
+        std::vector<std::string> responses(kClients);
+        std::vector<bool> complete(kClients, false);
+        u32 remaining = kClients;
+        for (u32 i = 0; i < kClients; i++) {
+            const int flags = fcntl(clients[i], F_GETFL, 0);
+            if (flags < 0) {
+                complete[i] = true;
+                remaining--;
+                failed++;
+                continue;
+            }
+            if (fcntl(clients[i], F_SETFL, flags | O_NONBLOCK) < 0) {
+                complete[i] = true;
+                remaining--;
+                failed++;
+                continue;
+            }
+            pollfds[i] = {clients[i], POLLIN | POLLERR | POLLHUP, 0};
+        }
+        while (remaining != 0 && monotonic_us() < burst_deadline_us) {
+            const i32 ready = poll(pollfds.data(), pollfds.size(), 100);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) break;
+            for (u32 i = 0; i < kClients; i++) {
+                if (complete[i] || (pollfds[i].revents & (POLLIN | POLLERR | POLLHUP)) == 0)
+                    continue;
+                char buf[512];
+                for (;;) {
+                    const i32 n = recv(clients[i], buf, sizeof(buf), MSG_DONTWAIT);
+                    if (n > 0) {
+                        responses[i].append(buf, static_cast<size_t>(n));
+                        const size_t end = responses[i].find("\r\n\r\n");
+                        if (end != std::string::npos) {
+                            const size_t header_len = end + 4;
+                            const size_t marker =
+                                responses[i].substr(0, header_len).find("Content-Length:");
+                            const u32 expected =
+                                marker == std::string::npos
+                                    ? 0
+                                    : static_cast<u32>(
+                                          strtoul(responses[i].c_str() + marker + 15, nullptr, 10));
+                            const bool status_ok = responses[i].compare(0, 12, "HTTP/1.1 200") == 0;
+                            if (status_ok && responses[i].size() >= header_len + expected) {
+                                complete[i] = true;
+                                remaining--;
+                                served++;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                    complete[i] = true;
+                    remaining--;
+                    failed++;
+                    break;
+                }
+            }
+        }
+        failed += remaining;
+    }
+    CHECK_EQ(failed, 0u);
+    CHECK_EQ(served, 2 * kClients);
+}
+#endif
 
 // io_uring variant of the reuse e2e (Shard wires the pool for both backends). Unlike
 // epoll's synchronous detach, io_uring defers the pool-return until the cancelled
