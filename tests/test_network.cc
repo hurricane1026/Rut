@@ -71331,9 +71331,8 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
         close(peer);
     }
 
-    // An ENOBUFS/error carrying F_MORE is still a live target: close submits
-    // cancellation rather than inventing a terminal decrement, and clears the
-    // boundary marker immediately.
+    // A lossy ENOBUFS/error carrying F_MORE fails closed.  It submits
+    // cancellation for the still-live target and clears the boundary marker.
     {
         ScopedIoUringLoopForRetirement guard;
         if (!guard.init()) SKIP("io_uring unavailable");
@@ -71358,29 +71357,17 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
         const u32 pending_before = conn->pending_ops;
         loop->dispatch(error);
         Connection& parked = loop->conns[id];
-        // F_MORE means the multishot target is still live. Ring exhaustion is
-        // recoverable and must leave the parked boundary and its target owner
-        // intact; an actual terminal is required to close the connection.
-        CHECK_GE(parked.fd, 0);
-        CHECK(parked.http1_boundary_deferred);
+        CHECK_EQ(parked.fd, -1);
+        CHECK_FALSE(parked.http1_boundary_deferred);
         CHECK_FALSE(parked.http1_boundary_ready);
-        CHECK(parked.recv_armed);
         CHECK_EQ(parked.handler_gen, 0u);
-        CHECK_EQ(parked.pending_ops, pending_before);
-        IoEvent terminal{};
-        REQUIRE(harvest_http1_boundary_recv(loop, parked, nullptr, 0, 0, false, &terminal));
-        loop->dispatch(terminal);
-        Connection& closed = loop->conns[id];
-        CHECK_EQ(closed.fd, -1);
-        CHECK_FALSE(closed.http1_boundary_deferred);
-        CHECK_FALSE(closed.http1_boundary_ready);
-        CHECK_EQ(closed.handler_gen, 0u);
+        CHECK_EQ(parked.pending_ops, pending_before + 1);
         constexpr u32 kOld = 101;
         loop->dispatch({id, -ECANCELED, 0, 0, IoEventType::UpstreamRecv, 0, 0, kOld});
         loop->dispatch(
             {id, -ENOENT, 0, 0, IoEventType::UpstreamRecv, 0, kUpstreamRetirementCancelAux, kOld});
         loop->resume_deferred_http1_boundaries();
-        CHECK_EQ(closed.handler_gen, 0u);
+        CHECK_EQ(parked.handler_gen, 0u);
         close(peer);
     }
 
