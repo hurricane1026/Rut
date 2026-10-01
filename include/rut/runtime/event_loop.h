@@ -203,7 +203,8 @@ public:
                 // io_uring: a request-body CQE overflowed recv_buf, so its uncopied
                 // tail is gone. Answer 413 (and let that response drain) instead of
                 // a silent close.
-                if (ev.result == -ENOBUFS && conn.request_body_incomplete()) {
+                if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+                    conn.request_body_incomplete()) {
                     respond_request_body_overflow(&self(), conn);
                     return;
                 }

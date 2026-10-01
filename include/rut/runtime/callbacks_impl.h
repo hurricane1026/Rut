@@ -5166,12 +5166,35 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
 // before any response byte); anything else keeps the plain close.
 template <typename Loop>
 void respond_request_body_overflow(Loop* loop, Connection& conn) {
+    bool complete_early_response = false;
+    if (conn.upstream_recv_buf.len() > 0) {
+        HttpResponseParser parser;
+        ParsedResponse response;
+        parser.reset();
+        response.reset();
+        complete_early_response =
+            parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &response) ==
+            ParseStatus::Complete;
+    }
     if (conn.state == ConnState::Proxying && !conn.proxy_resp_started && !conn.upstream_abandoned &&
-        (conn.upstream_recv_buf.len() > 0 ||
+        (complete_early_response ||
          conn.on_upstream_send == &on_body_send_with_early_response<Loop>)) {
         // The upstream send completion (on_request_body_sent / on_upstream_request_sent /
         // on_body_send_with_early_response) picks the buffered response up and marks
         // the upload abandoned. Nothing more to forward, nothing to reject.
+        return;
+    }
+    // The body counters are advanced only when the in-flight send completes. If
+    // the copied prefix already contains this request's complete Content-Length,
+    // preserve that request and close after its response; only the pipelined
+    // successor was lost in the overflowing CQE.
+    if (conn.req_body_mode == BodyMode::ContentLength &&
+        conn.req_header_end <= conn.recv_buf.len() &&
+        conn.req_content_length <= conn.recv_buf.len() - conn.req_header_end) {
+        conn.req_body_remaining = 0;
+        conn.request_body_fully_buffered = true;
+        conn.request_upload_complete = true;
+        conn.keep_alive = false;
         return;
     }
     conn.req_body_overflow_rejected = true;
@@ -5194,7 +5217,8 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     conn.keep_alive = false;
     conn.resp_status = 413;
     conn.transition_to_sending(&on_response_sent<Loop>);
-    loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len());
+    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len()) && conn.fd >= 0)
+        loop->close_conn(conn);
 }
 
 // forward(set_path:) — rewrite the request-line path in recv_buf in place from
@@ -9336,7 +9360,8 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         // io_uring: the CQE did not fit in recv_buf and its tail was dropped.
         if constexpr (loop_backend_async_io<Loop>() &&
                       requires(Loop* l, Connection& c) { l->pause_recv(c); }) {
-            if (ev.result == -ENOBUFS && conn.request_body_incomplete()) {
+            if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+                conn.request_body_incomplete()) {
                 respond_request_body_overflow<Loop>(loop, conn);
                 return;
             }

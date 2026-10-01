@@ -454,6 +454,14 @@ struct IoUringBackend {
     u32 upstream_once_max_len() const {
         return large_buf_ring != nullptr ? kLargeProvidedBufSize : kProvidedBufSize;
     }
+    // Number of CQEs currently holding provided buffers until wait() harvests
+    // them. Deferred downstream re-arms use this to avoid an ENOBUFS loop while
+    // the ring is still short of reusable buffers.
+    u32 cq_unharvested() const {
+        if (cq_head == nullptr || cq_tail == nullptr) return 0;
+        return __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE) -
+               __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
+    }
 
 #ifdef RUT_TESTING
 public:
