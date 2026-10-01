@@ -564,7 +564,8 @@ void tls_process(Self* loop, Connection& c) {
         } else if (!pending_recv) {
             pending_recv = &on_header_received<Self>;
         }
-        if (c.req_body_abandoned && pending_recv != &tls_resume_pending_send_recv<Self>) {
+        if ((c.req_body_abandoned || c.req_body_overflow_rejected) &&
+            pending_recv != &tls_resume_pending_send_recv<Self>) {
             // Early-response ownership has no request parser.  Discard any
             // plaintext decrypted before the parked send continuation changed
             // state, then leave the response drain in charge of the connection.
