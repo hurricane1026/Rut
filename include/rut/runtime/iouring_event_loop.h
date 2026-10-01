@@ -5972,10 +5972,10 @@ public:
         // (e.g., buffer-ring edge case) and would otherwise leave no
         // in-flight recv to surface a silent client FIN.
         this->submit_recv(conn);
-        // submit_recv silently no-ops under SQ pressure (add_recv fails
-        // with no retry). If recv still isn't armed, we'd sleep without
-        // a disconnect detector — fail the request instead of leaking
-        // the slot until the yield deadline expires.
+        // add_recv flushes and retries on a full SQ, so a miss here means the
+        // flush itself failed (the backend is then stopping). If recv still isn't armed, we'd sleep
+        // without a disconnect detector — fail the request instead of leaking the slot until the
+        // yield deadline expires.
         if (!conn.recv_armed) return false;
         // NOTE: we deliberately do NOT cancel the multishot recv here.
         // A cancel SQE would make the canceled target's -ECANCELED CQE

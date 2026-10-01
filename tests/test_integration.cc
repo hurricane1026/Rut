@@ -24,6 +24,7 @@
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/iouring_event_loop.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/tls.h"
@@ -5176,6 +5177,232 @@ TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
     CHECK_EQ(failure, 0);
     CHECK_EQ(eofs, kPeers);
     CHECK_FALSE(out_of_range_seen);
+}
+
+// Skip only when the host cannot give us a ring (memlock budget, no io_uring, no
+// permission). Any other init failure, such as EINVAL from a bad ring size, is a bug
+// and must fail instead of turning the suite into silent skips.
+#define INIT_URING_OR_SKIP(backend, listen_fd, capacity)                                \
+    do {                                                                                \
+        auto init_result_ = (backend).init(0, (listen_fd), (capacity));                 \
+        if (!init_result_) {                                                            \
+            const i32 init_errno_ = init_result_.error().code;                          \
+            if (init_errno_ == ENOMEM || init_errno_ == ENOSYS || init_errno_ == EPERM) \
+                SKIP("io_uring unavailable");                                           \
+            CHECK_EQ(init_errno_, 0);                                                   \
+            return;                                                                     \
+        }                                                                               \
+    } while (0)
+
+// Queue real recvs until the SQ has no free slot. Each add only flushes when it finds
+// the ring full, so this stops at the first full ring with every entry still pending.
+static void fill_sq_with_recvs(IoUringBackend& backend, i32 fd) {
+    u32 guard = 0;
+    while (backend.sq_has_room() && guard++ < 4u * backend.sq_ring_entries)
+        (void)backend.add_recv(fd, 1);
+}
+
+// Pump wait() until `pred` sees the event it wants or the attempt cap is reached (the
+// 1s periodic timerfd wakes wait(), so a missing event fails the caller cleanly).
+template <typename Pred>
+static bool wait_for_event(IoUringBackend& backend, Pred&& pred, u32 attempts = 4) {
+    IoEvent events[kMaxEventsPerWait]{};
+    for (u32 a = 0; a < attempts; ++a) {
+        const u32 n = backend.wait(events, kMaxEventsPerWait, nullptr, 0);
+        for (u32 i = 0; i < n; ++i)
+            if (pred(events[i])) return true;
+    }
+    return false;
+}
+
+// The rings are sized from the connection capacity, not fixed. The default
+// capacity's 32768-entry CQ is larger than the kernel default for its SQ (2 x 1024),
+// so seeing it proves IORING_SETUP_CQSIZE reached io_uring_setup.
+TEST(uring, ring_sizes_follow_connection_capacity) {
+    static constexpr u32 kCapacities[] = {1, 1024, 4096, kDefaultConnectionCapacity};
+    for (const u32 capacity : kCapacities) {
+        const IoUringRingSizes expected = io_uring_ring_sizes(capacity);
+        IoUringBackend backend;
+        INIT_URING_OR_SKIP(backend, -1, capacity);
+        CHECK_EQ(backend.sq_ring_entries, expected.sq_entries);
+        CHECK_EQ(backend.cq_ring_entries, expected.cq_entries);
+        CHECK_EQ(*backend.cq_ring_mask, expected.cq_entries - 1u);
+        backend.shutdown();
+    }
+    CHECK_EQ(io_uring_ring_sizes(kDefaultConnectionCapacity).cq_entries, 32768u);
+}
+
+// Submitters used to give up on a full SQ (they returned false, and most callers
+// ignore it), so a burst larger than the ring left connections with nothing armed until
+// the keep-alive timeout. They now flush the queued SQEs and retry, so a run of
+// submissions longer than the ring all succeed.
+TEST(uring, full_sq_recv_submission_flushes_and_retries) {
+    IoUringBackend backend;
+    INIT_URING_OR_SKIP(backend, -1, 4);
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    const u32 n = backend.sq_ring_entries + 64;
+    u32 ok = 0;
+    for (u32 i = 0; i < n; ++i)
+        if (backend.add_recv(fds[0], i % 4)) ++ok;
+    CHECK_EQ(ok, n);
+    CHECK_EQ(backend.failure_code(), 0);
+    CHECK_LE(backend.pending, backend.sq_ring_entries);
+    close(fds[0]);
+    close(fds[1]);
+    backend.shutdown();
+}
+
+TEST(uring, full_sq_accept_submission_flushes_and_retries) {
+    const i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    IoUringBackend backend;
+    {
+        auto init_result = backend.init(0, listener, 4);
+        if (!init_result) {
+            close(listener);
+            const i32 err = init_result.error().code;
+            if (err == ENOMEM || err == ENOSYS || err == EPERM) SKIP("io_uring unavailable");
+            CHECK_EQ(err, 0);
+            return;
+        }
+    }
+    const u32 n = backend.sq_ring_entries + 64;
+    u32 ok = 0;
+    for (u32 i = 0; i < n; ++i)
+        if (backend.add_accept()) ++ok;
+    CHECK_EQ(ok, n);
+    CHECK_EQ(backend.failure_code(), 0);
+    backend.shutdown();
+    close(listener);
+}
+
+// A send submitted while the SQ is full used to return false without arming: the
+// caller (client_send has about forty, most ignoring the result) then neither re-armed
+// recv nor completed, and the client got nothing until the keep-alive timeout. The send
+// must flush, arm and complete.
+TEST(uring, full_sq_send_submission_flushes_arms_and_completes) {
+    IoUringBackend backend;
+    INIT_URING_OR_SKIP(backend, -1, 4);
+    i32 fds[2];
+    i32 filler[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, filler), 0);
+    fill_sq_with_recvs(backend, filler[0]);
+    REQUIRE(!backend.sq_has_room());
+    static const u8 byte = 'x';
+    CHECK(backend.add_send(fds[0], 0, &byte, 1, 1));
+    CHECK_EQ(backend.send_state[0].remaining, 1u);
+    CHECK_EQ(backend.failure_code(), 0);
+    CHECK(wait_for_event(backend, [](const IoEvent& ev) {
+        return ev.type == IoEventType::Send && ev.conn_id == 0 && ev.result == 1;
+    }));
+    char got = 0;
+    CHECK_EQ(recv(fds[1], &got, 1, MSG_DONTWAIT), 1);
+    close(fds[0]);
+    close(fds[1]);
+    close(filler[0]);
+    close(filler[1]);
+    backend.shutdown();
+}
+
+TEST(uring, full_sq_upstream_send_and_recv_flush_and_arm) {
+    IoUringBackend backend;
+    INIT_URING_OR_SKIP(backend, -1, 4);
+    i32 fds[2];
+    i32 filler[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, filler), 0);
+    static const u8 byte = 'u';
+    fill_sq_with_recvs(backend, filler[0]);
+    REQUIRE(!backend.sq_has_room());
+    CHECK(backend.add_send_upstream(fds[0], 0, &byte, 1, 1));
+    fill_sq_with_recvs(backend, filler[0]);
+    REQUIRE(!backend.sq_has_room());
+    CHECK(backend.add_recv_upstream(fds[1], 0, 1));
+    fill_sq_with_recvs(backend, filler[0]);
+    REQUIRE(!backend.sq_has_room());
+    CHECK(backend.add_recv_upstream_once(fds[1], 0, 1, 1));
+    fill_sq_with_recvs(backend, filler[0]);
+    REQUIRE(!backend.sq_has_room());
+    static u8 direct_dst[16];
+    CHECK(backend.add_recv_upstream_direct(fds[1], 0, 1, direct_dst, sizeof(direct_dst)));
+    fill_sq_with_recvs(backend, filler[0]);
+    REQUIRE(!backend.sq_has_room());
+    CHECK(backend.add_first_response_recv(fds[1], 0, 1, false));
+    CHECK_EQ(backend.failure_code(), 0);
+    close(fds[0]);
+    close(fds[1]);
+    close(filler[0]);
+    close(filler[1]);
+    backend.shutdown();
+}
+
+TEST(uring, full_sq_connect_flushes_and_completes) {
+    const i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    IoUringBackend backend;
+    {
+        auto init_result = backend.init(0, -1, 4);
+        if (!init_result) {
+            close(listener);
+            const i32 err = init_result.error().code;
+            if (err == ENOMEM || err == ENOSYS || err == EPERM) SKIP("io_uring unavailable");
+            CHECK_EQ(err, 0);
+            return;
+        }
+    }
+    i32 filler[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, filler), 0);
+    const i32 sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    REQUIRE(sock >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(get_port(listener));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    fill_sq_with_recvs(backend, filler[0]);
+    REQUIRE(!backend.sq_has_room());
+    CHECK(backend.add_connect(sock, 0, &addr, sizeof(addr), 1));
+    CHECK(wait_for_event(backend, [](const IoEvent& ev) {
+        return ev.type == IoEventType::UpstreamConnect && ev.conn_id == 0 && ev.result == 0;
+    }));
+    close(sock);
+    close(listener);
+    close(filler[0]);
+    close(filler[1]);
+    backend.shutdown();
+}
+
+// cancel_accept used to drop the cancel on a full SQ and then the caller closed the
+// listener with the multishot accept still armed.
+TEST(uring, full_sq_cancel_accept_flushes_and_cancels) {
+    const i32 listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    IoUringBackend backend;
+    {
+        auto init_result = backend.init(0, listener, 4);
+        if (!init_result) {
+            close(listener);
+            const i32 err = init_result.error().code;
+            if (err == ENOMEM || err == ENOSYS || err == EPERM) SKIP("io_uring unavailable");
+            CHECK_EQ(err, 0);
+            return;
+        }
+    }
+    i32 filler[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, filler), 0);
+    REQUIRE(backend.add_accept());
+    CHECK(backend.flush_pending_nonblocking());
+    fill_sq_with_recvs(backend, filler[0]);
+    REQUIRE(!backend.sq_has_room());
+    backend.cancel_accept();
+    // The cancelled multishot accept ends with a terminal Accept CQE (no F_MORE).
+    CHECK(wait_for_event(
+        backend, [](const IoEvent& ev) { return ev.type == IoEventType::Accept && ev.more == 0; }));
+    close(listener);
+    close(filler[0]);
+    close(filler[1]);
+    backend.shutdown();
 }
 
 // Shrink both ends' socket buffers and write directly until EAGAIN, so a

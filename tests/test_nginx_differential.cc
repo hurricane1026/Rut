@@ -8,7 +8,9 @@
 #include "rut/nginx/converter.h"
 #include "rut/nginx/parser.h"
 #include "rut/runtime/compile_to_config.h"
+#include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/io_uring_memlock.h"
 #include "rut/serve_loader.h"
 #include "rut_iouring_gate.h"
 #include <algorithm>
@@ -26032,6 +26034,11 @@ struct RutIoUringGateMapping {
         gate->magic = RUT_IOURING_GATE_MAGIC;
         gate->version = RUT_IOURING_GATE_VERSION;
         gate->layout_size = sizeof(*gate);
+        // The server runs with the default capacity; follow the sizes it derives from it.
+        gate->expected_sq_entries =
+            rut::io_uring_ring_sizes(rut::kDefaultConnectionCapacity).sq_entries;
+        gate->expected_cq_entries =
+            rut::io_uring_ring_sizes(rut::kDefaultConnectionCapacity).cq_entries;
         gate->ring_fd = -1;
         gate->intercepted_fd = -1;
         rut_downstream_gate_store(&gate->state, RUT_DOWNSTREAM_GATE_DISARMED);
