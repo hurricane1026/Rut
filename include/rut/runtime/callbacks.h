@@ -175,13 +175,19 @@ inline bool preserved_response_late_recv_owner(const Connection& conn) {
 // Strictly prove the current HTTP/1 request boundary before admitting a
 // lossy successor while the initial upstream connect owns the request.
 bool ordinary_local_response_request_boundary_reusable(const Connection& conn);
+inline bool request_fully_resendable(const Connection& conn);
 
 template <typename Loop>
 inline bool initial_connect_request_owner(const Connection& conn) {
+    const bool request_owner = conn.retry_req_send_len == 0
+                                   ? ordinary_local_response_request_boundary_reusable(conn)
+                                   : request_fully_resendable(conn) &&
+                                         conn.send_buf.data() != nullptr &&
+                                         conn.retry_req_send_len <= conn.send_buf.len();
     return conn.state == ConnState::Proxying && conn.upstream_connect_armed &&
            conn.upstream_fd >= 0 && !conn.upstream_abandoned && !conn.proxy_resp_started &&
            conn.on_upstream_send == &on_upstream_connected<Loop> && !conn.req_wants_upgrade &&
-           ordinary_local_response_request_boundary_reusable(conn);
+           request_owner;
 }
 
 template <typename Loop>

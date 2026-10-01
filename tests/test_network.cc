@@ -32841,6 +32841,50 @@ TEST(local_response_persistence, exact_request_boundary_matrix) {
     CHECK(ordinary_local_response_request_boundary_reusable(*conn));
 }
 
+TEST(upstream_reuse, retry_connect_owner_uses_snapshot_over_successor) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->state = ConnState::Proxying;
+    conn->upstream_connect_armed = true;
+    conn->upstream_fd = dup(2);
+    REQUIRE(conn->upstream_fd >= 0);
+    conn->on_upstream_send = &on_upstream_connected<SmallLoop>;
+    static constexpr char kRequest[] = "GET /retry HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 request_len = sizeof(kRequest) - 1;
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), request_len),
+               request_len);
+    capture_request_metadata(*conn);
+    REQUIRE(conn->req_initial_send_len == request_len);
+    REQUIRE_EQ(conn->send_buf.write(reinterpret_cast<const u8*>(kRequest), request_len),
+               request_len);
+    conn->retry_req_send_len = request_len;
+    conn->retry_req_snapshot_replayable = true;
+    conn->recv_buf.reset();
+    static constexpr char kSuccessor[] = "GET /successor HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(
+        conn->recv_buf.write(reinterpret_cast<const u8*>(kSuccessor), sizeof(kSuccessor) - 1),
+        sizeof(kSuccessor) - 1);
+
+    REQUIRE(request_fully_resendable(*conn));
+    REQUIRE(initial_connect_request_owner<SmallLoop>(*conn));
+    respond_request_body_overflow(&loop, *conn);
+    CHECK(conn->req_body_lossy_successor);
+    CHECK_EQ(conn->retry_req_send_len, request_len);
+    CHECK_EQ(conn->send_buf.len(), request_len);
+    CHECK(__builtin_memcmp(conn->send_buf.data(), kRequest, request_len) == 0);
+
+    conn->req_body_lossy_successor = false;
+    conn->retry_req_snapshot_replayable = false;
+    CHECK_FALSE(initial_connect_request_owner<SmallLoop>(*conn));
+    conn->retry_req_snapshot_replayable = true;
+    conn->retry_req_send_len = conn->send_buf.len() + 1;
+    CHECK_FALSE(initial_connect_request_owner<SmallLoop>(*conn));
+    if (conn->upstream_fd >= 0) close(conn->upstream_fd);
+}
+
 TEST(local_response_persistence, ordinary_jit_connection_close_owns_send_until_terminal) {
     for (const bool recv_stays_live : {false, true}) {
         AsyncSmallLoop loop;
