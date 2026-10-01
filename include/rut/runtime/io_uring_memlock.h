@@ -34,6 +34,16 @@ static_assert((kIoUringSqEntries & (kIoUringSqEntries - 1)) == 0,
               "io_uring SQ entries must be a power of two (the kernel rounds up)");
 
 namespace iouring_memlock_detail {
+constexpr u64 saturating_add(u64 a, u64 b) {
+    const u64 max = ~u64(0);
+    return b > max - a ? max : a + b;
+}
+
+constexpr u64 saturating_mul(u64 a, u64 b) {
+    const u64 max = ~u64(0);
+    return a != 0 && b > max / a ? max : a * b;
+}
+
 // Bytes before the CQE array in the shared ring mapping: params.cq_off.cqes as
 // reported by the kernel (sizeof(struct io_rings) on x86-64, 64-byte cache lines:
 // head/tail/mask/flags/overflow, each cache-line separated). Architectures with
@@ -63,16 +73,48 @@ constexpr u64 io_uring_pbuf_ring_locked_bytes(u32 entries, u64 page_bytes) {
     return iouring_memlock_detail::round_up_page(static_cast<u64>(entries) * 16, page_bytes);
 }
 
-// Total per-shard charge: the ring plus both provided-buffer rings.
+// Per-shard charge a shard cannot start without: the ring plus the primary
+// provided-buffer ring (IoUringBackend::init fails on either). The large
+// provided-buffer ring is optional -- setup_extra_buf_ring leaves it absent
+// when registration fails and recvs fall back to the primary ring -- so it is
+// excluded here and only counted by io_uring_shard_locked_bytes.
+// Measured reference (Linux 7.2.7, 4 KiB pages): SQ 16384 / CQ 32768 with 2048
+// provided-buffer entries = 1636 KiB (1604 + 32).
+constexpr u64 io_uring_shard_required_locked_bytes(u32 sq_entries,
+                                                   u32 cq_entries,
+                                                   u32 pbuf_entries,
+                                                   u64 page_bytes) {
+    return io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes) +
+           io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes);
+}
+
+// Total per-shard charge with every ring registered: the required charge plus
+// the optional large provided-buffer ring. This is what a limit should cover
+// so no ring is silently skipped.
 // Measured reference (Linux 7.2.7, 4 KiB pages): SQ 16384 / CQ 32768 with
 // 2048 + 1024 provided-buffer entries = 1652 KiB (1604 + 32 + 16). If the ring
 // constants change and this drifts from the kernel's accounting, the tests
 // will say so.
 constexpr u64 io_uring_shard_locked_bytes(
     u32 sq_entries, u32 cq_entries, u32 pbuf_entries, u32 large_pbuf_entries, u64 page_bytes) {
-    return io_uring_ring_locked_bytes(sq_entries, cq_entries, page_bytes) +
-           io_uring_pbuf_ring_locked_bytes(pbuf_entries, page_bytes) +
+    return io_uring_shard_required_locked_bytes(sq_entries, cq_entries, pbuf_entries, page_bytes) +
            io_uring_pbuf_ring_locked_bytes(large_pbuf_entries, page_bytes);
+}
+
+// Minimum locked memory for sequential startup of all shards. Every shard
+// needs its required rings, while each successful shard before the last can
+// also retain its optional large ring before the final required allocation.
+// Calculated in bytes so page-rounded charges are not mixed with KiB values;
+// saturating arithmetic keeps diagnostics valid if sizing inputs grow beyond
+// the u64 range.
+constexpr u64 io_uring_startup_min_locked_bytes(u32 shard_count,
+                                                u64 required_per_shard,
+                                                u64 optional_per_shard) {
+    using namespace iouring_memlock_detail;
+    const u64 required = saturating_mul(required_per_shard, shard_count);
+    const u64 earlier_optional =
+        saturating_mul(optional_per_shard, shard_count == 0 ? 0 : shard_count - 1);
+    return saturating_add(required, earlier_optional);
 }
 
 }  // namespace rut
