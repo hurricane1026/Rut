@@ -150,9 +150,15 @@ inline bool completed_request_waiting_response_owner(const Connection& conn) {
 
 template <typename Loop>
 inline bool preserved_response_drain_owner(const Connection& conn) {
+    const bool response_owner = conn.on_send == &on_proxy_response_sent<Loop> ||
+                                conn.on_send == &on_response_sent<Loop> ||
+                                conn.on_send == &on_response_header_sent<Loop> ||
+                                conn.on_send == &on_response_body_sent<Loop> ||
+                                conn.on_send == &on_complete_response_sent<Loop>;
     return conn.state == ConnState::Sending && conn.req_body_lossy_successor &&
-           !conn.upstream_request_incomplete && !conn.upstream_abandoned && !conn.tls_active &&
-           conn.on_send == &on_proxy_response_sent<Loop>;
+           !conn.upstream_request_incomplete && conn.proxy_resp_started && conn.send_armed &&
+           response_owner &&
+           (!conn.recv_buf.data() || conn.send_buf.data() != conn.recv_buf.data());
 }
 
 // Strictly prove the current HTTP/1 request boundary before admitting a

@@ -679,7 +679,8 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
     if (ev.result <= 0) {  // peer EOF or recv error
         if (ev.result == -ENOBUFS && !ev.provided_ring_empty && c.state == ConnState::Sending &&
             c.req_body_lossy_successor && !c.upstream_request_incomplete && c.tls_active &&
-            c.send_armed && c.proxy_resp_started && c.on_send == &on_proxy_response_sent<Self> &&
+            c.send_armed && c.proxy_resp_started && c.tls_out_inflight &&
+            c.tls_send_owner_generation != 0 &&
             c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
             tls_discard_abandoned_input<Self>(loop, c);
             return;
