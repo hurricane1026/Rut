@@ -5249,6 +5249,19 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
             return;
         }
     }
+    // The initial send may have completed in an earlier CQE in this batch. A
+    // later lossy recv then belongs solely to a pipelined successor while the
+    // complete current request is already owned by the upstream response
+    // callback. Preserve that response and close after it drains.
+    if (conn.state == ConnState::Proxying && conn.request_upload_complete &&
+        !conn.upstream_request_incomplete && !conn.upstream_abandoned &&
+        conn.on_upstream_recv != nullptr && conn.on_upstream_send == nullptr) {
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        conn.pipeline_stash_len = 0;
+        if (conn.retry_req_send_len == 0) conn.send_buf.reset();
+        return;
+    }
     conn.req_body_overflow_rejected = true;
     if (conn.state != ConnState::Proxying || conn.proxy_resp_started ||
         conn.response_read_deadline_state != ResponseReadDeadlineState::None ||
