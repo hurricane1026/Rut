@@ -136,6 +136,19 @@ inline bool final_request_body_send_inflight(const Connection& conn) {
 }
 
 template <typename Loop>
+inline bool completed_request_waiting_response_owner(const Connection& conn) {
+    const bool framing_complete =
+        conn.req_body_mode == BodyMode::None ||
+        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state == ChunkedParser::State::Complete);
+    return conn.state == ConnState::Proxying && conn.request_upload_complete &&
+           !conn.upstream_request_incomplete && !conn.upstream_abandoned && conn.upstream_fd >= 0 &&
+           !conn.proxy_resp_started && conn.on_upstream_send == nullptr &&
+           conn.on_upstream_recv == &on_upstream_response<Loop> && framing_complete;
+}
+
+template <typename Loop>
 void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
