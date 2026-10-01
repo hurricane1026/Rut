@@ -76711,7 +76711,7 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
             upstream[0] = -1;
             REQUIRE(loop->alloc_upstream_buf(*c));
             const char* request =
-                incomplete ? "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabNEXT"
+                incomplete ? "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nab"
                            : "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabcNEXT";
             const u32 request_len = static_cast<u32>(strlen(request));
             REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),

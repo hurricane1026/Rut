@@ -157,8 +157,7 @@ inline bool preserved_response_drain_owner(const Connection& conn) {
                                 conn.on_send == &on_complete_response_sent<Loop>;
     return conn.state == ConnState::Sending && conn.req_body_lossy_successor &&
            !conn.upstream_request_incomplete && conn.proxy_resp_started && conn.send_armed &&
-           response_owner &&
-           (!conn.recv_buf.data() || conn.send_buf.data() != conn.recv_buf.data());
+           response_owner;
 }
 
 // Strictly prove the current HTTP/1 request boundary before admitting a
