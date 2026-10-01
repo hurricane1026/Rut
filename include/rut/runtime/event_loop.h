@@ -193,7 +193,6 @@ public:
                         self().close_conn(conn);
                         return;
                     }
-                    if (!conn.recv_armed) conn.recv_pause_cancel_pending = false;
                     return;
                 }
             }
