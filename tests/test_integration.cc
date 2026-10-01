@@ -5971,6 +5971,11 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     CHECK(conn.recv_pause_cancel_pending);
     CHECK(!conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 2u);
+    // Repeated WebSocket receive CQEs while the first cancel is pending must
+    // coalesce onto the existing cancel owner.
+    CHECK(loop->pause_recv(conn));
+    CHECK(conn.recv_pause_cancel_pending);
+    CHECK_EQ(conn.pending_ops, 2u);
 
     CHECK(loop->submit_recv(conn));
     CHECK(conn.recv_pause_rearm_pending);
@@ -12969,12 +12974,34 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     const u16 port = get_port(lfd);
-    REQUIRE(shard.init(0, lfd).has_value());
+    auto shard_init = shard.init(0, lfd);
+    if (!shard_init.has_value()) {
+        close(lfd);
+        REQUIRE(shard_init.has_value());
+    }
     shard.route_config = &cfg;
+
+    struct BurstCleanup {
+        Shard<IoUringEventLoop>* shard;
+        std::vector<i32>* clients;
+        i32 listener;
+        bool spawned = false;
+        ~BurstCleanup() {
+            for (i32 c : *clients)
+                if (c >= 0) close(c);
+            if (spawned) {
+                shard->stop();
+                shard->join();
+            }
+            shard->shutdown();
+            if (listener >= 0) close(listener);
+        }
+    } cleanup{&shard, nullptr, lfd};
 
     static constexpr char kReq[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     std::vector<i32> clients;
     clients.reserve(kClients);
+    cleanup.clients = &clients;
     // The shard is not running, so the backlog (4096) holds every connection and
     // the kernel queues each request in its socket.
     for (u32 i = 0; i < kClients; i++) {
@@ -12989,14 +13016,20 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
     }
     REQUIRE_EQ(clients.size(), static_cast<size_t>(kClients));
     REQUIRE(shard.spawn(-1).has_value());
+    cleanup.spawned = true;
 
-    auto read_response = [](i32 c) {
+    const u64 burst_deadline_us = monotonic_us() + 120000000;
+    auto read_response = [&](i32 c) {
         std::string response;
         char buf[512];
         u32 expected = 0;
         u32 header_len = 0;
         for (;;) {
-            const i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
+            const u64 now = monotonic_us();
+            if (now >= burst_deadline_us) return false;
+            const u64 remaining_ms = (burst_deadline_us - now + 999) / 1000;
+            const i32 n = recv_timeout(
+                c, buf, sizeof(buf), remaining_ms > 10000 ? 10000 : static_cast<i32>(remaining_ms));
             if (n <= 0) return false;
             response.append(buf, static_cast<size_t>(n));
             if (header_len == 0) {
@@ -13030,12 +13063,6 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
     }
     CHECK_EQ(failed, 0u);
     CHECK_EQ(served, 2 * kClients);
-
-    for (i32 c : clients) close(c);
-    shard.stop();
-    shard.join();
-    shard.shutdown();
-    close(lfd);
 }
 #endif
 
