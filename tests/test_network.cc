@@ -76237,9 +76237,12 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     CHECK_EQ(c->resp_status, static_cast<u16>(200));
     const u32 response_send_len = sizeof(kResponse) - 1u;
     CHECK_EQ(c->upstream_send_len, response_send_len);
-    loop->backend.send_state[c->id] = {
-        c->upstream_recv_buf.data(), c->fd, response_send_len, 0, IoEventType::Send, 0};
-    CHECK_EQ(loop->backend.send_state[c->id].src, c->upstream_recv_buf.data());
+    const auto& response_send = loop->backend.send_state[c->id];
+    CHECK_EQ(response_send.src, c->upstream_recv_buf.data());
+    CHECK_EQ(response_send.fd, c->fd);
+    CHECK_EQ(response_send.offset, 0u);
+    CHECK_EQ(response_send.remaining, response_send_len);
+    CHECK_EQ(response_send.type, IoEventType::Send);
     loop->backend.send_state[c->id].offset = response_send_len;
     loop->backend.send_state[c->id].remaining = 0;
     loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
@@ -76550,9 +76553,12 @@ TEST(request_body_overflow, iouring_full_cl_initial_owner_send_first_clears_succ
     CHECK_EQ(c->resp_status, static_cast<u16>(200));
     const u32 response_send_len = sizeof(kResponse) - 1u;
     CHECK_EQ(c->upstream_send_len, response_send_len);
-    loop->backend.send_state[c->id] = {
-        c->upstream_recv_buf.data(), c->fd, response_send_len, 0, IoEventType::Send, 0};
-    CHECK_EQ(loop->backend.send_state[c->id].src, c->upstream_recv_buf.data());
+    const auto& response_send = loop->backend.send_state[c->id];
+    CHECK_EQ(response_send.src, c->upstream_recv_buf.data());
+    CHECK_EQ(response_send.fd, c->fd);
+    CHECK_EQ(response_send.offset, 0u);
+    CHECK_EQ(response_send.remaining, response_send_len);
+    CHECK_EQ(response_send.type, IoEventType::Send);
     loop->backend.send_state[c->id].offset = response_send_len;
     loop->backend.send_state[c->id].remaining = 0;
     loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
