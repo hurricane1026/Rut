@@ -59,17 +59,15 @@ TEST(io_uring_memlock, small_capacity_costs_152_kib_per_shard) {
         152 * kKiB);
 }
 
-TEST(io_uring_memlock, default_capacity_costs_632_kib_required_648_kib_with_primary_ring) {
+TEST(io_uring_memlock, default_capacity_costs_632_kib_required_616_kib_with_primary_ring) {
     const IoUringRingSizes sizes = io_uring_ring_sizes(kDefaultConnectionCapacity);
     CHECK_EQ(io_uring_shard_required_locked_bytes(
                  sizes.sq_entries, sizes.cq_entries, kProvidedBufCount, kPage4K),
              616 * kKiB);
-    CHECK_EQ(io_uring_shard_locked_bytes(sizes.sq_entries,
-                                         sizes.cq_entries,
-                                         kProvidedBufCount,
-                                         kLargeProvidedBufCount,
-                                         kPage4K),
-             632 * kKiB);
+    CHECK_EQ(
+        io_uring_shard_locked_bytes(
+            sizes.sq_entries, sizes.cq_entries, kProvidedBufCount, kLargeProvidedBufCount, kPage4K),
+        632 * kKiB);
 }
 
 // --- 16 KiB / 64 KiB pages: derived from the kernel's whole-page rounding,
