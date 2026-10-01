@@ -13005,7 +13005,8 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
                 header_len = static_cast<u32>(end + 4);
                 const size_t marker = response.substr(0, header_len).find("Content-Length:");
                 if (marker != std::string::npos) {
-                    expected = static_cast<u32>(strtoul(response.c_str() + marker + 15, nullptr, 10));
+                    expected =
+                        static_cast<u32>(strtoul(response.c_str() + marker + 15, nullptr, 10));
                 }
             }
             if (response.size() >= static_cast<size_t>(header_len) + expected)
