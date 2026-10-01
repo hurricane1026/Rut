@@ -5993,6 +5993,11 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
 
     conn.pending_ops = 1;
     loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+    CHECK(conn.recv_pause_cancel_pending);
+    CHECK(!conn.recv_armed);
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 1u);  // pause cancel remains the second owner
+    loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
     CHECK(!conn.recv_pause_cancel_pending);
     CHECK(conn.recv_armed);
     CHECK(!conn.recv_pause_rearm_pending);
@@ -12985,6 +12990,29 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
     REQUIRE_EQ(clients.size(), static_cast<size_t>(kClients));
     REQUIRE(shard.spawn(-1).has_value());
 
+    auto read_response = [](i32 c) {
+        std::string response;
+        char buf[512];
+        u32 expected = 0;
+        u32 header_len = 0;
+        for (;;) {
+            const i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
+            if (n <= 0) return false;
+            response.append(buf, static_cast<size_t>(n));
+            if (header_len == 0) {
+                const size_t end = response.find("\r\n\r\n");
+                if (end == std::string::npos) continue;
+                header_len = static_cast<u32>(end + 4);
+                const size_t marker = response.substr(0, header_len).find("Content-Length:");
+                if (marker != std::string::npos) {
+                    expected = static_cast<u32>(strtoul(response.c_str() + marker + 15, nullptr, 10));
+                }
+            }
+            if (response.size() >= static_cast<size_t>(header_len) + expected)
+                return response.compare(0, 12, "HTTP/1.1 200") == 0;
+        }
+    };
+
     u32 served = 0;
     u32 failed = 0;
     for (u32 round = 0; round < 2; round++) {
@@ -12993,9 +13021,7 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
                 if (!send_all(c, kReq, sizeof(kReq) - 1)) failed++;
         }
         for (i32 c : clients) {
-            char buf[512];
-            const i32 n = recv_timeout(c, buf, sizeof(buf), 10000);
-            if (n > 0 && buf_contains(buf, static_cast<u32>(n), "HTTP/1.1 200", 12))
+            if (read_response(c))
                 served++;
             else
                 failed++;  // reset (-ECONNRESET), EOF or timeout

@@ -40907,6 +40907,37 @@ TEST(iouring_downstream_ring_empty, pause_cancel_race_clears_flag_and_resume_arm
     conn.pending_ops = 0;
 }
 
+TEST(iouring_downstream_ring_empty, pause_cancel_cqe_first_waits_for_recv_terminal) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    Connection& conn = *f.raw.conns[0];
+    REQUIRE(loop->pause_recv(conn));
+    loop->backend.pending = 0;
+
+    // The cancel drains while the target recv is still armed. Keep a second
+    // owner so the following terminal cannot be mistaken for a fresh recv.
+    loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    CHECK_FALSE(conn.recv_pause_cancel_pending);
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+
+    loop->dispatch({conn.id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(conn.recv_armed);
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 0u);
+
+    conn.recv_paused_for_send = false;
+    loop->submit_recv(conn);
+    CHECK(conn.recv_armed);
+    CHECK_FALSE(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
+    loop->backend.pending = 0;
+    conn.recv_armed = false;
+    conn.pending_ops = 0;
+}
+
 TEST(iouring_downstream_ring_empty, terminal_for_a_closed_connection_reclaims_the_slot) {
     DownstreamRingEmptyFixture f;
     if (!f.init()) SKIP("io_uring unavailable");

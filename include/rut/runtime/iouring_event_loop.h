@@ -2308,6 +2308,11 @@ public:
     // refresh, armed-flag changes, send state, or current request buffers.
     bool consume_strict_upstream_retirement_event(Connection& c, const IoEvent& ev) {
         if (!io_event_is_upstream(ev.type)) return false;
+        if (c.fd < 0 && c.http1_boundary_deferred) {
+            c.http1_boundary_deferred = false;
+            c.http1_boundary_ready = false;
+            c.http1_boundary_successor_episode = 0;
+        }
 
         const u8 retirement_op = upstream_op_for_event(ev.type);
         const bool matching_retirement = retirement_op != 0 && c.upstream_retiring_episode != 0 &&
@@ -2357,7 +2362,14 @@ public:
                 c.upstream_retirement_cancel_owned == 0 &&
                 c.upstream_retirement_cancel_retry == 0) {
                 c.upstream_retirement_active = false;
-                if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
+                if (c.fd < 0) {
+                    // A closed slot has no successor rendezvous to publish.
+                    // Clear the boundary owner at the exact final retirement
+                    // transition, before any reclamation decision.
+                    c.http1_boundary_deferred = false;
+                    c.http1_boundary_ready = false;
+                    c.http1_boundary_successor_episode = 0;
+                } else if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
                     if (!prebuilt_http1_response_is_complete(c)) {
                         close_conn(c);
                         return true;
@@ -5779,7 +5791,6 @@ public:
         if (!c.recv_armed) return true;
         if (!backend.pause_recv(c.fd, c.id)) return false;
         c.recv_pause_cancel_pending = true;
-        c.pending_ops++;
         return true;
     }
 
@@ -6240,8 +6251,14 @@ public:
                     // rearm_deferred_recvs). Paused/boundary connections are
                     // covered: submit_recv_impl parks the re-arm behind a pause.
                     if (ev.type == IoEventType::Recv && ev.aux == kPauseCancelAux) {
-                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        // A cancel-first completion shares the recv's existing
+                        // lifetime pin; only a terminal-first race transferred
+                        // an additional cancel pin above.
+                        if (!conn.recv_armed && conn.pending_ops > 0) conn.pending_ops--;
                         conn.recv_pause_cancel_pending = false;
+                        // The recv target may complete after this cancel CQE;
+                        // retain a second owner until that terminal drains.
+                        if (conn.recv_armed) conn.recv_pause_rearm_pending = true;
                         if (conn.fd < 0) {
                             if (conn.pending_ops == 0) reclaim_slot(conn.id);
                             break;
@@ -6262,6 +6279,9 @@ public:
                         if (ev.more) break;
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         conn.recv_armed = false;
+                        // Transfer the recv's lifetime pin to the outstanding
+                        // pause cancel when the terminal wins the race.
+                        if (conn.recv_pause_cancel_pending) conn.pending_ops++;
                         if (conn.fd < 0) {
                             if (conn.pending_ops == 0) reclaim_slot(conn.id);
                             break;
@@ -6285,11 +6305,18 @@ public:
                             conn.recv_armed = false;
                         }
                         if (ev.result <= 0) {
+                            conn.http1_boundary_deferred = false;
+                            conn.http1_boundary_ready = false;
+                            conn.http1_boundary_successor_episode = 0;
                             this->close_conn(conn);
                             break;
                         }
-                        if (!ev.more && !this->submit_recv_impl(conn)) {
-                            this->close_conn(conn);
+                        if (!ev.more) {
+                            if (conn.recv_pause_cancel_pending) {
+                                conn.recv_pause_rearm_pending = true;
+                            } else if (!this->submit_recv_impl(conn)) {
+                                this->close_conn(conn);
+                            }
                         }
                         break;
                     }
@@ -6314,17 +6341,23 @@ public:
                     // best-effort liveness/buffer-pressure defence, not a hard
                     // data barrier the residual in-flight CQE could breach.
                     if (ev.type == IoEventType::Recv && ev.result == -ECANCELED &&
-                        conn.recv_pause_cancel_pending) {
-                        const bool needs_recv_rearm = conn.recv_pause_rearm_pending;
+                        (conn.recv_pause_cancel_pending || conn.recv_pause_rearm_pending)) {
+                        // Both the target recv and its pause cancel own a
+                        // pending operation. Either CQE may arrive first; the
+                        // last owner is the only one allowed to re-arm.
+                        conn.recv_pause_rearm_pending = true;
+                        const bool cancel_drained = !conn.recv_pause_cancel_pending;
                         conn.recv_pause_rearm_pending = false;
-                        conn.recv_pause_cancel_pending = false;
                         conn.recv_armed = false;
                         if (conn.pending_ops > 0) conn.pending_ops--;
-                        if (needs_recv_rearm && !conn.recv_paused_for_send) {
+                        if (conn.recv_pause_cancel_pending) conn.pending_ops++;
+                        if (cancel_drained && !conn.recv_paused_for_send) {
                             if (!this->submit_recv_impl(conn)) {
                                 this->close_conn(conn);
                                 break;
                             }
+                        } else {
+                            conn.recv_pause_rearm_pending = true;
                         }
                         break;
                     }
