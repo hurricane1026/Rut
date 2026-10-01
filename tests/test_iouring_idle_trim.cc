@@ -33,6 +33,9 @@ i64 g_fail_point = -1;               // probe step (PidfdOpen / ProbeAdvise) tha
 i64 g_batch_allowed = -1;            // ranges process_madvise may take per call (-1: all)
 const u8* g_fail_slice_a = nullptr;  // per-slice madvise fails for these two slices
 const u8* g_fail_slice_b = nullptr;
+// Once the retry budget proves that this process cannot create a ring, later
+// test cases must skip immediately instead of repeating the same 10-second wait.
+bool g_iouring_permanently_unavailable = false;
 
 }  // namespace
 
@@ -134,6 +137,7 @@ struct TrimRig {
 
     // capacity: slot count. server_sndbuf != 0 shrinks accepted sockets' send buffers.
     bool init(u32 capacity, bool listen_socket, u32 server_sndbuf = 0) {
+        if (g_iouring_permanently_unavailable) return false;
         storage = mmap(nullptr,
                        sizeof(IoUringEventLoop),
                        PROT_READ | PROT_WRITE,
@@ -155,6 +159,7 @@ struct TrimRig {
         // processes can transiently exhaust it (ENOMEM): retry briefly before
         // treating io_uring as unavailable.
         bool inited = false;
+        bool saw_enomem = false;
         for (u32 attempt = 0; attempt < 40 && !inited; attempt++) {
             if (attempt != 0) {
                 usleep(250 * 1000);
@@ -164,8 +169,12 @@ struct TrimRig {
             auto r = loop->init(0, lfd, 0, capacity);
             inited = r.has_value();
             if (!inited && r.error().code != ENOMEM) break;
+            if (!inited) saw_enomem = true;
         }
-        if (!inited) return false;
+        if (!inited) {
+            if (saw_enomem) g_iouring_permanently_unavailable = true;
+            return false;
+        }
         up = true;
         if (need_trim && loop->idle_trim_pidfd < 0) return false;
         loop->config_ptr = &active;

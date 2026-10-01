@@ -6150,6 +6150,11 @@ public:
             ::close(idle_trim_pidfd);
             idle_trim_pidfd = -1;
         }
+        // Each queued range describes one SlicePool slice.  MADV_DONTNEED
+        // rounds ranges to host pages, so a host page larger than a slice
+        // could discard neighbouring slices that are still in use.
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0 || static_cast<u64>(page_size) > SlicePool::kSliceSize) return false;
 #if defined(SYS_pidfd_open) && defined(SYS_process_madvise)
         if (detail::idle_trim_inject(detail::IdleTrimPidfdOpen, 0) >= 0) return false;
         const long fd = syscall(SYS_pidfd_open, getpid(), 0u);
