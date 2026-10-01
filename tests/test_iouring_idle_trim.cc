@@ -89,13 +89,21 @@ u64 waiting_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
 }
 
 u32 resident_pages(const u8* p, u32 len) {
-    const u32 pages = len / 4096;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || reinterpret_cast<uintptr_t>(p) % static_cast<uintptr_t>(page_size) != 0)
+        return 0xffffffffu;
+    const u32 pages = (len + static_cast<u32>(page_size) - 1) / static_cast<u32>(page_size);
     unsigned char vec[16];
     if (pages > sizeof(vec)) return 0;
     if (mincore(const_cast<u8*>(p), len, vec) != 0) return 0xffffffffu;
     u32 n = 0;
     for (u32 i = 0; i < pages; i++) n += vec[i] & 1u;
     return n;
+}
+
+bool slice_pages_are_independent() {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    return page_size > 0 && SlicePool::kSliceSize % static_cast<u32>(page_size) == 0;
 }
 
 void drain_client(i32 fd, std::string& out) {
@@ -287,12 +295,17 @@ bool add_routes(TrimRig& r) {
 // ---------------------------------------------------------------------------
 
 TEST(slice_pool_discard, returns_pages_of_a_bound_slice_and_keeps_it_bound) {
+    if (!slice_pages_are_independent()) SKIP("host pages exceed SlicePool slices");
+    const long page_size = sysconf(_SC_PAGESIZE);
+    REQUIRE(page_size > 0);
     SlicePool pool;
     REQUIRE(pool.init(512).has_value());
     u8* s = pool.alloc();
     REQUIRE(s != nullptr);
     __builtin_memset(s, 0x5a, SlicePool::kSliceSize);
-    CHECK_EQ(resident_pages(s, SlicePool::kSliceSize), 4u);
+    const u32 expected_pages =
+        (SlicePool::kSliceSize + static_cast<u32>(page_size) - 1) / static_cast<u32>(page_size);
+    CHECK_EQ(resident_pages(s, SlicePool::kSliceSize), expected_pages);
     const u32 avail = pool.available();
     CHECK(pool.bound_slice_valid(s));
     CHECK_EQ(madvise(s, SlicePool::kSliceSize, MADV_DONTNEED), 0);
@@ -1363,8 +1376,9 @@ constexpr char kUpstreamBody[] = "proxied-body-0123456789-abcdefghijklmnopqrstuv
 struct TestUpstream {
     i32 lfd = -1;
     u16 port = 0;
-    volatile u32 requests = 0;
-    volatile bool stop = false;
+    u32 requests = 0;
+    bool stop = false;
+    std::string request_buffers[8];
     pthread_t thread{};
     bool started = false;
 
@@ -1375,7 +1389,7 @@ struct TestUpstream {
         static const char kResp[] =
             "HTTP/1.1 200 OK\r\nContent-Length: 50\r\nConnection: keep-alive\r\n\r\n";
         static_assert(sizeof(kUpstreamBody) - 1 == 50);
-        while (!u->stop) {
+        while (!__atomic_load_n(&u->stop, __ATOMIC_ACQUIRE)) {
             pollfd pfds[9];
             pfds[0] = {u->lfd, POLLIN, 0};
             for (u32 i = 0; i < n; i++) pfds[1 + i] = {conns[i], POLLIN, 0};
@@ -1391,20 +1405,31 @@ struct TestUpstream {
                     if (got <= 0) {
                         drop = true;
                     } else {
-                        // One request per recv in this test (no pipelining).
-                        __atomic_add_fetch(&u->requests, 1u, __ATOMIC_SEQ_CST);
-                        send(conns[i], kResp, sizeof(kResp) - 1, MSG_NOSIGNAL);
-                        send(conns[i], kUpstreamBody, sizeof(kUpstreamBody) - 1, MSG_NOSIGNAL);
+                        u->request_buffers[i].append(buf, static_cast<size_t>(got));
+                        for (;;) {
+                            const size_t end = u->request_buffers[i].find("\r\n\r\n");
+                            if (end == std::string::npos) break;
+                            u->request_buffers[i].erase(0, end + 4);
+                            __atomic_add_fetch(&u->requests, 1u, __ATOMIC_SEQ_CST);
+                            send(conns[i], kResp, sizeof(kResp) - 1, MSG_NOSIGNAL);
+                            send(conns[i], kUpstreamBody, sizeof(kUpstreamBody) - 1, MSG_NOSIGNAL);
+                        }
                     }
                 }
                 if (drop) {
                     ::close(conns[i]);
-                    conns[i] = conns[--n];
+                    const u32 last = --n;
+                    conns[i] = conns[last];
+                    u->request_buffers[i].swap(u->request_buffers[last]);
+                    u->request_buffers[last].clear();
                 }
             }
             if ((pfds[0].revents & POLLIN) != 0 && n < 8) {
                 const i32 c = accept(u->lfd, nullptr, nullptr);
-                if (c >= 0) conns[n++] = c;
+                if (c >= 0) {
+                    u->request_buffers[n].clear();
+                    conns[n++] = c;
+                }
             }
         }
         for (u32 i = 0; i < n; i++) ::close(conns[i]);
@@ -1421,7 +1446,7 @@ struct TestUpstream {
     }
 
     ~TestUpstream() {
-        stop = true;
+        __atomic_store_n(&stop, true, __ATOMIC_RELEASE);
         if (started) pthread_join(thread, nullptr);
         if (lfd >= 0) ::close(lfd);
     }
@@ -1445,7 +1470,7 @@ TEST(iouring_idle_trim, proxied_connection_is_trimmed_and_serves_the_next_proxie
     REQUIRE(r.exchange(cli, kReqProxy, first));
     CHECK(first.compare(0, 12, "HTTP/1.1 200") == 0);
     CHECK_EQ(first.substr(first.size() - (sizeof(kUpstreamBody) - 1)), std::string(kUpstreamBody));
-    CHECK_EQ(up.requests, 1u);
+    CHECK_EQ(__atomic_load_n(&up.requests, __ATOMIC_ACQUIRE), 1u);
     REQUIRE(r.wait_idle());
     Connection* c = r.live_conn();
     REQUIRE(c != nullptr);
@@ -1462,7 +1487,7 @@ TEST(iouring_idle_trim, proxied_connection_is_trimmed_and_serves_the_next_proxie
     std::string second;
     REQUIRE(r.exchange(cli, kReqProxy, second));
     CHECK(second == first);
-    CHECK_EQ(up.requests, 2u);
+    CHECK_EQ(__atomic_load_n(&up.requests, __ATOMIC_ACQUIRE), 2u);
     ::close(cli);
 }
 
