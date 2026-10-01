@@ -5178,6 +5178,9 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
             parser.reset();
             response.reset();
             if (parser.parse(probe_data, probe_len, &response) != ParseStatus::Complete) break;
+            if (response.status_code >= 200 && response.has_content_length &&
+                probe_len < parser.header_end + response.content_length)
+                break;
             if (response.status_code == 101 || response.status_code >= 200) {
                 complete_early_response = true;
                 upgrade_response_101 = response.status_code == 101;
@@ -5191,7 +5194,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     // A 101 commits the Upgrade tunnel, so a lossy successor cannot be
     // admitted with missing protocol bytes. A complete non-101 response keeps
     // the ordinary response owner and may safely drain the abandoned request.
-    if (conn.req_wants_upgrade && upgrade_response_101) {
+    if (conn.req_wants_upgrade && (!complete_early_response || upgrade_response_101)) {
         loop->close_conn(conn);
         return;
     }
