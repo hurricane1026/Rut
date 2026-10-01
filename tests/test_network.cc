@@ -14063,6 +14063,8 @@ TEST(tls_iouring, raw_response_owner_first_loss_discards_late_positive) {
     conn.tls_send_src = kCiphertext;
     conn.tls_send_len = sizeof(kCiphertext);
     conn.tls_send_off = 0;
+    REQUIRE(tls_single_shot_send_owner_is_current<IoUringEventLoop>(conn));
+    REQUIRE(loop.tls_ciphertext_send_is_current(conn));
     conn.tls_pending_on_recv = nullptr;
     IoEvent overflow{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0};
     overflow.provided_ring_empty = 0;
@@ -14101,6 +14103,34 @@ TEST(tls_iouring, raw_response_owner_mismatch_fails_closed_before_loss_admission
     tls_recv<IoUringEventLoop>(&loop, conn, overflow);
     CHECK_EQ(conn.fd, -1);
     CHECK_FALSE(conn.req_body_lossy_successor);
+}
+
+TEST(tls_iouring, response_body_gap_first_loss_discards_positive_cqe) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    u8 in_storage[32];
+    u8 out_storage[32];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.state = ConnState::Sending;
+    conn.proxy_resp_started = true;
+    conn.tls_in_buf.bind(in_storage, sizeof(in_storage));
+    conn.tls_out_buf.bind(out_storage, sizeof(out_storage));
+    conn.on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    IoEvent overflow{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0};
+    overflow.provided_ring_empty = 0;
+    tls_recv<IoUringEventLoop>(&loop, conn, overflow);
+    CHECK(conn.req_body_lossy_successor);
+    CHECK_FALSE(conn.keep_alive);
+    static constexpr u8 kLate = 0x17;
+    REQUIRE_EQ(conn.tls_in_buf.write(&kLate, 1), 1u);
+    tls_recv<IoUringEventLoop>(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK(conn.req_body_lossy_successor);
 }
 
 TEST(tls_iouring, live_raw_owner_consumes_zero_and_stale_tokens_without_accounting) {
