@@ -40455,24 +40455,31 @@ TEST(iouring_downstream_recv, positive_target_then_headroom_pause_keeps_cancel_o
     auto* loop = fixture.guard.loop;
     Connection& conn = *fixture.conns[0];
     REQUIRE(loop->pause_recv(conn));
-    REQUIRE(conn.recv_pause_cancel_pending);
+    fixture.guard.loop->backend.pending = 0;
     conn.req_body_mode = BodyMode::ContentLength;
     conn.req_body_remaining = 1;
     conn.recv_buf.commit(conn.recv_buf.write_avail() - kRequestBodyRecvHeadroom + 1);
-    conn.recv_armed = true;
-    conn.pending_ops = 2;
-    loop->dispatch({conn.id, 1, 0, 0, IoEventType::Recv, 0, 0});
-    CHECK_FALSE(conn.recv_armed);
+    static constexpr u8 kByte[] = {'x'};
+    REQUIRE(fixture.append_recv(conn, kByte, 1, false));
+    fixture.append_pause_cancel(conn, -ENOENT);
+    IoEvent events[2]{};
+    REQUIRE_EQ(fixture.wait(events, 2), 2u);
+    REQUIRE_EQ(events[0].aux, 0u);
+    loop->dispatch(events[0]);
     CHECK(conn.recv_pause_cancel_pending);
+    CHECK_FALSE(conn.recv_pause_target_inflight);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK(conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 1u);
     conn.recv_paused_for_send = false;
-    loop->handle_unhandled_recv(conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0, 0});
-    CHECK(conn.recv_pause_cancel_pending);
-    CHECK_EQ(conn.pending_ops, 1u);
-    loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    conn.recv_buf.reset();
+    loop->dispatch(events[1]);
     CHECK_FALSE(conn.recv_pause_cancel_pending);
+    CHECK_FALSE(conn.recv_pause_target_inflight);
+    CHECK_FALSE(conn.recv_pause_rearm_pending);
     CHECK(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(loop->backend.pending, 1u);
 }
 
 TEST(iouring_downstream_recv, pause_cancel_close_drains_each_owner_once) {
