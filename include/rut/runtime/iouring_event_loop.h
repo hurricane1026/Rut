@@ -3084,6 +3084,10 @@ public:
             c.recv_pause_rearm_pending = true;
             return true;
         }
+        if (c.recv_pause_cancel_pending || c.recv_pause_target_inflight) {
+            c.recv_pause_rearm_pending = true;
+            return true;
+        }
         if (c.recv_armed) {
             if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
             return true;

@@ -40882,18 +40882,27 @@ TEST(iouring_downstream_ring_empty, pause_cancel_race_clears_flag_and_resume_arm
     CHECK_FALSE(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);  // the tagged cancel is still in flight
 
+    // A send completion may clear the pause before the deferred bitmap is
+    // revisited. The outstanding cancel still owns the receive token.
+    conn.recv_paused_for_send = false;
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
+
     // The cancel completion owns clearing the pause marker. It must not cancel
     // a receive re-armed in the interval between these two CQEs.
     const IoEvent cancel{conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux};
     loop->dispatch(cancel);
     CHECK_FALSE(conn.recv_pause_cancel_pending);
-    CHECK_EQ(conn.pending_ops, 0u);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
 
-    // The re-arm pass parks behind the pause instead of arming.
+    // The deferred bitmap can now arm exactly one successor.
     loop->rearm_deferred_recvs(/*force=*/false);
-    CHECK_FALSE(conn.recv_armed);
-    CHECK(conn.recv_pause_rearm_pending);
-    CHECK_EQ(loop->backend.pending, 0u);
+    CHECK(conn.recv_armed);
+    CHECK_FALSE(conn.recv_pause_rearm_pending);
+    CHECK_EQ(loop->backend.pending, 1u);
 
     // Resume: exactly one recv is armed.
     conn.recv_paused_for_send = false;
@@ -41660,8 +41669,8 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get       ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                                   : sizeof(kGetKeepAliveRequest) - 1u)
+    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
+                                                             : sizeof(kGetKeepAliveRequest) - 1u)
                             : downstream_close ? sizeof(kCloseRequest) - 1u
                                                : sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
