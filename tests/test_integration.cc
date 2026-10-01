@@ -6412,6 +6412,24 @@ TEST(uring, request_body_recv_paused_before_recv_buf_fills) {
 // A CQE that did not fit recv_buf (the backend reports -ENOBUFS after dropping the
 // tail) can no longer be forwarded intact: the client gets 413 + close, not a
 // silent close, and later recv events do not cut that response short.
+TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+    Connection* c = make_uploading_conn(*loop, 16384, 0);
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::Chunked;
+    c->req_chunk_parser.state = ChunkedParser::State::Complete;
+    c->upstream_send_armed = true;
+    c->pending_ops = 2;
+    c->on_upstream_send = &on_request_body_sent<IoUringEventLoop>;
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    CHECK(c->fd >= 0);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->keep_alive);
+    CHECK_FALSE(c->request_upload_complete);
+    loop->shutdown();
+}
+
 TEST(uring, request_body_overflow_is_answered_with_413) {
     auto loop = std::make_unique<IoUringEventLoop>();
     if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
