@@ -5166,6 +5166,14 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
 // before any response byte); anything else keeps the plain close.
 template <typename Loop>
 void respond_request_body_overflow(Loop* loop, Connection& conn) {
+    // Upgrade handshakes require every request byte to reach the origin before
+    // a 101 can install the tunnel. A lossy CQE after the request boundary can
+    // never preserve that protocol prefix, regardless of which send owner is
+    // currently active, so fail closed before admitting a successor.
+    if (conn.req_wants_upgrade) {
+        loop->close_conn(conn);
+        return;
+    }
     bool complete_early_response = false;
     const bool final_body_send_inflight = final_request_body_send_inflight<Loop>(conn);
     if (conn.upstream_recv_buf.len() > 0) {
