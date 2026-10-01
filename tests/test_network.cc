@@ -75979,6 +75979,60 @@ TEST(request_body_overflow, iouring_initial_send_suffix_excludes_lossy_successor
     close(upstream[1]);
 }
 
+TEST(request_body_overflow, iouring_chunked_initial_send_forwards_terminator_only) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    downstream[0] = -1;
+    upstream[0] = -1;
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    static constexpr char kPrefix[] = "3\r\nabc";
+    static constexpr char kSuffix[] = "\r\n0\r\n\r\nNEXT";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1),
+               sizeof(kPrefix) - 1);
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kSuffix), sizeof(kSuffix) - 1),
+               sizeof(kSuffix) - 1);
+    c->state = ConnState::Proxying;
+    c->req_body_mode = BodyMode::Chunked;
+    c->req_body_streamed = true;
+    c->req_initial_send_len = sizeof(kPrefix) - 1;
+    c->req_chunk_parser.reset();
+    // The initial send consumed the chunk payload and left the live parser at
+    // its trailing CRLF boundary; the overflow suffix starts there.
+    c->req_chunk_parser.state = ChunkedParser::State::DataCR;
+    c->req_chunk_parser.chunk_remaining = 0;
+    c->upstream_episode = 1;
+    c->upstream_send_armed = true;
+    c->recv_armed = true;
+    c->pending_ops = 2;
+    c->on_upstream_send = &on_upstream_request_sent<IoUringEventLoop>;
+    loop->backend.upstream_send_state[c->id] = {
+        c->recv_buf.data(), c->upstream_fd, 0, sizeof(kPrefix) - 1, IoEventType::UpstreamSend, 1};
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->keep_alive);
+    loop->dispatch(
+        {c->id, static_cast<i32>(sizeof(kPrefix) - 1), 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
+    const auto& suffix_send = loop->backend.upstream_send_state[c->id];
+    REQUIRE_EQ(suffix_send.remaining, (sizeof(kSuffix) - 1u) - 4u);  // CRLF + terminating chunk
+    CHECK_EQ(__builtin_memcmp(suffix_send.src, "\r\n0\r\n\r\n", suffix_send.remaining), 0);
+    loop->dispatch(
+        {c->id, static_cast<i32>(suffix_send.remaining), 0, 0, IoEventType::UpstreamSend, 0, 0, 1});
+    CHECK(c->request_upload_complete);
+    CHECK_EQ(c->pipeline_stash_len, 0u);
+    close(downstream[1]);
+    close(upstream[1]);
+}
+
 #endif
 
 // State 7: Body chunk recv → send to upstream {up_recv=early_inflight, up_send=body_sent}
