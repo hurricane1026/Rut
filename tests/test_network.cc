@@ -76934,6 +76934,28 @@ TEST(request_body_overflow, completed_upgrade_owner_rejects_lossy_successor) {
     CHECK_FALSE(loop.conns[id].is_ws_tunnel);
 }
 
+TEST(request_body_overflow, completed_upgrade_owner_preserves_non101_response) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 0, 0);
+    REQUIRE(c != nullptr);
+    c->state = ConnState::Proxying;
+    c->req_body_mode = BodyMode::None;
+    c->req_wants_upgrade = true;
+    c->request_upload_complete = true;
+    c->upstream_fd = 100;
+    c->on_upstream_send = nullptr;
+    c->on_upstream_recv = &on_upstream_response<SmallLoop>;
+    static constexpr char k200[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(k200), sizeof(k200) - 1),
+               sizeof(k200) - 1);
+    respond_request_body_overflow(&loop, *c);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->keep_alive);
+    loop.close_conn(*c);
+}
+
 TEST(request_body_overflow, iouring_bodyless_initial_owner_preserves_response) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

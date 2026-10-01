@@ -5166,15 +5166,8 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
 // before any response byte); anything else keeps the plain close.
 template <typename Loop>
 void respond_request_body_overflow(Loop* loop, Connection& conn) {
-    // Upgrade handshakes require every request byte to reach the origin before
-    // a 101 can install the tunnel. A lossy CQE after the request boundary can
-    // never preserve that protocol prefix, regardless of which send owner is
-    // currently active, so fail closed before admitting a successor.
-    if (conn.req_wants_upgrade) {
-        loop->close_conn(conn);
-        return;
-    }
     bool complete_early_response = false;
+    bool upgrade_response_101 = false;
     const bool final_body_send_inflight = final_request_body_send_inflight<Loop>(conn);
     if (conn.upstream_recv_buf.len() > 0) {
         HttpResponseParser parser;
@@ -5187,12 +5180,20 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
             if (parser.parse(probe_data, probe_len, &response) != ParseStatus::Complete) break;
             if (response.status_code == 101 || response.status_code >= 200) {
                 complete_early_response = true;
+                upgrade_response_101 = response.status_code == 101;
                 break;
             }
             if (parser.header_end == 0 || parser.header_end >= probe_len) break;
             probe_data += parser.header_end;
             probe_len -= parser.header_end;
         }
+    }
+    // A 101 commits the Upgrade tunnel, so a lossy successor cannot be
+    // admitted with missing protocol bytes. A complete non-101 response keeps
+    // the ordinary response owner and may safely drain the abandoned request.
+    if (conn.req_wants_upgrade && upgrade_response_101) {
+        loop->close_conn(conn);
+        return;
     }
     if (!final_body_send_inflight && conn.state == ConnState::Proxying &&
         !conn.proxy_resp_started && !conn.upstream_abandoned &&
