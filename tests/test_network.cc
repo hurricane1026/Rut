@@ -76531,8 +76531,7 @@ TEST(request_body_overflow, iouring_full_cl_retry_send_first_preserves_prefix) {
     upstream[0] = -1;
     REQUIRE(loop->alloc_upstream_buf(*c));
     static constexpr char kBytes[] = "abcdefNEXT";
-    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kBytes), sizeof(kBytes) - 1),
-               sizeof(kBytes) - 1);
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("NEXT"), 4), 4u);
     c->state = ConnState::Proxying;
     c->req_body_mode = BodyMode::ContentLength;
     c->req_content_length = 6;
@@ -76546,7 +76545,9 @@ TEST(request_body_overflow, iouring_full_cl_retry_send_first_preserves_prefix) {
     c->pending_ops = 2;
     c->on_upstream_send = &on_upstream_request_sent<IoUringEventLoop>;
     REQUIRE_EQ(c->send_buf.write(reinterpret_cast<const u8*>(kBytes), 6), 6u);
+    REQUIRE_EQ(c->send_buf.write(reinterpret_cast<const u8*>("NEXT"), 4), 4u);
     c->retry_req_send_len = 6;
+    c->retry_req_snapshot_replayable = true;
     loop->backend.upstream_send_state[c->id] = {
         c->send_buf.data(), c->upstream_fd, 0, 6, IoEventType::UpstreamSend, 1};
     loop->backend.upstream_send_state[c->id].offset = 6;
@@ -76558,6 +76559,8 @@ TEST(request_body_overflow, iouring_full_cl_retry_send_first_preserves_prefix) {
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK(c->req_body_lossy_successor);
     CHECK_FALSE(c->keep_alive);
+    CHECK_EQ(c->send_buf.len(), 6u);
+    CHECK_EQ(__builtin_memcmp(c->send_buf.data(), "abcdef", 6), 0);
     CHECK(c->request_upload_complete);
     CHECK_EQ(c->pipeline_stash_len, 0u);
     CHECK_EQ(c->recv_buf.len(), 0u);
