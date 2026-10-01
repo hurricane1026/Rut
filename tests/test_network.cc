@@ -13330,6 +13330,7 @@ TEST(tls_iouring, strict_tls_constrained_output_needroom_keeps_raw_owner_and_rec
     REQUIRE(guard.init());
     IoUringEventLoop& loop = *guard.loop;
     Connection& conn = loop.conns[0];
+    u8 tls_out_storage[16];
     conn.reset();
     conn.id = 0;
     conn.fd = dup(STDERR_FILENO);
@@ -13439,7 +13440,6 @@ TEST(tls_iouring, drain_completion_invokes_saved_send_continuation) {
     conn.reset();
     conn.id = 0;
     conn.fd = 42;
-    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
     REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
     const u32 raw_generation =
         stage_tls_raw_send_target(loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), true);
@@ -14044,12 +14044,22 @@ TEST(tls_iouring, raw_response_owner_first_loss_discards_late_positive) {
     conn.reset();
     conn.id = 0;
     conn.fd = 42;
+    u8 tls_in_storage[16];
+    u8 tls_out_storage[16];
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
     conn.state = ConnState::Sending;
     conn.proxy_resp_started = true;
     static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xCA, 0xFE};
     REQUIRE_NE(stage_tls_raw_send_target(loop, conn, kCiphertext, sizeof(kCiphertext), false), 0u);
     conn.tls_active = true;
     conn.tls_pending_on_send = &on_response_sent<IoUringEventLoop>;
+    REQUIRE(conn.next_non_upstream_send_generation(conn.tls_send_owner_generation));
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kCiphertext;
+    conn.tls_send_len = sizeof(kCiphertext);
+    conn.tls_send_off = 0;
     conn.tls_pending_on_recv = nullptr;
     IoEvent overflow{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0};
     overflow.provided_ring_empty = 0;
