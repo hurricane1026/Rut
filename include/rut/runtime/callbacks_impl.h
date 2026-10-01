@@ -5213,7 +5213,13 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         // The initial upstream send still owns completion. Keep the buffered
         // current-request bytes available for that send and discard any lossy
         // successor after its completion; do not publish upload completion yet.
-        conn.request_body_fully_buffered = false;
+        conn.request_upload_complete = false;
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        return;
+    }
+    if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::None &&
+        conn.req_initial_send_len <= conn.recv_buf.len()) {
         conn.request_upload_complete = false;
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
@@ -7542,6 +7548,17 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
 template <typename Loop>
 void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    // Discard only the successor known to have been damaged by a lossy recv
+    // CQE, before strict upload validation or request classification runs.
+    const bool lossy_current_request_complete =
+        !conn.req_body_abandoned &&
+        (conn.req_body_mode == BodyMode::None ||
+         (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0) ||
+         (conn.req_body_mode == BodyMode::Chunked &&
+          conn.req_chunk_parser.state == ChunkedParser::State::Complete));
+    if (conn.req_body_lossy_successor && lossy_current_request_complete &&
+        conn.retry_req_send_len == 0 && conn.req_initial_send_len <= conn.recv_buf.len())
+        conn.recv_buf.set_len(conn.req_initial_send_len);
     const bool fixed_upload =
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         response_read_deadline_profile_is_fixed_upload(conn.response_read_deadline_profile);
@@ -7731,8 +7748,6 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // request (Case C: stash_len==0 && recv_buf.len()>0). This matches on_upstream_-
     // response's "recv_buf is NOT touched here" handling once a response byte arrives.
     if (conn.retry_req_send_len == 0) {
-        if (conn.req_body_lossy_successor && conn.recv_buf.len() > conn.req_initial_send_len)
-            conn.recv_buf.set_len(conn.req_initial_send_len);
         // Snapshot the request for a reused pooled socket so the rare post-send dead-
         // socket case (origin FIN landing just after take_idle's MSG_PEEK probe) can
         // replay it on a fresh connect even after recv_buf is reset below. Do this
