@@ -76158,11 +76158,16 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     // The lossy CQE is for a successor read, while the current request is fully
     // buffered.  Its response must wait for the current body send to drain.
     loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
-    CHECK(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK(c->req_body_lossy_successor);
     CHECK_FALSE(c->keep_alive);
     CHECK_GE(c->fd, 0);
-    CHECK_EQ(c->resp_status, static_cast<u16>(413));
-    CHECK(c->send_armed);
+    loop->backend.upstream_send_state[c->id].offset = 3;
+    loop->backend.upstream_send_state[c->id].remaining = 0;
+    loop->dispatch({c->id, 3, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
+    CHECK(c->request_upload_complete);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK_EQ(c->pipeline_stash_len, 0u);
     close(downstream[1]);
     close(upstream[1]);
 }
