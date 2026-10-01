@@ -3138,6 +3138,7 @@ public:
     bool submit_recv_impl(Connection& c) {
         const bool tls_send_needs_recv =
             c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>;
+        if (tls_send_needs_recv) c.recv_paused_for_send = false;
         if (c.recv_paused_for_send && !tls_send_needs_recv) {
             c.recv_pause_rearm_pending = true;
             return true;

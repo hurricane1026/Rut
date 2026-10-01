@@ -6294,6 +6294,69 @@ TEST(uring, tls_send_want_read_recv_survives_send_pause) {
     loop->shutdown();
 }
 
+TEST(uring, tls_want_read_clears_send_pause_across_cancel_orders) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    auto rc = loop->init(0, -1);
+    if (!rc) {
+        CHECK(true);
+        return;
+    }
+
+    test_initialize_slots(*loop, 1);
+    Connection& conn = loop->conns[0];
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(0x1);
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<IoUringEventLoop>;
+
+    auto exercise_order = [&](bool cancel_first) {
+        conn.recv_armed = true;
+        conn.recv_paused_for_send = true;
+        conn.recv_pause_cancel_pending = true;
+        conn.recv_pause_target_inflight = true;
+        conn.recv_pause_rearm_pending = false;
+        conn.pending_ops = 2;
+
+        // WANT_READ needs a receive immediately, but the old multishot target
+        // and its cancellation still own the connection. Record one re-arm and
+        // clear the send pause before either CQE can suppress it.
+        CHECK(loop->submit_recv(conn));
+        CHECK_FALSE(conn.recv_paused_for_send);
+        CHECK(conn.recv_pause_rearm_pending);
+        CHECK_EQ(conn.pending_ops, 2u);
+
+        if (cancel_first) {
+            loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+            CHECK_FALSE(conn.recv_pause_cancel_pending);
+            CHECK(conn.recv_pause_target_inflight);
+            CHECK(conn.recv_pause_rearm_pending);
+            CHECK_EQ(conn.pending_ops, 1u);
+            loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+        } else {
+            loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+            CHECK(conn.recv_pause_cancel_pending);
+            CHECK_FALSE(conn.recv_pause_target_inflight);
+            CHECK(conn.recv_pause_rearm_pending);
+            CHECK_EQ(conn.pending_ops, 1u);
+            loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+        }
+        CHECK_FALSE(conn.recv_paused_for_send);
+        CHECK_FALSE(conn.recv_pause_cancel_pending);
+        CHECK_FALSE(conn.recv_pause_target_inflight);
+        CHECK_FALSE(conn.recv_pause_rearm_pending);
+        CHECK(conn.recv_armed);
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK(loop->submit_recv(conn));
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK(conn.recv_armed);
+    };
+
+    exercise_order(false);
+    exercise_order(true);
+    conn.tls_engine.ssl = nullptr;
+    loop->shutdown();
+}
+
 // HandlerFn stub that yields on an upstream recv — never invoked by the test
 // below, only used as a non-null pending_handler_fn.
 static u64 upstream_recv_yield_handler(void* /*conn*/,
