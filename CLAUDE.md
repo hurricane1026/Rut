@@ -82,9 +82,9 @@ Coroutines were explored but rejected: frame allocation adds complexity (FramePo
 ### Memory: Arena + SlicePool (not Arena-only like nginx)
 
 - **Arena**: per-request bump allocator, bulk reset on request completion. For parsed headers, route params, JIT handler temporaries.
-- **SlicePool**: per-shard free-list of fixed 16KB slices. For network recv/send buffers with unpredictable lifetimes (streaming proxy, body rewrite). Idle connections hold zero slices.
+- **SlicePool**: per-shard free-list of fixed 16KB slices. For network recv/send buffers with unpredictable lifetimes (streaming proxy, body rewrite). Free connection slots hold no slices; a live connection keeps its recv and send slices bound (virtual reservation, physical pages only once touched). On io_uring, the dirty pages of idle plaintext HTTP/1.1 keep-alive connections (TLS, h2 and WebSocket connections are never trimmed) idle for ~5 s or more are returned with batched `MADV_DONTNEED` (`process_madvise` on self) when that syscall is available; the bindings stay.
 
-nginx uses only Arena + fixed `proxy_buffers` per connection, which doesn't scale to C100K+ (128KB/conn × 100K = 12.8GB). SlicePool gives zero memory overhead for idle connections.
+nginx uses only Arena + fixed `proxy_buffers` per connection, which doesn't scale to C100K+ (128KB/conn × 100K = 12.8GB). SlicePool gives free slots zero memory overhead, and on io_uring a long-idle live connection's dirty buffer pages are returned to the kernel (see above).
 
 ### io_uring vs epoll: dual backend, workload-dependent tradeoffs
 

@@ -3983,7 +3983,7 @@ Characteristics:
   - Completion-based: "I/O is already done when you get the event"
   - One syscall (io_uring_enter) for submit + wait
   - multishot accept: one SQE continuously accepts
-  - multishot recv + provided buffer ring: idle connections hold no buffer
+  - multishot recv + provided buffer ring: an idle plaintext HTTP/1.1 connection holds no ring buffer (when the idle-trim capability probe succeeds, its bound recv/send slices keep dirty pages only until the trim returns them, ~5 s; TLS, HTTP/2, WebSocket, and unsupported hosts retain their pages)
   - send_zc: zero-copy send
   - Kernel-side SQ polling (SQPOLL): can reduce to zero syscalls
 ```
@@ -4515,7 +4515,7 @@ io_uring features used:
 |---------|---------|----------------|
 | `IORING_ACCEPT_MULTISHOT` | One SQE continuously accepts connections | 5.19 |
 | `IORING_RECV_MULTISHOT` | One SQE continuously receives data per connection | 6.0 |
-| `IOSQE_BUFFER_SELECT` + provided buffer ring | Kernel auto-selects buffer on recv, idle connections hold no buffer | 5.19 / 6.0 |
+| `IOSQE_BUFFER_SELECT` + provided buffer ring | Kernel auto-selects buffer on recv; eligible plaintext HTTP/1.1 idle connections have bound recv/send slices trimmed after ~5 s when the `process_madvise` capability probe succeeds (TLS, H2, WebSocket, and unsupported hosts retain pages) | 5.19 / 6.0 |
 | `IORING_SETUP_SQPOLL` | Kernel-side SQ polling, reduces syscalls | 5.11 |
 | `IORING_SETUP_SINGLE_ISSUER` | Single-thread optimization (evaluated, not adopted; see note below) | 6.0 |
 | `IORING_OP_SEND_ZC` | Zero-copy send | 6.0 |
@@ -4651,7 +4651,7 @@ struct EpollBackend {
 Model                    completion            readiness
 Syscalls per I/O         1 (batched)           2 (epoll_wait + recv/send)
 Accept                   multishot (1 SQE)     accept4() loop
-Idle conn buffer         0 (provided buf ring) 0 (alloc on readiness)
+Idle conn buffer         0 ring buffer (+trim) 0 (alloc on readiness)
 Zero-copy recv           yes                   no
 Zero-copy send           yes (SEND_ZC)         no (must copy to kernel)
 Kernel version           6.0+                  3.9+ (SO_REUSEPORT)
@@ -4696,7 +4696,7 @@ Reactor advantages (pure networking):
 Proactor advantages:
   ├── Fewer syscalls — submit + wait = 1 syscall (vs 2 for reactor)
   ├── Batch submission — 100 sends in one io_uring_enter
-  ├── Provided buffer ring — idle connections hold zero buffer
+  ├── Provided buffer ring — idle connections hold no ring buffer
   ├── Multishot — accept/recv without re-submitting
   └── SQPOLL — zero syscalls in extreme case
 ```

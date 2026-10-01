@@ -33,7 +33,9 @@
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace rut {
@@ -51,6 +53,27 @@ namespace detail {
 
 inline bool injected_iouring_submit_failure(u8 operation) noexcept {
     return test_fail_iouring_submit != nullptr && test_fail_iouring_submit(operation);
+}
+
+// Optional test-binary hook for the idle-trim page release (see
+// IoUringEventLoop::sweep_idle_trim). Production binaries leave it unresolved.
+// Returns -1 to leave the step alone; any value >= 0 injects a fault:
+//   IdleTrimPidfdOpen / IdleTrimProbeAdvise: the probe step fails;
+//   IdleTrimBatchAdvise (arg = ranges in the chunk): only that many ranges are
+//     submitted to process_madvise, so the return is short exactly as if an iovec
+//     further in were bad; 0 makes the call fail hard (-1, EPERM), -2 makes it
+//     fail softly (-1, EAGAIN);
+//   IdleTrimSliceAdvise (arg = slice address): that per-slice madvise fails.
+enum IdleTrimPoint : u8 {
+    IdleTrimPidfdOpen = 1,
+    IdleTrimProbeAdvise = 2,
+    IdleTrimBatchAdvise = 3,
+    IdleTrimSliceAdvise = 4,
+};
+[[gnu::weak]] i64 test_idle_trim_inject(u8 point, u64 arg) noexcept;
+
+inline i64 idle_trim_inject(IdleTrimPoint point, u64 arg) noexcept {
+    return test_idle_trim_inject != nullptr ? test_idle_trim_inject(point, arg) : -1;
 }
 
 inline constexpr u8 kTestIoUringConnectSubmit = 1;
@@ -512,6 +535,7 @@ public:
             destroy_slot_storage();
             return core::make_unexpected(be.error());
         }
+        probe_idle_trim();  // idle-buffer trim is on only if this succeeds
         return {};
     }
 
@@ -602,6 +626,10 @@ public:
     void shutdown() {
         close_deferred_idle_return_fds();
         reclaim_pending();
+        if (idle_trim_pidfd >= 0) {
+            ::close(idle_trim_pidfd);
+            idle_trim_pidfd = -1;
+        }
         backend.shutdown();
         // No CQE can arrive after the backend is stopped.  Release any
         // deferred config epochs now so shutdown does not leave a shard pinned
@@ -5989,6 +6017,431 @@ public:
         return false;
     }
 
+    // --- Idle keep-alive buffer trim ---
+    //
+    // Every live connection keeps its request-receive and send slices bound for its
+    // whole life, so pages dirtied while serving a request stay resident however
+    // long the connection then sits idle (8-20 KiB per connection). Once a
+    // connection has been idle for a few seconds this hands those pages back with
+    // MADV_DONTNEED — bindings, pointers and capacities are untouched, the next
+    // request just re-faults zero pages.
+    //
+    // Driven from the timer wheel, not from a scan of the connection slots. A
+    // connection waiting in keep-alive sits in the wheel list that pops at
+    // (arm tick + keepalive_timeout), and the timer is re-armed by every request
+    // and response event, so "list whose expiry is `S - age` ticks away" is
+    // exactly "connections whose last activity was `age` ticks ago" for a
+    // connection armed with keepalive_timeout. Each tick visits the lists aged
+    // [kIdleTrimMinIdleTicks, +kIdleTrimAgeWindow), oldest first, and examines only
+    // the nodes it finds there: cost follows the connections that newly aged, not
+    // the slot capacity or the live population, and no slot is ever indexed by
+    // number — the wheel holds only live, allocated connections.
+    //
+    // The age is inferred from the list, not recorded: a node armed with a
+    // shorter timeout (an upstream/deadline/wait timer re-arm) that lands in a
+    // visited list can be examined earlier than the nominal 5 s. That is a policy
+    // imprecision only; safety never depends on age, because idle_trim_eligible()
+    // re-evaluates the connection's whole state at examination time.
+    //
+    // Examined nodes are rotated to the tail of their list and marked
+    // (Connection::idle_trim_examined); a walk stops at the first marked node, so
+    // a list longer than the per-tick budget is finished on the following ticks
+    // (the same list is visited again one age later) and handled nodes are never
+    // walked again. TimerWheel::add clears the mark on every arm and re-arm, so a
+    // re-armed node is always unexamined in its new list — with whatever timeout
+    // and expiry tick it picked, including one that lands back in the very list it
+    // was examined in. Reordering within a list is invisible to TimerWheel::tick(),
+    // which drains the whole list. A connection that was busy when examined is not
+    // retried under the same arming: whatever kept it busy ends with a dispatched
+    // completion, which re-arms its timer and so earns a fresh examination.
+    //
+    // Releasing is batched. madvise(MADV_DONTNEED) per slice sends TLB-shootdown
+    // IPIs to every CPU running another shard of this process, once per call. The
+    // examination therefore only validates (SlicePool::bound_slice_valid) and queues
+    // {ptr, 16 KiB} ranges; at the end of the tick's sweep — still on the shard
+    // thread, before dispatch resumes, so nothing can touch a queued slice in
+    // between — the queue is handed to process_madvise(pidfd-of-self,
+    // MADV_DONTNEED) in chunks of at most 1024 ranges (the kernel's iovec limit),
+    // which flushes TLBs about once per busy CPU per call instead of per range. The
+    // kernel stops at the first range it cannot advise and reports the bytes done;
+    // the un-advised remainder of that chunk is released with per-slice madvise, and
+    // a connection counts as trimmed only if one of its slices really was advised.
+    //
+    // Platform: needs process_madvise on the calling process (syscall: Linux 5.10;
+    // MADV_DONTNEED on self: observed working unprivileged on 7.2.7, minimum
+    // version not established). probe_idle_trim() proves it once at init; if pidfd_open or
+    // process_madvise is refused (ENOSYS, EPERM under seccomp/containers, EINVAL on
+    // an older kernel) the feature is OFF entirely and the sweep is a no-op —
+    // there is no per-slice mode, the shootdown cost would outweigh the memory.
+    //
+    // Nothing is added to any request path. Work per tick is bounded: the walk stops
+    // after kIdleTrimMaxExamined nodes, kIdleTrimMaxTrims queued connections
+    // (<= kIdleTrimMaxRanges = 1536 ranges, two flush calls), or when the wall clock
+    // plus the projected flush (queued ranges * kIdleTrimFlushNsPerRange) reaches
+    // kIdleTrimBudgetNs. Measured on Linux 7.2.7 (shared 32-CPU host, other load
+    // present): examining 512 connections 0.03-0.13 ms; flush 0.25-0.9 us per range
+    // (every page of every slice dirty, 0-7 busy threads: 0.35-0.55 us); a real
+    // 10000-connection burst (1 shard, two slices each) took 0.4-1.5 ms per tick in
+    // total, one tick in 20 took 3.0 ms (flush 2.5 ms, host interference); idle
+    // ticks cost ~2.4 us. So the added stall is ~1 ms typical per tick. The 1.5 ms
+    // budget is a target: the flush runs after the walk and cannot be interrupted, so
+    // the hard bound is the caps (2048 examinations plus up to 1536 ranges in two
+    // syscalls), realistically ~1.8 ms; host-interference outliers of ~3 ms were
+    // observed. A batch that fails hard (an errno other than EINTR/EAGAIN) finishes
+    // that tick per slice and then turns the feature off for the loop's life. The
+    // sweep is skipped while the shard is draining. Trim
+    // throughput is therefore at most 512 connections per tick; since a list is revisited on each
+    // of kIdleTrimAgeWindow (40) consecutive ticks, a burst that goes idle within one
+    // second is trimmed completely when it is no larger than ~40 * 512 = 20480
+    // connections (10000 connections took ~20 ticks). Whatever remains when the
+    // window closes is not trimmed for that idle period; its next request starts a
+    // new one. The window (ages 5..44) closes 15 ticks before the default 60 s
+    // keep-alive expiry; it is clipped for smaller timeouts (see sweep_idle_trim).
+    //
+    // Remaining proxied residual: a proxied connection's upstream receive slice is
+    // never trimmed, because idle_trim_upstream_slice_quiet vetoes on
+    // upstream_send_len, which stays stale after every proxied response (its recv
+    // and send slices do trim; measured plateau ~9.8 KB per proxied connection).
+    //
+    // Cost that remains: the release itself still has a residual cost. Measured (20000 idle
+    // connections trimmed during a 12 s window, 2 shards, one load generator of 64 connections,
+    // throughput-limited by the client): -1.0% to -1.6% requests/s (18 alternating
+    // rounds, se ~0.5-0.6), mechanism not identified. With the load generators
+    // saturating the shards (2 and 4 shards, 20000 idle connections) no cost is
+    // measurable: 4 shards -0.13% (6 rounds, se 0.2), 2 shards -0.45% (2 clean
+    // rounds only). TLB shootdowns on the shard CPUs during the trim window fell
+    // from ~20-35k (2 shards) and ~100-113k (4 shards) with per-slice madvise to
+    // ~40 and ~125 with the batch (~25 without trimming), i.e. >99% removed.
+    static constexpr u32 kIdleTrimMinIdleTicks = 5;
+    static constexpr u32 kIdleTrimAgeWindow = 40;
+    static constexpr u32 kIdleTrimMaxExamined = 2048;
+    static constexpr u32 kIdleTrimMaxTrims = 512;     // connections queued per tick
+    static constexpr u32 kIdleTrimSlicesPerConn = 3;  // recv, send, upstream recv
+    static constexpr u32 kIdleTrimMaxRanges = kIdleTrimMaxTrims * kIdleTrimSlicesPerConn;
+    static constexpr u32 kIdleTrimIovChunk = 1024;        // kernel UIO_MAXIOV per call
+    static constexpr u64 kIdleTrimBudgetNs = 1500000;     // examination + projected flush
+    static constexpr u64 kIdleTrimFlushNsPerRange = 900;  // upper end of the measured 0.25-0.9 us
+    static_assert(kIdleTrimMaxRanges <= 0xffffu, "idle_trim_first holds u16 range indices");
+    u64 idle_trim_budget_ns = kIdleTrimBudgetNs;  // per-tick budget (tests)
+
+    // Feature state: the pidfd of this process when process_madvise(MADV_DONTNEED)
+    // on it was proven to work at init (probe_idle_trim), -1 when the feature is
+    // off. The sweep is a no-op while it is -1.
+    i32 idle_trim_pidfd = -1;
+    // Ranges queued by this tick's examination, flushed at the end of the sweep.
+    // idle_trim_first[k] is the index of the first range of the k-th queued
+    // connection (idle_trim_first[idle_trim_queued] == idle_trim_nranges).
+    struct iovec idle_trim_iov[kIdleTrimMaxRanges];
+    u16 idle_trim_first[kIdleTrimMaxTrims + 1];
+    u32 idle_trim_nranges = 0;
+    u32 idle_trim_queued = 0;
+    // Observability / test counters; touched only by the sweep.
+    u64 idle_trim_examined = 0;  // wheel nodes examined
+    u64 idle_trim_conns = 0;     // connections with at least one slice released
+    u64 idle_trim_madvise = 0;   // slices released (batched or per slice)
+    u64 idle_trim_batches = 0;   // process_madvise calls issued
+    u64 idle_trim_fallback = 0;  // slices released by the per-slice fallback
+
+    // One-time capability probe (init): is process_madvise(MADV_DONTNEED) on this
+    // process usable? Holds a pidfd of self (pidfd_open(getpid()); PIDFD_SELF
+    // would save the fd but needs a 6.15+ kernel, pidfd_open works from 5.3 on)
+    // for the loop's lifetime and proves the call on one scratch page, including
+    // that the page reads back zero. Any failure (ENOSYS, EPERM from seccomp or a
+    // container profile, EINVAL on a kernel without DONTNEED-on-self) leaves the
+    // feature off. There is deliberately no per-slice mode as a feature: without
+    // the batched flush the per-range cross-CPU TLB shootdowns cost more than the
+    // memory is worth.
+    bool probe_idle_trim() {
+        if (idle_trim_pidfd >= 0) {
+            ::close(idle_trim_pidfd);
+            idle_trim_pidfd = -1;
+        }
+        // Each queued range describes one SlicePool slice.  MADV_DONTNEED
+        // rounds ranges to host pages, so a host page larger than a slice
+        // could discard neighbouring slices that are still in use.
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0 || static_cast<u64>(page_size) > SlicePool::kSliceSize) return false;
+#if defined(SYS_pidfd_open) && defined(SYS_process_madvise)
+        if (detail::idle_trim_inject(detail::IdleTrimPidfdOpen, 0) >= 0) return false;
+        const long fd = syscall(SYS_pidfd_open, getpid(), 0u);
+        if (fd < 0) return false;
+        void* page = mmap(nullptr,
+                          SlicePool::kSliceSize,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS,
+                          -1,
+                          0);
+        if (page == MAP_FAILED) {
+            ::close(static_cast<i32>(fd));
+            return false;
+        }
+        *static_cast<volatile u8*>(page) = 1;
+        struct iovec iov = {page, SlicePool::kSliceSize};
+        const long r = detail::idle_trim_inject(detail::IdleTrimProbeAdvise, 0) >= 0
+                           ? -1
+                           : syscall(SYS_process_madvise, fd, &iov, 1ul, MADV_DONTNEED, 0u);
+        const bool ok =
+            r == static_cast<long>(SlicePool::kSliceSize) && *static_cast<volatile u8*>(page) == 0;
+        munmap(page, SlicePool::kSliceSize);
+        if (!ok) {
+            ::close(static_cast<i32>(fd));
+            return false;
+        }
+        idle_trim_pidfd = static_cast<i32>(fd);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // True only for plain HTTP/1.1 keep-alive at rest between requests: nothing
+    // can still read or write the receive/send slice contents. The downstream
+    // multishot recv is the one op allowed outstanding — it lands in backend-owned
+    // provided buffers and IoUringBackend::wait() copies into recv_buf on this
+    // thread, so the kernel never references the connection's slice.
+    [[nodiscard]] bool idle_trim_eligible(const Connection& c) const {
+        if (c.fd < 0 || c.state != ConnState::ReadingHeader) return false;
+        if (c.on_recv != &on_header_received<IoUringEventLoop> || c.on_send != nullptr ||
+            c.on_upstream_recv != nullptr || c.on_upstream_send != nullptr)
+            return false;
+        // Protocol / transport: HTTP/1.1 plaintext only.
+        if (c.protocol != ConnProtocol::Http11 || c.tls_active || c.tls_engine.ssl != nullptr ||
+            c.tls_in_slice != nullptr || c.tls_out_slice != nullptr || c.h2 != nullptr ||
+            c.is_ws_tunnel || c.is_ws_terminate)
+            return false;
+        // Buffers: bound as allocated, nothing received, no live View, no stash or
+        // retry snapshot. (send_buf's own length is checked per slice at trim time.)
+        // is_released() first: Buffer::data() traps while a View is alive.
+        if (c.recv_buf.is_released() || c.send_buf.is_released()) return false;
+        if (c.recv_slice == nullptr || c.send_slice == nullptr ||
+            c.recv_buf.data() != c.recv_slice || c.send_buf.data() != c.send_slice ||
+            c.recv_buf.len() != 0 || c.pipeline_stash_len != 0 || c.retry_req_send_len != 0 ||
+            c.pipeline_depth != 0 || c.send_progress != 0)
+            return false;
+        // Sends: none in flight (an IORING_OP_SEND reads its slice asynchronously),
+        // no local body mid-stream.
+        if (c.send_armed || c.direct_write_completion_pending || c.local_body_remaining != 0 ||
+            c.local_body_send_len != 0 || c.local_body_cursor != nullptr)
+            return false;
+        if (c.id >= connection_capacity) return false;
+        const auto& send = backend.send_state[c.id];
+        if (send.remaining != 0 || send.file_fd >= 0) return false;
+        // Neutrality checks shared with submit_staged_local_response_impl:
+        // detach_upstream_close / return_idle_upstream clear upstream_send_armed
+        // without waiting for the CQE, so an upstream IORING_OP_SEND that reads
+        // recv_buf/send_buf can outlive the flag; these ledgers still record it.
+        // (upstream_send_len is deliberately not here: it only describes a client
+        // send sourced from upstream_recv_buf and is left stale after every
+        // proxied response, so vetoing on it would exempt all proxied connections;
+        // idle_trim_upstream_slice_quiet applies it to that one slice.)
+        if (backend.upstream_send_state[c.id].remaining != 0 || c.upstream_request_incomplete ||
+            c.response_mutations_snapshotted || !c.response_read_deadline_owner_is_neutral() ||
+            backend.failure_code() != 0)
+            return false;
+        // The downstream recv must be the armed multishot and not mid pause/rearm.
+        if (!c.recv_armed || c.recv_paused_for_send || c.recv_pause_cancel_pending ||
+            c.recv_pause_rearm_pending)
+            return false;
+        // Backstop for any in-flight op the flags above failed to record: an idle
+        // plaintext connection has exactly that multishot recv outstanding
+        // (observed: pending_ops == 1 on idle keep-alive connections, both direct
+        // and after proxied exchanges).
+        if (c.pending_ops != 1u) return false;
+        // No request in flight, no pending handler / yield / throttle / deadline.
+        if (c.req_start_us != 0 || c.epoch_held || c.pending_handler_fn != nullptr ||
+            c.yield_armed || c.yield_timeout_armed || c.throttle_paused ||
+            c.request_policy_body_pending ||
+            c.response_read_deadline_state != ResponseReadDeadlineState::None ||
+            c.http1_boundary_deferred || c.http1_boundary_ready || c.http1_prebuilt_wait != 0 ||
+            c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None)
+            return false;
+        // No upstream episode of any kind: no upstream socket or pending pool return,
+        // no upstream op or cancel outstanding, no retirement/close ledger open.
+        if (c.upstream_fd >= 0 || c.idle_return_fd >= 0 || c.close_after_idle_return ||
+            c.upstream_connect_armed || c.upstream_recv_armed || c.upstream_send_armed ||
+            c.upstream_recv_direct_armed || c.upstream_recv_cancel_inflight ||
+            c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
+            c.upstream_recv_paused_for_send || c.upstream_recv_terminal_stale ||
+            c.upstream_recv_idle_stale_bytes || c.upstream_recv_close_quarantine ||
+            c.upstream_retirement_active || c.upstream_close_target_owned != 0 ||
+            c.upstream_close_cancel_owned != 0 || c.upstream_close_pause_cancel_owned ||
+            c.response_header_slice != nullptr || c.response_body_tail.size != 0 ||
+            c.throttle_pending_len != 0 || c.resp_fully_buffered)
+            return false;
+        return true;
+    }
+
+    // A proxied connection's upstream receive slice may be trimmed as well once the
+    // upstream side is quiescent (idle_trim_eligible already proved no upstream op
+    // or cancel is outstanding, so no recv — including the direct-into-slice kind —
+    // can still write it) and it holds no bytes. A bulk buffer swapped in for a
+    // large relay is refused by SlicePool::bound_slice_valid; the relay slice is never
+    // touched and its presence (possible in-flight source) skips this slice too.
+    [[nodiscard]] static bool idle_trim_upstream_slice_quiet(const Connection& c) {
+        if (c.upstream_recv_slice == nullptr || c.upstream_relay_slice != nullptr ||
+            c.upstream_relay_send_len != 0 || c.upstream_send_len != 0 ||
+            c.upstream_recv_buf.is_released())
+            return false;
+        return c.upstream_recv_buf.data() == c.upstream_recv_slice &&
+               c.upstream_recv_buf.len() == 0;
+    }
+
+    // Queue one examined connection's releasable slices; true if at least one was
+    // queued. Nothing is advised here: the ranges are released together by
+    // idle_trim_flush() at the end of the sweep.
+    bool idle_trim_connection(Connection& c) {
+        if (!idle_trim_eligible(c)) return false;
+        const u32 first = idle_trim_nranges;
+        u32 n = first;
+        if (pool.bound_slice_valid(c.recv_slice)) queue_trim_range(n++, c.recv_slice);
+        // A proxied request on a reused upstream socket leaves its retry-snapshot
+        // bytes in send_buf after completion (length kept, nothing will replay
+        // them); a non-empty send_buf is never touched, so that slice stays as is.
+        if (c.send_buf.len() == 0 && pool.bound_slice_valid(c.send_slice))
+            queue_trim_range(n++, c.send_slice);
+        if (idle_trim_upstream_slice_quiet(c) && pool.bound_slice_valid(c.upstream_recv_slice))
+            queue_trim_range(n++, c.upstream_recv_slice);
+        if (n == first) return false;
+        idle_trim_first[idle_trim_queued++] = static_cast<u16>(first);
+        idle_trim_nranges = n;
+        return true;
+    }
+
+    void queue_trim_range(u32 index, u8* slice) {
+        idle_trim_iov[index].iov_base = slice;
+        idle_trim_iov[index].iov_len = SlicePool::kSliceSize;
+    }
+
+    // One process_madvise(MADV_DONTNEED) call over `n` queued ranges; returns the
+    // bytes advised (the kernel stops at the first bad range and reports what it
+    // did so far), or -1.
+    long idle_trim_advise_batch(const struct iovec* iov, u32 n) {
+        ++idle_trim_batches;  // attempted calls, whether injected or real
+        const i64 inject = detail::idle_trim_inject(detail::IdleTrimBatchAdvise, n);
+        if (inject == 0 || inject == -2) {
+            errno = inject == 0 ? EPERM : EAGAIN;
+            return -1;
+        }
+        if (inject > 0 && static_cast<u64>(inject) < n) n = static_cast<u32>(inject);
+        return syscall(SYS_process_madvise, idle_trim_pidfd, iov, n, MADV_DONTNEED, 0u);
+    }
+
+    bool idle_trim_advise_slice(const struct iovec& r) {
+        if (detail::idle_trim_inject(detail::IdleTrimSliceAdvise,
+                                     reinterpret_cast<u64>(r.iov_base)) >= 0)
+            return false;
+        return madvise(r.iov_base, r.iov_len, MADV_DONTNEED) == 0;
+    }
+
+    // Release everything queued this tick, synchronously on the shard thread and
+    // before dispatch resumes (nothing can touch a queued slice in between). One
+    // process_madvise call per chunk of at most kIdleTrimIovChunk ranges; a short
+    // or failed return leaves the un-advised remainder of that chunk to per-slice
+    // madvise. A connection counts as trimmed only if one of its slices was
+    // actually advised.
+    void idle_trim_flush() {
+        const u32 total = idle_trim_nranges;
+        u32 queued = idle_trim_queued;
+        idle_trim_nranges = 0;
+        idle_trim_queued = 0;
+        if (total == 0) return;
+        idle_trim_first[queued] = static_cast<u16>(total);
+        u32 conn = 0;       // connection owning range `i`
+        u32 counted = ~0u;  // last connection added to idle_trim_conns
+        bool hard_failure = false;
+        for (u32 base = 0; base < total; base += kIdleTrimIovChunk) {
+            const u32 chunk = total - base < kIdleTrimIovChunk ? total - base : kIdleTrimIovChunk;
+            long r = -1;
+            if (!hard_failure) {
+                r = idle_trim_advise_batch(&idle_trim_iov[base], chunk);
+                // EINTR / EAGAIN are transient: this tick falls back, the next tries
+                // the batch again. Anything else means the batch is refused for good.
+                if (r < 0 && errno != EINTR && errno != EAGAIN) hard_failure = true;
+            }
+            // Whole ranges the kernel reports done; a partly advised range is redone.
+            const u32 advised =
+                r > 0 ? static_cast<u32>(static_cast<u64>(r) / SlicePool::kSliceSize) : 0;
+            for (u32 i = base; i < base + chunk; i++) {
+                while (idle_trim_first[conn + 1] <= i) ++conn;
+                bool ok = i - base < advised;
+                if (!ok) {
+                    ok = idle_trim_advise_slice(idle_trim_iov[i]);
+                    if (ok) ++idle_trim_fallback;
+                }
+                if (!ok) continue;
+                ++idle_trim_madvise;
+                if (conn != counted) {
+                    counted = conn;
+                    ++idle_trim_conns;
+                }
+            }
+        }
+        // The per-slice fallback for this tick is done (nothing queued is left
+        // un-advised). A batch that fails hard would otherwise be retried, and its
+        // remainder released per slice, every tick forever: that per-slice mode is
+        // exactly what the feature does not offer. Switch the feature off for the
+        // life of the loop.
+        if (hard_failure) {
+            ::close(idle_trim_pidfd);
+            idle_trim_pidfd = -1;
+        }
+    }
+
+    // Walk the wheel list that pops at `expiry`, examining nodes not yet examined
+    // since they were armed. Returns false once a per-tick budget is exhausted.
+    bool idle_trim_walk_list(u32 expiry, u64 deadline_ns, u32& examined, u32& queued) {
+        ListNode* head = &timer.slots[expiry & (TimerWheel::kSlots - 1)];
+        ListNode* const last = head->prev;  // rotated nodes land after this one
+        if (last == head) return true;
+        const u64 node_offset = TimerWheel::timer_node_offset();
+        ListNode* node = head->next;
+        for (;;) {
+            if (examined == kIdleTrimMaxExamined || queued == kIdleTrimMaxTrims) return false;
+            auto* c = reinterpret_cast<Connection*>(reinterpret_cast<char*>(node) - node_offset);
+            if (c->idle_trim_examined) return true;  // reached the examined region
+            ListNode* const next = node->next;
+            const bool at_end = node == last;
+            c->idle_trim_examined = true;
+            node->remove();
+            head->prev->insert_after(node);
+            examined++;
+            idle_trim_examined++;
+            if (idle_trim_connection(*c)) queued++;
+            // The time budget is checked after the node, so every tick makes progress.
+            if (monotonic_ns() + idle_trim_nranges * kIdleTrimFlushNsPerRange >= deadline_ns)
+                return false;
+            if (at_end) return true;
+            node = next;
+        }
+    }
+
+    // Once per timer tick, after TimerWheel::tick() has advanced the cursor. The
+    // keep-alive timer was armed `age` ticks ago iff its list pops at
+    // cursor + keepalive_timeout - age (add() files a node under cursor + timeout,
+    // tick() pops slot `cursor` and then increments it). Idle connections are
+    // armed with keepalive_timeout by accept and by every request/response event
+    // (a proxied exchange finishing while state is still Proxying re-arms with
+    // keepalive_timeout too: measured, they are found here). A timeout too small
+    // for the age range or too large for the wheel (it would wrap) contributes only
+    // the ages that fit, or nothing. A stalled loop that ticked several times at
+    // once ages every node by that much; the window is wider than any realistic
+    // stall, and a longer one only skips nodes that are about to expire anyway.
+    void sweep_idle_trim() {
+        if (idle_trim_pidfd < 0) return;
+        const u32 timeout = keepalive_timeout;
+        if (timeout >= TimerWheel::kSlots || timeout <= kIdleTrimMinIdleTicks) return;
+        const u64 deadline_ns = monotonic_ns() + idle_trim_budget_ns;
+        u32 examined = 0;
+        u32 queued = 0;
+        for (u32 back = kIdleTrimAgeWindow; back-- != 0;) {
+            const u32 age = kIdleTrimMinIdleTicks + back;
+            if (age >= timeout) continue;
+            if (!idle_trim_walk_list(timer.cursor + (timeout - age), deadline_ns, examined, queued))
+                break;
+        }
+        idle_trim_flush();
+    }
+
     void dispatch(const IoEvent& ev) {
         switch (ev.type) {
             case IoEventType::Accept:
@@ -6100,6 +6553,8 @@ public:
                             this->close_conn(conns[i]);
                         }
                     }
+                } else {
+                    sweep_idle_trim();
                 }
                 break;
             }
