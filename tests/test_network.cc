@@ -76868,7 +76868,6 @@ TEST(request_body_overflow, lossy_successor_late_recv_during_response_body_is_di
     loop.dispatch(make_ev(c->id, IoEventType::Send, 5));
     CHECK_FALSE(c->send_armed);
     CHECK_EQ(c->resp_body_remaining, 0u);
-    loop.close_conn(*c);
     CHECK_EQ(c->fd, -1);
 }
 
@@ -76954,6 +76953,33 @@ TEST(request_body_overflow, completed_upgrade_owner_preserves_non101_response) {
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK_FALSE(c->keep_alive);
     loop.close_conn(*c);
+}
+
+TEST(request_body_overflow, incomplete_upgrade_response_rejects_lossy_successor) {
+    static constexpr const char* kResponses[] = {
+        "",
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nxy",
+        "HTTP/1.1 100 Continue\r\n\r\n",
+    };
+    for (const char* response : kResponses) {
+        SmallLoop loop;
+        loop.setup();
+        auto* c = setup_body_streaming_proxy(loop, 0, 0);
+        REQUIRE(c != nullptr);
+        const u32 id = c->id;
+        c->state = ConnState::Proxying;
+        c->req_body_mode = BodyMode::None;
+        c->req_wants_upgrade = true;
+        c->request_upload_complete = true;
+        c->upstream_fd = 100;
+        c->on_upstream_recv = &on_upstream_response<SmallLoop>;
+        const u32 len = static_cast<u32>(strlen(response));
+        REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(response), len), len);
+        respond_request_body_overflow(&loop, *c);
+        CHECK_EQ(loop.conns[id].fd, -1);
+        CHECK_FALSE(loop.conns[id].req_body_lossy_successor);
+        CHECK_FALSE(loop.conns[id].is_ws_tunnel);
+    }
 }
 
 TEST(request_body_overflow, iouring_bodyless_initial_owner_preserves_response) {
