@@ -76872,6 +76872,42 @@ TEST(request_body_overflow, lossy_successor_late_recv_during_response_body_is_di
     CHECK_EQ(c->fd, -1);
 }
 
+#ifdef __linux__
+TEST(request_body_overflow, iouring_response_owner_first_loss_pauses_recv) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    downstream[0] = -1;
+    upstream[0] = -1;
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    c->state = ConnState::Sending;
+    c->proxy_resp_started = true;
+    c->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    c->recv_armed = true;
+    c->pending_ops = 1;
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0});
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->keep_alive);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    CHECK_EQ(c->pending_ops, 2u);
+    loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(c->recv_pause_cancel_pending);
+    CHECK_FALSE(c->recv_pause_target_inflight);
+    close(downstream[1]);
+    close(upstream[1]);
+}
+#endif
+
 TEST(request_body_overflow, iouring_connect_owner_upgrade_rejects_lossy_successor) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
