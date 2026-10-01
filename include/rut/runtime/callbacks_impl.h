@@ -9329,8 +9329,6 @@ bool ws_pause_client_recv(Loop* loop, Connection& conn) {
     // backend form with preserve_send_interest=true (unchanged behavior).
     if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
         const bool ok = loop->pause_recv(conn);
-        if (ok && !conn.recv_armed && !conn.recv_pause_target_inflight)
-            conn.recv_pause_cancel_pending = false;
         return ok;
     } else if constexpr (requires(Loop* lp, u32 conn_id) {
                              lp->backend.pause_recv(conn_id, true);

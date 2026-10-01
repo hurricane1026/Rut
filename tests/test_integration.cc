@@ -5971,11 +5971,13 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     CHECK(conn.recv_pause_cancel_pending);
     CHECK(!conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 2u);
+    const u32 pause_sq_tail = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     // Repeated WebSocket receive CQEs while the first cancel is pending must
     // coalesce onto the existing cancel owner.
     CHECK(loop->pause_recv(conn));
     CHECK(conn.recv_pause_cancel_pending);
     CHECK_EQ(conn.pending_ops, 2u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), pause_sq_tail);
 
     CHECK(loop->submit_recv(conn));
     CHECK(conn.recv_pause_rearm_pending);
@@ -12997,6 +12999,8 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
         REQUIRE(shard_init.has_value());
     }
     shard.route_config = &cfg;
+    std::vector<i32> clients;
+    clients.reserve(kClients);
 
     struct BurstCleanup {
         Shard<IoUringEventLoop>* shard;
@@ -13016,8 +13020,6 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
     } cleanup{&shard, nullptr, lfd};
 
     static constexpr char kReq[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
-    std::vector<i32> clients;
-    clients.reserve(kClients);
     cleanup.clients = &clients;
     // The shard is not running, so the backlog (4096) holds every connection and
     // the kernel queues each request in its socket.
@@ -13046,12 +13048,23 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
         std::vector<pollfd> pollfds(kClients);
         std::vector<std::string> responses(kClients);
         std::vector<bool> complete(kClients, false);
+        u32 remaining = kClients;
         for (u32 i = 0; i < kClients; i++) {
             const int flags = fcntl(clients[i], F_GETFL, 0);
-            (void)fcntl(clients[i], F_SETFL, flags | O_NONBLOCK);
+            if (flags < 0) {
+                complete[i] = true;
+                remaining--;
+                failed++;
+                continue;
+            }
+            if (fcntl(clients[i], F_SETFL, flags | O_NONBLOCK) < 0) {
+                complete[i] = true;
+                remaining--;
+                failed++;
+                continue;
+            }
             pollfds[i] = {clients[i], POLLIN | POLLERR | POLLHUP, 0};
         }
-        u32 remaining = kClients;
         while (remaining != 0 && monotonic_us() < burst_deadline_us) {
             const i32 ready = poll(pollfds.data(), pollfds.size(), 100);
             if (ready < 0 && errno == EINTR) continue;
@@ -13066,14 +13079,16 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
                         responses[i].append(buf, static_cast<size_t>(n));
                         const size_t end = responses[i].find("\r\n\r\n");
                         if (end != std::string::npos) {
-                            const size_t marker = responses[i].find("Content-Length:");
+                            const size_t header_len = end + 4;
+                            const size_t marker =
+                                responses[i].substr(0, header_len).find("Content-Length:");
                             const u32 expected =
                                 marker == std::string::npos
                                     ? 0
                                     : static_cast<u32>(
                                           strtoul(responses[i].c_str() + marker + 15, nullptr, 10));
-                            const u32 header_len = static_cast<u32>(end + 4);
-                            if (responses[i].size() >= header_len + expected) {
+                            const bool status_ok = responses[i].compare(0, 12, "HTTP/1.1 200") == 0;
+                            if (status_ok && responses[i].size() >= header_len + expected) {
                                 complete[i] = true;
                                 remaining--;
                                 served++;

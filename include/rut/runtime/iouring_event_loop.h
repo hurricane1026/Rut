@@ -5783,11 +5783,11 @@ public:
         c.recv_paused_for_send = true;
         if (c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>)
             return true;
-        if (!c.recv_armed) return true;
-        if (c.recv_pause_cancel_pending) {
+        if (c.recv_pause_cancel_pending || c.recv_pause_target_inflight) {
             c.recv_pause_rearm_pending = true;
             return true;
         }
+        if (!c.recv_armed) return true;
         if (!backend.pause_recv(c.fd, c.id)) return false;
         c.recv_pause_cancel_pending = true;
         c.recv_pause_target_inflight = true;
