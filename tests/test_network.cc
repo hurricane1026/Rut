@@ -76836,7 +76836,6 @@ TEST(request_body_overflow, lossy_successor_late_recv_during_response_body_is_di
     auto* c = setup_body_streaming_proxy(loop, 200, 10);
     REQUIRE(c != nullptr);
     c->state = ConnState::Sending;
-    c->req_body_lossy_successor = true;
     c->proxy_resp_started = true;
     c->on_upstream_recv = &on_response_body_recvd<SmallLoop>;
     c->keep_alive = false;
@@ -76848,6 +76847,8 @@ TEST(request_body_overflow, lossy_successor_late_recv_during_response_body_is_di
 
     loop.handle_unhandled_recv(*c, make_ev(c->id, IoEventType::Recv, -ENOBUFS));
     CHECK_GE(c->fd, 0);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->keep_alive);
     CHECK_EQ(c->recv_buf.len(), 0u);
     REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("stale"), 5), 5u);
     loop.handle_unhandled_recv(*c, make_ev(c->id, IoEventType::Recv, 1));

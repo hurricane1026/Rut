@@ -168,8 +168,8 @@ inline bool preserved_response_late_recv_owner(const Connection& conn) {
                                 conn.on_send == &on_response_body_sent<Loop> ||
                                 conn.on_send == &on_complete_response_sent<Loop> ||
                                 conn.on_upstream_recv == &on_response_body_recvd<Loop>;
-    return conn.state == ConnState::Sending && conn.req_body_lossy_successor &&
-           !conn.upstream_request_incomplete && conn.proxy_resp_started && response_owner;
+    return conn.state == ConnState::Sending && !conn.upstream_request_incomplete &&
+           conn.proxy_resp_started && response_owner;
 }
 
 // Strictly prove the current HTTP/1 request boundary before admitting a

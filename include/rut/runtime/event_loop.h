@@ -174,7 +174,15 @@ public:
         // A lossy successor may race the response header/body transition. Once
         // the origin response owns the connection, discard that late client CQE
         // even while no downstream send is armed between body chunks.
-        if (preserved_response_late_recv_owner<Derived>(conn) &&
+        const bool response_owner = preserved_response_late_recv_owner<Derived>(conn);
+        if (response_owner && ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+            !conn.req_body_lossy_successor) {
+            conn.req_body_lossy_successor = true;
+            conn.keep_alive = false;
+            conn.reset_request_receive_buffer();
+            return;
+        }
+        if (response_owner && conn.req_body_lossy_successor &&
             (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty))) {
             conn.reset_request_receive_buffer();
             if constexpr (loop_backend_async_io<Derived>() &&
