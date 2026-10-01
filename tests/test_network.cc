@@ -33625,12 +33625,26 @@ TEST(early_response, client_recv_enobufs_during_send_preserves_response) {
     c->upstream_recv_buf.commit(rlen);
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
     CHECK_EQ(c->resp_status, static_cast<u16>(413));
+    const u32 send_len_before = c->send_buf.len();
+    u8 send_snapshot[256]{};
+    REQUIRE_LE(send_len_before, static_cast<u32>(sizeof(send_snapshot)));
+    if (send_len_before != 0) __builtin_memcpy(send_snapshot, c->send_buf.data(), send_len_before);
+    const auto on_send_before = c->on_send;
+    const bool send_armed_before = c->send_armed;
+    CHECK(c->req_body_abandoned);
     // Client Recv with -ENOBUFS during response send must not cut the response.
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));  // -ENOBUFS
     CHECK_GE(loop.conns[cid].fd, 0);
     CHECK_FALSE(loop.conns[cid].req_body_overflow_rejected);
     CHECK_FALSE(loop.conns[cid].keep_alive);
+    CHECK(loop.conns[cid].req_body_abandoned);
+    CHECK_EQ(loop.conns[cid].send_buf.len(), send_len_before);
+    CHECK_EQ(loop.conns[cid].on_send, on_send_before);
+    CHECK_EQ(loop.conns[cid].send_armed, send_armed_before);
+    CHECK_EQ(loop.conns[cid].recv_buf.len(), 0u);
+    CHECK(send_len_before == 0 ||
+          __builtin_memcmp(loop.conns[cid].send_buf.data(), send_snapshot, send_len_before) == 0);
 }
 
 // Client Recv drain during response body streaming (keep_alive=false).
@@ -40347,10 +40361,20 @@ TEST(iouring_downstream_recv, pause_cancel_positive_terminal_race_rearms_once) {
         loop->dispatch(events[0]);
         conn.recv_paused_for_send = false;
         REQUIRE(loop->submit_recv_impl(conn));
+        if (events[0].aux == kPauseCancelAux) {
+            CHECK_FALSE(conn.recv_pause_cancel_pending);
+            CHECK(conn.recv_pause_target_inflight);
+            CHECK(conn.recv_armed);
+            CHECK_EQ(conn.pending_ops, 1u);
+        } else {
+            CHECK(conn.recv_pause_cancel_pending);
+            CHECK_FALSE(conn.recv_pause_target_inflight);
+            CHECK_FALSE(conn.recv_armed);
+            CHECK_EQ(conn.pending_ops, 1u);
+        }
         loop->dispatch(events[1]);
         CHECK_FALSE(conn.recv_pause_cancel_pending);
         CHECK_FALSE(conn.recv_pause_target_inflight);
-        if (!conn.recv_armed) REQUIRE(loop->submit_recv_impl(conn));
         CHECK(conn.recv_armed);
         CHECK_EQ(conn.pending_ops, 1u);
         CHECK_EQ(fixture.guard.loop->backend.pending, 1u);
