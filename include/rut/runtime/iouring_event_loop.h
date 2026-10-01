@@ -3065,9 +3065,18 @@ public:
                 }
                 Connection& c = conns[cid];
                 if (c.fd >= 0) {
+                    const bool was_armed = c.recv_armed;
                     if (!submit_recv_impl(c)) {
                         recv_rearm_cursor = w;
                         return;  // SQ full: retry later
+                    }
+                    if (!was_armed && !c.recv_armed) {
+                        // A pause/cancel rendezvous accepted the request but
+                        // deliberately did not submit a successor yet. Keep
+                        // the bitmap bit until the owner CQE or resume path
+                        // makes the re-arm legal.
+                        recv_rearm_cursor = w;
+                        return;
                     }
                     budget--;
                 }

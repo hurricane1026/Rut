@@ -40754,7 +40754,7 @@ TEST(iouring_downstream_ring_empty, terminal_enobufs_is_flagged_and_rearmed_not_
     loop->rearm_deferred_recvs(/*force=*/false);
     CHECK(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);
-    CHECK_EQ(loop->recv_rearm_count, 0u);
+    CHECK_EQ(loop->recv_rearm_count, 1u);
     CHECK_EQ(loop->backend.pending, 1u);
 
     // Nothing left to do: a second pass must not arm again.
@@ -40885,10 +40885,13 @@ TEST(iouring_downstream_ring_empty, pause_cancel_race_clears_flag_and_resume_arm
     // A send completion may clear the pause before the deferred bitmap is
     // revisited. The outstanding cancel still owns the receive token.
     conn.recv_paused_for_send = false;
+    const u32 sq_tail_before_deferred = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
     loop->rearm_deferred_recvs(/*force=*/true);
     CHECK_FALSE(conn.recv_armed);
     CHECK(conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before_deferred);
+    CHECK_EQ(loop->recv_rearm_count, 1u);
 
     // The cancel completion owns clearing the pause marker. It must not cancel
     // a receive re-armed in the interval between these two CQEs.
@@ -40932,13 +40935,19 @@ TEST(iouring_downstream_ring_empty, pause_cancel_cqe_first_waits_for_recv_termin
     CHECK(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);
 
+    conn.recv_paused_for_send = true;
     loop->dispatch({conn.id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0});
     CHECK_FALSE(conn.recv_armed);
     CHECK(conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 0u);
 
+    loop->defer_recv_rearm(conn);
+    const u32 sq_tail_before_target = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before_target);
     conn.recv_paused_for_send = false;
-    loop->submit_recv(conn);
+    loop->rearm_deferred_recvs(/*force=*/true);
     CHECK(conn.recv_armed);
     CHECK_FALSE(conn.recv_pause_rearm_pending);
     CHECK_EQ(conn.pending_ops, 1u);
