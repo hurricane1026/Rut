@@ -5207,8 +5207,8 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     // the copied prefix already contains this request's complete Content-Length,
     // preserve that request and close after its response; only the pipelined
     // successor was lost in the overflowing CQE.
-    if (conn.req_body_mode == BodyMode::ContentLength && conn.req_content_length != 0 &&
-        conn.req_header_end <= conn.recv_buf.len() &&
+    if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::ContentLength &&
+        conn.req_content_length != 0 && conn.req_header_end <= conn.recv_buf.len() &&
         conn.req_content_length <= conn.recv_buf.len() - conn.req_header_end) {
         // The initial upstream send still owns completion. Keep the buffered
         // current-request bytes available for that send and discard any lossy
@@ -7709,6 +7709,8 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     // request (Case C: stash_len==0 && recv_buf.len()>0). This matches on_upstream_-
     // response's "recv_buf is NOT touched here" handling once a response byte arrives.
     if (conn.retry_req_send_len == 0) {
+        if (conn.req_body_lossy_successor && conn.recv_buf.len() > conn.req_initial_send_len)
+            conn.recv_buf.set_len(conn.req_initial_send_len);
         // Snapshot the request for a reused pooled socket so the rare post-send dead-
         // socket case (origin FIN landing just after take_idle's MSG_PEEK probe) can
         // replay it on a fresh connect even after recv_buf is reset below. Do this
@@ -9327,8 +9329,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         // A lossy recv CQE may have left successor bytes behind the completed
         // current request. This request is already marked Connection: close;
         // discard the damaged successor instead of stashing it for reuse.
-        if (conn.req_body_lossy_successor && conn.recv_buf.len() > conn.req_initial_send_len)
-            conn.recv_buf.reset();
+        if (conn.req_body_lossy_successor && conn.recv_buf.len() != 0) conn.recv_buf.reset();
         if (!pipeline_stash(conn)) {
             loop->close_conn(conn);
             return;

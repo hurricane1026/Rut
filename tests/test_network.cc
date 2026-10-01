@@ -75908,7 +75908,7 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     CHECK_EQ(c->req_body_remaining, 0u);
 
     loop->dispatch({c->id, 3, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
-    CHECK_EQ(c->recv_buf.len(), 0u);  // the damaged successor is discarded after completion
+    CHECK_EQ(c->pipeline_stash_len, 0u);  // the damaged successor is never stashed
     close(downstream[1]);
     close(upstream[1]);
 }

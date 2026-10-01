@@ -219,7 +219,8 @@ public:
                 const bool final_body_send_inflight =
                     final_request_body_send_inflight<Derived>(conn);
                 if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
-                    (conn.request_body_incomplete() || final_body_send_inflight)) {
+                    (conn.request_body_incomplete() || final_body_send_inflight ||
+                     initial_request_send_owner<Derived>(conn))) {
                     respond_request_body_overflow(&self(), conn);
                     return;
                 }

@@ -661,7 +661,8 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         // which corrupts the record stream. A streamed request body is refused with
         // 413 instead of a silent close.
         if (ev.result == -ENOBUFS &&
-            (c.request_body_incomplete() || final_request_body_send_inflight<Self>(c))) {
+            (c.request_body_incomplete() || final_request_body_send_inflight<Self>(c) ||
+             initial_request_send_owner<Self>(c))) {
             respond_request_body_overflow<Self>(loop, c);
             return;
         }
