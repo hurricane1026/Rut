@@ -182,17 +182,21 @@ static void report_io_uring_enomem(u32 failed_shard, u32 shard_count, bool will_
     // optional -- when its registration fails the shard starts without it and
     // nothing says so -- so the suggested limit covers all rings while the
     // minimum stays honest.
-    const u64 required_per_shard_kib =
-        io_uring_shard_required_locked_bytes(
-            kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, page_bytes) /
-        1024;
+    const u64 required_per_shard_bytes = io_uring_shard_required_locked_bytes(
+        kIoUringSqEntries, kIoUringCqEntries, kProvidedBufCount, page_bytes);
+    const u64 required_per_shard_kib = required_per_shard_bytes / 1024;
     const u64 per_shard_kib = io_uring_shard_locked_bytes(kIoUringSqEntries,
                                                           kIoUringCqEntries,
                                                           kProvidedBufCount,
                                                           kLargeProvidedBufCount,
                                                           page_bytes) /
                               1024;
-    const u64 required_total_kib = required_per_shard_kib * shard_count;
+    const u64 optional_per_shard_bytes =
+        io_uring_pbuf_ring_locked_bytes(kLargeProvidedBufCount, page_bytes);
+    const u64 required_total_kib =
+        io_uring_startup_min_locked_bytes(
+            shard_count, required_per_shard_bytes, optional_per_shard_bytes) /
+        1024;
     const u64 total_kib = per_shard_kib * shard_count;
     write_str("io_uring ring creation failed with ENOMEM at shard ");
     write_u32(failed_shard);

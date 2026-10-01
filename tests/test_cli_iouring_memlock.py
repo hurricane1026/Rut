@@ -30,7 +30,9 @@ def round_up_page(n):
 
 # Per-shard charges for the current ring constants (SQ 16384 / CQ 32768, 2048
 # primary + 1024 optional large provided-buffer entries): 1636 KiB required to
-# start and 1652 KiB with every ring, on 4 KiB pages. Keep in sync with
+# start and 1652 KiB with every ring, on 4 KiB pages. For sequential startup,
+# the advertised minimum for two shards is 2*1636 + 16 = 3288 KiB because the
+# first shard can retain its optional ring while the second starts. Keep in sync with
 # io_uring_shard_required_locked_bytes() / io_uring_shard_locked_bytes() in
 # include/rut/runtime/io_uring_memlock.h (unit-tested there against measured
 # kernel values); update when ring sizes change.
@@ -123,7 +125,7 @@ def limits():
 
 def common_needles(limit, hard):
     total = PER_SHARD_KIB * 2
-    required_total = REQUIRED_PER_SHARD_KIB * 2
+    required_total = REQUIRED_PER_SHARD_KIB * 2 + (PER_SHARD_KIB - REQUIRED_PER_SHARD_KIB)
     needles = [
         "RLIMIT_MEMLOCK",
         f"soft {limit // 1024} KiB",

@@ -34,6 +34,16 @@ static_assert((kIoUringSqEntries & (kIoUringSqEntries - 1)) == 0,
               "io_uring SQ entries must be a power of two (the kernel rounds up)");
 
 namespace iouring_memlock_detail {
+constexpr u64 saturating_add(u64 a, u64 b) {
+    const u64 max = ~u64(0);
+    return b > max - a ? max : a + b;
+}
+
+constexpr u64 saturating_mul(u64 a, u64 b) {
+    const u64 max = ~u64(0);
+    return a != 0 && b > max / a ? max : a * b;
+}
+
 // Bytes before the CQE array in the shared ring mapping: params.cq_off.cqes as
 // reported by the kernel (sizeof(struct io_rings) on x86-64, 64-byte cache lines:
 // head/tail/mask/flags/overflow, each cache-line separated). Architectures with
@@ -89,6 +99,22 @@ constexpr u64 io_uring_shard_locked_bytes(
     u32 sq_entries, u32 cq_entries, u32 pbuf_entries, u32 large_pbuf_entries, u64 page_bytes) {
     return io_uring_shard_required_locked_bytes(sq_entries, cq_entries, pbuf_entries, page_bytes) +
            io_uring_pbuf_ring_locked_bytes(large_pbuf_entries, page_bytes);
+}
+
+// Minimum locked memory for sequential startup of all shards. Every shard
+// needs its required rings, while each successful shard before the last can
+// also retain its optional large ring before the final required allocation.
+// Calculated in bytes so page-rounded charges are not mixed with KiB values;
+// saturating arithmetic keeps diagnostics valid if sizing inputs grow beyond
+// the u64 range.
+constexpr u64 io_uring_startup_min_locked_bytes(u32 shard_count,
+                                                u64 required_per_shard,
+                                                u64 optional_per_shard) {
+    using namespace iouring_memlock_detail;
+    const u64 required = saturating_mul(required_per_shard, shard_count);
+    const u64 earlier_optional =
+        saturating_mul(optional_per_shard, shard_count == 0 ? 0 : shard_count - 1);
+    return saturating_add(required, earlier_optional);
 }
 
 }  // namespace rut
