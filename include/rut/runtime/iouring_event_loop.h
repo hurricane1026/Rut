@@ -3052,13 +3052,15 @@ public:
         for (u32 n = 0; n < words && recv_rearm_count != 0 && budget != 0; ++n) {
             const u32 w = (start + n) % words;
             u64 bits = recv_rearm_words[w];
+            u64 retained = 0;
             while (bits != 0) {
                 if (budget == 0) {
                     recv_rearm_cursor = w;  // resume inside this word
                     return;
                 }
                 const u32 cid = (w << 6) + static_cast<u32>(__builtin_ctzll(bits));
-                bits &= bits - 1;
+                const u64 bit = u64{1} << (cid & 63u);
+                bits &= ~bit;
                 if (cid >= slots_initialized) {
                     clear_deferred_recv(cid);
                     continue;
@@ -3075,13 +3077,14 @@ public:
                         // deliberately did not submit a successor yet. Keep
                         // the bitmap bit until the owner CQE or resume path
                         // makes the re-arm legal.
-                        recv_rearm_cursor = w;
-                        return;
+                        retained |= bit;
+                        continue;
                     }
                     budget--;
                 }
                 clear_deferred_recv(cid);
             }
+            recv_rearm_words[w] |= retained;
             recv_rearm_cursor = (w + 1u) % words;
         }
     }

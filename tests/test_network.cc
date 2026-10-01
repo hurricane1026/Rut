@@ -40754,7 +40754,7 @@ TEST(iouring_downstream_ring_empty, terminal_enobufs_is_flagged_and_rearmed_not_
     loop->rearm_deferred_recvs(/*force=*/false);
     CHECK(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);
-    CHECK_EQ(loop->recv_rearm_count, 1u);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
     CHECK_EQ(loop->backend.pending, 1u);
 
     // Nothing left to do: a second pass must not arm again.
@@ -40844,9 +40844,12 @@ TEST(iouring_downstream_ring_empty, closed_or_paused_connection_is_never_armed_w
         loop->rearm_deferred_recvs(/*force=*/false);
         CHECK_FALSE(conn.recv_armed);
         CHECK(conn.recv_pause_rearm_pending);
-        CHECK_EQ(loop->recv_rearm_count, 0u);
+        CHECK_EQ(loop->recv_rearm_count, 1u);
         CHECK_EQ(loop->backend.pending, 0u);
         conn.recv_paused_for_send = false;
+        loop->rearm_deferred_recvs(/*force=*/true);
+        CHECK(conn.recv_armed);
+        CHECK_EQ(loop->recv_rearm_count, 0u);
     }
 }
 
@@ -40975,6 +40978,36 @@ TEST(iouring_downstream_ring_empty, terminal_for_a_closed_connection_reclaims_th
     CHECK_EQ(loop->recv_rearm_count, 0u);
 }
 
+TEST(iouring_downstream_ring_empty, closed_bitmap_owner_reclaims_once_without_rearm) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    Connection& conn = *f.raw.conns[0];
+    const u32 id = conn.id;
+    REQUIRE(loop->pause_recv(conn));
+    CHECK_EQ(conn.pending_ops, 2u);  // target recv plus tagged cancel
+    loop->backend.pending = 0;
+
+    // The target terminal parks a deferred bitmap entry while the cancel owner
+    // remains outstanding.
+    f.terminal(-ENOBUFS);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(loop->recv_rearm_count, 1u);
+    const u32 free_before = loop->free_top;
+
+    // Closing clears the retained bit. The late cancel can reclaim the slot,
+    // but must never use the dead fd to arm a successor.
+    loop->close_conn(conn);
+    CHECK_LT(conn.fd, 0);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
+    CHECK_EQ(loop->pending_free_count, 1u);
+    loop->dispatch({id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    CHECK_EQ(loop->pending_free_count, 0u);
+    CHECK_EQ(loop->free_top, free_before + 1u);
+    CHECK_EQ(loop->recv_rearm_count, 0u);
+    CHECK_EQ(loop->backend.pending, 0u);
+}
+
 TEST(iouring_downstream_ring_empty, dropped_bytes_enobufs_is_not_a_ring_empty_terminal) {
     DownstreamRingEmptyFixture f;
     if (!f.init()) SKIP("io_uring unavailable");
@@ -41061,6 +41094,40 @@ TEST(iouring_downstream_ring_empty, rearm_pass_is_capped_and_resumes_so_all_are_
         parked[k]->pending_ops = 0;
         parked[k]->fd = -1;
     }
+}
+
+TEST(iouring_downstream_ring_empty, blocked_pause_bitmap_entry_does_not_starve_next) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto* loop = f.raw.guard.loop;
+    Connection* blocked = loop->alloc_conn();
+    Connection* ready = loop->alloc_conn();
+    REQUIRE(blocked != nullptr);
+    REQUIRE(ready != nullptr);
+    blocked->fd = 41;
+    blocked->pending_ops = 1;
+    blocked->recv_pause_cancel_pending = true;
+    blocked->recv_pause_rearm_pending = true;
+    ready->fd = 42;
+    loop->defer_recv_rearm(*blocked);
+    loop->defer_recv_rearm(*ready);
+    REQUIRE_EQ(loop->recv_rearm_count, 2u);
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK_FALSE(blocked->recv_armed);
+    CHECK(ready->recv_armed);
+    CHECK_EQ(ready->pending_ops, 1u);
+    CHECK_EQ(loop->recv_rearm_count, 1u);
+    CHECK_EQ(loop->backend.pending, 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before + 1u);
+    const u32 sq_tail_after_ready = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop->rearm_deferred_recvs(/*force=*/true);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_after_ready);
+    loop->backend.pending = 0;
+    blocked->fd = -1;
+    ready->fd = -1;
+    blocked->pending_ops = 0;
+    ready->pending_ops = 0;
 }
 
 TEST(iouring_downstream_ring_empty, timer_tick_is_the_forced_backstop) {
