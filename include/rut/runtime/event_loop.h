@@ -163,7 +163,12 @@ public:
         // discarded upload; consume them without rearming or truncating the
         // queued response send.
         if (conn.req_body_abandoned) {
-            conn.recv_buf.reset();
+            conn.reset_request_receive_buffer();
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
+                if (conn.recv_armed && !conn.recv_pause_cancel_pending)
+                    (void)self().pause_recv(conn);
+            }
             return;
         }
         if (ev.result > 0) {
