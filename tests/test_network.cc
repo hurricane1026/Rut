@@ -75747,6 +75747,54 @@ TEST(state_transition, more_body_to_body_streaming) {
                 nullptr);
 }
 
+TEST(request_body_overflow, informational_origin_response_probe_requires_final_response) {
+    static constexpr const char* kCases[] = {
+        "HTTP/1.1 100 Continue\r\n\r\n",
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\n\r\n",
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nxy",
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nxy",
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
+    };
+    static constexpr const char kLongChain[] =
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 100 Continue\r\n\r\n"
+        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nxy";
+    for (u32 i = 0; i < 6; i++) {
+        SmallLoop loop;
+        loop.setup();
+        auto* c = setup_body_streaming_proxy(loop, 200, 10);
+        REQUIRE(c != nullptr);
+        c->req_body_remaining = 10;
+        c->req_body_mode = BodyMode::ContentLength;
+        c->req_header_end = 1;
+        c->req_content_length = 100000;
+        const char* input = i == 5 ? kLongChain : kCases[i];
+        const u32 input_len = static_cast<u32>(strlen(input));
+        REQUIRE_EQ(c->upstream_recv_buf.write(reinterpret_cast<const u8*>(input), input_len),
+                   input_len);
+        respond_request_body_overflow(&loop, *c);
+        if (i == 3 || i == 4 || i == 5) CHECK_FALSE(c->req_body_overflow_rejected);
+        loop.close_conn(*c);
+    }
+}
+
+TEST(request_body_overflow, final_body_send_inflight_preserves_successor_overflow) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    c->req_body_remaining = 0;
+    c->upstream_send_armed = true;
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 200 OK\r\n\r\n"), 19);
+    loop.handle_unhandled_recv(*c, make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->keep_alive);
+    loop.close_conn(*c);
+}
+
 // State 7: Body chunk recv → send to upstream {up_recv=early_inflight, up_send=body_sent}
 TEST(state_transition, body_recvd_to_body_sent) {
     SmallLoop loop;

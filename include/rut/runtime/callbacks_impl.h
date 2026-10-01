@@ -5167,16 +5167,30 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
 template <typename Loop>
 void respond_request_body_overflow(Loop* loop, Connection& conn) {
     bool complete_early_response = false;
+    const bool final_body_send_inflight =
+        conn.state == ConnState::Proxying && conn.req_body_mode == BodyMode::ContentLength &&
+        conn.req_body_remaining == 0 && conn.upstream_send_armed &&
+        conn.on_upstream_send == &on_request_body_sent<Loop> && !conn.upstream_abandoned;
     if (conn.upstream_recv_buf.len() > 0) {
         HttpResponseParser parser;
         ParsedResponse response;
-        parser.reset();
-        response.reset();
-        complete_early_response =
-            parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &response) ==
-            ParseStatus::Complete;
+        const u8* probe_data = conn.upstream_recv_buf.data();
+        u32 probe_len = conn.upstream_recv_buf.len();
+        for (; probe_len != 0;) {
+            parser.reset();
+            response.reset();
+            if (parser.parse(probe_data, probe_len, &response) != ParseStatus::Complete) break;
+            if (response.status_code == 101 || response.status_code >= 200) {
+                complete_early_response = true;
+                break;
+            }
+            if (parser.header_end == 0 || parser.header_end >= probe_len) break;
+            probe_data += parser.header_end;
+            probe_len -= parser.header_end;
+        }
     }
-    if (conn.state == ConnState::Proxying && !conn.proxy_resp_started && !conn.upstream_abandoned &&
+    if (!final_body_send_inflight && conn.state == ConnState::Proxying &&
+        !conn.proxy_resp_started && !conn.upstream_abandoned &&
         (complete_early_response ||
          conn.on_upstream_send == &on_body_send_with_early_response<Loop>)) {
         // The upstream send completion (on_request_body_sent / on_upstream_request_sent /
@@ -5184,11 +5198,18 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         // the upload abandoned. Nothing more to forward, nothing to reject.
         return;
     }
+    // The final request-body send owns completion of the origin response even
+    // when recv_buf contains only a partial or empty response prefix. Preserve
+    // that owner so on_request_body_sent can finish the response and close.
+    if (final_body_send_inflight) {
+        conn.keep_alive = false;
+        return;
+    }
     // The body counters are advanced only when the in-flight send completes. If
     // the copied prefix already contains this request's complete Content-Length,
     // preserve that request and close after its response; only the pipelined
     // successor was lost in the overflowing CQE.
-    if (conn.req_body_mode == BodyMode::ContentLength &&
+    if (conn.req_body_mode == BodyMode::ContentLength && conn.req_content_length != 0 &&
         conn.req_header_end <= conn.recv_buf.len() &&
         conn.req_content_length <= conn.recv_buf.len() - conn.req_header_end) {
         conn.req_body_remaining = 0;
@@ -9360,8 +9381,12 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         // io_uring: the CQE did not fit in recv_buf and its tail was dropped.
         if constexpr (loop_backend_async_io<Loop>() &&
                       requires(Loop* l, Connection& c) { l->pause_recv(c); }) {
+            const bool final_body_send_inflight =
+                conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0 &&
+                conn.upstream_send_armed && conn.on_upstream_send == &on_request_body_sent<Loop> &&
+                !conn.upstream_abandoned;
             if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
-                conn.request_body_incomplete()) {
+                (conn.request_body_incomplete() || final_body_send_inflight)) {
                 respond_request_body_overflow<Loop>(loop, conn);
                 return;
             }
