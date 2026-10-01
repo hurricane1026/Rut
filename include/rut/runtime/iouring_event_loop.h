@@ -3169,7 +3169,7 @@ public:
     bool process_buffered_tls_input(Connection& c) {
         if (!c.uses_iouring_tls() || c.tls_in_buf.len() == 0 || c.tls_out_inflight) return false;
         tls_process<Self>(this, c);
-        if (c.tls_active && c.req_body_abandoned &&
+        if (c.tls_active && (c.req_body_abandoned || c.req_body_overflow_rejected) &&
             c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
             tls_discard_abandoned_input<Self>(this, c);
         return true;
