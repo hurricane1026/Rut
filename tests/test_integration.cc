@@ -6983,6 +6983,45 @@ TEST(tls_iouring, overflow_owned_recv_error_closes_but_unowned_late_input_is_ign
     CHECK_FALSE(conn.tls_active);
 }
 
+TEST(tls_iouring, preserved_response_owner_discards_late_overflow_but_want_read_closes) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[64];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.req_body_lossy_successor = true;
+    conn.proxy_resp_started = true;
+    conn.state = ConnState::Sending;
+    conn.send_armed = true;
+    conn.on_send = &on_proxy_response_sent<TlsIouringHarness>;
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.send_slice = loop.send_storage[0];
+    conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
+    static constexpr char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(conn.send_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1),
+               sizeof(kResponse) - 1);
+    conn.pending_ops = 1;
+    const u8* source = conn.send_buf.data();
+    const u32 length = conn.send_buf.len();
+    conn.tls_in_buf.write(reinterpret_cast<const u8*>("late"), 4);
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_EQ(conn.fd, 42);
+    CHECK(conn.send_armed);
+    CHECK_EQ(conn.send_buf.data(), source);
+    CHECK_EQ(conn.send_buf.len(), length);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK(loop.closed);
+    CHECK_FALSE(conn.tls_active);
+}
+
 TEST(tls_iouring, abandoned_late_recv_discards_ciphertext_and_clears_want_read) {
     TlsIouringHarness loop;
     Connection& conn = loop.conns[0];
