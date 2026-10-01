@@ -6459,7 +6459,9 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     IoEvent late_positive = make_ev(c->id, IoEventType::Recv, 4096);
     late_positive.more = 1;
     loop->dispatch(late_positive);
-    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    IoEvent late_loss = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
+    late_loss.more = 1;
+    loop->dispatch(late_loss);
     CHECK(c->fd >= 0);
     CHECK_EQ(c->send_buf.len(), response_len);
     CHECK_EQ(c->recv_buf.len(), 0u);
