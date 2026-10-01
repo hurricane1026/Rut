@@ -5253,13 +5253,23 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     // later lossy recv then belongs solely to a pipelined successor while the
     // complete current request is already owned by the upstream response
     // callback. Preserve that response and close after it drains.
+    const bool request_framing_complete =
+        conn.req_body_mode == BodyMode::None ||
+        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state == ChunkedParser::State::Complete);
     if (conn.state == ConnState::Proxying && conn.request_upload_complete &&
-        !conn.upstream_request_incomplete && !conn.upstream_abandoned &&
-        conn.on_upstream_recv != nullptr && conn.on_upstream_send == nullptr) {
+        !conn.upstream_request_incomplete && !conn.upstream_abandoned && conn.upstream_fd >= 0 &&
+        conn.on_upstream_recv == &on_upstream_response<Loop> && conn.on_upstream_send == nullptr &&
+        !conn.proxy_resp_started && request_framing_complete) {
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
+        conn.reset_request_receive_buffer();
         conn.pipeline_stash_len = 0;
-        if (conn.retry_req_send_len == 0) conn.send_buf.reset();
+        if (conn.retry_req_send_len == 0)
+            conn.send_buf.reset();
+        else
+            conn.send_buf.set_len(conn.retry_req_send_len);
         return;
     }
     conn.req_body_overflow_rejected = true;
