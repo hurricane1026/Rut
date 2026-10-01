@@ -7691,7 +7691,7 @@ TEST(tls_iouring, abandoned_positive_want_read_discards_real_tls_plaintext) {
     destroy_tls_server_context(tls_ctx.value());
 }
 
-TEST(tls_iouring, overflow_rejected_positive_want_read_discards_real_tls_plaintext) {
+TEST(tls_iouring, preserved_tls_owner_late_enobufs_then_want_read_plaintext) {
     auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
     REQUIRE(tls_ctx.has_value());
     TlsIouringHarness loop;
@@ -7733,6 +7733,7 @@ TEST(tls_iouring, overflow_rejected_positive_want_read_discards_real_tls_plainte
         tls_fill_output<TlsIouringHarness>(&loop, conn, kResponse, sizeof(kResponse) - 1, consumed),
         TlsFill::Done);
     REQUIRE_EQ(consumed, sizeof(kResponse) - 1u);
+    CHECK_FALSE(conn.req_body_overflow_rejected);
     const u32 raw_len = conn.tls_out_inflight_len;
     const u32 raw_generation = conn.tls_out_inflight_generation;
     REQUIRE_GT(raw_len, 0u);
