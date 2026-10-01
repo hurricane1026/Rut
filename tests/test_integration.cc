@@ -6436,6 +6436,29 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     loop->shutdown();
 }
 
+TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+    Connection* c = make_uploading_conn(*loop, 0, 40000);
+    REQUIRE(c != nullptr);
+    static constexpr char kResponse[] =
+        "HTTP/1.1 401 Unauthorized\\r\\nContent-Length: 0\\r\\n\\r\\n";
+    REQUIRE(c->send_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1) ==
+            sizeof(kResponse) - 1);
+    c->req_body_abandoned = true;
+    c->state = ConnState::Sending;
+    c->send_armed = true;
+    c->on_send = &on_response_sent<IoUringEventLoop>;
+    const u32 response_len = c->send_buf.len();
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, 4096));
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    CHECK(c->fd >= 0);
+    CHECK_EQ(c->send_buf.len(), response_len);
+    CHECK(c->send_armed);
+    CHECK_EQ(c->state, ConnState::Sending);
+    loop->shutdown();
+}
+
 TEST(uring, request_body_overflow_is_answered_with_413) {
     auto loop = std::make_unique<IoUringEventLoop>();
     if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
