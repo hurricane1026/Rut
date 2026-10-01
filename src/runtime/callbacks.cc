@@ -998,7 +998,13 @@ void prepare_early_response_state(Connection& conn) {
         conn.reset_request_receive_buffer();
         conn.keep_alive = false;
     } else {
-        if (!pipeline_stash(conn)) conn.keep_alive = false;
+        // A lossy downstream CQE may have appended a damaged successor after
+        // this complete request. Preserve the response owner while discarding
+        // that suffix; stashing it would expose truncated bytes to the parser.
+        if (conn.req_body_lossy_successor)
+            conn.recv_buf.reset();
+        else if (!pipeline_stash(conn))
+            conn.keep_alive = false;
         conn.reset_request_receive_buffer();
     }
     if (conn.upstream_start_us == 0) conn.upstream_start_us = monotonic_us();

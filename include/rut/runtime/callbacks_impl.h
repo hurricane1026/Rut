@@ -5193,6 +5193,8 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         // The upstream send completion (on_request_body_sent / on_upstream_request_sent /
         // on_body_send_with_early_response) picks the buffered response up and marks
         // the upload abandoned. Nothing more to forward, nothing to reject.
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
         return;
     }
     // The final request-body send owns completion of the origin response even

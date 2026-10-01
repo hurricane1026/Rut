@@ -35060,6 +35060,74 @@ TEST(response_headers, early_response_reserves_snapshot_before_pipeline_stash) {
           0);
 }
 
+TEST(request_body_overflow, complete_early_response_marks_lossy_successor) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->fd = 42;
+    c->state = ConnState::Proxying;
+    c->req_body_mode = BodyMode::None;
+    static constexpr char kFirst[] = "GET /first HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kNext[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kFirst), sizeof(kFirst) - 1),
+               sizeof(kFirst) - 1);
+    c->req_initial_send_len = c->recv_buf.len();
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kNext), sizeof(kNext) - 1),
+               sizeof(kNext) - 1);
+    static constexpr char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1),
+        sizeof(kResponse) - 1);
+    c->on_upstream_send = &on_body_send_with_early_response<SmallLoop>;
+    respond_request_body_overflow(&loop, *c);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->keep_alive);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    on_body_send_with_early_response<SmallLoop>(
+        static_cast<void*>(&loop),
+        *c,
+        make_ev(c->id, IoEventType::UpstreamSend, static_cast<i32>(c->req_initial_send_len)));
+    CHECK_EQ(c->resp_status, static_cast<u16>(200));
+    CHECK_EQ(c->pipeline_stash_len, 0u);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    CHECK_EQ(c->on_send, &on_proxy_response_sent<SmallLoop>);
+    CHECK_EQ(c->on_upstream_recv, nullptr);
+    CHECK_EQ(c->upstream_send_len, sizeof(kResponse) - 1u);
+    CHECK(buf_has(c->upstream_recv_buf.data(), c->upstream_recv_buf.len(), kResponse));
+    CHECK_FALSE(c->keep_alive);
+    CHECK_EQ(c->send_buf.len(), 0u);
+}
+
+TEST(request_body_overflow, complete_probe_marks_initial_owner_lossy_successor) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->fd = 42;
+    c->upstream_fd = 43;
+    c->state = ConnState::Proxying;
+    c->req_body_mode = BodyMode::None;
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    c->req_initial_send_len = c->recv_buf.len();
+    static constexpr char kResponse[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(
+        c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1),
+        sizeof(kResponse) - 1);
+    c->upstream_send_armed = false;
+    c->on_upstream_send = &on_upstream_request_sent<SmallLoop>;
+    CHECK_FALSE(initial_request_send_owner<SmallLoop>(*c));
+    respond_request_body_overflow(&loop, *c);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->keep_alive);
+}
+
 TEST(response_headers, failed_initial_send_reserves_snapshot_before_pipeline_stash) {
     SmallLoop loop;
     loop.setup();
