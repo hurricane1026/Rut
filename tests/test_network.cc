@@ -76243,6 +76243,11 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     CHECK_EQ(response_send.offset, 0u);
     CHECK_EQ(response_send.remaining, response_send_len);
     CHECK_EQ(response_send.type, IoEventType::Send);
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_EQ(c->fd, response_send.fd);
+    CHECK_EQ(loop->backend.send_state[c->id].src, response_send.src);
+    CHECK_EQ(loop->backend.send_state[c->id].offset, 0u);
+    CHECK_EQ(loop->backend.send_state[c->id].remaining, response_send_len);
     loop->backend.send_state[c->id].offset = response_send_len;
     loop->backend.send_state[c->id].remaining = 0;
     loop->dispatch({c->id, static_cast<i32>(response_send_len), 0, 0, IoEventType::Send, 0, 0});
