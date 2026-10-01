@@ -647,13 +647,14 @@ public:
     }
 
     // A deferred idle-pool return (return_idle_upstream) whose cancelled multishot
-    // recv has not drained yet: idle_return_fd/idle_return_config are still pinned,
-    // so the successor-neutrality predicates would reject request 2. Same condition
-    // as close_conn_impl's idle_return_recv_draining. try_deferred_upstream_rearm
-    // clears the pin and publishes readiness when the drain completes.
+    // recv has not drained yet. Usually idle_return_fd/config are still pinned, but
+    // cancel submission can fail after upstream_fd is closed and leave only the
+    // cancel-inflight ownership marker. Either form must reject request 2 until the
+    // old recv terminal drains; try_deferred_upstream_rearm publishes readiness then.
     static bool idle_return_drain_blocks_boundary(const Connection& c) {
-        return c.idle_return_fd >= 0 && (c.upstream_recv_armed || c.upstream_recv_cancel_inflight ||
-                                         c.upstream_recv_pause_cancel_pending);
+        return c.upstream_recv_cancel_inflight ||
+               (c.idle_return_fd >= 0 &&
+                (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending));
     }
 
     void maybe_publish_http1_boundary_ready(Connection& c) {
@@ -5682,6 +5683,7 @@ public:
             c.upstream_recv_close_quarantine = false;
             c.upstream_recv_buf.reset();
         }
+        if (c.idle_return_fd < 0 && kUpstreamRecvDrained) maybe_publish_http1_boundary_ready(c);
         if (c.close_after_idle_return && kUpstreamRecvDrained) {
             c.close_after_idle_return = false;
             this->free_conn(c);

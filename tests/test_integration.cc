@@ -13793,6 +13793,120 @@ TEST(proxy_reuse, parked_boundary_resolved_during_shard_drain_closes_iouring) {
     close(lfd);
 }
 
+// If the idle-return cancel cannot be submitted under SQ pressure, the upstream fd is
+// closed but its old multishot recv remains an independent boundary owner. Request 2 must
+// stay parked until that old recv reaches its terminal CQE; closing the downstream first
+// must also reclaim the slot without publishing a dead boundary.
+TEST(proxy_reuse, idle_return_cancel_failure_keeps_boundary_parked_until_terminal_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg{};
+    shard.active_config = &cfg;
+
+    Connection* const slot = shard.loop->alloc_conn();
+    REQUIRE(slot != nullptr);
+    auto& c = *slot;
+    i32 cli[2];
+    i32 upstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, upstream), 0);
+    c.fd = cli[0];
+    c.state = ConnState::Sending;
+    c.upstream_fd = upstream[0];
+    c.upstream_recv_armed = true;
+    c.pending_ops = 1;
+    c.on_send = &on_response_body_sent<IoUringEventLoop>;
+    c.on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+
+    const u32 tail_before = __atomic_load_n(shard.loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 pending_before = shard.loop->backend.pending;
+    const i32 ring_fd = shard.loop->backend.ring_fd;
+    const u32 head = __atomic_load_n(shard.loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    shard.loop->backend.ring_fd = -1;
+    __atomic_store_n(
+        shard.loop->backend.sq_tail, head + shard.loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+    shard.loop->return_idle_upstream(c, 5, 0);
+    shard.loop->backend.ring_fd = ring_fd;
+    __atomic_store_n(shard.loop->backend.sq_tail, tail_before, __ATOMIC_RELEASE);
+    shard.loop->backend.pending = pending_before;
+
+    CHECK_EQ(c.upstream_fd, -1);
+    CHECK_EQ(c.idle_return_fd, -1);
+    CHECK(c.upstream_recv_cancel_inflight);
+    CHECK(c.upstream_recv_terminal_stale);
+    REQUIRE(shard.loop->defer_http1_request_boundary(c));
+    CHECK(c.http1_boundary_deferred);
+    CHECK_FALSE(c.http1_boundary_ready);
+    CHECK_FALSE(shard.loop->http1_boundary_ready_pending);
+
+    const IoEvent old_recv{c.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, c.upstream_episode};
+    shard.loop->dispatch(old_recv);
+    CHECK_FALSE(c.upstream_recv_cancel_inflight);
+    CHECK_FALSE(c.upstream_recv_armed);
+    CHECK(c.http1_boundary_deferred);
+    CHECK(c.http1_boundary_ready);
+    CHECK(shard.loop->http1_boundary_ready_pending);
+    shard.loop->maybe_publish_http1_boundary_ready(c);
+    CHECK(c.http1_boundary_ready);  // readiness is published exactly once
+
+    c.http1_boundary_deferred = false;
+    c.http1_boundary_ready = false;
+    shard.loop->http1_boundary_ready_pending = false;
+    close(cli[1]);
+    close(upstream[1]);
+    c.fd = -1;
+    shard.loop->shutdown();
+    close(lfd);
+
+    // Repeat the failed cancel, but close the downstream before the old recv terminal.
+    Shard<IoUringEventLoop> closed_shard;
+    lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(closed_shard.init(0, lfd).has_value());
+    closed_shard.active_config = &cfg;
+    Connection* const closed_slot = closed_shard.loop->alloc_conn();
+    REQUIRE(closed_slot != nullptr);
+    auto& closed = *closed_slot;
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, upstream), 0);
+    closed.fd = cli[0];
+    closed.state = ConnState::Sending;
+    closed.upstream_fd = upstream[0];
+    closed.upstream_recv_armed = true;
+    closed.pending_ops = 1;
+    const u32 closed_tail = __atomic_load_n(closed_shard.loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 closed_pending = closed_shard.loop->backend.pending;
+    const i32 closed_ring_fd = closed_shard.loop->backend.ring_fd;
+    const u32 closed_head = __atomic_load_n(closed_shard.loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    closed_shard.loop->backend.ring_fd = -1;
+    __atomic_store_n(closed_shard.loop->backend.sq_tail,
+                     closed_head + closed_shard.loop->backend.sq_ring_entries,
+                     __ATOMIC_RELEASE);
+    closed_shard.loop->return_idle_upstream(closed, 6, 0);
+    closed_shard.loop->backend.ring_fd = closed_ring_fd;
+    __atomic_store_n(closed_shard.loop->backend.sq_tail, closed_tail, __ATOMIC_RELEASE);
+    closed_shard.loop->backend.pending = closed_pending;
+    REQUIRE(closed_shard.loop->defer_http1_request_boundary(closed));
+    const u32 free_before_close = closed_shard.loop->free_top;
+    closed_shard.loop->close_conn_impl(closed);
+    CHECK_FALSE(closed.http1_boundary_deferred);
+    CHECK_FALSE(closed_shard.loop->http1_boundary_ready_pending);
+    const IoEvent closed_old_recv{
+        closed.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, closed.upstream_episode};
+    closed_shard.loop->dispatch(closed_old_recv);
+    CHECK_FALSE(closed_shard.loop->http1_boundary_ready_pending);
+    CHECK_EQ(closed_shard.loop->free_top, free_before_close + 1u);
+    close(cli[1]);
+    close(upstream[1]);
+    closed_shard.shutdown();
+    close(lfd);
+}
+
 #if RUT_ENABLE_JIT_TESTS
 // Client-visible form of the same bug on a real io_uring loop with a real upstream. A
 // request whose upstream recv is multishot (any request with a body or a Content-Length
