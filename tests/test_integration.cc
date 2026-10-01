@@ -6422,6 +6422,7 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     c->upstream_fd = 99;
     c->upstream_episode = 1;
     c->upstream_send_armed = true;
+    c->upstream_recv_armed = false;
     c->pending_ops = 2;
     c->on_upstream_send = &on_request_body_sent<IoUringEventLoop>;
     IoEvent late_loss = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
@@ -6433,7 +6434,7 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     CHECK_FALSE(c->request_upload_complete);
     loop->dispatch({c->id, 1, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
     CHECK(c->request_upload_complete);
-    CHECK_EQ(c->pending_ops, 2u);
+    CHECK_EQ(c->pending_ops, 3u);
     CHECK(c->recv_armed);
     CHECK(c->upstream_recv_armed);
     CHECK_FALSE(c->upstream_send_armed);
