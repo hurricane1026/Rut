@@ -676,6 +676,18 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         tls_discard_abandoned_input<Self>(loop, c);
         return;
     }
+    // The first non-empty-ring overflow establishes the lossy successor only
+    // when the TLS response owner is exact. WANT_READ owns ciphertext input and
+    // remains the exception.
+    if (c.tls_active && ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+        !c.req_body_lossy_successor &&
+        c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self> &&
+        preserved_response_late_recv_owner<Self>(c)) {
+        c.req_body_lossy_successor = true;
+        c.keep_alive = false;
+        tls_discard_abandoned_input<Self>(loop, c);
+        return;
+    }
     // A lossy successor is never TLS input for the committed response.  Keep
     // the raw response send owner intact while discarding both positive CQEs
     // already copied by io_uring and the specific non-empty-ring overflow CQE.
