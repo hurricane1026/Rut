@@ -593,7 +593,7 @@ void tls_process(Self* loop, Connection& c) {
         if (c.tls_in_buf.len() == 0 || c.recv_buf.write_avail() == 0) break;
         tls_engine_set_input(c.tls_engine, c.tls_in_buf.data(), c.tls_in_buf.len());
     }
-    if (c.req_body_abandoned) {
+    if (c.req_body_abandoned || c.req_body_overflow_rejected) {
         c.reset_request_receive_buffer();
         if (c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
             tls_discard_abandoned_input<Self>(loop, c);
@@ -643,7 +643,7 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
                 return;
             }
             tls_process<Self>(loop, c);
-            if (c.req_body_abandoned) {
+            if (c.req_body_abandoned || c.req_body_overflow_rejected) {
                 c.reset_request_receive_buffer();
                 if (c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
                     tls_discard_abandoned_input<Self>(loop, c);
@@ -657,8 +657,19 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
     // the pending TLS send continuation still has to feed that send; unrelated
     // late upload CQEs remain discarded.
     if (c.req_body_overflow_rejected) {
+        if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> && ev.result <= 0) {
+            tls_discard_abandoned_input<Self>(loop, c);
+            c.tls_pending_on_recv = nullptr;
+            loop->close_conn(c);
+            return;
+        }
         if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> && ev.result > 0) {
             tls_process<Self>(loop, c);
+            if (c.tls_active && c.req_body_overflow_rejected &&
+                c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
+                c.reset_request_receive_buffer();
+                tls_discard_abandoned_input<Self>(loop, c);
+            }
             return;
         }
         return;

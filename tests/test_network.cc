@@ -75898,7 +75898,9 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
     CHECK(c->req_body_overflow_rejected);
     CHECK_FALSE(c->keep_alive);
-    CHECK_EQ(c->fd, -1);
+    CHECK_GE(c->fd, 0);
+    CHECK_EQ(c->resp_status, static_cast<u16>(413));
+    CHECK(c->send_armed);
     close(downstream[1]);
     close(upstream[1]);
 }

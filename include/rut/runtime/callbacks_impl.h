@@ -5234,7 +5234,9 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
                 break;
         }
         if (probe.state == ChunkedParser::State::Complete) {
-            conn.req_chunk_parser = probe;
+            // Keep the live parser at the pre-CQE boundary. The completion
+            // callback must forward the exact suffix through the real parser;
+            // the probe only classifies whether the suffix completes this body.
             conn.req_body_lossy_successor = true;
             conn.keep_alive = false;
             return;
