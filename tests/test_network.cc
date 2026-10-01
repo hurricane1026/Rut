@@ -76731,7 +76731,7 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
             CHECK_EQ(c->state, ConnState::Sending);
             CHECK_EQ(c->resp_status, static_cast<u16>(413));
             CHECK_EQ(c->on_upstream_send, nullptr);
-            CHECK_FALSE(c->upstream_connect_armed);
+            CHECK(c->upstream_connect_armed);
             CHECK(buf_contains(reinterpret_cast<const char*>(c->send_buf.data()),
                                c->send_buf.len(),
                                "HTTP/1.1 413 Payload Too Large",
@@ -76741,6 +76741,17 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
                                "Connection: close",
                                17));
             const u32 response_len = c->send_buf.len();
+            CHECK_EQ(loop->backend.send_state[c->id].src, c->send_buf.data());
+            CHECK_EQ(loop->backend.send_state[c->id].offset, 0u);
+            CHECK_EQ(loop->backend.send_state[c->id].remaining, response_len);
+            const u32 pending_before_connect_cancel = c->pending_ops;
+            loop->dispatch(
+                {c->id, -ECANCELED, 0, 0, IoEventType::UpstreamConnect, 0, 0, c->upstream_episode});
+            CHECK_FALSE(c->upstream_connect_armed);
+            CHECK_EQ(c->pending_ops, pending_before_connect_cancel - 1u);
+            CHECK_EQ(c->state, ConnState::Sending);
+            CHECK_EQ(c->resp_status, static_cast<u16>(413));
+            CHECK(c->send_armed);
             CHECK_EQ(loop->backend.send_state[c->id].src, c->send_buf.data());
             CHECK_EQ(loop->backend.send_state[c->id].offset, 0u);
             CHECK_EQ(loop->backend.send_state[c->id].remaining, response_len);
@@ -76797,6 +76808,42 @@ TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_reject
         close(downstream[1]);
         close(upstream[1]);
     }
+}
+
+TEST(request_body_overflow, iouring_connect_owner_upgrade_rejects_lossy_successor) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    downstream[0] = -1;
+    upstream[0] = -1;
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    static constexpr char kRequest[] =
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\n"
+        "Upgrade: websocket\r\n\r\nNEXT";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(*c);
+    REQUIRE(c->req_wants_upgrade);
+    c->state = ConnState::Proxying;
+    c->upstream_connect_armed = true;
+    c->recv_armed = true;
+    c->pending_ops = 2;
+    c->on_upstream_send = &on_upstream_connected<IoUringEventLoop>;
+    c->upstream_episode = 1;
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_EQ(c->fd, -1);
+    CHECK_FALSE(c->req_body_lossy_successor);
+    CHECK_FALSE(c->is_ws_tunnel);
+    close(downstream[1]);
+    close(upstream[1]);
 }
 
 TEST(request_body_overflow, iouring_bodyless_initial_owner_preserves_response) {

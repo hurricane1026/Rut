@@ -168,7 +168,7 @@ template <typename Loop>
 inline bool initial_connect_request_owner(const Connection& conn) {
     return conn.state == ConnState::Proxying && conn.upstream_connect_armed &&
            conn.upstream_fd >= 0 && !conn.upstream_abandoned && !conn.proxy_resp_started &&
-           conn.on_upstream_send == &on_upstream_connected<Loop> &&
+           conn.on_upstream_send == &on_upstream_connected<Loop> && !conn.req_wants_upgrade &&
            ordinary_local_response_request_boundary_reusable(conn);
 }
 

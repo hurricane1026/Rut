@@ -7752,6 +7752,18 @@ TEST(tls_iouring, preserved_tls_owner_late_enobufs_then_want_read_plaintext) {
     CHECK_EQ(conn.tls_out_inflight_len, response_length);
     CHECK_EQ(loop.backend.send_state[conn.id].src, response_source);
     CHECK_EQ(loop.backend.send_state[conn.id].remaining, response_length);
+    // A positive CQE from the damaged successor is already copied by io_uring,
+    // but must not enter TLS processing or consume the preserved response owner.
+    static constexpr u8 kDiscardedCiphertext = 0x17;
+    REQUIRE_EQ(conn.tls_in_buf.write(&kDiscardedCiphertext, 1), 1u);
+    conn.recv_armed = false;
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 1, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK(conn.tls_out_inflight);
+    CHECK_EQ(conn.tls_out_inflight_src, response_source);
+    CHECK_EQ(conn.tls_out_inflight_len, response_length);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK_FALSE(g_tls_iouring_logical_send_called);
     conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
 
     REQUIRE(SSL_write(cl.ssl, kNextRequest, sizeof(kNextRequest) - 1) ==

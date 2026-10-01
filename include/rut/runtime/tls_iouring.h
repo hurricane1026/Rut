@@ -676,18 +676,23 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         tls_discard_abandoned_input<Self>(loop, c);
         return;
     }
+    // A lossy successor is never TLS input for the committed response.  Keep
+    // the raw response send owner intact while discarding both positive CQEs
+    // already copied by io_uring and the specific non-empty-ring overflow CQE.
+    // A WANT_READ continuation is the one exception: it owns the ciphertext
+    // needed to resume the pending TLS send.
+    if (c.state == ConnState::Sending && c.req_body_lossy_successor &&
+        !c.upstream_request_incomplete && c.tls_active && c.send_armed && c.proxy_resp_started &&
+        c.tls_out_inflight && c.tls_send_owner_generation != 0 &&
+        c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self> &&
+        (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty))) {
+        tls_discard_abandoned_input<Self>(loop, c);
+        return;
+    }
     if (ev.result <= 0) {  // peer EOF or recv error
         if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
             initial_connect_request_owner<Self>(c)) {
             respond_request_body_overflow(loop, c);
-            return;
-        }
-        if (ev.result == -ENOBUFS && !ev.provided_ring_empty && c.state == ConnState::Sending &&
-            c.req_body_lossy_successor && !c.upstream_request_incomplete && c.tls_active &&
-            c.send_armed && c.proxy_resp_started && c.tls_out_inflight &&
-            c.tls_send_owner_generation != 0 &&
-            c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
-            tls_discard_abandoned_input<Self>(loop, c);
             return;
         }
         // -ENOBUFS: the backend dropped the tail of a CQE that did not fit tls_in_buf,
