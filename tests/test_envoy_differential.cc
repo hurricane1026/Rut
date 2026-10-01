@@ -1717,6 +1717,13 @@ private:
 // launched").
 int g_docker_rm_invocations = 0;
 
+// How long docker_rm_force() keeps re-running `docker rm -f` after a
+// nonzero exit that does not say "No such container" before giving up. A
+// test hook: the always-on self-tests shrink it so their stubbed
+// "daemon unavailable" cases fail fast, and the race case below proves the
+// retry itself. Real teardown keeps the default.
+int g_docker_rm_confirm_window_ms = 5000;
+
 // Runs `docker rm -f <name>` (via docker_binary(), so a self-test can
 // redirect this away from the real Docker CLI) and decides whether it is
 // now safe to consider the container gone. Sweep-3 review, "Preserve
@@ -1724,23 +1731,52 @@ int g_docker_rm_invocations = 0;
 // mean the container is still there -- `docker rm -f` on a container that
 // is already gone (e.g. `docker run --rm` already cleaned it up, or a
 // previous call's teardown already removed it) also exits nonzero, with
-// "No such container" in its output. Any OTHER failure (the daemon
-// temporarily unavailable, a lost connection, the CLI missing) genuinely
-// leaves the container behind, so counts as failure here: the caller must
-// keep `launched` set so the next stop() call (or the destructor's
-// automatic one) retries, rather than silently abandoning a live container
-// and the host-network listener it holds. Always increments
+// "No such container" in its output.
+//
+// A nonzero exit can also be transient. EnvoyInstance::stop() sends the
+// docker-run client SIGTERM and then calls this; Envoy exits within
+// milliseconds, at which point the daemon's own `--rm` auto-removal of the
+// container is under way, and a `docker rm -f` that lands inside that
+// window is refused with "removal of container ... is already in
+// progress" (CI hit this on otherwise green runs). The container is being
+// removed, not left behind, so this does not match on that message text
+// (which belongs to the daemon and may change) but instead re-runs
+// `docker rm -f` every 200 ms until it confirms removal -- exit 0 or "No
+// such container" -- or `g_docker_rm_confirm_window_ms` elapses. Any
+// failure that persists for the whole window (the daemon unavailable, a
+// lost connection, the CLI missing) genuinely leaves the container behind,
+// so counts as failure here: the caller must keep `launched` set so the
+// next stop() call (or the destructor's automatic one) retries, rather
+// than silently abandoning a live container and the host-network listener
+// it holds. A capture that could not reap the CLI's status is never
+// retried (see run_and_capture()). Always increments
 // `g_docker_rm_invocations` exactly once per call, regardless of outcome
-// (self-tests assert on this counter).
-bool docker_rm_force(const std::string& name) {
+// or how many times the CLI ran (self-tests assert on this counter). On
+// failure, `*detail` (when given) receives the last CLI output and exit
+// status so the FAIL message says what docker actually reported.
+bool docker_rm_force(const std::string& name, std::string* detail = nullptr) {
     g_docker_rm_invocations++;
-    std::string output;
-    int exit_code = -1;
-    if (!run_and_capture({docker_binary(), "rm", "-f", name}, 10'000, &output, &exit_code)) {
-        return false;
+    const int64_t deadline = now_ms() + g_docker_rm_confirm_window_ms;
+    for (;;) {
+        std::string output;
+        int exit_code = -1;
+        if (!run_and_capture({docker_binary(), "rm", "-f", name}, 10'000, &output, &exit_code)) {
+            if (detail != nullptr) *detail = "docker rm -f could not be run or reaped";
+            return false;
+        }
+        if (exit_code == 0) return true;
+        if (output.find("No such container") != std::string::npos) return true;
+        if (now_ms() >= deadline) {
+            if (detail != nullptr) {
+                while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+                    output.pop_back();
+                }
+                *detail = "docker rm -f exited " + std::to_string(exit_code) + ": " + output;
+            }
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    if (exit_code == 0) return true;
-    return output.find("No such container") != std::string::npos;
 }
 
 // Renders a `waitpid` status for a FAIL message: "exited N" for a normal
@@ -1781,6 +1817,22 @@ struct EnvoyInstance {
     // `name`/`pid` for a new attempt: sweep-6 review, "Abort retries when
     // failed Envoy cleanup remains pending".
     bool docker_cleanup_failed = false;
+    // What docker_rm_force() last reported when it failed; appended to the
+    // "docker rm -f failed to remove the container" descriptions so a CI
+    // log shows the daemon's actual error instead of only the conclusion.
+    std::string docker_rm_failure;
+
+    bool remove_container() {
+        docker_rm_failure.clear();
+        return docker_rm_force(name, &docker_rm_failure);
+    }
+
+    std::string cleanup_failure_description() const {
+        std::string description =
+            "docker rm -f failed to remove the container; it may still be running";
+        if (!docker_rm_failure.empty()) description += " (" + docker_rm_failure + ")";
+        return description;
+    }
 
     bool launch(const std::string& bootstrap_path, uint16_t /*listen_port*/) {
         // docker run --pull=never --rm --network host --name <name>
@@ -1902,13 +1954,12 @@ struct EnvoyInstance {
                 // actually gone. A failed removal leaves `launched` set so
                 // a later stop() call (or the destructor's automatic one)
                 // retries, instead of silently abandoning a live container.
-                if (docker_rm_force(name)) {
+                if (remove_container()) {
                     launched = false;
                 } else {
                     exited_unexpectedly = true;
                     docker_cleanup_failed = true;
-                    unexpected_exit_description =
-                        "docker rm -f failed to remove the container; it may still be running";
+                    unexpected_exit_description = cleanup_failure_description();
                     return false;
                 }
             }
@@ -1931,10 +1982,14 @@ struct EnvoyInstance {
             // unexpected exit regardless, but `launched` must stay true on
             // a failed removal so a later stop() call retries.
             if (launched) {
-                if (docker_rm_force(name)) {
+                if (remove_container()) {
                     launched = false;
                 } else {
                     docker_cleanup_failed = true;
+                    // launch_envoy_with_port_retry() reports this description
+                    // when it refuses to retry over a failed cleanup, so the
+                    // daemon's error must not be lost behind the exit status.
+                    unexpected_exit_description += "; " + cleanup_failure_description();
                 }
             }
             return false;
@@ -1962,10 +2017,14 @@ struct EnvoyInstance {
             // unexpected exit regardless, but `launched` must stay true on
             // a failed removal so a later stop() call retries.
             if (launched) {
-                if (docker_rm_force(name)) {
+                if (remove_container()) {
                     launched = false;
                 } else {
                     docker_cleanup_failed = true;
+                    // launch_envoy_with_port_retry() reports this description
+                    // when it refuses to retry over a failed cleanup, so the
+                    // daemon's error must not be lost behind the exit status.
+                    unexpected_exit_description += "; " + cleanup_failure_description();
                 }
             }
             return false;
@@ -2020,10 +2079,14 @@ struct EnvoyInstance {
             // unexpected exit regardless, but `launched` must stay true on
             // a failed removal so a later stop() call retries.
             if (launched) {
-                if (docker_rm_force(name)) {
+                if (remove_container()) {
                     launched = false;
                 } else {
                     docker_cleanup_failed = true;
+                    // launch_envoy_with_port_retry() reports this description
+                    // when it refuses to retry over a failed cleanup, so the
+                    // daemon's error must not be lost behind the exit status.
+                    unexpected_exit_description += "; " + cleanup_failure_description();
                 }
             }
             return false;
@@ -2040,7 +2103,7 @@ struct EnvoyInstance {
         // process's own unexpected exit (sweep-6 review, "Abort retries
         // when failed Envoy cleanup remains pending").
         if (launched) {
-            if (docker_rm_force(name)) {
+            if (remove_container()) {
                 launched = false;
             } else {
                 docker_cleanup_failed = true;
@@ -2126,6 +2189,11 @@ struct EnvoyInstance {
             unexpected_exit_description =
                 reaped ? describe_wait_status(status)
                        : "no child status could be reaped (waitpid failed, e.g. ECHILD)";
+            // Both failed: the removal above and the teardown reap. The
+            // caller's abort-retry report uses this description, so docker's
+            // error must survive alongside the child status.
+            if (docker_cleanup_failed)
+                unexpected_exit_description += "; " + cleanup_failure_description();
             return false;
         }
         if (docker_cleanup_failed) {
@@ -2135,8 +2203,7 @@ struct EnvoyInstance {
             // that it (and the host-network listener it holds) may still
             // be running.
             exited_unexpectedly = true;
-            unexpected_exit_description =
-                "docker rm -f failed to remove the container; it may still be running";
+            unexpected_exit_description = cleanup_failure_description();
             return false;
         }
         return true;
@@ -8017,6 +8084,18 @@ struct ScopedDockerBinOverride {
     }
 };
 
+// RAII: shrinks docker_rm_force()'s confirmation window for one self-test
+// and restores the default afterwards, so a stubbed docker that keeps
+// failing does not hold the always-on suite for the full window, and the
+// race self-test below can bound its own wait.
+struct ScopedDockerRmConfirmWindow {
+    int saved;
+    explicit ScopedDockerRmConfirmWindow(int window_ms) : saved(g_docker_rm_confirm_window_ms) {
+        g_docker_rm_confirm_window_ms = window_ms;
+    }
+    ~ScopedDockerRmConfirmWindow() { g_docker_rm_confirm_window_ms = saved; }
+};
+
 // Covers round-15 review thread P2 ("Skip Docker teardown for instances
 // that were never launched"): constructing and destroying an EnvoyInstance
 // that never called launch() -- exactly what every dummy-child self-test
@@ -8173,6 +8252,7 @@ bool self_test_envoy_instance_cleans_up_after_readiness_reaps_docker() {
 // Every case increments g_docker_rm_invocations exactly once.
 bool self_test_docker_rm_failure_preserves_launched() {
     bool ok = true;
+    ScopedDockerRmConfirmWindow confirm_window(300);
     TempDir dir("rut-envoy-selftest-docker-rm-outcomes");
     if (dir.empty()) {
         std::cerr << "FAIL [self-test docker rm outcomes]: could not create temp dir\n";
@@ -8252,6 +8332,93 @@ bool self_test_docker_rm_failure_preserves_launched() {
     return ok;
 }
 
+// docker_rm_force() must ride out `docker run --rm`'s own auto-removal
+// racing its `docker rm -f` (see its comment): a stubbed docker that
+// refuses the first two removals with the daemon's "removal ... is already
+// in progress" conflict and only then reports "No such container" must
+// still count as a confirmed removal -- `launched` cleared, stop()
+// reporting success, one docker_rm_force() invocation on the counter even
+// though the CLI ran three times. The counterpart, a failure that never
+// clears, is self_test_docker_rm_failure_preserves_launched()'s "daemon
+// unavailable" case. The stub counts its calls in a file next to itself.
+bool self_test_docker_rm_rides_out_autoremove_race() {
+    bool ok = true;
+    ScopedDockerRmConfirmWindow confirm_window(5000);
+    TempDir dir("rut-envoy-selftest-docker-rm-race");
+    if (dir.empty()) {
+        std::cerr << "FAIL [self-test docker rm autoremove race]: could not create temp dir\n";
+        return false;
+    }
+    const std::string stub_path = dir.path() + "/docker";
+    const std::string calls_path = dir.path() + "/calls";
+    const std::string script =
+        "#!/bin/sh\n"
+        "calls=$(cat '" +
+        calls_path +
+        "' 2>/dev/null || echo 0)\n"
+        "calls=$((calls + 1))\n"
+        "echo \"$calls\" > '" +
+        calls_path +
+        "'\n"
+        "if [ \"$calls\" -lt 3 ]; then\n"
+        "  echo 'Error response from daemon: removal of container abc123 is already in "
+        "progress' >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "echo 'Error response from daemon: No such container: rut-envoy-selftest-docker-rm-race' "
+        ">&2\n"
+        "exit 1\n";
+    if (!write_file_mode(stub_path, script, 0755)) {
+        std::cerr << "FAIL [self-test docker rm autoremove race]: could not write the docker "
+                     "stub\n";
+        return false;
+    }
+    ScopedDockerBinOverride docker_override(stub_path);
+
+    EnvoyInstance envoy;
+    envoy.name = "rut-envoy-selftest-docker-rm-race";
+    envoy.launched = true;
+    envoy.pid = -1;  // already reaped, exactly like a readiness-loop reap
+
+    const int before = g_docker_rm_invocations;
+    const bool stopped = envoy.stop();
+    const int after = g_docker_rm_invocations;
+
+    if (after != before + 1) {
+        std::cerr << "FAIL [self-test docker rm autoremove race]: expected exactly one "
+                     "docker_rm_force invocation, got "
+                  << (after - before) << "\n";
+        ok = false;
+    }
+    std::ifstream calls_in(calls_path);
+    int calls = 0;
+    calls_in >> calls;
+    if (calls != 3) {
+        std::cerr << "FAIL [self-test docker rm autoremove race]: expected the docker CLI to run "
+                     "3 times (two refusals, then gone), got "
+                  << calls << "\n";
+        ok = false;
+    }
+    if (!stopped) {
+        std::cerr << "FAIL [self-test docker rm autoremove race]: stop() reported failure ("
+                  << envoy.unexpected_exit_description << ") although removal was confirmed\n";
+        ok = false;
+    }
+    if (envoy.launched) {
+        std::cerr << "FAIL [self-test docker rm autoremove race]: launched stayed set after a "
+                     "confirmed removal\n";
+        ok = false;
+    }
+    if (envoy.docker_cleanup_failed) {
+        std::cerr << "FAIL [self-test docker rm autoremove race]: docker_cleanup_failed was set "
+                     "after a confirmed removal\n";
+        ok = false;
+    }
+
+    if (ok) std::cerr << "PASS [self-test docker rm autoremove race]\n";
+    return ok;
+}
+
 // Sweep-6 review, "Abort retries when failed Envoy cleanup remains
 // pending": launch_envoy_with_port_retry() must check EnvoyInstance::
 // docker_cleanup_failed specifically -- not just stop()'s bool return,
@@ -8273,6 +8440,7 @@ bool self_test_docker_rm_failure_preserves_launched() {
 //     break is unaffected.
 bool self_test_docker_cleanup_failure_blocks_retry() {
     bool ok = true;
+    ScopedDockerRmConfirmWindow confirm_window(300);
     TempDir dir("rut-envoy-selftest-cleanup-blocks-retry");
     if (dir.empty()) {
         std::cerr << "FAIL [self-test docker cleanup blocks retry]: could not create temp dir\n";
@@ -8374,6 +8542,130 @@ bool self_test_docker_cleanup_failure_blocks_retry() {
         }
     }
 
+    // Case 3: early exit AND a failed removal -- the description
+    // launch_envoy_with_port_retry() reports when it refuses to retry must
+    // carry docker's own error, not only the child's exit status. Driven
+    // through both early-exit branches that reach it: the precheck reap
+    // (an unreaped zombie) and ECHILD (already reaped by someone else).
+    {
+        const std::string stub_path = dir.path() + "/docker-fail-after-exit";
+        if (!write_docker_stub(stub_path, 1, "Cannot connect to the Docker daemon")) {
+            std::cerr << "FAIL [self-test docker cleanup blocks retry]: could not write the "
+                         "docker stub (fail-after-exit case)\n";
+            ok = false;
+        } else {
+            ScopedDockerBinOverride docker_override(stub_path);
+            for (const bool reap_first : {false, true}) {
+                const char* const branch = reap_first ? "ECHILD" : "precheck";
+                const pid_t child = fork();
+                if (child < 0) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: fork failed ("
+                              << branch << " case)\n";
+                    ok = false;
+                    continue;
+                }
+                if (child == 0) _exit(1);
+                if (reap_first) {
+                    int status = 0;
+                    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+                    }
+                } else {
+                    struct timespec settle{0, 50'000'000};
+                    nanosleep(&settle, nullptr);
+                }
+
+                EnvoyInstance envoy;
+                envoy.name = "rut-envoy-selftest-cleanup-blocks-retry-3";
+                envoy.launched = true;
+                envoy.pid = child;
+                if (envoy.stop()) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: stop() reported "
+                                 "success despite an early exit and a failed removal ("
+                              << branch << " case)\n";
+                    ok = false;
+                }
+                if (!envoy.docker_cleanup_failed) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: "
+                                 "docker_cleanup_failed was not set for a removal that failed "
+                                 "after an early exit ("
+                              << branch << " case)\n";
+                    ok = false;
+                }
+                const std::string& description = envoy.unexpected_exit_description;
+                const bool has_exit =
+                    description.find(reap_first ? "ECHILD" : "exited 1") != std::string::npos;
+                const bool has_docker_error =
+                    description.find("Cannot connect to the Docker daemon") != std::string::npos;
+                if (!has_exit || !has_docker_error) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: the " << branch
+                              << " description must name both the early exit and docker's "
+                                 "removal error, got \""
+                              << description << "\"\n";
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // Case 4: a failed removal AND an unexpected teardown status. The child is
+    // alive when stop() runs, answers SIGTERM by exiting 3 (not a status the
+    // clean-teardown check accepts), and the docker stub keeps failing: the
+    // description must still carry docker's error next to "exited 3".
+    {
+        const std::string stub_path = dir.path() + "/docker-fail-during-teardown";
+        if (!write_docker_stub(stub_path, 1, "Cannot connect to the Docker daemon")) {
+            std::cerr << "FAIL [self-test docker cleanup blocks retry]: could not write the "
+                         "docker stub (fail-during-teardown case)\n";
+            ok = false;
+        } else {
+            ScopedDockerBinOverride docker_override(stub_path);
+            // The handler is installed before fork() (and restored in the
+            // parent right after) so the child inherits it: installing it in
+            // the child would race stop()'s SIGTERM.
+            struct sigaction exit_3{};
+            exit_3.sa_handler = +[](int) { _exit(3); };
+            struct sigaction saved_term{};
+            sigaction(SIGTERM, &exit_3, &saved_term);
+            const pid_t child = fork();
+            if (child != 0) sigaction(SIGTERM, &saved_term, nullptr);
+            if (child < 0) {
+                std::cerr << "FAIL [self-test docker cleanup blocks retry]: fork failed "
+                             "(teardown case)\n";
+                ok = false;
+            } else if (child == 0) {
+                for (;;) pause();
+            } else {
+                EnvoyInstance envoy;
+                envoy.name = "rut-envoy-selftest-cleanup-blocks-retry-4";
+                envoy.launched = true;
+                envoy.pid = child;
+                if (envoy.stop()) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: stop() reported "
+                                 "success despite an unexpected teardown status and a failed "
+                                 "removal\n";
+                    ok = false;
+                }
+                if (!envoy.docker_cleanup_failed) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: "
+                                 "docker_cleanup_failed was not set for a removal that failed "
+                                 "during teardown\n";
+                    ok = false;
+                }
+                const std::string& description = envoy.unexpected_exit_description;
+                const bool has_exit = description.find("exited 3") != std::string::npos;
+                const bool has_docker_error =
+                    description.find("Cannot connect to the Docker daemon") != std::string::npos;
+                if (!has_exit || !has_docker_error) {
+                    std::cerr << "FAIL [self-test docker cleanup blocks retry]: the teardown "
+                                 "description must name both the unexpected status and docker's "
+                                 "removal error, got \""
+                              << description << "\"\n";
+                    ok = false;
+                }
+            }
+        }
+    }
+
     if (ok) std::cerr << "PASS [self-test docker cleanup blocks retry]\n";
     return ok;
 }
@@ -8398,6 +8690,7 @@ bool self_test_docker_cleanup_failure_blocks_retry() {
 //     as before this review.
 bool self_test_record_only_docker_cleanup_failure_fails_closed() {
     bool ok = true;
+    ScopedDockerRmConfirmWindow confirm_window(300);
     TempDir dir("rut-envoy-selftest-record-only-docker-cleanup");
     if (dir.empty()) {
         std::cerr << "FAIL [self-test record-only docker cleanup fails closed]: could not create "
@@ -12756,6 +13049,7 @@ int run_self_test(const std::string& rut_binary, const std::string& converter_bi
     ok &= self_test_envoy_instance_skips_docker_when_unlaunched();
     ok &= self_test_envoy_instance_cleans_up_after_readiness_reaps_docker();
     ok &= self_test_docker_rm_failure_preserves_launched();
+    ok &= self_test_docker_rm_rides_out_autoremove_race();
     ok &= self_test_docker_cleanup_failure_blocks_retry();
     ok &= self_test_record_only_docker_cleanup_failure_fails_closed();
     ok &= self_test_rut_wait_ready_ownership();
