@@ -6009,6 +6009,23 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     CHECK_EQ(conn.pending_ops, 1u);
     CHECK(!conn.recv_paused_for_send);
 
+    // The cancel-first ordering must keep the target owner until its own
+    // terminal CQE; that late terminal cannot consume a successor recv.
+    conn.recv_armed = true;
+    conn.recv_pause_cancel_pending = true;
+    conn.recv_pause_target_inflight = true;
+    conn.recv_pause_rearm_pending = true;
+    conn.pending_ops = 2;
+    loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    CHECK_FALSE(conn.recv_pause_cancel_pending);
+    CHECK(conn.recv_pause_target_inflight);
+    CHECK_EQ(conn.pending_ops, 1u);
+    loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+    CHECK_FALSE(conn.recv_pause_target_inflight);
+    CHECK(conn.recv_armed);
+    CHECK_FALSE(conn.recv_pause_rearm_pending);
+    CHECK_EQ(conn.pending_ops, 1u);
+
     loop->shutdown();
 }
 
@@ -13019,34 +13036,6 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
     cleanup.spawned = true;
 
     const u64 burst_deadline_us = monotonic_us() + 120000000;
-    auto read_response = [&](i32 c) {
-        std::string response;
-        char buf[512];
-        u32 expected = 0;
-        u32 header_len = 0;
-        for (;;) {
-            const u64 now = monotonic_us();
-            if (now >= burst_deadline_us) return false;
-            const u64 remaining_ms = (burst_deadline_us - now + 999) / 1000;
-            const i32 n = recv_timeout(
-                c, buf, sizeof(buf), remaining_ms > 10000 ? 10000 : static_cast<i32>(remaining_ms));
-            if (n <= 0) return false;
-            response.append(buf, static_cast<size_t>(n));
-            if (header_len == 0) {
-                const size_t end = response.find("\r\n\r\n");
-                if (end == std::string::npos) continue;
-                header_len = static_cast<u32>(end + 4);
-                const size_t marker = response.substr(0, header_len).find("Content-Length:");
-                if (marker != std::string::npos) {
-                    expected =
-                        static_cast<u32>(strtoul(response.c_str() + marker + 15, nullptr, 10));
-                }
-            }
-            if (response.size() >= static_cast<size_t>(header_len) + expected)
-                return response.compare(0, 12, "HTTP/1.1 200") == 0;
-        }
-    };
-
     u32 served = 0;
     u32 failed = 0;
     for (u32 round = 0; round < 2; round++) {
@@ -13054,12 +13043,54 @@ TEST(iouring_provided_ring_burst, exhausted_ring_never_resets_clients) {
             for (i32 c : clients)
                 if (!send_all(c, kReq, sizeof(kReq) - 1)) failed++;
         }
-        for (i32 c : clients) {
-            if (read_response(c))
-                served++;
-            else
-                failed++;  // reset (-ECONNRESET), EOF or timeout
+        std::vector<pollfd> pollfds(kClients);
+        std::vector<std::string> responses(kClients);
+        std::vector<bool> complete(kClients, false);
+        for (u32 i = 0; i < kClients; i++) {
+            const int flags = fcntl(clients[i], F_GETFL, 0);
+            (void)fcntl(clients[i], F_SETFL, flags | O_NONBLOCK);
+            pollfds[i] = {clients[i], POLLIN | POLLERR | POLLHUP, 0};
         }
+        u32 remaining = kClients;
+        while (remaining != 0 && monotonic_us() < burst_deadline_us) {
+            const i32 ready = poll(pollfds.data(), pollfds.size(), 100);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready < 0) break;
+            for (u32 i = 0; i < kClients; i++) {
+                if (complete[i] || (pollfds[i].revents & (POLLIN | POLLERR | POLLHUP)) == 0)
+                    continue;
+                char buf[512];
+                for (;;) {
+                    const i32 n = recv(clients[i], buf, sizeof(buf), MSG_DONTWAIT);
+                    if (n > 0) {
+                        responses[i].append(buf, static_cast<size_t>(n));
+                        const size_t end = responses[i].find("\r\n\r\n");
+                        if (end != std::string::npos) {
+                            const size_t marker = responses[i].find("Content-Length:");
+                            const u32 expected =
+                                marker == std::string::npos
+                                    ? 0
+                                    : static_cast<u32>(
+                                          strtoul(responses[i].c_str() + marker + 15, nullptr, 10));
+                            const u32 header_len = static_cast<u32>(end + 4);
+                            if (responses[i].size() >= header_len + expected) {
+                                complete[i] = true;
+                                remaining--;
+                                served++;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                    complete[i] = true;
+                    remaining--;
+                    failed++;
+                    break;
+                }
+            }
+        }
+        failed += remaining;
     }
     CHECK_EQ(failed, 0u);
     CHECK_EQ(served, 2 * kClients);
