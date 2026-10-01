@@ -76125,6 +76125,43 @@ TEST(request_body_overflow, final_body_send_inflight_preserves_successor_overflo
     CHECK_FALSE(c->keep_alive);
 }
 
+TEST(request_body_overflow, intermediate_cl_suffix_shorter_than_remaining_rejects) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_content_length = 10;
+    c->req_body_remaining = 5;
+    c->req_initial_send_len = 3;
+    c->recv_buf.reset();
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("abcde"), 5), 5u);
+    c->upstream_send_armed = true;
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
+    respond_request_body_overflow(&loop, *c);
+    CHECK(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->req_body_lossy_successor);
+}
+
+TEST(request_body_overflow, intermediate_chunked_malformed_suffix_rejects) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::Chunked;
+    c->req_body_streamed = true;
+    c->req_initial_send_len = 3;
+    c->req_chunk_parser.reset();
+    c->req_chunk_parser.state = ChunkedParser::State::DataCR;
+    c->recv_buf.reset();
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>("abcX"), 4), 4u);
+    c->upstream_send_armed = true;
+    c->on_upstream_send = &on_request_body_sent<SmallLoop>;
+    respond_request_body_overflow(&loop, *c);
+    CHECK(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->req_body_lossy_successor);
+}
+
 #ifdef __linux__
 TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     ScopedIoUringLoopForRetirement guard;
@@ -76181,6 +76218,9 @@ TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     CHECK(c->request_upload_complete);
     CHECK_EQ(c->recv_buf.len(), 0u);
     CHECK_EQ(c->pipeline_stash_len, 0u);
+    CHECK_GE(c->fd, 0);
+    CHECK_FALSE(c->upstream_send_armed);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<IoUringEventLoop>);
     close(downstream[1]);
     close(upstream[1]);
 }
