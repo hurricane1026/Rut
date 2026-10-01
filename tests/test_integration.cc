@@ -6846,6 +6846,64 @@ struct TlsIouringHarness : SmallLoop {
     void disarm_yield_timer(Connection& /*conn*/) {}
 };
 
+TEST(tls_iouring, late_recv_after_body_overflow_preserves_413_send) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.req_body_overflow_rejected = true;
+    conn.send_armed = true;
+    conn.pending_ops = 1;
+    conn.send_slice = loop.send_storage[0];
+    conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
+    static constexpr char k413[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
+    REQUIRE_EQ(conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1),
+               sizeof(k413) - 1);
+    const u32 send_len = conn.send_buf.len();
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 1, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_EQ(conn.fd, 42);
+    CHECK(conn.send_armed);
+    CHECK_EQ(conn.send_buf.len(), send_len);
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_EQ(conn.fd, 42);
+    CHECK(conn.send_armed);
+    CHECK_EQ(conn.send_buf.len(), send_len);
+}
+
+TEST(tls_iouring, final_body_send_overflow_keeps_content_length_and_chunked_owner) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    for (const bool chunked : {false, true}) {
+        conn.reset();
+        conn.id = 0;
+        conn.fd = 42;
+        conn.state = ConnState::Proxying;
+        conn.tls_active = true;
+        conn.on_recv = &tls_recv<TlsIouringHarness>;
+        conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
+        conn.upstream_send_armed = true;
+        conn.pending_ops = 2;  // TLS recv plus the final body send.
+        conn.keep_alive = true;
+        conn.req_body_mode = chunked ? BodyMode::Chunked : BodyMode::ContentLength;
+        conn.req_body_remaining = chunked ? 0u : 0u;
+        if (chunked) conn.req_chunk_parser.state = ChunkedParser::State::Complete;
+
+        tls_recv<TlsIouringHarness>(
+            &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+
+        CHECK_FALSE(loop.closed);
+        CHECK_EQ(conn.fd, 42);
+        CHECK_FALSE(conn.req_body_overflow_rejected);
+        CHECK_FALSE(conn.keep_alive);
+        CHECK(conn.upstream_send_armed);
+        CHECK_EQ(conn.on_upstream_send, &on_request_body_sent<TlsIouringHarness>);
+        CHECK_FALSE(conn.request_upload_complete);
+    }
+}
+
+>>>>>>> fa717277 (Test TLS final body overflow ownership)
 enum class TlsKeyUpdatePeer : u8 { Client, Server };
 
 struct TlsKeyUpdateDiagnostic {
