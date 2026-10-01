@@ -674,12 +674,23 @@ public:
                c.upstream_close_pause_cancel_owned;
     }
 
+    // A deferred idle-pool return (return_idle_upstream) whose cancelled multishot
+    // recv has not drained yet. Usually idle_return_fd/config are still pinned, but
+    // cancel submission can fail after upstream_fd is closed and leave only the
+    // cancel-inflight ownership marker. Either form must reject request 2 until the
+    // old recv terminal drains; try_deferred_upstream_rearm publishes readiness then.
+    static bool idle_return_drain_blocks_boundary(const Connection& c) {
+        return c.upstream_recv_cancel_inflight ||
+               (c.idle_return_fd >= 0 &&
+                (c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending));
+    }
+
     void maybe_publish_http1_boundary_ready(Connection& c) {
         if (c.id >= connection_capacity || conns.data() == nullptr || &conns[c.id] != &c ||
             c.fd < 0 || !c.http1_boundary_deferred || c.http1_boundary_ready ||
             (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None &&
              c.http1_prebuilt_wait != 0) ||
-            strict_upstream_retirement_blocks_reclaim(c) ||
+            strict_upstream_retirement_blocks_reclaim(c) || idle_return_drain_blocks_boundary(c) ||
             !c.response_read_timer_owner_is_neutral())
             return;
         c.http1_boundary_ready = true;
@@ -719,7 +730,7 @@ public:
             return true;
         }
         if (!strict_upstream_retirement_blocks_reclaim(c) &&
-            c.response_read_timer_owner_is_neutral())
+            !idle_return_drain_blocks_boundary(c) && c.response_read_timer_owner_is_neutral())
             return false;
         if (c.http1_boundary_deferred || c.http1_boundary_ready) {
             // A duplicate rendezvous cannot be resumed safely. Keep it parked;
@@ -727,6 +738,13 @@ public:
             close_conn(c);
             return true;
         }
+        // Request 1's callbacks are spent, and the resume validity check refuses a
+        // connection that still advertises one. The io_uring TLS completion
+        // (tls_on_out_drain -> proxy_stream_complete) reaches here with them set.
+        // For TLS this also nulls tls_pending_on_recv, so the tail tls_process in
+        // tls_on_out_drain cannot dispatch request 2 while parked; its ciphertext
+        // stays in tls_in_buf and is decrypted on resume.
+        c.clear_slots();
         c.http1_boundary_deferred = true;
         c.http1_boundary_ready = false;
         c.http1_boundary_successor_episode = c.upstream_episode;
@@ -2455,7 +2473,7 @@ public:
             c.http1_boundary_ready = false;
             if (!c.http1_boundary_deferred) continue;
             if (strict_upstream_retirement_blocks_reclaim(c) ||
-                !c.response_read_timer_owner_is_neutral())
+                idle_return_drain_blocks_boundary(c) || !c.response_read_timer_owner_is_neutral())
                 continue;
             const u32 expected_episode = c.http1_boundary_successor_episode;
 
@@ -5679,6 +5697,9 @@ public:
             if (kConfigStale || kStaleBytes || kDraining || !upstream ||
                 !upstream->put_idle(fd, c.idle_return_uid, c.idle_return_bidx, monotonic_secs()))
                 ::close(fd);
+            // A request boundary parked behind this drain (defer_http1_request_boundary)
+            // is now ready: the pin is cleared, so request 2 sees a neutral connection.
+            maybe_publish_http1_boundary_ready(c);
         }
         // Deferred close: close_conn_impl tore the conn down (e.g. Connection: close)
         // while the deferred pool-return was still draining, leaving the slot allocated
@@ -5690,6 +5711,7 @@ public:
             c.upstream_recv_close_quarantine = false;
             c.upstream_recv_buf.reset();
         }
+        if (c.idle_return_fd < 0 && kUpstreamRecvDrained) maybe_publish_http1_boundary_ready(c);
         if (c.close_after_idle_return && kUpstreamRecvDrained) {
             c.close_after_idle_return = false;
             this->free_conn(c);

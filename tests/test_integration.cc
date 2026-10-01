@@ -13612,6 +13612,298 @@ TEST(proxy_reuse, deferred_idle_return_state_released_iouring) {
     close(lfd);
 }
 
+// A request boundary that arrives while a deferred idle return is still draining parks
+// instead of dispatching, and is published exactly once, when the drain resolves.
+TEST(proxy_reuse, boundary_parks_until_deferred_idle_return_drains_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg{};
+    shard.active_config = &cfg;
+
+    Connection* const slot = shard.loop->alloc_conn();
+    REQUIRE(slot != nullptr);
+    auto& c = *slot;
+    i32 cli[2];
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    c.fd = cli[0];
+    c.idle_return_fd = sv[0];
+    c.idle_return_uid = 4;
+    c.idle_return_bidx = 0;
+    c.idle_return_config = &cfg;
+    c.upstream_recv_pause_cancel_pending = true;  // cancel CQE outstanding
+    c.upstream_recv_cancel_inflight = true;       // recv terminal outstanding
+    const u32 episode = c.upstream_episode;
+
+    // Parks (dropping the spent request-1 callbacks), and is not published while either
+    // half of the drain is outstanding.
+    c.on_send = &on_response_body_sent<IoUringEventLoop>;
+    c.on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+    CHECK(shard.loop->defer_http1_request_boundary(c));
+    CHECK(c.on_send == nullptr);
+    CHECK(c.on_upstream_recv == nullptr);
+    CHECK(c.http1_boundary_deferred);
+    CHECK_FALSE(c.http1_boundary_ready);
+    CHECK_EQ(c.http1_boundary_successor_episode, episode);
+    shard.loop->maybe_publish_http1_boundary_ready(c);
+    CHECK_FALSE(c.http1_boundary_ready);
+    c.upstream_recv_pause_cancel_pending = false;
+    CHECK(shard.loop->try_deferred_upstream_rearm(c));
+    CHECK_EQ(c.idle_return_fd, sv[0]);  // recv terminal still outstanding
+    CHECK_FALSE(c.http1_boundary_ready);
+    CHECK_FALSE(shard.loop->http1_boundary_ready_pending);
+
+    // The last half of the drain resolves the pin and publishes readiness once; the
+    // drain does not advance the upstream episode the boundary captured.
+    c.upstream_recv_cancel_inflight = false;
+    CHECK(shard.loop->try_deferred_upstream_rearm(c));
+    CHECK_EQ(c.idle_return_fd, -1);
+    CHECK(c.idle_return_config == nullptr);
+    CHECK(c.http1_boundary_deferred);
+    CHECK(c.http1_boundary_ready);
+    CHECK(shard.loop->http1_boundary_ready_pending);
+    CHECK_EQ(c.upstream_episode, episode);
+    CHECK_EQ(c.http1_boundary_successor_episode, episode);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(shard.upstream->take_idle(4, 0), sv[0]);
+
+    // No idle return pending: the boundary is not parked on its account.
+    c.http1_boundary_deferred = false;
+    c.http1_boundary_ready = false;
+    c.http1_boundary_successor_episode = 0;
+    shard.loop->http1_boundary_ready_pending = false;
+    CHECK_FALSE(shard.loop->defer_http1_request_boundary(c));
+    CHECK_FALSE(c.http1_boundary_deferred);
+
+    c.fd = -1;
+    close(cli[0]);
+    close(cli[1]);
+    close(sv[0]);
+    close(sv[1]);
+    shard.shutdown();
+    close(lfd);
+}
+
+// A parked boundary whose client goes away before the drain resolves: close_conn
+// clears the parked state and keeps the slot for the drain; the drain pools the fd,
+// publishes nothing for the dead connection and frees the slot once.
+TEST(proxy_reuse, parked_boundary_closed_before_idle_return_drains_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg{};
+    shard.active_config = &cfg;
+
+    Connection* const slot = shard.loop->alloc_conn();
+    REQUIRE(slot != nullptr);
+    auto& c = *slot;
+    i32 cli[2];
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    c.fd = cli[0];
+    c.idle_return_fd = sv[0];
+    c.idle_return_uid = 3;
+    c.idle_return_bidx = 0;
+    c.idle_return_config = &cfg;
+    c.upstream_recv_cancel_inflight = true;
+    c.pending_ops = 1;
+    REQUIRE(shard.loop->defer_http1_request_boundary(c));
+    REQUIRE(c.http1_boundary_deferred);
+
+    const u32 free_before = shard.loop->free_top;
+    shard.loop->close_conn_impl(c);
+    CHECK(c.close_after_idle_return);
+    CHECK_FALSE(c.http1_boundary_deferred);
+    CHECK_FALSE(c.http1_boundary_ready);
+    CHECK_EQ(c.http1_boundary_successor_episode, 0u);
+    CHECK_EQ(shard.loop->free_top, free_before);
+
+    c.upstream_recv_cancel_inflight = false;
+    c.pending_ops = 0;
+    CHECK(shard.loop->try_deferred_upstream_rearm(c));
+    CHECK_EQ(c.idle_return_fd, -1);
+    CHECK_FALSE(c.close_after_idle_return);
+    CHECK_FALSE(c.http1_boundary_ready);
+    CHECK_FALSE(shard.loop->http1_boundary_ready_pending);
+    CHECK_EQ(shard.loop->free_top, free_before + 1u);
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 1u);
+    CHECK_EQ(shard.upstream->take_idle(3, 0), sv[0]);
+    close(sv[0]);
+    close(sv[1]);
+    close(cli[1]);
+    shard.shutdown();
+    close(lfd);
+}
+
+// A parked boundary that resolves during a graceful drain is not resumed: the
+// connection is closed and freed instead of dispatching request 2.
+TEST(proxy_reuse, parked_boundary_resolved_during_shard_drain_closes_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg{};
+    shard.active_config = &cfg;
+
+    Connection* const slot = shard.loop->alloc_conn();
+    REQUIRE(slot != nullptr);
+    auto& c = *slot;
+    i32 cli[2];
+    i32 sv[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sv), 0);
+    c.fd = cli[0];
+    c.state = ConnState::Sending;
+    c.idle_return_fd = sv[0];
+    c.idle_return_uid = 2;
+    c.idle_return_bidx = 0;
+    c.idle_return_config = &cfg;
+    c.upstream_recv_cancel_inflight = true;
+    REQUIRE(shard.loop->defer_http1_request_boundary(c));
+
+    const u32 free_before = shard.loop->free_top;
+    shard.loop->drain(30);
+    c.upstream_recv_cancel_inflight = false;
+    CHECK(shard.loop->try_deferred_upstream_rearm(c));
+    CHECK(c.http1_boundary_ready);
+    shard.loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(c.fd, -1);
+    CHECK_FALSE(c.http1_boundary_deferred);
+    CHECK_FALSE(c.http1_boundary_ready);
+    CHECK_EQ(shard.loop->free_top, free_before + 1u);
+    // Draining: the drained fd is closed, not pooled.
+    CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
+    close(sv[1]);
+    close(cli[1]);
+    shard.shutdown();
+    close(lfd);
+}
+
+// If the idle-return cancel cannot be submitted under SQ pressure, the upstream fd is
+// closed but its old multishot recv remains an independent boundary owner. Request 2 must
+// stay parked until that old recv reaches its terminal CQE; closing the downstream first
+// must also reclaim the slot without publishing a dead boundary.
+TEST(proxy_reuse, idle_return_cancel_failure_keeps_boundary_parked_until_terminal_iouring) {
+    Shard<IoUringEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard.init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("io_uring queue init unavailable in this environment");
+    }
+    RouteConfig cfg{};
+    shard.active_config = &cfg;
+
+    Connection* const slot = shard.loop->alloc_conn();
+    REQUIRE(slot != nullptr);
+    auto& c = *slot;
+    i32 cli[2];
+    i32 upstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, upstream), 0);
+    c.fd = cli[0];
+    c.state = ConnState::Sending;
+    c.upstream_fd = upstream[0];
+    c.upstream_recv_armed = true;
+    c.pending_ops = 1;
+    c.on_send = &on_response_body_sent<IoUringEventLoop>;
+    c.on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+
+    const u32 tail_before = __atomic_load_n(shard.loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 pending_before = shard.loop->backend.pending;
+    const i32 ring_fd = shard.loop->backend.ring_fd;
+    const u32 head = __atomic_load_n(shard.loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    shard.loop->backend.ring_fd = -1;
+    __atomic_store_n(
+        shard.loop->backend.sq_tail, head + shard.loop->backend.sq_ring_entries, __ATOMIC_RELEASE);
+    shard.loop->return_idle_upstream(c, 5, 0);
+    shard.loop->backend.ring_fd = ring_fd;
+    __atomic_store_n(shard.loop->backend.sq_tail, tail_before, __ATOMIC_RELEASE);
+    shard.loop->backend.pending = pending_before;
+
+    CHECK_EQ(c.upstream_fd, -1);
+    CHECK_EQ(c.idle_return_fd, -1);
+    CHECK(c.upstream_recv_cancel_inflight);
+    CHECK(c.upstream_recv_terminal_stale);
+    REQUIRE(shard.loop->defer_http1_request_boundary(c));
+    CHECK(c.http1_boundary_deferred);
+    CHECK_FALSE(c.http1_boundary_ready);
+    CHECK_FALSE(shard.loop->http1_boundary_ready_pending);
+
+    const IoEvent old_recv{c.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, c.upstream_episode};
+    shard.loop->dispatch(old_recv);
+    CHECK_FALSE(c.upstream_recv_cancel_inflight);
+    CHECK_FALSE(c.upstream_recv_armed);
+    CHECK(c.http1_boundary_deferred);
+    CHECK(c.http1_boundary_ready);
+    CHECK(shard.loop->http1_boundary_ready_pending);
+    shard.loop->maybe_publish_http1_boundary_ready(c);
+    CHECK(c.http1_boundary_ready);  // readiness is published exactly once
+
+    c.http1_boundary_deferred = false;
+    c.http1_boundary_ready = false;
+    shard.loop->http1_boundary_ready_pending = false;
+    close(cli[0]);
+    close(cli[1]);
+    close(upstream[1]);
+    c.fd = -1;
+    shard.loop->free_conn(c);
+
+    // Repeat the failed cancel, but close the downstream before the old recv terminal.
+    Connection* const closed_slot = shard.loop->alloc_conn();
+    REQUIRE(closed_slot != nullptr);
+    auto& closed = *closed_slot;
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, cli), 0);
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, upstream), 0);
+    closed.fd = cli[0];
+    closed.state = ConnState::Sending;
+    closed.upstream_fd = upstream[0];
+    closed.upstream_recv_armed = true;
+    closed.pending_ops = 1;
+    const u32 closed_id = closed.id;
+    const u32 closed_tail = __atomic_load_n(shard.loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 closed_pending = shard.loop->backend.pending;
+    const i32 closed_ring_fd = shard.loop->backend.ring_fd;
+    const u32 closed_head = __atomic_load_n(shard.loop->backend.sq_head, __ATOMIC_ACQUIRE);
+    shard.loop->backend.ring_fd = -1;
+    __atomic_store_n(shard.loop->backend.sq_tail,
+                     closed_head + shard.loop->backend.sq_ring_entries,
+                     __ATOMIC_RELEASE);
+    shard.loop->return_idle_upstream(closed, 6, 0);
+    shard.loop->backend.ring_fd = closed_ring_fd;
+    __atomic_store_n(shard.loop->backend.sq_tail, closed_tail, __ATOMIC_RELEASE);
+    shard.loop->backend.pending = closed_pending;
+    REQUIRE(shard.loop->defer_http1_request_boundary(closed));
+    const u32 free_before_close = shard.loop->free_top;
+    shard.loop->close_conn_impl(closed);
+    CHECK_FALSE(closed.http1_boundary_deferred);
+    CHECK_FALSE(shard.loop->http1_boundary_ready_pending);
+    const IoEvent closed_old_recv{
+        closed.id, 0, 0, 0, IoEventType::UpstreamRecv, 0, 0, closed.upstream_episode};
+    shard.loop->dispatch(closed_old_recv);
+    CHECK_EQ(closed.id, closed_id);  // the terminal was dispatched to the reallocated slot
+    CHECK_FALSE(shard.loop->http1_boundary_ready_pending);
+    CHECK_EQ(shard.loop->free_top, free_before_close + 1u);
+    close(cli[1]);
+    close(upstream[1]);
+    shard.shutdown();
+    close(lfd);
+}
+
 #if RUT_ENABLE_JIT_TESTS
 // Client-visible form of the same bug on a real io_uring loop with a real upstream. A
 // request whose upstream recv is multishot (any request with a body or a Content-Length
@@ -13710,7 +14002,20 @@ struct BodyAwareKeepAliveUpstream {
                 u32 consumed = 0;
                 while (request_complete(p.buf, p.have, &consumed)) {
                     s->request_count.fetch_add(1, std::memory_order_release);
-                    (void)send_all(p.fd, kResp, sizeof(kResp) - 1);
+                    if (memmem(p.buf, consumed, "/big ", 5) != nullptr) {
+                        // Header and body in separate writes: the gateway streams the body,
+                        // so the response completes through proxy_stream_complete (and, over
+                        // TLS, through tls_on_out_drain) instead of the one-shot path.
+                        static const char kBigHead[] =
+                            "HTTP/1.1 200 OK\r\nContent-Length: 8192\r\n\r\n";
+                        static char big_body[8192];
+                        memset(big_body, 'b', sizeof(big_body));
+                        (void)send_all(p.fd, kBigHead, sizeof(kBigHead) - 1);
+                        usleep(300);
+                        (void)send_all(p.fd, big_body, sizeof(big_body));
+                    } else {
+                        (void)send_all(p.fd, kResp, sizeof(kResp) - 1);
+                    }
                     memmove(p.buf, p.buf + consumed, p.have - consumed);
                     p.have -= consumed;
                 }
@@ -13756,6 +14061,8 @@ struct DeferredReturnRig {
     i32 lfd = -1;
     u16 port = 0;
     i32 client = -1;
+    // Optional TLS termination (owned by the test; must outlive the rig).
+    TlsServerContext* tls_server = nullptr;
     bool shard_inited = false;
     bool spawned = false;
     bool ready = false;
@@ -13788,6 +14095,21 @@ struct DeferredReturnRig {
         return false;
     }
 
+    // Fds parked in idle_return_fd right now (shard thread stopped and joined).
+    u32 collect_parked_fds(i32* out, u32 cap) const {
+        u32 n = 0;
+        for (u32 i = 0; i < shard.loop->slots_initialized && n < cap; i++)
+            if (shard.loop->conns[i].idle_return_fd >= 0)
+                out[n++] = shard.loop->conns[i].idle_return_fd;
+        return n;
+    }
+
+    void shutdown_shard() {
+        if (!shard_inited) return;
+        shard.shutdown();
+        shard_inited = false;
+    }
+
     void stop_shard() {
         if (!spawned) return;
         shard.stop();
@@ -13809,6 +14131,9 @@ route GET "/plain" {
   return forward(backend)
 }
 route POST "/post" {
+  return forward(backend)
+}
+route POST "/big" {
   return forward(backend)
 }
 route GET "/withbody" {
@@ -13923,6 +14248,7 @@ route GET "/gr" {
     rig.shard.loop->listener_context = listener_context.value();
     rig.shard.route_config = &rig.program.config;
     rig.shard.active_config = rig.shard.route_config;
+    if (rig.tls_server != nullptr) rig.shard.loop->tls_server = rig.tls_server;
     REQUIRE(rig.shard.spawn(-1).has_value());
     rig.spawned = true;
     usleep(50000);
@@ -14040,6 +14366,385 @@ DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_post_cl0_then_deadline_forward_iou
 DEFERRED_RETURN_SEQUENCE_TEST(deferred_return_get_cl0_then_guarded_forward_iouring,
                               "GET /withbody HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
                               DEFERRED_RETURN_GUARDED_REQ)
+// One Content-Length-framed HTTP/1.1 response read off a client connection.
+struct FramedResponse {
+    u32 status = 0;
+    std::string body;
+};
+
+// Read up to `count` framed responses; returns how many arrived before a close,
+// error or timeout. Bytes past the last parsed response land in *rest.
+static u32 read_framed_responses(i32 fd, u32 count, FramedResponse* out, std::string* rest) {
+    std::string stream;
+    u32 parsed = 0;
+    for (;;) {
+        while (parsed < count) {
+            const size_t head_end = stream.find("\r\n\r\n");
+            if (head_end == std::string::npos) break;
+            std::string head = stream.substr(0, head_end);
+            for (char& ch : head) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+            const size_t cl = head.find("\r\ncontent-length:");
+            const u32 body_len =
+                cl == std::string::npos ? 0 : static_cast<u32>(atoi(head.c_str() + cl + 17));
+            if (stream.size() < head_end + 4 + body_len) break;
+            out[parsed].status = static_cast<u32>(atoi(stream.c_str() + 9));
+            out[parsed].body = stream.substr(head_end + 4, body_len);
+            parsed++;
+            stream.erase(0, head_end + 4 + body_len);
+        }
+        if (parsed == count) break;
+        char buf[2048];
+        const i32 n = recv_timeout(fd, buf, sizeof(buf), 3000);
+        if (n <= 0) break;
+        stream.append(buf, static_cast<size_t>(n));
+    }
+    if (rest) *rest = stream;
+    return parsed;
+}
+
+// True when some connection STILL carries deferred idle-return or parked-boundary state
+// (the failure condition). Only meaningful once the shard thread has been stopped and
+// joined, and only for runs that finished every response: a loop stopped mid-drain may
+// legitimately hold a parked fd until shutdown().
+static bool boundary_or_idle_return_state_left(const DeferredReturnRig& rig) {
+    if (rig.parked_state_left()) return true;
+    for (u32 i = 0; i < rig.shard.loop->slots_initialized; i++) {
+        const Connection& c = rig.shard.loop->conns[i];
+        if (c.close_after_idle_return ||
+            (c.fd >= 0 && (c.http1_boundary_deferred || c.http1_boundary_ready)))
+            return true;
+    }
+    return false;
+}
+
+// Write `wire` (one or more pipelined requests) and expect `count` answers in order: a 200
+// "hi" for every request except a trailing Connection: close redirect (301 "fixed", then
+// EOF). Nothing may follow them, and the backend must have seen one request per 200.
+static void expect_pipelined_answers(rut::test::TestCase* _tc,
+                                     const std::string& wire,
+                                     const u32* statuses,
+                                     u32 count,
+                                     bool split_write) {
+    DeferredReturnRig rig;
+    start_deferred_return_rig(_tc, rig);
+    if (!rig.ready) return;
+
+    if (split_write) {
+        // Request 2 follows request 1 with no pause, in its own write.
+        const u32 first_end = static_cast<u32>(wire.find("\r\n\r\n")) + 4;
+        const u32 first_total = wire.find("hello") == std::string::npos ? first_end : first_end + 5;
+        REQUIRE(send_all(rig.client, wire.data(), first_total));
+        REQUIRE(send_all(
+            rig.client, wire.data() + first_total, static_cast<u32>(wire.size()) - first_total));
+    } else {
+        REQUIRE(send_all(rig.client, wire.data(), static_cast<u32>(wire.size())));
+    }
+    FramedResponse got[4];
+    std::string rest;
+    const u32 parsed = read_framed_responses(rig.client, count, got, &rest);
+    // Fewer than `count` is the bug: the gateway closed with the later request unanswered.
+    REQUIRE_EQ(parsed, count);
+    u32 forwarded = 0;
+    for (u32 i = 0; i < count; i++) {
+        CHECK_EQ(got[i].status, statuses[i]);
+        CHECK_EQ(got[i].body, statuses[i] == 200 ? "hi" : "fixed");
+        if (statuses[i] == 200) forwarded++;
+    }
+    CHECK(rest.empty());
+    CHECK_EQ(rig.backend.request_count.load(std::memory_order_acquire), forwarded);
+    if (statuses[count - 1] == 301) {
+        char extra[16];
+        CHECK_EQ(recv_timeout(rig.client, extra, sizeof(extra), 3000), 0);  // closed after 301
+    }
+
+    rig.stop_shard();
+    CHECK_FALSE(boundary_or_idle_return_state_left(rig));
+}
+
+#define PIPELINED_POST "POST /post HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+#define PIPELINED_CL0_POST "POST /post HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n"
+#define PIPELINED_REDIRECT "GET /gr HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+
+#define PIPELINED_DEFERRED_RETURN_TEST(name, wire_literal, split, ...)                          \
+    TEST(proxy_reuse, name) {                                                                   \
+        if (!iouring_socket_live())                                                             \
+            SKIP("io_uring async socket ops unavailable in this environment");                  \
+        static const u32 kStatuses[] = {__VA_ARGS__};                                           \
+        expect_pipelined_answers(                                                               \
+            _tc, std::string(wire_literal), kStatuses, sizeof(kStatuses) / sizeof(u32), split); \
+    }
+
+// Request 2 is already in recv_buf (one write) or arrives right behind request 1 (two
+// writes) while request 1's upstream idle return is still draining. The boundary parks
+// until the drain resolves, then request 2 is dispatched on a neutral connection.
+PIPELINED_DEFERRED_RETURN_TEST(pipelined_post_then_deadline_forward_iouring,
+                               PIPELINED_POST DEFERRED_RETURN_DIRECT_REQ,
+                               false,
+                               200,
+                               200)
+PIPELINED_DEFERRED_RETURN_TEST(pipelined_post_then_deadline_forward_split_write_iouring,
+                               PIPELINED_POST DEFERRED_RETURN_DIRECT_REQ,
+                               true,
+                               200,
+                               200)
+PIPELINED_DEFERRED_RETURN_TEST(pipelined_post_then_guarded_forward_iouring,
+                               PIPELINED_POST DEFERRED_RETURN_GUARDED_REQ,
+                               false,
+                               200,
+                               200)
+PIPELINED_DEFERRED_RETURN_TEST(pipelined_cl0_post_then_deadline_forward_iouring,
+                               PIPELINED_CL0_POST DEFERRED_RETURN_DIRECT_REQ,
+                               false,
+                               200,
+                               200)
+PIPELINED_DEFERRED_RETURN_TEST(pipelined_post_then_guarded_redirect_close_iouring,
+                               PIPELINED_POST PIPELINED_REDIRECT,
+                               false,
+                               200,
+                               301)
+PIPELINED_DEFERRED_RETURN_TEST(pipelined_post_post_then_deadline_forward_iouring,
+                               PIPELINED_POST PIPELINED_POST DEFERRED_RETURN_DIRECT_REQ,
+                               false,
+                               200,
+                               200,
+                               200)
+
+// Request 2 is sent the moment response 1 is read, on one connection, hundreds of times:
+// whichever side of the drain it lands on, it is answered and the connection stays open.
+TEST(proxy_reuse, back_to_back_requests_after_deferred_return_never_close_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    DeferredReturnRig rig;
+    start_deferred_return_rig(_tc, rig);
+    if (!rig.ready) return;
+
+    static const char kPost[] = PIPELINED_POST;
+    static const char kDirect[] = DEFERRED_RETURN_DIRECT_REQ;
+    static const char kGuarded[] = DEFERRED_RETURN_GUARDED_REQ;
+    constexpr u32 kIterations = 250;
+    for (u32 i = 0; i < kIterations; i++) {
+        FramedResponse got;
+        REQUIRE(send_all(rig.client, kPost, sizeof(kPost) - 1));
+        REQUIRE_EQ(read_framed_responses(rig.client, 1, &got, nullptr), 1u);
+        REQUIRE_EQ(got.status, 200u);
+        const char* const next = (i & 1) ? kGuarded : kDirect;
+        REQUIRE(send_all(rig.client, next, static_cast<u32>(strlen(next))));
+        // Zero is the bug: the gateway closed the connection with request 2 unanswered.
+        REQUIRE_EQ(read_framed_responses(rig.client, 1, &got, nullptr), 1u);
+        REQUIRE_EQ(got.status, 200u);
+        REQUIRE_EQ(got.body, "hi");
+    }
+    CHECK_EQ(rig.backend.request_count.load(std::memory_order_acquire), kIterations * 2);
+
+    rig.stop_shard();
+    CHECK_FALSE(boundary_or_idle_return_state_left(rig));
+}
+
+// The client disappears with request 2 pipelined behind a POST, at offsets that sweep
+// across the deferred-return window: every connection is freed and no parked state leaks.
+TEST(proxy_reuse, client_close_with_pipelined_request_after_deferred_return_frees_conn_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    DeferredReturnRig rig;
+    start_deferred_return_rig(_tc, rig);
+    if (!rig.ready) return;
+
+    static const char kWire[] = PIPELINED_POST DEFERRED_RETURN_DIRECT_REQ;
+    close(rig.client);
+    rig.client = -1;
+    for (u32 i = 0; i < 60; i++) {
+        const i32 fd = connect_to(rig.port);
+        REQUIRE_GE(fd, 0);
+        REQUIRE(send_all(fd, kWire, sizeof(kWire) - 1));
+        if (i % 3 != 0) usleep(i * 7);
+        close(fd);
+    }
+    // Allow normal close processing to run for the original bounded interval. active_count()
+    // reads free_top, which is mutated by the shard thread and is not synchronized for polling.
+    for (u32 waited = 0; waited < 3000; waited++) usleep(1000);
+    // Stop and join before inspecting loop-owned slot state.
+    rig.shard.stop();
+    rig.shard.join();
+    rig.spawned = false;
+    CHECK_EQ(rig.shard.loop->active_count(), 0u);
+
+    rig.stop_shard();
+    CHECK_FALSE(boundary_or_idle_return_state_left(rig));
+}
+
+// The shard is stopped with pipelined requests in flight. The loop may stop while a
+// drain is still pending (the fd stays parked and the boundary parked, both legitimate),
+// so the contract is checked at shutdown: every fd still parked when the loop stopped is
+// closed by shutdown, and nothing crashes or leaks under the sanitizers.
+TEST(proxy_reuse, shard_stop_with_pipelined_request_after_deferred_return_is_clean_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    for (u32 round = 0; round < 10; round++) {
+        DeferredReturnRig rig;
+        start_deferred_return_rig(_tc, rig);
+        if (!rig.ready) return;
+        static const char kWire[] = PIPELINED_POST PIPELINED_POST DEFERRED_RETURN_DIRECT_REQ;
+        REQUIRE(send_all(rig.client, kWire, sizeof(kWire) - 1));
+        usleep(round * 150);
+        rig.stop_shard();
+        i32 parked[16];
+        const u32 parked_count = rig.collect_parked_fds(parked, 16);
+        rig.shutdown_shard();
+        for (u32 i = 0; i < parked_count; i++) {
+            errno = 0;
+            CHECK_EQ(fcntl(parked[i], F_GETFD), -1);  // closed by close_deferred_idle_return_fds
+            CHECK_EQ(errno, EBADF);
+        }
+    }
+}
+
+// Request 2 pipelined behind a POST whose response header and body arrive in separate
+// upstream writes, over TLS: the response completes through tls_on_out_drain ->
+// proxy_stream_complete, which reaches the boundary with request 1's callbacks still set
+// (defer_http1_request_boundary must clear them) and with request 2's ciphertext already
+// in tls_in_buf (it must stay there until the boundary resumes).
+struct TlsBoundaryClient {
+    SSL_CTX* ctx = nullptr;
+    SSL* ssl = nullptr;
+    i32 fd = -1;
+    ~TlsBoundaryClient() {
+        if (ssl != nullptr) {
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+        }
+        if (fd >= 0) close(fd);
+        if (ctx != nullptr) SSL_CTX_free(ctx);
+    }
+    bool connect(u16 port) {
+        ctx = create_test_client_ctx();
+        fd = connect_to(port);
+        if (ctx == nullptr || fd < 0) return false;
+        ssl = SSL_new(ctx);
+        if (ssl == nullptr || SSL_set_fd(ssl, fd) != 1 || SSL_connect(ssl) != 1) return false;
+        set_socket_timeouts(fd, 3);
+        return true;
+    }
+    // Up to `count` framed responses, like read_framed_responses but through SSL_read.
+    u32 read_framed(u32 count, FramedResponse* out, std::string* rest) {
+        std::string stream;
+        u32 parsed = 0;
+        for (;;) {
+            while (parsed < count) {
+                const size_t head_end = stream.find("\r\n\r\n");
+                if (head_end == std::string::npos) break;
+                std::string head = stream.substr(0, head_end);
+                for (char& ch : head)
+                    ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+                const size_t cl = head.find("\r\ncontent-length:");
+                const u32 body_len =
+                    cl == std::string::npos ? 0 : static_cast<u32>(atoi(head.c_str() + cl + 17));
+                if (stream.size() < head_end + 4 + body_len) break;
+                out[parsed].status = static_cast<u32>(atoi(stream.c_str() + 9));
+                out[parsed].body = stream.substr(head_end + 4, body_len);
+                parsed++;
+                stream.erase(0, head_end + 4 + body_len);
+            }
+            if (parsed == count) break;
+            char buf[4096];
+            const i32 n = SSL_read(ssl, buf, sizeof(buf));
+            if (n <= 0) break;
+            stream.append(buf, static_cast<size_t>(n));
+        }
+        if (rest) *rest = stream;
+        return parsed;
+    }
+};
+
+#define TLS_BIG_POST "POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+
+static bool tls_answer_is_ok(const FramedResponse& r) {
+    return r.status == 200 && (r.body == "hi" || r.body == std::string(8192, 'b'));
+}
+
+// `wire` is written whole (split_at == 0) or as two TLS records split at `split_at`; every
+// request is answered 200, in order.
+static void expect_tls_pipelined_answers(rut::test::TestCase* _tc,
+                                         const std::string& wire,
+                                         u32 split_at,
+                                         u32 count) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    {
+        DeferredReturnRig rig;
+        rig.tls_server = tls_ctx.value();
+        start_deferred_return_rig(_tc, rig);
+        if (rig.ready) {
+            TlsBoundaryClient client;
+            REQUIRE(client.connect(rig.port));
+            const u32 total = static_cast<u32>(wire.size());
+            if (split_at == 0) {
+                REQUIRE(ssl_write_all(client.ssl, wire.data(), total));
+            } else {
+                REQUIRE(ssl_write_all(client.ssl, wire.data(), split_at));
+                REQUIRE(ssl_write_all(client.ssl, wire.data() + split_at, total - split_at));
+            }
+            FramedResponse got[4];
+            std::string rest;
+            // Fewer than `count` is the bug: request 2 was closed or dispatched over a parked
+            // boundary.
+            REQUIRE_EQ(client.read_framed(count, got, &rest), count);
+            for (u32 i = 0; i < count; i++) CHECK(tls_answer_is_ok(got[i]));
+            CHECK(rest.empty());
+            CHECK_EQ(rig.backend.request_count.load(std::memory_order_acquire), count);
+        }
+    }
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+#define TLS_BOUNDARY_TEST(name, wire_literal, split_at, count)                         \
+    TEST(proxy_reuse, name) {                                                          \
+        if (!iouring_socket_live())                                                    \
+            SKIP("io_uring async socket ops unavailable in this environment");         \
+        expect_tls_pipelined_answers(_tc, std::string(wire_literal), split_at, count); \
+    }
+
+TLS_BOUNDARY_TEST(tls_split_body_post_then_deadline_forward_one_record_iouring,
+                  TLS_BIG_POST DEFERRED_RETURN_DIRECT_REQ,
+                  0,
+                  2)
+TLS_BOUNDARY_TEST(tls_split_body_post_then_guarded_forward_two_records_iouring,
+                  TLS_BIG_POST DEFERRED_RETURN_GUARDED_REQ,
+                  sizeof(TLS_BIG_POST) - 1,
+                  2)
+TLS_BOUNDARY_TEST(tls_split_body_post_post_then_deadline_forward_iouring,
+                  TLS_BIG_POST TLS_BIG_POST DEFERRED_RETURN_DIRECT_REQ,
+                  0,
+                  3)
+
+// Request 2 sent the moment response 1 is read, over TLS, on one connection.
+TEST(proxy_reuse, tls_split_body_back_to_back_requests_never_close_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    {
+        DeferredReturnRig rig;
+        rig.tls_server = tls_ctx.value();
+        start_deferred_return_rig(_tc, rig);
+        if (rig.ready) {
+            TlsBoundaryClient client;
+            REQUIRE(client.connect(rig.port));
+            static const char kPost[] = TLS_BIG_POST;
+            static const char kDirect[] = DEFERRED_RETURN_DIRECT_REQ;
+            static const char kGuarded[] = DEFERRED_RETURN_GUARDED_REQ;
+            constexpr u32 kIterations = 100;
+            for (u32 i = 0; i < kIterations; i++) {
+                FramedResponse got;
+                REQUIRE(ssl_write_all(client.ssl, kPost, sizeof(kPost) - 1));
+                REQUIRE_EQ(client.read_framed(1, &got, nullptr), 1u);
+                REQUIRE(tls_answer_is_ok(got));
+                const char* const next = (i & 1) ? kGuarded : kDirect;
+                REQUIRE(ssl_write_all(client.ssl, next, static_cast<u32>(strlen(next))));
+                // Zero is the bug: request 2 was closed with no response.
+                REQUIRE_EQ(client.read_framed(1, &got, nullptr), 1u);
+                REQUIRE(tls_answer_is_ok(got));
+            }
+        }
+    }
+    destroy_tls_server_context(tls_ctx.value());
+}
+
 #endif  // RUT_ENABLE_JIT_TESTS
 
 // End-to-end proxy over HTTP/2: an h2c client requests a RouteAction::Proxy
