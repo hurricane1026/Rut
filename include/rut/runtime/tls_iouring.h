@@ -179,7 +179,7 @@ bool tls_ensure_draining(Self* loop, Connection& c) {
         // as the response completion, tls_out_inflight is never cleared, and the
         // output buffer/accounting get stuck.
         c.on_send = &tls_on_out_drain<Self>;
-        return false;
+        return true;
     }
     if (c.tls_out_buf.len() == 0) return true;
     const u32 kAvail = c.tls_out_buf.len();
