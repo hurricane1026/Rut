@@ -14051,7 +14051,9 @@ TEST(tls_iouring, raw_response_owner_first_loss_discards_late_positive) {
     conn.state = ConnState::Sending;
     conn.proxy_resp_started = true;
     static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xCA, 0xFE};
-    REQUIRE_NE(stage_tls_raw_send_target(loop, conn, kCiphertext, sizeof(kCiphertext), false), 0u);
+    REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
+    REQUIRE_NE(stage_tls_raw_send_target(loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), false),
+               0u);
     conn.tls_active = true;
     conn.tls_pending_on_send = &on_response_sent<IoUringEventLoop>;
     REQUIRE(conn.next_non_upstream_send_generation(conn.tls_send_owner_generation));
@@ -14073,6 +14075,31 @@ TEST(tls_iouring, raw_response_owner_first_loss_discards_late_positive) {
     tls_recv<IoUringEventLoop>(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0, 0});
     CHECK(conn.tls_out_inflight);
     CHECK_EQ(conn.tls_in_buf.len(), 0u);
+}
+
+TEST(tls_iouring, raw_response_owner_mismatch_fails_closed_before_loss_admission) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    u8 in_storage[16];
+    u8 out_storage[16];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_in_buf.bind(in_storage, sizeof(in_storage));
+    conn.tls_out_buf.bind(out_storage, sizeof(out_storage));
+    conn.state = ConnState::Sending;
+    conn.proxy_resp_started = true;
+    conn.tls_active = true;
+    static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xCA, 0xFE};
+    REQUIRE_NE(stage_tls_raw_send_target(loop, conn, kCiphertext, sizeof(kCiphertext), false), 0u);
+    conn.tls_pending_on_send = nullptr;
+    IoEvent overflow{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0};
+    overflow.provided_ring_empty = 0;
+    tls_recv<IoUringEventLoop>(&loop, conn, overflow);
+    CHECK_EQ(conn.fd, -1);
+    CHECK_FALSE(conn.req_body_lossy_successor);
 }
 
 TEST(tls_iouring, live_raw_owner_consumes_zero_and_stale_tokens_without_accounting) {
