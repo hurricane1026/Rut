@@ -9326,6 +9326,11 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (body_done) {
         conn.request_upload_complete = true;
+        // A lossy recv CQE may have left successor bytes behind the completed
+        // current request. This request is already marked Connection: close;
+        // discard the damaged successor instead of stashing it for reuse.
+        if (!conn.keep_alive && conn.recv_buf.len() > conn.req_initial_send_len)
+            conn.recv_buf.reset();
         if (!pipeline_stash(conn)) {
             loop->close_conn(conn);
             return;
