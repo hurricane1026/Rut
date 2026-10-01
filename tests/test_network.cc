@@ -76694,87 +76694,108 @@ TEST(request_body_overflow, iouring_connect_owner_requires_exact_bodyless_bounda
 }
 
 TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_rejects) {
-    for (const bool tls : {false, true}) {
-        for (const bool incomplete : {false, true}) {
-            ScopedIoUringLoopForRetirement guard;
-            if (!guard.init()) SKIP("io_uring unavailable");
-            auto* loop = guard.loop;
-            Connection* c = loop->alloc_conn();
-            REQUIRE(c != nullptr);
-            i32 downstream[2] = {-1, -1};
-            i32 upstream[2] = {-1, -1};
-            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
-            REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
-            c->fd = downstream[0];
-            c->upstream_fd = upstream[0];
-            downstream[0] = -1;
-            upstream[0] = -1;
-            REQUIRE(loop->alloc_upstream_buf(*c));
-            const char* request =
-                incomplete ? "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nab"
-                           : "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabcNEXT";
-            const u32 request_len = static_cast<u32>(strlen(request));
-            REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
-                       request_len);
-            capture_request_metadata(*c);
-            c->tls_active = tls;
-            c->state = ConnState::Proxying;
-            c->upstream_connect_armed = true;
-            c->recv_armed = true;
-            c->pending_ops = 2;
-            c->on_upstream_send = &on_upstream_connected<IoUringEventLoop>;
-            c->upstream_episode = 1;
-            loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
-            if (incomplete) {
-                CHECK_EQ(c->fd, -1);
-            } else {
-                CHECK_FALSE(c->req_body_overflow_rejected);
-                CHECK(c->req_body_lossy_successor);
-                CHECK_FALSE(c->keep_alive);
-                CHECK_GE(c->fd, 0);
-                c->upstream_connect_armed = false;
-                loop->dispatch(
-                    {c->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, c->upstream_episode});
-                CHECK_GE(c->fd, 0);
-                CHECK_EQ(c->on_upstream_send, &on_upstream_request_sent<IoUringEventLoop>);
-                const auto& send = loop->backend.upstream_send_state[c->id];
-                CHECK_EQ(send.remaining, c->req_initial_send_len);
-                CHECK(__builtin_memcmp(send.src, request, c->req_initial_send_len) == 0);
-                loop->backend.upstream_send_state[c->id].offset = c->req_initial_send_len;
-                loop->backend.upstream_send_state[c->id].remaining = 0;
-                loop->dispatch({c->id,
-                                static_cast<i32>(c->req_initial_send_len),
-                                0,
-                                0,
-                                IoEventType::UpstreamSend,
-                                0,
-                                0,
-                                c->upstream_episode});
-                static constexpr u8 kResponse[] =
-                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                REQUIRE_EQ(c->upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1),
-                           sizeof(kResponse) - 1);
-                loop->dispatch({c->id,
-                                static_cast<i32>(sizeof(kResponse) - 1),
-                                0,
-                                0,
-                                IoEventType::UpstreamRecv,
-                                0,
-                                0,
-                                c->upstream_episode});
-                CHECK_EQ(c->state, ConnState::Sending);
-                CHECK_EQ(c->resp_status, static_cast<u16>(200));
-                const u32 response_len = sizeof(kResponse) - 1;
-                CHECK_EQ(loop->backend.send_state[c->id].src, c->upstream_recv_buf.data());
-                loop->backend.send_state[c->id].offset = response_len;
-                loop->backend.send_state[c->id].remaining = 0;
-                loop->dispatch(
-                    {c->id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0, 0, 0});
-                CHECK_EQ(c->fd, -1);
-            }
-            close(downstream[1]);
-            close(upstream[1]);
+    for (const bool incomplete : {false, true}) {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        Connection* c = loop->alloc_conn();
+        REQUIRE(c != nullptr);
+        i32 downstream[2] = {-1, -1};
+        i32 upstream[2] = {-1, -1};
+        REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+        REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+        c->fd = downstream[0];
+        c->upstream_fd = upstream[0];
+        downstream[0] = -1;
+        upstream[0] = -1;
+        REQUIRE(loop->alloc_upstream_buf(*c));
+        const char* request =
+            incomplete ? "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nab"
+                       : "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabcNEXT";
+        const u32 request_len = static_cast<u32>(strlen(request));
+        REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+                   request_len);
+        capture_request_metadata(*c);
+        c->state = ConnState::Proxying;
+        c->upstream_connect_armed = true;
+        c->recv_armed = true;
+        c->pending_ops = 2;
+        c->on_upstream_send = &on_upstream_connected<IoUringEventLoop>;
+        c->upstream_episode = 1;
+        loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+        if (incomplete) {
+            CHECK_GE(c->fd, 0);
+            CHECK(c->req_body_overflow_rejected);
+            CHECK_FALSE(c->req_body_lossy_successor);
+            CHECK_FALSE(c->keep_alive);
+            CHECK_EQ(c->state, ConnState::Sending);
+            CHECK_EQ(c->resp_status, static_cast<u16>(413));
+            CHECK_EQ(c->on_upstream_send, nullptr);
+            CHECK_FALSE(c->upstream_connect_armed);
+            CHECK(buf_contains(reinterpret_cast<const char*>(c->send_buf.data()),
+                               c->send_buf.len(),
+                               "HTTP/1.1 413 Payload Too Large",
+                               30));
+            CHECK(buf_contains(reinterpret_cast<const char*>(c->send_buf.data()),
+                               c->send_buf.len(),
+                               "Connection: close",
+                               17));
+            const u32 response_len = c->send_buf.len();
+            CHECK_EQ(loop->backend.send_state[c->id].src, c->send_buf.data());
+            CHECK_EQ(loop->backend.send_state[c->id].offset, 0u);
+            CHECK_EQ(loop->backend.send_state[c->id].remaining, response_len);
+            loop->backend.send_state[c->id].offset = response_len;
+            loop->backend.send_state[c->id].remaining = 0;
+            loop->dispatch(
+                {c->id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0, 0, 0});
+            CHECK_EQ(c->fd, -1);
+        } else {
+            CHECK_FALSE(c->req_body_overflow_rejected);
+            CHECK(c->req_body_lossy_successor);
+            CHECK_FALSE(c->keep_alive);
+            CHECK_GE(c->fd, 0);
+            c->upstream_connect_armed = false;
+            loop->dispatch(
+                {c->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, c->upstream_episode});
+            CHECK_GE(c->fd, 0);
+            CHECK_EQ(c->on_upstream_send, &on_upstream_request_sent<IoUringEventLoop>);
+            const auto& send = loop->backend.upstream_send_state[c->id];
+            CHECK_EQ(send.remaining, c->req_initial_send_len);
+            CHECK(__builtin_memcmp(send.src, request, c->req_initial_send_len) == 0);
+            loop->backend.upstream_send_state[c->id].offset = c->req_initial_send_len;
+            loop->backend.upstream_send_state[c->id].remaining = 0;
+            loop->dispatch({c->id,
+                            static_cast<i32>(c->req_initial_send_len),
+                            0,
+                            0,
+                            IoEventType::UpstreamSend,
+                            0,
+                            0,
+                            c->upstream_episode});
+            static constexpr u8 kResponse[] =
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            REQUIRE_EQ(c->upstream_recv_buf.write(kResponse, sizeof(kResponse) - 1),
+                       sizeof(kResponse) - 1);
+            loop->dispatch({c->id,
+                            static_cast<i32>(sizeof(kResponse) - 1),
+                            0,
+                            0,
+                            IoEventType::UpstreamRecv,
+                            0,
+                            0,
+                            c->upstream_episode});
+            CHECK_EQ(c->state, ConnState::Sending);
+            CHECK_EQ(c->resp_status, static_cast<u16>(200));
+            const u32 response_len = sizeof(kResponse) - 1;
+            CHECK_EQ(loop->backend.send_state[c->id].src, c->upstream_recv_buf.data());
+            loop->backend.send_state[c->id].offset = response_len;
+            loop->backend.send_state[c->id].remaining = 0;
+            loop->dispatch(
+                {c->id, static_cast<i32>(response_len), 0, 0, IoEventType::Send, 0, 0, 0});
+            CHECK_EQ(c->fd, -1);
         }
+        close(downstream[1]);
+        close(upstream[1]);
     }
 }
 
