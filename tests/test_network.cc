@@ -71354,6 +71354,7 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
         loop->dispatch({id, 2, 0, 0, IoEventType::Send, 0});
         IoEvent error{};
         REQUIRE(harvest_http1_boundary_recv(loop, *conn, nullptr, 0, -ENOBUFS, true, &error));
+        error.provided_ring_empty = 0;  // selected-buffer loss is fail-closed
         const u32 pending_before = conn->pending_ops;
         loop->dispatch(error);
         Connection& parked = loop->conns[id];
@@ -71380,6 +71381,53 @@ TEST(iouring_boundary, eof_error_and_close_before_final_cancel_without_resume) {
             {id, -ENOENT, 0, 0, IoEventType::UpstreamRecv, 0, kUpstreamRetirementCancelAux, kOld});
         loop->resume_deferred_http1_boundaries();
         CHECK_EQ(closed.handler_gen, 0u);
+        close(peer);
+    }
+
+    // A ring-empty ENOBUFS consumed no socket bytes.  Keep the parked boundary
+    // live, then re-arm exactly once after the provided ring is replenished.
+    {
+        ScopedIoUringLoopForRetirement guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto* loop = guard.loop;
+        RouteConfig config{};
+        const RouteConfig* active = &config;
+        loop->config_ptr = &active;
+        ShardEpoch epoch{};
+        epoch.epoch.store(1, std::memory_order_relaxed);
+        ShardMetrics metrics{};
+        metrics.init();
+        metrics.requests_active = 1;
+        Connection* conn = nullptr;
+        i32 peer = -1;
+        REQUIRE(stage_http1_boundary_retirement(
+            loop, &config, &epoch, &metrics, nullptr, 0, &conn, &peer));
+        const u32 id = conn->id;
+        loop->dispatch({id, 2, 0, 0, IoEventType::Send, 0});
+        IoEvent ring_empty{};
+        REQUIRE(harvest_http1_boundary_recv(loop, *conn, nullptr, 0, -ENOBUFS, true, &ring_empty));
+        ring_empty.provided_ring_empty = 1;
+        const u32 pending_live = conn->pending_ops;
+        loop->dispatch(ring_empty);
+        CHECK_GE(conn->fd, 0);
+        CHECK(conn->http1_boundary_deferred);
+        CHECK(conn->recv_armed);
+        CHECK_EQ(conn->pending_ops, pending_live);
+
+        IoEvent terminal{};
+        REQUIRE(harvest_http1_boundary_recv(loop, *conn, nullptr, 0, -ENOBUFS, false, &terminal));
+        terminal.provided_ring_empty = 1;
+        loop->dispatch(terminal);
+        CHECK_GE(conn->fd, 0);
+        CHECK(conn->http1_boundary_deferred);
+        CHECK_FALSE(conn->recv_armed);
+        CHECK_EQ(loop->recv_rearm_count, 1u);
+        const u32 pending_before_rearm = conn->pending_ops;
+        loop->rearm_deferred_recvs(/*force=*/true);
+        CHECK_EQ(loop->recv_rearm_count, 0u);
+        CHECK(conn->recv_armed);
+        CHECK_EQ(conn->pending_ops, pending_before_rearm + 1u);
+        loop->close_conn(*conn);
         close(peer);
     }
 
