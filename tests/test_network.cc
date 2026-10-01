@@ -76508,6 +76508,7 @@ TEST(request_body_overflow, iouring_full_cl_initial_owner_send_first_clears_succ
     CHECK_FALSE(c->keep_alive);
     CHECK(c->request_upload_complete);
     CHECK_EQ(c->pipeline_stash_len, 0u);
+    CHECK_EQ(c->send_buf.len(), 0u);
     CHECK_EQ(c->recv_buf.len(), 0u);
     CHECK_GE(c->fd, 0);
     CHECK_FALSE(c->upstream_send_armed);
