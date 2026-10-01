@@ -6958,7 +6958,11 @@ TEST(tls_iouring, overflow_owned_recv_error_closes_but_unowned_late_input_is_ign
     conn.fd = 42;
     conn.tls_active = true;
     conn.req_body_overflow_rejected = true;
+    u8 tls_in_storage[64];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
     conn.send_armed = true;
+    conn.recv_armed = true;
     conn.pending_ops = 1;
     conn.send_slice = loop.send_storage[0];
     conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
@@ -7588,6 +7592,116 @@ TEST(tls_iouring, abandoned_positive_want_read_discards_real_tls_plaintext) {
     REQUIRE_EQ(tls_fill_output<TlsIouringHarness>(&loop, conn, kResponse, 4, consumed),
                TlsFill::Done);
     REQUIRE_EQ(consumed, 4u);
+    const u32 raw_len = conn.tls_out_inflight_len;
+    const u32 raw_generation = conn.tls_out_inflight_generation;
+    REQUIRE_GT(raw_len, 0u);
+
+    REQUIRE(SSL_write(cl.ssl, kNextRequest, sizeof(kNextRequest) - 1) ==
+            static_cast<int>(sizeof(kNextRequest) - 1));
+    u8 peer_ciphertext[4096]{};
+    const int cipher_len = BIO_read(cl.wbio, peer_ciphertext, sizeof(peer_ciphertext));
+    REQUIRE_GT(cipher_len, 0);
+    constexpr u32 kPrefixLen = 1;
+    REQUIRE_LE(kPrefixLen, static_cast<u32>(cipher_len));
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>(peer_ciphertext), kPrefixLen),
+               kPrefixLen);
+    conn.recv_armed = false;  // this positive CQE has already consumed the raw recv owner
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, kPrefixLen, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK(conn.tls_out_inflight);
+    CHECK_EQ(conn.tls_in_buf.len(), kPrefixLen);
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK_FALSE(g_tls_iouring_logical_send_called);
+    CHECK_EQ(conn.tls_pending_on_recv, &tls_resume_pending_send_recv<TlsIouringHarness>);
+    const u32 suffix_len = static_cast<u32>(cipher_len) - kPrefixLen;
+    REQUIRE_LE(suffix_len, conn.tls_in_buf.write_avail());
+    REQUIRE_EQ(conn.tls_in_buf.write(peer_ciphertext + kPrefixLen, suffix_len), suffix_len);
+    tls_recv<TlsIouringHarness>(
+        &loop,
+        conn,
+        IoEvent{conn.id, static_cast<i32>(suffix_len), 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_in_buf.len(), static_cast<u32>(cipher_len));
+    CHECK_EQ(conn.tls_pending_on_recv, &tls_resume_pending_send_recv<TlsIouringHarness>);
+
+    u32 drain_generation = raw_generation;
+    for (u32 drains = 0; drains < 4 && !g_tls_iouring_logical_send_called; drains++) {
+        const u32 drain_len = conn.tls_out_inflight_len;
+        REQUIRE_GT(drain_len, 0u);
+        REQUIRE_EQ(BIO_write(cl.rbio, conn.tls_out_buf.data(), static_cast<int>(drain_len)),
+                   static_cast<int>(drain_len));
+        auto& state = loop.backend.send_state[conn.id];
+        state.offset = drain_len;
+        state.remaining = 0;
+        drain_generation = conn.tls_out_inflight_generation;
+        conn.pending_ops--;
+        conn.send_armed = false;
+        IoEvent drain = {};
+        drain.conn_id = conn.id;
+        drain.type = IoEventType::Send;
+        drain.result = static_cast<i32>(drain_len);
+        drain.non_upstream_generation = drain_generation;
+        tls_on_out_drain<TlsIouringHarness>(&loop, conn, drain);
+    }
+
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_out_buf.len(), 0u);
+    CHECK_EQ(conn.tls_send_off, conn.tls_send_len);
+    CHECK(g_tls_iouring_logical_send_called);
+    CHECK_EQ(g_tls_iouring_logical_send_calls, 1u);
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_NE(conn.tls_pending_on_recv, &tls_resume_pending_send_recv<TlsIouringHarness>);
+    cl.destroy();
+    tls_engine_free(conn.tls_engine);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls_iouring, overflow_rejected_positive_want_read_discards_real_tls_plaintext) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.req_body_overflow_rejected = true;
+    conn.recv_slice = loop.recv_storage[0];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    conn.on_recv = &tls_recv<TlsIouringHarness>;
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+
+    static constexpr u8 kResponse[] =
+        "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr u8 kNextRequest[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 owner_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(owner_generation));
+    conn.tls_send_owner_generation = owner_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kResponse;
+    conn.tls_send_len = sizeof(kResponse) - 1;
+    conn.tls_pending_on_send = &tls_iouring_logical_send_probe;
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
+    g_tls_iouring_logical_send_called = false;
+    g_tls_iouring_logical_send_calls = 0;
+    u32 consumed = 0;
+    REQUIRE_EQ(
+        tls_fill_output<TlsIouringHarness>(&loop, conn, kResponse, sizeof(kResponse) - 1, consumed),
+        TlsFill::Done);
+    REQUIRE_EQ(consumed, sizeof(kResponse) - 1u);
     const u32 raw_len = conn.tls_out_inflight_len;
     const u32 raw_generation = conn.tls_out_inflight_generation;
     REQUIRE_GT(raw_len, 0u);

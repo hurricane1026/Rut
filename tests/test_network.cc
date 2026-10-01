@@ -76079,6 +76079,9 @@ TEST(request_body_overflow, iouring_full_cl_initial_owner_preserves_response) {
     CHECK(c->request_upload_complete);
     CHECK_EQ(c->pipeline_stash_len, 0u);
     CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK_GE(c->fd, 0);
+    CHECK_FALSE(c->upstream_send_armed);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<IoUringEventLoop>);
     close(downstream[1]);
     close(upstream[1]);
 }
