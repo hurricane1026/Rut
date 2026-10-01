@@ -76693,6 +76693,60 @@ TEST(request_body_overflow, iouring_connect_owner_requires_exact_bodyless_bounda
     close(upstream[1]);
 }
 
+TEST(request_body_overflow, iouring_connect_owner_exact_cl_and_incomplete_rejects) {
+    for (const bool tls : {false, true}) {
+        for (const bool incomplete : {false, true}) {
+            ScopedIoUringLoopForRetirement guard;
+            if (!guard.init()) SKIP("io_uring unavailable");
+            auto* loop = guard.loop;
+            Connection* c = loop->alloc_conn();
+            REQUIRE(c != nullptr);
+            i32 downstream[2] = {-1, -1};
+            i32 upstream[2] = {-1, -1};
+            REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+            REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+            c->fd = downstream[0];
+            c->upstream_fd = upstream[0];
+            downstream[0] = -1;
+            upstream[0] = -1;
+            REQUIRE(loop->alloc_upstream_buf(*c));
+            const char* request =
+                incomplete ? "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabNEXT"
+                           : "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabcNEXT";
+            const u32 request_len = static_cast<u32>(strlen(request));
+            REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+                       request_len);
+            capture_request_metadata(*c);
+            c->tls_active = tls;
+            c->state = ConnState::Proxying;
+            c->upstream_connect_armed = true;
+            c->recv_armed = true;
+            c->pending_ops = 2;
+            c->on_upstream_send = &on_upstream_connected<IoUringEventLoop>;
+            c->upstream_episode = 1;
+            loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0});
+            if (incomplete) {
+                CHECK_EQ(c->fd, -1);
+            } else {
+                CHECK_FALSE(c->req_body_overflow_rejected);
+                CHECK(c->req_body_lossy_successor);
+                CHECK_FALSE(c->keep_alive);
+                CHECK_GE(c->fd, 0);
+                c->upstream_connect_armed = false;
+                loop->dispatch(
+                    {c->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, c->upstream_episode});
+                CHECK_GE(c->fd, 0);
+                CHECK_EQ(c->on_upstream_send, &on_upstream_request_sent<IoUringEventLoop>);
+                const auto& send = loop->backend.upstream_send_state[c->id];
+                CHECK_EQ(send.remaining, c->req_initial_send_len);
+                CHECK(__builtin_memcmp(send.src, request, c->req_initial_send_len) == 0);
+            }
+            close(downstream[1]);
+            close(upstream[1]);
+        }
+    }
+}
+
 TEST(request_body_overflow, iouring_bodyless_initial_owner_preserves_response) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
