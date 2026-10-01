@@ -13440,6 +13440,7 @@ TEST(tls_iouring, drain_completion_invokes_saved_send_continuation) {
     conn.reset();
     conn.id = 0;
     conn.fd = 42;
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
     REQUIRE_EQ(conn.tls_out_buf.write(kCiphertext, sizeof(kCiphertext)), sizeof(kCiphertext));
     const u32 raw_generation =
         stage_tls_raw_send_target(loop, conn, conn.tls_out_buf.data(), sizeof(kCiphertext), true);
