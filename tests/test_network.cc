@@ -42217,10 +42217,15 @@ bool stage_live_precise_request(IoUringEventLoop* loop,
     const u8* request = bodyless_get ? (downstream_close ? kGetCloseRequest : kGetKeepAliveRequest)
                         : downstream_close ? kCloseRequest
                                            : kKeepAliveRequest;
-    const u32 request_len = bodyless_get ? (downstream_close ? sizeof(kGetCloseRequest) - 1u
-                                                             : sizeof(kGetKeepAliveRequest) - 1u)
-                            : downstream_close ? sizeof(kCloseRequest) - 1u
-                                               : sizeof(kKeepAliveRequest) - 1u;
+    u32 request_len;
+    if (bodyless_get && downstream_close)
+        request_len = sizeof(kGetCloseRequest) - 1u;
+    else if (bodyless_get)
+        request_len = sizeof(kGetKeepAliveRequest) - 1u;
+    else if (downstream_close)
+        request_len = sizeof(kCloseRequest) - 1u;
+    else
+        request_len = sizeof(kKeepAliveRequest) - 1u;
     if (conn->recv_buf.write(request, request_len) != request_len) return fail();
     capture_request_metadata(*conn);
     // Match real ingress: runtime keep-alive is a drain decision; the client's
