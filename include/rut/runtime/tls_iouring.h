@@ -690,7 +690,7 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
                       }) {
             return loop->tls_ciphertext_send_is_current(c);
         }
-        return true;
+        return false;
     }();
     const bool tls_raw_owner =
         c.on_send == &tls_on_out_drain<Self> && c.send_armed && c.proxy_resp_started &&
