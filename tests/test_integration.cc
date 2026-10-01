@@ -6419,6 +6419,8 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     REQUIRE(c != nullptr);
     c->req_body_mode = BodyMode::Chunked;
     c->req_chunk_parser.state = ChunkedParser::State::Complete;
+    c->upstream_fd = 99;
+    c->upstream_episode = 1;
     c->upstream_send_armed = true;
     c->pending_ops = 2;
     c->on_upstream_send = &on_request_body_sent<IoUringEventLoop>;
@@ -6427,6 +6429,10 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK_FALSE(c->keep_alive);
     CHECK_FALSE(c->request_upload_complete);
+    loop->dispatch({c->id, 1, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
+    CHECK(c->request_upload_complete);
+    CHECK_EQ(c->pending_ops, 1u);
+    CHECK(c->fd >= 0);
     loop->shutdown();
 }
 
