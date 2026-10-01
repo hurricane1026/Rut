@@ -5212,7 +5212,6 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     if (conn.req_body_mode == BodyMode::ContentLength && conn.req_content_length != 0 &&
         conn.req_header_end <= conn.recv_buf.len() &&
         conn.req_content_length <= conn.recv_buf.len() - conn.req_header_end) {
-        conn.req_body_remaining = 0;
         // The initial upstream send still owns completion. Keep the buffered
         // current-request bytes available for that send and discard any lossy
         // successor after its completion; do not publish upload completion yet.
