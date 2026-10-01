@@ -7004,7 +7004,6 @@ TEST(tls_iouring, final_body_send_overflow_keeps_content_length_and_chunked_owne
     }
 }
 
->>>>>>> fa717277 (Test TLS final body overflow ownership)
 enum class TlsKeyUpdatePeer : u8 { Client, Server };
 
 struct TlsKeyUpdateDiagnostic {
