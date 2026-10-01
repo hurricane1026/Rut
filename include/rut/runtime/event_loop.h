@@ -180,6 +180,12 @@ public:
             conn.req_body_lossy_successor = true;
             conn.keep_alive = false;
             conn.reset_request_receive_buffer();
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
+                if (!conn.uses_iouring_tls() && conn.recv_armed && !self().pause_recv(conn)) {
+                    self().close_conn(conn);
+                }
+            }
             return;
         }
         if (response_owner && conn.req_body_lossy_successor &&
