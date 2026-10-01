@@ -7005,6 +7005,15 @@ public:
                                 if (conn.recv_pause_cancel_pending)
                                     conn.recv_pause_rearm_pending = true;
                             }
+                            if (conn.recv_pause_rearm_pending && !conn.recv_pause_cancel_pending &&
+                                !conn.recv_pause_target_inflight && !conn.recv_paused_for_send &&
+                                conn.fd >= 0) {
+                                conn.recv_pause_rearm_pending = false;
+                                if (!submit_recv_impl(conn)) {
+                                    close_conn(conn);
+                                    break;
+                                }
+                            }
                         }
                         if (ev.type == IoEventType::Send) {
                             conn.send_armed = false;

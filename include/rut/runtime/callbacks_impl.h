@@ -5199,6 +5199,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     // when recv_buf contains only a partial or empty response prefix. Preserve
     // that owner so on_request_body_sent can finish the response and close.
     if (final_body_send_inflight) {
+        conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
         return;
     }
@@ -5214,6 +5215,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         // successor after its completion; do not publish upload completion yet.
         conn.request_body_fully_buffered = false;
         conn.request_upload_complete = false;
+        conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
         return;
     }
@@ -9325,7 +9327,7 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         // A lossy recv CQE may have left successor bytes behind the completed
         // current request. This request is already marked Connection: close;
         // discard the damaged successor instead of stashing it for reuse.
-        if (!conn.keep_alive && conn.recv_buf.len() > conn.req_initial_send_len)
+        if (conn.req_body_lossy_successor && conn.recv_buf.len() > conn.req_initial_send_len)
             conn.recv_buf.reset();
         if (!pipeline_stash(conn)) {
             loop->close_conn(conn);

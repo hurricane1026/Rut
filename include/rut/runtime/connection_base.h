@@ -350,6 +350,9 @@ struct ConnectionBase {
     // io_uring: a request-body CQE overflowed recv_buf and the client was refused with
     // 413 (respond_request_body_overflow); later recv errors must not cut that response.
     bool req_body_overflow_rejected;
+    // A lossy downstream CQE discarded bytes after the complete current body.
+    // Only this provenance permits dropping a pipelined successor on completion.
+    bool req_body_lossy_successor;
     // An early upstream response ended the upload: the rest of the request body is
     // read and dropped, never forwarded (prepare_early_response_state).
     bool req_body_abandoned;
@@ -1755,6 +1758,7 @@ struct ConnectionBase {
         proxy_resp_started = false;
         upstream_abandoned = false;
         req_body_overflow_rejected = false;
+        req_body_lossy_successor = false;
         req_body_abandoned = false;
         upstream_keep_alive = false;
         upstream_reused = false;

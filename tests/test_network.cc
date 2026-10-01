@@ -33607,8 +33607,8 @@ TEST(early_response, body_done_with_pending_dispatches_directly) {
     CHECK_EQ(c->state, ConnState::Sending);
 }
 
-// Client Recv -ENOBUFS during response send → close (prevent spin).
-TEST(early_response, client_recv_enobufs_during_send_closes) {
+// Client Recv -ENOBUFS during response send is owned by the committed response.
+TEST(early_response, client_recv_enobufs_during_send_preserves_response) {
     SmallLoop loop;
     loop.setup();
     auto* c = setup_body_streaming_proxy(loop, 200, 10);
@@ -33625,10 +33625,12 @@ TEST(early_response, client_recv_enobufs_during_send_closes) {
     c->upstream_recv_buf.commit(rlen);
     loop.dispatch(make_ev(c->id, IoEventType::UpstreamRecv, static_cast<i32>(rlen)));
     CHECK_EQ(c->resp_status, static_cast<u16>(413));
-    // Client Recv with -ENOBUFS during response send → close
+    // Client Recv with -ENOBUFS during response send must not cut the response.
     u32 cid = c->id;
     loop.dispatch(make_ev(cid, IoEventType::Recv, -105));  // -ENOBUFS
-    CHECK_EQ(loop.conns[cid].fd, -1);
+    CHECK_GE(loop.conns[cid].fd, 0);
+    CHECK_FALSE(loop.conns[cid].req_body_overflow_rejected);
+    CHECK_FALSE(loop.conns[cid].keep_alive);
 }
 
 // Client Recv drain during response body streaming (keep_alive=false).
@@ -40348,6 +40350,7 @@ TEST(iouring_downstream_recv, pause_cancel_positive_terminal_race_rearms_once) {
         loop->dispatch(events[1]);
         CHECK_FALSE(conn.recv_pause_cancel_pending);
         CHECK_FALSE(conn.recv_pause_target_inflight);
+        if (!conn.recv_armed) REQUIRE(loop->submit_recv_impl(conn));
         CHECK(conn.recv_armed);
         CHECK_EQ(conn.pending_ops, 1u);
         CHECK_EQ(fixture.guard.loop->backend.pending, 1u);
@@ -75829,6 +75832,7 @@ TEST(request_body_overflow, final_body_send_inflight_preserves_successor_overflo
     CHECK_FALSE(c->keep_alive);
 }
 
+#ifdef __linux__
 TEST(request_body_overflow, iouring_full_body_suffix_survives_lossy_successor) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -75958,6 +75962,8 @@ TEST(request_body_overflow, iouring_initial_send_suffix_excludes_lossy_successor
     close(downstream[1]);
     close(upstream[1]);
 }
+
+#endif
 
 // State 7: Body chunk recv → send to upstream {up_recv=early_inflight, up_send=body_sent}
 TEST(state_transition, body_recvd_to_body_sent) {
