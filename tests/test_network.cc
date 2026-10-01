@@ -14036,6 +14036,35 @@ TEST(tls_iouring, completion_callback_close_or_successor_owner_is_not_overwritte
     }
 }
 
+TEST(tls_iouring, raw_response_owner_first_loss_discards_late_positive) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.state = ConnState::Sending;
+    conn.proxy_resp_started = true;
+    static constexpr u8 kCiphertext[] = {0x17, 0x03, 0x03, 0x00, 0x01, 0xCA, 0xFE};
+    REQUIRE_NE(stage_tls_raw_send_target(loop, conn, kCiphertext, sizeof(kCiphertext), false), 0u);
+    conn.tls_active = true;
+    conn.tls_pending_on_send = &on_response_sent<IoUringEventLoop>;
+    conn.tls_pending_on_recv = nullptr;
+    IoEvent overflow{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0};
+    overflow.provided_ring_empty = 0;
+    tls_recv<IoUringEventLoop>(&loop, conn, overflow);
+    CHECK(conn.req_body_lossy_successor);
+    CHECK_FALSE(conn.keep_alive);
+    CHECK(conn.tls_out_inflight);
+    static constexpr u8 kLate = 0x17;
+    REQUIRE_EQ(conn.tls_in_buf.write(&kLate, 1), 1u);
+    conn.recv_armed = false;
+    tls_recv<IoUringEventLoop>(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK(conn.tls_out_inflight);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+}
+
 TEST(tls_iouring, live_raw_owner_consumes_zero_and_stale_tokens_without_accounting) {
     for (const u32 bad_generation : {0u, 17u}) {
         ScopedTlsRawSendLoop guard;

@@ -679,10 +679,16 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
     // The first non-empty-ring overflow establishes the lossy successor only
     // when the TLS response owner is exact. WANT_READ owns ciphertext input and
     // remains the exception.
-    const bool tls_response_owner =
-        (c.on_send == &tls_on_out_drain<Self> && c.send_armed && c.proxy_resp_started &&
-         c.tls_out_inflight && c.tls_send_owner_generation != 0) ||
-        preserved_response_late_recv_owner<Self>(c);
+    const bool tls_response_completion = c.tls_pending_on_send == &on_proxy_response_sent<Self> ||
+                                         c.tls_pending_on_send == &on_response_sent<Self> ||
+                                         c.tls_pending_on_send == &on_response_header_sent<Self> ||
+                                         c.tls_pending_on_send == &on_response_body_sent<Self> ||
+                                         c.tls_pending_on_send == &on_complete_response_sent<Self>;
+    const bool tls_raw_owner = c.on_send == &tls_on_out_drain<Self> && c.send_armed &&
+                               c.proxy_resp_started && c.tls_out_inflight &&
+                               c.tls_send_owner_generation != 0 && tls_response_completion &&
+                               tls_single_shot_send_owner_is_current<Self>(c);
+    const bool tls_response_owner = tls_raw_owner || preserved_response_late_recv_owner<Self>(c);
     const bool tls_response_core = c.state == ConnState::Sending &&
                                    !c.upstream_request_incomplete && c.proxy_resp_started &&
                                    c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>;
