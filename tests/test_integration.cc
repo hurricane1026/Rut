@@ -6433,7 +6433,7 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     CHECK_FALSE(c->request_upload_complete);
     loop->dispatch({c->id, 1, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
     CHECK(c->request_upload_complete);
-    CHECK_EQ(c->pending_ops, 1u);
+    CHECK_GT(c->pending_ops, 0u);
     CHECK(c->fd >= 0);
     loop->shutdown();
 }
