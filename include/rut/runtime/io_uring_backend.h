@@ -270,7 +270,7 @@ struct IoUringBackend {
                                  bool separate_body_ring = false);
 
     // Pause downstream recv while a send wait is pending.
-    // Uses a silent cancel CQE so the event loop does not have to special-case it.
+    // The cancel completion is tagged so ownership is retained until it drains.
     bool pause_recv(i32 fd, u32 conn_id);
     // Cancel the multishot upstream recv by user_data (recv-only). The cancel's own
     // completion is tagged kPauseCancelAux so dispatch re-arms only once it drains.

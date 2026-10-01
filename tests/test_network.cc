@@ -39874,12 +39874,12 @@ struct RawDownstreamRecvBatch {
         return true;
     }
 
-    void append_terminal(Connection& conn, i32 result) {
+    void append_terminal(Connection& conn, i32 result, bool more = false) {
         u32 cursor = tail();
         auto& cqe = guard.loop->backend.cq_entries[cursor & *guard.loop->backend.cq_ring_mask];
         cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Recv, 0});
         cqe.res = result;
-        cqe.flags = 0;
+        cqe.flags = more ? IORING_CQE_F_MORE : 0;
         __atomic_store_n(guard.loop->backend.cq_tail, cursor + 1u, __ATOMIC_RELEASE);
     }
 
@@ -40710,8 +40710,8 @@ struct DownstreamRingEmptyFixture {
     }
 
     // Harvest one injected downstream terminal and dispatch it like run() does.
-    IoEvent terminal(i32 result) {
-        raw.append_terminal(*raw.conns[0], result);
+    IoEvent terminal(i32 result, bool more = false) {
+        raw.append_terminal(*raw.conns[0], result, more);
         IoEvent events[2]{};
         if (raw.wait(events, 2) != 1u) return IoEvent{};
         raw.guard.loop->dispatch(events[0]);
@@ -40765,6 +40765,18 @@ TEST(iouring_downstream_ring_empty, terminal_enobufs_is_flagged_and_rearmed_not_
     loop->backend.pending = 0;  // the SQE targets a socketpair end; never submit it
     conn.recv_armed = false;
     conn.pending_ops = 0;
+}
+
+TEST(iouring_downstream_ring_empty, nonterminal_enobufs_with_more_keeps_recv_armed) {
+    DownstreamRingEmptyFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    Connection& conn = *f.raw.conns[0];
+    const IoEvent ev = f.terminal(-ENOBUFS, true);
+    CHECK_EQ(ev.provided_ring_empty, 1u);
+    CHECK_EQ(ev.more, 1u);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(f.raw.guard.loop->recv_rearm_count, 0u);
 }
 
 TEST(iouring_downstream_ring_empty, rearm_waits_until_cq_backlog_no_longer_pins_the_ring) {
@@ -40853,9 +40865,9 @@ TEST(iouring_downstream_ring_empty, genuine_recv_errors_still_close) {
     }
 }
 
-// A pause cancel that loses the race to an -ENOBUFS terminal completes -ENOENT
-// (dropped), so the terminal must clear recv_pause_cancel_pending itself or the
-// flag outlives the recv and vetoes retirement/trim for the connection.
+// A pause cancel that loses the race to an -ENOBUFS terminal completes -ENOENT.
+// Its tagged completion owns clearing recv_pause_cancel_pending, so the flag
+// cannot be cleared before the cancel drains and then match a fresh recv.
 TEST(iouring_downstream_ring_empty, pause_cancel_race_clears_flag_and_resume_arms_one_recv) {
     DownstreamRingEmptyFixture f;
     if (!f.init()) SKIP("io_uring unavailable");
@@ -40866,8 +40878,15 @@ TEST(iouring_downstream_ring_empty, pause_cancel_race_clears_flag_and_resume_arm
     loop->backend.pending = 0;  // never submit SQEs aimed at a socketpair end
 
     f.terminal(-ENOBUFS);
-    CHECK_FALSE(conn.recv_pause_cancel_pending);
+    CHECK(conn.recv_pause_cancel_pending);
     CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);  // the tagged cancel is still in flight
+
+    // The cancel completion owns clearing the pause marker. It must not cancel
+    // a receive re-armed in the interval between these two CQEs.
+    const IoEvent cancel{conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux};
+    loop->dispatch(cancel);
+    CHECK_FALSE(conn.recv_pause_cancel_pending);
     CHECK_EQ(conn.pending_ops, 0u);
 
     // The re-arm pass parks behind the pause instead of arming.

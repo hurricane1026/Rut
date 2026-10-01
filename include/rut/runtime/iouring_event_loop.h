@@ -5776,9 +5776,11 @@ public:
         c.recv_paused_for_send = true;
         if (c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>)
             return true;
-        c.recv_pause_cancel_pending = true;
         if (!c.recv_armed) return true;
-        return backend.pause_recv(c.fd, c.id);
+        if (!backend.pause_recv(c.fd, c.id)) return false;
+        c.recv_pause_cancel_pending = true;
+        c.pending_ops++;
+        return true;
     }
 
     [[nodiscard]] bool local_body_send_holds_epoch(const Connection& c) const {
@@ -6237,13 +6239,29 @@ public:
                     // account the terminal and re-arm once buffers are back (see
                     // rearm_deferred_recvs). Paused/boundary connections are
                     // covered: submit_recv_impl parks the re-arm behind a pause.
+                    if (ev.type == IoEventType::Recv && ev.aux == kPauseCancelAux) {
+                        if (conn.pending_ops > 0) conn.pending_ops--;
+                        conn.recv_pause_cancel_pending = false;
+                        if (conn.fd < 0) {
+                            if (conn.pending_ops == 0) reclaim_slot(conn.id);
+                            break;
+                        }
+                        if (conn.recv_pause_rearm_pending && !conn.recv_armed &&
+                            !conn.recv_paused_for_send) {
+                            conn.recv_pause_rearm_pending = false;
+                            if (!submit_recv_impl(conn)) {
+                                close_conn(conn);
+                                break;
+                            }
+                        }
+                        break;
+                    }
                     if (ev.type == IoEventType::Recv && ev.provided_ring_empty &&
-                        ev.result == -ENOBUFS && !ev.more) {
+                        ev.result == -ENOBUFS) {
+                        // F_MORE means the multishot recv is still live.
+                        if (ev.more) break;
                         if (conn.pending_ops > 0) conn.pending_ops--;
                         conn.recv_armed = false;
-                        // This terminal is the recv's final CQE: a racing pause cancel
-                        // completes -ENOENT (dropped), so nothing else would clear this.
-                        conn.recv_pause_cancel_pending = false;
                         if (conn.fd < 0) {
                             if (conn.pending_ops == 0) reclaim_slot(conn.id);
                             break;
