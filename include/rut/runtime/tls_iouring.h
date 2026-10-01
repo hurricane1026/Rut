@@ -72,6 +72,8 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev);
 template <class Self>
 void tls_process(Self* loop, Connection& c);
 template <class Self>
+bool tls_discard_abandoned_input(Self* loop, Connection& c);
+template <class Self>
 void tls_resume_pending_handler_recv(void* lp, Connection& c, IoEvent ev);
 template <class Self>
 void tls_resume_pending_send_recv(void* lp, Connection& c, IoEvent ev);
@@ -146,6 +148,19 @@ bool tls_finish_single_shot_send(Self* loop, Connection& c) {
     // next response body's logical owner. No old completion tail may alter it.
     return c.tls_active && c.fd == witness.fd && c.handler_gen == witness.handler_generation &&
            c.tls_send_owner_generation == 0;
+}
+
+template <class Self>
+bool tls_discard_abandoned_input(Self* loop, Connection& c) {
+    c.tls_in_buf.reset();
+    c.reset_request_receive_buffer();
+    if constexpr (requires(Self* candidate, Connection& conn) { candidate->pause_recv(conn); }) {
+        if (c.recv_armed && !c.recv_pause_cancel_pending && !loop->pause_recv(c)) {
+            loop->close_conn(c);
+            return false;
+        }
+    }
+    return true;
 }
 
 // Ensure exactly one raw send is draining tls_out_buf. Submits at most
@@ -531,6 +546,13 @@ void tls_process(Self* loop, Connection& c) {
         } else if (!pending_recv) {
             pending_recv = &on_header_received<Self>;
         }
+        if (c.req_body_abandoned && pending_recv != &tls_resume_pending_send_recv<Self>) {
+            // Early-response ownership has no request parser.  Discard any
+            // plaintext decrypted before the parked send continuation changed
+            // state, then leave the response drain in charge of the connection.
+            tls_discard_abandoned_input<Self>(loop, c);
+            return;
+        }
         const i32 callback_fd = c.fd;
         const u32 callback_handler_generation = c.handler_gen;
         const u32 callback_send_owner_generation = c.tls_send_owner_generation;
@@ -552,6 +574,12 @@ void tls_process(Self* loop, Connection& c) {
         if (!c.tls_pending_on_recv) return;
         if (c.tls_in_buf.len() == 0 || c.recv_buf.write_avail() == 0) break;
         tls_engine_set_input(c.tls_engine, c.tls_in_buf.data(), c.tls_in_buf.len());
+    }
+    if (c.req_body_abandoned) {
+        c.reset_request_receive_buffer();
+        if (c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
+            tls_discard_abandoned_input<Self>(loop, c);
+        return;
     }
     // Fail closed if a needed recv can't be armed: reaching here with no armed
     // recv means peer input is required to make progress (e.g. a pending
@@ -582,7 +610,31 @@ inline bool tls_recv_callback_is_current(const Connection& c) {
 template <class Self>
 void tls_recv(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
-    if (c.req_body_abandoned) return;
+    if (c.req_body_abandoned) {
+        // An early upstream response owns the connection's logical send.  TLS
+        // still receives ciphertext while that response drains, but there is
+        // no request callback left to consume the plaintext.  Drop the copied
+        // ciphertext instead of leaving tls_in_buf (and the recv owner) stuck.
+        // A send WANT_READ is different: its pending continuation must consume
+        // valid ciphertext through tls_process before the logical send can run.
+        if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>) {
+            if (ev.result <= 0) {
+                tls_discard_abandoned_input<Self>(loop, c);
+                c.tls_pending_on_recv = nullptr;
+                loop->close_conn(c);
+                return;
+            }
+            tls_process<Self>(loop, c);
+            if (c.req_body_abandoned) {
+                c.reset_request_receive_buffer();
+                if (c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
+                    tls_discard_abandoned_input<Self>(loop, c);
+            }
+            return;
+        }
+        tls_discard_abandoned_input<Self>(loop, c);
+        return;
+    }
     // A prior body overflow already committed the 413 response. Late TLS CQEs
     // belong to that drain and must not re-enter overflow handling or TLS parsing.
     if (c.req_body_overflow_rejected) return;

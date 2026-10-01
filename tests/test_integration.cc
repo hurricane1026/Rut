@@ -6832,6 +6832,7 @@ struct TlsIouringHarness : SmallLoop {
     u32 connection_capacity = SmallLoop::kMaxConns;
     bool sent = false;
     bool closed = false;
+    bool recv_paused = false;
     TlsKeyUpdateDiagnostic* key_update_diagnostic = nullptr;
 
     bool submit_send_raw(Connection& /*conn*/, const u8* /*buf*/, u32 len) {
@@ -6899,6 +6900,12 @@ struct TlsIouringHarness : SmallLoop {
         conn.tls_active = false;
     }
 
+    bool pause_recv(Connection& conn) {
+        recv_paused = true;
+        conn.recv_paused_for_send = true;
+        return true;
+    }
+
     void disarm_yield_timer(Connection& /*conn*/) {}
 };
 
@@ -6926,6 +6933,44 @@ TEST(tls_iouring, late_recv_after_body_overflow_preserves_413_send) {
     CHECK_EQ(conn.fd, 42);
     CHECK(conn.send_armed);
     CHECK_EQ(conn.send_buf.len(), send_len);
+}
+
+TEST(tls_iouring, abandoned_late_recv_discards_ciphertext_and_clears_want_read) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[256];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.req_body_abandoned = true;
+    conn.on_recv = &tls_recv<TlsIouringHarness>;
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.send_armed = true;
+    conn.recv_armed = true;
+    conn.pending_ops = 1;
+
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("late"), 4u), 4u);
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 4, 0, 0, IoEventType::Recv, 1, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK(conn.send_armed);
+    CHECK(loop.recv_paused);
+
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("loss"), 4u), 4u);
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("eof"), 3u), 3u);
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 0, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK(loop.closed);
+    CHECK_FALSE(conn.tls_active);
+    CHECK_EQ(conn.tls_pending_on_recv, nullptr);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
 }
 
 TEST(tls_iouring, final_body_send_overflow_keeps_content_length_and_chunked_owner) {
