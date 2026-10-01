@@ -683,9 +683,11 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         (c.on_send == &tls_on_out_drain<Self> && c.send_armed && c.proxy_resp_started &&
          c.tls_out_inflight && c.tls_send_owner_generation != 0) ||
         preserved_response_late_recv_owner<Self>(c);
-    if (c.tls_active && ev.result == -ENOBUFS && !ev.provided_ring_empty &&
-        !c.req_body_lossy_successor &&
-        c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self> && tls_response_owner) {
+    const bool tls_response_core = c.state == ConnState::Sending &&
+                                   !c.upstream_request_incomplete && c.proxy_resp_started &&
+                                   c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>;
+    if (c.tls_active && tls_response_core && ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+        !c.req_body_lossy_successor && tls_response_owner) {
         c.req_body_lossy_successor = true;
         c.keep_alive = false;
         tls_discard_abandoned_input<Self>(loop, c);
@@ -696,10 +698,7 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
     // already copied by io_uring and the specific non-empty-ring overflow CQE.
     // A WANT_READ continuation is the one exception: it owns the ciphertext
     // needed to resume the pending TLS send.
-    if (c.state == ConnState::Sending && c.req_body_lossy_successor &&
-        !c.upstream_request_incomplete && c.tls_active && c.send_armed && c.proxy_resp_started &&
-        c.tls_out_inflight && c.tls_send_owner_generation != 0 && tls_response_owner &&
-        c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self> &&
+    if (c.tls_active && tls_response_core && c.req_body_lossy_successor && tls_response_owner &&
         (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty))) {
         tls_discard_abandoned_input<Self>(loop, c);
         return;
