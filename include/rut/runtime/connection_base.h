@@ -354,6 +354,7 @@ struct ConnectionBase {
     // Defer successor classification until that prefix is decrypted and the
     // current request-body parser has advanced its framing state.
     bool tls_recv_overflow_pending;
+    u32 tls_recv_overflow_prefix_len;
     // A lossy downstream CQE discarded bytes after the complete current body.
     // Only this provenance permits dropping a pipelined successor on completion.
     bool req_body_lossy_successor;
@@ -1763,6 +1764,7 @@ struct ConnectionBase {
         upstream_abandoned = false;
         req_body_overflow_rejected = false;
         tls_recv_overflow_pending = false;
+        tls_recv_overflow_prefix_len = 0;
         req_body_lossy_successor = false;
         req_body_abandoned = false;
         upstream_keep_alive = false;

@@ -6980,6 +6980,11 @@ struct TlsIouringHarness : SmallLoop {
         return true;
     }
 
+    bool process_buffered_tls_input(Connection& conn) {
+        tls_process<TlsIouringHarness>(this, conn);
+        return conn.tls_active;
+    }
+
     void disarm_yield_timer(Connection& /*conn*/) {}
 };
 
@@ -7145,6 +7150,86 @@ TEST(tls_iouring, final_body_send_overflow_keeps_content_length_and_chunked_owne
         CHECK_EQ(conn.on_upstream_send, &on_request_body_sent<TlsIouringHarness>);
         CHECK_FALSE(conn.request_upload_complete);
     }
+}
+
+TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    for (const u32 body_len : {4u, 2u}) {
+        conn.reset();
+        conn.id = 0;
+        conn.fd = 42;
+        conn.tls_active = true;
+        conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+        conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+        conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+        conn.on_recv = &tls_recv<TlsIouringHarness>;
+        REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+        TlsClientPeer cl;
+        REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+        u8 stale[4096];
+        while (BIO_ctrl_pending(cl.wbio) != 0)
+            REQUIRE_GT(BIO_read(cl.wbio, stale, sizeof(stale)), 0);
+        conn.state = ConnState::Proxying;
+        conn.proxy_resp_started = true;
+        conn.upstream_fd = 43;
+        conn.req_body_mode = BodyMode::ContentLength;
+        conn.req_body_remaining = 4;
+        conn.upstream_send_armed = true;
+        conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
+        conn.recv_armed = true;
+        conn.pending_ops = 1;
+        conn.tls_pending_on_recv = &on_request_body_recvd<TlsIouringHarness>;
+        const char body[] = "DATA";
+        REQUIRE_EQ(SSL_write(cl.ssl, body, static_cast<int>(body_len)), static_cast<int>(body_len));
+        u8 ciphertext[4096];
+        const int cipher_len = BIO_read(cl.wbio, ciphertext, sizeof(ciphertext));
+        REQUIRE_GT(cipher_len, 0);
+        REQUIRE_EQ(conn.tls_in_buf.write(ciphertext, static_cast<u32>(cipher_len)),
+                   static_cast<u32>(cipher_len));
+        REQUIRE_EQ(SSL_write(cl.ssl, "NEXT", 4), 4);
+        u8 successor_ciphertext[4096];
+        const int successor_len =
+            BIO_read(cl.wbio, successor_ciphertext, sizeof(successor_ciphertext));
+        REQUIRE_GT(successor_len, 0);
+        REQUIRE_EQ(conn.tls_in_buf.write(successor_ciphertext, 1), 1u);
+        tls_recv<TlsIouringHarness>(
+            &loop, conn, {conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0, 0});
+        CHECK(conn.tls_recv_overflow_pending);
+        // The actual TLS engine consumes the saved current-body record before
+        // the overflow classifier runs.  The tail byte represents the
+        // successor prefix that the overflowing CQE lost.
+        tls_engine_set_input(conn.tls_engine, conn.tls_in_buf.data(), conn.tls_in_buf.len());
+        TlsOp tls_status = TlsOp::Ok;
+        u8 plaintext[32];
+        const i32 plaintext_len =
+            tls_engine_read(conn.tls_engine, plaintext, sizeof(plaintext), tls_status);
+        REQUIRE_EQ(plaintext_len, static_cast<i32>(body_len));
+        conn.tls_in_buf.consume(tls_engine_input_consumed(conn.tls_engine));
+        REQUIRE_EQ(conn.recv_buf.write(plaintext, static_cast<u32>(plaintext_len)), body_len);
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("N"), 1), 1u);
+        conn.req_body_remaining -= body_len;
+        conn.req_initial_send_len = body_len;
+        conn.tls_recv_overflow_pending = false;
+        conn.tls_recv_overflow_prefix_len = 0;
+        respond_request_body_overflow<TlsIouringHarness>(&loop, conn);
+        if (body_len == 4) {
+            CHECK(conn.req_body_lossy_successor);
+            CHECK_FALSE(conn.req_body_overflow_rejected);
+        } else {
+            CHECK_FALSE(conn.req_body_lossy_successor);
+            CHECK(conn.req_body_overflow_rejected);
+        }
+        conn.tls_in_buf.reset();  // discard the saved incomplete successor record
+        CHECK_EQ(conn.tls_in_buf.len(), 0u);
+        tls_engine_free(conn.tls_engine);
+        cl.destroy();
+    }
+    destroy_tls_server_context(tls_ctx.value());
 }
 
 enum class TlsKeyUpdatePeer : u8 { Client, Server };

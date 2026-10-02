@@ -7611,8 +7611,25 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
         const i32 callback_fd = conn.fd;
         const u32 callback_handler_generation = conn.handler_gen;
         const u32 callback_send_owner_generation = conn.tls_send_owner_generation;
+        if constexpr (requires { conn.tls_pending_on_recv; })
+            conn.tls_pending_on_recv = &on_request_body_recvd<Loop>;
+        if (conn.tls_recv_overflow_prefix_len > conn.tls_in_buf.len()) {
+            conn.tls_recv_overflow_pending = false;
+            conn.tls_recv_overflow_prefix_len = 0;
+            loop->close_conn(conn);
+            return;
+        }
+        if (conn.tls_recv_overflow_prefix_len < conn.tls_in_buf.len())
+            conn.tls_in_buf.set_len(conn.tls_recv_overflow_prefix_len);
+        bool tls_input_processed = true;
         if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
-            (void)loop->process_buffered_tls_input(conn);
+            tls_input_processed = loop->process_buffered_tls_input(conn);
+        }
+        if (!tls_input_processed) {
+            conn.tls_recv_overflow_pending = false;
+            conn.tls_recv_overflow_prefix_len = 0;
+            loop->close_conn(conn);
+            return;
         }
         if (!conn.tls_active || conn.fd != callback_fd ||
             conn.handler_gen != callback_handler_generation ||
@@ -7625,6 +7642,7 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
         conn.recv_paused_for_send = true;
         conn.recv_pause_rearm_pending = false;
         conn.tls_recv_overflow_pending = false;
+        conn.tls_recv_overflow_prefix_len = 0;
         respond_request_body_overflow<Loop>(loop, conn);
         return;
     }

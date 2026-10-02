@@ -634,8 +634,18 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         // send completes.  Do not feed raced CQEs back into TLS: a positive
         // CQE may contain the same truncated record and another overflow must
         // not queue a second pause/rearm pair.
-        if (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty)) return;
+        if (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty)) {
+            if (c.tls_recv_overflow_prefix_len > c.tls_in_buf.len()) {
+                c.tls_recv_overflow_pending = false;
+                c.tls_recv_overflow_prefix_len = 0;
+                loop->close_conn(c);
+            } else if (c.tls_in_buf.len() > c.tls_recv_overflow_prefix_len) {
+                c.tls_in_buf.set_len(c.tls_recv_overflow_prefix_len);
+            }
+            return;
+        }
         c.tls_recv_overflow_pending = false;
+        c.tls_recv_overflow_prefix_len = 0;
         loop->close_conn(c);
         return;
     }
@@ -744,8 +754,10 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         if (ev.result == -ENOBUFS && !ev.provided_ring_empty && c.tls_in_buf.len() != 0 &&
             tls_streaming_body_send_owner) {
             c.tls_recv_overflow_pending = true;
+            c.tls_recv_overflow_prefix_len = c.tls_in_buf.len();
             if (!loop->pause_recv(c)) {
                 c.tls_recv_overflow_pending = false;
+                c.tls_recv_overflow_prefix_len = 0;
                 loop->close_conn(c);
             }
             return;
