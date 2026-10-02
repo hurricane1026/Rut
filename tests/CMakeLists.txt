@@ -3492,7 +3492,7 @@ if(RUT_ENABLE_JIT)
     add_test(NAME test_native_program COMMAND test_native_program)
     set_tests_properties(test_native_program PROPERTIES LABELS "unit;jit")
 
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND Python3_Interpreter_FOUND)
+    if(Python3_Interpreter_FOUND)
         add_test(NAME test_native_protocol
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test_native_protocol.py
                 --server $<TARGET_FILE:rut> --compiler $<TARGET_FILE:rut-compile>)

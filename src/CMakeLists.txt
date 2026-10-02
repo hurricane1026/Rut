@@ -422,7 +422,7 @@ if(RUT_ENABLE_JIT)
     get_filename_component(RUT_NATIVE_LINKER_DIR "${CMAKE_LINKER}" DIRECTORY)
     target_compile_definitions(rut_jit PRIVATE ${LLVM_DEFINITIONS}
         RUT_NATIVE_LINKER="${CMAKE_C_COMPILER}"
-        RUT_NATIVE_LINKER_DIR="${CMAKE_LINKER}")
+        RUT_NATIVE_LINKER_DIR="${RUT_NATIVE_LINKER_DIR}/")
     target_include_directories(rut_jit PRIVATE ${PROJECT_BINARY_DIR}/generated)
 
     # Native helpers use the runtime; regex compilation remains compiler-only.

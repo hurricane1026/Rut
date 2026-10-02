@@ -37,11 +37,12 @@ def check_startup(server, source, explicit):
                 if ready:
                     break
         assert ready, diagnostic.decode()
-        maps = Path(f"/proc/{process.pid}/maps").read_text()
-        assert "libLLVM" not in maps, maps
-        assert "/memfd:rut-program" in maps, maps
-        children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text()
-        assert not children.strip(), children
+        if sys.platform.startswith("linux"):
+            maps = Path(f"/proc/{process.pid}/maps").read_text()
+            assert "libLLVM" not in maps, maps
+            assert "/memfd:rut-program" in maps, maps
+            children = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text()
+            assert not children.strip(), children
         # No compiler process or source is needed once serving starts.
         source.unlink()
         with socket.create_connection(("127.0.0.1", int(ready.group(1))), timeout=3) as client:
@@ -117,7 +118,7 @@ def main():
         result = subprocess.run([str(args.compiler.resolve()), str(source), "2"],
                                 capture_output=True, check=True, timeout=15)
         data = result.stdout
-        offset = data.find(b"\x7fELF")
+        offset = data.find(b"\x7fELF" if sys.platform.startswith("linux") else b"\xcf\xfa\xed\xfe")
         assert offset > 0, "compiler stream must contain a framed native image"
         header, image = data[:offset], data[offset:]
         fingerprint = re.search(rb"[0-9a-f]{64}\x00", header)
@@ -153,7 +154,12 @@ def main():
             # The consumer must stop and reap even a producer that would sleep
             # or block with a full pipe after sending an invalid handshake.
             producer_pid = int(pid_file.read_text())
-            assert not Path(f"/proc/{producer_pid}").exists(), (name, producer_pid)
+            try:
+                os.kill(producer_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError((name, producer_pid))
             print(json.dumps({"case": name, "exit_code": run.returncode,
                               "diagnostic": diagnostic.strip()}))
 
