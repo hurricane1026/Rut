@@ -37,6 +37,8 @@ struct StartupSignalScope {
     bool term_installed = false;
     sigset_t old_mask{};
     bool mask_saved = false;
+    struct sigaction old_chld{};
+    bool chld_installed = false;
     StartupSignalScope() {
         sigset_t blocked{};
         sigemptyset(&blocked);
@@ -56,6 +58,10 @@ struct StartupSignalScope {
             sigaction(SIGINT, &old_int, nullptr);
             int_installed = false;
         }
+        struct sigaction chld_default{};
+        chld_default.sa_handler = SIG_DFL;
+        sigemptyset(&chld_default.sa_mask);
+        if (sigaction(SIGCHLD, &chld_default, &old_chld) == 0) chld_installed = true;
         if (mask_saved) sigprocmask(SIG_SETMASK, &old_mask, nullptr);
     }
     bool finish() {
@@ -71,9 +77,11 @@ struct StartupSignalScope {
         if (int_installed) {
             sigaction(SIGINT, &old_int, nullptr);
         }
+        if (chld_installed) sigaction(SIGCHLD, &old_chld, nullptr);
         const bool cancelled = g_startup_cancelled != 0;
         int_installed = false;
         term_installed = false;
+        chld_installed = false;
         if (mask_saved) sigprocmask(SIG_SETMASK, &old_mask, nullptr);
         g_startup_cancelled = 0;
         return cancelled;
@@ -162,6 +170,7 @@ bool load_native_program(
     pid_t child = fork();
     if (child == 0) {
         close(channel[0]);
+        setpgid(0, 0);
         struct sigaction default_action{};
         default_action.sa_handler = SIG_DFL;
         sigemptyset(&default_action.sa_mask);
@@ -174,6 +183,7 @@ bool load_native_program(
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent_pid) _exit(127);
 #endif
         if (dup2(channel[1], STDOUT_FILENO) < 0) _exit(127);
+        if (fcntl(STDOUT_FILENO, F_SETFD, 0) != 0) _exit(127);
         if (channel[1] != STDOUT_FILENO) close(channel[1]);
         execl(compiler, compiler, source, level, nullptr);
         const char message[] = "Cannot execute sibling rut-compile\n";
@@ -185,6 +195,7 @@ bool load_native_program(
         close(channel[0]);
         return fail("cannot start rut-compile");
     }
+    setpgid(child, child);
     struct Child {
         pid_t pid;
         int fd;
@@ -208,7 +219,9 @@ bool load_native_program(
             }
         }
         void cancel() {
-            if (!reaped) kill(pid, SIGKILL);
+            if (!reaped) {
+                if (kill(-pid, SIGKILL) != 0) kill(pid, SIGKILL);
+            }
             while (!reaped) {
                 pid_t result = waitpid(pid, &status, WNOHANG);
                 if (result == pid || (result < 0 && errno == ECHILD)) {

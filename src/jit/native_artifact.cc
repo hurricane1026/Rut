@@ -11,6 +11,10 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#endif
 
 namespace rut {
 bool write_native_program(LoadedProgram& p, const char* output) {
@@ -208,8 +212,12 @@ bool write_native_program(LoadedProgram& p, const char* output) {
         ~ObjectCleanup() { unlink(path); }
     } object_cleanup{object};
     if (!jit::emit_native_object(p.native_module, object, p.engine.opt_level)) return false;
+    const pid_t parent_pid = getpid();
     pid_t child = fork();
     if (child == 0) {
+#ifdef __linux__
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent_pid) _exit(127);
+#endif
         if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) _exit(127);
 #ifdef __APPLE__
         execl(RUT_NATIVE_LINKER,
