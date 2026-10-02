@@ -112,7 +112,7 @@ bool write_native_program(LoadedProgram& p, const char* output) {
     if (!native::visit_views(c, [&](const char*& ptr, u32 len) {
             if (!ptr) return true;
             auto& fix = relocs[r++];
-            fix.field = field(&ptr);
+            fix.field = field(reinterpret_cast<const void*>(&ptr));
             if (internal(ptr, len))
                 fix.config_offset = field(ptr);
             else {
@@ -139,7 +139,7 @@ bool write_native_program(LoadedProgram& p, const char* output) {
                 char name[256];
                 jit::format_handler_symbol(p.rir.module.functions[j].name, name, sizeof(name));
                 if (p.engine.lookup(name) == reinterpret_cast<void*>(route.fn)) {
-                    add_symbol(&route.fn, name);
+                    add_symbol(reinterpret_cast<const void*>(&route.fn), name);
                     found = true;
                     break;
                 }
@@ -153,7 +153,7 @@ bool write_native_program(LoadedProgram& p, const char* output) {
             for (u32 j = 0; j < i; j++)
                 if (c.routes[j].ws_frame_handler) id++;
             jit::format_ws_handler_symbol(id, name, sizeof(name));
-            add_symbol(&route.ws_frame_handler, name);
+            add_symbol(reinterpret_cast<const void*>(&route.ws_frame_handler), name);
         }
     }
     for (u32 i = 0; i < c.timer_count; i++) {
@@ -162,7 +162,7 @@ bool write_native_program(LoadedProgram& p, const char* output) {
             char name[256];
             jit::format_handler_symbol(p.rir.module.functions[j].name, name, sizeof(name));
             if (p.engine.lookup(name) == reinterpret_cast<void*>(c.timers[i].fn)) {
-                add_symbol(&c.timers[i].fn, name);
+                add_symbol(reinterpret_cast<const void*>(&c.timers[i].fn), name);
                 found = true;
                 break;
             }

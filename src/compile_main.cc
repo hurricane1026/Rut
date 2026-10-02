@@ -57,8 +57,9 @@ int main(int argc, char** argv) {
         char message[512];
         rut::format_load_error(error, message, sizeof(message));
         fprintf(stderr, "%s: %s\n", argv[1], message);
-    } else if (!(ok = rut::write_native_program(program, artifact))) {
-        fprintf(stderr, "Failed to emit native artifact\n");
+    } else {
+        ok = rut::write_native_program(program, artifact);
+        if (!ok) fprintf(stderr, "Failed to emit native artifact\n");
     }
     program.destroy();
     if (!ok) return 1;

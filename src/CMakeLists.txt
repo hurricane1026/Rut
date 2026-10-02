@@ -511,6 +511,12 @@ target_link_libraries(rut
 if(RUT_ENABLE_JIT)
     target_link_libraries(rut rut_native_loader)
     set_target_properties(rut PROPERTIES ENABLE_EXPORTS ON)
+    if(APPLE)
+        # Darwin's ENABLE_EXPORTS does not retain/export symbols pulled from
+        # static archives consistently. Native handlers are resolved by the
+        # sibling artifact through the serving executable.
+        target_link_options(rut PRIVATE -Wl,-export_dynamic)
+    endif()
     add_dependencies(rut rut-compile)
     target_compile_definitions(rut PRIVATE RUT_ENABLE_JIT=1)
 endif()

@@ -13,12 +13,33 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/memfd.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
 
 namespace rut {
 namespace {
+#ifdef __linux__
+int create_artifact_memfd() {
+    // MFD_EXEC is required by kernels that enforce W^X for anonymous files.
+    // Older kernels reject the new flag, but their memfds are executable by
+    // default, so retain that compatibility path.
+    unsigned int flags = MFD_CLOEXEC | MFD_ALLOW_SEALING;
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0004U
+#endif
+    int fd = static_cast<int>(syscall(SYS_memfd_create, "rut-program", flags | MFD_EXEC));
+    if (fd >= 0) return fd;
+    if (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP) return -1;
+    return static_cast<int>(syscall(SYS_memfd_create, "rut-program", flags));
+}
+#endif
+
 bool compiler_path(char* path, u32 cap) {
 #ifdef __linux__
     ssize_t n = readlink("/proc/self/exe", path, cap - 1);
@@ -78,9 +99,16 @@ bool load_native_program(
     fcntl(channel[0], F_SETFD, FD_CLOEXEC);
     fcntl(channel[1], F_SETFD, FD_CLOEXEC);
     char level[] = {static_cast<char>('0' + opt), '\0'};
+    const pid_t parent_pid = getpid();
     pid_t child = fork();
     if (child == 0) {
         close(channel[0]);
+#ifdef __linux__
+        // The compiler must never survive a killed or cancelled server
+        // startup. Check the parent PID after arming the signal to close the
+        // fork/parent-death race.
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent_pid) _exit(127);
+#endif
         if (dup2(channel[1], STDOUT_FILENO) < 0) _exit(127);
         if (channel[1] != STDOUT_FILENO) close(channel[1]);
         execl(compiler, compiler, source, level, nullptr);
@@ -113,7 +141,7 @@ bool load_native_program(
             if (!reaped) {
                 // Failure closes the pipe and stops a blocked producer before
                 // reaping it; no child may outlive a failed load.
-                kill(pid, SIGTERM);
+                kill(pid, SIGKILL);
                 while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
                 }
             }
@@ -142,7 +170,7 @@ bool load_native_program(
         return fail("invalid compiler artifact size");
     char artifact[4096];
 #ifdef __linux__
-    out.artifact_fd = memfd_create("rut-program", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    out.artifact_fd = create_artifact_memfd();
     if (out.artifact_fd < 0) return fail("cannot allocate anonymous compiler artifact");
     snprintf(artifact, sizeof(artifact), "/proc/self/fd/%d", out.artifact_fd);
 #else
@@ -211,7 +239,8 @@ bool load_native_program(
     const u8* regex_data = take(sizeof(native::Regex) * h.regex_count);
     if (!routes || !metadata || !reloc_data || !symbol_data || !regex_data)
         return fail("truncated native configuration");
-    memcpy(c.routes, routes, sizeof(RouteEntry) * h.route_count);
+    memcpy(static_cast<void*>(c.routes), static_cast<const void*>(routes),
+           sizeof(RouteEntry) * h.route_count);
     memcpy(reinterpret_cast<u8*>(&c) + native::metadata_offset(c), metadata, h.metadata_size);
     if (c.upstream_count > c.kMaxUpstreams || c.timer_count > c.kMaxTimers ||
         c.cache_instance_count > c.kMaxCacheInstances ||
