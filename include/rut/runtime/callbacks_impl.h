@@ -7602,30 +7602,37 @@ template <typename Loop>
 void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
     conn.consume_request_receive_buffer(sent);
     conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
-    // The recv was paused (handle_unhandled_recv) because recv_buf ran low on room
-    // while the send drained it; the space is back, let the client send again.
-    if (conn.recv_paused_for_send && conn.recv_buf.write_avail() >= kRequestBodyRecvHeadroom)
-        conn.recv_paused_for_send = false;
-    const u32 kBuffered = conn.recv_buf.len();
     const bool tls_overflow_pending = conn.tls_recv_overflow_pending;
     if (tls_overflow_pending) {
         // The overflow CQE already copied a valid ciphertext prefix into
         // tls_in_buf.  Decrypt it under the newly installed body callback
         // before deciding whether the lost tail was a successor.  Keep the
         // cancelled multishot recv out of the way until that decision is made.
+        const i32 callback_fd = conn.fd;
+        const u32 callback_handler_generation = conn.handler_gen;
+        const u32 callback_send_owner_generation = conn.tls_send_owner_generation;
         if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
             (void)loop->process_buffered_tls_input(conn);
         }
-        if (!conn.tls_active) return;
+        if (!conn.tls_active || conn.fd != callback_fd ||
+            conn.handler_gen != callback_handler_generation ||
+            conn.tls_send_owner_generation != callback_send_owner_generation)
+            return;
         // The remaining bytes are the tail of the record whose suffix the
         // backend dropped.  They cannot be replayed after -ENOBUFS; discard
         // that incomplete record before classifying the now-updated body.
         if (conn.tls_in_buf.len() != 0) conn.tls_in_buf.reset();
+        conn.recv_paused_for_send = true;
         conn.recv_pause_rearm_pending = false;
         conn.tls_recv_overflow_pending = false;
         respond_request_body_overflow<Loop>(loop, conn);
         return;
     }
+    // The recv was paused (handle_unhandled_recv) because recv_buf ran low on room
+    // while the send drained it; the space is back, let the client send again.
+    if (conn.recv_paused_for_send && conn.recv_buf.write_avail() >= kRequestBodyRecvHeadroom)
+        conn.recv_paused_for_send = false;
+    const u32 kBuffered = conn.recv_buf.len();
     loop->submit_recv(conn);
     loop->submit_recv_upstream(conn);
     if (kBuffered > 0) {
