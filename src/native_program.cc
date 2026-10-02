@@ -24,6 +24,33 @@
 
 namespace rut {
 namespace {
+volatile sig_atomic_t g_startup_cancelled = 0;
+void startup_cancel_handler(int) { g_startup_cancelled = 1; }
+
+struct StartupSignalScope {
+    struct sigaction old_int{};
+    struct sigaction old_term{};
+    bool installed = false;
+    StartupSignalScope() {
+        struct sigaction action{};
+        action.sa_handler = startup_cancel_handler;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGINT, &action, &old_int) == 0 &&
+            sigaction(SIGTERM, &action, &old_term) == 0) {
+            g_startup_cancelled = 0;
+            installed = true;
+        } else if (old_int.sa_handler || old_int.sa_sigaction) {
+            sigaction(SIGINT, &old_int, nullptr);
+        }
+    }
+    ~StartupSignalScope() {
+        if (installed) {
+            sigaction(SIGINT, &old_int, nullptr);
+            sigaction(SIGTERM, &old_term, nullptr);
+        }
+    }
+};
+
 #ifdef __linux__
 int create_artifact_memfd() {
     // MFD_EXEC is required by kernels that enforce W^X for anonymous files.
@@ -88,6 +115,7 @@ bool load_native_program(
         snprintf(error, error_size, "native program destination is already populated");
         return false;
     }
+    StartupSignalScope startup_signals;
     if (opt > 3) return fail("invalid optimization level");
     char compiler[4096];
     if (!compiler_path(compiler, sizeof(compiler)))
@@ -103,6 +131,11 @@ bool load_native_program(
     pid_t child = fork();
     if (child == 0) {
         close(channel[0]);
+        struct sigaction default_action{};
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        sigaction(SIGINT, &default_action, nullptr);
+        sigaction(SIGTERM, &default_action, nullptr);
 #ifdef __linux__
         // The compiler must never survive a killed or cancelled server
         // startup. Check the parent PID after arming the signal to close the
@@ -136,6 +169,12 @@ bool load_native_program(
             reaped = true;
             return n == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
         }
+        void cancel() {
+            if (!reaped) kill(pid, SIGKILL);
+            while (!reaped && waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+            }
+            reaped = true;
+        }
         ~Child() {
             if (fd >= 0) close(fd);
             if (!reaped) {
@@ -151,7 +190,10 @@ bool load_native_program(
         auto* ptr = static_cast<u8*>(data);
         while (size) {
             ssize_t n = read(producer.fd, ptr, size);
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR) {
+                if (g_startup_cancelled) return false;
+                continue;
+            }
             if (n <= 0) return false;
             ptr += n;
             size -= static_cast<u64>(n);
@@ -160,7 +202,8 @@ bool load_native_program(
     };
     native::StreamHeader stream{};
     if (!read_all(&stream, sizeof(stream))) {
-        producer.wait();
+        producer.cancel();
+        if (g_startup_cancelled) return fail("startup cancelled");
         return fail("rut-compile failed (see diagnostic above)");
     }
     if (stream.magic != native::kMagic || stream.version != native::kVersion ||
@@ -192,7 +235,10 @@ bool load_native_program(
         u64 pos = 0;
         while (pos < n) {
             ssize_t written = write(out.artifact_fd, buffer + pos, n - pos);
-            if (written < 0 && errno == EINTR) continue;
+            if (written < 0 && errno == EINTR) {
+                if (g_startup_cancelled) return fail("startup cancelled");
+                continue;
+            }
             if (written <= 0) return fail("cannot receive compiler artifact");
             pos += static_cast<u64>(written);
         }
@@ -204,6 +250,10 @@ bool load_native_program(
         tail = read(producer.fd, &extra, 1);
     } while (tail < 0 && errno == EINTR);
     if (tail != 0) return fail("invalid compiler artifact framing");
+    if (g_startup_cancelled) {
+        producer.cancel();
+        return fail("startup cancelled");
+    }
     if (!producer.wait()) return fail("rut-compile failed (see diagnostic above)");
 #ifdef __linux__
     if (fcntl(out.artifact_fd,
