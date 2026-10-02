@@ -207,6 +207,7 @@ bool load_native_program(
         kill(child, SIGKILL);
         while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
         }
+        close(channel[0]);
         return fail("cannot isolate compiler process");
     }
     struct Child {

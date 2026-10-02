@@ -7,6 +7,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,13 @@ struct Program {
     ~Program() {
         if (p) p->destroy();
         arena.destroy();
+    }
+};
+struct SigchldRestore {
+    struct sigaction old{};
+    bool active = sigaction(SIGCHLD, nullptr, &old) == 0;
+    ~SigchldRestore() {
+        if (active) sigaction(SIGCHLD, &old, nullptr);
     }
 };
 jit::HandlerResult invoke(const RouteEntry& route, const char* request) {
@@ -271,6 +279,45 @@ TEST(native_program, serving_loader_does_not_map_llvm) {
     fclose(maps);
     CHECK_FALSE(llvm);
 #endif
+}
+
+TEST(native_program, preserves_sigchld_disposition) {
+    Source source;
+    REQUIRE(source.append("route GET \"/\" { return 200 }\n"));
+    Source bad;
+    REQUIRE(bad.append("route GET \"/\" { broken\n"));
+    void (*const dispositions[])(int) = {
+        SIG_IGN,
+#ifdef SA_NOCLDWAIT
+        SIG_DFL,
+#endif
+    };
+    for (u32 i = 0; i < sizeof(dispositions) / sizeof(dispositions[0]); i++) {
+        SigchldRestore restore;
+        REQUIRE(restore.active);
+        struct sigaction requested{};
+        requested.sa_handler = dispositions[i];
+        sigemptyset(&requested.sa_mask);
+#ifdef SA_NOCLDWAIT
+        if (i == 1) requested.sa_flags = SA_NOCLDWAIT;
+#endif
+        REQUIRE_EQ(sigaction(SIGCHLD, &requested, nullptr), 0);
+        Program owner;
+        REQUIRE(owner.p);
+        char error[512];
+        REQUIRE(load_native_program(source.path, *owner.p, error, sizeof(error)));
+        struct sigaction observed{};
+        REQUIRE_EQ(sigaction(SIGCHLD, nullptr, &observed), 0);
+        CHECK_EQ(observed.sa_handler, requested.sa_handler);
+        CHECK_EQ(observed.sa_flags & static_cast<int>(SA_NOCLDWAIT),
+                 requested.sa_flags & static_cast<int>(SA_NOCLDWAIT));
+        owner.p->destroy();
+        CHECK_FALSE(load_native_program(bad.path, *owner.p, error, sizeof(error)));
+        REQUIRE_EQ(sigaction(SIGCHLD, nullptr, &observed), 0);
+        CHECK_EQ(observed.sa_handler, requested.sa_handler);
+        CHECK_EQ(observed.sa_flags & static_cast<int>(SA_NOCLDWAIT),
+                 requested.sa_flags & static_cast<int>(SA_NOCLDWAIT));
+    }
 }
 
 int main(int argc, char** argv) {

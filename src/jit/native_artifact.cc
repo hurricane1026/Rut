@@ -13,7 +13,6 @@
 #include <unistd.h>
 #ifdef __linux__
 #include <sys/prctl.h>
-#include <sys/syscall.h>
 #endif
 
 namespace rut {
