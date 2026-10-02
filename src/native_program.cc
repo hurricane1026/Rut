@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <poll.h>
 #ifdef __linux__
 #include <linux/memfd.h>
 #include <sys/prctl.h>
@@ -30,23 +31,27 @@ void startup_cancel_handler(int) { g_startup_cancelled = 1; }
 struct StartupSignalScope {
     struct sigaction old_int{};
     struct sigaction old_term{};
-    bool installed = false;
+    bool int_installed = false;
+    bool term_installed = false;
     StartupSignalScope() {
+        g_startup_cancelled = 0;
         struct sigaction action{};
         action.sa_handler = startup_cancel_handler;
         sigemptyset(&action.sa_mask);
-        if (sigaction(SIGINT, &action, &old_int) == 0 &&
-            sigaction(SIGTERM, &action, &old_term) == 0) {
-            g_startup_cancelled = 0;
-            installed = true;
-        } else if (old_int.sa_handler || old_int.sa_sigaction) {
+        if (sigaction(SIGINT, &action, &old_int) == 0) {
+            int_installed = true;
+        }
+        if (int_installed && sigaction(SIGTERM, &action, &old_term) == 0) {
+            term_installed = true;
+        } else if (int_installed) {
             sigaction(SIGINT, &old_int, nullptr);
+            int_installed = false;
         }
     }
     ~StartupSignalScope() {
-        if (installed) {
+        if (term_installed) sigaction(SIGTERM, &old_term, nullptr);
+        if (int_installed) {
             sigaction(SIGINT, &old_int, nullptr);
-            sigaction(SIGTERM, &old_term, nullptr);
         }
     }
 };
@@ -162,18 +167,31 @@ bool load_native_program(
         bool wait() {
             close(fd);
             fd = -1;
-            pid_t n;
-            do {
-                n = waitpid(pid, &status, 0);
-            } while (n < 0 && errno == EINTR);
-            reaped = true;
-            return n == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            for (;;) {
+                if (g_startup_cancelled) {
+                    cancel();
+                    return false;
+                }
+                pid_t n = waitpid(pid, &status, WNOHANG);
+                if (n == pid) {
+                    reaped = true;
+                    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+                }
+                if (n < 0 && errno != EINTR) return false;
+                poll(nullptr, 0, 10);
+            }
         }
         void cancel() {
             if (!reaped) kill(pid, SIGKILL);
-            while (!reaped && waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+            while (!reaped) {
+                pid_t result = waitpid(pid, &status, WNOHANG);
+                if (result == pid || (result < 0 && errno == ECHILD)) {
+                    reaped = true;
+                    break;
+                }
+                if (result < 0 && errno != EINTR) break;
+                poll(nullptr, 0, 10);
             }
-            reaped = true;
         }
         ~Child() {
             if (fd >= 0) close(fd);
@@ -189,6 +207,11 @@ bool load_native_program(
     auto read_all = [&](void* data, u64 size) {
         auto* ptr = static_cast<u8*>(data);
         while (size) {
+            if (g_startup_cancelled) return false;
+            struct pollfd wait_fd{producer.fd, POLLIN, 0};
+            int ready = poll(&wait_fd, 1, 50);
+            if (ready < 0 && errno == EINTR) continue;
+            if (ready <= 0) continue;
             ssize_t n = read(producer.fd, ptr, size);
             if (n < 0 && errno == EINTR) {
                 if (g_startup_cancelled) return false;
@@ -245,10 +268,20 @@ bool load_native_program(
         remaining -= n;
     }
     u8 extra;
-    ssize_t tail;
-    do {
+    ssize_t tail = -1;
+    for (;;) {
+        if (g_startup_cancelled) {
+            producer.cancel();
+            return fail("startup cancelled");
+        }
+        struct pollfd wait_fd{producer.fd, POLLIN, 0};
+        int ready = poll(&wait_fd, 1, 50);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) continue;
         tail = read(producer.fd, &extra, 1);
-    } while (tail < 0 && errno == EINTR);
+        if (tail < 0 && errno == EINTR) continue;
+        break;
+    }
     if (tail != 0) return fail("invalid compiler artifact framing");
     if (g_startup_cancelled) {
         producer.cancel();
