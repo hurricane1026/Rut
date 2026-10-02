@@ -5178,7 +5178,11 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
             parser.reset();
             response.reset();
             if (parser.parse(probe_data, probe_len, &response) != ParseStatus::Complete) break;
-            if (response.status_code >= 200 && response.has_content_length &&
+            const bool response_bodyless =
+                conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
+                response.status_code == 204 || response.status_code == 205 ||
+                response.status_code == 304;
+            if (response.status_code >= 200 && response.has_content_length && !response_bodyless &&
                 probe_len < parser.header_end + response.content_length)
                 break;
             if (response.status_code == 101 || response.status_code >= 200) {
@@ -7603,6 +7607,25 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
     if (conn.recv_paused_for_send && conn.recv_buf.write_avail() >= kRequestBodyRecvHeadroom)
         conn.recv_paused_for_send = false;
     const u32 kBuffered = conn.recv_buf.len();
+    const bool tls_overflow_pending = conn.tls_recv_overflow_pending;
+    if (tls_overflow_pending) {
+        // The overflow CQE already copied a valid ciphertext prefix into
+        // tls_in_buf.  Decrypt it under the newly installed body callback
+        // before deciding whether the lost tail was a successor.  Keep the
+        // cancelled multishot recv out of the way until that decision is made.
+        if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
+            (void)loop->process_buffered_tls_input(conn);
+        }
+        if (!conn.tls_active) return;
+        // The remaining bytes are the tail of the record whose suffix the
+        // backend dropped.  They cannot be replayed after -ENOBUFS; discard
+        // that incomplete record before classifying the now-updated body.
+        if (conn.tls_in_buf.len() != 0) conn.tls_in_buf.reset();
+        conn.recv_pause_rearm_pending = false;
+        conn.tls_recv_overflow_pending = false;
+        respond_request_body_overflow<Loop>(loop, conn);
+        return;
+    }
     loop->submit_recv(conn);
     loop->submit_recv_upstream(conn);
     if (kBuffered > 0) {

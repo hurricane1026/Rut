@@ -629,6 +629,16 @@ inline bool tls_recv_callback_is_current(const Connection& c) {
 template <class Self>
 void tls_recv(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
+    if (c.tls_recv_overflow_pending) {
+        // The overflow path owns the copied prefix until the in-flight body
+        // send completes.  Do not feed raced CQEs back into TLS: a positive
+        // CQE may contain the same truncated record and another overflow must
+        // not queue a second pause/rearm pair.
+        if (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty)) return;
+        c.tls_recv_overflow_pending = false;
+        loop->close_conn(c);
+        return;
+    }
     if (c.req_body_abandoned) {
         // An early upstream response owns the connection's logical send.  TLS
         // still receives ciphertext while that response drains, but there is
@@ -721,6 +731,23 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
             initial_connect_request_owner<Self>(c)) {
             respond_request_body_overflow(loop, c);
+            return;
+        }
+        // A body send may have a valid TLS prefix already copied into tls_in_buf
+        // when the multishot CQE reports a dropped tail.  Decrypt that prefix
+        // under continue_request_body before classifying the missing tail; it may
+        // complete the current body, making the tail a successor instead of a
+        // truncation of the current request.
+        const bool tls_streaming_body_send_owner =
+            c.state == ConnState::Proxying && c.upstream_send_armed &&
+            c.on_upstream_send == &on_request_body_sent<Self> && c.request_body_incomplete();
+        if (ev.result == -ENOBUFS && !ev.provided_ring_empty && c.tls_in_buf.len() != 0 &&
+            tls_streaming_body_send_owner) {
+            c.tls_recv_overflow_pending = true;
+            if (!loop->pause_recv(c)) {
+                c.tls_recv_overflow_pending = false;
+                loop->close_conn(c);
+            }
             return;
         }
         // -ENOBUFS: the backend dropped the tail of a CQE that did not fit tls_in_buf,

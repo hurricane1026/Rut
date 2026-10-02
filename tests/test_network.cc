@@ -76266,6 +76266,31 @@ TEST(request_body_overflow, informational_origin_response_probe_requires_final_r
     }
 }
 
+TEST(request_body_overflow, bodyless_early_response_ignores_declared_content_length) {
+    static constexpr const char* kResponses[] = {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+        "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n",
+        "HTTP/1.1 205 Reset Content\r\nContent-Length: 5\r\n\r\n",
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n",
+    };
+    for (u32 i = 0; i < sizeof(kResponses) / sizeof(kResponses[0]); i++) {
+        SmallLoop loop;
+        loop.setup();
+        auto* c = setup_body_streaming_proxy(loop, 200, 10);
+        REQUIRE(c != nullptr);
+        c->req_method = static_cast<u8>(i == 0 ? LogHttpMethod::Head : LogHttpMethod::Get);
+        const u32 response_len = static_cast<u32>(strlen(kResponses[i]));
+        REQUIRE_EQ(
+            c->upstream_recv_buf.write(reinterpret_cast<const u8*>(kResponses[i]), response_len),
+            response_len);
+        respond_request_body_overflow(&loop, *c);
+        CHECK_FALSE(c->req_body_overflow_rejected);
+        CHECK(c->req_body_lossy_successor);
+        CHECK_FALSE(c->keep_alive);
+        loop.close_conn(*c);
+    }
+}
+
 TEST(request_body_overflow, final_body_send_inflight_preserves_successor_overflow) {
     SmallLoop loop;
     loop.setup();
@@ -77053,6 +77078,44 @@ TEST(request_body_overflow, iouring_response_owner_first_loss_pauses_recv) {
     CHECK(c->recv_pause_cancel_pending);
     CHECK(c->recv_pause_target_inflight);
     CHECK_EQ(c->pending_ops, 2u);
+    loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(c->recv_pause_cancel_pending);
+    CHECK_FALSE(c->recv_pause_target_inflight);
+    close(downstream[1]);
+    close(upstream[1]);
+}
+
+TEST(request_body_overflow, iouring_tls_body_prefix_defers_loss_classification) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    downstream[0] = -1;
+    upstream[0] = -1;
+    u8 tls_input[16];
+    c->tls_in_buf.bind(tls_input, sizeof(tls_input));
+    REQUIRE_EQ(c->tls_in_buf.write(reinterpret_cast<const u8*>("prefix"), 6), 6u);
+    c->tls_active = true;
+    c->state = ConnState::Proxying;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 6;
+    c->upstream_send_armed = true;
+    c->on_upstream_send = &on_request_body_sent<IoUringEventLoop>;
+    c->recv_armed = true;
+    c->pending_ops = 1;
+    tls_recv<IoUringEventLoop>(loop, *c, {c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0});
+    CHECK(c->tls_recv_overflow_pending);
+    CHECK_FALSE(c->req_body_lossy_successor);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
     loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
     loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0});
     CHECK_FALSE(c->recv_pause_cancel_pending);
