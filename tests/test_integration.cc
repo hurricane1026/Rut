@@ -6634,6 +6634,7 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
             sizeof(kResponse) - 1);
     c->req_body_abandoned = true;
     c->state = ConnState::Sending;
+    c->keep_alive = false;  // an abandoned upload cannot start another request
     c->send_armed = true;
     c->recv_armed = true;
     c->on_send = &on_response_sent<IoUringEventLoop>;
@@ -6668,7 +6669,7 @@ TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
     CHECK_FALSE(c->recv_armed);
     CHECK(c->recv_pause_rearm_pending);
     loop->dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(response_len)));
-    CHECK(c->fd < 0 || c->pending_ops != 0);
+    CHECK(c->fd < 0);
     loop->shutdown();
 }
 
