@@ -1740,6 +1740,13 @@ struct ConnectionBase {
         else
             tls_recv_overflow_prefix_len &= ~kTlsOverflowResumeBit;
     }
+    bool recv_pause_must_survive_send() const {
+        return req_body_lossy_successor || req_body_abandoned || req_body_overflow_rejected ||
+               tls_recv_overflow_resume_pending();
+    }
+    void clear_recv_pause_for_send() {
+        if (!recv_pause_must_survive_send()) recv_paused_for_send = false;
+    }
 
     void bind_request_receive_buffer(u8* slice, u32 capacity) {
         clear_raw_request_target_witness();

@@ -2017,7 +2017,7 @@ public:
             c.response_read_deadline_state != ResponseReadDeadlineState::RefreshPending)
             timer.refresh(&c,
                           c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
-        c.recv_paused_for_send = false;
+        c.clear_recv_pause_for_send();
         if (!successful) {
             backend.send_state[c.id] = {};
             Connection::visit_tls_raw_send_owner_fields(
@@ -7180,7 +7180,7 @@ public:
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);
-                        if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
+                        if (ev.type == IoEventType::Send) conn.clear_recv_pause_for_send();
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
@@ -7192,7 +7192,7 @@ public:
                                     conn.tls_pending_on_recv = nullptr;
                                 break;
                             }
-                            if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
+                            if (ev.type == IoEventType::Send) conn.clear_recv_pause_for_send();
                             disarm_yield_timer(conn);
                             conn.resume_event_kind = yield_kind_from_event(ev.type);
                             conn.resume_event_result = ev.result;

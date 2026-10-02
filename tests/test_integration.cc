@@ -96,9 +96,14 @@ static u32 fill_socket_send_buffer(i32 fd, i32 peer);
 namespace {
 
 bool g_send_pause_cleared = false;
+bool g_send_pause_observed = false;
 
 void verify_send_pause_cleared(void* /*lp*/, Connection& conn, IoEvent ev) {
     g_send_pause_cleared = (ev.type == IoEventType::Send && !conn.recv_paused_for_send);
+}
+
+void observe_send_pause(void* /*lp*/, Connection& conn, IoEvent ev) {
+    g_send_pause_observed = (ev.type == IoEventType::Send && conn.recv_paused_for_send);
 }
 
 struct ScriptedTlsState {
@@ -6258,6 +6263,64 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     loop->shutdown();
 }
 
+TEST(uring, lossy_pause_survives_plain_and_tls_send_dispatch) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+    test_initialize_slots(*loop, 2);
+    Connection& plain = loop->conns[0];
+    plain.fd = 42;
+    plain.state = ConnState::Sending;
+    plain.pending_ops = 1;
+    plain.send_armed = true;
+    plain.recv_paused_for_send = true;
+    plain.req_body_lossy_successor = true;
+    plain.on_send = &observe_send_pause;
+    g_send_pause_observed = false;
+    loop->dispatch(make_ev(plain.id, IoEventType::Send, 1));
+    CHECK(g_send_pause_observed);
+    CHECK(plain.recv_paused_for_send);
+
+    Connection& ordinary = loop->conns[1];
+    ordinary.fd = 43;
+    ordinary.state = ConnState::Sending;
+    ordinary.pending_ops = 1;
+    ordinary.send_armed = true;
+    ordinary.recv_paused_for_send = true;
+    ordinary.on_send = &observe_send_pause;
+    loop->dispatch(make_ev(ordinary.id, IoEventType::Send, 1));
+    CHECK_FALSE(ordinary.recv_paused_for_send);
+
+    u8 tls_out_storage[16];
+    plain.tls_active = true;
+    plain.recv_armed = false;  // the pause target drained before the raw Send CQE
+    plain.recv_pause_rearm_pending = true;
+    plain.req_body_overflow_rejected = true;
+    plain.pending_ops = 1;
+    plain.send_armed = true;
+    plain.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    REQUIRE_EQ(plain.tls_out_buf.write(reinterpret_cast<const u8*>("tls"), 3), 3u);
+    const u32 raw_generation = 7;
+    plain.tls_out_inflight = true;
+    plain.tls_out_inflight_len = 3;
+    plain.tls_out_inflight_generation = raw_generation;
+    plain.tls_out_inflight_fd = plain.fd;
+    plain.tls_out_inflight_src = plain.tls_out_buf.data();
+    plain.on_send = &tls_on_out_drain<IoUringEventLoop>;
+    loop->backend.send_state[plain.id] = {
+        plain.tls_out_inflight_src, plain.fd, 3, 0, IoEventType::Send, 0, raw_generation};
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    IoEvent raw_send = make_ev(plain.id, IoEventType::Send, 3);
+    raw_send.non_upstream_generation = raw_generation;
+    loop->dispatch(raw_send);
+    CHECK(plain.tls_active);
+    CHECK(plain.recv_paused_for_send);
+    CHECK(plain.req_body_lossy_successor);
+    CHECK_FALSE(plain.recv_armed);
+    CHECK(plain.recv_pause_rearm_pending);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before);
+    loop->shutdown();
+}
+
 TEST(uring, tls_send_want_read_recv_survives_send_pause) {
     auto loop = std::make_unique<IoUringEventLoop>();
     auto rc = loop->init(0, -1);
@@ -6289,6 +6352,7 @@ TEST(uring, tls_send_want_read_recv_survives_send_pause) {
     CHECK(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);
     CHECK(!conn.recv_pause_rearm_pending);
+    CHECK_FALSE(conn.recv_paused_for_send);
 
     conn.tls_engine.ssl = nullptr;
     loop->shutdown();
@@ -7231,7 +7295,13 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
     Connection& conn = loop.conns[0];
     u8 tls_in_storage[4096];
     u8 tls_out_storage[4096];
-    for (const u32 body_len : {4u, 2u, 3u}) {
+    for (const u32 body_len : {4u, 2u, 3u, 5u}) {
+        loop.closed = false;
+        loop.recv_paused = false;
+        loop.sent = false;
+        loop.SmallLoop::backend.init(0, -1);
+        loop.backend.send_state[0] = {};
+        const u32 plaintext_len = body_len == 5 ? 4u : body_len;
         conn.reset();
         conn.id = 0;
         conn.fd = 42;
@@ -7239,6 +7309,7 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
         conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
         conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+        conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
         conn.on_recv = &tls_recv<TlsIouringHarness>;
         REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
         TlsClientPeer cl;
@@ -7251,16 +7322,45 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         conn.upstream_fd = 43;
         conn.req_body_mode = BodyMode::ContentLength;
         conn.req_body_remaining = 4;
-        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("prev"), 4), 4u);
-        conn.req_initial_send_len = 4;
-        conn.upstream_send_armed = true;
-        conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
+        u32 initial_send_len = 4;
+        if (body_len == 2 || body_len == 5) {
+            static constexpr char kRequest[] =
+                "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n";
+            REQUIRE_EQ(
+                conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+                sizeof(kRequest) - 1);
+            capture_request_metadata(conn);
+            conn.req_initial_send_len = conn.recv_buf.len();
+            initial_send_len = conn.req_initial_send_len;
+            conn.upstream_connect_armed = true;
+            conn.upstream_send_armed = false;
+            conn.proxy_resp_started = false;
+            conn.on_upstream_send = &on_upstream_connected<TlsIouringHarness>;
+            conn.protocol = ConnProtocol::Http11;
+            conn.req_strict_h1_complete = true;
+            conn.req_client_has_content_length = true;
+            conn.req_content_length = 4;
+            conn.req_body_mode = BodyMode::ContentLength;
+            conn.req_body_remaining = 4;
+            REQUIRE(tls_partial_initial_connect_request_owner<TlsIouringHarness>(conn));
+        } else {
+            REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("prev"), 4), 4u);
+            conn.req_initial_send_len = 4;
+        }
+        if (body_len == 4) {
+            conn.upstream_send_armed = true;
+            conn.on_upstream_send = &on_upstream_request_sent<TlsIouringHarness>;
+        } else if (body_len == 3) {
+            conn.upstream_send_armed = true;
+            conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
+        }
         conn.recv_armed = true;
         conn.pending_ops = 1;
         CHECK_EQ(conn.tls_pending_on_recv, nullptr);
         const char body[] = "DATA";
         if (body_len == 4) REQUIRE_EQ(SSL_key_update(cl.ssl, SSL_KEY_UPDATE_REQUESTED), 1);
-        REQUIRE_EQ(SSL_write(cl.ssl, body, static_cast<int>(body_len)), static_cast<int>(body_len));
+        REQUIRE_EQ(SSL_write(cl.ssl, body, static_cast<int>(plaintext_len)),
+                   static_cast<int>(plaintext_len));
         u8 ciphertext[4096];
         const int cipher_len = BIO_read(cl.wbio, ciphertext, sizeof(ciphertext));
         REQUIRE_GT(cipher_len, 0);
@@ -7278,18 +7378,39 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         // Model the upstream body-send CQE that opens continue_request_body;
         // its send slot is no longer armed when the buffered TLS prefix runs.
         conn.upstream_send_armed = false;
-        if (body_len == 4 || body_len == 3) {
+        if (body_len != 3) {
             REQUIRE_EQ(conn.tls_out_buf.write(reinterpret_cast<const u8*>("raw"), 3), 3u);
             REQUIRE(loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3));
-            if (body_len == 3) ++conn.tls_out_inflight_generation;
+        } else {
+            REQUIRE_EQ(conn.tls_out_buf.write(reinterpret_cast<const u8*>("raw"), 3), 3u);
+            REQUIRE(loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3));
+            ++conn.tls_out_inflight_generation;
         }
-        on_request_body_sent<TlsIouringHarness>(
-            &loop, conn, {conn.id, 4, 0, 0, IoEventType::UpstreamSend, 0});
+        if (body_len == 2 || body_len == 5) {
+            // Drive the real connect callback into its initial request send;
+            // the copied TLS prefix must remain parked across this transition.
+            CHECK(conn.tls_recv_overflow_prefix_len != 0);
+            conn.upstream_connect_armed = false;
+            on_upstream_connected<TlsIouringHarness>(
+                &loop, conn, {conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+            REQUIRE_FALSE(loop.closed);
+            REQUIRE(conn.upstream_send_armed);
+            REQUIRE_EQ(conn.on_upstream_send, &on_upstream_request_sent<TlsIouringHarness>);
+        }
+        if (body_len == 4 || body_len == 2 || body_len == 5) {
+            on_upstream_request_sent<TlsIouringHarness>(
+                &loop,
+                conn,
+                {conn.id, static_cast<i32>(initial_send_len), 0, 0, IoEventType::UpstreamSend, 0});
+        } else {
+            on_request_body_sent<TlsIouringHarness>(
+                &loop, conn, {conn.id, 4, 0, 0, IoEventType::UpstreamSend, 0});
+        }
         if (body_len == 3) {
             CHECK(loop.closed);
             CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
             CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
-        } else if (body_len == 4) {
+        } else {
             CHECK(conn.tls_recv_overflow_resume_pending());
             CHECK(conn.tls_out_inflight);
             auto drain_tls_output = [&]() {
@@ -7310,25 +7431,31 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
                 CHECK(loop.tls_ciphertext_send_is_current(conn));
                 drain_tls_output();
             }
-            CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
-            CHECK(conn.req_body_lossy_successor);
-            CHECK_FALSE(conn.req_body_overflow_rejected);
-            CHECK_EQ(conn.req_body_remaining, 0u);
-            CHECK(conn.upstream_send_armed);
-            CHECK_EQ(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].type,
-                     MockOp::Send);
-            CHECK_EQ(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].send_len,
-                     4u);
-            CHECK(memcmp(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].send_buf,
-                         "DATA",
-                         4) == 0);
-            CHECK(conn.recv_paused_for_send);
-            CHECK(loop.recv_paused);
-        } else {
-            CHECK_FALSE(conn.req_body_lossy_successor);
-            CHECK(conn.req_body_overflow_rejected);
-            CHECK_EQ(conn.req_body_remaining, 2u);
-            CHECK(loop.closed);
+            if (body_len == 2) {
+                CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
+                CHECK(conn.req_body_overflow_rejected);
+                CHECK_EQ(conn.req_body_remaining, 2u);
+                CHECK_FALSE(loop.closed);
+                CHECK_EQ(conn.resp_status, 413u);
+                CHECK_EQ(conn.on_send, &on_response_sent<TlsIouringHarness>);
+            } else {
+                CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
+                CHECK(conn.req_body_lossy_successor);
+                CHECK_FALSE(conn.req_body_overflow_rejected);
+                CHECK_EQ(conn.req_body_remaining, 0u);
+                CHECK(conn.upstream_send_armed);
+                CHECK_EQ(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].type,
+                         MockOp::Send);
+                CHECK_EQ(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].send_len,
+                         4u);
+                CHECK(
+                    memcmp(
+                        loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].send_buf,
+                        "DATA",
+                        4) == 0);
+                CHECK(conn.recv_paused_for_send);
+                CHECK(loop.recv_paused);
+            }
         }
         if (body_len != 3) {
             CHECK_EQ(conn.tls_in_buf.len(), 0u);

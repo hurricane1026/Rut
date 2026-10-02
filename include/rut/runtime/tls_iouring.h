@@ -144,7 +144,7 @@ bool tls_finish_single_shot_send(Self* loop, Connection& c) {
     c.on_send = continuation;
     Connection::visit_tls_single_shot_send_owner_fields(
         c, [](auto& value, const auto& reset_value) { value = reset_value; });
-    c.recv_paused_for_send = false;
+    c.clear_recv_pause_for_send();
     loop->complete_tls_logical_send(c, witness, continuation);
 
     // The continuation may close/reuse the slot or synchronously install the
@@ -750,26 +750,31 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         return;
     }
     if (ev.result <= 0) {  // peer EOF or recv error
-        if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
-            initial_connect_request_owner<Self>(c)) {
-            respond_request_body_overflow(loop, c);
-            return;
-        }
         // A body send may have a valid TLS prefix already copied into tls_in_buf
-        // when the multishot CQE reports a dropped tail.  Decrypt that prefix
-        // under continue_request_body before classifying the missing tail; it may
-        // complete the current body, making the tail a successor instead of a
-        // truncation of the current request.
+        // when the multishot CQE reports a dropped tail. Decrypt it only after
+        // the exact send owner completes: the prefix may finish the current body
+        // before the dropped tail, so classifying ciphertext as a 413 is premature.
         const bool tls_streaming_body_send_owner =
             c.state == ConnState::Proxying && c.upstream_send_armed &&
             c.on_upstream_send == &on_request_body_sent<Self> && c.request_body_incomplete();
+        const bool tls_initial_request_send_owner =
+            (initial_connect_request_owner<Self>(c) || initial_request_send_owner<Self>(c)) &&
+            c.request_body_incomplete();
+        const bool tls_partial_initial_connect_owner =
+            tls_partial_initial_connect_request_owner<Self>(c);
         if (ev.result == -ENOBUFS && !ev.provided_ring_empty && c.tls_in_buf.len() != 0 &&
-            tls_streaming_body_send_owner) {
+            (tls_streaming_body_send_owner || tls_initial_request_send_owner ||
+             tls_partial_initial_connect_owner)) {
             c.tls_recv_overflow_prefix_len = c.tls_in_buf.len();
             if (!loop->pause_recv(c)) {
                 c.tls_recv_overflow_prefix_len = 0;
                 loop->close_conn(c);
             }
+            return;
+        }
+        if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+            (initial_connect_request_owner<Self>(c) || tls_partial_initial_connect_owner)) {
+            respond_request_body_overflow(loop, c);
             return;
         }
         // -ENOBUFS: the backend dropped the tail of a CQE that did not fit tls_in_buf,
