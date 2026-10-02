@@ -988,7 +988,7 @@ In file included from /home/hurricane/private/code/Rut/src/main.cc:9:
  4681 |                  (owner.positive_bytes > received ||
  4682 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
  4683 |                   owner.expected_copy_end != header + received)))
-      |                                                                
+      |
       |                                                                )
 In file included from /home/hurricane/private/code/Rut/src/main.cc:20:
 In file included from /home/hurricane/private/code/Rut/include/rut/serve_loader.h:27:
@@ -1127,7 +1127,7 @@ In file included from /home/hurricane/private/code/Rut/src/runtime/callbacks.cc:
  4681 |                  (owner.positive_bytes > received ||
  4682 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
  4683 |                   owner.expected_copy_end != header + received)))
-      |                                                                
+      |
       |                                                                )
 4 warnings generated.
 [23/84] Linking CXX static library src/librut_runtime.a
@@ -2123,7 +2123,7 @@ In file included from /home/hurricane/private/code/Rut/tests/test_serve_loader.c
  4681 |                  (owner.positive_bytes > received ||
  4682 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
  4683 |                   owner.expected_copy_end != header + received)))
-      |                                                                
+      |
       |                                                                )
 5 warnings generated.
 [68/84] Linking CXX executable tests/test_serve_loader
@@ -2177,7 +2177,7 @@ In file included from /home/hurricane/private/code/Rut/tests/test_traffic_captur
  4681 |                  (owner.positive_bytes > received ||
  4682 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
  4683 |                   owner.expected_copy_end != header + received)))
-      |                                                                
+      |
       |                                                                )
 4 warnings generated.
 [70/84] Linking CXX executable tests/test_traffic_capture
@@ -4010,7 +4010,7 @@ In file included from /home/hurricane/private/code/Rut/tests/test_integration.cc
  4681 |                  (owner.positive_bytes > received ||
  4682 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
  4683 |                   owner.expected_copy_end != header + received)))
-      |                                                                
+      |
       |                                                                )
 /home/hurricane/private/code/Rut/tests/test_integration.cc:4445:94: warning: missing field 'upstream_episode' initializer [-Wmissing-field-initializers]
  4445 |     backend.send_state[0] = {payload, fds[0], 0, sizeof(payload), IoEventType::Send, false, 0};
@@ -4023,7 +4023,7 @@ In file included from /home/hurricane/private/code/Rut/tests/test_integration.cc
       |                          ^
 /home/hurricane/private/code/Rut/tests/test_integration.cc:26883:9: warning: suspicious concatenation of string literals in an array initialization; did you mean to separate the elements with a comma? [-Wstring-concatenation]
  26882 |         "GET /api HTTP/1.1\r\nHost: client.example\r\nConnection: Upgrade\r\n"
-       |                                                                               
+       |
        |                                                                               ,
  26883 |         "Upgrade: websocket\r\n\r\n",
        |         ^
@@ -4130,11 +4130,11 @@ In file included from /home/hurricane/private/code/Rut/tests/test_network.cc:10:
  4681 |                  (owner.positive_bytes > received ||
  4682 |                   owner.first_copy_begin != header + received - owner.positive_bytes ||
  4683 |                   owner.expected_copy_end != header + received)))
-      |                                                                
+      |
       |                                                                )
 /home/hurricane/private/code/Rut/tests/test_network.cc:7218:9: warning: suspicious concatenation of string literals in an array initialization; did you mean to separate the elements with a comma? [-Wstring-concatenation]
  7217 |         "GET /api HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\nGET /next "
-      |                                                                                         
+      |
       |                                                                                         ,
  7218 |         "HTTP/1.1\r\n",
       |         ^

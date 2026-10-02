@@ -6,15 +6,15 @@
 # Samples: 4K of event 'cycles:u'
 # Event count (approx.): 1497406304
 #
-# Overhead  Command  Shared Object      Symbol                                                                                                                                                                                                                                                  
+# Overhead  Command  Shared Object      Symbol
 # ........  .......  .................  ........................................................................................................................................................................................................................................................
 #
     27.92%  rut      libc.so.6          [.] __memmove_avx_unaligned_erms
             |
             ---__memmove_avx_unaligned_erms
-               |          
+               |
                |--24.37%--void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
-               |          
+               |
                 --2.41%--rut::write_response_headers(rut::ConnectionBase&, unsigned short, char const*, unsigned int, unsigned int, bool, char const*, unsigned int)
 
      7.52%  rut      rut                [.] rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
@@ -24,7 +24,7 @@
      7.01%  rut      libc.so.6          [.] __memcmp_avx2_movbe
             |
             ---__memcmp_avx2_movbe
-               |          
+               |
                 --5.34%--rut::RouteConfig::has_exact_strict_local_response_inventory() const
 
      4.61%  rut      rut                [.] rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
