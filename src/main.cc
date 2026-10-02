@@ -17,7 +17,7 @@
 #include "rut/runtime/tls.h"
 
 #ifdef RUT_ENABLE_JIT
-#include "rut/serve_loader.h"
+#include "rut/native_program.h"
 #endif
 
 #include <errno.h>
@@ -790,7 +790,8 @@ int main(int argc, char** argv) {
     bool cli_access_log_level_present = false;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
-    // Simple arg parsing: [port] [--shards N] [--no-pin] [--drain N]
+    // Simple arg parsing: [port] [program.rut | --compile PATH]
+    //                      [--shards N] [--no-pin] [--drain N]
     //                      [--max-connections-per-shard N]
     //                      [--tls-cert PATH] [--tls-key PATH]
     //                      [--access-log PATH] [--access-log-compress]
@@ -813,7 +814,14 @@ int main(int argc, char** argv) {
             config_path = argv[i];
         }
         if (i + 1 < argc) {
-            if (str_eq(argv[i], "--shards")) {
+            if (str_eq(argv[i], "--compile")) {
+                if (!argv[i + 1][0] || starts_with_dash_dash(argv[i + 1])) {
+                    write_str("--compile requires a program path\n");
+                    return 1;
+                }
+                config_path = argv[++i];
+                continue;
+            } else if (str_eq(argv[i], "--shards")) {
                 if (argv[i + 1][0] < '0' || argv[i + 1][0] > '9') {
                     write_str("--shards requires a numeric argument\n");
                     return 1;
@@ -935,11 +943,11 @@ int main(int argc, char** argv) {
         if (str_eq(argv[i], "--metrics")) serve_metrics = true;
         // Catch flags that require a value but appear as the last argument.
         if (i + 1 >= argc) {
-            if (str_eq(argv[i], "--shards") || str_eq(argv[i], "--drain") ||
-                str_eq(argv[i], "--pool-prealloc") || str_eq(argv[i], "--tls-cert") ||
-                str_eq(argv[i], "--tls-key") || str_eq(argv[i], "--access-log") ||
-                str_eq(argv[i], "--access-log-level") || str_eq(argv[i], "--opt") ||
-                str_eq(argv[i], "--max-connections-per-shard")) {
+            if (str_eq(argv[i], "--compile") || str_eq(argv[i], "--shards") ||
+                str_eq(argv[i], "--drain") || str_eq(argv[i], "--pool-prealloc") ||
+                str_eq(argv[i], "--tls-cert") || str_eq(argv[i], "--tls-key") ||
+                str_eq(argv[i], "--access-log") || str_eq(argv[i], "--access-log-level") ||
+                str_eq(argv[i], "--opt") || str_eq(argv[i], "--max-connections-per-shard")) {
                 if (str_eq(argv[i], "--max-connections-per-shard"))
                     write_str("--max-connections-per-shard capacity requires an argument\n");
                 else {
@@ -995,36 +1003,16 @@ int main(int argc, char** argv) {
         write_str("TLS: enabled\n");
     }
 
-    // Compile the .rut program (if given) into a RouteConfig the shards
-    // serve. The loader owns the JIT code + RIR arena + source mapping
-    // for the whole run, so it lives at file scope to outlive every
-    // shard and to keep the 1.28 MB RouteConfig off the stack.
+    // Compile in a separate process and load native code/configuration.
+    // Keep the owner alive until every shard has joined and keep the
+    // 1.28 MB RouteConfig off the stack.
     const RouteConfig* route_config = nullptr;
 #ifdef RUT_ENABLE_JIT
-    static LoadedProgram program;
+    static NativeProgram program;
     if (config_path) {
-        jit::OptLevel olvl = jit::OptLevel::O2;
-        switch (opt_level) {
-            case 0:
-                olvl = jit::OptLevel::O0;
-                break;
-            case 1:
-                olvl = jit::OptLevel::O1;
-                break;
-            case 2:
-                olvl = jit::OptLevel::O2;
-                break;
-            case 3:
-                olvl = jit::OptLevel::O3;
-                break;
-            default:
-                olvl = jit::OptLevel::O2;
-                break;
-        }
-        LoadError load_err;
-        if (!load_rut_program(config_path, program, load_err, olvl)) {
-            char msg[512];
-            format_load_error(load_err, msg, sizeof(msg));
+        char msg[512];
+        if (!load_native_program(
+                config_path, program, msg, sizeof(msg), static_cast<u8>(opt_level))) {
             write_str("Failed to load ");
             write_str(config_path);
             write_str(": ");
@@ -1169,7 +1157,7 @@ int main(int argc, char** argv) {
         // startup installation is the activation boundary (no shard exists
         // yet); live reload must pair the same call with its config swap and
         // RCU lifetime handoff.
-        activate_rut_program(program);
+        activate_native_program(program);
     }
 #endif
 
@@ -1262,8 +1250,8 @@ int main(int argc, char** argv) {
 #endif
     destroy_tls_server_context(tls_server);
 #ifdef RUT_ENABLE_JIT
-    // Shards have joined inside run_shards; safe to release JIT code,
-    // the RIR arena, and the source mapping.
+    // Shards have joined inside run_shards; safe to release native code
+    // and the owned configuration.
     program.destroy();
 #endif
     return outcome.exit_code();

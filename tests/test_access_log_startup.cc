@@ -795,8 +795,6 @@ SourceLiveProxyResult run_source_live_proxy(
         unsetenv("RUE_ACCESS_LOG_COMPRESS");
         if (mode == SourceLiveProxyMode::FileSizeWriteFatal) {
             if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) _exit(124);
-            const struct rlimit file_size_limit{3u, 3u};
-            if (setrlimit(RLIMIT_FSIZE, &file_size_limit) != 0) _exit(125);
         }
         std::vector<char*> argv;
         argv.reserve(args.size() + 1u);
@@ -850,6 +848,17 @@ SourceLiveProxyResult run_source_live_proxy(
             transaction_attempted = true;
             result.port = port;
             result.listening_seen_ns = monotonic_ns();
+#ifdef __linux__
+            if (mode == SourceLiveProxyMode::FileSizeWriteFatal) {
+                // Limit log writes after compilation and artifact reception.
+                // The fault targets the live publisher, not compiler output.
+                const struct rlimit file_size_limit{3u, 3u};
+                if (prlimit(child, RLIMIT_FSIZE, &file_size_limit, nullptr) != 0) {
+                    perror("inject live-publisher file size limit");
+                    break;
+                }
+            }
+#endif
             result.request_completed =
                 transact_loopback(port, request, request_length, result.response, result.client);
             result.transact_done_ns = monotonic_ns();
@@ -1042,6 +1051,9 @@ TEST(access_log_startup, public_main_source_live_publishes_downstream_size_befor
 }
 
 TEST(access_log_startup, public_main_source_live_write_fatal_exits_without_retry_or_shutdown) {
+#ifndef __linux__
+    SKIP("post-compilation file-size fault injection requires Linux prlimit");
+#endif
     const std::string dir = make_temp_dir("/tmp/rut-access-log-startup-write-fatal-XXXXXX");
     REQUIRE_FALSE(dir.empty());
     const std::string program = dir + "/app.rut";
