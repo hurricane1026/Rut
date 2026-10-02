@@ -212,7 +212,9 @@ bool write_native_program(LoadedProgram& p, const char* output) {
         ~ObjectCleanup() { unlink(path); }
     } object_cleanup{object};
     if (!jit::emit_native_object(p.native_module, object, p.engine.opt_level)) return false;
+#ifdef __linux__
     const pid_t parent_pid = getpid();
+#endif
     pid_t child = fork();
     if (child == 0) {
 #ifdef __linux__

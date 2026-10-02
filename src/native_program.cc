@@ -39,6 +39,7 @@ struct StartupSignalScope {
     bool mask_saved = false;
     struct sigaction old_chld{};
     bool chld_installed = false;
+    bool ready_state = false;
     StartupSignalScope() {
         sigset_t blocked{};
         sigemptyset(&blocked);
@@ -62,8 +63,10 @@ struct StartupSignalScope {
         chld_default.sa_handler = SIG_DFL;
         sigemptyset(&chld_default.sa_mask);
         if (sigaction(SIGCHLD, &chld_default, &old_chld) == 0) chld_installed = true;
+        ready_state = mask_saved && int_installed && term_installed && chld_installed;
         if (mask_saved) sigprocmask(SIG_SETMASK, &old_mask, nullptr);
     }
+    bool ready() const { return ready_state; }
     bool finish() {
         if (!int_installed && !term_installed) return g_startup_cancelled != 0;
         if (mask_saved) {
@@ -82,6 +85,7 @@ struct StartupSignalScope {
         int_installed = false;
         term_installed = false;
         chld_installed = false;
+        ready_state = false;
         if (mask_saved) sigprocmask(SIG_SETMASK, &old_mask, nullptr);
         g_startup_cancelled = 0;
         return cancelled;
@@ -155,6 +159,7 @@ bool load_native_program(
         return false;
     }
     StartupSignalScope startup_signals;
+    if (!startup_signals.ready()) return fail("cannot install startup signal handlers");
     if (opt > 3) return fail("invalid optimization level");
     char compiler[4096];
     if (!compiler_path(compiler, sizeof(compiler)))
@@ -170,7 +175,7 @@ bool load_native_program(
     pid_t child = fork();
     if (child == 0) {
         close(channel[0]);
-        setpgid(0, 0);
+        if (setpgid(0, 0) != 0) _exit(127);
         struct sigaction default_action{};
         default_action.sa_handler = SIG_DFL;
         sigemptyset(&default_action.sa_mask);
@@ -183,7 +188,10 @@ bool load_native_program(
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent_pid) _exit(127);
 #endif
         if (dup2(channel[1], STDOUT_FILENO) < 0) _exit(127);
-        if (fcntl(STDOUT_FILENO, F_SETFD, 0) != 0) _exit(127);
+        int descriptor_flags = fcntl(STDOUT_FILENO, F_GETFD);
+        if (descriptor_flags < 0 ||
+            fcntl(STDOUT_FILENO, F_SETFD, descriptor_flags & ~FD_CLOEXEC) != 0)
+            _exit(127);
         if (channel[1] != STDOUT_FILENO) close(channel[1]);
         execl(compiler, compiler, source, level, nullptr);
         const char message[] = "Cannot execute sibling rut-compile\n";
@@ -195,7 +203,12 @@ bool load_native_program(
         close(channel[0]);
         return fail("cannot start rut-compile");
     }
-    setpgid(child, child);
+    if (setpgid(child, child) != 0 && errno != EACCES && errno != ESRCH) {
+        kill(child, SIGKILL);
+        while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {
+        }
+        return fail("cannot isolate compiler process");
+    }
     struct Child {
         pid_t pid;
         int fd;
@@ -234,13 +247,7 @@ bool load_native_program(
         }
         ~Child() {
             if (fd >= 0) close(fd);
-            if (!reaped) {
-                // Failure closes the pipe and stops a blocked producer before
-                // reaping it; no child may outlive a failed load.
-                kill(pid, SIGKILL);
-                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-                }
-            }
+            if (!reaped) cancel();
         }
     } producer{child, channel[0]};
     auto read_all = [&](void* data, u64 size) {
