@@ -127,7 +127,11 @@ def main():
                               'route GET "/" { return response(200, body: "native") }\n')
             check_startup(args.server, source, explicit)
         if sys.platform != "win32":
+            source.write_text('listen 127.0.0.1:0\n'
+                              'route GET "/" { return response(200, body: "native") }\n')
             check_startup(args.server, source, True, preexec_fn=lambda: signal.signal(signal.SIGCHLD, signal.SIG_IGN))
+            source.write_text('listen 127.0.0.1:0\n'
+                              'route GET "/" { return response(200, body: "native") }\n')
             check_startup(args.server, source, True, preexec_fn=lambda: (os.close(0), os.close(1)))
         source.write_text('listen 127.0.0.1:0\n'
                           'route GET "/" { return response(200, body: "native") }\n')

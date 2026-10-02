@@ -68,7 +68,7 @@ struct StartupSignalScope {
     }
     bool ready() const { return ready_state; }
     bool finish() {
-        if (!int_installed && !term_installed) return g_startup_cancelled != 0;
+        if (!int_installed && !term_installed && !chld_installed) return g_startup_cancelled != 0;
         if (mask_saved) {
             sigset_t blocked{};
             sigemptyset(&blocked);
