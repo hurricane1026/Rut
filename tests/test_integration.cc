@@ -6475,7 +6475,7 @@ TEST(uring, request_body_recv_paused_before_recv_buf_fills) {
 // A CQE that did not fit recv_buf (the backend reports -ENOBUFS after dropping the
 // tail) can no longer be forwarded intact: the client gets 413 + close, not a
 // silent close, and later recv events do not cut that response short.
-TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
+TEST(uring, request_body_overflow_chunked_final_send_cancels_recv_immediately) {
     auto loop = std::make_unique<IoUringEventLoop>();
     if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
     Connection* c = make_uploading_conn(*loop, 16384, 0);
@@ -6495,11 +6495,16 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     CHECK_FALSE(c->req_body_overflow_rejected);
     CHECK_FALSE(c->keep_alive);
     CHECK_FALSE(c->request_upload_complete);
-    CHECK_EQ(c->pending_ops, 2u);
+    CHECK_EQ(c->pending_ops, 3u);
     CHECK(c->recv_armed);
-    CHECK_FALSE(c->recv_pause_cancel_pending);
-    CHECK_FALSE(c->recv_pause_target_inflight);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
     CHECK(c->upstream_send_armed);
+    const u32 pending_after_cancel = c->pending_ops;
+    loop->dispatch(late_loss);
+    CHECK_EQ(c->pending_ops, pending_after_cancel);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
     loop->dispatch({c->id, 1, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
     CHECK(c->request_upload_complete);
     CHECK_EQ(c->pending_ops, 3u);
@@ -6510,6 +6515,48 @@ TEST(uring, request_body_overflow_chunked_final_send_waits_for_cqe) {
     CHECK(c->upstream_recv_armed);
     CHECK_FALSE(c->upstream_send_armed);
     CHECK(c->fd >= 0);
+    loop->shutdown();
+}
+
+TEST(uring, initial_request_overflow_cancels_recv_before_send_completion) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+    Connection* c = make_uploading_conn(*loop, 4, 0);
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::None;
+    c->req_initial_send_len = 4;
+    c->upstream_send_armed = true;
+    c->pending_ops = 2;
+
+    IoEvent overflow = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
+    overflow.more = 1;
+    loop->dispatch(overflow);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->keep_alive);
+    CHECK(c->recv_paused_for_send);
+    CHECK(c->recv_armed);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    CHECK(c->upstream_send_armed);
+    const u32 pending_after_cancel = c->pending_ops;
+    const u32 buffer_boundary = c->recv_buf.len();
+
+    loop->dispatch(overflow);
+    CHECK_EQ(c->pending_ops, pending_after_cancel);
+    CHECK_EQ(c->recv_buf.len(), buffer_boundary);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->upstream_send_armed);
+
+    // The target CQE may terminate before the cancel CQE; both owners stay
+    // accounted for while the initial upstream send remains in flight.
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ECANCELED));
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK_FALSE(c->recv_armed);
+    CHECK(c->upstream_send_armed);
+    loop->dispatch({c->id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    CHECK_FALSE(c->recv_pause_cancel_pending);
+    CHECK(c->upstream_send_armed);
     loop->shutdown();
 }
 
@@ -6909,6 +6956,7 @@ struct TlsIouringHarness : SmallLoop {
     bool closed = false;
     bool recv_paused = false;
     TlsKeyUpdateDiagnostic* key_update_diagnostic = nullptr;
+    u8 tls_overflow_control_flights_to_emit = 0;
 
     bool submit_send_raw(Connection& /*conn*/, const u8* /*buf*/, u32 len) {
         sent = len > 0;
@@ -6988,6 +7036,21 @@ struct TlsIouringHarness : SmallLoop {
     }
 
     bool process_buffered_tls_input(Connection& conn) {
+        if (conn.tls_out_inflight) return false;
+        if (tls_overflow_control_flights_to_emit != 0) {
+            if (tls_overflow_control_flights_to_emit == 2 && conn.tls_in_buf.len() > 1)
+                conn.tls_in_buf.consume(2);
+            else
+                conn.tls_in_buf.reset();
+            conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
+            --tls_overflow_control_flights_to_emit;
+            if (conn.tls_out_buf.write(reinterpret_cast<const u8*>("ctl"), 3) != 3u ||
+                !submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3)) {
+                close_conn(conn);
+                return false;
+            }
+            return conn.tls_active;
+        }
         tls_process<TlsIouringHarness>(this, conn);
         return conn.tls_active;
     }
@@ -7023,6 +7086,8 @@ TEST(tls_iouring, connect_owner_overflow_preserves_tls_request_prefix) {
     CHECK_FALSE(conn.req_body_overflow_rejected);
     CHECK(conn.req_body_lossy_successor);
     CHECK_FALSE(conn.keep_alive);
+    CHECK(conn.recv_paused_for_send);
+    CHECK(loop.recv_paused);
     CHECK_EQ(conn.req_initial_send_len, sizeof(kRequest) - 1 - 4u);
     CHECK(__builtin_memcmp(conn.recv_buf.data(), kRequest, conn.req_initial_send_len) == 0);
 }
@@ -7166,7 +7231,7 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
     Connection& conn = loop.conns[0];
     u8 tls_in_storage[4096];
     u8 tls_out_storage[4096];
-    for (const u32 body_len : {4u, 2u}) {
+    for (const u32 body_len : {4u, 2u, 3u}) {
         conn.reset();
         conn.id = 0;
         conn.fd = 42;
@@ -7177,7 +7242,7 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         conn.on_recv = &tls_recv<TlsIouringHarness>;
         REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
         TlsClientPeer cl;
-        REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+        REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl, /*tls13_only=*/true));
         u8 stale[4096];
         while (BIO_ctrl_pending(cl.wbio) != 0)
             REQUIRE_GT(BIO_read(cl.wbio, stale, sizeof(stale)), 0);
@@ -7194,6 +7259,7 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         conn.pending_ops = 1;
         CHECK_EQ(conn.tls_pending_on_recv, nullptr);
         const char body[] = "DATA";
+        if (body_len == 4) REQUIRE_EQ(SSL_key_update(cl.ssl, SSL_KEY_UPDATE_REQUESTED), 1);
         REQUIRE_EQ(SSL_write(cl.ssl, body, static_cast<int>(body_len)), static_cast<int>(body_len));
         u8 ciphertext[4096];
         const int cipher_len = BIO_read(cl.wbio, ciphertext, sizeof(ciphertext));
@@ -7212,9 +7278,39 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         // Model the upstream body-send CQE that opens continue_request_body;
         // its send slot is no longer armed when the buffered TLS prefix runs.
         conn.upstream_send_armed = false;
+        if (body_len == 4 || body_len == 3) {
+            REQUIRE_EQ(conn.tls_out_buf.write(reinterpret_cast<const u8*>("raw"), 3), 3u);
+            REQUIRE(loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3));
+            if (body_len == 3) ++conn.tls_out_inflight_generation;
+        }
         on_request_body_sent<TlsIouringHarness>(
             &loop, conn, {conn.id, 4, 0, 0, IoEventType::UpstreamSend, 0});
-        if (body_len == 4) {
+        if (body_len == 3) {
+            CHECK(loop.closed);
+            CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
+            CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
+        } else if (body_len == 4) {
+            CHECK(conn.tls_recv_overflow_resume_pending());
+            CHECK(conn.tls_out_inflight);
+            auto drain_tls_output = [&]() {
+                const u32 len = conn.tls_out_inflight_len;
+                const u32 generation = conn.tls_out_inflight_generation;
+                IoEvent drain = {};
+                drain.conn_id = conn.id;
+                drain.result = static_cast<i32>(len);
+                drain.type = IoEventType::Send;
+                drain.non_upstream_generation = generation;
+                conn.send_armed = false;
+                if (conn.pending_ops > 0) conn.pending_ops--;
+                tls_on_out_drain<TlsIouringHarness>(&loop, conn, drain);
+            };
+            drain_tls_output();
+            if (conn.tls_out_inflight) {
+                CHECK(conn.tls_recv_overflow_resume_pending());
+                CHECK(loop.tls_ciphertext_send_is_current(conn));
+                drain_tls_output();
+            }
+            CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
             CHECK(conn.req_body_lossy_successor);
             CHECK_FALSE(conn.req_body_overflow_rejected);
             CHECK_EQ(conn.req_body_remaining, 0u);
@@ -7234,13 +7330,75 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
             CHECK_EQ(conn.req_body_remaining, 2u);
             CHECK(loop.closed);
         }
-        CHECK_EQ(conn.tls_in_buf.len(), 0u);
-        CHECK_FALSE(conn.tls_recv_overflow_prefix_len != 0);
-        CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
+        if (body_len != 3) {
+            CHECK_EQ(conn.tls_in_buf.len(), 0u);
+            CHECK_FALSE(conn.tls_recv_overflow_prefix_len != 0);
+            CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
+        }
         tls_engine_free(conn.tls_engine);
         cl.destroy();
     }
     destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls_iouring, overflow_prefix_rebases_across_control_flights_without_recv_rearm) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[16];
+    u8 tls_out_storage[16];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.state = ConnState::Proxying;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("abc"), 3), 3u);
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("AB"), 2), 2u);
+    conn.tls_recv_overflow_prefix_len = 3;
+    conn.set_tls_recv_overflow_resume_pending(true);
+    conn.set_slots(nullptr, nullptr, nullptr, &on_request_body_sent<TlsIouringHarness>);
+    conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
+    conn.upstream_send_armed = true;
+    conn.req_body_mode = BodyMode::ContentLength;
+    conn.req_body_remaining = 1;
+    conn.req_initial_send_len = 1;
+    conn.recv_paused_for_send = true;
+    conn.recv_armed = false;  // the pause target CQE arrived before the raw drain
+    conn.tls_send_owner_generation = 0;
+    loop.tls_overflow_control_flights_to_emit = 2;
+    REQUIRE_EQ(conn.tls_out_buf.write(reinterpret_cast<const u8*>("raw"), 3), 3u);
+    REQUIRE(loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3));
+
+    auto drain = [&]() {
+        const u32 len = conn.tls_out_inflight_len;
+        const u32 generation = conn.tls_out_inflight_generation;
+        IoEvent event = {};
+        event.conn_id = conn.id;
+        event.result = static_cast<i32>(len);
+        event.type = IoEventType::Send;
+        event.non_upstream_generation = generation;
+        conn.send_armed = false;
+        if (conn.pending_ops > 0) conn.pending_ops--;
+        tls_on_out_drain<TlsIouringHarness>(&loop, conn, event);
+    };
+
+    const u32 recv_ops_before = loop.SmallLoop::backend.count_ops(MockOp::Recv);
+    drain();
+    CHECK(conn.tls_recv_overflow_resume_pending());
+    CHECK_EQ(conn.tls_recv_overflow_prefix_size(), 1u);
+    CHECK(loop.tls_ciphertext_send_is_current(conn));
+    drain();
+    CHECK(conn.tls_recv_overflow_resume_pending());
+    CHECK_EQ(conn.tls_recv_overflow_prefix_size(), 0u);
+    CHECK(loop.tls_ciphertext_send_is_current(conn));
+    drain();
+    CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
+    CHECK(conn.req_body_lossy_successor);
+    CHECK(conn.tls_active);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(loop.SmallLoop::backend.count_ops(MockOp::Recv), recv_ops_before);
 }
 
 enum class TlsKeyUpdatePeer : u8 { Client, Server };

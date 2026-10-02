@@ -66,6 +66,9 @@ void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly);
 // watermark resume from bypassing @throttle.
 template <typename Loop>
 bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remaining);
+// Deferred request-body overflow classification after control ciphertext drains.
+template <typename Loop>
+void resume_request_body_tls_overflow(Loop* loop, Connection& conn);
 
 template <class Self>
 void tls_on_out_drain(void* lp, Connection& c, IoEvent ev);
@@ -255,6 +258,17 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     Connection::visit_tls_raw_send_owner_fields(
         c, [](auto& value, const auto& reset_value) { value = reset_value; });
     c.tls_out_buf.consume(kDrainedLen);
+
+    // A request-body overflow prefix can contain an app record behind control
+    // output (for example a TLS 1.3 KeyUpdate response). Resume its deferred
+    // classification only after the kernel no longer owns tls_out_buf.
+    if (c.tls_recv_overflow_resume_pending()) {
+        resume_request_body_tls_overflow<Self>(loop, c);
+        // The deferred routine owns every continuation: it may park another
+        // raw flight, classify the overflow, or close the connection. Do not
+        // fall through to the generic TLS tail and re-arm the lossy recv.
+        return;
+    }
 
     // Low-watermark resume: the proxy read side pauses the upstream recv once the
     // ciphertext buffer crosses the high watermark; as it drains back below the
@@ -635,11 +649,11 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
         // CQE may contain the same truncated record and another overflow must
         // not queue a second pause/rearm pair.
         if (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty)) {
-            if (c.tls_recv_overflow_prefix_len > c.tls_in_buf.len()) {
+            if (c.tls_recv_overflow_prefix_size() > c.tls_in_buf.len()) {
                 c.tls_recv_overflow_prefix_len = 0;
                 loop->close_conn(c);
-            } else if (c.tls_in_buf.len() > c.tls_recv_overflow_prefix_len) {
-                c.tls_in_buf.set_len(c.tls_recv_overflow_prefix_len);
+            } else if (c.tls_in_buf.len() > c.tls_recv_overflow_prefix_size()) {
+                c.tls_in_buf.set_len(c.tls_recv_overflow_prefix_size());
             }
             return;
         }

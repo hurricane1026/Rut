@@ -5231,6 +5231,20 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
 // Same admission shape as respond_upstream_timeout (plain, policy-free proxying
 // before any response byte); anything else keeps the plain close.
 template <typename Loop>
+bool pause_recv_for_lossy_request_successor(Loop* loop, Connection& conn) {
+    conn.recv_paused_for_send = true;
+    conn.recv_pause_rearm_pending = false;
+    if (!conn.recv_armed || conn.recv_pause_cancel_pending || conn.recv_pause_target_inflight)
+        return true;
+    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+        return loop->pause_recv(conn);
+    } else if constexpr (loop_backend_async_io<Loop>()) {
+        return false;
+    }
+    return true;
+}
+
+template <typename Loop>
 void respond_request_body_overflow(Loop* loop, Connection& conn) {
     bool complete_early_response = false;
     bool upgrade_response_101 = false;
@@ -5277,6 +5291,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         // the upload abandoned. Nothing more to forward, nothing to reject.
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
         return;
     }
     const bool intermediate_body_send_owner =
@@ -5304,6 +5319,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         if (complete_suffix) {
             conn.req_body_lossy_successor = true;
             conn.keep_alive = false;
+            if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
             return;
         }
     }
@@ -5313,6 +5329,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     if (final_body_send_inflight) {
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
         return;
     }
     if (conn.retry_req_send_len == 0 && conn.upstream_connect_armed &&
@@ -5321,16 +5338,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     if (initial_connect_request_owner<Loop>(conn)) {
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
-        conn.recv_paused_for_send = true;
-        conn.recv_pause_rearm_pending = false;
-        if (conn.recv_armed && !conn.recv_pause_cancel_pending &&
-            !conn.recv_pause_target_inflight) {
-            if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
-                if (!loop->pause_recv(conn)) loop->close_conn(conn);
-            } else if constexpr (loop_backend_async_io<Loop>()) {
-                loop->close_conn(conn);
-            }
-        }
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
         return;
     }
     // The body counters are advanced only when the in-flight send completes. If
@@ -5346,6 +5354,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         conn.request_upload_complete = false;
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
         return;
     }
     if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::None &&
@@ -5353,6 +5362,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         conn.request_upload_complete = false;
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
         return;
     }
     if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::Chunked &&
@@ -5374,6 +5384,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
             // the probe only classifies whether the suffix completes this body.
             conn.req_body_lossy_successor = true;
             conn.keep_alive = false;
+            if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
             return;
         }
     }
@@ -5390,6 +5401,7 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
             conn.send_buf.reset();
         else
             conn.send_buf.set_len(conn.retry_req_send_len);
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
         return;
     }
     conn.req_body_overflow_rejected = true;
@@ -5424,6 +5436,61 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     conn.transition_to_sending(&on_response_sent<Loop>);
     if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len()) && conn.fd >= 0)
         loop->close_conn(conn);
+}
+
+template <typename Loop>
+void resume_request_body_tls_overflow(Loop* loop, Connection& conn) {
+    if (!conn.tls_recv_overflow_resume_pending() || !conn.tls_active || conn.tls_out_inflight ||
+        conn.tls_recv_overflow_prefix_size() > conn.tls_in_buf.len()) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (conn.tls_recv_overflow_prefix_size() == 0) {
+        conn.set_tls_recv_overflow_resume_pending(false);
+        respond_request_body_overflow<Loop>(loop, conn);
+        return;
+    }
+    const i32 fd = conn.fd;
+    const u32 handler_generation = conn.handler_gen;
+    const u32 send_owner_generation = conn.tls_send_owner_generation;
+    if (conn.tls_recv_overflow_prefix_size() < conn.tls_in_buf.len())
+        conn.tls_in_buf.set_len(conn.tls_recv_overflow_prefix_size());
+    const bool processed = loop->process_buffered_tls_input(conn);
+    if (conn.tls_out_inflight) {
+        const bool current_raw_owner = [&]() {
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->tls_ciphertext_send_is_current(c);
+                          }) {
+                return loop->tls_ciphertext_send_is_current(conn);
+            }
+            return false;
+        }();
+        if (conn.tls_active && conn.fd == fd && conn.handler_gen == handler_generation &&
+            conn.tls_send_owner_generation == send_owner_generation && current_raw_owner) {
+            // tls_process can either be blocked behind a control flight or
+            // produce another control flight while consuming this prefix. Keep
+            // the classification parked until the current raw owner drains.
+            conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
+            return;
+        }
+        conn.set_tls_recv_overflow_resume_pending(false);
+        conn.tls_recv_overflow_prefix_len = 0;
+        loop->close_conn(conn);
+        return;
+    }
+    if (!processed) {
+        conn.set_tls_recv_overflow_resume_pending(false);
+        conn.tls_recv_overflow_prefix_len = 0;
+        loop->close_conn(conn);
+        return;
+    }
+    if (!conn.tls_active || conn.fd != fd || conn.handler_gen != handler_generation ||
+        conn.tls_send_owner_generation != send_owner_generation)
+        return;
+    if (conn.tls_in_buf.len() != 0) conn.tls_in_buf.reset();
+    conn.set_tls_recv_overflow_resume_pending(false);
+    conn.tls_recv_overflow_prefix_len = 0;
+    respond_request_body_overflow<Loop>(loop, conn);
 }
 
 // forward(set_path:) — rewrite the request-line path in recv_buf in place from
@@ -7692,18 +7759,50 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
         const u32 callback_send_owner_generation = conn.tls_send_owner_generation;
         if constexpr (requires { conn.tls_pending_on_recv; })
             conn.tls_pending_on_recv = &on_request_body_recvd<Loop>;
-        if (conn.tls_recv_overflow_prefix_len > conn.tls_in_buf.len()) {
+        if (conn.tls_recv_overflow_prefix_size() > conn.tls_in_buf.len()) {
             conn.tls_recv_overflow_prefix_len = 0;
             loop->close_conn(conn);
             return;
         }
-        if (conn.tls_recv_overflow_prefix_len < conn.tls_in_buf.len())
-            conn.tls_in_buf.set_len(conn.tls_recv_overflow_prefix_len);
+        if (conn.tls_recv_overflow_prefix_size() < conn.tls_in_buf.len())
+            conn.tls_in_buf.set_len(conn.tls_recv_overflow_prefix_size());
         bool tls_input_processed = true;
         if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
             tls_input_processed = loop->process_buffered_tls_input(conn);
         }
         if (!tls_input_processed) {
+            if (conn.tls_out_inflight) {
+                if constexpr (requires(Loop* candidate, Connection& c) {
+                                  candidate->tls_ciphertext_send_is_current(c);
+                              }) {
+                    if (loop->tls_ciphertext_send_is_current(conn) &&
+                        conn.tls_send_owner_generation == callback_send_owner_generation) {
+                        conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
+                        conn.set_tls_recv_overflow_resume_pending(true);
+                        if (!pause_recv_for_lossy_request_successor(loop, conn))
+                            loop->close_conn(conn);
+                        return;
+                    }
+                }
+            }
+            conn.set_tls_recv_overflow_resume_pending(false);
+            conn.tls_recv_overflow_prefix_len = 0;
+            loop->close_conn(conn);
+            return;
+        }
+        if (conn.tls_out_inflight) {
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->tls_ciphertext_send_is_current(c);
+                          }) {
+                if (loop->tls_ciphertext_send_is_current(conn) &&
+                    conn.tls_send_owner_generation == callback_send_owner_generation) {
+                    conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
+                    conn.set_tls_recv_overflow_resume_pending(true);
+                    if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+                    return;
+                }
+            }
+            conn.set_tls_recv_overflow_resume_pending(false);
             conn.tls_recv_overflow_prefix_len = 0;
             loop->close_conn(conn);
             return;
@@ -7718,6 +7817,7 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
         if (conn.tls_in_buf.len() != 0) conn.tls_in_buf.reset();
         conn.recv_paused_for_send = true;
         conn.recv_pause_rearm_pending = false;
+        conn.set_tls_recv_overflow_resume_pending(false);
         conn.tls_recv_overflow_prefix_len = 0;
         respond_request_body_overflow<Loop>(loop, conn);
         return;

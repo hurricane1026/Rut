@@ -1721,8 +1721,25 @@ struct ConnectionBase {
     u8* upstream_relay_slice;
     u32 upstream_relay_send_len;  // bytes of upstream_relay_slice in flight; 0 = none
     // Nonzero while TLS overflow classification is deferred; also records the
-    // copied prefix length. This occupies existing tail padding.
+    // copied prefix length. The high bit marks deferred classification.
     u32 tls_recv_overflow_prefix_len;
+    static constexpr u32 kTlsOverflowResumeBit = 1u << 31;
+    bool tls_recv_overflow_resume_pending() const {
+        return (tls_recv_overflow_prefix_len & kTlsOverflowResumeBit) != 0;
+    }
+    u32 tls_recv_overflow_prefix_size() const {
+        return tls_recv_overflow_prefix_len & ~kTlsOverflowResumeBit;
+    }
+    void set_tls_recv_overflow_prefix_size(u32 size) {
+        tls_recv_overflow_prefix_len =
+            size | (tls_recv_overflow_prefix_len & kTlsOverflowResumeBit);
+    }
+    void set_tls_recv_overflow_resume_pending(bool pending) {
+        if (pending)
+            tls_recv_overflow_prefix_len |= kTlsOverflowResumeBit;
+        else
+            tls_recv_overflow_prefix_len &= ~kTlsOverflowResumeBit;
+    }
 
     void bind_request_receive_buffer(u8* slice, u32 capacity) {
         clear_raw_request_target_witness();
