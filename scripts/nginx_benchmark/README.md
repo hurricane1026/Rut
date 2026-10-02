@@ -51,8 +51,10 @@ same process. Higher levels include the earlier load history; this is not a
 cold-start-per-level capacity measurement. JIT startup is outside timing.
 
 The default `--keepalive-header explicit` preserves #644's original wire shape
-(`Connection: keep-alive`). The bounded converter proxy currently rejects that
-request shape, so the full default run can fail its proxy keepalive preflight.
+(`Connection: keep-alive`). Current main admits that shape on deadline-owned
+forwards; the [2026-10-02 rerun](../../docs/benchmarks/nginx-main-2026-10-02/README.md)
+includes HTTP and HTTPS explicit-header smoke checks. Older binaries can still
+fail the proxy keepalive preflight.
 Use `--keepalive-header implicit` to test HTTP/1.1 default persistence with no
 Connection header. Preflight, wrk and the independent client all use the chosen
 shape, which is recorded in `environment.json`. Close cases always send
@@ -134,7 +136,10 @@ container IDs in `commands.json`. No existing named containers are removed.
 RUT stdout, binary hashes, command records, and server logs are retained.
 `REPORT.md` masks invalid/incomplete groups; `summary.csv` retains their raw
 values with an explicit `valid` column. A p99 summary is the median of each
-run's p99, not a pooled histogram. Socket errors are not application failure
+run's p99, not a pooled histogram. wrk starts request latency timing when it
+writes the HTTP request, after connection establishment and TLS handshake.
+Short-connection p99 therefore excludes those setup phases; throughput includes
+their cost. Socket errors are not application failure
 percentages. CPU 100% denotes one logical CPU; summed parent/child RSS can
 count shared nginx pages twice and includes RUT's resident compiler/JIT.
 

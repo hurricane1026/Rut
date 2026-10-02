@@ -1,0 +1,55 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 9K of event 'cycles:u'
+# Event count (approx.): 1560816526
+#
+# Overhead  Command  Shared Object      Symbol                                                                                                                                                                                                                                                  
+# ........  .......  .................  ........................................................................................................................................................................................................................................................
+#
+    27.63%  rut      libc.so.6          [.] __memmove_avx_unaligned_erms
+     8.06%  rut      rut                [.] rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+     6.81%  rut      libc.so.6          [.] __memcmp_avx2_movbe
+     4.34%  rut      rut                [.] rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
+     4.07%  rut      rut                [.] void rut::on_header_received<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+     3.28%  rut      rut                [.] rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)
+     3.08%  rut      rut                [.] void rut::on_response_sent<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+     2.45%  rut      rut                [.] rut::capture_request_metadata(rut::ConnectionBase&)
+     2.29%  rut      rut                [.] rut::IoUringBackend::add_send_file(int, unsigned int, int, unsigned int, unsigned int, unsigned int, bool, bool*, bool)
+     2.01%  rut      rut                [.] rut::RouteConfig::strict_local_response_table_is_valid() const
+     1.71%  rut      rut                [.] rut::ArtTrie::match_canonical_key(rut::Str, unsigned char) const
+     1.65%  rut      rut                [.] rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)
+     1.64%  rut      libc.so.6          [.] clock_gettime@@GLIBC_2.17
+     1.61%  rut      rut                [.] rut::write_response_headers(rut::ConnectionBase&, unsigned short, char const*, unsigned int, unsigned int, bool, char const*, unsigned int)
+     1.57%  rut      rut                [.] rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+     1.53%  rut      libc.so.6          [.] __memset_avx2_unaligned_erms
+     1.48%  rut      rut                [.] rut::simd::scan_uri(unsigned char const*, unsigned int, unsigned int, unsigned int*)
+     1.46%  rut      rut                [.] void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
+     1.25%  rut      rut                [.] void rut::on_request_complete<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, unsigned short, unsigned int)
+     1.16%  rut      rut                [.] rut::IoUringEventLoop::consume_response_read_deadline_send_event(rut::ConnectionBase&, rut::IoEvent const&)
+     1.08%  rut      rut                [.] rut::IoUringEventLoop::submit_send_file(rut::ConnectionBase&, int, unsigned int, unsigned int)
+     0.90%  rut      rut                [.] rut::TimerWheel::refresh(rut::ConnectionBase*, unsigned int)
+     0.89%  rut      [vdso]             [.] 0x0000000000000932
+     0.88%  rut      rut                [.] rut::IoUringEventLoop::poll_command()
+     0.85%  rut      rut                [.] rut::simd::scan_header_value(unsigned char const*, unsigned int, unsigned int)
+     0.82%  rut      rut                [.] rut::ConnectionBase::clear_response_read_deadline()
+     0.79%  rut      libc.so.6          [.] sendfile64
+     0.75%  rut      rut                [.] rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)
+     0.74%  rut      rut                [.] rut::format_response_with_body(rut::ConnectionBase&, unsigned short, char const*, unsigned int, bool, bool)
+     0.73%  rut      rut                [.] rut::monotonic_us()
+     0.66%  rut      rut                [.] rut::match_client_preface(unsigned char const*, unsigned int)
+     0.65%  rut      [unknown]          [k] 0xffffffff9e000080
+     0.65%  rut      libc.so.6          [.] syscall
+     0.61%  rut      rut                [.] rut::RouteConfig::has_exact_strict_local_response_inventory() const
+     0.61%  rut      rut                [.] rut::IoUringEventLoop::consume_tls_ciphertext_send_event(rut::ConnectionBase&, rut::IoEvent const&)
+     0.57%  rut      rut                [.] rut::IoUringEventLoop::run()
+     0.56%  rut      rut                [.] rut::EventLoopCRTP<rut::IoUringEventLoop>::dispatch_event(rut::ConnectionBase&, rut::IoEvent const&)
+     0.56%  rut      rut                [.] rut::IoUringEventLoop::resolve_response_read_deadline_expiries()
+     0.52%  rut      rut                [.] rut::IoUringBackend::add_send(int, unsigned int, unsigned char const*, unsigned int, unsigned int, bool)
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

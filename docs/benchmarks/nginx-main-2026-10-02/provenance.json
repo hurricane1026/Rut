@@ -1,0 +1,21 @@
+{
+  "source_commit": "e54b32bc5e98803cf43cd254131ad4e6634fc855",
+  "source_status": "",
+  "compiler": "clang version 22.1.8 (Fedora 22.1.8-4.fc44)\nTarget: x86_64-redhat-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin\nConfiguration file: /etc/clang/x86_64-redhat-linux-gnu-clang++.cfg\n",
+  "build": "./dev.sh build; Release -O2 -DNDEBUG, JIT ON, IPO OFF",
+  "binaries": {
+    "/tmp/rut-nginx-20261002/rut": "b93be14ae0a04573e6c9d235f5ea6fdf5ea5e9b53b6baeca0e35f2a7dc155fcc",
+    "/tmp/rut-nginx-20261002/rut-nginx-convert": "1338759c9e3c09bf1d126c6d4732e591809430bb35b3d64883864af2a25b8163"
+  },
+  "wrk": {
+    "path": "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk",
+    "sha256": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30"
+  },
+  "build_log": "/tmp/rut-nginx-20261002-build.log",
+  "note": "Docker group membership refreshed with sg docker; no privilege elevation. Pinned nginx image is local.",
+  "nginx_version": "1.29.7",
+  "perf_version": "7.2.5-200.fc44.x86_64",
+  "previous_research_commit": "96ebc0264ba62e7fbde9a7e5faf825496874e5e0",
+  "previous_research_commit_is_ancestor": false,
+  "scope_of_repo_changes": "Benchmark documentation and evidence only; no production source changes."
+}

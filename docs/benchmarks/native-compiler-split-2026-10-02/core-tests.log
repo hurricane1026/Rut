@@ -1,0 +1,18 @@
+Test project /home/hurricane/private/code/Rut/build
+    Start 258: test_serve_loader
+    Start  70: test_access_log_startup
+1/4 Test  #70: test_access_log_startup ..........   Passed    2.32 sec
+    Start 256: test_native_program
+2/4 Test #256: test_native_program ..............   Passed    0.99 sec
+    Start 257: test_native_protocol
+3/4 Test #257: test_native_protocol .............   Passed    0.38 sec
+4/4 Test #258: test_serve_loader ................   Passed    5.67 sec
+
+100% tests passed, 0 tests failed out of 4
+
+Label Time Summary:
+jit        =   7.04 sec*proc (3 tests)
+runtime    =   2.32 sec*proc (1 test)
+unit       =   9.36 sec*proc (4 tests)
+
+Total Test time (real) =   5.67 sec

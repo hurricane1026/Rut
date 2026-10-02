@@ -1,0 +1,5606 @@
+{
+  "matrix_complete": true,
+  "expected_cells": 96,
+  "valid_cells": 96,
+  "sample_count": 576,
+  "errors": 0,
+  "warmup_errors": 0,
+  "wins": 78,
+  "at_least_1_05": 70,
+  "at_least_1_10": 60,
+  "p99_wins": 60,
+  "cells": [
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 892.5360690844877,
+          "p50_us": 1113.0,
+          "p95_us": 1185.0,
+          "p99_us": 1261.0,
+          "server_cpu_pct": 71.17543784658811,
+          "origin_cpu_pct": 18.235029530944054,
+          "server_rss_bytes": 21458944,
+          "cpu_us_per_request": 797.4516695957822,
+          "client_cpu_pct": 42.940553411577945,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 979.0654895396078,
+          "p50_us": 1013.0,
+          "p95_us": 1075.0,
+          "p99_us": 1204.0,
+          "server_cpu_pct": 77.2591739386374,
+          "origin_cpu_pct": 25.491390674974745,
+          "server_rss_bytes": 100720640,
+          "cpu_us_per_request": 789.1047466453034,
+          "client_cpu_pct": 41.57057556226655,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0969478135980286,
+      "p99_ratio": 0.9547977795400476,
+      "cpu_per_request_ratio": 0.9895330046086558,
+      "rss_ratio": 4.693643825157473,
+      "valid": true,
+      "paired_ratios": [
+        1.109801695090685,
+        1.08806903856056,
+        1.1020101396819302
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 914.5105608671472,
+          "p50_us": 34770.0,
+          "p95_us": 35470.0,
+          "p99_us": 35895.0,
+          "server_cpu_pct": 75.18854126631102,
+          "origin_cpu_pct": 18.398200655975845,
+          "server_rss_bytes": 26509312,
+          "cpu_us_per_request": 824.4041110868139,
+          "client_cpu_pct": 47.195384291416296,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 966.2734181822182,
+          "p50_us": 32836.0,
+          "p95_us": 33397.0,
+          "p99_us": 34049.0,
+          "server_cpu_pct": 86.38868308251618,
+          "origin_cpu_pct": 19.019376627186148,
+          "server_rss_bytes": 129642496,
+          "cpu_us_per_request": 894.0397350993377,
+          "client_cpu_pct": 43.39431534468984,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0566017053602847,
+      "p99_ratio": 0.9485722245438083,
+      "cpu_per_request_ratio": 1.0844678272173134,
+      "rss_ratio": 4.890451174289246,
+      "valid": true,
+      "paired_ratios": [
+        1.062281484105206,
+        1.045457246052736,
+        1.0570188651063253
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 857.2195014444886,
+          "p50_us": 144187.0,
+          "p95_us": 146325.0,
+          "p99_us": 190908.0,
+          "server_cpu_pct": 75.2749777012814,
+          "origin_cpu_pct": 17.130034088767832,
+          "server_rss_bytes": 43798528,
+          "cpu_us_per_request": 884.1321544904608,
+          "client_cpu_pct": 45.473719481001254,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 764.3310580551238,
+          "p50_us": 160444.0,
+          "p95_us": 170010.0,
+          "p99_us": 181233.0,
+          "server_cpu_pct": 88.05191206814065,
+          "origin_cpu_pct": 15.724519163113241,
+          "server_rss_bytes": 233140224,
+          "cpu_us_per_request": 1153.645833333333,
+          "client_cpu_pct": 40.746370144399165,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.8916398387661039,
+      "p99_ratio": 0.949321138977937,
+      "cpu_per_request_ratio": 1.3048341557017538,
+      "rss_ratio": 5.32301505657907,
+      "valid": true,
+      "paired_ratios": [
+        0.899491190515797,
+        0.880917244316725,
+        0.8916732055115796
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 485.88864091182353,
+          "p50_us": 1230.0,
+          "p95_us": 1308.0,
+          "p99_us": 1391.0,
+          "server_cpu_pct": 76.8677490377805,
+          "origin_cpu_pct": 9.804559826247512,
+          "server_rss_bytes": 21512192,
+          "cpu_us_per_request": 1585.9564164648912,
+          "client_cpu_pct": 62.55309169145913,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 548.8218076178584,
+          "p50_us": 1087.0,
+          "p95_us": 1155.0,
+          "p99_us": 1226.0,
+          "server_cpu_pct": 78.23491061318327,
+          "origin_cpu_pct": 14.313680584531507,
+          "server_rss_bytes": 100802560,
+          "cpu_us_per_request": 1425.5091103965703,
+          "client_cpu_pct": 62.15583900186742,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1295217904002322,
+      "p99_ratio": 0.8813803019410497,
+      "cpu_per_request_ratio": 0.898832461975242,
+      "rss_ratio": 4.685833968012186,
+      "valid": true,
+      "paired_ratios": [
+        1.1323446054892221,
+        1.1324572764525873,
+        1.1240326869468265
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 553.1594897441955,
+          "p50_us": 13455.0,
+          "p95_us": 13974.0,
+          "p99_us": 14179.0,
+          "server_cpu_pct": 85.8852326225056,
+          "origin_cpu_pct": 11.56782450786749,
+          "server_rss_bytes": 23175168,
+          "cpu_us_per_request": 1552.6409074796175,
+          "client_cpu_pct": 196.08500598745567,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 590.3390263503736,
+          "p50_us": 42971.0,
+          "p95_us": 51086.0,
+          "p99_us": 51922.0,
+          "server_cpu_pct": 90.3748577145838,
+          "origin_cpu_pct": 12.15576872591271,
+          "server_rss_bytes": 127303680,
+          "cpu_us_per_request": 1531.0528063766187,
+          "client_cpu_pct": 103.87513033388996,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0672130502965276,
+      "p99_ratio": 3.6618943508004795,
+      "cpu_per_request_ratio": 0.9860958828284111,
+      "rss_ratio": 5.493107104984094,
+      "valid": true,
+      "paired_ratios": [
+        1.0606689976625503,
+        1.0672130502965276,
+        1.066642265080567
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 585.3960413289605,
+          "p50_us": 12570.0,
+          "p95_us": 13097.0,
+          "p99_us": 13438.0,
+          "server_cpu_pct": 88.80497769820283,
+          "origin_cpu_pct": 12.345086585848811,
+          "server_rss_bytes": 28160000,
+          "cpu_us_per_request": 1517.0068027210884,
+          "client_cpu_pct": 193.1408707786026,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 509.03183536796934,
+          "p50_us": 218439.0,
+          "p95_us": 236132.0,
+          "p99_us": 240224.0,
+          "server_cpu_pct": 90.88311139226761,
+          "origin_cpu_pct": 10.940840686241353,
+          "server_rss_bytes": 178200576,
+          "cpu_us_per_request": 1789.0624999999998,
+          "client_cpu_pct": 121.29274202127394,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.869551208806213,
+      "p99_ratio": 17.876469712754876,
+      "cpu_per_request_ratio": 1.17933716367713,
+      "rss_ratio": 6.328145454545455,
+      "valid": true,
+      "paired_ratios": [
+        0.8583635643931623,
+        0.8699177426865076,
+        0.873012692426004
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1127.742806399053,
+          "p50_us": 883.0,
+          "p95_us": 915.0,
+          "p99_us": 962.0,
+          "server_cpu_pct": 77.84376305770301,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 21430272,
+          "cpu_us_per_request": 692.0535559033212,
+          "client_cpu_pct": 54.120873087336975,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1660.8497707458666,
+          "p50_us": 598.0,
+          "p95_us": 619.0,
+          "p99_us": 683.0,
+          "server_cpu_pct": 80.7852007786752,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 81473536,
+          "cpu_us_per_request": 486.8250029540352,
+          "client_cpu_pct": 68.6301558159449,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.472720341306414,
+      "p99_ratio": 0.7099792099792099,
+      "cpu_per_request_ratio": 0.703449897484587,
+      "rss_ratio": 3.801796636085627,
+      "valid": true,
+      "paired_ratios": [
+        1.4581978878774158,
+        1.4844353670459345,
+        1.472720341306414
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1128.2404667979947,
+          "p50_us": 28169.0,
+          "p95_us": 28728.0,
+          "p99_us": 29140.0,
+          "server_cpu_pct": 78.58824319881747,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 23003136,
+          "cpu_us_per_request": 696.561503013116,
+          "client_cpu_pct": 54.99222409951232,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1889.487764426793,
+          "p50_us": 16832.0,
+          "p95_us": 17244.0,
+          "p99_us": 17472.0,
+          "server_cpu_pct": 85.99012833326734,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 84209664,
+          "cpu_us_per_request": 454.0643522438611,
+          "client_cpu_pct": 72.99246717738728,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.6747207887244622,
+      "p99_ratio": 0.5995881949210707,
+      "cpu_per_request_ratio": 0.6518654135775735,
+      "rss_ratio": 3.6607905982905984,
+      "valid": true,
+      "paired_ratios": [
+        1.6679227338796645,
+        1.7045259328369633,
+        1.6747207887244622
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1110.152015066093,
+          "p50_us": 112385.0,
+          "p95_us": 114085.0,
+          "p99_us": 121047.0,
+          "server_cpu_pct": 78.81411035289015,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 28114944,
+          "cpu_us_per_request": 709.0420769919424,
+          "client_cpu_pct": 57.66506974192496,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1708.1977557595903,
+          "p50_us": 72738.0,
+          "p95_us": 74168.0,
+          "p99_us": 82101.0,
+          "server_cpu_pct": 86.39785255549519,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 97308672,
+          "cpu_us_per_request": 506.06343283582083,
+          "client_cpu_pct": 69.47661415176918,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.5387061704859333,
+      "p99_ratio": 0.6782572058787083,
+      "cpu_per_request_ratio": 0.7137283516131466,
+      "rss_ratio": 3.4611013986013988,
+      "valid": true,
+      "paired_ratios": [
+        1.5542296506453492,
+        1.566483265545879,
+        1.5342631572750087
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 556.7021427836087,
+          "p50_us": 975.0,
+          "p95_us": 1033.0,
+          "p99_us": 1094.0,
+          "server_cpu_pct": 80.78735513180104,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 21622784,
+          "cpu_us_per_request": 1447.6928495949278,
+          "client_cpu_pct": 71.37352865627568,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 732.1721774572567,
+          "p50_us": 648.0,
+          "p95_us": 687.0,
+          "p99_us": 726.0,
+          "server_cpu_pct": 80.39039142669806,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 81543168,
+          "cpu_us_per_request": 1098.060639169626,
+          "client_cpu_pct": 80.99692211695955,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3151955438796534,
+      "p99_ratio": 0.6636197440585009,
+      "cpu_per_request_ratio": 0.7584900619470969,
+      "rss_ratio": 3.7711687819662814,
+      "valid": true,
+      "paired_ratios": [
+        1.2996713260880517,
+        1.2974198568675053,
+        1.3151955438796534
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 720.1216658592339,
+          "p50_us": 2358.0,
+          "p95_us": 2723.0,
+          "p99_us": 2937.0,
+          "server_cpu_pct": 95.49425926554132,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 23195648,
+          "cpu_us_per_request": 1317.7239313912332,
+          "client_cpu_pct": 191.96895240444542,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 856.9072826320192,
+          "p50_us": 31571.0,
+          "p95_us": 35829.0,
+          "p99_us": 36319.0,
+          "server_cpu_pct": 91.99004667694955,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 84561920,
+          "cpu_us_per_request": 1073.5122520420068,
+          "client_cpu_pct": 135.58532966733,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1899479258266388,
+      "p99_ratio": 12.36601974804222,
+      "cpu_per_request_ratio": 0.8146715912707213,
+      "rss_ratio": 3.645594208016952,
+      "valid": true,
+      "paired_ratios": [
+        1.1922393128099624,
+        1.1494252726378942,
+        1.195730753952488
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 742.4055934799086,
+          "p50_us": 4505.0,
+          "p95_us": 4892.0,
+          "p99_us": 5179.0,
+          "server_cpu_pct": 97.1895490962567,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 28307456,
+          "cpu_us_per_request": 1310.418904403867,
+          "client_cpu_pct": 190.595078862946,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 813.9204237791143,
+          "p50_us": 130198.0,
+          "p95_us": 146400.0,
+          "p99_us": 150802.0,
+          "server_cpu_pct": 91.85750792966894,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 99065856,
+          "cpu_us_per_request": 1127.9296875000002,
+          "client_cpu_pct": 135.59917837236847,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0963285176287416,
+      "p99_ratio": 29.11797644332883,
+      "cpu_per_request_ratio": 0.8607397861168034,
+      "rss_ratio": 3.4996382578498046,
+      "valid": true,
+      "paired_ratios": [
+        1.117969106237919,
+        1.096177348784555,
+        1.0817334204775257
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 5655.566712569249,
+          "p50_us": 173.0,
+          "p95_us": 204.0,
+          "p99_us": 222.0,
+          "server_cpu_pct": 64.11851454460853,
+          "origin_cpu_pct": 20.982050150237367,
+          "server_rss_bytes": 21475328,
+          "cpu_us_per_request": 113.37239538189506,
+          "client_cpu_pct": 24.11797336081606,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 5559.319375064341,
+          "p50_us": 176.0,
+          "p95_us": 212.0,
+          "p99_us": 226.0,
+          "server_cpu_pct": 60.19590138460377,
+          "origin_cpu_pct": 21.373529687440577,
+          "server_rss_bytes": 99745792,
+          "cpu_us_per_request": 108.20527280417312,
+          "client_cpu_pct": 23.922858585511968,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.9829818403006365,
+      "p99_ratio": 1.018018018018018,
+      "cpu_per_request_ratio": 0.954423450608797,
+      "rss_ratio": 4.644669082586305,
+      "valid": true,
+      "paired_ratios": [
+        0.9755988123120519,
+        0.9836540130307182,
+        0.9915808613591686
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 7254.174964566432,
+          "p50_us": 4344.0,
+          "p95_us": 4492.0,
+          "p99_us": 4665.0,
+          "server_cpu_pct": 73.9261491496336,
+          "origin_cpu_pct": 23.726960337150285,
+          "server_rss_bytes": 23048192,
+          "cpu_us_per_request": 102.1431087268688,
+          "client_cpu_pct": 33.38938217646788,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 10068.34354400093,
+          "p50_us": 3143.0,
+          "p95_us": 3246.0,
+          "p99_us": 3356.0,
+          "server_cpu_pct": 75.39028973068267,
+          "origin_cpu_pct": 32.19790069687457,
+          "server_rss_bytes": 105385984,
+          "cpu_us_per_request": 74.88330519416027,
+          "client_cpu_pct": 37.99752256152898,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3879377866098512,
+      "p99_ratio": 0.7193997856377278,
+      "cpu_per_request_ratio": 0.7331214619128014,
+      "rss_ratio": 4.572418695574907,
+      "valid": true,
+      "paired_ratios": [
+        1.391237267650288,
+        1.3909370044636329,
+        1.36842030931617
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 7014.129554817329,
+          "p50_us": 17811.0,
+          "p95_us": 18163.0,
+          "p99_us": 22646.0,
+          "server_cpu_pct": 73.95711521126881,
+          "origin_cpu_pct": 23.130515930145844,
+          "server_rss_bytes": 28028928,
+          "cpu_us_per_request": 105.46963838981125,
+          "client_cpu_pct": 33.49936789883191,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 8932.989380724535,
+          "p50_us": 13933.0,
+          "p95_us": 14604.0,
+          "p99_us": 15141.0,
+          "server_cpu_pct": 78.60540088754455,
+          "origin_cpu_pct": 27.98568006492678,
+          "server_rss_bytes": 120098816,
+          "cpu_us_per_request": 87.68230149392885,
+          "client_cpu_pct": 37.014188772362736,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.2735706278178631,
+      "p99_ratio": 0.6685948953457564,
+      "cpu_per_request_ratio": 0.831351115188798,
+      "rss_ratio": 4.284816600906035,
+      "valid": true,
+      "paired_ratios": [
+        1.282877381319118,
+        1.2702432272879067,
+        1.2767904280012596
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 902.3946990488187,
+          "p50_us": 307.0,
+          "p95_us": 346.0,
+          "p99_us": 370.0,
+          "server_cpu_pct": 78.43500209029278,
+          "origin_cpu_pct": 4.509988742675926,
+          "server_rss_bytes": 21331968,
+          "cpu_us_per_request": 869.9415710885089,
+          "client_cpu_pct": 75.10151450145536,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1012.1602366125534,
+          "p50_us": 276.0,
+          "p95_us": 305.0,
+          "p99_us": 335.0,
+          "server_cpu_pct": 74.3139732034401,
+          "origin_cpu_pct": 5.2941352941764706,
+          "server_rss_bytes": 99725312,
+          "cpu_us_per_request": 734.2115459124371,
+          "client_cpu_pct": 74.70507670995705,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.12163805669452,
+      "p99_ratio": 0.9054054054054054,
+      "cpu_per_request_ratio": 0.843977998423227,
+      "rss_ratio": 4.674923195084485,
+      "valid": true,
+      "paired_ratios": [
+        1.12163805669452,
+        1.1286847409708367,
+        1.1103091144590462
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1071.4288515553365,
+          "p50_us": 3741.0,
+          "p95_us": 4058.0,
+          "p99_us": 4174.0,
+          "server_cpu_pct": 93.72911071270792,
+          "origin_cpu_pct": 5.2943958623708065,
+          "server_rss_bytes": 22904832,
+          "cpu_us_per_request": 876.6471449487555,
+          "client_cpu_pct": 195.69383366377096,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1347.4845680373837,
+          "p50_us": 16625.0,
+          "p95_us": 20743.0,
+          "p99_us": 21557.0,
+          "server_cpu_pct": 93.92479153696448,
+          "origin_cpu_pct": 5.686469633761943,
+          "server_rss_bytes": 105160704,
+          "cpu_us_per_request": 696.930016004656,
+          "client_cpu_pct": 184.5161353575858,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.257651934686388,
+      "p99_ratio": 5.164590321034979,
+      "cpu_per_request_ratio": 0.7949949076094865,
+      "rss_ratio": 4.5912017167381975,
+      "valid": true,
+      "paired_ratios": [
+        1.2787516425159473,
+        1.257651934686388,
+        1.268017046708052
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1057.3285575302048,
+          "p50_us": 3912.0,
+          "p95_us": 4239.0,
+          "p99_us": 4349.0,
+          "server_cpu_pct": 94.00246358151377,
+          "origin_cpu_pct": 5.5762885060147225,
+          "server_rss_bytes": 27885568,
+          "cpu_us_per_request": 889.0563194575249,
+          "client_cpu_pct": 194.7762910650858,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1330.6175923599594,
+          "p50_us": 57542.0,
+          "p95_us": 83408.0,
+          "p99_us": 85850.0,
+          "server_cpu_pct": 94.2910358467066,
+          "origin_cpu_pct": 4.973155899087903,
+          "server_rss_bytes": 120008704,
+          "cpu_us_per_request": 708.6261025564356,
+          "client_cpu_pct": 180.0282435469821,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.2584712508551985,
+      "p99_ratio": 19.740170154058404,
+      "cpu_per_request_ratio": 0.7970542327271435,
+      "rss_ratio": 4.3036133960047005,
+      "valid": true,
+      "paired_ratios": [
+        1.282906724737128,
+        1.2735813158138434,
+        1.2419000603058663
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 12416.202204592611,
+          "p50_us": 80.0,
+          "p95_us": 83.0,
+          "p99_us": 93.0,
+          "server_cpu_pct": 72.35661575754534,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 21377024,
+          "cpu_us_per_request": 58.75106604756941,
+          "client_cpu_pct": 50.199749903277244,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 14533.329385728506,
+          "p50_us": 68.0,
+          "p95_us": 71.0,
+          "p99_us": 84.0,
+          "server_cpu_pct": 57.59791495547861,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79376384,
+          "cpu_us_per_request": 39.394511750897166,
+          "client_cpu_pct": 51.37136042734698,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.170513265348787,
+      "p99_ratio": 0.9032258064516129,
+      "cpu_per_request_ratio": 0.6705327137213191,
+      "rss_ratio": 3.7131634412722745,
+      "valid": true,
+      "paired_ratios": [
+        1.1580042976209277,
+        1.1790940414364022,
+        1.185232669730986
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14630.746883019909,
+          "p50_us": 2157.0,
+          "p95_us": 2301.0,
+          "p99_us": 2401.0,
+          "server_cpu_pct": 79.80692606466752,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 23080960,
+          "cpu_us_per_request": 54.54740397244485,
+          "client_cpu_pct": 60.59051634885078,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 26947.976437043762,
+          "p50_us": 1210.0,
+          "p95_us": 1354.0,
+          "p99_us": 1426.0,
+          "server_cpu_pct": 83.14123263936548,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 80891904,
+          "cpu_us_per_request": 30.870839671997324,
+          "client_cpu_pct": 81.76728716337908,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.8418729168446577,
+      "p99_ratio": 0.5939192003331945,
+      "cpu_per_request_ratio": 0.565945167392238,
+      "rss_ratio": 3.5047027506654835,
+      "valid": true,
+      "paired_ratios": [
+        1.842178776472753,
+        1.8418729168446577,
+        1.8791225757397636
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14291.841405816436,
+          "p50_us": 8711.0,
+          "p95_us": 9009.0,
+          "p99_us": 11452.0,
+          "server_cpu_pct": 79.62017989383446,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 28192768,
+          "cpu_us_per_request": 55.790528131782516,
+          "client_cpu_pct": 61.50658896798712,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 25771.637034752654,
+          "p50_us": 4794.0,
+          "p95_us": 5595.0,
+          "p99_us": 5845.0,
+          "server_cpu_pct": 84.0706448417679,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 92217344,
+          "cpu_us_per_request": 32.621383239411585,
+          "client_cpu_pct": 77.77127468116271,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.803241185160662,
+      "p99_ratio": 0.5103911980440098,
+      "cpu_per_request_ratio": 0.584711855789513,
+      "rss_ratio": 3.270957431352608,
+      "valid": true,
+      "paired_ratios": [
+        1.7941254124385992,
+        1.7880320518544648,
+        1.822278539905928
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1015.3580254757211,
+          "p50_us": 166.0,
+          "p95_us": 173.0,
+          "p99_us": 209.0,
+          "server_cpu_pct": 83.14248798796943,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 21614592,
+          "cpu_us_per_request": 818.8489764387793,
+          "client_cpu_pct": 86.08395087292853,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1203.3262549435983,
+          "p50_us": 120.0,
+          "p95_us": 130.0,
+          "p99_us": 165.0,
+          "server_cpu_pct": 77.64660207881131,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79437824,
+          "cpu_us_per_request": 646.4187104109145,
+          "client_cpu_pct": 87.84262053360472,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1851250738672297,
+      "p99_ratio": 0.7894736842105263,
+      "cpu_per_request_ratio": 0.7894236043650273,
+      "rss_ratio": 3.6751942391510326,
+      "valid": true,
+      "paired_ratios": [
+        1.1916962013106653,
+        1.1851250738672297,
+        1.1614839766245926
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1191.436559532806,
+          "p50_us": 914.0,
+          "p95_us": 1003.0,
+          "p99_us": 1256.0,
+          "server_cpu_pct": 96.27968247705859,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 23187456,
+          "cpu_us_per_request": 808.8114417228339,
+          "client_cpu_pct": 195.1119648539621,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1487.7016597441225,
+          "p50_us": 12771.0,
+          "p95_us": 17785.0,
+          "p99_us": 18883.0,
+          "server_cpu_pct": 96.85148373924365,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 82972672,
+          "cpu_us_per_request": 648.3921982076963,
+          "client_cpu_pct": 191.94253095538951,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.2486620859842423,
+      "p99_ratio": 15.034235668789808,
+      "cpu_per_request_ratio": 0.8016605166051661,
+      "rss_ratio": 3.578343048931284,
+      "valid": true,
+      "paired_ratios": [
+        1.3032853723537476,
+        1.2486620859842423,
+        1.2799356951373624
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1182.8881479737597,
+          "p50_us": 1027.0,
+          "p95_us": 1247.0,
+          "p99_us": 1680.0,
+          "server_cpu_pct": 96.49680774632596,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 28299264,
+          "cpu_us_per_request": 816.9440242057492,
+          "client_cpu_pct": 193.95007068734117,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1476.9564149584776,
+          "p50_us": 51089.0,
+          "p95_us": 74412.0,
+          "p99_us": 76608.0,
+          "server_cpu_pct": 96.79797863513255,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 93249536,
+          "cpu_us_per_request": 654.8982616897993,
+          "client_cpu_pct": 192.61242880893562,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.2486019219048268,
+      "p99_ratio": 45.6,
+      "cpu_per_request_ratio": 0.8016439832906613,
+      "rss_ratio": 3.295122304240845,
+      "valid": true,
+      "paired_ratios": [
+        1.2741522335630722,
+        1.2486019219048268,
+        1.2766733419360061
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 9501.912853868162,
+          "p50_us": 102.0,
+          "p95_us": 113.0,
+          "p99_us": 146.0,
+          "server_cpu_pct": 55.29726200117262,
+          "origin_cpu_pct": 23.72683936929747,
+          "server_rss_bytes": 21188608,
+          "cpu_us_per_request": 58.19592628516004,
+          "client_cpu_pct": 10.19665824135098,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 9905.136800768458,
+          "p50_us": 98.0,
+          "p95_us": 112.0,
+          "p99_us": 143.0,
+          "server_cpu_pct": 57.64716055381275,
+          "origin_cpu_pct": 24.90156528886501,
+          "server_rss_bytes": 87027712,
+          "cpu_us_per_request": 58.22589269799774,
+          "client_cpu_pct": 10.000017647089965,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.042436081355571,
+      "p99_ratio": 0.9794520547945206,
+      "cpu_per_request_ratio": 1.0005149228605945,
+      "rss_ratio": 4.107287840711386,
+      "valid": true,
+      "paired_ratios": [
+        1.0419592201291112,
+        1.0419852691923923,
+        1.0471946596319306
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14025.35903299314,
+          "p50_us": 2237.0,
+          "p95_us": 2317.0,
+          "p99_us": 2719.0,
+          "server_cpu_pct": 68.38904407513917,
+          "origin_cpu_pct": 32.99613945168415,
+          "server_rss_bytes": 22761472,
+          "cpu_us_per_request": 48.62051757325159,
+          "client_cpu_pct": 18.39828160049851,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 19900.697493319636,
+          "p50_us": 1550.0,
+          "p95_us": 1839.0,
+          "p99_us": 1898.0,
+          "server_cpu_pct": 64.79226380370183,
+          "origin_cpu_pct": 39.39529620163357,
+          "server_rss_bytes": 89649152,
+          "cpu_us_per_request": 32.48152863687857,
+          "client_cpu_pct": 16.398432309871176,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.4189082394614925,
+      "p99_ratio": 0.6980507539536595,
+      "cpu_per_request_ratio": 0.6680621732983808,
+      "rss_ratio": 3.9386359546517906,
+      "valid": true,
+      "paired_ratios": [
+        1.4189082394614925,
+        1.4105765019700884,
+        1.4194344235491256
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 13818.344608038202,
+          "p50_us": 8968.0,
+          "p95_us": 9133.0,
+          "p99_us": 15305.0,
+          "server_cpu_pct": 68.44409072821328,
+          "origin_cpu_pct": 32.414524093139036,
+          "server_rss_bytes": 27742208,
+          "cpu_us_per_request": 49.53132424299145,
+          "client_cpu_pct": 18.096452101077638,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 21147.492038216562,
+          "p50_us": 5766.0,
+          "p95_us": 6817.0,
+          "p99_us": 6976.0,
+          "server_cpu_pct": 64.29140127388533,
+          "origin_cpu_pct": 40.406050955414,
+          "server_rss_bytes": 95125504,
+          "cpu_us_per_request": 30.417176758640178,
+          "client_cpu_pct": 17.71496815286624,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.5303925787112704,
+      "p99_ratio": 0.4557987585756289,
+      "cpu_per_request_ratio": 0.6140998090303253,
+      "rss_ratio": 3.4289089029971946,
+      "valid": true,
+      "paired_ratios": [
+        1.5303925787112704,
+        1.5154426456081682,
+        1.5295423512079693
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 979.842154625249,
+          "p50_us": 202.0,
+          "p95_us": 247.0,
+          "p99_us": 277.0,
+          "server_cpu_pct": 80.00312169043458,
+          "origin_cpu_pct": 3.137377321193516,
+          "server_rss_bytes": 21417984,
+          "cpu_us_per_request": 815.8415841584158,
+          "client_cpu_pct": 79.22073465465937,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1136.838225057891,
+          "p50_us": 165.0,
+          "p95_us": 183.0,
+          "p99_us": 210.0,
+          "server_cpu_pct": 74.90457510085646,
+          "origin_cpu_pct": 4.117558248743654,
+          "server_rss_bytes": 87076864,
+          "cpu_us_per_request": 660.4426002766251,
+          "client_cpu_pct": 80.19887752945102,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1602258789250466,
+      "p99_ratio": 0.7581227436823105,
+      "cpu_per_request_ratio": 0.8095230901448924,
+      "rss_ratio": 4.065595716198126,
+      "valid": true,
+      "paired_ratios": [
+        1.148006928990524,
+        1.1579245803577558,
+        1.1744174240820469
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1117.1186222321314,
+          "p50_us": 3544.0,
+          "p95_us": 3868.0,
+          "p99_us": 3980.0,
+          "server_cpu_pct": 94.49859379426557,
+          "origin_cpu_pct": 4.509268998481553,
+          "server_rss_bytes": 22990848,
+          "cpu_us_per_request": 844.30401965947,
+          "client_cpu_pct": 195.50066111382043,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1480.7974701164367,
+          "p50_us": 13022.0,
+          "p95_us": 16547.0,
+          "p99_us": 17919.0,
+          "server_cpu_pct": 94.90625947959605,
+          "origin_cpu_pct": 4.313192684040986,
+          "server_rss_bytes": 90238976,
+          "cpu_us_per_request": 642.1289553819674,
+          "client_cpu_pct": 190.9890428370383,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.325550788113829,
+      "p99_ratio": 4.502261306532663,
+      "cpu_per_request_ratio": 0.7605423407091618,
+      "rss_ratio": 3.9249955460538035,
+      "valid": true,
+      "paired_ratios": [
+        1.3266542230559404,
+        1.325550788113829,
+        1.3352691859551233
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1120.1728607782316,
+          "p50_us": 3527.0,
+          "p95_us": 3879.0,
+          "p99_us": 4020.0,
+          "server_cpu_pct": 94.83836235666153,
+          "origin_cpu_pct": 4.576194635506097,
+          "server_rss_bytes": 27971584,
+          "cpu_us_per_request": 847.2468916518652,
+          "client_cpu_pct": 194.42293043165077,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1474.0014718154105,
+          "p50_us": 53644.0,
+          "p95_us": 72660.0,
+          "p99_us": 76168.0,
+          "server_cpu_pct": 95.08528433881715,
+          "origin_cpu_pct": 3.779540590873492,
+          "server_rss_bytes": 99549184,
+          "cpu_us_per_request": 644.4654172846166,
+          "client_cpu_pct": 193.36915247695916,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3158696513959098,
+      "p99_ratio": 18.94726368159204,
+      "cpu_per_request_ratio": 0.7606583436713606,
+      "rss_ratio": 3.5589398154927516,
+      "valid": true,
+      "paired_ratios": [
+        1.3392669571214126,
+        1.300733647826195,
+        1.319749740072651
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 33062.7874125556,
+          "p50_us": 29.0,
+          "p95_us": 31.0,
+          "p99_us": 34.0,
+          "server_cpu_pct": 57.45086774339658,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 21532672,
+          "cpu_us_per_request": 17.317660455240965,
+          "client_cpu_pct": 31.76464359873804,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 43043.37493784421,
+          "p50_us": 22.0,
+          "p95_us": 24.0,
+          "p99_us": 26.0,
+          "server_cpu_pct": 43.332585633816514,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79384576,
+          "cpu_us_per_request": 10.067190524997153,
+          "client_cpu_pct": 40.98177428728969,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3018676979878134,
+      "p99_ratio": 0.7647058823529411,
+      "cpu_per_request_ratio": 0.5813250901307774,
+      "rss_ratio": 3.686703443028343,
+      "valid": true,
+      "paired_ratios": [
+        1.3132819396174498,
+        1.306698436929179,
+        1.2969886680688973
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 63054.802692269775,
+          "p50_us": 501.0,
+          "p95_us": 537.0,
+          "p99_us": 603.0,
+          "server_cpu_pct": 80.99139871345665,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 23105536,
+          "cpu_us_per_request": 12.863278609893824,
+          "client_cpu_pct": 62.59335258595537,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 185004.2855525883,
+          "p50_us": 125.0,
+          "p95_us": 239.0,
+          "p99_us": 280.0,
+          "server_cpu_pct": 73.59189017370286,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 80826368,
+          "cpu_us_per_request": 3.977870931059605,
+          "client_cpu_pct": 111.58678812428609,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 2.9340237008666263,
+      "p99_ratio": 0.46434494195688225,
+      "cpu_per_request_ratio": 0.3092423830422219,
+      "rss_ratio": 3.498138627902854,
+      "valid": true,
+      "paired_ratios": [
+        2.9340237008666263,
+        2.906707577765131,
+        2.9444426695270067
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 61598.66977222994,
+          "p50_us": 2017.0,
+          "p95_us": 2137.0,
+          "p99_us": 4125.0,
+          "server_cpu_pct": 80.94347394238181,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 28086272,
+          "cpu_us_per_request": 13.20398200876146,
+          "client_cpu_pct": 64.70227893371441,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 181710.62237752636,
+          "p50_us": 573.0,
+          "p95_us": 1125.0,
+          "p99_us": 1184.0,
+          "server_cpu_pct": 73.42478466540288,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 85168128,
+          "cpu_us_per_request": 4.040753573165017,
+          "client_cpu_pct": 107.8647964529597,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 2.9499114680467593,
+      "p99_ratio": 0.287030303030303,
+      "cpu_per_request_ratio": 0.3060253770782017,
+      "rss_ratio": 3.0323756744932187,
+      "valid": true,
+      "paired_ratios": [
+        2.969836256258992,
+        2.920318059347013,
+        2.952935614498347
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1101.8130992420058,
+          "p50_us": 113.0,
+          "p95_us": 119.0,
+          "p99_us": 182.0,
+          "server_cpu_pct": 83.53065653527388,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 21557248,
+          "cpu_us_per_request": 758.1420181526963,
+          "client_cpu_pct": 87.65090858892627,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1305.0499314927215,
+          "p50_us": 59.0,
+          "p95_us": 66.0,
+          "p99_us": 77.0,
+          "server_cpu_pct": 78.23241025624938,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79306752,
+          "cpu_us_per_request": 599.4591346153846,
+          "client_cpu_pct": 90.97703849348298,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1844567217348685,
+      "p99_ratio": 0.4230769230769231,
+      "cpu_per_request_ratio": 0.7906950416440952,
+      "rss_ratio": 3.678890366711001,
+      "valid": true,
+      "paired_ratios": [
+        1.1962120219442725,
+        1.1844567217348685,
+        1.1823575016129824
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1245.7148526740712,
+          "p50_us": 813.0,
+          "p95_us": 895.0,
+          "p99_us": 1170.0,
+          "server_cpu_pct": 97.0617734460557,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 23130112,
+          "cpu_us_per_request": 780.7335117267434,
+          "client_cpu_pct": 195.49468095640623,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1619.0770692057895,
+          "p50_us": 6031.0,
+          "p95_us": 9148.0,
+          "p99_us": 10559.0,
+          "server_cpu_pct": 97.45443906930815,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 82546688,
+          "cpu_us_per_request": 601.913527915708,
+          "client_cpu_pct": 194.29421987439693,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.2997172392464078,
+      "p99_ratio": 9.024786324786325,
+      "cpu_per_request_ratio": 0.7709590005742928,
+      "rss_ratio": 3.5687975916415797,
+      "valid": true,
+      "paired_ratios": [
+        1.3235812797534985,
+        1.2997172392464078,
+        1.3190220820658296
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1222.5476293297652,
+          "p50_us": 811.0,
+          "p95_us": 912.0,
+          "p99_us": 1152.0,
+          "server_cpu_pct": 97.39161406525716,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 28110848,
+          "cpu_us_per_request": 795.6394402863649,
+          "client_cpu_pct": 194.1435870852344,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1605.1648551452606,
+          "p50_us": 26420.0,
+          "p95_us": 40071.0,
+          "p99_us": 45414.0,
+          "server_cpu_pct": 97.64886977896751,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 89038848,
+          "cpu_us_per_request": 608.5016730697735,
+          "client_cpu_pct": 192.51345406525567,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3129671324341423,
+      "p99_ratio": 39.421875,
+      "cpu_per_request_ratio": 0.7647957633306398,
+      "rss_ratio": 3.167419495847297,
+      "valid": true,
+      "paired_ratios": [
+        1.3131632242082565,
+        1.3129671324341423,
+        1.3061031656842172
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 9564.713192923547,
+          "p50_us": 101.0,
+          "p95_us": 118.0,
+          "p99_us": 146.0,
+          "server_cpu_pct": 55.49512535133022,
+          "origin_cpu_pct": 24.314740988202026,
+          "server_rss_bytes": 21307392,
+          "cpu_us_per_request": 57.81294846037148,
+          "client_cpu_pct": 9.804792464899332,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 10094.88786736915,
+          "p50_us": 96.0,
+          "p95_us": 112.0,
+          "p99_us": 141.0,
+          "server_cpu_pct": 58.041389393210615,
+          "origin_cpu_pct": 25.098979197064036,
+          "server_rss_bytes": 87068672,
+          "cpu_us_per_request": 57.49582378306982,
+          "client_cpu_pct": 9.608202973876082,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0554302741495534,
+      "p99_ratio": 0.9657534246575342,
+      "cpu_per_request_ratio": 0.9945146427271558,
+      "rss_ratio": 4.0863129565551715,
+      "valid": true,
+      "paired_ratios": [
+        1.0597678817053626,
+        1.0554302741495534,
+        1.047217004180909
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14119.373976444898,
+          "p50_us": 2224.0,
+          "p95_us": 2315.0,
+          "p99_us": 2849.0,
+          "server_cpu_pct": 68.43227156121463,
+          "origin_cpu_pct": 33.92242001367878,
+          "server_rss_bytes": 22880256,
+          "cpu_us_per_request": 48.46751010318441,
+          "client_cpu_pct": 17.64750174122017,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 20272.98081111121,
+          "p50_us": 1520.0,
+          "p95_us": 1803.0,
+          "p99_us": 1854.0,
+          "server_cpu_pct": 64.19360631681084,
+          "origin_cpu_pct": 39.2178701715939,
+          "server_rss_bytes": 89690112,
+          "cpu_us_per_request": 31.664611590628855,
+          "client_cpu_pct": 15.798426476722918,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.4358271722905185,
+      "p99_ratio": 0.6507546507546508,
+      "cpu_per_request_ratio": 0.6533162426379404,
+      "rss_ratio": 3.9199785177228788,
+      "valid": true,
+      "paired_ratios": [
+        1.4489205920667612,
+        1.4326145372319576,
+        1.4358271722905185
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 13882.595533140266,
+          "p50_us": 8976.0,
+          "p95_us": 9197.0,
+          "p99_us": 14513.0,
+          "server_cpu_pct": 68.25679120247575,
+          "origin_cpu_pct": 33.250055549494036,
+          "server_rss_bytes": 27860992,
+          "cpu_us_per_request": 49.16716837246641,
+          "client_cpu_pct": 17.113947648434145,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 21567.631152162263,
+          "p50_us": 5642.0,
+          "p95_us": 6691.0,
+          "p99_us": 6886.0,
+          "server_cpu_pct": 63.83721311785128,
+          "origin_cpu_pct": 40.54684979797133,
+          "server_rss_bytes": 95395840,
+          "cpu_us_per_request": 29.598620575190647,
+          "client_cpu_pct": 17.093279816791842,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.5535734006422954,
+      "p99_ratio": 0.47447116378419346,
+      "cpu_per_request_ratio": 0.6019996992905099,
+      "rss_ratio": 3.4239929432519847,
+      "valid": true,
+      "paired_ratios": [
+        1.5606553612226282,
+        1.537942742348138,
+        1.5544691882808617
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 990.5855160397599,
+          "p50_us": 191.0,
+          "p95_us": 230.0,
+          "p99_us": 263.0,
+          "server_cpu_pct": 80.98016985835726,
+          "origin_cpu_pct": 2.7450905036731297,
+          "server_rss_bytes": 21270528,
+          "cpu_us_per_request": 817.4980205859066,
+          "client_cpu_pct": 80.7936921305375,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1134.9064113976917,
+          "p50_us": 164.0,
+          "p95_us": 187.0,
+          "p99_us": 213.0,
+          "server_cpu_pct": 74.90225451864517,
+          "origin_cpu_pct": 4.313742406832972,
+          "server_rss_bytes": 86966272,
+          "cpu_us_per_request": 659.9861782999308,
+          "client_cpu_pct": 80.00031372672049,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1456925152054607,
+      "p99_ratio": 0.8098859315589354,
+      "cpu_per_request_ratio": 0.8073244970390436,
+      "rss_ratio": 4.088580781821683,
+      "valid": true,
+      "paired_ratios": [
+        1.1508816494566325,
+        1.1350303745452295,
+        1.1456925152054607
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1120.8091473399313,
+          "p50_us": 3496.0,
+          "p95_us": 3842.0,
+          "p99_us": 3947.0,
+          "server_cpu_pct": 94.49859379426557,
+          "origin_cpu_pct": 4.509268998481553,
+          "server_rss_bytes": 22843392,
+          "cpu_us_per_request": 841.4975507347795,
+          "client_cpu_pct": 195.66513500208114,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1471.7853244162263,
+          "p50_us": 12755.0,
+          "p95_us": 16958.0,
+          "p99_us": 17982.0,
+          "server_cpu_pct": 94.89064833055197,
+          "origin_cpu_pct": 3.921184197627683,
+          "server_rss_bytes": 90210304,
+          "cpu_us_per_request": 644.7315838550686,
+          "client_cpu_pct": 192.72620331340065,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3131453538805276,
+      "p99_ratio": 4.555865214086648,
+      "cpu_per_request_ratio": 0.7661716701279777,
+      "rss_ratio": 3.94907656446118,
+      "valid": true,
+      "paired_ratios": [
+        1.3176956702178486,
+        1.3131453538805276,
+        1.3329594335982424
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1109.4742254174655,
+          "p50_us": 3541.0,
+          "p95_us": 3888.0,
+          "p99_us": 4009.0,
+          "server_cpu_pct": 94.71121436490563,
+          "origin_cpu_pct": 3.581516509597265,
+          "server_rss_bytes": 27824128,
+          "cpu_us_per_request": 853.6585365853662,
+          "client_cpu_pct": 194.34753038395868,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1471.3844694363636,
+          "p50_us": 53579.0,
+          "p95_us": 70750.0,
+          "p99_us": 72654.0,
+          "server_cpu_pct": 94.79400091097632,
+          "origin_cpu_pct": 3.775861671506392,
+          "server_rss_bytes": 99393536,
+          "cpu_us_per_request": 646.90756529977,
+          "client_cpu_pct": 193.11927161450689,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3261997761892315,
+      "p99_ratio": 18.122723871289597,
+      "cpu_per_request_ratio": 0.7578060050654446,
+      "rss_ratio": 3.5722066833505077,
+      "valid": true,
+      "paired_ratios": [
+        1.3404789823234409,
+        1.309012506398593,
+        1.320666752939599
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 34235.543898892385,
+          "p50_us": 28.0,
+          "p95_us": 30.0,
+          "p99_us": 33.0,
+          "server_cpu_pct": 58.03930672832428,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 21262336,
+          "cpu_us_per_request": 16.87917702607149,
+          "client_cpu_pct": 30.982281468536616,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 45701.39410800597,
+          "p50_us": 21.0,
+          "p95_us": 23.0,
+          "p99_us": 26.0,
+          "server_cpu_pct": 43.332347734835835,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79360000,
+          "cpu_us_per_request": 9.461466998317485,
+          "client_cpu_pct": 40.97946007502574,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3349107069242307,
+      "p99_ratio": 0.7878787878787878,
+      "cpu_per_request_ratio": 0.5605407765854551,
+      "rss_ratio": 3.732421498747833,
+      "valid": true,
+      "paired_ratios": [
+        1.3290236126985175,
+        1.3354133348933963,
+        1.3377547720430252
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 65255.608110638765,
+          "p50_us": 484.0,
+          "p95_us": 522.0,
+          "p99_us": 573.0,
+          "server_cpu_pct": 80.98637879702088,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 22835200,
+          "cpu_us_per_request": 12.410638892478191,
+          "client_cpu_pct": 60.787865643914095,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 201911.15919394157,
+          "p50_us": 115.0,
+          "p95_us": 229.0,
+          "p99_us": 267.0,
+          "server_cpu_pct": 71.39100473340359,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 80801792,
+          "cpu_us_per_request": 3.535267270177836,
+          "client_cpu_pct": 117.18982792293626,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 3.094157958831795,
+      "p99_ratio": 0.46596858638743455,
+      "cpu_per_request_ratio": 0.28485779828147945,
+      "rss_ratio": 3.53847533632287,
+      "valid": true,
+      "paired_ratios": [
+        3.1223137086317574,
+        3.0613731376601514,
+        3.094157958831795
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 63138.750712335495,
+          "p50_us": 1965.0,
+          "p95_us": 2085.0,
+          "p99_us": 3938.0,
+          "server_cpu_pct": 80.79812627951095,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 27815936,
+          "cpu_us_per_request": 12.799213132118776,
+          "client_cpu_pct": 62.89850231898417,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 198691.0935393036,
+          "p50_us": 522.0,
+          "p95_us": 1022.0,
+          "p99_us": 1087.0,
+          "server_cpu_pct": 71.22271901284515,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 85127168,
+          "cpu_us_per_request": 3.584595451368654,
+          "client_cpu_pct": 110.77516162334734,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 3.1468961817846846,
+      "p99_ratio": 0.2760284408329101,
+      "cpu_per_request_ratio": 0.280063736291206,
+      "rss_ratio": 3.0603740244441173,
+      "valid": true,
+      "paired_ratios": [
+        3.1863949419694912,
+        3.09170067786549,
+        3.164963856947478
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1102.3654778819052,
+          "p50_us": 112.0,
+          "p95_us": 118.0,
+          "p99_us": 148.0,
+          "server_cpu_pct": 83.53334274554096,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 21331968,
+          "cpu_us_per_request": 757.7374599786552,
+          "client_cpu_pct": 87.84413626664774,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1303.3082893701257,
+          "p50_us": 58.0,
+          "p95_us": 65.0,
+          "p99_us": 79.0,
+          "server_cpu_pct": 77.84200778263217,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79364096,
+          "cpu_us_per_request": 596.5439519158527,
+          "client_cpu_pct": 90.78299648201182,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1822832948962751,
+      "p99_ratio": 0.5337837837837838,
+      "cpu_per_request_ratio": 0.7872699759790902,
+      "rss_ratio": 3.7204301075268815,
+      "valid": true,
+      "paired_ratios": [
+        1.180893426003227,
+        1.1889484716497252,
+        1.1811905956634428
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1241.9963395030525,
+          "p50_us": 813.0,
+          "p95_us": 915.0,
+          "p99_us": 1200.0,
+          "server_cpu_pct": 97.2576862004285,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 22904832,
+          "cpu_us_per_request": 783.0754657404484,
+          "client_cpu_pct": 195.49920437510355,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1634.9731302029227,
+          "p50_us": 5958.0,
+          "p95_us": 9245.0,
+          "p99_us": 10633.0,
+          "server_cpu_pct": 97.24655019823786,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 82247680,
+          "cpu_us_per_request": 594.866874550252,
+          "client_cpu_pct": 194.32218422056803,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3164073662705866,
+      "p99_ratio": 8.860833333333334,
+      "cpu_per_request_ratio": 0.7596545934276806,
+      "rss_ratio": 3.5908440629470673,
+      "valid": true,
+      "paired_ratios": [
+        1.30901082157673,
+        1.3164163574713676,
+        1.321910912619111
+      ]
+    },
+    {
+      "transport": "https",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1218.8156457691564,
+          "p50_us": 809.0,
+          "p95_us": 913.0,
+          "p99_us": 1149.0,
+          "server_cpu_pct": 97.32815311370477,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 27885568,
+          "cpu_us_per_request": 800.653594771242,
+          "client_cpu_pct": 194.26510326671584,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1607.917566723208,
+          "p50_us": 24741.0,
+          "p95_us": 39155.0,
+          "p99_us": 44985.0,
+          "server_cpu_pct": 97.669731493774,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 89133056,
+          "cpu_us_per_request": 607.4477298032912,
+          "client_cpu_pct": 192.6874898938391,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3192459190237105,
+      "p99_ratio": 39.15143603133159,
+      "cpu_per_request_ratio": 0.7586898176318656,
+      "rss_ratio": 3.1963866039952995,
+      "valid": true,
+      "paired_ratios": [
+        1.3192459190237105,
+        1.3034605193853561,
+        1.3462211810192743
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 2048.6905185120404,
+          "p50_us": 482.0,
+          "p95_us": 530.0,
+          "p99_us": 577.0,
+          "server_cpu_pct": 65.49221221123867,
+          "origin_cpu_pct": 39.80552159449542,
+          "server_rss_bytes": 16687104,
+          "cpu_us_per_request": 319.67840735068916,
+          "client_cpu_pct": 35.68770901575456,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1813.6163176059795,
+          "p50_us": 537.0,
+          "p95_us": 604.0,
+          "p99_us": 731.0,
+          "server_cpu_pct": 71.95645281744805,
+          "origin_cpu_pct": 43.91892488040426,
+          "server_rss_bytes": 99344384,
+          "cpu_us_per_request": 396.3612735542559,
+          "client_cpu_pct": 25.684728389879275,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.8852563631344402,
+      "p99_ratio": 1.266897746967071,
+      "cpu_per_request_ratio": 1.2398750257769058,
+      "rss_ratio": 5.953362788414335,
+      "valid": true,
+      "paired_ratios": [
+        0.8908960693591944,
+        0.8811412635667707,
+        0.884331384082168
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 2026.033460049584,
+          "p50_us": 15783.0,
+          "p95_us": 16330.0,
+          "p99_us": 16579.0,
+          "server_cpu_pct": 67.25718342994772,
+          "origin_cpu_pct": 37.65036614981077,
+          "server_rss_bytes": 20119552,
+          "cpu_us_per_request": 331.78564519249375,
+          "client_cpu_pct": 35.597073920523734,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1594.409173050167,
+          "p50_us": 20602.0,
+          "p95_us": 21537.0,
+          "p99_us": 21867.0,
+          "server_cpu_pct": 79.36063712398649,
+          "origin_cpu_pct": 31.984135868609055,
+          "server_rss_bytes": 123842560,
+          "cpu_us_per_request": 497.74322968906716,
+          "client_cpu_pct": 23.78820105227807,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.7869609285777277,
+      "p99_ratio": 1.3189577175945473,
+      "cpu_per_request_ratio": 1.5001951919899639,
+      "rss_ratio": 6.155333876221499,
+      "valid": true,
+      "paired_ratios": [
+        0.8726676133866731,
+        0.7694661785750117,
+        0.7902393320289945
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 1843.4799010947665,
+          "p50_us": 68737.0,
+          "p95_us": 69630.0,
+          "p99_us": 70892.0,
+          "server_cpu_pct": 66.85474870672874,
+          "origin_cpu_pct": 35.39614651300231,
+          "server_rss_bytes": 31903744,
+          "cpu_us_per_request": 362.65515380464126,
+          "client_cpu_pct": 32.66365536975557,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1584.164721288507,
+          "p50_us": 79494.0,
+          "p95_us": 90498.0,
+          "p99_us": 97623.0,
+          "server_cpu_pct": 78.40106402581105,
+          "origin_cpu_pct": 32.83293290421026,
+          "server_rss_bytes": 180613120,
+          "cpu_us_per_request": 496.2216624685138,
+          "client_cpu_pct": 24.077484129754158,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.8593338719601646,
+      "p99_ratio": 1.3770665237262314,
+      "cpu_per_request_ratio": 1.3683016972532078,
+      "rss_ratio": 5.661188856079086,
+      "valid": true,
+      "paired_ratios": [
+        0.859109954805178,
+        0.8570532978996689,
+        0.8631456004710306
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 2105.511664040496,
+          "p50_us": 436.0,
+          "p95_us": 486.0,
+          "p99_us": 526.0,
+          "server_cpu_pct": 66.4737555142333,
+          "origin_cpu_pct": 41.57060816819311,
+          "server_rss_bytes": 16683008,
+          "cpu_us_per_request": 314.76997578692493,
+          "client_cpu_pct": 43.137694737279666,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1453.353492688234,
+          "p50_us": 654.0,
+          "p95_us": 696.0,
+          "p99_us": 763.0,
+          "server_cpu_pct": 57.64781615758481,
+          "origin_cpu_pct": 36.07890535032519,
+          "server_rss_bytes": 99426304,
+          "cpu_us_per_request": 396.31209577542313,
+          "client_cpu_pct": 25.882692968711545,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.690261430278299,
+      "p99_ratio": 1.450570342205323,
+      "cpu_per_request_ratio": 1.2590530427326905,
+      "rss_ratio": 5.959734839184876,
+      "valid": true,
+      "paired_ratios": [
+        0.6901905328084341,
+        0.690261430278299,
+        0.7059641162158209
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 2329.5822634104406,
+          "p50_us": 13687.0,
+          "p95_us": 14030.0,
+          "p99_us": 14245.0,
+          "server_cpu_pct": 67.64631604045131,
+          "origin_cpu_pct": 41.96356542845388,
+          "server_rss_bytes": 16965632,
+          "cpu_us_per_request": 290.3795976769632,
+          "client_cpu_pct": 48.6269170377737,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1512.2572588248488,
+          "p50_us": 21184.0,
+          "p95_us": 22576.0,
+          "p99_us": 23343.0,
+          "server_cpu_pct": 79.95015907083527,
+          "origin_cpu_pct": 30.000794138668258,
+          "server_rss_bytes": 118149120,
+          "cpu_us_per_request": 528.6809410520751,
+          "client_cpu_pct": 27.45170705499067,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.6491538343921576,
+      "p99_ratio": 1.6386802386802386,
+      "cpu_per_request_ratio": 1.8206545683013637,
+      "rss_ratio": 6.964027040077258,
+      "valid": true,
+      "paired_ratios": [
+        0.6864784866193631,
+        0.6491538343921576,
+        0.6411102849647651
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 2307.7076081551468,
+          "p50_us": 54974.0,
+          "p95_us": 55400.0,
+          "p99_us": 56499.0,
+          "server_cpu_pct": 67.4291397314769,
+          "origin_cpu_pct": 41.57135753356539,
+          "server_rss_bytes": 17612800,
+          "cpu_us_per_request": 292.1910015514567,
+          "client_cpu_pct": 48.564201376635886,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 1548.6751626994048,
+          "p50_us": 78688.0,
+          "p95_us": 90027.0,
+          "p99_us": 101014.0,
+          "server_cpu_pct": 78.0315195583416,
+          "origin_cpu_pct": 32.81934264646822,
+          "server_rss_bytes": 176308224,
+          "cpu_us_per_request": 500.89904957616216,
+          "client_cpu_pct": 29.04014561445069,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.671088121054237,
+      "p99_ratio": 1.7878900511513478,
+      "cpu_per_request_ratio": 1.714286363770688,
+      "rss_ratio": 10.010232558139535,
+      "valid": true,
+      "paired_ratios": [
+        0.6714681567502483,
+        0.6695282236729684,
+        0.6714795313122398
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 4585.67458553537,
+          "p50_us": 215.0,
+          "p95_us": 222.0,
+          "p99_us": 264.0,
+          "server_cpu_pct": 25.29405317202133,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16211968,
+          "cpu_us_per_request": 55.15884893316801,
+          "client_cpu_pct": 67.05865259559143,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 4564.592832279257,
+          "p50_us": 217.0,
+          "p95_us": 245.0,
+          "p99_us": 259.0,
+          "server_cpu_pct": 23.925087022601364,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 80293888,
+          "cpu_us_per_request": 52.41450421034541,
+          "client_cpu_pct": 69.42197381967937,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.9954026931342639,
+      "p99_ratio": 0.9810606060606061,
+      "cpu_per_request_ratio": 0.9502465193545333,
+      "rss_ratio": 4.952753916119252,
+      "valid": true,
+      "paired_ratios": [
+        0.9954026931342639,
+        0.8753160452222516,
+        1.0106406967438906
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 9951.872679874912,
+          "p50_us": 1731.0,
+          "p95_us": 3079.0,
+          "p99_us": 3300.0,
+          "server_cpu_pct": 41.256518081416445,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16211968,
+          "cpu_us_per_request": 41.23013185675018,
+          "client_cpu_pct": 145.29469411281445,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 8832.891668855094,
+          "p50_us": 2025.0,
+          "p95_us": 3413.0,
+          "p99_us": 3671.0,
+          "server_cpu_pct": 33.62848798557597,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 81342464,
+          "cpu_us_per_request": 37.76198775528445,
+          "client_cpu_pct": 138.26883440367337,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.8875607589632183,
+      "p99_ratio": 1.1124242424242423,
+      "cpu_per_request_ratio": 0.915883264368025,
+      "rss_ratio": 5.017433046993431,
+      "valid": true,
+      "paired_ratios": [
+        0.8939748001470555,
+        0.881809653317257,
+        0.88996852071739
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 9804.249497724199,
+          "p50_us": 6364.0,
+          "p95_us": 12178.0,
+          "p99_us": 12811.0,
+          "server_cpu_pct": 40.77187089250614,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16211968,
+          "cpu_us_per_request": 41.45838292470046,
+          "client_cpu_pct": 143.69115664057992,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 8640.280972257438,
+          "p50_us": 7360.0,
+          "p95_us": 13377.0,
+          "p99_us": 14529.0,
+          "server_cpu_pct": 32.777560678232504,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 84881408,
+          "cpu_us_per_request": 38.23085023579507,
+          "client_cpu_pct": 135.62451753687822,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.8812791814674907,
+      "p99_ratio": 1.134103504800562,
+      "cpu_per_request_ratio": 0.9221500584147854,
+      "rss_ratio": 5.235725113693785,
+      "valid": true,
+      "paired_ratios": [
+        0.9020186662655365,
+        0.8668507248481182,
+        0.8812791814674907
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 3470.7448425096345,
+          "p50_us": 247.0,
+          "p95_us": 279.0,
+          "p99_us": 312.0,
+          "server_cpu_pct": 21.176229760524294,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16445440,
+          "cpu_us_per_request": 61.01350206203039,
+          "client_cpu_pct": 62.598898259390644,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 3422.3529411764707,
+          "p50_us": 252.0,
+          "p95_us": 287.0,
+          "p99_us": 309.0,
+          "server_cpu_pct": 21.176470588235293,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 80306176,
+          "cpu_us_per_request": 61.80611193773607,
+          "client_cpu_pct": 63.72549019607844,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.9860571999587926,
+      "p99_ratio": 0.9903846153846154,
+      "cpu_per_request_ratio": 1.0129907290832094,
+      "rss_ratio": 4.88318804483188,
+      "valid": true,
+      "paired_ratios": [
+        0.9860571999587926,
+        0.9883150185160521,
+        0.9871390677515531
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 6671.14259745442,
+          "p50_us": 2368.0,
+          "p95_us": 4368.0,
+          "p99_us": 4698.0,
+          "server_cpu_pct": 33.32183597762598,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16445440,
+          "cpu_us_per_request": 49.9925606308585,
+          "client_cpu_pct": 126.65688748441355,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 7457.203783460031,
+          "p50_us": 2116.0,
+          "p95_us": 3946.0,
+          "p99_us": 4170.0,
+          "server_cpu_pct": 37.036572420537134,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 81485824,
+          "cpu_us_per_request": 49.67285351849379,
+          "client_cpu_pct": 133.80955197097288,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1178300680164681,
+      "p99_ratio": 0.8876117496807152,
+      "cpu_per_request_ratio": 0.9936049062434428,
+      "rss_ratio": 4.95491905354919,
+      "valid": true,
+      "paired_ratios": [
+        1.1188208286621497,
+        1.1178300680164681,
+        1.1227081553127185
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1048576,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 6657.21047677212,
+          "p50_us": 9400.0,
+          "p95_us": 17321.0,
+          "p99_us": 18093.0,
+          "server_cpu_pct": 32.700815511060554,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16576512,
+          "cpu_us_per_request": 49.36362555013679,
+          "client_cpu_pct": 126.46357495022093,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 7304.621739988768,
+          "p50_us": 8304.0,
+          "p95_us": 15730.0,
+          "p99_us": 16682.0,
+          "server_cpu_pct": 35.756441345113856,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 85118976,
+          "cpu_us_per_request": 48.93920245233807,
+          "client_cpu_pct": 131.87369491788303,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0972496311293674,
+      "p99_ratio": 0.9220140385784558,
+      "cpu_per_request_ratio": 0.9914021084742318,
+      "rss_ratio": 5.134914751667902,
+      "valid": true,
+      "paired_ratios": [
+        1.1249274374032543,
+        1.0941490227970667,
+        1.0972496311293674
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 8078.190024238295,
+          "p50_us": 121.0,
+          "p95_us": 138.0,
+          "p99_us": 166.0,
+          "server_cpu_pct": 58.62996862022114,
+          "origin_cpu_pct": 29.999776472253693,
+          "server_rss_bytes": 16490496,
+          "cpu_us_per_request": 72.57810034711265,
+          "client_cpu_pct": 17.64781664153813,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 7176.371114743503,
+          "p50_us": 136.0,
+          "p95_us": 158.0,
+          "p99_us": 185.0,
+          "server_cpu_pct": 58.825928586891386,
+          "origin_cpu_pct": 27.452100007215986,
+          "server_rss_bytes": 98521088,
+          "cpu_us_per_request": 81.74767033089671,
+          "client_cpu_pct": 13.923629870696544,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.888363741532581,
+      "p99_ratio": 1.1144578313253013,
+      "cpu_per_request_ratio": 1.1263407272983117,
+      "rss_ratio": 5.974416294088425,
+      "valid": true,
+      "paired_ratios": [
+        0.8838359254658774,
+        0.8963222031903815,
+        0.8873358240107073
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 10150.16518896288,
+          "p50_us": 3137.0,
+          "p95_us": 3231.0,
+          "p99_us": 3361.0,
+          "server_cpu_pct": 67.84424138667356,
+          "origin_cpu_pct": 34.51026405842278,
+          "server_rss_bytes": 16883712,
+          "cpu_us_per_request": 66.84052931517435,
+          "client_cpu_pct": 26.86355100456936,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 13997.19188249662,
+          "p50_us": 2268.0,
+          "p95_us": 2373.0,
+          "p99_us": 2486.0,
+          "server_cpu_pct": 69.1926379033271,
+          "origin_cpu_pct": 43.1956545171555,
+          "server_rss_bytes": 102322176,
+          "cpu_us_per_request": 49.433514780049435,
+          "client_cpu_pct": 21.797807140601652,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.379011239907399,
+      "p99_ratio": 0.7396608152335614,
+      "cpu_per_request_ratio": 0.7395739573957395,
+      "rss_ratio": 6.060407569141193,
+      "valid": true,
+      "paired_ratios": [
+        1.34676484920147,
+        1.383239176045574,
+        1.3867305163798347
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 9899.778448406576,
+          "p50_us": 12830.0,
+          "p95_us": 13148.0,
+          "p99_us": 13331.0,
+          "server_cpu_pct": 67.59356923954242,
+          "origin_cpu_pct": 33.29830697051202,
+          "server_rss_bytes": 17801216,
+          "cpu_us_per_request": 68.31287295814833,
+          "client_cpu_pct": 26.475122143871786,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 13379.863202185574,
+          "p50_us": 9487.0,
+          "p95_us": 9864.0,
+          "p99_us": 10147.0,
+          "server_cpu_pct": 70.19363072566655,
+          "origin_cpu_pct": 41.478054519712046,
+          "server_rss_bytes": 111902720,
+          "cpu_us_per_request": 52.46214379396687,
+          "client_cpu_pct": 24.921745718444086,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.351531579410157,
+      "p99_ratio": 0.76115820268547,
+      "cpu_per_request_ratio": 0.767968634932213,
+      "rss_ratio": 6.286240220892775,
+      "valid": true,
+      "paired_ratios": [
+        1.3504825441459527,
+        1.3528128403031041,
+        1.3307080551784163
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 6116.969541044917,
+          "p50_us": 126.0,
+          "p95_us": 144.0,
+          "p99_us": 173.0,
+          "server_cpu_pct": 51.96100845925218,
+          "origin_cpu_pct": 22.940686169648533,
+          "server_rss_bytes": 16703488,
+          "cpu_us_per_request": 84.95223440405208,
+          "client_cpu_pct": 27.649314140133786,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 5479.421434273119,
+          "p50_us": 140.0,
+          "p95_us": 163.0,
+          "p99_us": 187.0,
+          "server_cpu_pct": 52.19792252268359,
+          "origin_cpu_pct": 21.176507958543493,
+          "server_rss_bytes": 98504704,
+          "cpu_us_per_request": 95.27286001095091,
+          "client_cpu_pct": 23.199076676748266,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.895773862777337,
+      "p99_ratio": 1.0809248554913296,
+      "cpu_per_request_ratio": 1.1214873944081518,
+      "rss_ratio": 5.897253555664541,
+      "valid": true,
+      "paired_ratios": [
+        0.9007713220665649,
+        0.8931615964594722,
+        0.895773862777337
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 7946.015256302231,
+          "p50_us": 3977.0,
+          "p95_us": 4112.0,
+          "p99_us": 4219.0,
+          "server_cpu_pct": 62.57406930567973,
+          "origin_cpu_pct": 29.01971595580455,
+          "server_rss_bytes": 16965632,
+          "cpu_us_per_request": 78.72266916736586,
+          "client_cpu_pct": 39.0197532108453,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 10200.403945330117,
+          "p50_us": 3059.0,
+          "p95_us": 3264.0,
+          "p99_us": 3383.0,
+          "server_cpu_pct": 66.08231856775889,
+          "origin_cpu_pct": 31.766574504382593,
+          "server_rss_bytes": 102830080,
+          "cpu_us_per_request": 64.78402122301468,
+          "client_cpu_pct": 38.43363335098143,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.283713108559647,
+      "p99_ratio": 0.8018487793315952,
+      "cpu_per_request_ratio": 0.822939845767712,
+      "rss_ratio": 6.061081603090295,
+      "valid": true,
+      "paired_ratios": [
+        1.2794359644247082,
+        1.2824682143920292,
+        1.3035807782907014
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 7853.826205161581,
+          "p50_us": 16153.0,
+          "p95_us": 16435.0,
+          "p99_us": 16695.0,
+          "server_cpu_pct": 62.60328299565651,
+          "origin_cpu_pct": 28.630974180826097,
+          "server_rss_bytes": 17829888,
+          "cpu_us_per_request": 79.82565064240643,
+          "client_cpu_pct": 38.81037251986793,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 9083.667904631824,
+          "p50_us": 13825.0,
+          "p95_us": 14947.0,
+          "p99_us": 15435.0,
+          "server_cpu_pct": 69.77344700905485,
+          "origin_cpu_pct": 28.62500390115073,
+          "server_rss_bytes": 114425856,
+          "cpu_us_per_request": 76.81197478991596,
+          "client_cpu_pct": 34.57621581599572,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.1565914074673544,
+      "p99_ratio": 0.9245283018867925,
+      "cpu_per_request_ratio": 0.9622467737094837,
+      "rss_ratio": 6.417643004824259,
+      "valid": true,
+      "paired_ratios": [
+        1.1666707440183648,
+        1.1252663837248427,
+        1.1565914074673544
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 28776.30412787551,
+          "p50_us": 33.0,
+          "p95_us": 35.0,
+          "p99_us": 38.0,
+          "server_cpu_pct": 42.157193389752074,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16273408,
+          "cpu_us_per_request": 14.649967974488614,
+          "client_cpu_pct": 50.0003921599385,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 30382.406969248714,
+          "p50_us": 32.0,
+          "p95_us": 34.0,
+          "p99_us": 36.0,
+          "server_cpu_pct": 39.02572187289734,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 78356480,
+          "cpu_us_per_request": 12.844842053625603,
+          "client_cpu_pct": 47.845135492913734,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0558133815321118,
+      "p99_ratio": 0.9473684210526315,
+      "cpu_per_request_ratio": 0.8767829442353424,
+      "rss_ratio": 4.81500125849484,
+      "valid": true,
+      "paired_ratios": [
+        1.0422296072005175,
+        1.0602800866620374,
+        1.0652218787617034
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 64558.70366118343,
+          "p50_us": 486.0,
+          "p95_us": 553.0,
+          "p99_us": 592.0,
+          "server_cpu_pct": 68.03970930769498,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16273408,
+          "cpu_us_per_request": 10.539200053455309,
+          "client_cpu_pct": 111.76389504625159,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 89077.47115185512,
+          "p50_us": 350.0,
+          "p95_us": 413.0,
+          "p99_us": 483.0,
+          "server_cpu_pct": 70.59089283361256,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79405056,
+          "cpu_us_per_request": 7.9280350635368935,
+          "client_cpu_pct": 120.20060363056804,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3797902699433207,
+      "p99_ratio": 0.8158783783783784,
+      "cpu_per_request_ratio": 0.7522425822951964,
+      "rss_ratio": 4.879436194311603,
+      "valid": true,
+      "paired_ratios": [
+        1.3753150042614068,
+        1.3543161214344608,
+        1.4023330073894962
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 63746.84778464508,
+          "p50_us": 1982.0,
+          "p95_us": 2117.0,
+          "p99_us": 2230.0,
+          "server_cpu_pct": 67.76278957880047,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16273408,
+          "cpu_us_per_request": 10.629982804439583,
+          "client_cpu_pct": 108.8190679706619,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 90730.7377858529,
+          "p50_us": 1378.0,
+          "p95_us": 1487.0,
+          "p99_us": 1586.0,
+          "server_cpu_pct": 69.99999204545547,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 82944000,
+          "cpu_us_per_request": 7.717690393448735,
+          "client_cpu_pct": 118.72731477991991,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.4232976364943888,
+      "p99_ratio": 0.7112107623318386,
+      "cpu_per_request_ratio": 0.7260303742189933,
+      "rss_ratio": 5.096904102693179,
+      "valid": true,
+      "paired_ratios": [
+        1.4244786886270338,
+        1.3907557807002997,
+        1.442725317570995
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 13084.053874293315,
+          "p50_us": 34.0,
+          "p95_us": 39.0,
+          "p99_us": 61.0,
+          "server_cpu_pct": 35.49108683512056,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16527360,
+          "cpu_us_per_request": 27.125451466422884,
+          "client_cpu_pct": 55.88190369449971,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 13605.8277239699,
+          "p50_us": 36.0,
+          "p95_us": 39.0,
+          "p99_us": 62.0,
+          "server_cpu_pct": 38.633541444572835,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 78319616,
+          "cpu_us_per_request": 28.441082204833542,
+          "client_cpu_pct": 56.08727336623265,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0398786075546305,
+      "p99_ratio": 1.0163934426229508,
+      "cpu_per_request_ratio": 1.0485017084430541,
+      "rss_ratio": 4.738785625774473,
+      "valid": true,
+      "paired_ratios": [
+        1.0418603424045778,
+        1.0337625771882364,
+        1.0384835490463344
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 29590.24234725139,
+          "p50_us": 1033.0,
+          "p95_us": 1091.0,
+          "p99_us": 1145.0,
+          "server_cpu_pct": 64.11645273274321,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16527360,
+          "cpu_us_per_request": 21.518962351686966,
+          "client_cpu_pct": 121.37059757078417,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 31381.160479985225,
+          "p50_us": 974.0,
+          "p95_us": 1042.0,
+          "p99_us": 1099.0,
+          "server_cpu_pct": 73.13858860563536,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79892480,
+          "cpu_us_per_request": 23.306527702276288,
+          "client_cpu_pct": 125.10782706333299,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.060523942714521,
+      "p99_ratio": 0.959825327510917,
+      "cpu_per_request_ratio": 1.0830693098196338,
+      "rss_ratio": 4.833952912019827,
+      "valid": true,
+      "paired_ratios": [
+        1.0587640664601619,
+        1.0682234230907672,
+        1.0532242227059287
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 65536,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 29485.122293812685,
+          "p50_us": 4251.0,
+          "p95_us": 4451.0,
+          "p99_us": 4593.0,
+          "server_cpu_pct": 63.650710361818476,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16527360,
+          "cpu_us_per_request": 21.55114355755502,
+          "client_cpu_pct": 120.50515762074619,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 30953.204257601483,
+          "p50_us": 4099.0,
+          "p95_us": 4318.0,
+          "p99_us": 4520.0,
+          "server_cpu_pct": 72.05574852027662,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 83292160,
+          "cpu_us_per_request": 23.278930323532233,
+          "client_cpu_pct": 123.07042446989398,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0497906011431692,
+      "p99_ratio": 0.9841062486392336,
+      "cpu_per_request_ratio": 1.0801714656748003,
+      "rss_ratio": 5.039653035935564,
+      "valid": true,
+      "paired_ratios": [
+        1.1326715607595552,
+        1.063970868845182,
+        1.0333241739198822
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 10866.351213459546,
+          "p50_us": 90.0,
+          "p95_us": 105.0,
+          "p99_us": 132.0,
+          "server_cpu_pct": 52.1609844856368,
+          "origin_cpu_pct": 27.647253980616334,
+          "server_rss_bytes": 16470016,
+          "cpu_us_per_request": 47.99884514056804,
+          "client_cpu_pct": 7.25495317221847,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 10909.53511290317,
+          "p50_us": 90.0,
+          "p95_us": 101.0,
+          "p99_us": 132.0,
+          "server_cpu_pct": 57.45100292196193,
+          "origin_cpu_pct": 27.84314817378363,
+          "server_rss_bytes": 85786624,
+          "cpu_us_per_request": 52.66090332320854,
+          "client_cpu_pct": 7.059982197078226,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.003974093842111,
+      "p99_ratio": 1.0,
+      "cpu_per_request_ratio": 1.0971285490096132,
+      "rss_ratio": 5.208654563541407,
+      "valid": true,
+      "paired_ratios": [
+        1.0053009177307866,
+        1.003974093842111,
+        1.0066314090745554
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 16770.598100351825,
+          "p50_us": 1897.0,
+          "p95_us": 1975.0,
+          "p99_us": 2073.0,
+          "server_cpu_pct": 63.72907651861978,
+          "origin_cpu_pct": 40.000023529425604,
+          "server_rss_bytes": 16732160,
+          "cpu_us_per_request": 37.88144510698,
+          "client_cpu_pct": 11.765367972668264,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 21272.932732872523,
+          "p50_us": 1413.0,
+          "p95_us": 1972.0,
+          "p99_us": 2037.0,
+          "server_cpu_pct": 62.35262330035181,
+          "origin_cpu_pct": 42.942346860041866,
+          "server_rss_bytes": 87883776,
+          "cpu_us_per_request": 29.30362425013132,
+          "client_cpu_pct": 12.94111049629943,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.2684659548562103,
+      "p99_ratio": 0.9826338639652678,
+      "cpu_per_request_ratio": 0.7735614142326334,
+      "rss_ratio": 5.252386780905753,
+      "valid": true,
+      "paired_ratios": [
+        1.2684659548562103,
+        1.2773602929627708,
+        1.256753339478354
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 16613.534597254544,
+          "p50_us": 7628.0,
+          "p95_us": 7876.0,
+          "p99_us": 7972.0,
+          "server_cpu_pct": 63.438703893585235,
+          "origin_cpu_pct": 38.35604786437301,
+          "server_rss_bytes": 17780736,
+          "cpu_us_per_request": 38.04009761232593,
+          "client_cpu_pct": 11.733177209158399,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 22364.268670850175,
+          "p50_us": 5038.0,
+          "p95_us": 7051.0,
+          "p99_us": 7190.0,
+          "server_cpu_pct": 60.88694369032186,
+          "origin_cpu_pct": 42.97901907552137,
+          "server_rss_bytes": 92561408,
+          "cpu_us_per_request": 27.185984114856346,
+          "client_cpu_pct": 13.33145499101818,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.346147536511945,
+      "p99_ratio": 0.9019066733567486,
+      "cpu_per_request_ratio": 0.7146665182596014,
+      "rss_ratio": 5.205712969361898,
+      "valid": true,
+      "paired_ratios": [
+        1.346147536511945,
+        1.3619280669906868,
+        1.3255878598351067
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 7557.345770284374,
+          "p50_us": 90.0,
+          "p95_us": 97.0,
+          "p99_us": 127.0,
+          "server_cpu_pct": 42.747537163395016,
+          "origin_cpu_pct": 19.21690711331465,
+          "server_rss_bytes": 16400384,
+          "cpu_us_per_request": 56.300755000908076,
+          "client_cpu_pct": 24.901614114783893,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 7540.084271530094,
+          "p50_us": 91.0,
+          "p95_us": 103.0,
+          "p99_us": 132.0,
+          "server_cpu_pct": 49.81156910953191,
+          "origin_cpu_pct": 19.21634565891968,
+          "server_rss_bytes": 85782528,
+          "cpu_us_per_request": 65.99802525593722,
+          "client_cpu_pct": 24.706730132896716,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.9977159310584739,
+      "p99_ratio": 1.0393700787401574,
+      "cpu_per_request_ratio": 1.1722405011242343,
+      "rss_ratio": 5.23051948051948,
+      "valid": true,
+      "paired_ratios": [
+        0.9824912858173886,
+        0.9986883612590204,
+        0.9981630615549273
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14136.537837469523,
+          "p50_us": 2214.0,
+          "p95_us": 2296.0,
+          "p99_us": 2351.0,
+          "server_cpu_pct": 64.7030151212907,
+          "origin_cpu_pct": 35.68632349103223,
+          "server_rss_bytes": 16662528,
+          "cpu_us_per_request": 45.69624459953474,
+          "client_cpu_pct": 48.03928162254339,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 14522.629716484154,
+          "p50_us": 1974.0,
+          "p95_us": 2241.0,
+          "p99_us": 4460.0,
+          "server_cpu_pct": 60.23397108210928,
+          "origin_cpu_pct": 29.96003929958222,
+          "server_rss_bytes": 88535040,
+          "cpu_us_per_request": 41.34794293983874,
+          "client_cpu_pct": 54.09730168248596,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0273116291593885,
+      "p99_ratio": 1.8970650786899192,
+      "cpu_per_request_ratio": 0.9048433476798163,
+      "rss_ratio": 5.313421828908554,
+      "valid": true,
+      "paired_ratios": [
+        1.0321782435352713,
+        1.0318927790025052,
+        1.0256548918298594
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14048.705258386724,
+          "p50_us": 9018.0,
+          "p95_us": 9212.0,
+          "p99_us": 9414.0,
+          "server_cpu_pct": 64.92228841905865,
+          "origin_cpu_pct": 35.448366069301976,
+          "server_rss_bytes": 17547264,
+          "cpu_us_per_request": 46.21229303696985,
+          "client_cpu_pct": 48.440359949749606,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 14643.688581657376,
+          "p50_us": 7722.0,
+          "p95_us": 9121.0,
+          "p99_us": 16078.0,
+          "server_cpu_pct": 59.940772995419856,
+          "origin_cpu_pct": 29.170011957720526,
+          "server_rss_bytes": 94437376,
+          "cpu_us_per_request": 40.93283783055959,
+          "client_cpu_pct": 59.15207861390117,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0423514702833887,
+      "p99_ratio": 1.7078818780539622,
+      "cpu_per_request_ratio": 0.8857564760487715,
+      "rss_ratio": 5.381886087768441,
+      "valid": true,
+      "paired_ratios": [
+        1.0366583679300168,
+        1.0490040249177666,
+        1.0423514702833887
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 38230.96422414537,
+          "p50_us": 25.0,
+          "p95_us": 27.0,
+          "p99_us": 29.0,
+          "server_cpu_pct": 47.45120369193894,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16515072,
+          "cpu_us_per_request": 12.411720356760028,
+          "client_cpu_pct": 37.64711787783196,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 59700.798834635694,
+          "p50_us": 16.0,
+          "p95_us": 17.0,
+          "p99_us": 19.0,
+          "server_cpu_pct": 41.37921837598138,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 78245888,
+          "cpu_us_per_request": 6.931099614026444,
+          "client_cpu_pct": 38.24157773375312,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.5615823468279335,
+      "p99_ratio": 0.6551724137931034,
+      "cpu_per_request_ratio": 0.5584318220843115,
+      "rss_ratio": 4.737847222222222,
+      "valid": true,
+      "paired_ratios": [
+        1.5615823468279335,
+        1.5949262737506373,
+        1.5517564892137852
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 69003.34707851223,
+          "p50_us": 459.0,
+          "p95_us": 497.0,
+          "p99_us": 550.0,
+          "server_cpu_pct": 61.76538409049198,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16515072,
+          "cpu_us_per_request": 8.951025105494224,
+          "client_cpu_pct": 57.84347751065203,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 240644.17319257415,
+          "p50_us": 128.0,
+          "p95_us": 148.0,
+          "p99_us": 213.0,
+          "server_cpu_pct": 64.31300669776829,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79294464,
+          "cpu_us_per_request": 2.6725353805388905,
+          "client_cpu_pct": 109.21446564224675,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 3.4874275434605866,
+      "p99_ratio": 0.38727272727272727,
+      "cpu_per_request_ratio": 0.2985731074420139,
+      "rss_ratio": 4.801339285714286,
+      "valid": true,
+      "paired_ratios": [
+        3.479660781191287,
+        3.6136775392026386,
+        3.471282158700125
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 69345.1844214874,
+          "p50_us": 1824.0,
+          "p95_us": 1946.0,
+          "p99_us": 2042.0,
+          "server_cpu_pct": 62.04305588583119,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16515072,
+          "cpu_us_per_request": 8.946988374668802,
+          "client_cpu_pct": 58.45213946800174,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 253643.58096948307,
+          "p50_us": 494.0,
+          "p95_us": 562.0,
+          "p99_us": 581.0,
+          "server_cpu_pct": 63.479100451398104,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 82833408,
+          "cpu_us_per_request": 2.5026890177455563,
+          "client_cpu_pct": 108.11844295927331,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 3.657695672533084,
+      "p99_ratio": 0.28452497551420175,
+      "cpu_per_request_ratio": 0.27972418348405426,
+      "rss_ratio": 5.015625,
+      "valid": true,
+      "paired_ratios": [
+        3.634272829481093,
+        3.761993660789267,
+        3.657695672533084
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14114.86959471516,
+          "p50_us": 26.0,
+          "p95_us": 28.0,
+          "p99_us": 48.0,
+          "server_cpu_pct": 34.11760692046246,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16252928,
+          "cpu_us_per_request": 24.217793118806373,
+          "client_cpu_pct": 54.1190265634222,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 14524.242954252939,
+          "p50_us": 18.0,
+          "p95_us": 20.0,
+          "p99_us": 34.0,
+          "server_cpu_pct": 31.96106005620441,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 78241792,
+          "cpu_us_per_request": 22.00531907712662,
+          "client_cpu_pct": 61.37307851283423,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0290029855954925,
+      "p99_ratio": 0.7083333333333334,
+      "cpu_per_request_ratio": 0.9086426235939041,
+      "rss_ratio": 4.814012096774194,
+      "valid": true,
+      "paired_ratios": [
+        1.0463020808133616,
+        1.0275403023205378,
+        1.03097826261201
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 35351.52305414759,
+          "p50_us": 820.0,
+          "p95_us": 945.0,
+          "p99_us": 1049.0,
+          "server_cpu_pct": 66.47143542025535,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16252928,
+          "cpu_us_per_request": 18.768602016791792,
+          "client_cpu_pct": 126.27574780144906,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 46251.48356941359,
+          "p50_us": 287.0,
+          "p95_us": 527.0,
+          "p99_us": 593.0,
+          "server_cpu_pct": 63.72416573302595,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79814656,
+          "cpu_us_per_request": 13.777958657645287,
+          "client_cpu_pct": 119.41103887407742,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3083307188369404,
+      "p99_ratio": 0.5653002859866539,
+      "cpu_per_request_ratio": 0.734096159389948,
+      "rss_ratio": 4.910786290322581,
+      "valid": true,
+      "paired_ratios": [
+        1.2922216736108498,
+        1.3086609034707697,
+        1.3042475787028376
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 1024,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 33458.644386216445,
+          "p50_us": 3533.0,
+          "p95_us": 3899.0,
+          "p99_us": 7492.0,
+          "server_cpu_pct": 63.559138027550695,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16252928,
+          "cpu_us_per_request": 18.687110685194057,
+          "client_cpu_pct": 128.10521919217518,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 45902.17385260947,
+          "p50_us": 1106.0,
+          "p95_us": 2033.0,
+          "p99_us": 2158.0,
+          "server_cpu_pct": 59.17352457369249,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 83877888,
+          "cpu_us_per_request": 12.891224882659575,
+          "client_cpu_pct": 118.319850173264,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.371907759404599,
+      "p99_ratio": 0.28804057661505605,
+      "cpu_per_request_ratio": 0.6898458033361676,
+      "rss_ratio": 5.160786290322581,
+      "valid": true,
+      "paired_ratios": [
+        1.3527128256023457,
+        1.3650493128755254,
+        1.3872150505943994
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 10956.397366182002,
+          "p50_us": 89.0,
+          "p95_us": 98.0,
+          "p99_us": 131.0,
+          "server_cpu_pct": 52.36128818182193,
+          "origin_cpu_pct": 27.063137711952884,
+          "server_rss_bytes": 16363520,
+          "cpu_us_per_request": 47.9650642517092,
+          "client_cpu_pct": 7.450892734595279,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 10925.750892879643,
+          "p50_us": 89.0,
+          "p95_us": 99.0,
+          "p99_us": 132.0,
+          "server_cpu_pct": 57.598686749942104,
+          "origin_cpu_pct": 26.999384414035372,
+          "server_rss_bytes": 85794816,
+          "cpu_us_per_request": 52.71828665568369,
+          "client_cpu_pct": 7.254773935361926,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.9972028694945885,
+      "p99_ratio": 1.0076335877862594,
+      "cpu_per_request_ratio": 1.099097592761071,
+      "rss_ratio": 5.24305381727159,
+      "valid": true,
+      "paired_ratios": [
+        0.9972028694945885,
+        1.0019072189265363,
+        0.9905521553832024
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 16950.71464316473,
+          "p50_us": 1877.0,
+          "p95_us": 1948.0,
+          "p99_us": 2047.0,
+          "server_cpu_pct": 63.73038868869921,
+          "origin_cpu_pct": 39.60827028526777,
+          "server_rss_bytes": 16625664,
+          "cpu_us_per_request": 37.59746419564563,
+          "client_cpu_pct": 11.961703723109698,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 21501.53268642783,
+          "p50_us": 1398.0,
+          "p95_us": 1953.0,
+          "p99_us": 2014.0,
+          "server_cpu_pct": 61.962375896322044,
+          "origin_cpu_pct": 41.37631345283178,
+          "server_rss_bytes": 87891968,
+          "cpu_us_per_request": 28.81765537367197,
+          "client_cpu_pct": 12.745422922545085,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.2684735209732403,
+      "p99_ratio": 0.9838788470933073,
+      "cpu_per_request_ratio": 0.7664786971726009,
+      "rss_ratio": 5.286523774328653,
+      "valid": true,
+      "paired_ratios": [
+        1.2684735209732403,
+        1.2838119953479001,
+        1.2591795551789517
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 16827.28964741749,
+          "p50_us": 7549.0,
+          "p95_us": 7756.0,
+          "p99_us": 7878.0,
+          "server_cpu_pct": 63.50699144288083,
+          "origin_cpu_pct": 37.82548079670019,
+          "server_rss_bytes": 17612800,
+          "cpu_us_per_request": 37.757735009350654,
+          "client_cpu_pct": 11.760923156719482,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 22625.584443220258,
+          "p50_us": 5008.0,
+          "p95_us": 6979.0,
+          "p99_us": 7146.0,
+          "server_cpu_pct": 60.65908381713097,
+          "origin_cpu_pct": 41.76527082490987,
+          "server_rss_bytes": 91394048,
+          "cpu_us_per_request": 26.721046339919848,
+          "client_cpu_pct": 13.12573459366902,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.344576869911587,
+      "p99_ratio": 0.9070830159939071,
+      "cpu_per_request_ratio": 0.7076972793336893,
+      "rss_ratio": 5.18906976744186,
+      "valid": true,
+      "paired_ratios": [
+        1.3528329367144685,
+        1.344576869911587,
+        1.3299462901374282
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 7594.8796229030695,
+          "p50_us": 89.0,
+          "p95_us": 102.0,
+          "p99_us": 130.0,
+          "server_cpu_pct": 42.798621884375315,
+          "origin_cpu_pct": 19.1993817799067,
+          "server_rss_bytes": 16379904,
+          "cpu_us_per_request": 56.32320042110803,
+          "client_cpu_pct": 24.7992014657128,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 7528.429896386295,
+          "p50_us": 91.0,
+          "p95_us": 102.0,
+          "p99_us": 131.0,
+          "server_cpu_pct": 49.41175501730294,
+          "origin_cpu_pct": 18.823525720877328,
+          "server_rss_bytes": 85897216,
+          "cpu_us_per_request": 65.63354603463993,
+          "client_cpu_pct": 24.70587750865147,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 0.9912507202462578,
+      "p99_ratio": 1.0076923076923077,
+      "cpu_per_request_ratio": 1.165302140928105,
+      "rss_ratio": 5.244061015253814,
+      "valid": true,
+      "paired_ratios": [
+        0.9926517765361261,
+        0.9907451390747413,
+        0.9919119036994111
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14073.844152019321,
+          "p50_us": 2219.0,
+          "p95_us": 2313.0,
+          "p99_us": 2408.0,
+          "server_cpu_pct": 65.09858808613484,
+          "origin_cpu_pct": 34.90493112551146,
+          "server_rss_bytes": 16642048,
+          "cpu_us_per_request": 46.25501560410164,
+          "client_cpu_pct": 48.23939919593157,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 14606.00276659881,
+          "p50_us": 1983.0,
+          "p95_us": 2256.0,
+          "p99_us": 4253.0,
+          "server_cpu_pct": 60.48794004227768,
+          "origin_cpu_pct": 29.602920926089148,
+          "server_rss_bytes": 88649728,
+          "cpu_us_per_request": 41.58032500817973,
+          "client_cpu_pct": 53.70051442697259,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.037811887699718,
+      "p99_ratio": 1.7661960132890366,
+      "cpu_per_request_ratio": 0.898936568610575,
+      "rss_ratio": 5.3268520797440315,
+      "valid": true,
+      "paired_ratios": [
+        1.0355681548320945,
+        1.0410431522231967,
+        1.0319642305208514
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "proxy-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 13985.699321799902,
+          "p50_us": 9049.0,
+          "p95_us": 9274.0,
+          "p99_us": 9435.0,
+          "server_cpu_pct": 64.69524657150029,
+          "origin_cpu_pct": 34.677968229799305,
+          "server_rss_bytes": 17461248,
+          "cpu_us_per_request": 46.124935937588994,
+          "client_cpu_pct": 48.38171139453016,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 14769.367952882272,
+          "p50_us": 7613.0,
+          "p95_us": 8986.0,
+          "p99_us": 15732.0,
+          "server_cpu_pct": 59.87926916462688,
+          "origin_cpu_pct": 28.575913402281977,
+          "server_rss_bytes": 95961088,
+          "cpu_us_per_request": 40.29630417725054,
+          "client_cpu_pct": 60.564154109139764,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0560335677931274,
+      "p99_ratio": 1.667408585055644,
+      "cpu_per_request_ratio": 0.8736338242675264,
+      "rss_ratio": 5.495660333098757,
+      "valid": true,
+      "paired_ratios": [
+        1.0560335677931274,
+        1.0482540411218986,
+        1.0581163437021408
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 38439.9310632739,
+          "p50_us": 25.0,
+          "p95_us": 27.0,
+          "p99_us": 29.0,
+          "server_cpu_pct": 47.398805550100136,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16363520,
+          "cpu_us_per_request": 12.307535173505604,
+          "client_cpu_pct": 37.84499982254028,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 61015.43413127268,
+          "p50_us": 16.0,
+          "p95_us": 17.0,
+          "p99_us": 19.0,
+          "server_cpu_pct": 41.378106667268064,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 78340096,
+          "cpu_us_per_request": 6.755631827670557,
+          "client_cpu_pct": 38.63337476452272,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.5872930164947088,
+      "p99_ratio": 0.6551724137931034,
+      "cpu_per_request_ratio": 0.5489020939150665,
+      "rss_ratio": 4.787484355444305,
+      "valid": true,
+      "paired_ratios": [
+        1.578421767142334,
+        1.5715906147342102,
+        1.5891078219526513
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 85502.50853277132,
+          "p50_us": 371.0,
+          "p95_us": 403.0,
+          "p99_us": 440.0,
+          "server_cpu_pct": 67.39819372840807,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16363520,
+          "cpu_us_per_request": 7.8825984038323,
+          "client_cpu_pct": 73.13976459976568,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 251817.72727718353,
+          "p50_us": 123.0,
+          "p95_us": 141.0,
+          "p99_us": 191.0,
+          "server_cpu_pct": 63.528788933441824,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79388672,
+          "cpu_us_per_request": 2.5228084464249707,
+          "client_cpu_pct": 111.56753365163085,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 2.9451501669178173,
+      "p99_ratio": 0.4340909090909091,
+      "cpu_per_request_ratio": 0.32004782143898786,
+      "rss_ratio": 4.851564455569462,
+      "valid": true,
+      "paired_ratios": [
+        2.946520188737878,
+        2.8080025547063197,
+        2.9694811052924734
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-keepalive",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 85287.1269229498,
+          "p50_us": 1483.0,
+          "p95_us": 1571.0,
+          "p99_us": 1672.0,
+          "server_cpu_pct": 67.1775616578386,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16363520,
+          "cpu_us_per_request": 7.91381181935966,
+          "client_cpu_pct": 76.63750460322673,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 262275.19651896355,
+          "p50_us": 478.0,
+          "p95_us": 545.0,
+          "p99_us": 567.0,
+          "server_cpu_pct": 62.594227735741505,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 82927616,
+          "cpu_us_per_request": 2.3903665203449687,
+          "client_cpu_pct": 108.66646936869357,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 3.0752026241417245,
+      "p99_ratio": 0.33911483253588515,
+      "cpu_per_request_ratio": 0.30204995707598004,
+      "rss_ratio": 5.067834793491865,
+      "valid": true,
+      "paired_ratios": [
+        3.0513439400764844,
+        2.9870304482376735,
+        3.1473437993461433
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 1,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 14123.795202224037,
+          "p50_us": 26.0,
+          "p95_us": 28.0,
+          "p99_us": 47.0,
+          "server_cpu_pct": 33.72810908454853,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16199680,
+          "cpu_us_per_request": 23.898846741697934,
+          "client_cpu_pct": 54.126179891888846,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 15118.605422281502,
+          "p50_us": 18.0,
+          "p95_us": 19.0,
+          "p99_us": 34.0,
+          "server_cpu_pct": 33.334581746100696,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 78258176,
+          "cpu_us_per_request": 22.04871468963192,
+          "client_cpu_pct": 60.19833291795831,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.0704350499149702,
+      "p99_ratio": 0.723404255319149,
+      "cpu_per_request_ratio": 0.922584881519075,
+      "rss_ratio": 4.830847029077118,
+      "valid": true,
+      "paired_ratios": [
+        1.0612240062894347,
+        1.0712644252589751,
+        1.0843159964071127
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 32,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 35311.92616477827,
+          "p50_us": 825.0,
+          "p95_us": 946.0,
+          "p99_us": 1041.0,
+          "server_cpu_pct": 66.86362350250482,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16199680,
+          "cpu_us_per_request": 18.879344331476865,
+          "client_cpu_pct": 126.68430310886419,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 46352.13868543581,
+          "p50_us": 281.0,
+          "p95_us": 516.0,
+          "p99_us": 591.0,
+          "server_cpu_pct": 62.93947340248441,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 79908864,
+          "cpu_us_per_request": 13.536608064434256,
+          "client_cpu_pct": 119.41195201874825,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.3126482670228723,
+      "p99_ratio": 0.5677233429394812,
+      "cpu_per_request_ratio": 0.717006259685891,
+      "rss_ratio": 4.932743362831858,
+      "valid": true,
+      "paired_ratios": [
+        1.317804948316531,
+        1.2885046644861164,
+        1.2962690097959615
+      ]
+    },
+    {
+      "transport": "http",
+      "body_size": 16,
+      "scenario": "static-close",
+      "concurrency": 128,
+      "workers": 1,
+      "engines": {
+        "nginx": {
+          "rps": 33064.13578683053,
+          "p50_us": 3539.0,
+          "p95_us": 4003.0,
+          "p99_us": 8711.0,
+          "server_cpu_pct": 63.04084613423681,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 16199680,
+          "cpu_us_per_request": 18.831819700513318,
+          "client_cpu_pct": 128.248721354338,
+          "samples": 3,
+          "valid": true
+        },
+        "rut": {
+          "rps": 46203.50673891507,
+          "p50_us": 1076.0,
+          "p95_us": 2059.0,
+          "p99_us": 2322.0,
+          "server_cpu_pct": 58.60457151416531,
+          "origin_cpu_pct": 0.0,
+          "server_rss_bytes": 83881984,
+          "cpu_us_per_request": 12.747082382326338,
+          "client_cpu_pct": 118.38890017507629,
+          "samples": 3,
+          "valid": true
+        }
+      },
+      "rps_ratio": 1.39739042437994,
+      "p99_ratio": 0.2665595224428883,
+      "cpu_per_request_ratio": 0.6768906343118227,
+      "rss_ratio": 5.178002528445006,
+      "valid": true,
+      "paired_ratios": [
+        1.4266405110621296,
+        1.3532575794568393,
+        1.3468331580873534
+      ]
+    }
+  ],
+  "followups": {
+    "reverse-http-proxy64k": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "http",
+          "body_size": 65536,
+          "scenario": "proxy-close",
+          "concurrency": 1,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 6097.203400073309,
+              "p50_us": 127.0,
+              "p95_us": 146.0,
+              "p99_us": 173.0,
+              "server_cpu_pct": 51.97567439672107,
+              "origin_cpu_pct": 22.963209604843893,
+              "server_rss_bytes": 16482304,
+              "cpu_us_per_request": 85.24510498714238,
+              "client_cpu_pct": 27.654122970477495,
+              "samples": 5,
+              "valid": true
+            },
+            "rut": {
+              "rps": 5481.057049538163,
+              "p50_us": 140.0,
+              "p95_us": 166.0,
+              "p99_us": 188.0,
+              "server_cpu_pct": 51.97796529353475,
+              "origin_cpu_pct": 21.481380704633757,
+              "server_rss_bytes": 98525184,
+              "cpu_us_per_request": 95.0124125479576,
+              "client_cpu_pct": 23.210498355326305,
+              "samples": 5,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.898946072468611,
+          "p99_ratio": 1.0867052023121386,
+          "cpu_per_request_ratio": 1.1145791017828932,
+          "rss_ratio": 5.977634194831014,
+          "valid": true,
+          "paired_ratios": [
+            0.8968333763770732,
+            0.9003964278864041,
+            0.897579468208952,
+            0.9001107390891571,
+            0.894954846537015
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 65536,
+          "scenario": "proxy-keepalive",
+          "concurrency": 1,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 8013.785469130788,
+              "p50_us": 122.0,
+              "p95_us": 138.0,
+              "p99_us": 167.0,
+              "server_cpu_pct": 58.39835654925223,
+              "origin_cpu_pct": 30.372083955847888,
+              "server_rss_bytes": 16498688,
+              "cpu_us_per_request": 72.87237320515193,
+              "client_cpu_pct": 17.65472421283696,
+              "samples": 5,
+              "valid": true
+            },
+            "rut": {
+              "rps": 7128.5612865388775,
+              "p50_us": 137.0,
+              "p95_us": 160.0,
+              "p99_us": 186.0,
+              "server_cpu_pct": 58.39372804448294,
+              "origin_cpu_pct": 27.778590558760797,
+              "server_rss_bytes": 98529280,
+              "cpu_us_per_request": 81.9288794969948,
+              "client_cpu_pct": 13.950462278814186,
+              "samples": 5,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.8895373246511519,
+          "p99_ratio": 1.1137724550898203,
+          "cpu_per_request_ratio": 1.12427900853931,
+          "rss_ratio": 5.971946375372394,
+          "valid": true,
+          "paired_ratios": [
+            0.8882913972942239,
+            0.8895373246511519,
+            0.8947655273404612,
+            0.8879963840871655,
+            0.8924692358626063
+          ]
+        }
+      ]
+    },
+    "reverse-http-static1m": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "static-close",
+          "concurrency": 1,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 3473.921085026867,
+              "p50_us": 247.0,
+              "p95_us": 280.0,
+              "p99_us": 307.0,
+              "server_cpu_pct": 21.235131549788047,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 16338944,
+              "cpu_us_per_request": 61.15990470433454,
+              "client_cpu_pct": 62.7177141121647,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 3426.686476767061,
+              "p50_us": 252.0,
+              "p95_us": 263.0,
+              "p99_us": 304.0,
+              "server_cpu_pct": 21.233925640520756,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 80220160,
+              "cpu_us_per_request": 61.842918985776144,
+              "client_cpu_pct": 63.87260477732086,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.9864030854173993,
+          "p99_ratio": 0.990228013029316,
+          "cpu_per_request_ratio": 1.0111676806028966,
+          "rss_ratio": 4.90975181749812,
+          "valid": true,
+          "paired_ratios": [
+            0.9862822530874241,
+            0.9879659878169905,
+            0.9864030854173993
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "static-close",
+          "concurrency": 32,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 6609.184261574959,
+              "p50_us": 2397.0,
+              "p95_us": 4418.0,
+              "p99_us": 4763.0,
+              "server_cpu_pct": 32.9480680231444,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 16338944,
+              "cpu_us_per_request": 49.85194347614228,
+              "client_cpu_pct": 126.57981223249935,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 7483.261615894862,
+              "p50_us": 2123.0,
+              "p95_us": 3944.0,
+              "p99_us": 4169.0,
+              "server_cpu_pct": 36.992852283430516,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 81399808,
+              "cpu_us_per_request": 49.987544631736284,
+              "client_cpu_pct": 133.72065928261847,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.1322519269740576,
+          "p99_ratio": 0.8752886836027713,
+          "cpu_per_request_ratio": 1.0027200776166107,
+          "rss_ratio": 4.981950363499624,
+          "valid": true,
+          "paired_ratios": [
+            1.103116929392351,
+            1.1382958637524139,
+            1.1232943465928906
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "static-close",
+          "concurrency": 128,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 6647.50434452674,
+              "p50_us": 9450.0,
+              "p95_us": 17395.0,
+              "p99_us": 18122.0,
+              "server_cpu_pct": 32.785325784926016,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 16338944,
+              "cpu_us_per_request": 49.54675975451831,
+              "client_cpu_pct": 126.69540499366214,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 7373.112812063114,
+              "p50_us": 8308.0,
+              "p95_us": 15701.0,
+              "p99_us": 16568.0,
+              "server_cpu_pct": 35.983957111093765,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 85397504,
+              "cpu_us_per_request": 48.84821921474815,
+              "client_cpu_pct": 132.76839347886323,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.109155019677995,
+          "p99_ratio": 0.9142478755104293,
+          "cpu_per_request_ratio": 0.9859013880376615,
+          "rss_ratio": 5.226623213838055,
+          "valid": true,
+          "paired_ratios": [
+            1.093471802045805,
+            1.109155019677995,
+            1.1108653892306461
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "static-keepalive",
+          "concurrency": 1,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 4672.127605725961,
+              "p50_us": 212.0,
+              "p95_us": 221.0,
+              "p99_us": 262.0,
+              "server_cpu_pct": 27.65449169439318,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 16551936,
+              "cpu_us_per_request": 59.19036042701618,
+              "client_cpu_pct": 68.27202637053314,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 4530.549605370093,
+              "p50_us": 210.0,
+              "p95_us": 249.0,
+              "p99_us": 264.0,
+              "server_cpu_pct": 25.555173805428335,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 80285696,
+              "cpu_us_per_request": 56.40634366995475,
+              "client_cpu_pct": 69.87549939068812,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.9696973173030727,
+          "p99_ratio": 1.0076335877862594,
+          "cpu_per_request_ratio": 0.9529650311811461,
+          "rss_ratio": 4.850532046523138,
+          "valid": true,
+          "paired_ratios": [
+            0.9696973173030727,
+            1.0209228409430746,
+            0.8780823365736629
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "static-keepalive",
+          "concurrency": 32,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 9995.013627924081,
+              "p50_us": 1684.0,
+              "p95_us": 3032.0,
+              "p99_us": 3253.0,
+              "server_cpu_pct": 41.35578204904945,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 16551936,
+              "cpu_us_per_request": 41.29969647211026,
+              "client_cpu_pct": 145.3004585438227,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 8858.009884682848,
+              "p50_us": 1994.0,
+              "p95_us": 3371.0,
+              "p99_us": 3635.0,
+              "server_cpu_pct": 33.09229865077971,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 81334272,
+              "cpu_us_per_request": 37.91442173380085,
+              "client_cpu_pct": 138.3830709717242,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.886242902154263,
+          "p99_ratio": 1.1174300645557946,
+          "cpu_per_request_ratio": 0.9180314862460189,
+          "rss_ratio": 4.913882702301411,
+          "valid": true,
+          "paired_ratios": [
+            0.876436237676772,
+            0.8942332533488181,
+            0.8845996894713847
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "static-keepalive",
+          "concurrency": 128,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 9762.544076067106,
+              "p50_us": 6541.0,
+              "p95_us": 12150.0,
+              "p99_us": 12919.0,
+              "server_cpu_pct": 40.18224576705543,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 16551936,
+              "cpu_us_per_request": 41.03950051924977,
+              "client_cpu_pct": 143.31252979457543,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 8804.281375591134,
+              "p50_us": 7428.0,
+              "p95_us": 13229.0,
+              "p99_us": 14364.0,
+              "server_cpu_pct": 33.43193475577724,
+              "origin_cpu_pct": 0.0,
+              "server_rss_bytes": 84873216,
+              "cpu_us_per_request": 37.97236063861324,
+              "client_cpu_pct": 137.82905443924517,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.9018429322306308,
+          "p99_ratio": 1.1118507624429135,
+          "cpu_per_request_ratio": 0.9252637132072824,
+          "rss_ratio": 5.127691165553081,
+          "valid": true,
+          "paired_ratios": [
+            0.8931391225518438,
+            0.9048441711366968,
+            0.9018429322306308
+          ]
+        }
+      ]
+    },
+    "reverse-http-proxy1m": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "proxy-close",
+          "concurrency": 1,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 2107.4204161754087,
+              "p50_us": 433.0,
+              "p95_us": 490.0,
+              "p99_us": 525.0,
+              "server_cpu_pct": 66.66707819184069,
+              "origin_cpu_pct": 41.85159350868206,
+              "server_rss_bytes": 16691200,
+              "cpu_us_per_request": 316.3444639718805,
+              "client_cpu_pct": 43.21014327248934,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 1452.0314180041773,
+              "p50_us": 655.0,
+              "p95_us": 706.0,
+              "p99_us": 822.0,
+              "server_cpu_pct": 57.65415727831884,
+              "origin_cpu_pct": 36.41929896923511,
+              "server_rss_bytes": 99409920,
+              "cpu_us_per_request": 396.53562027681073,
+              "client_cpu_pct": 25.925602656065642,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.6890088977306933,
+          "p99_ratio": 1.5657142857142856,
+          "cpu_per_request_ratio": 1.2534931552083628,
+          "rss_ratio": 5.955828220858896,
+          "valid": true,
+          "paired_ratios": [
+            0.6866842064108324,
+            0.6921530920899726,
+            0.6899176251849043
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "proxy-close",
+          "concurrency": 32,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 2342.8929830655015,
+              "p50_us": 13601.0,
+              "p95_us": 13972.0,
+              "p99_us": 14174.0,
+              "server_cpu_pct": 67.71800324346745,
+              "origin_cpu_pct": 42.12281487897817,
+              "server_rss_bytes": 17158144,
+              "cpu_us_per_request": 289.0358361774744,
+              "client_cpu_pct": 48.74747122493021,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 1586.1077408456674,
+              "p50_us": 20190.0,
+              "p95_us": 22302.0,
+              "p99_us": 23124.0,
+              "server_cpu_pct": 78.98669074260987,
+              "origin_cpu_pct": 32.24456679049578,
+              "server_rss_bytes": 118755328,
+              "cpu_us_per_request": 497.9907020723347,
+              "client_cpu_pct": 29.120093264284968,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.6769868501506898,
+          "p99_ratio": 1.6314378439396078,
+          "cpu_per_request_ratio": 1.722937572926277,
+          "rss_ratio": 6.921222248746718,
+          "valid": true,
+          "paired_ratios": [
+            0.6945884615501124,
+            0.6819756092587623,
+            0.6680764634533309
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "proxy-close",
+          "concurrency": 128,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 2316.3324370798655,
+              "p50_us": 54736.0,
+              "p95_us": 55373.0,
+              "p99_us": 56238.0,
+              "server_cpu_pct": 67.61587062780275,
+              "origin_cpu_pct": 42.004091223413376,
+              "server_rss_bytes": 18030592,
+              "cpu_us_per_request": 291.93548387096763,
+              "client_cpu_pct": 48.68840776329813,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 1576.3836851636242,
+              "p50_us": 78249.0,
+              "p95_us": 87394.0,
+              "p99_us": 94343.0,
+              "server_cpu_pct": 77.83534549117279,
+              "origin_cpu_pct": 33.50258156695434,
+              "server_rss_bytes": 175312896,
+              "cpu_us_per_request": 494.1400063351283,
+              "client_cpu_pct": 29.392599441640243,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.6805515736553456,
+          "p99_ratio": 1.6775667697997796,
+          "cpu_per_request_ratio": 1.6926342758440867,
+          "rss_ratio": 9.723080417991822,
+          "valid": true,
+          "paired_ratios": [
+            0.6790453934816804,
+            0.6806863911668332,
+            0.6780721258342807
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "proxy-keepalive",
+          "concurrency": 1,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 2041.140594253028,
+              "p50_us": 486.0,
+              "p95_us": 531.0,
+              "p99_us": 573.0,
+              "server_cpu_pct": 65.31077062264745,
+              "origin_cpu_pct": 39.877119212709665,
+              "server_rss_bytes": 16527360,
+              "cpu_us_per_request": 319.50232530047714,
+              "client_cpu_pct": 35.80482960234662,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 1818.7039459616155,
+              "p50_us": 538.0,
+              "p95_us": 596.0,
+              "p99_us": 663.0,
+              "server_cpu_pct": 71.97776121754272,
+              "origin_cpu_pct": 43.70519291768468,
+              "server_rss_bytes": 99438592,
+              "cpu_us_per_request": 395.76403502817186,
+              "client_cpu_pct": 25.926809357948493,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.8910233577649193,
+          "p99_ratio": 1.1570680628272252,
+          "cpu_per_request_ratio": 1.2386890601061327,
+          "rss_ratio": 6.016604708798018,
+          "valid": true,
+          "paired_ratios": [
+            0.8856723361107078,
+            0.9002816880912776,
+            0.8920566083922934
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "proxy-keepalive",
+          "concurrency": 32,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 2035.2635805231016,
+              "p50_us": 15717.0,
+              "p95_us": 16045.0,
+              "p99_us": 16278.0,
+              "server_cpu_pct": 67.37333251002039,
+              "origin_cpu_pct": 37.749065710623796,
+              "server_rss_bytes": 19955712,
+              "cpu_us_per_request": 331.2101910828025,
+              "client_cpu_pct": 35.8038482469942,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 1652.8981397303219,
+              "p50_us": 19297.0,
+              "p95_us": 20571.0,
+              "p99_us": 21396.0,
+              "server_cpu_pct": 78.86417589185884,
+              "origin_cpu_pct": 33.620385602076084,
+              "server_rss_bytes": 126365696,
+              "cpu_us_per_request": 477.1266540642722,
+              "client_cpu_pct": 24.746603528665688,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.8121297681283598,
+          "p99_ratio": 1.3144120899373388,
+          "cpu_per_request_ratio": 1.440555474770976,
+          "rss_ratio": 6.332307060755337,
+          "valid": true,
+          "paired_ratios": [
+            0.8121297681283598,
+            0.786239793489891,
+            0.876265954413639
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 1048576,
+          "scenario": "proxy-keepalive",
+          "concurrency": 128,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 1857.7745300646247,
+              "p50_us": 68565.0,
+              "p95_us": 69392.0,
+              "p99_us": 71349.0,
+              "server_cpu_pct": 66.81290715673435,
+              "origin_cpu_pct": 35.39482869089862,
+              "server_rss_bytes": 31698944,
+              "cpu_us_per_request": 360.17234414972404,
+              "client_cpu_pct": 33.026864799606074,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 1600.3063340341448,
+              "p50_us": 79127.0,
+              "p95_us": 89441.0,
+              "p99_us": 95640.0,
+              "server_cpu_pct": 78.34122192845652,
+              "origin_cpu_pct": 33.0579996991099,
+              "server_rss_bytes": 182108160,
+              "cpu_us_per_request": 490.3868607456992,
+              "client_cpu_pct": 24.415041758441067,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.8614104177531579,
+          "p99_ratio": 1.34045326493714,
+          "cpu_per_request_ratio": 1.3615339120591803,
+          "rss_ratio": 5.74492828530818,
+          "valid": true,
+          "paired_ratios": [
+            0.864405382018463,
+            0.8613445322102123,
+            0.8603029373965148
+          ]
+        }
+      ]
+    },
+    "reverse-https-proxy1m-c128": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "https",
+          "body_size": 1048576,
+          "scenario": "proxy-close",
+          "concurrency": 128,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 572.7571757624121,
+              "p50_us": 12912.0,
+              "p95_us": 13493.0,
+              "p99_us": 13727.0,
+              "server_cpu_pct": 88.59439938853666,
+              "origin_cpu_pct": 12.461908618568769,
+              "server_rss_bytes": 28278784,
+              "cpu_us_per_request": 1547.3340587595214,
+              "client_cpu_pct": 193.15958358781592,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 510.232045960746,
+              "p50_us": 219832.0,
+              "p95_us": 237182.0,
+              "p99_us": 240459.0,
+              "server_cpu_pct": 90.81034216440034,
+              "origin_cpu_pct": 10.96672558373824,
+              "server_rss_bytes": 180625408,
+              "cpu_us_per_request": 1779.7851562499998,
+              "client_cpu_pct": 123.82096037230997,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.8908348381346122,
+          "p99_ratio": 17.517228819115612,
+          "cpu_per_request_ratio": 1.1502268344541136,
+          "rss_ratio": 6.387311703360371,
+          "valid": true,
+          "paired_ratios": [
+            0.8909999331032722,
+            0.8865938797111289,
+            0.8676272667738602
+          ]
+        },
+        {
+          "transport": "https",
+          "body_size": 1048576,
+          "scenario": "proxy-keepalive",
+          "concurrency": 128,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 878.9421471774847,
+              "p50_us": 142557.0,
+              "p95_us": 144931.0,
+              "p99_us": 180594.0,
+              "server_cpu_pct": 75.10297653555958,
+              "origin_cpu_pct": 17.568510650068536,
+              "server_rss_bytes": 43765760,
+              "cpu_us_per_request": 855.440488012484,
+              "client_cpu_pct": 45.137900025287195,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 781.30050907857,
+              "p50_us": 160010.0,
+              "p95_us": 168913.0,
+              "p99_us": 176964.0,
+              "server_cpu_pct": 87.9043600562588,
+              "origin_cpu_pct": 15.695769155596292,
+              "server_rss_bytes": 251351040,
+              "cpu_us_per_request": 1125.637755102041,
+              "client_cpu_pct": 39.899851373053636,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 0.8889100512332151,
+          "p99_ratio": 0.9798996644406791,
+          "cpu_per_request_ratio": 1.3158574686093345,
+          "rss_ratio": 5.743097800655124,
+          "valid": true,
+          "paired_ratios": [
+            0.885670900755603,
+            0.8875444395787102,
+            0.9042908508529913
+          ]
+        }
+      ]
+    },
+    "two-worker-http": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "http",
+          "body_size": 65536,
+          "scenario": "proxy-keepalive",
+          "concurrency": 32,
+          "workers": 2,
+          "engines": {
+            "nginx": {
+              "rps": 19116.012177515913,
+              "p50_us": 1648.0,
+              "p95_us": 2255.0,
+              "p99_us": 2382.0,
+              "server_cpu_pct": 135.79014163571728,
+              "origin_cpu_pct": 63.39549891957671,
+              "server_rss_bytes": 24219648,
+              "cpu_us_per_request": 71.03476414156738,
+              "client_cpu_pct": 48.39656384396708,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 23315.97225966979,
+              "p50_us": 1379.0,
+              "p95_us": 1558.0,
+              "p99_us": 1760.0,
+              "server_cpu_pct": 139.41490837538495,
+              "origin_cpu_pct": 76.86447831666793,
+              "server_rss_bytes": 131895296,
+              "cpu_us_per_request": 59.62743366553129,
+              "client_cpu_pct": 42.942144773852746,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.2197090085082616,
+          "p99_ratio": 0.7388748950461796,
+          "cpu_per_request_ratio": 0.8394120032087097,
+          "rss_ratio": 5.445797395569085,
+          "valid": true,
+          "paired_ratios": [
+            1.2278088335619561,
+            1.237643202543733,
+            1.2197090085082616
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 65536,
+          "scenario": "proxy-keepalive",
+          "concurrency": 128,
+          "workers": 2,
+          "engines": {
+            "nginx": {
+              "rps": 18816.51756545213,
+              "p50_us": 6768.0,
+              "p95_us": 7232.0,
+              "p99_us": 7433.0,
+              "server_cpu_pct": 134.91882185223247,
+              "origin_cpu_pct": 62.68352342692217,
+              "server_rss_bytes": 25006080,
+              "cpu_us_per_request": 71.7956309345063,
+              "client_cpu_pct": 48.15686561687353,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 22604.535477054706,
+              "p50_us": 5629.0,
+              "p95_us": 6124.0,
+              "p99_us": 6340.0,
+              "server_cpu_pct": 139.15058422342923,
+              "origin_cpu_pct": 77.58044733404466,
+              "server_rss_bytes": 143474688,
+              "cpu_us_per_request": 61.56552330694811,
+              "client_cpu_pct": 42.47978221632779,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.2013134416836793,
+          "p99_ratio": 0.8529530472218485,
+          "cpu_per_request_ratio": 0.8575107218308263,
+          "rss_ratio": 5.737592137592138,
+          "valid": true,
+          "paired_ratios": [
+            1.201589784563228,
+            1.2225595725070475,
+            1.2013134416836793
+          ]
+        }
+      ]
+    },
+    "native-streaming-http": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "http",
+          "body_size": 262144,
+          "scenario": "proxy-keepalive",
+          "concurrency": 1,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 5427.094726794204,
+              "p50_us": 181.0,
+              "p95_us": 188.0,
+              "p99_us": 226.0,
+              "server_cpu_pct": 56.676501706668695,
+              "origin_cpu_pct": 36.66823405392623,
+              "server_rss_bytes": 17997824,
+              "cpu_us_per_request": 104.41213791103215,
+              "client_cpu_pct": 34.119105483332426,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 7644.372197708508,
+              "p50_us": 128.0,
+              "p95_us": 137.0,
+              "p99_us": 176.0,
+              "server_cpu_pct": 61.3725851211285,
+              "origin_cpu_pct": 51.998450446176726,
+              "server_rss_bytes": 95608832,
+              "cpu_us_per_request": 80.18444985269629,
+              "client_cpu_pct": 36.19892127214609,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.4085569872158938,
+          "p99_ratio": 0.7787610619469026,
+          "cpu_per_request_ratio": 0.7679610000996256,
+          "rss_ratio": 5.312243969048703,
+          "valid": true,
+          "paired_ratios": [
+            1.4034507672044125,
+            1.3968154855199033,
+            1.415131929945143
+          ]
+        },
+        {
+          "transport": "http",
+          "body_size": 262144,
+          "scenario": "proxy-keepalive",
+          "concurrency": 32,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 6921.968293185094,
+              "p50_us": 4168.0,
+              "p95_us": 6231.0,
+              "p99_us": 6399.0,
+              "server_cpu_pct": 64.12028730594788,
+              "origin_cpu_pct": 44.50896610573604,
+              "server_rss_bytes": 18628608,
+              "cpu_us_per_request": 92.96639563313809,
+              "client_cpu_pct": 44.50896610573605,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 12874.104140317853,
+              "p50_us": 2475.0,
+              "p95_us": 2560.0,
+              "p99_us": 2665.0,
+              "server_cpu_pct": 77.84542682627922,
+              "origin_cpu_pct": 79.61018461327285,
+              "server_rss_bytes": 106852352,
+              "cpu_us_per_request": 60.46667478981358,
+              "client_cpu_pct": 53.92302772114226,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.8598906546556755,
+          "p99_ratio": 0.41647132364431944,
+          "cpu_per_request_ratio": 0.6504143177544047,
+          "rss_ratio": 5.735927880386983,
+          "valid": true,
+          "paired_ratios": [
+            1.857209786918485,
+            1.861295564858451,
+            1.8665840550904527
+          ]
+        }
+      ]
+    },
+    "explicit-keepalive-http": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "http",
+          "body_size": 65536,
+          "scenario": "proxy-keepalive",
+          "concurrency": 32,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 10174.226847823342,
+              "p50_us": 3124.0,
+              "p95_us": 3269.0,
+              "p99_us": 3362.0,
+              "server_cpu_pct": 68.10759475885862,
+              "origin_cpu_pct": 33.339382049790935,
+              "server_rss_bytes": 16822272,
+              "cpu_us_per_request": 66.94129763130793,
+              "client_cpu_pct": 26.67150563983275,
+              "samples": 1,
+              "valid": true
+            },
+            "rut": {
+              "rps": 13814.188497383171,
+              "p50_us": 2290.0,
+              "p95_us": 2391.0,
+              "p99_us": 2460.0,
+              "server_cpu_pct": 69.5281136451304,
+              "origin_cpu_pct": 42.38357612614114,
+              "server_rss_bytes": 102264832,
+              "cpu_us_per_request": 50.330943188086046,
+              "client_cpu_pct": 21.429898041307318,
+              "samples": 1,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.3577629734428966,
+          "p99_ratio": 0.7317073170731707,
+          "cpu_per_request_ratio": 0.7518668590097162,
+          "rss_ratio": 6.079133187241295,
+          "valid": true,
+          "paired_ratios": [
+            1.3577629734428966
+          ]
+        }
+      ]
+    },
+    "two-worker-https": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "https",
+          "body_size": 65536,
+          "scenario": "proxy-keepalive",
+          "concurrency": 32,
+          "workers": 2,
+          "engines": {
+            "nginx": {
+              "rps": 13777.867017474671,
+              "p50_us": 2317.0,
+              "p95_us": 3272.0,
+              "p99_us": 3480.0,
+              "server_cpu_pct": 147.98863447287246,
+              "origin_cpu_pct": 46.79409458526334,
+              "server_rss_bytes": 34451456,
+              "cpu_us_per_request": 107.26779208337565,
+              "client_cpu_pct": 59.79540771268766,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 17336.985301999357,
+              "p50_us": 1846.0,
+              "p95_us": 1975.0,
+              "p99_us": 2071.0,
+              "server_cpu_pct": 150.3877283613657,
+              "origin_cpu_pct": 59.194435723042034,
+              "server_rss_bytes": 134389760,
+              "cpu_us_per_request": 86.74387486734646,
+              "client_cpu_pct": 72.99404368603521,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.2583214281289408,
+          "p99_ratio": 0.5951149425287356,
+          "cpu_per_request_ratio": 0.8086665454987958,
+          "rss_ratio": 3.9008441326833907,
+          "valid": true,
+          "paired_ratios": [
+            1.245659920955411,
+            1.2596856912125745,
+            1.2583214281289408
+          ]
+        },
+        {
+          "transport": "https",
+          "body_size": 65536,
+          "scenario": "proxy-keepalive",
+          "concurrency": 128,
+          "workers": 2,
+          "engines": {
+            "nginx": {
+              "rps": 13465.591137422683,
+              "p50_us": 9241.0,
+              "p95_us": 10767.0,
+              "p99_us": 10958.0,
+              "server_cpu_pct": 147.37446718461862,
+              "origin_cpu_pct": 45.73504772153957,
+              "server_rss_bytes": 40087552,
+              "cpu_us_per_request": 109.46317251159628,
+              "client_cpu_pct": 59.44271362548268,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 17567.343704912535,
+              "p50_us": 7239.0,
+              "p95_us": 7616.0,
+              "p99_us": 7828.0,
+              "server_cpu_pct": 152.13523290909808,
+              "origin_cpu_pct": 57.092408937607765,
+              "server_rss_bytes": 153116672,
+              "cpu_us_per_request": 86.60115921028797,
+              "client_cpu_pct": 73.18400746476877,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.3046099146802794,
+          "p99_ratio": 0.7143639350246396,
+          "cpu_per_request_ratio": 0.7911442471769548,
+          "rss_ratio": 3.8195565546132624,
+          "valid": true,
+          "paired_ratios": [
+            1.3046099146802794,
+            1.2985722449435717,
+            1.310055074787349
+          ]
+        }
+      ]
+    },
+    "native-streaming-https": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "https",
+          "body_size": 262144,
+          "scenario": "proxy-keepalive",
+          "concurrency": 1,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 3312.528310322311,
+              "p50_us": 297.0,
+              "p95_us": 333.0,
+              "p99_us": 374.0,
+              "server_cpu_pct": 70.5880138415252,
+              "origin_cpu_pct": 22.55021344267246,
+              "server_rss_bytes": 22605824,
+              "cpu_us_per_request": 213.16911416390337,
+              "client_cpu_pct": 43.725353018500336,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 3642.1575768936423,
+              "p50_us": 270.0,
+              "p95_us": 305.0,
+              "p99_us": 363.0,
+              "server_cpu_pct": 69.22089820096258,
+              "origin_cpu_pct": 24.706323191256935,
+              "server_rss_bytes": 96206848,
+              "cpu_us_per_request": 190.04037685060567,
+              "client_cpu_pct": 46.47141743117377,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.0995098715214477,
+          "p99_ratio": 0.9705882352941176,
+          "cpu_per_request_ratio": 0.891500523403619,
+          "rss_ratio": 4.255843449900344,
+          "valid": true,
+          "paired_ratios": [
+            1.1043618413551135,
+            1.0915972737530204,
+            1.0924968822311432
+          ]
+        },
+        {
+          "transport": "https",
+          "body_size": 262144,
+          "scenario": "proxy-keepalive",
+          "concurrency": 32,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 3837.9036715984344,
+              "p50_us": 8260.0,
+              "p95_us": 8442.0,
+              "p99_us": 8988.0,
+              "server_cpu_pct": 78.03985836746108,
+              "origin_cpu_pct": 25.490405999421935,
+              "server_rss_bytes": 24338432,
+              "cpu_us_per_request": 203.35172695687712,
+              "client_cpu_pct": 50.98380107375807,
+              "samples": 3,
+              "valid": true
+            },
+            "rut": {
+              "rps": 4729.266271534947,
+              "p50_us": 6698.0,
+              "p95_us": 6994.0,
+              "p99_us": 7175.0,
+              "server_cpu_pct": 78.9908370629007,
+              "origin_cpu_pct": 30.796427614396727,
+              "server_rss_bytes": 98828288,
+              "cpu_us_per_request": 167.0951156812339,
+              "client_cpu_pct": 58.43442030505906,
+              "samples": 3,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.23225246806814,
+          "p99_ratio": 0.7982866043613707,
+          "cpu_per_request_ratio": 0.8217049256565605,
+          "rss_ratio": 4.06058566139347,
+          "valid": true,
+          "paired_ratios": [
+            1.2371465342985675,
+            1.2341533723402152,
+            1.1977975300806427
+          ]
+        }
+      ]
+    },
+    "explicit-keepalive-https": {
+      "exit_code": 0,
+      "status": {
+        "complete": true,
+        "valid": true
+      },
+      "cells": [
+        {
+          "transport": "https",
+          "body_size": 65536,
+          "scenario": "proxy-keepalive",
+          "concurrency": 32,
+          "workers": 1,
+          "engines": {
+            "nginx": {
+              "rps": 7227.755781829741,
+              "p50_us": 4347.0,
+              "p95_us": 4553.0,
+              "p99_us": 4742.0,
+              "server_cpu_pct": 74.47687493033412,
+              "origin_cpu_pct": 23.992550313127772,
+              "server_rss_bytes": 22802432,
+              "cpu_us_per_request": 103.04287690179807,
+              "client_cpu_pct": 32.489911882360516,
+              "samples": 1,
+              "valid": true
+            },
+            "rut": {
+              "rps": 9937.367892035461,
+              "p50_us": 3149.0,
+              "p95_us": 3330.0,
+              "p99_us": 3543.0,
+              "server_cpu_pct": 75.97223214914949,
+              "origin_cpu_pct": 31.988308273326094,
+              "server_rss_bytes": 105058304,
+              "cpu_us_per_request": 76.4510612614425,
+              "client_cpu_pct": 38.985750708116186,
+              "samples": 1,
+              "valid": true
+            }
+          },
+          "rps_ratio": 1.3748898263853304,
+          "p99_ratio": 0.7471530999578238,
+          "cpu_per_request_ratio": 0.7419344602956098,
+          "rss_ratio": 4.607328902460931,
+          "valid": true,
+          "paired_ratios": [
+            1.3748898263853304
+          ]
+        }
+      ]
+    }
+  },
+  "http": {
+    "cells": 48,
+    "wins": 33,
+    "target110": 21
+  },
+  "https": {
+    "cells": 48,
+    "wins": 45,
+    "target110": 39
+  }
+}

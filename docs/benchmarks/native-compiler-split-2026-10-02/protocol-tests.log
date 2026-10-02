@@ -1,0 +1,5 @@
+{"case": "explicit flag", "llvm_loaded": false, "compiler_exited": true}
+{"case": "positional source", "llvm_loaded": false, "compiler_exited": true}
+{"case": "mismatched build", "exit_code": 1, "diagnostic": "Failed to load /tmp/rut-native-protocol-4oj0oaxm/app.rut: rut and rut-compile build mismatch"}
+{"case": "truncated image", "exit_code": 1, "diagnostic": "Failed to load /tmp/rut-native-protocol-4oj0oaxm/app.rut: truncated compiler artifact"}
+{"case": "trailing bytes", "exit_code": 1, "diagnostic": "Failed to load /tmp/rut-native-protocol-4oj0oaxm/app.rut: invalid compiler artifact framing"}

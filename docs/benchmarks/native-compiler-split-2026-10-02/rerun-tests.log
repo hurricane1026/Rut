@@ -1,0 +1,63 @@
+Test project /home/hurricane/private/code/Rut/build
+      Start  70: test_access_log_startup
+ 1/18 Test  #70: test_access_log_startup ....................................................   Passed    2.31 sec
+      Start  76: test_fixture_privileged_broker
+ 2/18 Test  #76: test_fixture_privileged_broker .............................................***Skipped   0.73 sec
+      Start  77: test_fixture_generated_nginx_differential
+ 3/18 Test  #77: test_fixture_generated_nginx_differential ..................................***Skipped   0.70 sec
+      Start  78: test_fixture_exact_input_mount_owner
+ 4/18 Test  #78: test_fixture_exact_input_mount_owner .......................................***Failed    6.32 sec
+fatal exact-input mount controller: destroyed on a foreign thread; no owner
+FAIL [#358 exact input read observation]: exact container input read failed with outcome 9
+
+      Start 121: test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential
+ 5/18 Test #121: test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential ....   Passed    3.98 sec
+      Start 122: test_nginx_issue270_fixed_upload_head_success_differential
+ 6/18 Test #122: test_nginx_issue270_fixed_upload_head_success_differential .................   Passed    3.14 sec
+      Start 123: test_nginx_issue270_fixed_upload_head_zero_response_timeout_differential
+ 7/18 Test #123: test_nginx_issue270_fixed_upload_head_zero_response_timeout_differential ...   Passed    4.06 sec
+      Start 242: test_rut_iouring_gate_spike
+ 8/18 Test #242: test_rut_iouring_gate_spike ................................................   Passed    0.18 sec
+      Start 243: test_rut_issue566_id3_successor_public_gate
+ 9/18 Test #243: test_rut_issue566_id3_successor_public_gate ................................   Passed    0.18 sec
+      Start 244: test_rut_issue566_id3_successor_live200_public_gate
+10/18 Test #244: test_rut_issue566_id3_successor_live200_public_gate ........................   Passed    0.21 sec
+      Start 245: test_rut_iouring_gate_identity_negative
+11/18 Test #245: test_rut_iouring_gate_identity_negative ....................................   Passed    0.17 sec
+      Start 246: test_rut_iouring_gate_ready_mutation_negative
+12/18 Test #246: test_rut_iouring_gate_ready_mutation_negative ..............................   Passed    0.13 sec
+      Start 247: test_rut_iouring_gate_owner_death_negative
+13/18 Test #247: test_rut_iouring_gate_owner_death_negative .................................   Passed    0.13 sec
+      Start 249: test_rut_iouring_gate_connect_journal_negative
+14/18 Test #249: test_rut_iouring_gate_connect_journal_negative .............................   Passed    0.13 sec
+      Start 250: test_rut_iouring_coalesced_ingress_gate
+15/18 Test #250: test_rut_iouring_coalesced_ingress_gate ....................................   Passed    0.64 sec
+      Start 251: test_nginx_converter_coalesced_successor_differential
+16/18 Test #251: test_nginx_converter_coalesced_successor_differential ......................   Passed    1.96 sec
+      Start 252: test_nginx_late_successor_differential
+17/18 Test #252: test_nginx_late_successor_differential .....................................   Passed    0.89 sec
+      Start 253: test_nginx_differential
+18/18 Test #253: test_nginx_differential ....................................................   Passed   50.24 sec
+
+94% tests passed, 1 tests failed out of 18
+
+Label Time Summary:
+differential    =  11.87 sec*proc (4 tests)
+docker          =  72.01 sec*proc (9 tests)
+integration     =  73.77 sec*proc (17 tests)
+io_uring        =  11.17 sec*proc (3 tests)
+negative        =   0.56 sec*proc (4 tests)
+network         =  18.93 sec*proc (6 tests)
+nginx           =  66.02 sec*proc (14 tests)
+runtime         =   2.31 sec*proc (1 test)
+unit            =   2.31 sec*proc (1 test)
+
+Total Test time (real) =  76.09 sec
+
+The following tests did not run:
+	 76 - test_fixture_privileged_broker (Skipped)
+	 77 - test_fixture_generated_nginx_differential (Skipped)
+
+The following tests FAILED:
+	 78 - test_fixture_exact_input_mount_owner (Failed)     docker integration network
+Errors while running CTest
