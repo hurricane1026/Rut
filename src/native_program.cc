@@ -31,7 +31,7 @@ int create_artifact_memfd() {
     // default, so retain that compatibility path.
     unsigned int flags = MFD_CLOEXEC | MFD_ALLOW_SEALING;
 #ifndef MFD_EXEC
-#define MFD_EXEC 0x0004U
+#define MFD_EXEC 0x0010U
 #endif
     int fd = static_cast<int>(syscall(SYS_memfd_create, "rut-program", flags | MFD_EXEC));
     if (fd >= 0) return fd;
@@ -270,7 +270,7 @@ bool load_native_program(
             return fail("invalid native relocation");
         const void* ptr =
             r.blob_offset ? bytes + r.blob_offset : reinterpret_cast<u8*>(&c) + r.config_offset;
-        memcpy(reinterpret_cast<u8*>(&c) + r.field, &ptr, sizeof(ptr));
+        memcpy(reinterpret_cast<u8*>(&c) + r.field, static_cast<const void*>(&ptr), sizeof(ptr));
     }
     for (u32 i = 0; i < h.symbol_count; i++) {
         const auto& s = symbols[i];
@@ -278,7 +278,7 @@ bool load_native_program(
             return fail("invalid native symbol");
         void* fn = dlsym(out.library, s.name);
         if (!fn) return fail("missing native handler symbol");
-        memcpy(reinterpret_cast<u8*>(&c) + s.field, &fn, sizeof(fn));
+        memcpy(reinterpret_cast<u8*>(&c) + s.field, static_cast<const void*>(&fn), sizeof(fn));
     }
     if (!out.arena.init(4096)) return fail("cannot allocate native program arena");
     out.regex_handles = out.arena.alloc_array<void*>(h.regex_count);
