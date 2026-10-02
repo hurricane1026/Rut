@@ -70,10 +70,11 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
     write = "" if mode == "header" else (
         f"sys.stdout.buffer.write(bytes.fromhex({frame.hex()!r}));sys.stdout.flush()\n")
     close = "sys.stdout.close()\n" if mode == "eof" else ""
+    marker = (f"tmp={str(pid_file)!r}+'.tmp';open(tmp,'w').write(str(os.getpid()));"
+              f"os.replace(tmp,{str(pid_file)!r})\n")
     helper.write_text(
         f"#!{sys.executable}\nimport os,sys,time\n"
-        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-        f"{write}{close}time.sleep(30)\n")
+        f"{write}{close}{marker}time.sleep(30)\n")
     helper.chmod(0o700)
     process = subprocess.Popen(
         [str(server), "--compile", str(source), "--shards", "1", "--no-pin"],

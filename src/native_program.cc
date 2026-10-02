@@ -33,7 +33,14 @@ struct StartupSignalScope {
     struct sigaction old_term{};
     bool int_installed = false;
     bool term_installed = false;
+    sigset_t old_mask{};
+    bool mask_saved = false;
     StartupSignalScope() {
+        sigset_t blocked{};
+        sigemptyset(&blocked);
+        sigaddset(&blocked, SIGINT);
+        sigaddset(&blocked, SIGTERM);
+        if (sigprocmask(SIG_BLOCK, &blocked, &old_mask) == 0) mask_saved = true;
         g_startup_cancelled = 0;
         struct sigaction action{};
         action.sa_handler = startup_cancel_handler;
@@ -47,12 +54,21 @@ struct StartupSignalScope {
             sigaction(SIGINT, &old_int, nullptr);
             int_installed = false;
         }
+        if (mask_saved) sigprocmask(SIG_SETMASK, &old_mask, nullptr);
     }
     ~StartupSignalScope() {
+        if (mask_saved) {
+            sigset_t blocked{};
+            sigemptyset(&blocked);
+            sigaddset(&blocked, SIGINT);
+            sigaddset(&blocked, SIGTERM);
+            sigprocmask(SIG_BLOCK, &blocked, nullptr);
+        }
         if (term_installed) sigaction(SIGTERM, &old_term, nullptr);
         if (int_installed) {
             sigaction(SIGINT, &old_int, nullptr);
         }
+        if (mask_saved) sigprocmask(SIG_SETMASK, &old_mask, nullptr);
     }
 };
 
@@ -62,10 +78,11 @@ int create_artifact_memfd() {
     // Older kernels reject the new flag, but their memfds are executable by
     // default, so retain that compatibility path.
     unsigned int flags = MFD_CLOEXEC | MFD_ALLOW_SEALING;
-#ifndef MFD_EXEC
-#define MFD_EXEC 0x0010U
+    constexpr unsigned kMfdExec = 0x0010U;
+#ifdef MFD_EXEC
+    static_assert(MFD_EXEC == kMfdExec);
 #endif
-    int fd = static_cast<int>(syscall(SYS_memfd_create, "rut-program", flags | MFD_EXEC));
+    int fd = static_cast<int>(syscall(SYS_memfd_create, "rut-program", flags | kMfdExec));
     if (fd >= 0) return fd;
     if (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP) return -1;
     return static_cast<int>(syscall(SYS_memfd_create, "rut-program", flags));
@@ -254,7 +271,8 @@ bool load_native_program(
     u64 remaining = stream.artifact_size;
     while (remaining) {
         u64 n = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-        if (!read_all(buffer, n)) return fail("truncated compiler artifact");
+        if (!read_all(buffer, n))
+            return fail(g_startup_cancelled ? "startup cancelled" : "truncated compiler artifact");
         u64 pos = 0;
         while (pos < n) {
             ssize_t written = write(out.artifact_fd, buffer + pos, n - pos);
@@ -287,7 +305,8 @@ bool load_native_program(
         producer.cancel();
         return fail("startup cancelled");
     }
-    if (!producer.wait()) return fail("rut-compile failed (see diagnostic above)");
+    if (!producer.wait())
+        return fail(g_startup_cancelled ? "startup cancelled" : "rut-compile failed (see diagnostic above)");
 #ifdef __linux__
     if (fcntl(out.artifact_fd,
               F_ADD_SEALS,
