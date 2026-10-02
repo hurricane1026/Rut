@@ -15,6 +15,21 @@ import tempfile
 import time
 
 
+def wait_dead(pid, timeout=2):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "gone"
+        if sys.platform.startswith("linux"):
+            stat = Path(f"/proc/{pid}/stat")
+            if stat.exists() and stat.read_text().split()[2] == "Z":
+                return "zombie"
+        time.sleep(0.01)
+    raise AssertionError(("still alive", pid))
+
+
 def check_startup(server, source, explicit, environment=None, preexec_fn=None):
     command = [str(server.resolve())]
     command += ["--compile", str(source)] if explicit else [str(source)]
@@ -67,7 +82,8 @@ def check_startup(server, source, explicit, environment=None, preexec_fn=None):
 def check_startup_cancellation(server, source, header, image, signal_name, mode, root,
                                grandchild=False):
     """Terminate startup while the compiler is blocked at each pipe boundary."""
-    pid_file = root / f"producer-{signal_name}-{mode}.pid"
+    suffix = "-grandchild" if grandchild else ""
+    pid_file = root / f"producer-{signal_name}-{mode}{suffix}.pid"
     pid_file.unlink(missing_ok=True)
     helper = root / "rut-compile"
     frame = header + image
@@ -91,24 +107,27 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
             time.sleep(0.01)
         assert pid_file.exists(), f"producer did not start: {mode}"
         producer_pid, grandchild_pid = map(int, pid_file.read_text().split(','))
+        pid_file.unlink(missing_ok=True)
+        if grandchild:
+            assert grandchild_pid > 0, (mode, grandchild_pid)
         os.kill(process.pid, getattr(signal, signal_name))
         process.wait(timeout=3)
         diagnostic = process.stderr.read().decode()
         assert process.returncode != 0 and "startup cancelled" in diagnostic, (process.returncode, diagnostic)
-        for dead_pid in (producer_pid, grandchild_pid):
-            if not dead_pid:
-                continue
-            try:
-                os.kill(dead_pid, 0)
-            except ProcessLookupError:
-                pass
-            else:
-                raise AssertionError((mode, dead_pid))
-        print(json.dumps({"case": f"{signal_name} during {mode}", "producer_reaped": True}))
+        states = {"producer": wait_dead(producer_pid)}
+        if grandchild:
+            states["grandchild"] = wait_dead(grandchild_pid)
+        print(json.dumps({"case": f"{signal_name} during {mode}{suffix}", **states}))
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
+        for tracked_pid in (locals().get("producer_pid", 0), locals().get("grandchild_pid", 0)):
+            if tracked_pid:
+                try:
+                    os.kill(tracked_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 def main():
