@@ -1,0 +1,52 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 17K of event 'cycles:u'
+# Event count (approx.): 14871529856
+#
+# Overhead  Command  Shared Object      Symbol
+# ........  .......  .................  ............................................................................................................................................................................................................................................................................................................................................................................
+#
+    10.82%  rut      libc.so.6          [.] __memmove_avx_unaligned_erms
+     5.28%  rut      rut                [.] rut::HttpResponseParser::parse(unsigned char const*, unsigned int, rut::ParsedResponse*)
+     4.81%  rut      rut                [.] rut::IoUringBackend::wait(rut::IoEvent*, unsigned int, rut::ConnectionBase*, unsigned int)
+     3.81%  rut      rut                [.] rut::response_read_deadline_coalesced_get_phase1_proof_is_stable(rut::ConnectionBase const&, rut::ResponseReadDeadlineUploadProof const&, bool, bool, rut::ResponseReadDeadlineProfile, rut::ForwardResponseBufferingMode, unsigned short, unsigned char, unsigned char)
+     3.75%  rut      rut                [.] rut::RouteConfig::policy_bundle_id_is_valid(unsigned short) const
+     3.61%  rut      libc.so.6          [.] __memset_avx2_unaligned_erms
+     3.27%  rut      rut                [.] rut::response_read_deadline_owner_is_stable(rut::ConnectionBase const&, void (*)(void*, rut::ConnectionBase&, rut::IoEvent), rut::ResponseReadDeadlineOwnerPhase)
+     3.25%  rut      rut                [.] rut::IoUringEventLoop::dispatch_batch(rut::IoEvent const*, unsigned int)
+     3.11%  rut      rut                [.] rut::IoUringEventLoop::dispatch(rut::IoEvent const&)
+     2.60%  rut      rut                [.] rut::simd::scan_header_name(unsigned char const*, unsigned int, unsigned int)
+     2.53%  rut      rut                [.] rut::simd::scan_header_value(unsigned char const*, unsigned int, unsigned int)
+     2.36%  rut      rut                [.] rut::response_read_deadline_post_commit_is_stable(rut::ConnectionBase const&)
+     2.22%  rut      libc.so.6          [.] __memcmp_avx2_movbe
+     2.13%  rut      rut                [.] rut::complete_content_length_content_type_view(rut::ParsedResponse const&, bool, rut::CompleteContentLengthContentTypeView*)
+     2.06%  rut      rut                [.] rut::IoUringEventLoop::prepare_response_read_deadline_batch(rut::IoEvent const*, unsigned int)
+     1.75%  rut      rut                [.] rut::complete_content_length_parsed_header_matches(rut::ConnectionBase const&, rut::ParsedResponse const&, unsigned int, rut::CompleteContentLengthResponseClassification*)
+     1.47%  rut      rut                [.] rut::HttpParser::parse(unsigned char const*, unsigned int, rut::ParsedRequest*)
+     1.47%  rut      rut                [.] void rut::handle_jit_outcome<rut::IoUringEventLoop>(rut::IoUringEventLoop*, rut::ConnectionBase&, rut::JitDispatchOutcome, unsigned long (*)(void*, rut::jit::HandlerCtx*, unsigned char const*, unsigned int, void*), bool, rut::RouteEntry const*)
+     1.19%  rut      rut                [.] rut::apply_request_policy(rut::ConnectionBase&, sockaddr_in const&, unsigned short)
+     1.04%  rut      rut                [.] rut::IoUringEventLoop::settle_response_read_deadline_batch()
+     1.01%  rut      rut                [.] rut::IoUringEventLoop::poll_command()
+     0.96%  rut      rut                [.] rut::inspect_request_policy_body(rut::ConnectionBase const&, unsigned short)
+     0.90%  rut      libc.so.6          [.] clock_gettime@@GLIBC_2.17
+     0.88%  rut      rut                [.] rut::IoUringEventLoop::response_read_deadline_identity_is_stable(rut::ConnectionBase const&) const
+     0.79%  rut      rut                [.] rut::RouteConfig::timeout_failure_policy_id_is_valid(unsigned short) const
+     0.77%  rut      rut                [.] void rut::on_header_received<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+     0.76%  rut      rut                [.] rut::classify_complete_content_length_response(rut::ParsedResponse const&)
+     0.65%  rut      rut                [.] void rut::on_upstream_response<rut::IoUringEventLoop>(void*, rut::ConnectionBase&, rut::IoEvent)
+     0.64%  rut      rut                [.] rut::complete_content_length_pinned_header_is_stable(rut::ConnectionBase const&)
+     0.60%  rut      [vdso]             [.] 0x0000000000000932
+     0.59%  rut      rut                [.] rut::classify_response_read_deadline_profile(rut::ConnectionBase const&, rut::ForwardResponsePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardFailurePolicySpec const&, rut::ForwardResponseBufferingMode, unsigned short)
+     0.59%  rut      libc.so.6          [.] __strlen_avx2
+     0.57%  rut      rut                [.] rut::IoUringEventLoop::consume_response_read_deadline_send_event(rut::ConnectionBase&, rut::IoEvent const&)
+     0.57%  rut      rut                [.] rut::build_strict_response_headers(rut::ConnectionBase&, rut::RouteConfig const&, rut::ParsedResponse const&, rut::Http1PrebuiltResponsePurpose, bool)
+     0.56%  rut      rut                [.] rut::IoUringEventLoop::run()
+     0.55%  rut      libc.so.6          [.] syscall
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

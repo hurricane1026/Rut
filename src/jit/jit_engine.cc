@@ -3,6 +3,8 @@
 #include "rut/jit/runtime_helpers.h"
 
 #include <llvm-c/Analysis.h>
+#include <llvm-c/BitReader.h>
+#include <llvm-c/BitWriter.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/LLJIT.h>
@@ -344,6 +346,63 @@ static void optimize_module(const char* triple, LLVMModuleRef mod, OptLevel leve
         // log_error consumes the error via LLVMGetErrorMessage.
         log_error("jit: optimization pipeline failed (continuing unoptimized)", perr);
     }
+}
+
+void dispose_module(LLVMModuleRef mod, LLVMContextRef ctx) {
+    if (mod) LLVMDisposeModule(mod);
+    if (ctx) LLVMContextDispose(ctx);
+}
+
+bool copy_native_module(LLVMModuleRef source, LLVMModuleRef& copy, LLVMContextRef& context) {
+    auto bitcode = LLVMWriteBitcodeToMemoryBuffer(source);
+    context = LLVMContextCreate();
+    bool ok = bitcode && context && !LLVMParseBitcodeInContext2(context, bitcode, &copy);
+    if (bitcode) LLVMDisposeMemoryBuffer(bitcode);
+    if (!ok) {
+        dispose_module(copy, context);
+        copy = nullptr;
+        context = nullptr;
+    }
+    return ok;
+}
+
+bool emit_native_object(LLVMModuleRef mod, const char* output, OptLevel level) {
+    LLVMInitializeNativeTarget();
+    LLVMInitializeNativeAsmPrinter();
+    char* triple = LLVMGetDefaultTargetTriple();
+    LLVMTargetRef target = nullptr;
+    char* error = nullptr;
+    if (LLVMGetTargetFromTriple(triple, &target, &error)) {
+        if (error) LLVMDisposeMessage(error);
+        LLVMDisposeMessage(triple);
+        return false;
+    }
+    char* cpu = LLVMGetHostCPUName();
+    char* features = LLVMGetHostCPUFeatures();
+    auto tm = LLVMCreateTargetMachine(
+        target, triple, cpu, features, LLVMCodeGenLevelDefault, LLVMRelocPIC, LLVMCodeModelSmall);
+    LLVMDisposeMessage(cpu);
+    LLVMDisposeMessage(features);
+    if (!tm) {
+        LLVMDisposeMessage(triple);
+        return false;
+    }
+    LLVMSetTarget(mod, triple);
+    auto layout = LLVMCreateTargetDataLayout(tm);
+    char* layout_str = LLVMCopyStringRepOfTargetData(layout);
+    LLVMSetDataLayout(mod, layout_str);
+    LLVMDisposeMessage(layout_str);
+    LLVMDisposeTargetData(layout);
+    optimize_module(triple, mod, level);
+    LLVMDisposeMessage(triple);
+    bool ok =
+        !LLVMTargetMachineEmitToFile(tm, mod, const_cast<char*>(output), LLVMObjectFile, &error);
+    if (error) {
+        (void)::write(2, error, strlen(error));
+        LLVMDisposeMessage(error);
+    }
+    LLVMDisposeTargetMachine(tm);
+    return ok;
 }
 
 bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {

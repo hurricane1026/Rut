@@ -6618,7 +6618,26 @@ $ rut --emit-rir gateway.rut
 
 ### 11.2 LLVM Dependency Management
 
-LLVM is the heaviest dependency. Strategies:
+LLVM is the heaviest dependency. The implemented production startup path
+separates compilation from serving: `rut` executes its sibling `rut-compile`,
+which uses the existing frontend/RIR verification and LLVM backend to emit a
+PIC native image containing handlers, configuration bytes, symbolic pointer
+relocations and serialized Vectorscan databases. It sends the image through a
+pipe with a protocol version and source/build fingerprint. The LLVM-free server
+rejects mismatched compiler builds, receives the image into a sealed anonymous
+memfd on Linux and loads it through `/proc/self/fd`. No shared object is retained
+or deployed as a versioned artifact. The compiler removes its private linker
+files and exits before shards start. The server resolves runtime helpers,
+restores owned byte views, rebuilds route indices and recreates large-body
+memfds. Its program owner retains code/configuration until all shards join;
+Cache publication remains a separate activation step.
+
+This is a private same-build, host-CPU artifact ABI. Startup currently requires
+the configured C compiler driver/linker on the compiler host. Offline simulation
+and the deterministic harness retain the in-process ORC loader. Mesh artifact
+distribution and live reload remain design work.
+
+LLVM linking strategies below apply to the compiler process:
 
 | Strategy | Binary Size | Notes |
 |----------|-------------|-------|
@@ -6627,7 +6646,9 @@ LLVM is the heaviest dependency. Strategies:
 | Replace with Cranelift (via C API) | ~3MB | Lighter, faster compile, Rust FFI |
 | Custom bytecode VM | 0 external deps | Lower performance ceiling |
 
-Recommended: start with LLVM ORC JIT (dynamic link), consider Cranelift if LLVM proves too heavy.
+The compiler currently uses LLVM ORC JIT for verified handler registration and
+LLVM native object emission for the serving artifact. The server does not link
+`libLLVM`; changing compiler backends is a separate future option.
 
 ### 11.3 C++ Integration API
 

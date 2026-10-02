@@ -1,7 +1,8 @@
 #pragma once
 
-// Control-plane bridge: compile a `.rut` source file end to end and
-// produce a RouteConfig the shards can serve.
+// Compiler/harness bridge: compile a `.rut` source file end to end and
+// produce a verified RouteConfig. Production invokes this in rut-compile;
+// the serving process uses native_program.h and never owns this structure.
 //
 // This is the seam that connects the three otherwise-separate halves of
 // the project — the frontend (lex/parse/analyze), the JIT backend
@@ -69,6 +70,8 @@ struct LoadedProgram {
     FrontendRirModule rir;  // owns the lowered module + its arena
     jit::JitEngine engine;  // owns the native handler code
     bool jit_inited = false;
+    LLVMContextRef native_context = nullptr;
+    LLVMModuleRef native_module = nullptr;  // optional relocatable artifact, compiler process only
     // Immutable process-start listener metadata copied out of HIR before the
     // temporary frontend modules are released. It is intentionally separate
     // from RouteConfig, which participates in route hot reload.
@@ -94,7 +97,10 @@ bool load_rut_program(const char* path,
                       LoadedProgram& out,
                       LoadError& err,
                       jit::OptLevel opt = jit::OptLevel::O2,
-                      u64 max_source_bytes = ~u64{0});
+                      u64 max_source_bytes = ~u64{0},
+                      bool retain_native_module = false);
+
+bool write_native_program(LoadedProgram& program, const char* output);
 
 // Publish the program's Cache descriptors as part of installing its
 // RouteConfig. Compilation alone never mutates the live Cache registry;

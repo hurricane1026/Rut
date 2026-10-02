@@ -5,28 +5,38 @@ program with it.
 
 ## The execution model (read this first)
 
-Rut does **not** compile a `.rut` file into a standalone executable.
-There is one executable — the `rut` server binary — and your program is
-the `.rut` file it loads at startup:
+The `rut` server loads a `.rut` file at startup. Compilation runs in the
+sibling `rut-compile` process; the serving process does not link or load LLVM.
 
 ```
-rut  +  app.rut   ─►   lex → parse → type-check → RIR → LLVM IR → ORC JIT → native handlers
-(binary)  (your program)                                                         │
-                                                                                 ▼
-                                                              per-core shards serve traffic
+app.rut → rut-compile: frontend → RIR → LLVM → native code/config → pipe
+                                                    ↓ compiler exits
+          rut: load native code, rebuild route indices → shards serve traffic
 ```
 
-The handlers are JIT-compiled into native code **in memory at startup**,
-not ahead of time. So:
+The compiler streams native handlers, owned configuration bytes and serialized
+Vectorscan databases through a pipe. On Linux, `rut` receives the native image
+into a sealed anonymous memfd and loads it through `/proc/self/fd`; the descriptor
+and code remain owned until all shards join. There is no `.so` to version,
+retain or deploy. The compiler uses private temporary linker files and removes
+them before exiting. macOS uses an immediately unlinked temporary load file.
+No source, RIR or LLVM engine is retained in the serving process.
 
-- The thing you ship/run is the `rut` binary plus a `.rut` file.
-- There is currently **no** `rut build app.rut -o app` AOT command, and
-  no "compile to a self-contained binary" mode.
-- The mesh-mode AOT path from DESIGN.md (control plane compiles `.rut`
-  to a distributable `.so`) is **not implemented yet**.
+The stream carries a protocol version and source/build-configuration fingerprint;
+`rut` rejects a mismatched `rut-compile` before loading any native code.
 
-If you were looking for "how do I produce an executable from my `.rut`":
-the answer today is "you don't — you run `rut your.rut`".
+- Ship `rut` and the matching `rut-compile` in the same directory, plus the
+  `.rut` source and its imports.
+- The startup host needs the compiler's LLVM dependencies and the C compiler
+  driver/linker recorded by CMake (`CMAKE_C_COMPILER`). These run only during
+  compilation. Vectorscan's compiler is also confined to `rut-compile`.
+- `--opt 0..3` still controls handler optimization. `--compile PATH` makes
+  automatic compilation explicit; the positional source path remains supported.
+  There is no new language syntax.
+- The artifact is a private ABI for the same build and host CPU. There is
+  still no `rut build app.rut -o app` standalone executable command or
+  mesh distribution/hot-reload protocol. `rut-compile` is an internal startup
+  helper with binary stdout, not a persistent artifact distribution API.
 
 ## 1. Build the `rut` binary
 
@@ -41,10 +51,11 @@ cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++
 ninja -C build
 ```
 
-This produces the server binary at:
+This produces the server and its compiler at:
 
 ```
 build/src/rut
+build/src/rut-compile
 ```
 
 For production, build a Release with link-time optimization (cross-module
@@ -103,7 +114,7 @@ Notes:
 
 ## 3. Run it
 
-Pass the `.rut` path as a positional argument. A source file may declare one
+Pass the `.rut` path with `--compile` or as a positional argument. A source file may declare one
 cleartext IPv4 wildcard listener, for example `listen :8080`; port `0` is
 allowed for an ephemeral test listener:
 
@@ -113,12 +124,15 @@ route GET "/health" { return 200 }
 ```
 
 ```bash
+./build/src/rut --compile app.rut --shards 4
+# The positional form remains supported:
 ./build/src/rut app.rut
 ```
 
 `rut` will:
 
-1. compile and JIT `app.rut` (prints `Loaded program: app.rut`),
+1. start its sibling `rut-compile`, receive the native program over a pipe,
+   wait for the compiler to exit, and load the program (prints `Loaded program: app.rut`),
 2. pick an I/O backend (io_uring if available, else epoll),
 3. spin up one share-nothing shard per CPU core,
 4. listen on the source-declared port, or the explicit CLI port/default 8080
@@ -147,9 +161,7 @@ gracefully before exiting.
 |---|---|---|
 | `<port>` (positional) | Listen port (`0` = ephemeral) | `8080` |
 | `<path.rut>` (positional) | Program to load and serve | none (route-less) |
-
-The positional CLI port is optional when the source declares `listen :<port>`;
-without either declaration the listener defaults to `:8080`.
+| `--compile PATH` | Compile and serve a program using the managed compiler subprocess | none |
 | `--shards N` | Number of per-core shards | auto (CPU count) |
 | `--no-pin` | Do not pin shard threads to CPUs | pin on |
 | `--drain N` | Graceful drain window, seconds | `30` |
@@ -161,6 +173,11 @@ without either declaration the listener defaults to `:8080`.
 | `--access-log PATH` | Write access logs to PATH | off |
 | `--access-log-compress` | zstd-compress access logs | off |
 | `--access-log-level N` | Access log verbosity | build default |
+
+The positional CLI port is optional when the source declares `listen :<port>`;
+without either declaration the listener defaults to `:8080`.
+Both program forms manage compilation automatically; users never need to invoke
+`rut-compile` or manage its generated native image themselves.
 
 `--tls-cert`/`--tls-key` must be given together. With TLS enabled the
 server uses the epoll backend.

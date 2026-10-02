@@ -3480,6 +3480,25 @@ if(RUT_ENABLE_JIT)
     add_test(NAME test_jit COMMAND test_jit)
     set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
 
+    add_executable(test_native_program test_native_program.cc)
+    target_link_libraries(test_native_program rut_native_loader)
+    target_include_directories(test_native_program PRIVATE ${PROJECT_SOURCE_DIR}/testing)
+    set_target_properties(test_native_program PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/src" ENABLE_EXPORTS ON)
+    if(APPLE)
+        target_link_options(test_native_program PRIVATE -Wl,-export_dynamic)
+    endif()
+    add_dependencies(test_native_program rut-compile)
+    add_test(NAME test_native_program COMMAND test_native_program)
+    set_tests_properties(test_native_program PROPERTIES LABELS "unit;jit")
+
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME test_native_protocol
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test_native_protocol.py
+                --server $<TARGET_FILE:rut> --compiler $<TARGET_FILE:rut-compile>)
+        set_tests_properties(test_native_protocol PROPERTIES LABELS "unit;jit" TIMEOUT 30)
+    endif()
+
     # Exercise the same reusable loader library linked by rut and SourceTarget.
     add_executable(test_serve_loader test_serve_loader.cc)
     target_link_libraries(test_serve_loader rut_loader rut_nginx)

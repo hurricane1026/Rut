@@ -1,0 +1,4 @@
+#pragma once
+namespace rut::native {
+inline constexpr char kBuildId[] = "@RUT_NATIVE_BUILD_ID@";
+}

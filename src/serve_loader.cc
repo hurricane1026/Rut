@@ -10,6 +10,7 @@
 #include "rut/jit/codegen.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/compile_to_config.h"
+#include "rut/runtime/response_body_files.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/slice_pool.h"    // SlicePool::kSliceSize (terminate cap)
 #include "rut/runtime/ws_frame.h"      // kWsMaxHeaderSize
@@ -29,44 +30,13 @@ namespace {
 // sendfile() it: the socket then takes page-cache pages instead of a
 // user-space copy per response. Best effort — a body without a file keeps
 // the ordinary memory send.
-void attach_response_body_files(RouteConfig& cfg) {
-#ifndef __linux__
-    (void)cfg;  // memfd/sendfile are Linux-only; bodies keep memory sends.
-#else
-    for (u32 i = 0; i < cfg.response_body_count; ++i) {
-        auto& body = cfg.response_bodies[i];
-        if (body.file_ref != 0 || body.len < RouteConfig::kFileBodyMinLen) continue;
-        const int fd = memfd_create("rut-response-body", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        if (fd < 0) continue;
-        u32 done = 0;
-        while (done < body.len) {
-            const ssize_t n = ::write(fd, body.data + done, body.len - done);
-            if (n <= 0) break;
-            done += static_cast<u32>(n);
-        }
-        if (done != body.len ||
-            fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) != 0) {
-            ::close(fd);
-            continue;
-        }
-        body.file_ref = static_cast<u32>(fd) + 1u;
-    }
-#endif
-}
-
-void close_response_body_files(RouteConfig& cfg) {
-    for (u32 i = 0; i < cfg.response_body_count; ++i) {
-        auto& body = cfg.response_bodies[i];
-        if (body.file_ref == 0) continue;
-        ::close(body.file_fd());
-        body.file_ref = 0;
-    }
-}
-
 }  // namespace
 
 void LoadedProgram::destroy() {
     (void)cache_registry_unpublish_if_owner(this);
+    jit::dispose_module(native_module, native_context);
+    native_module = nullptr;
+    native_context = nullptr;
     if (jit_inited) {
         engine.shutdown();
         jit_inited = false;
@@ -201,8 +171,12 @@ bool copy_access_log_sink(const HirModule& hir, Str source, AccessLogSinkSpec& o
 
 }  // namespace
 
-bool load_rut_program(
-    const char* path, LoadedProgram& out, LoadError& err, jit::OptLevel opt, u64 max_source_bytes) {
+bool load_rut_program(const char* path,
+                      LoadedProgram& out,
+                      LoadError& err,
+                      jit::OptLevel opt,
+                      u64 max_source_bytes,
+                      bool retain_native_module) {
     err = LoadError{};
     out.has_listener = false;
     out.listener = ListenerSpec{};
@@ -328,6 +302,15 @@ bool load_rut_program(
         }
     }
 #endif
+
+    if (retain_native_module) {
+        // A separate context keeps the artifact valid even when compile()
+        // rejects the original module and disposes its context.
+        if (!jit::copy_native_module(cg.mod, out.native_module, out.native_context)) {
+            jit::dispose_module(cg.mod, cg.ctx);
+            return false;
+        }
+    }
 
     err.stage = LoadStage::JitCompile;
     if (!out.engine.init()) return false;

@@ -1,0 +1,201 @@
+[
+  {
+    "case": "http-65536-proxy-keepalive",
+    "concurrency": 1,
+    "pid": 4158742,
+    "command": [
+      "/home/hurricane/private/code/Rut/.cache/perf-tools/perf/usr/bin/perf",
+      "record",
+      "-e",
+      "cycles:u",
+      "-F",
+      "997",
+      "-p",
+      "4158742",
+      "-o",
+      "/tmp/rut-nginx-20261002/profiles/http-65536-proxy-keepalive-c1/perf.data",
+      "--",
+      "sleep",
+      "22"
+    ],
+    "perf_exit_code": 0,
+    "report_exit_code": 0,
+    "before": {
+      "utime": 30,
+      "stime": 102,
+      "minflt": 57416,
+      "rss_pages": 24054
+    },
+    "after": {
+      "utime": 282,
+      "stime": 1061,
+      "minflt": 57416,
+      "rss_pages": 24054
+    },
+    "note": "Separate instrumented diagnosis; do not use its throughput as acceptance evidence.",
+    "user_cpu_seconds": 2.52,
+    "system_cpu_seconds": 9.59,
+    "user_fraction": 0.20809248554913296,
+    "report": "profiles-http-65536-proxy-keepalive-c1.txt"
+  },
+  {
+    "case": "http-1048576-proxy-close",
+    "concurrency": 32,
+    "pid": 4158875,
+    "command": [
+      "/home/hurricane/private/code/Rut/.cache/perf-tools/perf/usr/bin/perf",
+      "record",
+      "-e",
+      "cycles:u",
+      "-F",
+      "997",
+      "-p",
+      "4158875",
+      "-o",
+      "/tmp/rut-nginx-20261002/profiles/http-1048576-proxy-close-c32/perf.data",
+      "--",
+      "sleep",
+      "22"
+    ],
+    "perf_exit_code": 0,
+    "report_exit_code": 0,
+    "before": {
+      "utime": 38,
+      "stime": 137,
+      "minflt": 334897,
+      "rss_pages": 28831
+    },
+    "after": {
+      "utime": 397,
+      "stime": 1365,
+      "minflt": 2514320,
+      "rss_pages": 28845
+    },
+    "note": "Separate instrumented diagnosis; do not use its throughput as acceptance evidence.",
+    "user_cpu_seconds": 3.59,
+    "system_cpu_seconds": 12.28,
+    "user_fraction": 0.2262129804662886,
+    "report": "profiles-http-1048576-proxy-close-c32.txt"
+  },
+  {
+    "case": "http-1048576-static-keepalive",
+    "concurrency": 32,
+    "pid": 4158944,
+    "command": [
+      "/home/hurricane/private/code/Rut/.cache/perf-tools/perf/usr/bin/perf",
+      "record",
+      "-e",
+      "cycles:u",
+      "-F",
+      "997",
+      "-p",
+      "4158944",
+      "-o",
+      "/tmp/rut-nginx-20261002/profiles/http-1048576-static-keepalive-c32/perf.data",
+      "--",
+      "sleep",
+      "22"
+    ],
+    "perf_exit_code": 0,
+    "report_exit_code": 0,
+    "before": {
+      "utime": 4,
+      "stime": 72,
+      "minflt": 52685,
+      "rss_pages": 19867
+    },
+    "after": {
+      "utime": 39,
+      "stime": 738,
+      "minflt": 52685,
+      "rss_pages": 19867
+    },
+    "note": "Separate instrumented diagnosis; do not use its throughput as acceptance evidence.",
+    "user_cpu_seconds": 0.35,
+    "system_cpu_seconds": 6.66,
+    "user_fraction": 0.04992867332382311,
+    "report": "profiles-http-1048576-static-keepalive-c32.txt"
+  },
+  {
+    "case": "http-1048576-proxy-close",
+    "concurrency": 32,
+    "pid": 4159054,
+    "command": [
+      "/home/hurricane/private/code/Rut/.cache/perf-tools/perf/usr/bin/perf",
+      "record",
+      "-e",
+      "cycles:u",
+      "-F",
+      "499",
+      "--call-graph",
+      "dwarf,8192",
+      "-p",
+      "4159054",
+      "-o",
+      "/tmp/rut-nginx-20261002/profiles-callers/http-1048576-proxy-close-c32/perf.data",
+      "--",
+      "sleep",
+      "22"
+    ],
+    "perf_exit_code": 0,
+    "report_exit_code": 0,
+    "before": {
+      "utime": 39,
+      "stime": 133,
+      "minflt": 340285,
+      "rss_pages": 29948
+    },
+    "after": {
+      "utime": 407,
+      "stime": 1344,
+      "minflt": 2112421,
+      "rss_pages": 28803
+    },
+    "note": "Separate instrumented diagnosis; do not use its throughput as acceptance evidence.",
+    "user_cpu_seconds": 3.68,
+    "system_cpu_seconds": 12.11,
+    "user_fraction": 0.2330588980367321,
+    "report": "profiles-callers-http-1048576-proxy-close-c32.txt"
+  },
+  {
+    "case": "http-1048576-static-keepalive",
+    "concurrency": 32,
+    "pid": 4159151,
+    "command": [
+      "/home/hurricane/private/code/Rut/.cache/perf-tools/perf/usr/bin/perf",
+      "record",
+      "-e",
+      "cycles:u",
+      "-F",
+      "499",
+      "--call-graph",
+      "dwarf,8192",
+      "-p",
+      "4159151",
+      "-o",
+      "/tmp/rut-nginx-20261002/profiles-callers/http-1048576-static-keepalive-c32/perf.data",
+      "--",
+      "sleep",
+      "22"
+    ],
+    "perf_exit_code": 0,
+    "report_exit_code": 0,
+    "before": {
+      "utime": 5,
+      "stime": 72,
+      "minflt": 52687,
+      "rss_pages": 19881
+    },
+    "after": {
+      "utime": 38,
+      "stime": 713,
+      "minflt": 52687,
+      "rss_pages": 19881
+    },
+    "note": "Separate instrumented diagnosis; do not use its throughput as acceptance evidence.",
+    "user_cpu_seconds": 0.33,
+    "system_cpu_seconds": 6.41,
+    "user_fraction": 0.04896142433234421,
+    "report": "profiles-callers-http-1048576-static-keepalive-c32.txt"
+  }
+]

@@ -137,6 +137,12 @@ void* rut_helper_regex_compile(const char* pattern, rut::u32 pattern_len);
 const char* rut_helper_regex_last_compile_error();
 void rut_helper_regex_free(void* db);
 
+// Startup artifact support. adopt takes ownership of an hs_database_t even
+// on failure; serialized bytes use Vectorscan's existing miscellaneous allocator.
+void* rut_helper_regex_adopt(void* database);
+bool rut_helper_regex_serialize(void* db, char** bytes, rut::u64* length);
+void* rut_helper_regex_deserialize(const char* bytes, rut::u64 length);
+
 // Full regular-expression match using a precompiled database.
 rut::u8 rut_helper_str_regex_match(const char* s, rut::u32 s_len, void* db);
 

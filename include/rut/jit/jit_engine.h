@@ -24,6 +24,11 @@ enum class OptLevel : u8 {
     O3 = 3,
 };
 
+bool copy_native_module(LLVMModuleRef source, LLVMModuleRef& copy, LLVMContextRef& context);
+void dispose_module(LLVMModuleRef mod, LLVMContextRef ctx);
+
+bool emit_native_object(LLVMModuleRef mod, const char* output, OptLevel level);
+
 // ── JIT Engine ─────────────────────────────────────────────────────
 // Wraps LLVM ORC LLJIT via the C API. Compiles LLVM IR modules to
 // native code and resolves symbols (including runtime helpers).

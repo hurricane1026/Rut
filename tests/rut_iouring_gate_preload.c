@@ -326,6 +326,16 @@ __attribute__((constructor)) static void initialize(void) {
     }
     target_process = exact_target_executable();
     if (!target_process) {
+        // Compilation runs in a child of the instrumented server. Its LLVM
+        // and linker processes must not mutate the server's ring gate.
+        // Keep a mismatched top-level executable fail-closed as before.
+        if (gate->target_pid != 0 && (uint32_t)getppid() == gate->target_pid) {
+            unsetenv("RUT_IOURING_GATE_CONTROL");
+            (void)rut_gate_kernel_syscall(
+                SYS_munmap, (unsigned long)gate, sizeof(*gate), 0, 0, 0, 0);
+            gate = 0;
+            return;
+        }
         fail(RUT_IOURING_GATE_ERROR_TARGET);
         return;
     }

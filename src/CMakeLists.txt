@@ -358,14 +358,39 @@ if(RUT_ENABLE_JIT)
     unset(_RUT_SAVE_RULE_LAUNCH_COMPILE)
     unset(_RUT_SAVE_RULE_LAUNCH_LINK)
 
+    # A source/configuration fingerprint prevents mixing compiler and server builds.
+    file(GLOB_RECURSE _RUT_NATIVE_ABI_FILES CONFIGURE_DEPENDS
+        "${PROJECT_SOURCE_DIR}/src/*.cc" "${PROJECT_SOURCE_DIR}/include/rut/*.h")
+    list(APPEND _RUT_NATIVE_ABI_FILES "${PROJECT_SOURCE_DIR}/CMakeLists.txt"
+        "${PROJECT_SOURCE_DIR}/src/CMakeLists.txt")
+    list(SORT _RUT_NATIVE_ABI_FILES)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_RUT_NATIVE_ABI_FILES})
+    set(_RUT_NATIVE_ABI_INPUT "${CMAKE_SYSTEM_PROCESSOR};${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_BUILD_TYPE};${CMAKE_CXX_FLAGS};${LLVM_PACKAGE_VERSION};${RUT_ENABLE_WEBSOCKET}")
+    foreach(_RUT_NATIVE_ABI_FILE IN LISTS _RUT_NATIVE_ABI_FILES)
+        file(SHA256 "${_RUT_NATIVE_ABI_FILE}" _RUT_NATIVE_ABI_HASH)
+        string(APPEND _RUT_NATIVE_ABI_INPUT "${_RUT_NATIVE_ABI_HASH};")
+    endforeach()
+    string(SHA256 RUT_NATIVE_BUILD_ID "${_RUT_NATIVE_ABI_INPUT}")
+    configure_file("${PROJECT_SOURCE_DIR}/include/rut/native_build_id.h.in"
+        "${PROJECT_BINARY_DIR}/generated/rut/native_build_id.h" @ONLY)
+
+    # Native handler helpers are shared by the compiler and LLVM-free server.
+    add_library(rut_native_helpers STATIC jit/runtime_helpers.cc)
+    target_include_directories(rut_native_helpers PUBLIC ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/third_party/vectorscan/src
+        ${PROJECT_BINARY_DIR}/src/third_party/vectorscan
+        ${PROJECT_SOURCE_DIR}/third_party/vectorscan/include)
+    target_link_libraries(rut_native_helpers PUBLIC rut_runtime hs_runtime)
+
     # JIT library — LLVM ORC JIT integration via C API.
     # Only this library links LLVM. rut_runtime stays LLVM-free so shard
     # threads never transitively depend on LLVM headers or libraries.
     add_library(rut_jit STATIC
         jit/jit_engine.cc
+        jit/regex_compile.cc
+        jit/native_artifact.cc
         jit/codegen.cc
         jit/art_jit_codegen.cc
-        jit/runtime_helpers.cc
     )
 
     target_include_directories(rut_jit PUBLIC
@@ -387,17 +412,21 @@ if(RUT_ENABLE_JIT)
         # `target` provides TargetMachine creation. Required for static LLVM
         # installs where these aren't pulled in transitively.
         llvm_map_components_to_libnames(LLVM_LIBS
-            core orcjit orcshared orctargetprocess native support passes target)
+            core bitreader bitwriter orcjit orcshared orctargetprocess native support passes target)
     endif()
     target_link_libraries(rut_jit ${LLVM_LIBS})
 
     # JIT .cc files may need LLVM definitions that conflict with -fno-rtti.
     # The LLVM C API is pure C so no RTTI issues, but LLVM's cmake may add
     # -fno-rtti to definitions. Add LLVM definitions selectively.
-    target_compile_definitions(rut_jit PRIVATE ${LLVM_DEFINITIONS})
+    get_filename_component(RUT_NATIVE_LINKER_DIR "${CMAKE_LINKER}" DIRECTORY)
+    target_compile_definitions(rut_jit PRIVATE ${LLVM_DEFINITIONS}
+        RUT_NATIVE_LINKER="${CMAKE_C_COMPILER}"
+        RUT_NATIVE_LINKER_DIR="${RUT_NATIVE_LINKER_DIR}/")
+    target_include_directories(rut_jit PRIVATE ${PROJECT_BINARY_DIR}/generated)
 
-    # rut_jit also links rut_runtime for runtime_helpers (uses HttpParser, Connection)
-    target_link_libraries(rut_jit rut_runtime hs)
+    # Native helpers use the runtime; regex compilation remains compiler-only.
+    target_link_libraries(rut_jit rut_native_helpers hs)
     target_include_directories(rut_compiler PRIVATE
         ${PROJECT_SOURCE_DIR}/third_party/vectorscan/src
         ${PROJECT_BINARY_DIR}/src/third_party/vectorscan
@@ -406,12 +435,12 @@ if(RUT_ENABLE_JIT)
     target_compile_definitions(rut_compiler PUBLIC RUT_VALIDATE_REGEX_WITH_VECTORSCAN=1)
     target_link_libraries(rut_compiler PUBLIC hs)
 
-    # Production source -> JIT/RouteConfig ownership bridge. Keep it reusable:
-    # the server and project harness must compile targets through the same path.
+    # Compiler process and offline harness share source validation and lowering.
     add_library(rut_loader STATIC
         serve_loader.cc
     )
     target_include_directories(rut_loader PUBLIC
+        ${PROJECT_BINARY_DIR}/generated
         ${PROJECT_SOURCE_DIR}/include
         ${LLVM_INCLUDE_DIRS}
     )
@@ -422,6 +451,13 @@ if(RUT_ENABLE_JIT)
         rut_compiler
         rut_jit
     )
+
+    add_executable(rut-compile compile_main.cc)
+    target_link_libraries(rut-compile rut_loader)
+    add_library(rut_native_loader STATIC native_program.cc)
+    target_include_directories(rut_native_loader PUBLIC ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_BINARY_DIR}/generated)
+    target_link_libraries(rut_native_loader PUBLIC rut_native_helpers ${CMAKE_DL_LIBS})
 
     add_library(rut_harness_runtime STATIC
         harness/connection_execution.cc
@@ -469,14 +505,20 @@ endif()
 add_executable(rut main.cc)
 target_link_libraries(rut
     rut_runtime
-    rut_compiler
 )
 
-# When the JIT is built, the server can compile and serve a .rut program
-# end to end. serve_loader.cc bridges frontend → JIT → RouteConfig; it
-# pulls in rut_jit (and thus LLVM). Without the JIT the binary still
-# builds and runs, just without program loading.
+# Source loading executes the sibling compiler and loads its native artifact.
+# Only rut-compile (and offline compiler tools/tests) link LLVM.
+# Without compiler support, rut still builds and serves default routes.
 if(RUT_ENABLE_JIT)
-    target_link_libraries(rut rut_loader)
+    target_link_libraries(rut rut_native_loader)
+    set_target_properties(rut PROPERTIES ENABLE_EXPORTS ON)
+    if(APPLE)
+        # Darwin's ENABLE_EXPORTS does not retain/export symbols pulled from
+        # static archives consistently. Native handlers are resolved by the
+        # sibling artifact through the serving executable.
+        target_link_options(rut PRIVATE -Wl,-export_dynamic)
+    endif()
+    add_dependencies(rut rut-compile)
     target_compile_definitions(rut PRIVATE RUT_ENABLE_JIT=1)
 endif()

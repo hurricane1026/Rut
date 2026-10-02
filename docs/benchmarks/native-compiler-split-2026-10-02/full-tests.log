@@ -1,0 +1,1342 @@
+Test project /home/hurricane/private/code/Rut/build
+        Start 255: test_jit
+        Start 257: test_serve_loader
+        Start  34: test_io_uring_memlock
+        Start   1: test_framework
+  1/263 Test  #34: test_io_uring_memlock ......................................................................................   Passed    0.00 sec
+        Start   2: test_framework_sharding
+  2/263 Test   #1: test_framework .............................................................................................   Passed    0.01 sec
+        Start  10: test_fixture_exact_input_file_lease
+  3/263 Test  #10: test_fixture_exact_input_file_lease ........................................................................   Passed    0.00 sec
+        Start  14: test_fixture_direct_launch
+  4/263 Test  #14: test_fixture_direct_launch .................................................................................   Passed    0.00 sec
+        Start  16: test_fixture_privileged_listener
+  5/263 Test  #16: test_fixture_privileged_listener ...........................................................................   Passed    0.00 sec
+        Start  17: test_fixture_wildcard_source_lease
+  6/263 Test  #17: test_fixture_wildcard_source_lease .........................................................................   Passed    0.00 sec
+        Start  19: test_fixture_anonymous_log_capture
+  7/263 Test   #2: test_framework_sharding ....................................................................................   Passed    0.03 sec
+        Start  25: test_fixture_privileged_listener_loader
+  8/263 Test  #19: test_fixture_anonymous_log_capture .........................................................................   Passed    0.01 sec
+        Start  26: test_exact_path_view
+  9/263 Test  #26: test_exact_path_view .......................................................................................   Passed    0.00 sec
+        Start  27: test_network
+ 10/263 Test  #25: test_fixture_privileged_listener_loader ....................................................................   Passed    0.10 sec
+        Start  28: test_target_transform
+ 11/263 Test  #28: test_target_transform ......................................................................................   Passed    0.01 sec
+        Start  29: test_redirect_policy
+ 12/263 Test  #29: test_redirect_policy .......................................................................................   Passed    0.24 sec
+        Start  30: test_routing_corpus
+ 13/263 Test #257: test_serve_loader ..........................................................................................   Passed    5.66 sec
+        Start  31: test_cli_sigpipe
+ 14/263 Test  #31: test_cli_sigpipe ...........................................................................................   Passed    0.02 sec
+        Start  35: test_integration.shard_0_of_2
+ 15/263 Test  #30: test_routing_corpus ........................................................................................   Passed   14.65 sec
+        Start  37: test_arena
+ 16/263 Test  #37: test_arena .................................................................................................   Passed    0.01 sec
+        Start  38: test_expected
+ 17/263 Test  #38: test_expected ..............................................................................................   Passed    0.04 sec
+        Start  39: test_http_parser
+ 18/263 Test  #39: test_http_parser ...........................................................................................   Passed    0.00 sec
+        Start  40: test_http2
+ 19/263 Test  #40: test_http2 .................................................................................................   Passed    0.00 sec
+        Start  41: test_hpack
+ 20/263 Test  #41: test_hpack .................................................................................................   Passed    0.00 sec
+        Start  42: test_ws_frame
+ 21/263 Test  #42: test_ws_frame ..............................................................................................   Passed    0.00 sec
+        Start  43: test_ws_terminate
+ 22/263 Test  #43: test_ws_terminate ..........................................................................................   Passed    0.00 sec
+        Start  44: test_hpack_diff
+ 23/263 Test  #44: test_hpack_diff ............................................................................................   Passed    0.00 sec
+        Start  45: test_http2_conn
+ 24/263 Test  #45: test_http2_conn ............................................................................................   Passed    0.01 sec
+        Start  46: test_chunked_parser
+ 25/263 Test  #46: test_chunked_parser ........................................................................................   Passed    0.00 sec
+        Start  47: test_buffer
+ 26/263 Test  #47: test_buffer ................................................................................................   Passed    0.00 sec
+        Start  48: test_cache_table
+ 27/263 Test  #48: test_cache_table ...........................................................................................   Passed    0.00 sec
+        Start  49: test_types
+ 28/263 Test  #49: test_types .................................................................................................   Passed    0.00 sec
+        Start  50: test_route_trie
+ 29/263 Test  #50: test_route_trie ............................................................................................   Passed    0.00 sec
+        Start  51: test_route_art
+ 30/263 Test  #51: test_route_art .............................................................................................   Passed    0.03 sec
+        Start  52: test_route_select
+ 31/263 Test  #52: test_route_select ..........................................................................................   Passed    0.00 sec
+        Start  53: test_rir
+ 32/263 Test  #53: test_rir ...................................................................................................   Passed    0.00 sec
+        Start  54: test_frontend
+ 33/263 Test  #27: test_network ...............................................................................................   Passed   20.82 sec
+        Start  55: test_listener
+ 34/263 Test  #55: test_listener ..............................................................................................   Passed    0.01 sec
+        Start  56: test_nginx_parser
+ 35/263 Test  #56: test_nginx_parser ..........................................................................................   Passed    4.55 sec
+        Start  57: test_nginx_convert
+ 36/263 Test  #57: test_nginx_convert .........................................................................................   Passed    0.10 sec
+        Start  58: test_envoy_parser
+ 37/263 Test  #58: test_envoy_parser ..........................................................................................   Passed    0.01 sec
+        Start  59: test_envoy_convert
+ 38/263 Test  #59: test_envoy_convert .........................................................................................   Passed    0.56 sec
+        Start  61: test_envoy_differential_selftest
+ 39/263 Test #255: test_jit ...................................................................................................   Passed   36.58 sec
+        Start  65: test_drain
+ 40/263 Test  #65: test_drain .................................................................................................   Passed    0.00 sec
+        Start  66: test_access_log
+ 41/263 Test  #66: test_access_log ............................................................................................   Passed    0.51 sec
+        Start  67: test_access_log_live
+ 42/263 Test  #67: test_access_log_live .......................................................................................   Passed    0.00 sec
+        Start  68: test_access_log_live_writer
+ 43/263 Test  #68: test_access_log_live_writer ................................................................................   Passed    0.00 sec
+        Start  69: test_access_log_live_producer
+ 44/263 Test  #69: test_access_log_live_producer ..............................................................................   Passed    0.06 sec
+        Start  70: test_access_log_startup
+ 45/263 Test  #70: test_access_log_startup ....................................................................................***Failed    6.21 sec
+=== access_log_startup ===
+RUN: access_log_startup.resolution_preserves_legacy_absence_semantics
+  PASS: resolution_preserves_legacy_absence_semantics
+RUN: access_log_startup.source_resolution_is_owned_and_every_explicit_control_conflicts
+  PASS: source_resolution_is_owned_and_every_explicit_control_conflicts
+RUN: access_log_startup.forged_absent_and_present_source_specs_fail_closed
+  PASS: forged_absent_and_present_source_specs_fail_closed
+RUN: access_log_startup.source_opener_creates_appends_and_owns_exact_descriptor_flags
+  PASS: source_opener_creates_appends_and_owns_exact_descriptor_flags
+RUN: access_log_startup.source_opener_rejects_non_regular_and_path_failures_without_fd_leaks
+  PASS: source_opener_rejects_non_regular_and_path_failures_without_fd_leaks
+RUN: access_log_startup.process_helper_waits_for_exit_after_output_eof
+  PASS: process_helper_waits_for_exit_after_output_eof
+RUN: access_log_startup.listening_port_waits_for_the_complete_readiness_line
+  PASS: listening_port_waits_for_the_complete_readiness_line
+RUN: access_log_startup.public_main_source_live_publishes_downstream_size_before_shutdown
+  PASS: public_main_source_live_publishes_downstream_size_before_shutdown
+RUN: access_log_startup.public_main_source_live_write_fatal_exits_without_retry_or_shutdown
+    check: /home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1078 -> fatal.request_completed
+    check: /home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1080 -> !(fatal.backend.timed_out)
+    check: /home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1081 -> (fatal.backend.accepts) == (1u)
+    check: /home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1082 -> (fatal.backend.sends) == (1u)
+    check: /home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1083 -> (fatal.backend.request) == (expected_backend)
+    check: /home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1084 -> (fatal.response) == (kBackendResponse)
+    check: /home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1085 -> (read_file(sink)) == ("102")
+    require: /home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1087 -> (stat(sink.c_str(), &status)) == (0)
+  FAIL: public_main_source_live_write_fatal_exits_without_retry_or_shutdown (/home/hurricane/private/code/Rut/tests/test_access_log_startup.cc:1087: (stat(sink.c_str(), &status)) == (0))
+RUN: access_log_startup.public_main_source_live_open_failure_stays_before_listening
+  PASS: public_main_source_live_open_failure_stays_before_listening
+RUN: access_log_startup.public_main_conflicts_before_creating_any_source_sink
+  PASS: public_main_conflicts_before_creating_any_source_sink
+RUN: access_log_startup.public_main_source_absence_keeps_legacy_cli_startup_path
+  PASS: public_main_source_absence_keeps_legacy_cli_startup_path
+
+11 passed, 1 failed, 242 checks, 8 failed checks
+
+        Start  71: test_metrics
+ 46/263 Test  #71: test_metrics ...............................................................................................   Passed    0.00 sec
+        Start  72: test_debug
+ 47/263 Test  #72: test_debug .................................................................................................   Passed    0.00 sec
+        Start  73: test_fault_injection
+ 48/263 Test  #73: test_fault_injection .......................................................................................   Passed    0.01 sec
+        Start  74: test_shard_control
+ 49/263 Test  #74: test_shard_control .........................................................................................   Passed   11.04 sec
+        Start  79: test_fixture_exact_input_read_runner
+ 50/263 Test  #79: test_fixture_exact_input_read_runner .......................................................................   Passed    3.87 sec
+        Start  80: test_fixture_wildcard_attempt_protocol
+ 51/263 Test  #80: test_fixture_wildcard_attempt_protocol .....................................................................   Passed    0.01 sec
+        Start  81: test_fixture_canonical_wait_strategy
+ 52/263 Test  #81: test_fixture_canonical_wait_strategy .......................................................................   Passed    0.00 sec
+        Start 256: test_native_program
+ 53/263 Test #256: test_native_program ........................................................................................   Passed    0.97 sec
+        Start 258: test_traffic_capture
+ 54/263 Test #258: test_traffic_capture .......................................................................................   Passed    0.04 sec
+        Start 259: test_traffic_replay
+ 55/263 Test #259: test_traffic_replay ........................................................................................   Passed    0.00 sec
+        Start 260: test_sim
+ 56/263 Test #260: test_sim ...................................................................................................   Passed    1.13 sec
+        Start 261: test_harness
+ 57/263 Test #261: test_harness ...............................................................................................   Passed    1.26 sec
+        Start 262: test_simulate_engine
+ 58/263 Test #262: test_simulate_engine .......................................................................................   Passed    1.45 sec
+        Start 263: test_runtime_state_model
+ 59/263 Test #263: test_runtime_state_model ...................................................................................   Passed    0.05 sec
+ 60/263 Test  #54: test_frontend ..............................................................................................   Passed   86.97 sec
+ 61/263 Test  #61: test_envoy_differential_selftest ...........................................................................   Passed   93.57 sec
+ 62/263 Test  #35: test_integration.shard_0_of_2 ..............................................................................   Passed  137.79 sec
+        Start  33: test_cli_iouring_memlock
+ 63/263 Test  #33: test_cli_iouring_memlock ...................................................................................   Passed    0.07 sec
+        Start   3: test_fixture_worker_protocol
+ 64/263 Test   #3: test_fixture_worker_protocol ...............................................................................   Passed    0.84 sec
+        Start   4: test_fixture_bounded_http_exchange
+ 65/263 Test   #4: test_fixture_bounded_http_exchange .........................................................................   Passed    0.01 sec
+        Start   5: test_fixture_collision_release_protocol
+ 66/263 Test   #5: test_fixture_collision_release_protocol ....................................................................   Passed    0.12 sec
+        Start   6: test_fixture_collision_release_evidence_protocol
+ 67/263 Test   #6: test_fixture_collision_release_evidence_protocol ...........................................................   Passed    0.02 sec
+        Start   7: test_fixture_collision_release_evidence_transport
+ 68/263 Test   #7: test_fixture_collision_release_evidence_transport ..........................................................   Passed    0.01 sec
+        Start   8: test_fixture_exact_tcp_reservation_lease
+ 69/263 Test   #8: test_fixture_exact_tcp_reservation_lease ...................................................................   Passed    0.00 sec
+        Start   9: test_fixture_private_directory_lease
+ 70/263 Test   #9: test_fixture_private_directory_lease .......................................................................   Passed    0.00 sec
+        Start  11: test_fixture_wildcard_paused_child_lease
+ 71/263 Test  #11: test_fixture_wildcard_paused_child_lease ...................................................................   Passed    1.08 sec
+        Start  12: test_fixture_identity_bundle
+ 72/263 Test  #12: test_fixture_identity_bundle ...............................................................................   Passed    0.06 sec
+        Start  13: test_fixture_ancestry_bundle
+ 73/263 Test  #13: test_fixture_ancestry_bundle ...............................................................................   Passed    0.03 sec
+        Start  15: test_fixture_privileged_ancestry
+ 74/263 Test  #15: test_fixture_privileged_ancestry ...........................................................................   Passed    0.00 sec
+        Start  18: test_fixture_wildcard_source_reservation_sequence
+ 75/263 Test  #18: test_fixture_wildcard_source_reservation_sequence ..........................................................   Passed    0.01 sec
+        Start  20: test_fixture_executable_lease
+ 76/263 Test  #20: test_fixture_executable_lease ..............................................................................   Passed    0.01 sec
+        Start  21: test_fixture_executable_exec_handoff
+ 77/263 Test  #21: test_fixture_executable_exec_handoff .......................................................................   Passed    1.08 sec
+        Start  22: test_fixture_public_rut_session_attempt
+ 78/263 Test  #22: test_fixture_public_rut_session_attempt ....................................................................   Passed    0.70 sec
+        Start  23: test_fixture_wildcard_lease_composition
+ 79/263 Test  #23: test_fixture_wildcard_lease_composition ....................................................................   Passed    0.89 sec
+        Start  24: test_fixture_wildcard_canonical_session
+ 80/263 Test  #24: test_fixture_wildcard_canonical_session ....................................................................   Passed    0.12 sec
+        Start  32: test_cli_connection_capacity
+ 81/263 Test  #32: test_cli_connection_capacity ...............................................................................   Passed    0.05 sec
+        Start  36: test_integration.shard_1_of_2
+ 82/263 Test  #36: test_integration.shard_1_of_2 ..............................................................................   Passed  114.82 sec
+        Start  60: test_envoy_oracle_milestone_s
+ 83/263 Test  #60: test_envoy_oracle_milestone_s ..............................................................................***Skipped   0.05 sec
+        Start  62: test_route_boundaries_process
+ 84/263 Test  #62: test_route_boundaries_process ..............................................................................   Passed    3.94 sec
+        Start  63: test_envoy_pair_route_boundaries
+ 85/263 Test  #63: test_envoy_pair_route_boundaries ...........................................................................***Skipped   0.05 sec
+        Start  64: test_envoy_pair_milestone_s
+ 86/263 Test  #64: test_envoy_pair_milestone_s ................................................................................***Skipped   0.04 sec
+        Start  75: test_ipv4_fixture_topology
+ 87/263 Test  #75: test_ipv4_fixture_topology .................................................................................   Passed   86.79 sec
+        Start  76: test_fixture_privileged_broker
+ 88/263 Test  #76: test_fixture_privileged_broker .............................................................................***Failed    0.00 sec
+FAIL [#358 Stage 2a3b protocol self-check]: RUT executable custody or caller-owned mode validation failed
+
+        Start  77: test_fixture_generated_nginx_differential
+ 89/263 Test  #77: test_fixture_generated_nginx_differential ..................................................................***Failed    0.00 sec
+FAIL [#358 Stage 2a3b protocol self-check]: RUT executable custody or caller-owned mode validation failed
+
+        Start  78: test_fixture_exact_input_mount_owner
+ 90/263 Test  #78: test_fixture_exact_input_mount_owner .......................................................................***Failed    6.37 sec
+fatal exact-input mount controller: destroyed on a foreign thread; no owner
+FAIL [#358 exact input read observation]: exact container input read failed with outcome 9
+
+        Start  82: test_fixture_canonical_target_cleanup
+ 91/263 Test  #82: test_fixture_canonical_target_cleanup ......................................................................   Passed    0.02 sec
+        Start  83: test_nginx_downstream_gate_spike
+ 92/263 Test  #83: test_nginx_downstream_gate_spike ...........................................................................   Passed    0.83 sec
+        Start  84: test_nginx_downstream_gate_preload_loader_preflight
+ 93/263 Test  #84: test_nginx_downstream_gate_preload_loader_preflight ........................................................   Passed    0.42 sec
+        Start  85: test_nginx_coalesced_ingress_gate
+ 94/263 Test  #85: test_nginx_coalesced_ingress_gate ..........................................................................   Passed    1.36 sec
+        Start  86: test_nginx_exact_local_return_baseline
+ 95/263 Test  #86: test_nginx_exact_local_return_baseline .....................................................................   Passed    1.73 sec
+        Start  87: test_nginx_exact_local_return204_oracle
+ 96/263 Test  #87: test_nginx_exact_local_return204_oracle ....................................................................   Passed    3.63 sec
+        Start  88: test_nginx_exact_local_return204_query_oracle
+ 97/263 Test  #88: test_nginx_exact_local_return204_query_oracle ..............................................................   Passed    3.69 sec
+        Start  89: test_nginx_root_proxy_trace_oracle
+ 98/263 Test  #89: test_nginx_root_proxy_trace_oracle .........................................................................   Passed    1.01 sec
+        Start  90: test_nginx_api_proxy_trace_oracle
+ 99/263 Test  #90: test_nginx_api_proxy_trace_oracle ..........................................................................   Passed    1.01 sec
+        Start  91: test_nginx_exact_absolute_redirect_oracle
+100/263 Test  #91: test_nginx_exact_absolute_redirect_oracle ..................................................................   Passed    1.76 sec
+        Start  92: test_nginx_exact_absolute_redirect_302_oracle
+101/263 Test  #92: test_nginx_exact_absolute_redirect_302_oracle ..............................................................   Passed    2.98 sec
+        Start  93: test_nginx_api_non_root_proxy_uri_oracle
+102/263 Test  #93: test_nginx_api_non_root_proxy_uri_oracle ...................................................................   Passed    1.57 sec
+        Start  94: test_nginx_service_root_proxy_uri_oracle
+103/263 Test  #94: test_nginx_service_root_proxy_uri_oracle ...................................................................   Passed    1.58 sec
+        Start  95: test_nginx_issue357_wildcard_service_no_uri_oracle
+104/263 Test  #95: test_nginx_issue357_wildcard_service_no_uri_oracle .........................................................   Passed    2.88 sec
+        Start  96: test_nginx_pinned_static_query_proxy_uri_oracle
+105/263 Test  #96: test_nginx_pinned_static_query_proxy_uri_oracle ............................................................   Passed    2.53 sec
+        Start  97: test_nginx_issue341_zero_suffix_static_query_proxy_oracle
+106/263 Test  #97: test_nginx_issue341_zero_suffix_static_query_proxy_oracle ..................................................   Passed    2.63 sec
+        Start  98: test_nginx_issue360_empty_configured_query_oracle
+107/263 Test  #98: test_nginx_issue360_empty_configured_query_oracle ..........................................................   Passed    3.43 sec
+        Start  99: test_nginx_issue372_root_empty_query_proxy_uri_oracle
+108/263 Test  #99: test_nginx_issue372_root_empty_query_proxy_uri_oracle ......................................................   Passed    3.43 sec
+        Start 100: test_nginx_issue373_proxy_hide_header_oracle
+109/263 Test #100: test_nginx_issue373_proxy_hide_header_oracle ...............................................................   Passed    3.27 sec
+        Start 101: test_nginx_issue600_proxy_hide_header_name_oracle
+110/263 Test #101: test_nginx_issue600_proxy_hide_header_name_oracle ..........................................................   Passed    3.90 sec
+        Start 102: test_nginx_issue270_custom_hide_timeout_expiry_oracle
+111/263 Test #102: test_nginx_issue270_custom_hide_timeout_expiry_oracle ......................................................   Passed    2.08 sec
+        Start 103: test_nginx_issue270_custom_hide_timeout_completion_oracle
+112/263 Test #103: test_nginx_issue270_custom_hide_timeout_completion_oracle ..................................................   Passed    1.88 sec
+        Start 104: test_nginx_issue621_custom_hide_timeout_explicit_buffering_oracle
+113/263 Test #104: test_nginx_issue621_custom_hide_timeout_explicit_buffering_oracle ..........................................   Passed    7.78 sec
+        Start 105: test_nginx_issue627_custom_hide_timeout_2s_oracle
+114/263 Test #105: test_nginx_issue627_custom_hide_timeout_2s_oracle ..........................................................   Passed    6.59 sec
+        Start 106: test_nginx_issue630_bodyless_head_delayed_completion_oracle
+115/263 Test #106: test_nginx_issue630_bodyless_head_delayed_completion_oracle ................................................   Passed    3.81 sec
+        Start 107: test_nginx_issue630_head_same_file_pair
+116/263 Test #107: test_nginx_issue630_head_same_file_pair ....................................................................   Passed    7.73 sec
+        Start 108: test_nginx_issue270_custom_hide_timeout_cli_differential
+117/263 Test #108: test_nginx_issue270_custom_hide_timeout_cli_differential ...................................................   Passed    8.05 sec
+        Start 109: test_nginx_issue621_custom_hide_timeout_explicit_buffering_cli_differential
+118/263 Test #109: test_nginx_issue621_custom_hide_timeout_explicit_buffering_cli_differential ................................   Passed    8.04 sec
+        Start 110: test_nginx_issue627_custom_hide_timeout_2s_cli_differential
+119/263 Test #110: test_nginx_issue627_custom_hide_timeout_2s_cli_differential ................................................   Passed   13.36 sec
+        Start 111: test_nginx_issue617_custom_hide_timeout_boundary_cli_differential
+120/263 Test #111: test_nginx_issue617_custom_hide_timeout_boundary_cli_differential ..........................................   Passed   16.15 sec
+        Start 112: test_nginx_issue439_pinned_lifecycle_self_check
+121/263 Test #112: test_nginx_issue439_pinned_lifecycle_self_check ............................................................   Passed    0.01 sec
+        Start 113: test_nginx_zero_response_stall_self_check
+122/263 Test #113: test_nginx_zero_response_stall_self_check ..................................................................   Passed    0.21 sec
+        Start 114: test_nginx_issue253_gated_fragment_peer_probe_self_check
+123/263 Test #114: test_nginx_issue253_gated_fragment_peer_probe_self_check ...................................................   Passed    0.68 sec
+        Start 115: test_nginx_issue618_live_access_ledger_observer_self_check
+124/263 Test #115: test_nginx_issue618_live_access_ledger_observer_self_check .................................................   Passed    0.01 sec
+        Start 116: test_nginx_issue373_converter_proxy_hide_header_source_self_check
+125/263 Test #116: test_nginx_issue373_converter_proxy_hide_header_source_self_check ..........................................   Passed    0.01 sec
+        Start 117: test_nginx_issue270_converter_explicit_timeout_head_source_self_check
+126/263 Test #117: test_nginx_issue270_converter_explicit_timeout_head_source_self_check ......................................   Passed    0.16 sec
+        Start 118: test_nginx_issue270_converter_explicit_timeout_head_generated_episode
+127/263 Test #118: test_nginx_issue270_converter_explicit_timeout_head_generated_episode ......................................   Passed    1.24 sec
+        Start 119: test_nginx_issue268_explicit_timeout_head_phase_differential
+128/263 Test #119: test_nginx_issue268_explicit_timeout_head_phase_differential ...............................................   Passed    6.78 sec
+        Start 120: test_nginx_issue270_keepalive_timeout_head_differential
+129/263 Test #120: test_nginx_issue270_keepalive_timeout_head_differential ....................................................   Passed    3.68 sec
+        Start 121: test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential
+130/263 Test #121: test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential ....................................***Failed    2.33 sec
+FAIL [#270 keep-alive timeout GET initial-deadline differential]: generated RUT keep-alive side: process exited before readiness (exit 1)
+
+        Start 122: test_nginx_issue270_fixed_upload_head_success_differential
+131/263 Test #122: test_nginx_issue270_fixed_upload_head_success_differential .................................................***Failed    0.76 sec
+FAIL [#270 fixed-upload HEAD success differential]: process exited before readiness (exit 1)
+fixture left the pinned nginx container active
+[pinned nginx lifecycle diagnostics] container=rut-nginx-270-fixed-upload-head-50457 elapsed_readiness_ms=196 last_connect_errno=0 (none) attached_docker_cli=live pid 50616
+container_inspect=running|true|0|false|""
+nginx_config:
+events {}
+http {
+  log_format compat "$request_length";
+  access_log /tmp/rut-nginx-differential-WSGm38/nginx-access.log compat;
+  server {
+    listen 127.0.0.1:46833;
+    location / {
+      proxy_pass http://127.0.0.1:60905;
+      proxy_read_timeout 1s;
+    }
+  }
+}
+
+nginx_error_process_log:
+/docker-entrypoint.sh: /docker-entrypoint.d/ is not empty, will attempt to perform configuration
+/docker-entrypoint.sh: Looking for shell scripts in /docker-entrypoint.d/
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/10-listen-on-ipv6-by-default.sh
+10-listen-on-ipv6-by-default.sh: info: Getting the checksum of /etc/nginx/conf.d/default.conf
+10-listen-on-ipv6-by-default.sh: info: Enabled listen on IPv6 in /etc/nginx/conf.d/default.conf
+/docker-entrypoint.sh: Sourcing /docker-entrypoint.d/15-local-resolvers.envsh
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/20-envsubst-on-templates.sh
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/30-tune-worker-processes.sh
+/docker-entrypoint.sh: Configuration complete; ready for start up
+
+nginx_access_log:
+<empty>
+
+        Start 123: test_nginx_issue270_fixed_upload_head_zero_response_timeout_differential
+132/263 Test #123: test_nginx_issue270_fixed_upload_head_zero_response_timeout_differential ...................................***Failed    0.74 sec
+FAIL [#270 fixed-upload HEAD zero-response timeout differential]: process exited before readiness (exit 1)
+fixture left the pinned nginx container active
+[pinned nginx lifecycle diagnostics] container=rut-nginx-270-fixed-upload-head-zero-50772 elapsed_readiness_ms=196 last_connect_errno=0 (none) attached_docker_cli=live pid 50929
+container_inspect=running|true|0|false|""
+nginx_config:
+events {}
+http {
+  log_format compat "$request_length";
+  access_log /tmp/rut-nginx-differential-wwIILG/nginx-access.log compat;
+  server {
+    listen 127.0.0.1:46795;
+    location / {
+      proxy_pass http://127.0.0.1:41803;
+      proxy_read_timeout 1s;
+    }
+  }
+}
+
+nginx_error_process_log:
+/docker-entrypoint.sh: /docker-entrypoint.d/ is not empty, will attempt to perform configuration
+/docker-entrypoint.sh: Looking for shell scripts in /docker-entrypoint.d/
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/10-listen-on-ipv6-by-default.sh
+10-listen-on-ipv6-by-default.sh: info: Getting the checksum of /etc/nginx/conf.d/default.conf
+10-listen-on-ipv6-by-default.sh: info: Enabled listen on IPv6 in /etc/nginx/conf.d/default.conf
+/docker-entrypoint.sh: Sourcing /docker-entrypoint.d/15-local-resolvers.envsh
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/20-envsubst-on-templates.sh
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/30-tune-worker-processes.sh
+/docker-entrypoint.sh: Configuration complete; ready for start up
+
+nginx_access_log:
+<empty>
+
+        Start 124: test_nginx_issue270_fixed_upload_head_incomplete_progress_timeout_differential
+133/263 Test #124: test_nginx_issue270_fixed_upload_head_incomplete_progress_timeout_differential .............................   Passed    4.06 sec
+        Start 125: test_nginx_issue270_fixed_upload_head_two_incomplete_header_fragments_timeout_differential
+134/263 Test #125: test_nginx_issue270_fixed_upload_head_two_incomplete_header_fragments_timeout_differential .................   Passed    4.06 sec
+        Start 126: test_nginx_issue373_converter_proxy_hide_header_generated_side_self_check
+135/263 Test #126: test_nginx_issue373_converter_proxy_hide_header_generated_side_self_check ..................................   Passed    0.85 sec
+        Start 127: test_nginx_issue373_converter_proxy_hide_header_generated_pair_self_check
+136/263 Test #127: test_nginx_issue373_converter_proxy_hide_header_generated_pair_self_check ..................................   Passed    1.65 sec
+        Start 128: test_nginx_issue373_converter_proxy_hide_header_differential
+137/263 Test #128: test_nginx_issue373_converter_proxy_hide_header_differential ...............................................   Passed    4.82 sec
+        Start 129: test_nginx_issue271_converter_default_buffering_positive_get_differential
+138/263 Test #129: test_nginx_issue271_converter_default_buffering_positive_get_differential ..................................   Passed    4.24 sec
+        Start 130: test_nginx_issue271_converter_default_buffering_incomplete_clean_eof_differential
+139/263 Test #130: test_nginx_issue271_converter_default_buffering_incomplete_clean_eof_differential ..........................   Passed    1.96 sec
+        Start 131: test_nginx_issue271_converter_default_buffering_incomplete_body_inactivity_expiry_differential
+140/263 Test #131: test_nginx_issue271_converter_default_buffering_incomplete_body_inactivity_expiry_differential .............   Passed    3.09 sec
+        Start 132: test_nginx_issue572_converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential
+141/263 Test #132: test_nginx_issue572_converter_explicit_buffering_on_incomplete_body_inactivity_expiry_differential .........   Passed    3.19 sec
+        Start 133: test_nginx_issue271_converter_default_buffering_second_body_progress_refresh_differential
+142/263 Test #133: test_nginx_issue271_converter_default_buffering_second_body_progress_refresh_differential ..................   Passed    3.68 sec
+        Start 134: test_nginx_issue271_pinned_default_buffering_201_incomplete_body_inactivity_expiry_oracle
+143/263 Test #134: test_nginx_issue271_pinned_default_buffering_201_incomplete_body_inactivity_expiry_oracle ..................   Passed    2.59 sec
+        Start 135: test_nginx_issue271_pinned_default_buffering_202_incomplete_body_inactivity_expiry_oracle
+144/263 Test #135: test_nginx_issue271_pinned_default_buffering_202_incomplete_body_inactivity_expiry_oracle ..................   Passed    2.59 sec
+        Start 136: test_nginx_issue253_pinned_default_buffering_304_content_length_metadata_oracle
+145/263 Test #136: test_nginx_issue253_pinned_default_buffering_304_content_length_metadata_oracle ............................   Passed    1.79 sec
+        Start 137: test_nginx_issue253_pinned_default_buffering_206_range_completion_oracle
+146/263 Test #137: test_nginx_issue253_pinned_default_buffering_206_range_completion_oracle ...................................   Passed    1.81 sec
+        Start 138: test_nginx_issue253_pinned_default_buffering_206_range_delayed_completion_oracle
+147/263 Test #138: test_nginx_issue253_pinned_default_buffering_206_range_delayed_completion_oracle ...........................   Passed    2.43 sec
+        Start 139: test_nginx_issue253_pinned_default_buffering_206_range_three_publication_completion_oracle
+148/263 Test #139: test_nginx_issue253_pinned_default_buffering_206_range_three_publication_completion_oracle .................   Passed    3.03 sec
+        Start 140: test_nginx_issue253_pinned_default_buffering_206_range_incomplete_clean_eof_oracle
+149/263 Test #140: test_nginx_issue253_pinned_default_buffering_206_range_incomplete_clean_eof_oracle .........................   Passed    1.33 sec
+        Start 141: test_nginx_issue253_pinned_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle
+150/263 Test #141: test_nginx_issue253_pinned_default_buffering_206_range_incomplete_body_inactivity_expiry_oracle ............   Passed    1.69 sec
+        Start 142: test_nginx_issue546_converter_default_buffering_206_range_incomplete_clean_eof_differential
+151/263 Test #142: test_nginx_issue546_converter_default_buffering_206_range_incomplete_clean_eof_differential ................   Passed    3.38 sec
+        Start 143: test_nginx_issue554_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential
+152/263 Test #143: test_nginx_issue554_converter_default_buffering_206_range_incomplete_body_inactivity_expiry_differential ...   Passed    3.97 sec
+        Start 144: test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential
+153/263 Test #144: test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential ...................   Passed    3.06 sec
+        Start 145: test_nginx_issue534_converter_default_buffering_206_range_completion_differential
+154/263 Test #145: test_nginx_issue534_converter_default_buffering_206_range_completion_differential ..........................   Passed    2.21 sec
+        Start 146: test_nginx_issue534_converter_default_buffering_206_range_delayed_completion_differential
+155/263 Test #146: test_nginx_issue534_converter_default_buffering_206_range_delayed_completion_differential ..................   Passed    2.83 sec
+        Start 147: test_nginx_issue253_converter_default_buffering_206_range_three_publication_completion_differential
+156/263 Test #147: test_nginx_issue253_converter_default_buffering_206_range_three_publication_completion_differential ........   Passed    3.44 sec
+        Start 148: test_nginx_issue271_converter_default_buffering_201_incomplete_body_inactivity_expiry_differential
+157/263 Test #148: test_nginx_issue271_converter_default_buffering_201_incomplete_body_inactivity_expiry_differential .........   Passed    3.06 sec
+        Start 149: test_nginx_issue523_converter_default_buffering_202_incomplete_body_inactivity_expiry_differential
+158/263 Test #149: test_nginx_issue523_converter_default_buffering_202_incomplete_body_inactivity_expiry_differential .........   Passed    3.08 sec
+        Start 150: test_nginx_issue271_pinned_default_buffering_third_body_progress_expiry_oracle
+159/263 Test #150: test_nginx_issue271_pinned_default_buffering_third_body_progress_expiry_oracle .............................   Passed    3.81 sec
+        Start 151: test_nginx_issue271_pinned_default_buffering_three_publication_completion_oracle
+160/263 Test #151: test_nginx_issue271_pinned_default_buffering_three_publication_completion_oracle ...........................   Passed    2.13 sec
+        Start 152: test_nginx_issue271_pinned_explicit_buffering_on_baseline_oracle
+161/263 Test #152: test_nginx_issue271_pinned_explicit_buffering_on_baseline_oracle ...........................................   Passed    3.82 sec
+        Start 153: test_nginx_issue638_pinned_explicit_buffering_off_oracle
+162/263 Test #153: test_nginx_issue638_pinned_explicit_buffering_off_oracle ...................................................   Passed    1.76 sec
+        Start 154: test_nginx_issue638_explicit_off_observation_self_check
+163/263 Test #154: test_nginx_issue638_explicit_off_observation_self_check ....................................................   Passed    0.01 sec
+        Start 155: test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential
+164/263 Test #155: test_nginx_issue271_converter_default_buffering_third_body_progress_expiry_differential ....................   Passed    4.25 sec
+        Start 156: test_nginx_issue271_converter_default_buffering_three_publication_completion_differential
+165/263 Test #156: test_nginx_issue271_converter_default_buffering_three_publication_completion_differential ..................   Passed    2.77 sec
+        Start 157: test_nginx_issue268_pinned_positive_cl_options_default_buffering_oracle
+166/263 Test #157: test_nginx_issue268_pinned_positive_cl_options_default_buffering_oracle ....................................   Passed    3.62 sec
+        Start 158: test_nginx_issue268_pinned_positive_cl_head_default_buffering_oracle
+167/263 Test #158: test_nginx_issue268_pinned_positive_cl_head_default_buffering_oracle .......................................   Passed    2.31 sec
+        Start 159: test_nginx_issue362_request_length_oracle
+168/263 Test #159: test_nginx_issue362_request_length_oracle ..................................................................   Passed    1.18 sec
+        Start 160: test_nginx_issue252_retained_header_whitespace_oracle
+169/263 Test #160: test_nginx_issue252_retained_header_whitespace_oracle ......................................................   Passed    0.70 sec
+        Start 161: test_nginx_issue591_pinned_access_log_off_default_oracle
+170/263 Test #161: test_nginx_issue591_pinned_access_log_off_default_oracle ...................................................   Passed    1.08 sec
+        Start 162: test_nginx_issue252_converter_retained_header_whitespace_differential
+171/263 Test #162: test_nginx_issue252_converter_retained_header_whitespace_differential ......................................   Passed    1.77 sec
+        Start 163: test_nginx_issue577_converter_cli_retained_header_whitespace_differential
+172/263 Test #163: test_nginx_issue577_converter_cli_retained_header_whitespace_differential ..................................   Passed    1.59 sec
+        Start 164: test_nginx_issue583_converter_cli_complete_file_retained_differential
+173/263 Test #164: test_nginx_issue583_converter_cli_complete_file_retained_differential ......................................   Passed    1.57 sec
+        Start 165: test_nginx_issue591_converter_retained_access_log_off_four_phase
+174/263 Test #165: test_nginx_issue591_converter_retained_access_log_off_four_phase ...........................................   Passed    2.99 sec
+        Start 166: test_nginx_issue600_converter_proxy_hide_header_name_differential
+175/263 Test #166: test_nginx_issue600_converter_proxy_hide_header_name_differential ..........................................   Passed    1.77 sec
+        Start 167: test_nginx_issue600_converter_proxy_hide_header_boundaries
+176/263 Test #167: test_nginx_issue600_converter_proxy_hide_header_boundaries .................................................   Passed    3.05 sec
+        Start 168: test_nginx_issue370_request_length_split_header_oracle
+177/263 Test #168: test_nginx_issue370_request_length_split_header_oracle .....................................................   Passed    1.70 sec
+        Start 169: test_nginx_issue371_rut_initial_header_split_public
+178/263 Test #169: test_nginx_issue371_rut_initial_header_split_public ........................................................   Passed    1.33 sec
+        Start 170: test_nginx_issue367_request_length_fixed_body_oracle
+179/263 Test #170: test_nginx_issue367_request_length_fixed_body_oracle .......................................................   Passed    1.17 sec
+        Start 171: test_nginx_issue369_request_length_split_fixed_body_oracle
+180/263 Test #171: test_nginx_issue369_request_length_split_fixed_body_oracle .................................................   Passed    1.70 sec
+        Start 172: test_nginx_issue362_converter_request_length_differential
+181/263 Test #172: test_nginx_issue362_converter_request_length_differential ..................................................   Passed    2.68 sec
+        Start 173: test_nginx_issue370_converter_request_length_split_header_differential
+182/263 Test #173: test_nginx_issue370_converter_request_length_split_header_differential .....................................   Passed    3.65 sec
+        Start 174: test_nginx_issue367_converter_request_length_fixed_body_differential
+183/263 Test #174: test_nginx_issue367_converter_request_length_fixed_body_differential .......................................   Passed    2.92 sec
+        Start 175: test_nginx_issue369_converter_request_length_split_fixed_body_differential
+184/263 Test #175: test_nginx_issue369_converter_request_length_split_fixed_body_differential .................................   Passed    3.93 sec
+        Start 176: test_nginx_issue342_wildcard_listen_oracle
+185/263 Test #176: test_nginx_issue342_wildcard_listen_oracle .................................................................   Passed    2.21 sec
+        Start 177: test_nginx_issue343_asterisk_wildcard_listen_oracle
+186/263 Test #177: test_nginx_issue343_asterisk_wildcard_listen_oracle ........................................................   Passed    2.07 sec
+        Start 178: test_nginx_issue344_exact_loopback_listen_oracle
+187/263 Test #178: test_nginx_issue344_exact_loopback_listen_oracle ...........................................................   Passed    2.98 sec
+        Start 179: test_nginx_issue348_exact_loopback_return204_oracle
+188/263 Test #179: test_nginx_issue348_exact_loopback_return204_oracle ........................................................   Passed    3.99 sec
+        Start 180: test_nginx_issue349_exact_loopback_bodyful_return_oracle
+189/263 Test #180: test_nginx_issue349_exact_loopback_bodyful_return_oracle ...................................................   Passed    3.97 sec
+        Start 181: test_nginx_issue350_exact_loopback_return302_oracle
+190/263 Test #181: test_nginx_issue350_exact_loopback_return302_oracle ........................................................   Passed    5.86 sec
+        Start 182: test_nginx_issue351_exact_loopback_return301_oracle
+191/263 Test #182: test_nginx_issue351_exact_loopback_return301_oracle ........................................................   Passed    5.89 sec
+        Start 183: test_nginx_issue353_exact_loopback_prefix_root_replacement_oracle
+192/263 Test #183: test_nginx_issue353_exact_loopback_prefix_root_replacement_oracle ..........................................   Passed    5.51 sec
+        Start 184: test_nginx_issue354_exact_loopback_api_v1_replacement_oracle
+193/263 Test #184: test_nginx_issue354_exact_loopback_api_v1_replacement_oracle ...............................................   Passed    5.45 sec
+        Start 185: test_nginx_issue355_exact_loopback_api_no_uri_oracle
+194/263 Test #185: test_nginx_issue355_exact_loopback_api_no_uri_oracle .......................................................   Passed    5.45 sec
+        Start 186: test_nginx_issue356_exact_loopback_service_no_uri_oracle
+195/263 Test #186: test_nginx_issue356_exact_loopback_service_no_uri_oracle ...................................................   Passed    5.58 sec
+        Start 187: test_nginx_issue342_converter_wildcard_listen_differential
+196/263 Test #187: test_nginx_issue342_converter_wildcard_listen_differential .................................................   Passed    4.02 sec
+        Start 188: test_nginx_issue343_converter_asterisk_wildcard_listen_differential
+197/263 Test #188: test_nginx_issue343_converter_asterisk_wildcard_listen_differential ........................................   Passed    4.13 sec
+        Start 189: test_nginx_issue344_converter_exact_loopback_listen_differential
+198/263 Test #189: test_nginx_issue344_converter_exact_loopback_listen_differential ...........................................   Passed    7.44 sec
+        Start 190: test_nginx_issue348_converter_exact_loopback_return204_differential
+199/263 Test #190: test_nginx_issue348_converter_exact_loopback_return204_differential ........................................   Passed    7.59 sec
+        Start 191: test_nginx_issue349_converter_exact_loopback_bodyful_return_differential
+200/263 Test #191: test_nginx_issue349_converter_exact_loopback_bodyful_return_differential ...................................   Passed    7.56 sec
+        Start 192: test_nginx_issue350_converter_exact_loopback_return302_differential
+201/263 Test #192: test_nginx_issue350_converter_exact_loopback_return302_differential ........................................   Passed   11.51 sec
+        Start 193: test_nginx_issue351_converter_exact_loopback_return301_differential
+202/263 Test #193: test_nginx_issue351_converter_exact_loopback_return301_differential ........................................   Passed   11.53 sec
+        Start 194: test_nginx_issue353_converter_exact_loopback_prefix_root_replacement_differential
+203/263 Test #194: test_nginx_issue353_converter_exact_loopback_prefix_root_replacement_differential ..........................   Passed   10.40 sec
+        Start 195: test_nginx_issue354_converter_exact_loopback_api_v1_replacement_differential
+204/263 Test #195: test_nginx_issue354_converter_exact_loopback_api_v1_replacement_differential ...............................   Passed   10.45 sec
+        Start 196: test_nginx_issue355_converter_exact_loopback_api_no_uri_differential
+205/263 Test #196: test_nginx_issue355_converter_exact_loopback_api_no_uri_differential .......................................   Passed   10.55 sec
+        Start 197: test_nginx_issue356_converter_exact_loopback_service_no_uri_differential
+206/263 Test #197: test_nginx_issue356_converter_exact_loopback_service_no_uri_differential ...................................   Passed   10.54 sec
+        Start 198: test_nginx_issue357_converter_wildcard_service_no_uri_differential
+207/263 Test #198: test_nginx_issue357_converter_wildcard_service_no_uri_differential .........................................   Passed    5.95 sec
+        Start 199: test_nginx_issue353_converter_exact_loopback_max_proxy_prefix_differential
+208/263 Test #199: test_nginx_issue353_converter_exact_loopback_max_proxy_prefix_differential .................................   Passed    4.78 sec
+        Start 200: test_nginx_issue356_converter_exact_loopback_max_no_uri_prefix_differential
+209/263 Test #200: test_nginx_issue356_converter_exact_loopback_max_no_uri_prefix_differential ................................   Passed    4.71 sec
+        Start 201: test_nginx_issue357_converter_wildcard_max_no_uri_prefix_differential
+210/263 Test #201: test_nginx_issue357_converter_wildcard_max_no_uri_prefix_differential ......................................   Passed    3.88 sec
+        Start 202: test_nginx_converter_static_query_proxy_uri_differential
+211/263 Test #202: test_nginx_converter_static_query_proxy_uri_differential ...................................................   Passed    5.03 sec
+        Start 203: test_nginx_issue341_converter_zero_suffix_static_query_proxy_uri_differential
+212/263 Test #203: test_nginx_issue341_converter_zero_suffix_static_query_proxy_uri_differential ..............................   Passed    4.90 sec
+        Start 204: test_nginx_issue360_converter_empty_query_proxy_uri_differential
+213/263 Test #204: test_nginx_issue360_converter_empty_query_proxy_uri_differential ...........................................   Passed    6.50 sec
+        Start 205: test_nginx_issue372_converter_root_empty_query_proxy_uri_differential
+214/263 Test #205: test_nginx_issue372_converter_root_empty_query_proxy_uri_differential ......................................   Passed    6.47 sec
+        Start 206: test_nginx_bounded_exact_local_path_oracle
+215/263 Test #206: test_nginx_bounded_exact_local_path_oracle .................................................................   Passed    2.96 sec
+        Start 207: test_nginx_bounded_no_content_path_oracle
+216/263 Test #207: test_nginx_bounded_no_content_path_oracle ..................................................................   Passed    2.94 sec
+        Start 208: test_nginx_normalized_exact_trailing_slash_oracle
+217/263 Test #208: test_nginx_normalized_exact_trailing_slash_oracle ..........................................................   Passed    2.88 sec
+        Start 209: test_nginx_trailing_slash_no_content_oracle
+218/263 Test #209: test_nginx_trailing_slash_no_content_oracle ................................................................   Passed    2.93 sec
+        Start 210: test_nginx_max_boundary_no_content_oracle
+219/263 Test #210: test_nginx_max_boundary_no_content_oracle ..................................................................   Passed    6.40 sec
+        Start 211: test_nginx_bodyful_normalized_exact_oracle
+220/263 Test #211: test_nginx_bodyful_normalized_exact_oracle .................................................................   Passed    6.90 sec
+        Start 212: test_nginx_exact_local_body_space_oracle
+221/263 Test #212: test_nginx_exact_local_body_space_oracle ...................................................................   Passed    2.77 sec
+        Start 213: test_nginx_exact_local_body_multiple_space_oracle
+222/263 Test #213: test_nginx_exact_local_body_multiple_space_oracle ..........................................................   Passed    5.38 sec
+        Start 214: test_nginx_converter_exact_local_body_space_differential
+223/263 Test #214: test_nginx_converter_exact_local_body_space_differential ...................................................   Passed    5.28 sec
+        Start 215: test_nginx_converter_exact_local_body_multiple_space_differential
+224/263 Test #215: test_nginx_converter_exact_local_body_multiple_space_differential ..........................................   Passed   10.43 sec
+        Start 216: test_nginx_converter_exact_local_return204_differential
+225/263 Test #216: test_nginx_converter_exact_local_return204_differential ....................................................   Passed    6.94 sec
+        Start 217: test_nginx_converter_exact_local_return204_query_differential
+226/263 Test #217: test_nginx_converter_exact_local_return204_query_differential ..............................................   Passed    6.94 sec
+        Start 218: test_nginx_converter_bounded_exact_local_path_differential
+227/263 Test #218: test_nginx_converter_bounded_exact_local_path_differential .................................................   Passed    5.38 sec
+        Start 219: test_nginx_converter_bounded_no_content_path_differential
+228/263 Test #219: test_nginx_converter_bounded_no_content_path_differential ..................................................   Passed    7.86 sec
+        Start 220: test_nginx_converter_trailing_slash_no_content_differential
+229/263 Test #220: test_nginx_converter_trailing_slash_no_content_differential ................................................   Passed    7.90 sec
+        Start 221: test_nginx_converter_max_boundary_no_content_differential
+230/263 Test #221: test_nginx_converter_max_boundary_no_content_differential ..................................................   Passed   11.62 sec
+        Start 222: test_nginx_converter_bodyful_normalized_exact_differential
+231/263 Test #222: test_nginx_converter_bodyful_normalized_exact_differential .................................................   Passed   12.92 sec
+        Start 223: test_nginx_converter_normalized_exact_trailing_slash_differential
+232/263 Test #223: test_nginx_converter_normalized_exact_trailing_slash_differential ..........................................   Passed   10.78 sec
+        Start 224: test_nginx_converter_api_non_root_proxy_uri_differential
+233/263 Test #224: test_nginx_converter_api_non_root_proxy_uri_differential ...................................................   Passed    2.78 sec
+        Start 225: test_nginx_converter_service_root_proxy_uri_differential
+234/263 Test #225: test_nginx_converter_service_root_proxy_uri_differential ...................................................   Passed    2.83 sec
+        Start 226: test_nginx_converter_max_proxy_prefix_differential
+235/263 Test #226: test_nginx_converter_max_proxy_prefix_differential .........................................................   Passed    3.71 sec
+        Start 227: test_nginx_converter_max_proxy_replacement_differential
+236/263 Test #227: test_nginx_converter_max_proxy_replacement_differential ....................................................   Passed    3.66 sec
+        Start 228: test_nginx_converter_exact_absolute_redirect_differential
+237/263 Test #228: test_nginx_converter_exact_absolute_redirect_differential ..................................................   Passed    5.33 sec
+        Start 229: test_nginx_converter_exact_absolute_redirect_302_differential
+238/263 Test #229: test_nginx_converter_exact_absolute_redirect_302_differential ..............................................   Passed    5.37 sec
+        Start 230: test_nginx_converter_root_proxy_trace_differential
+239/263 Test #230: test_nginx_converter_root_proxy_trace_differential .........................................................   Passed    1.65 sec
+        Start 231: test_nginx_converter_api_proxy_trace_differential
+240/263 Test #231: test_nginx_converter_api_proxy_trace_differential ..........................................................   Passed    1.64 sec
+        Start 232: test_nginx_strict_local_response_differential
+241/263 Test #232: test_nginx_strict_local_response_differential ..............................................................   Passed    1.67 sec
+        Start 233: test_nginx_converter_exact_local_differential
+242/263 Test #233: test_nginx_converter_exact_local_differential ..............................................................   Passed   10.72 sec
+        Start 234: test_nginx_exact_strict_route_differential
+243/263 Test #234: test_nginx_exact_strict_route_differential .................................................................   Passed    2.71 sec
+        Start 235: test_rut_slash_normalized_exact_production
+244/263 Test #235: test_rut_slash_normalized_exact_production .................................................................   Passed    3.93 sec
+        Start 236: test_rut_no_content204_production
+245/263 Test #236: test_rut_no_content204_production ..........................................................................   Passed    1.88 sec
+        Start 237: test_rut_issue554_default_buffering_206_range_incomplete_body_inactivity_expiry
+246/263 Test #237: test_rut_issue554_default_buffering_206_range_incomplete_body_inactivity_expiry ............................   Passed    1.35 sec
+        Start 238: test_rut_issue558_retained_header_public_gate
+247/263 Test #238: test_rut_issue558_retained_header_public_gate ..............................................................   Passed    0.74 sec
+        Start 239: test_rut_exact_ipv4_listener_production
+248/263 Test #239: test_rut_exact_ipv4_listener_production ....................................................................   Passed    1.34 sec
+        Start 240: test_nginx_issue638_explicit_off_cli_differential
+249/263 Test #240: test_nginx_issue638_explicit_off_cli_differential ..........................................................   Passed    3.22 sec
+        Start 241: test_rut_explicit_buffering_off_capability
+250/263 Test #241: test_rut_explicit_buffering_off_capability .................................................................   Passed    1.36 sec
+        Start 242: test_rut_iouring_gate_spike
+251/263 Test #242: test_rut_iouring_gate_spike ................................................................................***Failed    0.19 sec
+FAIL [RUT io_uring gate spike]: RUT io_uring hook reported startup failure 2 with ring_ready=0; settled gate cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+RUT io_uring gate log (max 8192 bytes):
+Loaded program: /tmp/rut-nginx-differential-9bF0WK/generated.rut (opt O2)
+Backend: io_uring
+Listening on port 42557 with 1 shard(s)
+Draining connections (0s)...
+Shutdown complete.
+
+        Start 243: test_rut_issue566_id3_successor_public_gate
+252/263 Test #243: test_rut_issue566_id3_successor_public_gate ................................................................***Failed    0.19 sec
+FAIL [#566/#567 handwritten ID3 successor public gate]: RUT io_uring hook reported startup failure 2 with ring_ready=0; settled gate cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+
+        Start 244: test_rut_issue566_id3_successor_live200_public_gate
+253/263 Test #244: test_rut_issue566_id3_successor_live200_public_gate ........................................................***Failed    0.18 sec
+FAIL [#566/#567 handwritten ID3 live200 successor gate]: RUT io_uring hook reported startup failure 2 with ring_ready=0; settled gate cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+
+        Start 245: test_rut_iouring_gate_identity_negative
+254/263 Test #245: test_rut_iouring_gate_identity_negative ....................................................................***Failed    0.05 sec
+FAIL [RUT io_uring gate identity negative]: RUT io_uring startup rejection did not publish exact FAILED/RING/ring_ready=0 state; settled gate cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+RUT io_uring gate log (max 8192 bytes):
+<empty>
+
+        Start 246: test_rut_iouring_gate_ready_mutation_negative
+255/263 Test #246: test_rut_iouring_gate_ready_mutation_negative ..............................................................***Failed    0.04 sec
+FAIL [RUT io_uring gate ready mutation negative]: RUT io_uring startup rejection did not publish exact FAILED/RING/ring_ready=0 state; settled gate cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+RUT io_uring gate log (max 8192 bytes):
+<empty>
+
+        Start 247: test_rut_iouring_gate_owner_death_negative
+256/263 Test #247: test_rut_iouring_gate_owner_death_negative .................................................................***Failed    3.06 sec
+FAIL [RUT io_uring gate owner death negative]: owner-death helper did not exit while holding identity mutex (status unavailable); settled gate cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+RUT io_uring gate log (max 8192 bytes):
+Loaded program: /tmp/rut-nginx-differential-Vs5QW6/generated.rut (opt O2)
+Backend: io_uring
+Listening on port 37463 with 1 shard(s)
+Draining connections (0s)...
+Shutdown complete.
+
+        Start 248: test_rut_iouring_gate_recv_owner_diagnostics_self_check
+257/263 Test #248: test_rut_iouring_gate_recv_owner_diagnostics_self_check ....................................................   Passed    0.01 sec
+        Start 249: test_rut_iouring_gate_connect_journal_negative
+258/263 Test #249: test_rut_iouring_gate_connect_journal_negative .............................................................***Failed    0.13 sec
+FAIL [RUT io_uring gate Connect journal negative]: RUT io_uring hook reported startup failure 2 with ring_ready=0; settled gate cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+RUT io_uring gate log (max 8192 bytes):
+Loaded program: /tmp/rut-nginx-differential-kQUujp/generated.rut (opt O2)
+Backend: io_uring
+Listening on port 43457 with 1 shard(s)
+Draining connections (0s)...
+Shutdown complete.
+
+        Start 250: test_rut_iouring_coalesced_ingress_gate
+259/263 Test #250: test_rut_iouring_coalesced_ingress_gate ....................................................................***Failed    0.05 sec
+FAIL [converter-generated RUT coalesced-ingress gate]: RUT no-connection startup ring failure 2 with ring_ready=0
+RUT coalesced-ingress raw wire length=0 escaped=
+RUT coalesced-ingress raw wire hex=
+RUT coalesced-ingress response 1 length=0 escaped=
+RUT coalesced-ingress response 1 hex=
+RUT coalesced-ingress response 2 length=0 escaped=
+RUT coalesced-ingress response 2 hex=
+RUT coalesced-ingress tail length=0 escaped=
+RUT coalesced-ingress tail hex=
+RUT coalesced-ingress connect attempts=0 gate evidence=cleanup=clean state=6 error=2 mode=0 recv-fd=-1 recv-user-data=0 fragments=0 witness=0 attempts=0
+converter-generated RUT coalesced-ingress source (max 8192 bytes):
+listen :52133
+upstream nginx_upstream at "127.0.0.1:48853"
+pre_route TRACE { return local_response({
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched OPTIONS { return local_response({
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched CONNECT { return local_response({
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched { return local_response({
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .suppressBody, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+route HEAD "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            head_mode: .suppressBody,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            head_mode: .suppressBody,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+route GET "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        timeout_failure_policy: {
+            version: .http11,
+            status: 504,
+            reason: "Gateway Time-out",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        response_read_timeout: 60s,
+        response_buffering: .completeContentLength
+    )
+}
+route "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+route exact slash_normalized "/static" { return local_response({
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
+}) }
+RUT coalesced-ingress log (max 8192 bytes):
+<empty>
+
+        Start 251: test_nginx_converter_coalesced_successor_differential
+260/263 Test #251: test_nginx_converter_coalesced_successor_differential ......................................................***Failed    0.61 sec
+FAIL [converter-generated coalesced successor differential]: converter-generated ordinary RUT side: RUT no-connection startup ring failure 2 with ring_ready=0
+pinned nginx coalesced raw wire length=0 escaped=
+pinned nginx coalesced raw wire hex=
+pinned nginx coalesced response 1 length=0 escaped=
+pinned nginx coalesced response 1 hex=
+pinned nginx coalesced response 2 length=0 escaped=
+pinned nginx coalesced response 2 hex=
+pinned nginx coalesced tail length=0 escaped=
+pinned nginx coalesced tail hex=
+pinned nginx coalesced attempts=0 connect-ipv4-be=0 connect-port-be=0 connect-user-data=0 gate evidence=
+converter-generated ordinary RUT coalesced raw wire length=0 escaped=
+converter-generated ordinary RUT coalesced raw wire hex=
+converter-generated ordinary RUT coalesced response 1 length=0 escaped=
+converter-generated ordinary RUT coalesced response 1 hex=
+converter-generated ordinary RUT coalesced response 2 length=0 escaped=
+converter-generated ordinary RUT coalesced response 2 hex=
+converter-generated ordinary RUT coalesced tail length=0 escaped=
+converter-generated ordinary RUT coalesced tail hex=
+converter-generated ordinary RUT coalesced attempts=0 connect-ipv4-be=0 connect-port-be=0 connect-user-data=0 gate evidence=cleanup=clean state=6 error=2 mode=0 recv-fd=-1 recv-user-data=0 fragments=0 witness=0 attempts=0
+shared accepted nginx fragment:
+server {
+  listen 49633;
+  location / { proxy_pass http://127.0.0.1:47159; }
+  location = /static { return 200 "successor-static"; }
+}
+shared one-send R1||R2 length=121 escaped=GET /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\nGET /static HTTP/1.1\r\nHost: exact-local.example\r\nConnection: close\r\n\r\n
+shared one-send R1||R2 hex=47 45 54 20 2f 6d 69 73 73 69 6e 67 3f 71 3d 31 20 48 54 54 50 2f 31 2e 31 d a 48 6f 73 74 3a 20 63 6c 69 65 6e 74 2e 65 78 61 6d 70 6c 65 d a d a 47 45 54 20 2f 73 74 61 74 69 63 20 48 54 54 50 2f 31 2e 31 d a 48 6f 73 74 3a 20 65 78 61 63 74 2d 6c 6f 63 61 6c 2e 65 78 61 6d 70 6c 65 d a 43 6f 6e 6e 65 63 74 69 6f 6e 3a 20 63 6c 6f 73 65 d a d a
+converter coalesced pinned nginx config (max 8192 bytes):
+<unavailable>
+converter-generated coalesced ordinary RUT source (max 8192 bytes):
+listen :49633
+upstream nginx_upstream at "127.0.0.1:47159"
+pre_route TRACE { return local_response({
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched OPTIONS { return local_response({
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched CONNECT { return local_response({
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched { return local_response({
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .suppressBody, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+route HEAD "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            head_mode: .suppressBody,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            head_mode: .suppressBody,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+route GET "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        timeout_failure_policy: {
+            version: .http11,
+            status: 504,
+            reason: "Gateway Time-out",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        response_read_timeout: 60s,
+        response_buffering: .completeContentLength
+    )
+}
+route "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+route exact slash_normalized "/static" { return local_response({
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
+}) }
+converter coalesced pinned nginx log (max 8192 bytes):
+<unavailable>
+converter-generated coalesced ordinary RUT log (max 8192 bytes):
+<empty>
+
+        Start 252: test_nginx_late_successor_differential
+261/263 Test #252: test_nginx_late_successor_differential .....................................................................***Failed    0.89 sec
+gate evidence: master pid=1 worker pid=29 worker ppid=1 operation=2 bytes=314
+FAIL [late-successor differential]: converter-generated RUT side: RUT io_uring hook reported startup failure 2 with ring_ready=0; settled gate cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+pinned nginx raw wire length=623 escaped=HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: Fri, 02 Oct 2026 14:31:26 GMT\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: keep-alive\r\n\r\n<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\nHTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: Fri, 02 Oct 2026 14:31:26 GMT\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: close\r\n\r\n<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n
+pinned nginx raw wire hex=48 54 54 50 2f 31 2e 31 20 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 d a 53 65 72 76 65 72 3a 20 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 d a 44 61 74 65 3a 20 46 72 69 2c 20 30 32 20 4f 63 74 20 32 30 32 36 20 31 34 3a 33 31 3a 32 36 20 47 4d 54 d a 43 6f 6e 74 65 6e 74 2d 54 79 70 65 3a 20 74 65 78 74 2f 68 74 6d 6c d a 43 6f 6e 74 65 6e 74 2d 4c 65 6e 67 74 68 3a 20 31 35 37 d a 43 6f 6e 6e 65 63 74 69 6f 6e 3a 20 6b 65 65 70 2d 61 6c 69 76 65 d a d a 3c 68 74 6d 6c 3e d a 3c 68 65 61 64 3e 3c 74 69 74 6c 65 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 74 69 74 6c 65 3e 3c 2f 68 65 61 64 3e d a 3c 62 6f 64 79 3e d a 3c 63 65 6e 74 65 72 3e 3c 68 31 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 68 31 3e 3c 2f 63 65 6e 74 65 72 3e d a 3c 68 72 3e 3c 63 65 6e 74 65 72 3e 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 3c 2f 63 65 6e 74 65 72 3e d a 3c 2f 62 6f 64 79 3e d a 3c 2f 68 74 6d 6c 3e d a 48 54 54 50 2f 31 2e 31 20 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 d a 53 65 72 76 65 72 3a 20 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 d a 44 61 74 65 3a 20 46 72 69 2c 20 30 32 20 4f 63 74 20 32 30 32 36 20 31 34 3a 33 31 3a 32 36 20 47 4d 54 d a 43 6f 6e 74 65 6e 74 2d 54 79 70 65 3a 20 74 65 78 74 2f 68 74 6d 6c d a 43 6f 6e 74 65 6e 74 2d 4c 65 6e 67 74 68 3a 20 31 35 37 d a 43 6f 6e 6e 65 63 74 69 6f 6e 3a 20 63 6c 6f 73 65 d a d a 3c 68 74 6d 6c 3e d a 3c 68 65 61 64 3e 3c 74 69 74 6c 65 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 74 69 74 6c 65 3e 3c 2f 68 65 61 64 3e d a 3c 62 6f 64 79 3e d a 3c 63 65 6e 74 65 72 3e 3c 68 31 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 68 31 3e 3c 2f 63 65 6e 74 65 72 3e d a 3c 68 72 3e 3c 63 65 6e 74 65 72 3e 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 3c 2f 63 65 6e 74 65 72 3e d a 3c 2f 62 6f 64 79 3e d a 3c 2f 68 74 6d 6c 3e d a
+pinned nginx response 1 length=314 escaped=HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: Fri, 02 Oct 2026 14:31:26 GMT\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: keep-alive\r\n\r\n<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n
+pinned nginx response 1 hex=48 54 54 50 2f 31 2e 31 20 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 d a 53 65 72 76 65 72 3a 20 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 d a 44 61 74 65 3a 20 46 72 69 2c 20 30 32 20 4f 63 74 20 32 30 32 36 20 31 34 3a 33 31 3a 32 36 20 47 4d 54 d a 43 6f 6e 74 65 6e 74 2d 54 79 70 65 3a 20 74 65 78 74 2f 68 74 6d 6c d a 43 6f 6e 74 65 6e 74 2d 4c 65 6e 67 74 68 3a 20 31 35 37 d a 43 6f 6e 6e 65 63 74 69 6f 6e 3a 20 6b 65 65 70 2d 61 6c 69 76 65 d a d a 3c 68 74 6d 6c 3e d a 3c 68 65 61 64 3e 3c 74 69 74 6c 65 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 74 69 74 6c 65 3e 3c 2f 68 65 61 64 3e d a 3c 62 6f 64 79 3e d a 3c 63 65 6e 74 65 72 3e 3c 68 31 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 68 31 3e 3c 2f 63 65 6e 74 65 72 3e d a 3c 68 72 3e 3c 63 65 6e 74 65 72 3e 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 3c 2f 63 65 6e 74 65 72 3e d a 3c 2f 62 6f 64 79 3e d a 3c 2f 68 74 6d 6c 3e d a
+pinned nginx response 2 length=309 escaped=HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: Fri, 02 Oct 2026 14:31:26 GMT\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: close\r\n\r\n<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n
+pinned nginx response 2 hex=48 54 54 50 2f 31 2e 31 20 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 d a 53 65 72 76 65 72 3a 20 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 d a 44 61 74 65 3a 20 46 72 69 2c 20 30 32 20 4f 63 74 20 32 30 32 36 20 31 34 3a 33 31 3a 32 36 20 47 4d 54 d a 43 6f 6e 74 65 6e 74 2d 54 79 70 65 3a 20 74 65 78 74 2f 68 74 6d 6c d a 43 6f 6e 74 65 6e 74 2d 4c 65 6e 67 74 68 3a 20 31 35 37 d a 43 6f 6e 6e 65 63 74 69 6f 6e 3a 20 63 6c 6f 73 65 d a d a 3c 68 74 6d 6c 3e d a 3c 68 65 61 64 3e 3c 74 69 74 6c 65 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 74 69 74 6c 65 3e 3c 2f 68 65 61 64 3e d a 3c 62 6f 64 79 3e d a 3c 63 65 6e 74 65 72 3e 3c 68 31 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 68 31 3e 3c 2f 63 65 6e 74 65 72 3e d a 3c 68 72 3e 3c 63 65 6e 74 65 72 3e 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 3c 2f 63 65 6e 74 65 72 3e d a 3c 2f 62 6f 64 79 3e d a 3c 2f 68 74 6d 6c 3e d a
+pinned nginx tail length=0 escaped=
+pinned nginx tail hex=
+pinned nginx normalized response 1 length=314 escaped=HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: keep-alive\r\n\r\n<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n
+pinned nginx normalized response 1 hex=48 54 54 50 2f 31 2e 31 20 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 d a 53 65 72 76 65 72 3a 20 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 d a 44 61 74 65 3a 20 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 d a 43 6f 6e 74 65 6e 74 2d 54 79 70 65 3a 20 74 65 78 74 2f 68 74 6d 6c d a 43 6f 6e 74 65 6e 74 2d 4c 65 6e 67 74 68 3a 20 31 35 37 d a 43 6f 6e 6e 65 63 74 69 6f 6e 3a 20 6b 65 65 70 2d 61 6c 69 76 65 d a d a 3c 68 74 6d 6c 3e d a 3c 68 65 61 64 3e 3c 74 69 74 6c 65 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 74 69 74 6c 65 3e 3c 2f 68 65 61 64 3e d a 3c 62 6f 64 79 3e d a 3c 63 65 6e 74 65 72 3e 3c 68 31 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 68 31 3e 3c 2f 63 65 6e 74 65 72 3e d a 3c 68 72 3e 3c 63 65 6e 74 65 72 3e 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 3c 2f 63 65 6e 74 65 72 3e d a 3c 2f 62 6f 64 79 3e d a 3c 2f 68 74 6d 6c 3e d a
+pinned nginx normalized response 2 length=309 escaped=HTTP/1.1 502 Bad Gateway\r\nServer: nginx/1.29.7\r\nDate: XXXXXXXXXXXXXXXXXXXXXXXXXXXXX\r\nContent-Type: text/html\r\nContent-Length: 157\r\nConnection: close\r\n\r\n<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n
+pinned nginx normalized response 2 hex=48 54 54 50 2f 31 2e 31 20 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 d a 53 65 72 76 65 72 3a 20 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 d a 44 61 74 65 3a 20 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 d a 43 6f 6e 74 65 6e 74 2d 54 79 70 65 3a 20 74 65 78 74 2f 68 74 6d 6c d a 43 6f 6e 74 65 6e 74 2d 4c 65 6e 67 74 68 3a 20 31 35 37 d a 43 6f 6e 6e 65 63 74 69 6f 6e 3a 20 63 6c 6f 73 65 d a d a 3c 68 74 6d 6c 3e d a 3c 68 65 61 64 3e 3c 74 69 74 6c 65 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 74 69 74 6c 65 3e 3c 2f 68 65 61 64 3e d a 3c 62 6f 64 79 3e d a 3c 63 65 6e 74 65 72 3e 3c 68 31 3e 35 30 32 20 42 61 64 20 47 61 74 65 77 61 79 3c 2f 68 31 3e 3c 2f 63 65 6e 74 65 72 3e d a 3c 68 72 3e 3c 63 65 6e 74 65 72 3e 6e 67 69 6e 78 2f 31 2e 32 39 2e 37 3c 2f 63 65 6e 74 65 72 3e d a 3c 2f 62 6f 64 79 3e d a 3c 2f 68 74 6d 6c 3e d a
+pinned nginx gate/journal evidence: cleanup=clean state=5 error=0 master=1 worker=29 op=2 bytes=314 r2=70
+generated RUT raw wire length=0 escaped=
+generated RUT raw wire hex=
+generated RUT response 1 length=0 escaped=
+generated RUT response 1 hex=
+generated RUT response 2 length=0 escaped=
+generated RUT response 2 hex=
+generated RUT tail length=0 escaped=
+generated RUT tail hex=
+generated RUT gate/journal evidence: cleanup=clean state=6 error=2 ring=-1 send_fd=-1 send_bytes=0 cq_head=0 cq_tail=0 fragments=0 witness=0 attempts=0 overflow=0 duplicate=0 duplicate_sq_injection=0 ready_mask_mutation=0 ready_mask_restoration=0
+shared nginx fragment:
+server {
+  listen 58419;
+  location / {
+    proxy_pass http://127.0.0.1:41539;
+  }
+}
+converter-generated RUT source (max 8192 bytes):
+listen :58419
+upstream nginx_upstream at "127.0.0.1:41539"
+pre_route TRACE { return local_response({
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched OPTIONS { return local_response({
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched CONNECT { return local_response({
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched { return local_response({
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .suppressBody, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+route HEAD "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            head_mode: .suppressBody,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            head_mode: .suppressBody,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+route GET "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        timeout_failure_policy: {
+            version: .http11,
+            status: 504,
+            reason: "Gateway Time-out",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        response_read_timeout: 60s,
+        response_buffering: .completeContentLength
+    )
+}
+route "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+pinned nginx gate log (max 8192 bytes):
+/docker-entrypoint.sh: /docker-entrypoint.d/ is not empty, will attempt to perform configuration
+/docker-entrypoint.sh: Looking for shell scripts in /docker-entrypoint.d/
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/10-listen-on-ipv6-by-default.sh
+10-listen-on-ipv6-by-default.sh: info: Getting the checksum of /etc/nginx/conf.d/default.conf
+10-listen-on-ipv6-by-default.sh: info: Enabled listen on IPv6 in /etc/nginx/conf.d/default.conf
+/docker-entrypoint.sh: Sourcing /docker-entrypoint.d/15-local-resolvers.envsh
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/20-envsubst-on-templates.sh
+/docker-entrypoint.sh: Launching /docker-entrypoint.d/30-tune-worker-processes.sh
+/docker-entrypoint.sh: Configuration complete; ready for start up
+2026/10/02 14:31:26 [error] 29#29: *2 connect() failed (111: Connection refused) while connecting to upstream, client: 127.0.0.1, server: , request: "GET /missing?q=1 HTTP/1.1", upstream: "http://127.0.0.1:41539/missing?q=1", host: "client.example"
+127.0.0.1 - - [02/Oct/2026:14:31:26 +0000] "GET /missing?q=1 HTTP/1.1" 502 157 "-" "-"
+127.0.0.1 - - [02/Oct/2026:14:31:26 +0000] "GET /missing?q=2 HTTP/1.1" 502 157 "-" "-"
+2026/10/02 14:31:26 [error] 29#29: *2 connect() failed (111: Connection refused) while connecting to upstream, client: 127.0.0.1, server: , request: "GET /missing?q=2 HTTP/1.1", upstream: "http://127.0.0.1:41539/missing?q=2", host: "client.example"
+generated RUT gate log (max 8192 bytes):
+Loaded program: /tmp/rut-nginx-differential-upqEXM/generated.rut (opt O2)
+Backend: io_uring
+Listening on port 58419 with 1 shard(s)
+Draining connections (0s)...
+Shutdown complete.
+
+        Start 253: test_nginx_differential
+262/263 Test #253: test_nginx_differential ....................................................................................***Failed    0.61 sec
+FAIL [converter-generated coalesced successor differential]: converter-generated ordinary RUT side: RUT no-connection startup ring failure 2 with ring_ready=0
+pinned nginx coalesced raw wire length=0 escaped=
+pinned nginx coalesced raw wire hex=
+pinned nginx coalesced response 1 length=0 escaped=
+pinned nginx coalesced response 1 hex=
+pinned nginx coalesced response 2 length=0 escaped=
+pinned nginx coalesced response 2 hex=
+pinned nginx coalesced tail length=0 escaped=
+pinned nginx coalesced tail hex=
+pinned nginx coalesced attempts=0 connect-ipv4-be=0 connect-port-be=0 connect-user-data=0 gate evidence=
+converter-generated ordinary RUT coalesced raw wire length=0 escaped=
+converter-generated ordinary RUT coalesced raw wire hex=
+converter-generated ordinary RUT coalesced response 1 length=0 escaped=
+converter-generated ordinary RUT coalesced response 1 hex=
+converter-generated ordinary RUT coalesced response 2 length=0 escaped=
+converter-generated ordinary RUT coalesced response 2 hex=
+converter-generated ordinary RUT coalesced tail length=0 escaped=
+converter-generated ordinary RUT coalesced tail hex=
+converter-generated ordinary RUT coalesced attempts=0 connect-ipv4-be=0 connect-port-be=0 connect-user-data=0 gate evidence=cleanup=clean state=6 error=2 mode=0 recv-fd=-1 recv-user-data=0 fragments=0 witness=0 attempts=0
+shared accepted nginx fragment:
+server {
+  listen 50925;
+  location / { proxy_pass http://127.0.0.1:37809; }
+  location = /static { return 200 "successor-static"; }
+}
+shared one-send R1||R2 length=121 escaped=GET /missing?q=1 HTTP/1.1\r\nHost: client.example\r\n\r\nGET /static HTTP/1.1\r\nHost: exact-local.example\r\nConnection: close\r\n\r\n
+shared one-send R1||R2 hex=47 45 54 20 2f 6d 69 73 73 69 6e 67 3f 71 3d 31 20 48 54 54 50 2f 31 2e 31 d a 48 6f 73 74 3a 20 63 6c 69 65 6e 74 2e 65 78 61 6d 70 6c 65 d a d a 47 45 54 20 2f 73 74 61 74 69 63 20 48 54 54 50 2f 31 2e 31 d a 48 6f 73 74 3a 20 65 78 61 63 74 2d 6c 6f 63 61 6c 2e 65 78 61 6d 70 6c 65 d a 43 6f 6e 6e 65 63 74 69 6f 6e 3a 20 63 6c 6f 73 65 d a d a
+converter coalesced pinned nginx config (max 8192 bytes):
+<unavailable>
+converter-generated coalesced ordinary RUT source (max 8192 bytes):
+listen :50925
+upstream nginx_upstream at "127.0.0.1:37809"
+pre_route TRACE { return local_response({
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched OPTIONS { return local_response({
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched CONNECT { return local_response({
+  version: .http11, status: 405, reason: "Not Allowed", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .reject, body: b"<html>\r\n<head><title>405 Not Allowed</title></head>\r\n<body>\r\n<center><h1>405 Not Allowed</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+unmatched { return local_response({
+  version: .http11, status: 400, reason: "Bad Request", server: "nginx/1.29.7",
+  date: .current, content_type: "text/html", connection: .request,
+  head_mode: .suppressBody, body: b"<html>\r\n<head><title>400 Bad Request</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+}) }
+route HEAD "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            head_mode: .suppressBody,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            head_mode: .suppressBody,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+route GET "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        timeout_failure_policy: {
+            version: .http11,
+            status: 504,
+            reason: "Gateway Time-out",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        },
+        response_read_timeout: 60s,
+        response_buffering: .completeContentLength
+    )
+}
+route "/" {
+    return forward(nginx_upstream, request_policy: {
+            version: .http11,
+            host: .upstream,
+            connection: .omit,
+            strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+        },
+        response_policy: {
+            version: .http11,
+            framing: .contentLength,
+            connection: .request,
+            server: "nginx/1.29.7",
+            date: .current,
+            hide_headers: ["Date", "Server", "X-Pad"]
+        },
+        failure_policy: {
+            version: .http11,
+            status: 502,
+            reason: "Bad Gateway",
+            content_type: "text/html",
+            server: "nginx/1.29.7",
+            date: .current,
+            connection: .request,
+            body: b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n<hr><center>nginx/1.29.7</center>\r\n</body>\r\n</html>\r\n"
+        }
+    )
+}
+route exact slash_normalized "/static" { return local_response({
+  version: .http11, status: 200, reason: "OK", server: "nginx/1.29.7",
+  date: .current, content_type: "text/plain", connection: .request,
+  head_mode: .suppressBody, body: b"successor-static"
+}) }
+converter coalesced pinned nginx log (max 8192 bytes):
+<unavailable>
+converter-generated coalesced ordinary RUT log (max 8192 bytes):
+<empty>
+
+        Start 254: test_nginx_docker_info_preflight_self_check
+263/263 Test #254: test_nginx_docker_info_preflight_self_check ................................................................   Passed    0.25 sec
+
+93% tests passed, 18 tests failed out of 263
+
+Label Time Summary:
+cli             =   0.14 sec*proc (3 tests)
+compiler        =  91.53 sec*proc (3 tests)
+converter       =  11.64 sec*proc (7 tests)
+differential    =  91.60 sec*proc (34 tests)
+docker          = 709.58 sec*proc (152 tests)
+envoy           =  98.22 sec*proc (7 tests)
+harness         =   1.26 sec*proc (1 test)
+integration     = 986.99 sec*proc (177 tests)
+io_uring        = 319.79 sec*proc (71 tests)
+jit             =  44.89 sec*proc (6 tests)
+model           =   0.05 sec*proc (1 test)
+negative        =   3.72 sec*proc (7 tests)
+network         = 774.36 sec*proc (111 tests)
+nginx           = 628.88 sec*proc (164 tests)
+routing         =  14.65 sec*proc (1 test)
+runtime         =   6.29 sec*proc (5 tests)
+sim             =   2.58 sec*proc (2 tests)
+unit            = 294.60 sec*proc (76 tests)
+
+Total Test time (real) = 997.93 sec
+
+The following tests did not run:
+	 60 - test_envoy_oracle_milestone_s (Skipped)
+	 63 - test_envoy_pair_route_boundaries (Skipped)
+	 64 - test_envoy_pair_milestone_s (Skipped)
+
+The following tests FAILED:
+	 70 - test_access_log_startup (Failed)                  runtime unit
+	 76 - test_fixture_privileged_broker (Failed)           docker integration network
+	 77 - test_fixture_generated_nginx_differential (Failed) differential docker integration network
+	 78 - test_fixture_exact_input_mount_owner (Failed)     docker integration network
+	121 - test_nginx_issue270_keepalive_timeout_get_initial_deadline_differential (Failed) differential docker integration io_uring network nginx
+	122 - test_nginx_issue270_fixed_upload_head_success_differential (Failed) differential docker integration io_uring network nginx
+	123 - test_nginx_issue270_fixed_upload_head_zero_response_timeout_differential (Failed) differential docker integration io_uring network nginx
+	242 - test_rut_iouring_gate_spike (Failed)              integration nginx
+	243 - test_rut_issue566_id3_successor_public_gate (Failed) integration nginx
+	244 - test_rut_issue566_id3_successor_live200_public_gate (Failed) integration nginx
+	245 - test_rut_iouring_gate_identity_negative (Failed)  integration negative nginx
+	246 - test_rut_iouring_gate_ready_mutation_negative (Failed) integration negative nginx
+	247 - test_rut_iouring_gate_owner_death_negative (Failed) integration negative nginx
+	249 - test_rut_iouring_gate_connect_journal_negative (Failed) integration negative nginx
+	250 - test_rut_iouring_coalesced_ingress_gate (Failed)  integration nginx
+	251 - test_nginx_converter_coalesced_successor_differential (Failed) docker integration nginx
+	252 - test_nginx_late_successor_differential (Failed)   docker integration nginx
+	253 - test_nginx_differential (Failed)                  docker integration nginx
+Errors while running CTest

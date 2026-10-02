@@ -1,0 +1,9 @@
+{
+  "baseline_commit": "e54b32bc5e98803cf43cd254131ad4e6634fc855",
+  "candidate": "uncommitted compiler/server split working tree",
+  "sha256": {
+    "/tmp/rut-nginx-20261002/rut": "b93be14ae0a04573e6c9d235f5ea6fdf5ea5e9b53b6baeca0e35f2a7dc155fcc",
+    "/tmp/rut-split-final/bin/rut": "3ed8f2f18f7f9ed5736b3a35bb8e19167c73242707e37f96577936d89467b56e",
+    "/tmp/rut-split-final/bin/rut-compile": "97fe4a64fd40f9a6130b805006ac246c4c59ea048ea48f1a2cea8c9b01e31f03"
+  }
+}

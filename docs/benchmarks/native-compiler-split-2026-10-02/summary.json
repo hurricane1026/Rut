@@ -1,0 +1,58 @@
+[
+  {
+    "variant": "before",
+    "workload": "static",
+    "engine": "rut",
+    "rps": 8765.16045916208,
+    "rss_mib": 77.59375
+  },
+  {
+    "variant": "before",
+    "workload": "static",
+    "engine": "nginx",
+    "rps": 10027.071378966426,
+    "rss_mib": 15.43359375
+  },
+  {
+    "variant": "before",
+    "workload": "proxy",
+    "engine": "rut",
+    "rps": 1584.746767382485,
+    "rss_mib": 117.7734375
+  },
+  {
+    "variant": "before",
+    "workload": "proxy",
+    "engine": "nginx",
+    "rps": 2314.5156783287957,
+    "rss_mib": 16.0859375
+  },
+  {
+    "variant": "after",
+    "workload": "static",
+    "engine": "rut",
+    "rps": 8694.75199302429,
+    "rss_mib": 20.7890625
+  },
+  {
+    "variant": "after",
+    "workload": "static",
+    "engine": "nginx",
+    "rps": 9712.89460685079,
+    "rss_mib": 15.6328125
+  },
+  {
+    "variant": "after",
+    "workload": "proxy",
+    "engine": "rut",
+    "rps": 1558.3898154872734,
+    "rss_mib": 54.390625
+  },
+  {
+    "variant": "after",
+    "workload": "proxy",
+    "engine": "nginx",
+    "rps": 2337.386437236762,
+    "rss_mib": 15.95703125
+  }
+]
