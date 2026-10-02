@@ -301,11 +301,6 @@ TEST(native_program, preserves_sigchld_disposition) {
     REQUIRE(source.append("route GET \"/\" { return 200 }\n"));
     Source bad;
     REQUIRE(bad.append("route GET \"/\" { broken\n"));
-#ifdef SA_NOCLDWAIT
-    constexpr int kSaNoClDWait = SA_NOCLDWAIT;
-#else
-    constexpr int kSaNoClDWait = 0;
-#endif
     void (*const dispositions[])(int) = {
         SIG_IGN,
 #ifdef SA_NOCLDWAIT
@@ -318,23 +313,28 @@ TEST(native_program, preserves_sigchld_disposition) {
         struct sigaction requested{};
         requested.sa_handler = dispositions[i];
         sigemptyset(&requested.sa_mask);
+        sigaddset(&requested.sa_mask, SIGUSR1);
 #ifdef SA_NOCLDWAIT
         if (i == 1) requested.sa_flags = SA_NOCLDWAIT;
 #endif
         REQUIRE_EQ(sigaction(SIGCHLD, &requested, nullptr), 0);
+        struct sigaction baseline{};
+        REQUIRE_EQ(sigaction(SIGCHLD, nullptr, &baseline), 0);
         Program owner;
         REQUIRE(owner.p);
         char error[512];
         REQUIRE(load_native_program(source.path, *owner.p, error, sizeof(error)));
         struct sigaction observed{};
         REQUIRE_EQ(sigaction(SIGCHLD, nullptr, &observed), 0);
-        CHECK_EQ(observed.sa_handler, requested.sa_handler);
-        CHECK_EQ(observed.sa_flags & kSaNoClDWait, requested.sa_flags & kSaNoClDWait);
+        CHECK_EQ(observed.sa_handler, baseline.sa_handler);
+        CHECK_EQ(observed.sa_flags, baseline.sa_flags);
+        CHECK_EQ(sigismember(&observed.sa_mask, SIGUSR1), sigismember(&baseline.sa_mask, SIGUSR1));
         owner.p->destroy();
         CHECK_FALSE(load_native_program(bad.path, *owner.p, error, sizeof(error)));
         REQUIRE_EQ(sigaction(SIGCHLD, nullptr, &observed), 0);
-        CHECK_EQ(observed.sa_handler, requested.sa_handler);
-        CHECK_EQ(observed.sa_flags & kSaNoClDWait, requested.sa_flags & kSaNoClDWait);
+        CHECK_EQ(observed.sa_handler, baseline.sa_handler);
+        CHECK_EQ(observed.sa_flags, baseline.sa_flags);
+        CHECK_EQ(sigismember(&observed.sa_mask, SIGUSR1), sigismember(&baseline.sa_mask, SIGUSR1));
     }
 }
 
