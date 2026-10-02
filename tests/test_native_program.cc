@@ -107,6 +107,21 @@ TEST(native_program, code_and_views_survive_compiler_exit_and_source_removal) {
     CHECK((Str{c.header_values[0].data, c.header_values[0].len}.eq(lit_str("yes"))));
 }
 
+TEST(native_program, links_with_closed_stderr) {
+    Source source;
+    REQUIRE(source.append("route GET \"/\" { return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    const int saved_stderr = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    REQUIRE(saved_stderr >= 0);
+    REQUIRE_EQ(close(STDERR_FILENO), 0);
+    const bool loaded = load(source, *owner.p);
+    const bool restored = dup2(saved_stderr, STDERR_FILENO) == STDERR_FILENO;
+    close(saved_stderr);
+    REQUIRE(restored);
+    CHECK(loaded);
+}
+
 TEST(native_program, regex_and_independent_program_lifetimes) {
     Source source;
     REQUIRE(

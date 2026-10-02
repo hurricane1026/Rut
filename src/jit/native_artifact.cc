@@ -5,6 +5,7 @@
 #include "rut/serve_loader.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <llvm-c/Core.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -219,7 +220,12 @@ bool write_native_program(LoadedProgram& p, const char* output) {
 #ifdef __linux__
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() != parent_pid) _exit(127);
 #endif
-        if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) _exit(127);
+        if (dup2(STDERR_FILENO, STDOUT_FILENO) < 0) {
+            if (errno != EBADF) _exit(127);
+            const int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+            if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0) _exit(127);
+            if (null_fd != STDOUT_FILENO) close(null_fd);
+        }
 #ifdef __APPLE__
         execl(RUT_NATIVE_LINKER,
               RUT_NATIVE_LINKER,
