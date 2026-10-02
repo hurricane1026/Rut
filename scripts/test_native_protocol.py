@@ -68,6 +68,7 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
                                grandchild=False):
     """Terminate startup while the compiler is blocked at each pipe boundary."""
     pid_file = root / f"producer-{signal_name}-{mode}.pid"
+    pid_file.unlink(missing_ok=True)
     helper = root / "rut-compile"
     frame = header + image
     write = "" if mode == "header" else (
