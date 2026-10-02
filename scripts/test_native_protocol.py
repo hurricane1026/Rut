@@ -15,11 +15,12 @@ import tempfile
 import time
 
 
-def check_startup(server, source, explicit):
+def check_startup(server, source, explicit, environment=None):
     command = [str(server.resolve())]
     command += ["--compile", str(source)] if explicit else [str(source)]
     command += ["--shards", "1", "--no-pin", "--drain", "0"]
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               env=environment)
     diagnostic = b""
     ready = None
     try:
@@ -90,7 +91,12 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
         process.wait(timeout=3)
         diagnostic = process.stderr.read().decode()
         assert process.returncode != 0 and "startup cancelled" in diagnostic, diagnostic
-        assert not Path(f"/proc/{producer_pid}").exists(), (mode, producer_pid)
+        try:
+            os.kill(producer_pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError((mode, producer_pid))
         print(json.dumps({"case": f"{signal_name} during {mode}", "producer_reaped": True}))
     finally:
         if process.poll() is None:
@@ -114,6 +120,9 @@ def main():
             source.write_text('listen 127.0.0.1:0\n'
                               'route GET "/" { return response(200, body: "native") }\n')
             check_startup(args.server, source, explicit)
+        source.write_text('listen 127.0.0.1:0\n'
+                          'route GET "/" { return response(200, body: "native") }\n')
+        check_startup(args.server, source, True, {})
         source.write_text('route GET "/" { return 200 }\n')
         result = subprocess.run([str(args.compiler.resolve()), str(source), "2"],
                                 capture_output=True, check=True, timeout=15)

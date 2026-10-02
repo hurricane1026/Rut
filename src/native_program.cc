@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,6 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <poll.h>
 #ifdef __linux__
 #include <linux/memfd.h>
 #include <sys/prctl.h>
@@ -26,7 +26,9 @@
 namespace rut {
 namespace {
 volatile sig_atomic_t g_startup_cancelled = 0;
-void startup_cancel_handler(int) { g_startup_cancelled = 1; }
+void startup_cancel_handler(int) {
+    g_startup_cancelled = 1;
+}
 
 struct StartupSignalScope {
     struct sigaction old_int{};
@@ -306,7 +308,8 @@ bool load_native_program(
         return fail("startup cancelled");
     }
     if (!producer.wait())
-        return fail(g_startup_cancelled ? "startup cancelled" : "rut-compile failed (see diagnostic above)");
+        return fail(g_startup_cancelled ? "startup cancelled"
+                                        : "rut-compile failed (see diagnostic above)");
 #ifdef __linux__
     if (fcntl(out.artifact_fd,
               F_ADD_SEALS,
@@ -341,7 +344,8 @@ bool load_native_program(
     const u8* regex_data = take(sizeof(native::Regex) * h.regex_count);
     if (!routes || !metadata || !reloc_data || !symbol_data || !regex_data)
         return fail("truncated native configuration");
-    memcpy(static_cast<void*>(c.routes), static_cast<const void*>(routes),
+    memcpy(static_cast<void*>(c.routes),
+           static_cast<const void*>(routes),
            sizeof(RouteEntry) * h.route_count);
     memcpy(reinterpret_cast<u8*>(&c) + native::metadata_offset(c), metadata, h.metadata_size);
     if (c.upstream_count > c.kMaxUpstreams || c.timer_count > c.kMaxTimers ||
