@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import signal
 import shutil
 import socket
 import subprocess
@@ -61,6 +62,40 @@ def check_startup(server, source, explicit):
             process.wait()
 
 
+def check_startup_cancellation(server, source, header, image, signal_name, mode, root):
+    """Terminate startup while the compiler is blocked at each pipe boundary."""
+    pid_file = root / f"producer-{signal_name}-{mode}.pid"
+    helper = root / "rut-compile"
+    frame = header + image
+    write = "" if mode == "header" else (
+        f"sys.stdout.buffer.write(bytes.fromhex({frame.hex()!r}));sys.stdout.flush()\n")
+    close = "sys.stdout.close()\n" if mode == "eof" else ""
+    helper.write_text(
+        f"#!{sys.executable}\nimport os,sys,time\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        f"{write}{close}time.sleep(30)\n")
+    helper.chmod(0o700)
+    process = subprocess.Popen(
+        [str(server), "--compile", str(source), "--shards", "1", "--no-pin"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not pid_file.exists():
+            time.sleep(0.01)
+        assert pid_file.exists(), f"producer did not start: {mode}"
+        producer_pid = int(pid_file.read_text())
+        os.kill(process.pid, getattr(signal, signal_name))
+        process.wait(timeout=3)
+        diagnostic = process.stderr.read().decode()
+        assert process.returncode != 0 and "startup cancelled" in diagnostic, diagnostic
+        assert not Path(f"/proc/{producer_pid}").exists(), (mode, producer_pid)
+        print(json.dumps({"case": f"{signal_name} during {mode}", "producer_reaped": True}))
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", type=Path, required=True)
@@ -90,6 +125,11 @@ def main():
         wrong = header[:start] + b"x" + header[start + 1:]
         server = root / "rut"
         shutil.copy2(args.server, server)
+        for signal_name in ("SIGINT", "SIGTERM"):
+            for mode in ("header", "tail", "eof"):
+                source.write_text('route GET "/" { return 200 }\n')
+                check_startup_cancellation(
+                    server, source, header, image, signal_name, mode, root)
         cases = (
             ("mismatched build", wrong, b"", 30, "build mismatch"),
             ("truncated image", header, image[:16], 0, "truncated compiler artifact"),
