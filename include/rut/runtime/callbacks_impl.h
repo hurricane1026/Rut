@@ -7602,7 +7602,7 @@ template <typename Loop>
 void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
     conn.consume_request_receive_buffer(sent);
     conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
-    const bool tls_overflow_pending = conn.tls_recv_overflow_pending;
+    const bool tls_overflow_pending = conn.tls_recv_overflow_prefix_len != 0;
     if (tls_overflow_pending) {
         // The overflow CQE already copied a valid ciphertext prefix into
         // tls_in_buf.  Decrypt it under the newly installed body callback
@@ -7614,7 +7614,6 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
         if constexpr (requires { conn.tls_pending_on_recv; })
             conn.tls_pending_on_recv = &on_request_body_recvd<Loop>;
         if (conn.tls_recv_overflow_prefix_len > conn.tls_in_buf.len()) {
-            conn.tls_recv_overflow_pending = false;
             conn.tls_recv_overflow_prefix_len = 0;
             loop->close_conn(conn);
             return;
@@ -7626,7 +7625,6 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
             tls_input_processed = loop->process_buffered_tls_input(conn);
         }
         if (!tls_input_processed) {
-            conn.tls_recv_overflow_pending = false;
             conn.tls_recv_overflow_prefix_len = 0;
             loop->close_conn(conn);
             return;
@@ -7641,7 +7639,7 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
         if (conn.tls_in_buf.len() != 0) conn.tls_in_buf.reset();
         conn.recv_paused_for_send = true;
         conn.recv_pause_rearm_pending = false;
-        conn.tls_recv_overflow_pending = false;
+        conn.tls_recv_overflow_prefix_len = 0;
         conn.tls_recv_overflow_prefix_len = 0;
         respond_request_body_overflow<Loop>(loop, conn);
         return;

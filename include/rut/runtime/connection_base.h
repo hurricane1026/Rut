@@ -350,11 +350,6 @@ struct ConnectionBase {
     // io_uring: a request-body CQE overflowed recv_buf and the client was refused with
     // 413 (respond_request_body_overflow); later recv errors must not cut that response.
     bool req_body_overflow_rejected;
-    // TLS io_uring copied a non-empty prefix before reporting recv overflow.
-    // Defer successor classification until that prefix is decrypted and the
-    // current request-body parser has advanced its framing state.
-    bool tls_recv_overflow_pending;
-    u32 tls_recv_overflow_prefix_len;
     // A lossy downstream CQE discarded bytes after the complete current body.
     // Only this provenance permits dropping a pipelined successor on completion.
     bool req_body_lossy_successor;
@@ -1725,6 +1720,9 @@ struct ConnectionBase {
     // Owned like the other slices: freed only once no kernel op references it.
     u8* upstream_relay_slice;
     u32 upstream_relay_send_len;  // bytes of upstream_relay_slice in flight; 0 = none
+    // Nonzero while TLS overflow classification is deferred; also records the
+    // copied prefix length. This occupies existing tail padding.
+    u32 tls_recv_overflow_prefix_len;
 
     void bind_request_receive_buffer(u8* slice, u32 capacity) {
         clear_raw_request_target_witness();
@@ -1763,7 +1761,6 @@ struct ConnectionBase {
         proxy_resp_started = false;
         upstream_abandoned = false;
         req_body_overflow_rejected = false;
-        tls_recv_overflow_pending = false;
         tls_recv_overflow_prefix_len = 0;
         req_body_lossy_successor = false;
         req_body_abandoned = false;

@@ -7207,7 +7207,7 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         REQUIRE_EQ(conn.tls_in_buf.write(successor_ciphertext, 1), 1u);
         tls_recv<TlsIouringHarness>(
             &loop, conn, {conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0, 0});
-        CHECK(conn.tls_recv_overflow_pending);
+        CHECK(conn.tls_recv_overflow_prefix_len != 0);
         // Model the upstream body-send CQE that opens continue_request_body;
         // its send slot is no longer armed when the buffered TLS prefix runs.
         conn.upstream_send_armed = false;
@@ -7234,7 +7234,7 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
             CHECK(loop.closed);
         }
         CHECK_EQ(conn.tls_in_buf.len(), 0u);
-        CHECK_FALSE(conn.tls_recv_overflow_pending);
+        CHECK_FALSE(conn.tls_recv_overflow_prefix_len != 0);
         CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
         tls_engine_free(conn.tls_engine);
         cl.destroy();

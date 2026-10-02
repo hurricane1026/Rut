@@ -629,14 +629,13 @@ inline bool tls_recv_callback_is_current(const Connection& c) {
 template <class Self>
 void tls_recv(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
-    if (c.tls_recv_overflow_pending) {
+    if (c.tls_recv_overflow_prefix_len != 0) {
         // The overflow path owns the copied prefix until the in-flight body
         // send completes.  Do not feed raced CQEs back into TLS: a positive
         // CQE may contain the same truncated record and another overflow must
         // not queue a second pause/rearm pair.
         if (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty)) {
             if (c.tls_recv_overflow_prefix_len > c.tls_in_buf.len()) {
-                c.tls_recv_overflow_pending = false;
                 c.tls_recv_overflow_prefix_len = 0;
                 loop->close_conn(c);
             } else if (c.tls_in_buf.len() > c.tls_recv_overflow_prefix_len) {
@@ -644,7 +643,6 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
             }
             return;
         }
-        c.tls_recv_overflow_pending = false;
         c.tls_recv_overflow_prefix_len = 0;
         loop->close_conn(c);
         return;
@@ -753,10 +751,8 @@ void tls_recv(void* lp, Connection& c, IoEvent ev) {
             c.on_upstream_send == &on_request_body_sent<Self> && c.request_body_incomplete();
         if (ev.result == -ENOBUFS && !ev.provided_ring_empty && c.tls_in_buf.len() != 0 &&
             tls_streaming_body_send_owner) {
-            c.tls_recv_overflow_pending = true;
             c.tls_recv_overflow_prefix_len = c.tls_in_buf.len();
             if (!loop->pause_recv(c)) {
-                c.tls_recv_overflow_pending = false;
                 c.tls_recv_overflow_prefix_len = 0;
                 loop->close_conn(c);
             }

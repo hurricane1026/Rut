@@ -1084,7 +1084,7 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     CHECK(!c->idle_trim_examined);
     // Keep the slot-size assertion explicit: the deferred TLS overflow prefix
     // witness adds one u32 to the connection layout.
-    CHECK_EQ(sizeof(Connection), 3624u);
+    CHECK_EQ(sizeof(Connection), 3616u);
 }
 
 TEST(iouring_idle_trim,

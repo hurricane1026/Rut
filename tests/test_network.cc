@@ -77112,14 +77112,14 @@ TEST(request_body_overflow, iouring_tls_body_prefix_defers_loss_classification) 
     c->recv_armed = true;
     c->pending_ops = 1;
     tls_recv<IoUringEventLoop>(loop, *c, {c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0});
-    CHECK(c->tls_recv_overflow_pending);
+    CHECK(c->tls_recv_overflow_prefix_len != 0);
     CHECK_FALSE(c->req_body_lossy_successor);
     CHECK(c->recv_pause_cancel_pending);
     CHECK(c->recv_pause_target_inflight);
     REQUIRE_EQ(c->tls_in_buf.write(reinterpret_cast<const u8*>("raced"), 5), 5u);
     tls_recv<IoUringEventLoop>(loop, *c, {c->id, 5, 0, 0, IoEventType::Recv, 1, 0});
     CHECK_EQ(c->tls_in_buf.len(), 6u);  // raced bytes are discarded to the saved prefix
-    CHECK(c->tls_recv_overflow_pending);
+    CHECK(c->tls_recv_overflow_prefix_len != 0);
     loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
     loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0});
     CHECK_FALSE(c->recv_pause_cancel_pending);
