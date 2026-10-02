@@ -58,7 +58,8 @@ struct StartupSignalScope {
         }
         if (mask_saved) sigprocmask(SIG_SETMASK, &old_mask, nullptr);
     }
-    ~StartupSignalScope() {
+    bool finish() {
+        if (!int_installed && !term_installed) return g_startup_cancelled != 0;
         if (mask_saved) {
             sigset_t blocked{};
             sigemptyset(&blocked);
@@ -70,8 +71,14 @@ struct StartupSignalScope {
         if (int_installed) {
             sigaction(SIGINT, &old_int, nullptr);
         }
+        const bool cancelled = g_startup_cancelled != 0;
+        int_installed = false;
+        term_installed = false;
         if (mask_saved) sigprocmask(SIG_SETMASK, &old_mask, nullptr);
+        g_startup_cancelled = 0;
+        return cancelled;
     }
+    ~StartupSignalScope() { (void)finish(); }
 };
 
 #ifdef __linux__
@@ -230,7 +237,8 @@ bool load_native_program(
             struct pollfd wait_fd{producer.fd, POLLIN, 0};
             int ready = poll(&wait_fd, 1, 50);
             if (ready < 0 && errno == EINTR) continue;
-            if (ready <= 0) continue;
+            if (ready == 0) continue;
+            if (ready < 0) return false;
             ssize_t n = read(producer.fd, ptr, size);
             if (n < 0 && errno == EINTR) {
                 if (g_startup_cancelled) return false;
@@ -297,7 +305,11 @@ bool load_native_program(
         struct pollfd wait_fd{producer.fd, POLLIN, 0};
         int ready = poll(&wait_fd, 1, 50);
         if (ready < 0 && errno == EINTR) continue;
-        if (ready <= 0) continue;
+        if (ready == 0) continue;
+        if (ready < 0) {
+            producer.cancel();
+            return fail("cannot read compiler artifact");
+        }
         tail = read(producer.fd, &extra, 1);
         if (tail < 0 && errno == EINTR) continue;
         break;
@@ -307,9 +319,10 @@ bool load_native_program(
         producer.cancel();
         return fail("startup cancelled");
     }
-    if (!producer.wait())
-        return fail(g_startup_cancelled ? "startup cancelled"
-                                        : "rut-compile failed (see diagnostic above)");
+    const bool producer_ok = producer.wait();
+    const bool startup_cancelled = startup_signals.finish();
+    if (startup_cancelled) return fail("startup cancelled");
+    if (!producer_ok) return fail("rut-compile failed (see diagnostic above)");
 #ifdef __linux__
     if (fcntl(out.artifact_fd,
               F_ADD_SEALS,
