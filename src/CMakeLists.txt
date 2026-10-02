@@ -419,8 +419,10 @@ if(RUT_ENABLE_JIT)
     # JIT .cc files may need LLVM definitions that conflict with -fno-rtti.
     # The LLVM C API is pure C so no RTTI issues, but LLVM's cmake may add
     # -fno-rtti to definitions. Add LLVM definitions selectively.
+    get_filename_component(RUT_NATIVE_LINKER_DIR "${CMAKE_LINKER}" DIRECTORY)
     target_compile_definitions(rut_jit PRIVATE ${LLVM_DEFINITIONS}
-        RUT_NATIVE_LINKER="${CMAKE_C_COMPILER}")
+        RUT_NATIVE_LINKER="${CMAKE_C_COMPILER}"
+        RUT_NATIVE_LINKER_DIR="${CMAKE_LINKER}")
     target_include_directories(rut_jit PRIVATE ${PROJECT_BINARY_DIR}/generated)
 
     # Native helpers use the runtime; regex compilation remains compiler-only.

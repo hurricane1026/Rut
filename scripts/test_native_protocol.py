@@ -69,7 +69,7 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
     frame = header + image
     write = "" if mode == "header" else (
         f"sys.stdout.buffer.write(bytes.fromhex({frame.hex()!r}));sys.stdout.flush()\n")
-    close = "sys.stdout.close()\n" if mode == "eof" else ""
+    close = "os.close(1)\n" if mode == "eof" else ""
     marker = (f"tmp={str(pid_file)!r}+'.tmp';open(tmp,'w').write(str(os.getpid()));"
               f"os.replace(tmp,{str(pid_file)!r})\n")
     helper.write_text(

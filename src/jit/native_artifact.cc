@@ -214,6 +214,8 @@ bool write_native_program(LoadedProgram& p, const char* output) {
 #ifdef __APPLE__
         execl(RUT_NATIVE_LINKER,
               RUT_NATIVE_LINKER,
+              "-B",
+              RUT_NATIVE_LINKER_DIR,
               "-dynamiclib",
               "-Wl,-undefined,dynamic_lookup",
               object,
@@ -223,6 +225,8 @@ bool write_native_program(LoadedProgram& p, const char* output) {
 #else
         execl(RUT_NATIVE_LINKER,
               RUT_NATIVE_LINKER,
+              "-B",
+              RUT_NATIVE_LINKER_DIR,
               "-shared",
               "-nostdlib",
               "-Wl,-z,now",
