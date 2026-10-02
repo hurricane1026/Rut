@@ -546,6 +546,70 @@ inline bool ordinary_local_response_request_boundary_reusable(const Connection& 
            exact_end == conn.req_initial_send_len;
 }
 
+// During the initial upstream connect, recv_buf can gain the remainder of the
+// current request after the first partial upload snapshot was captured. Refresh
+// only that exact request boundary before admitting a lossy successor; never
+// reparse a retry snapshot or promote bytes past a complete body.
+inline bool refresh_initial_connect_request_boundary(Connection& conn) {
+    if (conn.retry_req_send_len != 0 || conn.recv_buf.data() == nullptr ||
+        conn.req_header_end == 0 || conn.req_header_end > conn.recv_buf.len() ||
+        !conn.req_strict_h1_complete || conn.req_malformed)
+        return false;
+    HttpParser parser;
+    ParsedRequest request;
+    parser.reset();
+    request.reset();
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &request) !=
+            ParseStatus::Complete ||
+        parser.header_end != conn.req_header_end || request.version != HttpVersion::Http11 ||
+        request.upgrade || request.has_upgrade_header || request.target_has_fragment ||
+        request.method == HttpMethod::Unknown || map_log_method(request.method) != conn.req_method)
+        return false;
+    const u32 body_len = conn.recv_buf.len() - parser.header_end;
+    if (request.has_content_length) {
+        if (!request_content_length_identity_is_valid(request) ||
+            request.content_length != conn.req_content_length || request.chunked ||
+            request.content_length > body_len)
+            return false;
+        conn.req_body_mode = request.content_length == 0 ? BodyMode::None : BodyMode::ContentLength;
+        conn.req_body_remaining = 0;
+        conn.req_initial_send_len = parser.header_end + request.content_length;
+        conn.downstream_req_size = conn.req_initial_send_len;
+        conn.req_size = conn.req_initial_send_len;
+        conn.request_body_fully_buffered = true;
+        return true;
+    }
+    if (request.chunked) {
+        ChunkedParser probe;
+        probe.reset();
+        u32 pos = 0;
+        while (pos < body_len && probe.state != ChunkedParser::State::Complete) {
+            u32 consumed = 0, out_start = 0, out_len = 0;
+            const ChunkStatus status = probe.feed(conn.recv_buf.data() + parser.header_end + pos,
+                                                  body_len - pos,
+                                                  &consumed,
+                                                  &out_start,
+                                                  &out_len);
+            if (consumed > body_len - pos || consumed == 0 || status == ChunkStatus::Error)
+                return false;
+            pos += consumed;
+        }
+        if (probe.state != ChunkedParser::State::Complete) return false;
+        conn.req_body_mode = BodyMode::Chunked;
+        conn.req_body_remaining = 0;
+        conn.req_chunk_parser = probe;
+        conn.req_initial_send_len = parser.header_end + pos;
+        conn.downstream_req_size = conn.req_initial_send_len;
+        conn.req_size = conn.req_initial_send_len;
+        return true;
+    }
+    if (body_len != 0) return false;
+    conn.req_body_mode = BodyMode::None;
+    conn.req_body_remaining = 0;
+    conn.req_initial_send_len = parser.header_end;
+    return true;
+}
+
 template <typename Loop>
 inline bool ordinary_local_response_may_persist(Loop* loop,
                                                 const Connection& conn,
@@ -5249,6 +5313,9 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         conn.keep_alive = false;
         return;
     }
+    if (conn.retry_req_send_len == 0 && conn.upstream_connect_armed &&
+        conn.on_upstream_send == &on_upstream_connected<Loop>)
+        (void)refresh_initial_connect_request_boundary(conn);
     if (initial_connect_request_owner<Loop>(conn)) {
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
@@ -7640,7 +7707,6 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
         conn.recv_paused_for_send = true;
         conn.recv_pause_rearm_pending = false;
         conn.tls_recv_overflow_prefix_len = 0;
-        conn.tls_recv_overflow_prefix_len = 0;
         respond_request_body_overflow<Loop>(loop, conn);
         return;
     }
@@ -9490,11 +9556,29 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         conn.reset_request_receive_buffer();
-        // Undo a recv pause from the upload (continue_request_body): successors
-        // and a client close are read again while the response is awaited.
-        if (conn.recv_paused_for_send) {
+        // A lossy successor is discarded while the current response is awaited;
+        // keep the client recv paused and never re-arm it into a new request.
+        if (conn.req_body_lossy_successor) {
+            conn.recv_pause_rearm_pending = false;
+            if (conn.recv_armed && !conn.recv_pause_cancel_pending &&
+                !conn.recv_pause_target_inflight) {
+                if constexpr (requires { loop->pause_recv(conn); }) {
+                    if (!loop->pause_recv(conn)) {
+                        loop->close_conn(conn);
+                        return;
+                    }
+                } else {
+                    loop->close_conn(conn);
+                    return;
+                }
+            }
+        } else if (conn.recv_paused_for_send) {
+            // Undo a recv pause from the upload for a lossless request.
             conn.recv_paused_for_send = false;
-            loop->submit_recv(conn);
+            if (!loop->submit_recv(conn)) {
+                loop->close_conn(conn);
+                return;
+            }
         }
         conn.upstream_start_us = monotonic_us();
         if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();

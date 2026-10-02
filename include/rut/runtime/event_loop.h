@@ -164,10 +164,15 @@ public:
         // queued response send.
         if (conn.req_body_abandoned) {
             conn.reset_request_receive_buffer();
+            conn.recv_paused_for_send = true;
+            conn.recv_pause_rearm_pending = false;
             if constexpr (loop_backend_async_io<Derived>() &&
                           requires { self().pause_recv(conn); }) {
-                if (conn.recv_armed && !conn.recv_pause_cancel_pending)
-                    (void)self().pause_recv(conn);
+                if (conn.recv_armed && !conn.recv_pause_cancel_pending &&
+                    !conn.recv_pause_target_inflight && !self().pause_recv(conn)) {
+                    self().close_conn(conn);
+                    return;
+                }
             }
             return;
         }

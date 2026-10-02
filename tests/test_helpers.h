@@ -478,6 +478,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     TimerWheel timer;
     u32 shard_id = 0;
     bool running = true;
+    bool fail_pause_recv = false;
 
     static constexpr u32 kMaxConns = 64;
     static constexpr u32 kBufSize = 4096;
@@ -540,6 +541,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
 
     void setup() {
         running = true;
+        fail_pause_recv = false;
         draining = false;
         access_log = nullptr;
         live_access_log = nullptr;
@@ -606,6 +608,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
         }
         return false;
     }
+    bool pause_recv(Connection&) { return !fail_pause_recv; }
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (backend.add_send(c.fd, c.id, buf, len)) {
             c.pending_ops++;
