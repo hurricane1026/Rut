@@ -1742,7 +1742,7 @@ struct ConnectionBase {
     }
     bool recv_pause_must_survive_send() const {
         return req_body_lossy_successor || req_body_abandoned || req_body_overflow_rejected ||
-               tls_recv_overflow_resume_pending();
+               tls_recv_overflow_prefix_len != 0;
     }
     void clear_recv_pause_for_send() {
         if (!recv_pause_must_survive_send()) recv_paused_for_send = false;

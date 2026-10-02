@@ -9557,6 +9557,7 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 
 template <typename Loop>
 void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
     // The body upload is still draining while an early upstream response is buffered;
     // this slot completes the final body chunk send. If that send FAILED the upload
     // is truncated even though the body counters (advanced before submit) may read
@@ -9580,6 +9581,21 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
 
     reserve_response_mutation_snapshot(conn);
     prepare_early_response_state(conn);
+    if (conn.tls_active && conn.req_body_abandoned && conn.tls_recv_overflow_prefix_len != 0) {
+        // The overflow prefix belonged to the request upload, which the early
+        // response just abandoned. A pending TLS logical-send WANT_READ owner
+        // may still need those bytes; otherwise discard them with the same
+        // pause/cancel rendezvous used for later abandoned-upload CQEs.
+        conn.tls_recv_overflow_prefix_len = 0;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->tls_ciphertext_send_is_current(c);
+                      }) {
+            if (conn.tls_pending_on_recv != &tls_resume_pending_send_recv<Loop>)
+                if (!tls_discard_abandoned_input<Loop>(loop, conn)) return;
+        } else {
+            conn.tls_in_buf.reset();
+        }
+    }
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
 
     HttpResponseParser probe;

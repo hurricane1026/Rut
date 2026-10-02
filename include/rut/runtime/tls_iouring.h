@@ -643,6 +643,10 @@ inline bool tls_recv_callback_is_current(const Connection& c) {
 template <class Self>
 void tls_recv(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
+    // A parked prefix belongs to the request upload. Once an early response
+    // has abandoned that upload, its owner must hand off before prefix handling:
+    // discard it, or feed it to a pending TLS send that owns WANT_READ.
+    if (c.req_body_abandoned) c.tls_recv_overflow_prefix_len = 0;
     if (c.tls_recv_overflow_prefix_len != 0) {
         // The overflow path owns the copied prefix until the in-flight body
         // send completes.  Do not feed raced CQEs back into TLS: a positive
