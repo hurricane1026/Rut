@@ -1082,8 +1082,8 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     r.loop->timer.remove(c);
     r.loop->timer.add(c, r.loop->keepalive_timeout);  // a bare add
     CHECK(!c->idle_trim_examined);
-    // The mark lives in padding-free space next to timer_node: the struct did not
-    // grow (3616 bytes on main when this field was added).
+    // Keep the slot-size assertion explicit: the deferred TLS overflow prefix
+    // witness occupies existing tail padding in the connection layout.
     CHECK_EQ(sizeof(Connection), 3616u);
 }
 

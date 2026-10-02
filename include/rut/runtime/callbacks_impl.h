@@ -546,6 +546,72 @@ inline bool ordinary_local_response_request_boundary_reusable(const Connection& 
            exact_end == conn.req_initial_send_len;
 }
 
+// During the initial upstream connect, recv_buf can gain the remainder of the
+// current request after the first partial upload snapshot was captured. Refresh
+// only that exact request boundary before admitting a lossy successor; never
+// reparse a retry snapshot or promote bytes past a complete body.
+inline bool refresh_initial_connect_request_boundary(Connection& conn) {
+    if (conn.retry_req_send_len != 0 || conn.recv_buf.data() == nullptr ||
+        conn.req_header_end == 0 || conn.req_header_end > conn.recv_buf.len() ||
+        !conn.req_strict_h1_complete || conn.req_malformed)
+        return false;
+    HttpParser parser;
+    ParsedRequest request;
+    parser.reset();
+    request.reset();
+    if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &request) !=
+            ParseStatus::Complete ||
+        parser.header_end != conn.req_header_end ||
+        (request.version != HttpVersion::Http10 && request.version != HttpVersion::Http11) ||
+        static_cast<u8>(request.version) != conn.req_http_version || request.upgrade ||
+        request.has_upgrade_header || request.target_has_fragment ||
+        request.method == HttpMethod::Unknown || map_log_method(request.method) != conn.req_method)
+        return false;
+    const u32 body_len = conn.recv_buf.len() - parser.header_end;
+    if (request.has_content_length) {
+        if (!request_content_length_identity_is_valid(request) ||
+            request.content_length != conn.req_content_length || request.chunked ||
+            request.content_length > body_len)
+            return false;
+        conn.req_body_mode = request.content_length == 0 ? BodyMode::None : BodyMode::ContentLength;
+        conn.req_body_remaining = 0;
+        conn.req_initial_send_len = parser.header_end + request.content_length;
+        conn.downstream_req_size = conn.req_initial_send_len;
+        conn.req_size = conn.req_initial_send_len;
+        conn.request_body_fully_buffered = true;
+        return true;
+    }
+    if (request.chunked) {
+        ChunkedParser probe;
+        probe.reset();
+        u32 pos = 0;
+        while (pos < body_len && probe.state != ChunkedParser::State::Complete) {
+            u32 consumed = 0, out_start = 0, out_len = 0;
+            const ChunkStatus status = probe.feed(conn.recv_buf.data() + parser.header_end + pos,
+                                                  body_len - pos,
+                                                  &consumed,
+                                                  &out_start,
+                                                  &out_len);
+            if (consumed > body_len - pos || consumed == 0 || status == ChunkStatus::Error)
+                return false;
+            pos += consumed;
+        }
+        if (probe.state != ChunkedParser::State::Complete) return false;
+        conn.req_body_mode = BodyMode::Chunked;
+        conn.req_body_remaining = 0;
+        conn.req_chunk_parser = probe;
+        conn.req_initial_send_len = parser.header_end + pos;
+        conn.downstream_req_size = conn.req_initial_send_len;
+        conn.req_size = conn.req_initial_send_len;
+        return true;
+    }
+    if (body_len != 0) return false;
+    conn.req_body_mode = BodyMode::None;
+    conn.req_body_remaining = 0;
+    conn.req_initial_send_len = parser.header_end;
+    return true;
+}
+
 template <typename Loop>
 inline bool ordinary_local_response_may_persist(Loop* loop,
                                                 const Connection& conn,
@@ -1552,6 +1618,10 @@ void resume_jit_handler(Loop* loop, Connection& conn);
 // requests retain the legacy close-only 504.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
+template <typename Loop>
+void respond_request_body_overflow(Loop* loop, Connection& conn);
+template <typename Loop>
+void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
 inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 
@@ -5138,6 +5208,291 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         close_conn_if_live(loop, conn);
 }
 
+// STOPGAP, not streaming. A downstream recv CQE did not fit in recv_buf while the
+// request body was still being forwarded upstream (io_uring: wait() copies
+// min(nbytes, room) and drops the rest, reporting -ENOBUFS), so the body can no
+// longer be forwarded intact. Answer 413 + Connection: close instead of hanging or
+// closing silently; never forward a truncated body.
+//
+// Effective limit on io_uring: a body that arrives faster than the upstream send
+// drains the 16 KiB recv_buf slice gets 413, e.g. a one-write client body above
+// ~16 KiB (curl --data-binary at 20 KB / 100 KB / 1 MiB -> 413), and a paced client
+// to a slow origin once a resume lets the multishot pull its whole backlog at once.
+// Bodies that fit (one write up to ~16 KiB) and uploads that stay paced below the
+// drain rate are forwarded byte-exact. Lossless streaming (a per-connection
+// parked-CQE FIFO in wait()) is tracked as a follow-up and will lift this ceiling.
+//
+// An upstream that already answered (early 401 and the like) keeps priority: its
+// buffered response is delivered through the existing early-response path and the
+// rest of the body is dropped, instead of being replaced by our 413. Best effort
+// only: the overflow CQE usually lands before the upstream's reply is read, in
+// which case the 413 still wins.
+//
+// Same admission shape as respond_upstream_timeout (plain, policy-free proxying
+// before any response byte); anything else keeps the plain close.
+template <typename Loop>
+bool pause_recv_for_lossy_request_successor(Loop* loop, Connection& conn) {
+    conn.recv_paused_for_send = true;
+    conn.recv_pause_rearm_pending = false;
+    if (!conn.recv_armed || conn.recv_pause_cancel_pending || conn.recv_pause_target_inflight)
+        return true;
+    if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+        return loop->pause_recv(conn);
+    } else if constexpr (loop_backend_async_io<Loop>()) {
+        return false;
+    }
+    return true;
+}
+
+template <typename Loop>
+void respond_request_body_overflow(Loop* loop, Connection& conn) {
+    bool complete_early_response = false;
+    bool upgrade_response_101 = false;
+    const bool final_body_send_inflight = final_request_body_send_inflight<Loop>(conn);
+    if (conn.upstream_recv_buf.len() > 0) {
+        HttpResponseParser parser;
+        ParsedResponse response;
+        const u8* probe_data = conn.upstream_recv_buf.data();
+        u32 probe_len = conn.upstream_recv_buf.len();
+        for (; probe_len != 0;) {
+            parser.reset();
+            response.reset();
+            if (parser.parse(probe_data, probe_len, &response) != ParseStatus::Complete) break;
+            const bool response_bodyless =
+                conn.req_method == static_cast<u8>(LogHttpMethod::Head) ||
+                response.status_code == 204 || response.status_code == 205 ||
+                response.status_code == 304;
+            if (response.status_code >= 200 && response.has_content_length && !response_bodyless &&
+                probe_len < parser.header_end + response.content_length)
+                break;
+            if (response.status_code == 101 || response.status_code >= 200) {
+                complete_early_response = true;
+                upgrade_response_101 = response.status_code == 101;
+                break;
+            }
+            if (parser.header_end == 0 || parser.header_end >= probe_len) break;
+            probe_data += parser.header_end;
+            probe_len -= parser.header_end;
+        }
+    }
+    // A 101 commits the Upgrade tunnel, so a lossy successor cannot be
+    // admitted with missing protocol bytes. A complete non-101 response keeps
+    // the ordinary response owner and may safely drain the abandoned request.
+    if (conn.req_wants_upgrade && (!complete_early_response || upgrade_response_101)) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (!final_body_send_inflight && conn.state == ConnState::Proxying &&
+        !conn.proxy_resp_started && !conn.upstream_abandoned &&
+        (complete_early_response ||
+         conn.on_upstream_send == &on_body_send_with_early_response<Loop>)) {
+        // The upstream send completion (on_request_body_sent / on_upstream_request_sent /
+        // on_body_send_with_early_response) picks the buffered response up and marks
+        // the upload abandoned. Nothing more to forward, nothing to reject.
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    const bool intermediate_body_send_owner =
+        conn.state == ConnState::Proxying && conn.upstream_send_armed &&
+        conn.on_upstream_send == &on_request_body_sent<Loop> && !conn.upstream_abandoned &&
+        conn.req_initial_send_len <= conn.recv_buf.len();
+    if (intermediate_body_send_owner) {
+        const u8* suffix = conn.recv_buf.data() + conn.req_initial_send_len;
+        const u32 suffix_len = conn.recv_buf.len() - conn.req_initial_send_len;
+        bool complete_suffix = false;
+        if (conn.req_body_mode == BodyMode::ContentLength) {
+            complete_suffix = conn.req_body_remaining <= suffix_len;
+        } else if (conn.req_body_mode == BodyMode::Chunked) {
+            ChunkedParser probe = conn.req_chunk_parser;
+            u32 pos = 0;
+            while (pos < suffix_len && probe.state != ChunkedParser::State::Complete) {
+                u32 consumed = 0, out_start = 0, out_len = 0;
+                const ChunkStatus status =
+                    probe.feed(suffix + pos, suffix_len - pos, &consumed, &out_start, &out_len);
+                pos += consumed;
+                if (status == ChunkStatus::Error || consumed == 0) break;
+            }
+            complete_suffix = probe.state == ChunkedParser::State::Complete;
+        }
+        if (complete_suffix) {
+            conn.req_body_lossy_successor = true;
+            conn.keep_alive = false;
+            if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+            return;
+        }
+    }
+    // The final request-body send owns completion of the origin response even
+    // when recv_buf contains only a partial or empty response prefix. Preserve
+    // that owner so on_request_body_sent can finish the response and close.
+    if (final_body_send_inflight) {
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    if (conn.retry_req_send_len == 0 && conn.upstream_connect_armed &&
+        conn.on_upstream_send == &on_upstream_connected<Loop>)
+        (void)refresh_initial_connect_request_boundary(conn);
+    if (initial_connect_request_owner<Loop>(conn)) {
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    // The body counters are advanced only when the in-flight send completes. If
+    // the copied prefix already contains this request's complete Content-Length,
+    // preserve that request and close after its response; only the pipelined
+    // successor was lost in the overflowing CQE.
+    if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::ContentLength &&
+        conn.req_content_length != 0 && conn.req_header_end <= conn.recv_buf.len() &&
+        conn.req_content_length <= conn.recv_buf.len() - conn.req_header_end) {
+        // The initial upstream send still owns completion. Keep the buffered
+        // current-request bytes available for that send and discard any lossy
+        // successor after its completion; do not publish upload completion yet.
+        conn.request_upload_complete = false;
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::None &&
+        conn.req_initial_send_len <= conn.recv_buf.len()) {
+        conn.request_upload_complete = false;
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    if (initial_request_send_owner<Loop>(conn) && conn.req_body_mode == BodyMode::Chunked &&
+        conn.req_initial_send_len <= conn.recv_buf.len()) {
+        ChunkedParser probe = conn.req_chunk_parser;
+        const u8* suffix = conn.recv_buf.data() + conn.req_initial_send_len;
+        const u32 suffix_len = conn.recv_buf.len() - conn.req_initial_send_len;
+        u32 pos = 0;
+        while (pos < suffix_len && probe.state != ChunkedParser::State::Complete) {
+            u32 consumed = 0, out_start = 0, out_len = 0;
+            const ChunkStatus status =
+                probe.feed(suffix + pos, suffix_len - pos, &consumed, &out_start, &out_len);
+            pos += consumed;
+            if (status == ChunkStatus::Error || consumed == 0) break;
+        }
+        if (probe.state == ChunkedParser::State::Complete) {
+            // Keep the live parser at the pre-CQE boundary. The completion
+            // callback must forward the exact suffix through the real parser;
+            // the probe only classifies whether the suffix completes this body.
+            conn.req_body_lossy_successor = true;
+            conn.keep_alive = false;
+            if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+            return;
+        }
+    }
+    // The initial send may have completed in an earlier CQE in this batch. A
+    // later lossy recv then belongs solely to a pipelined successor while the
+    // complete current request is already owned by the upstream response
+    // callback. Preserve that response and close after it drains.
+    if (completed_request_waiting_response_owner<Loop>(conn)) {
+        conn.req_body_lossy_successor = true;
+        conn.keep_alive = false;
+        conn.reset_request_receive_buffer();
+        conn.pipeline_stash_len = 0;
+        if (conn.retry_req_send_len == 0)
+            conn.send_buf.reset();
+        else
+            conn.send_buf.set_len(conn.retry_req_send_len);
+        if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+        return;
+    }
+    conn.req_body_overflow_rejected = true;
+    if (conn.state != ConnState::Proxying || conn.proxy_resp_started ||
+        conn.response_read_deadline_state != ResponseReadDeadlineState::None ||
+        conn.timeout_failure_policy_id != 0 || conn.failure_policy_suppress_body) {
+        loop->close_conn(conn);
+        return;
+    }
+    if constexpr (requires(Loop* candidate, Connection& c) { candidate->pause_recv(c); }) {
+        // Plaintext io_uring still has a live multishot client recv here. Cancel
+        // it before publishing 413 so repeated overflow CQEs cannot keep the
+        // request alive or refresh its timeout. TLS owns its receive path and
+        // may need WANT_READ while producing the 413, so leave it untouched.
+        if (!conn.uses_iouring_tls() && conn.recv_armed && !loop->pause_recv(conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
+    (void)detach_upstream_close(loop, conn);
+    conn.upstream_abandoned = true;
+    static const char k413[] =
+        "HTTP/1.1 413 Payload Too Large\r\n"
+        "Content-Length: 17\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "Payload Too Large";
+    conn.send_buf.reset();
+    conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1);
+    conn.keep_alive = false;
+    conn.resp_status = 413;
+    conn.transition_to_sending(&on_response_sent<Loop>);
+    if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len()) && conn.fd >= 0)
+        loop->close_conn(conn);
+}
+
+template <typename Loop>
+void resume_request_body_tls_overflow(Loop* loop, Connection& conn) {
+    if (!conn.tls_recv_overflow_resume_pending() || !conn.tls_active || conn.tls_out_inflight ||
+        conn.tls_recv_overflow_prefix_size() > conn.tls_in_buf.len()) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (conn.tls_recv_overflow_prefix_size() == 0) {
+        conn.set_tls_recv_overflow_resume_pending(false);
+        respond_request_body_overflow<Loop>(loop, conn);
+        return;
+    }
+    const i32 fd = conn.fd;
+    const u32 handler_generation = conn.handler_gen;
+    const u32 send_owner_generation = conn.tls_send_owner_generation;
+    if (conn.tls_recv_overflow_prefix_size() < conn.tls_in_buf.len())
+        conn.tls_in_buf.set_len(conn.tls_recv_overflow_prefix_size());
+    const bool processed = loop->process_buffered_tls_input(conn);
+    if (conn.tls_out_inflight) {
+        const bool current_raw_owner = [&]() {
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->tls_ciphertext_send_is_current(c);
+                          }) {
+                return loop->tls_ciphertext_send_is_current(conn);
+            }
+            return false;
+        }();
+        if (conn.tls_active && conn.fd == fd && conn.handler_gen == handler_generation &&
+            conn.tls_send_owner_generation == send_owner_generation && current_raw_owner) {
+            // tls_process can either be blocked behind a control flight or
+            // produce another control flight while consuming this prefix. Keep
+            // the classification parked until the current raw owner drains.
+            conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
+            return;
+        }
+        conn.set_tls_recv_overflow_resume_pending(false);
+        conn.tls_recv_overflow_prefix_len = 0;
+        loop->close_conn(conn);
+        return;
+    }
+    if (!processed) {
+        conn.set_tls_recv_overflow_resume_pending(false);
+        conn.tls_recv_overflow_prefix_len = 0;
+        loop->close_conn(conn);
+        return;
+    }
+    if (!conn.tls_active || conn.fd != fd || conn.handler_gen != handler_generation ||
+        conn.tls_send_owner_generation != send_owner_generation)
+        return;
+    if (conn.tls_in_buf.len() != 0) conn.tls_in_buf.reset();
+    conn.set_tls_recv_overflow_resume_pending(false);
+    conn.tls_recv_overflow_prefix_len = 0;
+    respond_request_body_overflow<Loop>(loop, conn);
+}
+
 // forward(set_path:) — rewrite the request-line path in recv_buf in place from
 // conn.req_path_override before forwarding upstream. The path lives at the front
 // of the request (inside the initial-forward chunk), so the buffered bytes after
@@ -7374,9 +7729,138 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
     }
 }
 
+// Continue the streamed request body after recv_buf[0, sent) went upstream.
+//
+// On io_uring the downstream multishot recv keeps delivering while the upstream
+// connect/send is in flight (no recv slot is set), and wait() has already
+// appended those CQEs to recv_buf behind the part being sent. They are request
+// stream bytes: drop only the sent prefix, never the whole buffer, and forward
+// what is already buffered as the next chunk instead of waiting for a recv that
+// the still-armed multishot will never re-deliver. epoll/kqueue read only when a
+// recv is submitted, so there the buffer is empty here and this is a plain re-arm.
+//
+// Limit (stopgap, see respond_request_body_overflow): this only recovers bytes that
+// wait() managed to copy into the 16 KiB recv_buf. A body arriving faster than the
+// upstream send drains it overflows and the client gets 413; one-write bodies above
+// ~16 KiB and paced uploads to a slow origin hit this. Lossless streaming (a
+// parked-CQE FIFO in wait()) is a follow-up.
+template <typename Loop>
+void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
+    conn.consume_request_receive_buffer(sent);
+    conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
+    const bool tls_overflow_pending = conn.tls_recv_overflow_prefix_len != 0;
+    if (tls_overflow_pending) {
+        // The overflow CQE already copied a valid ciphertext prefix into
+        // tls_in_buf.  Decrypt it under the newly installed body callback
+        // before deciding whether the lost tail was a successor.  Keep the
+        // cancelled multishot recv out of the way until that decision is made.
+        const i32 callback_fd = conn.fd;
+        const u32 callback_handler_generation = conn.handler_gen;
+        const u32 callback_send_owner_generation = conn.tls_send_owner_generation;
+        if constexpr (requires { conn.tls_pending_on_recv; })
+            conn.tls_pending_on_recv = &on_request_body_recvd<Loop>;
+        if (conn.tls_recv_overflow_prefix_size() > conn.tls_in_buf.len()) {
+            conn.tls_recv_overflow_prefix_len = 0;
+            loop->close_conn(conn);
+            return;
+        }
+        if (conn.tls_recv_overflow_prefix_size() < conn.tls_in_buf.len())
+            conn.tls_in_buf.set_len(conn.tls_recv_overflow_prefix_size());
+        bool tls_input_processed = true;
+        if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
+            tls_input_processed = loop->process_buffered_tls_input(conn);
+        }
+        if (!tls_input_processed) {
+            if (conn.tls_out_inflight) {
+                if constexpr (requires(Loop* candidate, Connection& c) {
+                                  candidate->tls_ciphertext_send_is_current(c);
+                              }) {
+                    if (loop->tls_ciphertext_send_is_current(conn) &&
+                        conn.tls_send_owner_generation == callback_send_owner_generation) {
+                        conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
+                        conn.set_tls_recv_overflow_resume_pending(true);
+                        if (!pause_recv_for_lossy_request_successor(loop, conn))
+                            loop->close_conn(conn);
+                        return;
+                    }
+                }
+            }
+            conn.set_tls_recv_overflow_resume_pending(false);
+            conn.tls_recv_overflow_prefix_len = 0;
+            loop->close_conn(conn);
+            return;
+        }
+        if (conn.tls_out_inflight) {
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->tls_ciphertext_send_is_current(c);
+                          }) {
+                if (loop->tls_ciphertext_send_is_current(conn) &&
+                    conn.tls_send_owner_generation == callback_send_owner_generation) {
+                    conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
+                    conn.set_tls_recv_overflow_resume_pending(true);
+                    if (!pause_recv_for_lossy_request_successor(loop, conn)) loop->close_conn(conn);
+                    return;
+                }
+            }
+            conn.set_tls_recv_overflow_resume_pending(false);
+            conn.tls_recv_overflow_prefix_len = 0;
+            loop->close_conn(conn);
+            return;
+        }
+        if (!conn.tls_active || conn.fd != callback_fd ||
+            conn.handler_gen != callback_handler_generation ||
+            conn.tls_send_owner_generation != callback_send_owner_generation)
+            return;
+        // The remaining bytes are the tail of the record whose suffix the
+        // backend dropped.  They cannot be replayed after -ENOBUFS; discard
+        // that incomplete record before classifying the now-updated body.
+        if (conn.tls_in_buf.len() != 0) conn.tls_in_buf.reset();
+        conn.recv_paused_for_send = true;
+        conn.recv_pause_rearm_pending = false;
+        conn.set_tls_recv_overflow_resume_pending(false);
+        conn.tls_recv_overflow_prefix_len = 0;
+        respond_request_body_overflow<Loop>(loop, conn);
+        return;
+    }
+    // The recv was paused (handle_unhandled_recv) because recv_buf ran low on room
+    // while the send drained it; the space is back, let the client send again.
+    if (conn.recv_paused_for_send && conn.recv_buf.write_avail() >= kRequestBodyRecvHeadroom)
+        conn.recv_paused_for_send = false;
+    const u32 kBuffered = conn.recv_buf.len();
+    if (!loop->submit_recv(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (!loop->submit_recv_upstream(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (kBuffered > 0) {
+        IoEvent synth = {conn.id, static_cast<i32>(kBuffered), 0, 0, IoEventType::Recv, 0, 0, 0};
+        on_request_body_recvd<Loop>(loop, conn, synth);
+        return;
+    }
+    if constexpr (requires { loop->process_buffered_tls_input(conn); }) {
+        // io_uring TLS: ciphertext that arrived while no recv slot was set waits in
+        // tls_in_buf and no further CQE is guaranteed to drive it.
+        (void)loop->process_buffered_tls_input(conn);
+    }
+}
+
 template <typename Loop>
 void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
+    // Discard only the successor known to have been damaged by a lossy recv
+    // CQE, before strict upload validation or request classification runs.
+    const bool lossy_current_request_complete =
+        !conn.req_body_abandoned &&
+        (conn.req_body_mode == BodyMode::None ||
+         (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0) ||
+         (conn.req_body_mode == BodyMode::Chunked &&
+          conn.req_chunk_parser.state == ChunkedParser::State::Complete));
+    if (conn.req_body_lossy_successor && lossy_current_request_complete &&
+        conn.retry_req_send_len == 0 && conn.req_initial_send_len <= conn.recv_buf.len())
+        conn.recv_buf.set_len(conn.req_initial_send_len);
     const bool fixed_upload =
         conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
         response_read_deadline_profile_is_fixed_upload(conn.response_read_deadline_profile);
@@ -7512,17 +7996,18 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
     }
     const bool response_mutation_snapshot = conn.response_mutations_snapshotted;
     if (kMoreReqBody) {
-        // Body streaming begins here: recv_buf is reset and refilled with body
-        // chunks, so the original headers+body are no longer replayable. Mark it so
-        // request_fully_resendable refuses any later reused-socket retry.
+        // Body streaming begins here: the sent prefix is dropped from recv_buf and
+        // the rest is refilled with body chunks, so the original headers+body are
+        // no longer replayable. Mark it so request_fully_resendable refuses any
+        // later reused-socket retry.
         conn.req_body_streamed = true;
         conn.request_upload_complete = false;
         reserve_response_mutation_snapshot(conn);
-        conn.reset_request_receive_buffer();
-        conn.set_slots(
-            &on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
-        loop->submit_recv(conn);
-        loop->submit_recv_upstream(conn);
+        // The sent prefix is always recv_buf[0, req_initial_send_len): an incomplete body
+        // is never replayed from send_buf (request_body_replayable refuses it), and the
+        // reserve above may itself set retry_req_send_len for the mutation snapshot,
+        // which says nothing about how much of recv_buf went upstream.
+        continue_request_body<Loop>(loop, conn, conn.req_initial_send_len);
         return;
     }
 
@@ -9072,6 +9557,7 @@ void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool s
 
 template <typename Loop>
 void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
+    auto* loop = static_cast<Loop*>(lp);
     // The body upload is still draining while an early upstream response is buffered;
     // this slot completes the final body chunk send. If that send FAILED the upload
     // is truncated even though the body counters (advanced before submit) may read
@@ -9095,6 +9581,21 @@ void on_body_send_with_early_response(void* lp, Connection& conn, IoEvent ev) {
 
     reserve_response_mutation_snapshot(conn);
     prepare_early_response_state(conn);
+    if (conn.tls_active && conn.req_body_abandoned && conn.tls_recv_overflow_prefix_len != 0) {
+        // The overflow prefix belonged to the request upload, which the early
+        // response just abandoned. A pending TLS logical-send WANT_READ owner
+        // may still need those bytes; otherwise discard them with the same
+        // pause/cancel rendezvous used for later abandoned-upload CQEs.
+        conn.tls_recv_overflow_prefix_len = 0;
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->tls_ciphertext_send_is_current(c);
+                      }) {
+            if (conn.tls_pending_on_recv != &tls_resume_pending_send_recv<Loop>)
+                if (!tls_discard_abandoned_input<Loop>(loop, conn)) return;
+        } else {
+            conn.tls_in_buf.reset();
+        }
+    }
     conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
 
     HttpResponseParser probe;
@@ -9180,11 +9681,39 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     if (body_done) {
         conn.request_upload_complete = true;
+        // A lossy recv CQE may have left successor bytes behind the completed
+        // current request. This request is already marked Connection: close;
+        // discard the damaged successor instead of stashing it for reuse.
+        if (conn.req_body_lossy_successor && conn.recv_buf.len() != 0) conn.recv_buf.reset();
         if (!pipeline_stash(conn)) {
             loop->close_conn(conn);
             return;
         }
         conn.reset_request_receive_buffer();
+        // A lossy successor is discarded while the current response is awaited;
+        // keep the client recv paused and never re-arm it into a new request.
+        if (conn.req_body_lossy_successor) {
+            conn.recv_pause_rearm_pending = false;
+            if (conn.recv_armed && !conn.recv_pause_cancel_pending &&
+                !conn.recv_pause_target_inflight) {
+                if constexpr (requires { loop->pause_recv(conn); }) {
+                    if (!loop->pause_recv(conn)) {
+                        loop->close_conn(conn);
+                        return;
+                    }
+                } else {
+                    loop->close_conn(conn);
+                    return;
+                }
+            }
+        } else if (conn.recv_paused_for_send) {
+            // Undo a recv pause from the upload for a lossless request.
+            conn.recv_paused_for_send = false;
+            if (!loop->submit_recv(conn)) {
+                loop->close_conn(conn);
+                return;
+            }
+        }
         conn.upstream_start_us = monotonic_us();
         if (conn.upstream_recv_buf.len() == 0) conn.upstream_recv_buf.reset();
         conn.set_slots(nullptr, nullptr, &on_upstream_response<Loop>, nullptr);
@@ -9204,10 +9733,9 @@ void on_request_body_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
-    conn.reset_request_receive_buffer();
-    conn.set_slots(&on_request_body_recvd<Loop>, nullptr, &on_early_upstream_recvd<Loop>, nullptr);
-    loop->submit_recv(conn);
-    loop->submit_recv_upstream(conn);
+    // Bytes the downstream recv appended while this chunk was in flight sit behind
+    // it in recv_buf: keep them (see continue_request_body).
+    continue_request_body<Loop>(loop, conn, conn.req_initial_send_len);
 }
 
 template <typename Loop>
@@ -9230,6 +9758,22 @@ void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
 
     if (ev.result <= 0) {
+        if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+            preserved_response_drain_owner<Loop>(conn)) {
+            conn.reset_request_receive_buffer();
+            return;
+        }
+        // io_uring: the CQE did not fit in recv_buf and its tail was dropped.
+        if constexpr (loop_backend_async_io<Loop>() &&
+                      requires(Loop* l, Connection& c) { l->pause_recv(c); }) {
+            const bool final_body_send_inflight = final_request_body_send_inflight<Loop>(conn);
+            if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+                (conn.request_body_incomplete() || final_body_send_inflight ||
+                 completed_request_waiting_response_owner<Loop>(conn))) {
+                respond_request_body_overflow<Loop>(loop, conn);
+                return;
+            }
+        }
         loop->close_conn(conn);
         return;
     }
@@ -9397,11 +9941,7 @@ void ws_stop_client_poll(Loop* loop, Connection& conn) {
 // Sync backends (epoll) leave the bytes in the socket, so pausing is safe.
 template <typename Loop>
 constexpr bool ws_loop_async() {
-    if constexpr (requires { decltype(Loop::backend)::kAsyncIo; }) {
-        return decltype(Loop::backend)::kAsyncIo;
-    } else {
-        return false;
-    }
+    return loop_backend_async_io<Loop>();
 }
 
 // Drive the bidirectional Close handshake: submit a Close frame on each peer's send slot

@@ -24,6 +24,7 @@
 #include "rut/runtime/upstream_concurrency.h"
 #include <atomic>
 
+#include <errno.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #ifdef __linux__
@@ -154,8 +155,82 @@ public:
     // Handle client Recv when no on_recv handler is set.
     // Centralizes drain/EOF/ENOBUFS logic — written once, correct everywhere.
     void handle_unhandled_recv(Connection& conn, const IoEvent& ev) {
+        // Refused with 413 after a request-body overflow: the response is draining and
+        // the connection closes behind it; nothing more to read or to fail on.
+        if (conn.req_body_overflow_rejected) return;
+        // The origin response owns the connection after an early response
+        // abandoned the request body. Late downstream CQEs belong to the
+        // discarded upload; consume them without rearming or truncating the
+        // queued response send.
+        if (conn.req_body_abandoned) {
+            conn.reset_request_receive_buffer();
+            conn.recv_paused_for_send = true;
+            conn.recv_pause_rearm_pending = false;
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
+                if (conn.recv_armed && !conn.recv_pause_cancel_pending &&
+                    !conn.recv_pause_target_inflight && !self().pause_recv(conn)) {
+                    self().close_conn(conn);
+                    return;
+                }
+            }
+            return;
+        }
+        // A lossy successor may race the response header/body transition. Once
+        // the origin response owns the connection, discard that late client CQE
+        // even while no downstream send is armed between body chunks.
+        const bool response_owner = preserved_response_late_recv_owner<Derived>(conn);
+        if (response_owner && ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+            !conn.req_body_lossy_successor) {
+            conn.req_body_lossy_successor = true;
+            conn.keep_alive = false;
+            conn.reset_request_receive_buffer();
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
+                if (!conn.uses_iouring_tls() && conn.recv_armed && !self().pause_recv(conn)) {
+                    self().close_conn(conn);
+                }
+            }
+            return;
+        }
+        if (response_owner && conn.req_body_lossy_successor &&
+            (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty))) {
+            conn.reset_request_receive_buffer();
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
+                if (conn.recv_armed && !conn.recv_pause_cancel_pending &&
+                    !self().pause_recv(conn)) {
+                    self().close_conn(conn);
+                }
+            }
+            return;
+        }
         if (ev.result > 0) {
-            if (!conn.keep_alive) conn.reset_request_receive_buffer();
+            // A streamed request body is still being forwarded: these bytes (already
+            // appended to recv_buf by the backend) are its next chunk, which
+            // on_upstream_request_sent / on_request_body_sent pick up. Keep them.
+            const bool kBodyInFlight = conn.request_body_incomplete();
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
+                // io_uring: the multishot recv keeps filling recv_buf while the upstream
+                // send drains it, and a CQE that does not fit is lost. Pause before the
+                // buffer can overflow; continue_request_body resumes once it is free.
+                // Plaintext only: a TLS connection never reaches here (tls_recv owns its
+                // recv slot) and its overflow is in tls_in_buf, which this headroom does
+                // not watch. A TLS pause was measured to move the one-write threshold
+                // not at all (the burst is already queued), so TLS has no pause and
+                // overflows at ~33 KB of body (ciphertext in tls_in_buf) -> 413.
+                static_assert(kRequestBodyRecvHeadroom == 2 * kProvidedBufSize);
+                if (kBodyInFlight && !conn.recv_paused_for_send &&
+                    conn.recv_buf.write_avail() < kRequestBodyRecvHeadroom) {
+                    if (!self().pause_recv(conn)) {
+                        self().close_conn(conn);
+                        return;
+                    }
+                    return;
+                }
+            }
+            if (!conn.keep_alive && !kBodyInFlight) conn.reset_request_receive_buffer();
             // Re-arm only when io_uring multishot terminated (!recv_armed).
             // On epoll, recv_armed is always false but EPOLLIN is already
             // armed via EPOLLIN|EPOLLOUT from add_send — calling submit_recv
@@ -165,10 +240,31 @@ public:
             return;
         }
         if (ev.result < 0) {
+            if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+                preserved_response_drain_owner<Derived>(conn)) {
+                conn.reset_request_receive_buffer();
+                return;
+            }
             // A response written directly still awaits its Send completion,
             // which accounts the request and closes this connection; a client
             // that read it and reset must not pre-empt that completion.
             if (conn.direct_write_completion_pending) return;
+            if constexpr (loop_backend_async_io<Derived>() &&
+                          requires { self().pause_recv(conn); }) {
+                // io_uring: a request-body CQE overflowed recv_buf, so its uncopied
+                // tail is gone. Answer 413 (and let that response drain) instead of
+                // a silent close.
+                const bool final_body_send_inflight =
+                    final_request_body_send_inflight<Derived>(conn);
+                if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+                    (conn.request_body_incomplete() || final_body_send_inflight ||
+                     initial_request_send_owner<Derived>(conn) ||
+                     completed_request_waiting_response_owner<Derived>(conn) ||
+                     initial_connect_request_owner<Derived>(conn))) {
+                    respond_request_body_overflow(&self(), conn);
+                    return;
+                }
+            }
             self().close_conn(conn);  // -ENOBUFS: prevent busy-loop
             return;
         }

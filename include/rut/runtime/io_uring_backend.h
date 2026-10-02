@@ -454,7 +454,6 @@ struct IoUringBackend {
     u32 upstream_once_max_len() const {
         return large_buf_ring != nullptr ? kLargeProvidedBufSize : kProvidedBufSize;
     }
-
 #ifdef RUT_TESTING
 public:
 #else

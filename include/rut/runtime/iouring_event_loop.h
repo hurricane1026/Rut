@@ -2017,7 +2017,7 @@ public:
             c.response_read_deadline_state != ResponseReadDeadlineState::RefreshPending)
             timer.refresh(&c,
                           c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
-        c.recv_paused_for_send = false;
+        c.clear_recv_pause_for_send();
         if (!successful) {
             backend.send_state[c.id] = {};
             Connection::visit_tls_raw_send_owner_fields(
@@ -3138,6 +3138,7 @@ public:
     bool submit_recv_impl(Connection& c) {
         const bool tls_send_needs_recv =
             c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>;
+        if (tls_send_needs_recv) c.recv_paused_for_send = false;
         if (c.recv_paused_for_send && !tls_send_needs_recv) {
             c.recv_pause_rearm_pending = true;
             return true;
@@ -3169,6 +3170,9 @@ public:
     bool process_buffered_tls_input(Connection& c) {
         if (!c.uses_iouring_tls() || c.tls_in_buf.len() == 0 || c.tls_out_inflight) return false;
         tls_process<Self>(this, c);
+        if (c.tls_active && (c.req_body_abandoned || c.req_body_overflow_rejected) &&
+            c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
+            tls_discard_abandoned_input<Self>(this, c);
         return true;
     }
 
@@ -7002,6 +7006,15 @@ public:
                                 if (conn.recv_pause_cancel_pending)
                                     conn.recv_pause_rearm_pending = true;
                             }
+                            if (conn.recv_pause_rearm_pending && !conn.recv_pause_cancel_pending &&
+                                !conn.recv_pause_target_inflight && !conn.recv_paused_for_send &&
+                                conn.fd >= 0) {
+                                conn.recv_pause_rearm_pending = false;
+                                if (!submit_recv_impl(conn)) {
+                                    close_conn(conn);
+                                    break;
+                                }
+                            }
                         }
                         if (ev.type == IoEventType::Send) {
                             conn.send_armed = false;
@@ -7167,7 +7180,7 @@ public:
                             timer.refresh(&conn,
                                           conn.state == ConnState::Proxying ? upstream_timeout
                                                                             : keepalive_timeout);
-                        if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
+                        if (ev.type == IoEventType::Send) conn.clear_recv_pause_for_send();
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {
                         if (yield_kind_matches_event(conn.pending_yield_kind, ev.type)) {
@@ -7179,7 +7192,7 @@ public:
                                     conn.tls_pending_on_recv = nullptr;
                                 break;
                             }
-                            if (ev.type == IoEventType::Send) conn.recv_paused_for_send = false;
+                            if (ev.type == IoEventType::Send) conn.clear_recv_pause_for_send();
                             disarm_yield_timer(conn);
                             conn.resume_event_kind = yield_kind_from_event(ev.type);
                             conn.resume_event_result = ev.result;

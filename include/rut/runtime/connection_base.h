@@ -42,6 +42,25 @@ enum class BodyMode : u8 {
     UntilClose,     // Read until EOF (HTTP/1.0)
 };
 
+// io_uring only: while a streamed request body is being forwarded upstream and
+// nothing consumes recv_buf, the downstream multishot recv is paused once fewer
+// than this many bytes of room remain (two provided buffers, see kProvidedBufSize
+// in io_backend.h), leaving slack for CQEs already in flight. Resumed when the
+// upstream send completes and the sent prefix is dropped.
+inline constexpr u32 kRequestBodyRecvHeadroom = 8192;
+
+// True when the loop's backend completes recvs asynchronously into provided buffers
+// (io_uring: kAsyncIo). Gates the request-body pause / 413 logic, which only exists
+// there; a sync mock loop that merely defines pause_recv must not run it.
+template <typename Loop>
+constexpr bool loop_backend_async_io() {
+    if constexpr (requires { decltype(Loop::backend)::kAsyncIo; }) {
+        return decltype(Loop::backend)::kAsyncIo;
+    } else {
+        return false;
+    }
+}
+
 // Active wire protocol on a connection, fixed after the TLS handshake from the
 // ALPN result (plaintext connections stay Http11). Drives parse/serialize path.
 enum class ConnProtocol : u8 {
@@ -328,6 +347,15 @@ struct ConnectionBase {
     u8 upstream_backend_idx;  // which backend endpoint the current connect targets
     bool proxy_resp_started;  // true once upstream response bytes were sent to the client
     bool upstream_abandoned;  // gave up on the upstream (timeout); ignore late upstream CQEs
+    // io_uring: a request-body CQE overflowed recv_buf and the client was refused with
+    // 413 (respond_request_body_overflow); later recv errors must not cut that response.
+    bool req_body_overflow_rejected;
+    // A lossy downstream CQE discarded bytes after the complete current body.
+    // Only this provenance permits dropping a pipelined successor on completion.
+    bool req_body_lossy_successor;
+    // An early upstream response ended the upload: the rest of the request body is
+    // read and dropped, never forwarded (prepare_early_response_state).
+    bool req_body_abandoned;
     // HTTP/1 idle upstream reuse: `upstream_keep_alive` is set when the upstream
     // response is parsed iff its connection may be reused (keep-alive, not
     // close-delimited) — the completion path then returns the fd to the per-shard
@@ -1290,6 +1318,17 @@ struct ConnectionBase {
         recv_buf.consume(count);
     }
 
+    // True while the downstream request body still has bytes to come and they are
+    // being forwarded upstream. Anything the downstream recv appends to recv_buf
+    // behind the chunk already handed upstream is then request-stream body, not a
+    // pipelined successor.
+    bool request_body_incomplete() const {
+        return !req_body_abandoned &&
+               ((req_body_mode == BodyMode::ContentLength && req_body_remaining > 0) ||
+                (req_body_mode == BodyMode::Chunked &&
+                 req_chunk_parser.state != ChunkedParser::State::Complete));
+    }
+
     RawRequestTargetWitnessResult checked_raw_request_target() const {
         const RawRequestTargetWitnessResult neutral{RawRequestTargetWitnessState::Neutral,
                                                     {nullptr, 0}};
@@ -1681,6 +1720,33 @@ struct ConnectionBase {
     // Owned like the other slices: freed only once no kernel op references it.
     u8* upstream_relay_slice;
     u32 upstream_relay_send_len;  // bytes of upstream_relay_slice in flight; 0 = none
+    // Nonzero while TLS overflow classification is deferred; also records the
+    // copied prefix length. The high bit marks deferred classification.
+    u32 tls_recv_overflow_prefix_len;
+    static constexpr u32 kTlsOverflowResumeBit = 1u << 31;
+    bool tls_recv_overflow_resume_pending() const {
+        return (tls_recv_overflow_prefix_len & kTlsOverflowResumeBit) != 0;
+    }
+    u32 tls_recv_overflow_prefix_size() const {
+        return tls_recv_overflow_prefix_len & ~kTlsOverflowResumeBit;
+    }
+    void set_tls_recv_overflow_prefix_size(u32 size) {
+        tls_recv_overflow_prefix_len =
+            size | (tls_recv_overflow_prefix_len & kTlsOverflowResumeBit);
+    }
+    void set_tls_recv_overflow_resume_pending(bool pending) {
+        if (pending)
+            tls_recv_overflow_prefix_len |= kTlsOverflowResumeBit;
+        else
+            tls_recv_overflow_prefix_len &= ~kTlsOverflowResumeBit;
+    }
+    bool recv_pause_must_survive_send() const {
+        return req_body_lossy_successor || req_body_abandoned || req_body_overflow_rejected ||
+               tls_recv_overflow_prefix_len != 0;
+    }
+    void clear_recv_pause_for_send() {
+        if (!recv_pause_must_survive_send()) recv_paused_for_send = false;
+    }
 
     void bind_request_receive_buffer(u8* slice, u32 capacity) {
         clear_raw_request_target_witness();
@@ -1718,6 +1784,10 @@ struct ConnectionBase {
         upstream_backend_idx = 0;
         proxy_resp_started = false;
         upstream_abandoned = false;
+        req_body_overflow_rejected = false;
+        tls_recv_overflow_prefix_len = 0;
+        req_body_lossy_successor = false;
+        req_body_abandoned = false;
         upstream_keep_alive = false;
         upstream_reused = false;
         upstream_request_incomplete = false;

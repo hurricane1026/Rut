@@ -128,6 +128,7 @@ void capture_request_metadata(Connection& conn) {
     // previous keep-alive request bleeding into the next).
     conn.req_body_mode = BodyMode::None;
     conn.req_body_remaining = 0;
+    conn.req_body_abandoned = false;
     conn.req_chunk_parser.reset();
     conn.req_malformed = false;
     // Default to "request asked the origin to close": only a cleanly parsed
@@ -993,10 +994,17 @@ void prepare_early_response_state(Connection& conn) {
         (conn.req_body_mode == BodyMode::Chunked &&
          conn.req_chunk_parser.state != ChunkedParser::State::Complete);
     if (kHasRemainingBody) {
+        conn.req_body_abandoned = true;
         conn.reset_request_receive_buffer();
         conn.keep_alive = false;
     } else {
-        if (!pipeline_stash(conn)) conn.keep_alive = false;
+        // A lossy downstream CQE may have appended a damaged successor after
+        // this complete request. Preserve the response owner while discarding
+        // that suffix; stashing it would expose truncated bytes to the parser.
+        if (conn.req_body_lossy_successor)
+            conn.recv_buf.reset();
+        else if (!pipeline_stash(conn))
+            conn.keep_alive = false;
         conn.reset_request_receive_buffer();
     }
     if (conn.upstream_start_us == 0) conn.upstream_start_us = monotonic_us();
@@ -1115,6 +1123,7 @@ template void on_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEven
 template void on_jit_request_body_recvd<IoUringEventLoop>(void*, Connection&, IoEvent);
 template void resume_jit_handler<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void respond_upstream_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+template void respond_request_body_overflow<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void h2_proxy_fail<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16);
 template void throttle_resume<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 

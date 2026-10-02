@@ -120,6 +120,106 @@ template <typename Loop>
 void on_request_body_sent(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
+inline bool initial_request_send_owner(const Connection& conn) {
+    return conn.state == ConnState::Proxying && conn.upstream_send_armed &&
+           !conn.upstream_abandoned && conn.on_upstream_send == &on_upstream_request_sent<Loop>;
+}
+
+template <typename Loop>
+inline bool final_request_body_send_inflight(const Connection& conn) {
+    const bool complete =
+        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state == ChunkedParser::State::Complete);
+    return conn.state == ConnState::Proxying && complete && conn.upstream_send_armed &&
+           conn.on_upstream_send == &on_request_body_sent<Loop> && !conn.upstream_abandoned;
+}
+
+template <typename Loop>
+inline bool completed_request_waiting_response_owner(const Connection& conn) {
+    const bool framing_complete =
+        conn.req_body_mode == BodyMode::None ||
+        (conn.req_body_mode == BodyMode::ContentLength && conn.req_body_remaining == 0) ||
+        (conn.req_body_mode == BodyMode::Chunked &&
+         conn.req_chunk_parser.state == ChunkedParser::State::Complete);
+    return conn.state == ConnState::Proxying && conn.request_upload_complete &&
+           !conn.upstream_request_incomplete && !conn.upstream_abandoned && conn.upstream_fd >= 0 &&
+           !conn.proxy_resp_started && conn.on_upstream_send == nullptr &&
+           conn.on_upstream_recv == &on_upstream_response<Loop> && framing_complete;
+}
+
+template <typename Loop>
+inline bool preserved_response_drain_owner(const Connection& conn) {
+    const bool response_owner = conn.on_send == &on_proxy_response_sent<Loop> ||
+                                conn.on_send == &on_response_sent<Loop> ||
+                                conn.on_send == &on_response_header_sent<Loop> ||
+                                conn.on_send == &on_response_body_sent<Loop> ||
+                                conn.on_send == &on_complete_response_sent<Loop>;
+    return conn.state == ConnState::Sending && conn.req_body_lossy_successor &&
+           !conn.upstream_request_incomplete && conn.proxy_resp_started && conn.send_armed &&
+           response_owner;
+}
+
+template <typename Loop>
+inline bool preserved_response_late_recv_owner(const Connection& conn) {
+    const bool response_owner = conn.on_send == &on_proxy_response_sent<Loop> ||
+                                conn.on_send == &on_response_sent<Loop> ||
+                                conn.on_send == &on_response_header_sent<Loop> ||
+                                conn.on_send == &on_response_body_sent<Loop> ||
+                                conn.on_send == &on_complete_response_sent<Loop> ||
+                                conn.on_upstream_recv == &on_response_body_recvd<Loop>;
+    return conn.state == ConnState::Sending && !conn.upstream_request_incomplete &&
+           conn.proxy_resp_started && response_owner;
+}
+
+// Strictly prove the current HTTP/1 request boundary before admitting a
+// lossy successor while the initial upstream connect owns the request.
+bool ordinary_local_response_request_boundary_reusable(const Connection& conn);
+
+template <typename Loop>
+inline bool initial_connect_request_owner(const Connection& conn) {
+    const bool retry_snapshot_owner = conn.retry_req_snapshot_replayable &&
+                                      conn.send_buf.data() != nullptr &&
+                                      conn.retry_req_send_len <= conn.send_buf.len();
+    const bool request_owner = conn.retry_req_send_len == 0
+                                   ? ordinary_local_response_request_boundary_reusable(conn)
+                                   : retry_snapshot_owner;
+    return conn.state == ConnState::Proxying && conn.upstream_connect_armed &&
+           conn.upstream_fd >= 0 && !conn.upstream_abandoned && !conn.proxy_resp_started &&
+           conn.on_upstream_send == &on_upstream_connected<Loop> && !conn.req_wants_upgrade &&
+           request_owner;
+}
+
+// A TLS overflow may arrive while a live request body is still incomplete and
+// the initial upstream connect owns the first request send.  The ordinary
+// initial-connect owner above intentionally proves a reusable request boundary,
+// so keep this separate and admit only the exact strict HTTP/1 body shape.
+template <typename Loop>
+inline bool tls_partial_initial_connect_request_owner(const Connection& conn) {
+    if (conn.state != ConnState::Proxying || !conn.upstream_connect_armed || conn.upstream_fd < 0 ||
+        conn.upstream_abandoned || conn.proxy_resp_started ||
+        conn.on_upstream_send != &on_upstream_connected<Loop> || conn.req_wants_upgrade ||
+        conn.retry_req_send_len != 0 || conn.protocol != ConnProtocol::Http11 ||
+        !conn.req_strict_h1_complete || conn.req_malformed || !conn.recv_buf.valid() ||
+        conn.recv_buf.is_released() || conn.req_header_end == 0 ||
+        conn.req_header_end > conn.req_initial_send_len ||
+        conn.req_initial_send_len > conn.recv_buf.len() || !conn.request_body_incomplete())
+        return false;
+    if (conn.req_body_mode == BodyMode::ContentLength) {
+        if (!conn.req_client_has_content_length || conn.req_client_has_transfer_encoding ||
+            conn.req_content_length == 0 || conn.req_body_remaining == 0 ||
+            conn.req_body_remaining > conn.req_content_length)
+            return false;
+        const u64 body_received = conn.req_content_length - conn.req_body_remaining;
+        return static_cast<u64>(conn.req_initial_send_len) ==
+               static_cast<u64>(conn.req_header_end) + body_received;
+    }
+    // Chunked partial-send ownership needs a fresh parse of the exact captured
+    // body prefix. Until that proof is available, leave it on the conservative 413 path.
+    return false;
+}
+
+template <typename Loop>
 void on_request_body_recvd(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
@@ -138,6 +238,12 @@ void resume_jit_handler(Loop* loop, Connection& conn);
 // before responding — invoked from timer.tick. Defined in callbacks_impl.h.
 template <typename Loop>
 void respond_upstream_timeout(Loop* loop, Connection& conn);
+
+// io_uring only: refuse a streamed request whose body overflowed recv_buf (the
+// backend had to drop bytes) with 413 + close instead of a silent close. Invoked
+// from the downstream recv dispatch; defined in callbacks_impl.h.
+template <typename Loop>
+void respond_request_body_overflow(Loop* loop, Connection& conn);
 
 template <typename Loop>
 bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);

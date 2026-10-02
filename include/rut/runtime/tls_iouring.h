@@ -66,11 +66,16 @@ void proxy_tls_parked_drained(Loop* loop, Connection& conn, u32 newly);
 // watermark resume from bypassing @throttle.
 template <typename Loop>
 bool throttle_pause_before_pump(Loop* loop, Connection& conn, u32 pending_remaining);
+// Deferred request-body overflow classification after control ciphertext drains.
+template <typename Loop>
+void resume_request_body_tls_overflow(Loop* loop, Connection& conn);
 
 template <class Self>
 void tls_on_out_drain(void* lp, Connection& c, IoEvent ev);
 template <class Self>
 void tls_process(Self* loop, Connection& c);
+template <class Self>
+bool tls_discard_abandoned_input(Self* loop, Connection& c);
 template <class Self>
 void tls_resume_pending_handler_recv(void* lp, Connection& c, IoEvent ev);
 template <class Self>
@@ -139,13 +144,26 @@ bool tls_finish_single_shot_send(Self* loop, Connection& c) {
     c.on_send = continuation;
     Connection::visit_tls_single_shot_send_owner_fields(
         c, [](auto& value, const auto& reset_value) { value = reset_value; });
-    c.recv_paused_for_send = false;
+    c.clear_recv_pause_for_send();
     loop->complete_tls_logical_send(c, witness, continuation);
 
     // The continuation may close/reuse the slot or synchronously install the
     // next response body's logical owner. No old completion tail may alter it.
     return c.tls_active && c.fd == witness.fd && c.handler_gen == witness.handler_generation &&
            c.tls_send_owner_generation == 0;
+}
+
+template <class Self>
+bool tls_discard_abandoned_input(Self* loop, Connection& c) {
+    c.tls_in_buf.reset();
+    c.reset_request_receive_buffer();
+    if constexpr (requires(Self* candidate, Connection& conn) { candidate->pause_recv(conn); }) {
+        if (c.recv_armed && !c.recv_pause_cancel_pending && !loop->pause_recv(c)) {
+            loop->close_conn(c);
+            return false;
+        }
+    }
+    return true;
 }
 
 // Ensure exactly one raw send is draining tls_out_buf. Submits at most
@@ -241,6 +259,17 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         c, [](auto& value, const auto& reset_value) { value = reset_value; });
     c.tls_out_buf.consume(kDrainedLen);
 
+    // A request-body overflow prefix can contain an app record behind control
+    // output (for example a TLS 1.3 KeyUpdate response). Resume its deferred
+    // classification only after the kernel no longer owns tls_out_buf.
+    if (c.tls_recv_overflow_resume_pending()) {
+        resume_request_body_tls_overflow<Self>(loop, c);
+        // The deferred routine owns every continuation: it may park another
+        // raw flight, classify the overflow, or close the connection. Do not
+        // fall through to the generic TLS tail and re-arm the lossy recv.
+        return;
+    }
+
     // Low-watermark resume: the proxy read side pauses the upstream recv once the
     // ciphertext buffer crosses the high watermark; as it drains back below the
     // low watermark, re-arm the read so producer and consumer ping-pong inside
@@ -284,6 +313,10 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
     // only input CQE has already been consumed.
     if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> && c.tls_in_buf.len() > 0) {
         tls_process<Self>(loop, c);
+        if (c.tls_active && (c.req_body_abandoned || c.req_body_overflow_rejected) &&
+            c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
+            tls_discard_abandoned_input<Self>(loop, c);
+        }
         return;
     }
 
@@ -355,7 +388,14 @@ void tls_on_out_drain(void* lp, Connection& c, IoEvent ev) {
         c.tls_pending_on_recv = &tls_resume_pending_handler_recv<Self>;
     if (c.tls_engine.ssl && (!c.tls_engine.handshake_done || c.tls_in_buf.len() > 0)) {
         tls_process<Self>(loop, c);  // continue handshake or drain deferred ciphertext
+        if (c.tls_active && (c.req_body_abandoned || c.req_body_overflow_rejected) &&
+            c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
+            tls_discard_abandoned_input<Self>(loop, c);
     } else if (!c.recv_armed && loop) {
+        if (c.req_body_abandoned || c.req_body_overflow_rejected) {
+            tls_discard_abandoned_input<Self>(loop, c);
+            return;
+        }
         loop->submit_recv(c);
     }
 }
@@ -400,6 +440,10 @@ void tls_process(Self* loop, Connection& c) {
     }
 
     if (!c.tls_pending_on_recv) {
+        if (c.req_body_abandoned || c.req_body_overflow_rejected) {
+            tls_discard_abandoned_input<Self>(loop, c);
+            return;
+        }
         if (c.tls_send_owner_generation != 0) {
             loop->close_conn(c);
             return;
@@ -520,6 +564,9 @@ void tls_process(Self* loop, Connection& c) {
             if (single_shot) {
                 if (c.tls_out_inflight || c.tls_out_buf.len() != 0) return;
                 if (!tls_finish_single_shot_send<Self>(loop, c)) return;
+                if (c.req_body_abandoned || c.req_body_overflow_rejected) {
+                    tls_discard_abandoned_input<Self>(loop, c);
+                }
                 // Completion callbacks own pipeline_shift / request-boundary
                 // replay. This pre-completion Recv event is stale after they may
                 // have consumed or moved recv_buf, even if handler_gen is stable.
@@ -530,6 +577,14 @@ void tls_process(Self* loop, Connection& c) {
             if (pending_recv == nullptr) pending_recv = &on_header_received<Self>;
         } else if (!pending_recv) {
             pending_recv = &on_header_received<Self>;
+        }
+        if ((c.req_body_abandoned || c.req_body_overflow_rejected) &&
+            pending_recv != &tls_resume_pending_send_recv<Self>) {
+            // Early-response ownership has no request parser.  Discard any
+            // plaintext decrypted before the parked send continuation changed
+            // state, then leave the response drain in charge of the connection.
+            tls_discard_abandoned_input<Self>(loop, c);
+            return;
         }
         const i32 callback_fd = c.fd;
         const u32 callback_handler_generation = c.handler_gen;
@@ -552,6 +607,12 @@ void tls_process(Self* loop, Connection& c) {
         if (!c.tls_pending_on_recv) return;
         if (c.tls_in_buf.len() == 0 || c.recv_buf.write_avail() == 0) break;
         tls_engine_set_input(c.tls_engine, c.tls_in_buf.data(), c.tls_in_buf.len());
+    }
+    if (c.req_body_abandoned || c.req_body_overflow_rejected) {
+        c.reset_request_receive_buffer();
+        if (c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
+            tls_discard_abandoned_input<Self>(loop, c);
+        return;
     }
     // Fail closed if a needed recv can't be armed: reaching here with no armed
     // recv means peer input is required to make progress (e.g. a pending
@@ -582,7 +643,154 @@ inline bool tls_recv_callback_is_current(const Connection& c) {
 template <class Self>
 void tls_recv(void* lp, Connection& c, IoEvent ev) {
     auto* loop = static_cast<Self*>(lp);
+    // A parked prefix belongs to the request upload. Once an early response
+    // has abandoned that upload, its owner must hand off before prefix handling:
+    // discard it, or feed it to a pending TLS send that owns WANT_READ.
+    if (c.req_body_abandoned) c.tls_recv_overflow_prefix_len = 0;
+    if (c.tls_recv_overflow_prefix_len != 0) {
+        // The overflow path owns the copied prefix until the in-flight body
+        // send completes.  Do not feed raced CQEs back into TLS: a positive
+        // CQE may contain the same truncated record and another overflow must
+        // not queue a second pause/rearm pair.
+        if (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty)) {
+            if (c.tls_recv_overflow_prefix_size() > c.tls_in_buf.len()) {
+                c.tls_recv_overflow_prefix_len = 0;
+                loop->close_conn(c);
+            } else if (c.tls_in_buf.len() > c.tls_recv_overflow_prefix_size()) {
+                c.tls_in_buf.set_len(c.tls_recv_overflow_prefix_size());
+            }
+            return;
+        }
+        c.tls_recv_overflow_prefix_len = 0;
+        loop->close_conn(c);
+        return;
+    }
+    if (c.req_body_abandoned) {
+        // An early upstream response owns the connection's logical send.  TLS
+        // still receives ciphertext while that response drains, but there is
+        // no request callback left to consume the plaintext.  Drop the copied
+        // ciphertext instead of leaving tls_in_buf (and the recv owner) stuck.
+        // A send WANT_READ is different: its pending continuation must consume
+        // valid ciphertext through tls_process before the logical send can run.
+        if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>) {
+            if (ev.result <= 0) {
+                tls_discard_abandoned_input<Self>(loop, c);
+                c.tls_pending_on_recv = nullptr;
+                loop->close_conn(c);
+                return;
+            }
+            tls_process<Self>(loop, c);
+            if (c.req_body_abandoned || c.req_body_overflow_rejected) {
+                c.reset_request_receive_buffer();
+                if (c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>)
+                    tls_discard_abandoned_input<Self>(loop, c);
+            }
+            return;
+        }
+        tls_discard_abandoned_input<Self>(loop, c);
+        return;
+    }
+    // A prior body overflow already committed the 413 response. A recv owned by
+    // the pending TLS send continuation still has to feed that send; unrelated
+    // late upload CQEs remain discarded.
+    if (c.req_body_overflow_rejected) {
+        if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> && ev.result <= 0) {
+            tls_discard_abandoned_input<Self>(loop, c);
+            c.tls_pending_on_recv = nullptr;
+            loop->close_conn(c);
+            return;
+        }
+        if (c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self> && ev.result > 0) {
+            tls_process<Self>(loop, c);
+            if (c.tls_active && c.req_body_overflow_rejected &&
+                c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>) {
+                c.reset_request_receive_buffer();
+                tls_discard_abandoned_input<Self>(loop, c);
+            }
+            return;
+        }
+        tls_discard_abandoned_input<Self>(loop, c);
+        return;
+    }
+    // The first non-empty-ring overflow establishes the lossy successor only
+    // when the TLS response owner is exact. WANT_READ owns ciphertext input and
+    // remains the exception.
+    const bool tls_response_completion = c.tls_pending_on_send == &on_proxy_response_sent<Self> ||
+                                         c.tls_pending_on_send == &on_response_sent<Self> ||
+                                         c.tls_pending_on_send == &on_response_header_sent<Self> ||
+                                         c.tls_pending_on_send == &on_response_body_sent<Self> ||
+                                         c.tls_pending_on_send == &on_complete_response_sent<Self>;
+    const bool tls_raw_backend_current = [&]() {
+        if constexpr (requires(const Self* candidate, const Connection& conn) {
+                          candidate->tls_ciphertext_send_is_current(conn);
+                      }) {
+            return loop->tls_ciphertext_send_is_current(c);
+        }
+        return false;
+    }();
+    const bool tls_raw_owner =
+        c.on_send == &tls_on_out_drain<Self> && c.send_armed && c.proxy_resp_started &&
+        c.tls_out_inflight && c.tls_send_owner_generation != 0 && tls_response_completion &&
+        tls_single_shot_send_owner_is_current<Self>(c) && tls_raw_backend_current;
+    const bool tls_response_owner = tls_raw_owner || preserved_response_late_recv_owner<Self>(c);
+    const bool tls_response_core = c.state == ConnState::Sending &&
+                                   !c.upstream_request_incomplete && c.proxy_resp_started &&
+                                   c.tls_pending_on_recv != &tls_resume_pending_send_recv<Self>;
+    if (c.tls_active && tls_response_core && ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+        !c.req_body_lossy_successor && tls_response_owner) {
+        c.req_body_lossy_successor = true;
+        c.keep_alive = false;
+        tls_discard_abandoned_input<Self>(loop, c);
+        return;
+    }
+    // A lossy successor is never TLS input for the committed response.  Keep
+    // the raw response send owner intact while discarding both positive CQEs
+    // already copied by io_uring and the specific non-empty-ring overflow CQE.
+    // A WANT_READ continuation is the one exception: it owns the ciphertext
+    // needed to resume the pending TLS send.
+    if (c.tls_active && tls_response_core && c.req_body_lossy_successor && tls_response_owner &&
+        (ev.result > 0 || (ev.result == -ENOBUFS && !ev.provided_ring_empty))) {
+        tls_discard_abandoned_input<Self>(loop, c);
+        return;
+    }
     if (ev.result <= 0) {  // peer EOF or recv error
+        // A body send may have a valid TLS prefix already copied into tls_in_buf
+        // when the multishot CQE reports a dropped tail. Decrypt it only after
+        // the exact send owner completes: the prefix may finish the current body
+        // before the dropped tail, so classifying ciphertext as a 413 is premature.
+        const bool tls_streaming_body_send_owner =
+            c.state == ConnState::Proxying && c.upstream_send_armed &&
+            c.on_upstream_send == &on_request_body_sent<Self> && c.request_body_incomplete();
+        const bool tls_initial_request_send_owner =
+            (initial_connect_request_owner<Self>(c) || initial_request_send_owner<Self>(c)) &&
+            c.request_body_incomplete();
+        const bool tls_partial_initial_connect_owner =
+            tls_partial_initial_connect_request_owner<Self>(c);
+        if (ev.result == -ENOBUFS && !ev.provided_ring_empty && c.tls_in_buf.len() != 0 &&
+            (tls_streaming_body_send_owner || tls_initial_request_send_owner ||
+             tls_partial_initial_connect_owner)) {
+            c.tls_recv_overflow_prefix_len = c.tls_in_buf.len();
+            if (!loop->pause_recv(c)) {
+                c.tls_recv_overflow_prefix_len = 0;
+                loop->close_conn(c);
+            }
+            return;
+        }
+        if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+            (initial_connect_request_owner<Self>(c) || tls_partial_initial_connect_owner)) {
+            respond_request_body_overflow(loop, c);
+            return;
+        }
+        // -ENOBUFS: the backend dropped the tail of a CQE that did not fit tls_in_buf,
+        // which corrupts the record stream. A streamed request body is refused with
+        // 413 instead of a silent close.
+        if (ev.result == -ENOBUFS && !ev.provided_ring_empty &&
+            (c.request_body_incomplete() || final_request_body_send_inflight<Self>(c) ||
+             initial_request_send_owner<Self>(c) ||
+             completed_request_waiting_response_owner<Self>(c))) {
+            respond_request_body_overflow<Self>(loop, c);
+            return;
+        }
         loop->close_conn(c);
         return;
     }

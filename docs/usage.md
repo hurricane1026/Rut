@@ -237,6 +237,14 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/   # 200
   silently runs on epoll. To keep io_uring, raise the limit (`ulimit -l <KiB>`,
   systemd `LimitMEMLOCK=`, container `--ulimit memlock=<bytes>`), grant
   `CAP_IPC_LOCK`, or run fewer shards. Rut never raises the limit itself.
+- **Large request bodies on io_uring are a stopgap.** A proxied request body
+  that arrives faster than the upstream send drains the 16 KiB receive buffer
+  is refused with `413` + `Connection: close` (instead of hanging or being
+  closed silently): a client that writes a body above about 16 KiB in one go
+  (e.g. `curl --data-binary` of 20 KB or more), or a fast client to a slow
+  origin. Bodies up to about 16 KiB and uploads paced below the upstream drain
+  rate are forwarded byte-exact; the epoll backend is unaffected. Lossless
+  streaming is a tracked follow-up.
 
 For what is and isn't implemented across the language and runtime, see
 `docs/core-capabilities.md`.

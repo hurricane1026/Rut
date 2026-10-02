@@ -96,9 +96,14 @@ static u32 fill_socket_send_buffer(i32 fd, i32 peer);
 namespace {
 
 bool g_send_pause_cleared = false;
+bool g_send_pause_observed = false;
 
 void verify_send_pause_cleared(void* /*lp*/, Connection& conn, IoEvent ev) {
     g_send_pause_cleared = (ev.type == IoEventType::Send && !conn.recv_paused_for_send);
+}
+
+void observe_send_pause(void* /*lp*/, Connection& conn, IoEvent ev) {
+    g_send_pause_observed = (ev.type == IoEventType::Send && conn.recv_paused_for_send);
 }
 
 struct ScriptedTlsState {
@@ -6258,6 +6263,80 @@ TEST(uring, pause_recv_defers_rearm_until_send_completes) {
     loop->shutdown();
 }
 
+TEST(uring, lossy_pause_survives_plain_and_tls_send_dispatch) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+    test_initialize_slots(*loop, 3);
+    Connection& plain = loop->conns[0];
+    plain.fd = 42;
+    plain.state = ConnState::Sending;
+    plain.pending_ops = 1;
+    plain.send_armed = true;
+    plain.recv_paused_for_send = true;
+    plain.req_body_lossy_successor = true;
+    plain.on_send = &observe_send_pause;
+    g_send_pause_observed = false;
+    loop->dispatch(make_ev(plain.id, IoEventType::Send, 1));
+    CHECK(g_send_pause_observed);
+    CHECK(plain.recv_paused_for_send);
+
+    Connection& ordinary = loop->conns[1];
+    ordinary.fd = 43;
+    ordinary.state = ConnState::Sending;
+    ordinary.pending_ops = 1;
+    ordinary.send_armed = true;
+    ordinary.recv_paused_for_send = true;
+    ordinary.on_send = &observe_send_pause;
+    loop->dispatch(make_ev(ordinary.id, IoEventType::Send, 1));
+    CHECK_FALSE(ordinary.recv_paused_for_send);
+
+    Connection& rejected = loop->conns[2];
+    rejected.fd = 44;
+    rejected.state = ConnState::Sending;
+    rejected.pending_ops = 1;
+    rejected.send_armed = true;
+    rejected.recv_paused_for_send = true;
+    rejected.req_body_overflow_rejected = true;
+    rejected.on_send = &observe_send_pause;
+    g_send_pause_observed = false;
+    loop->dispatch(make_ev(rejected.id, IoEventType::Send, 1));
+    CHECK(g_send_pause_observed);
+    CHECK(rejected.recv_paused_for_send);
+
+    u8 tls_out_storage[16];
+    plain.tls_active = true;
+    plain.recv_armed = false;  // the pause target drained before the raw Send CQE
+    plain.recv_pause_rearm_pending = true;
+    plain.req_body_lossy_successor = false;
+    plain.req_body_abandoned = false;
+    plain.req_body_overflow_rejected = false;
+    plain.tls_recv_overflow_prefix_len = 3;  // parked prefix without resume marker
+    plain.pending_ops = 1;
+    plain.send_armed = true;
+    plain.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    REQUIRE_EQ(plain.tls_out_buf.write(reinterpret_cast<const u8*>("tls"), 3), 3u);
+    const u32 raw_generation = 7;
+    plain.tls_out_inflight = true;
+    plain.tls_out_inflight_len = 3;
+    plain.tls_out_inflight_generation = raw_generation;
+    plain.tls_out_inflight_fd = plain.fd;
+    plain.tls_out_inflight_src = plain.tls_out_buf.data();
+    plain.on_send = &tls_on_out_drain<IoUringEventLoop>;
+    loop->backend.send_state[plain.id] = {
+        plain.tls_out_inflight_src, plain.fd, 3, 0, IoEventType::Send, 0, raw_generation};
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    IoEvent raw_send = make_ev(plain.id, IoEventType::Send, 3);
+    raw_send.non_upstream_generation = raw_generation;
+    loop->dispatch(raw_send);
+    CHECK(plain.tls_active);
+    CHECK(plain.recv_paused_for_send);
+    CHECK_EQ(plain.tls_recv_overflow_prefix_len, 3u);
+    CHECK_FALSE(plain.recv_armed);
+    CHECK(plain.recv_pause_rearm_pending);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), sq_tail_before);
+    loop->shutdown();
+}
+
 TEST(uring, tls_send_want_read_recv_survives_send_pause) {
     auto loop = std::make_unique<IoUringEventLoop>();
     auto rc = loop->init(0, -1);
@@ -6289,7 +6368,71 @@ TEST(uring, tls_send_want_read_recv_survives_send_pause) {
     CHECK(conn.recv_armed);
     CHECK_EQ(conn.pending_ops, 1u);
     CHECK(!conn.recv_pause_rearm_pending);
+    CHECK_FALSE(conn.recv_paused_for_send);
 
+    conn.tls_engine.ssl = nullptr;
+    loop->shutdown();
+}
+
+TEST(uring, tls_want_read_clears_send_pause_across_cancel_orders) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    auto rc = loop->init(0, -1);
+    if (!rc) {
+        CHECK(true);
+        return;
+    }
+
+    test_initialize_slots(*loop, 1);
+    Connection& conn = loop->conns[0];
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(0x1);
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<IoUringEventLoop>;
+
+    auto exercise_order = [&](bool cancel_first) {
+        conn.recv_armed = true;
+        conn.recv_paused_for_send = true;
+        conn.recv_pause_cancel_pending = true;
+        conn.recv_pause_target_inflight = true;
+        conn.recv_pause_rearm_pending = false;
+        conn.pending_ops = 2;
+
+        // WANT_READ needs a receive immediately, but the old multishot target
+        // and its cancellation still own the connection. Record one re-arm and
+        // clear the send pause before either CQE can suppress it.
+        CHECK(loop->submit_recv(conn));
+        CHECK_FALSE(conn.recv_paused_for_send);
+        CHECK(conn.recv_pause_rearm_pending);
+        CHECK_EQ(conn.pending_ops, 2u);
+
+        if (cancel_first) {
+            loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+            CHECK_FALSE(conn.recv_pause_cancel_pending);
+            CHECK(conn.recv_pause_target_inflight);
+            CHECK(conn.recv_pause_rearm_pending);
+            CHECK_EQ(conn.pending_ops, 1u);
+            loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+        } else {
+            loop->dispatch(make_ev(conn.id, IoEventType::Recv, -ECANCELED));
+            CHECK(conn.recv_pause_cancel_pending);
+            CHECK_FALSE(conn.recv_pause_target_inflight);
+            CHECK(conn.recv_pause_rearm_pending);
+            CHECK_EQ(conn.pending_ops, 1u);
+            loop->dispatch({conn.id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+        }
+        CHECK_FALSE(conn.recv_paused_for_send);
+        CHECK_FALSE(conn.recv_pause_cancel_pending);
+        CHECK_FALSE(conn.recv_pause_target_inflight);
+        CHECK_FALSE(conn.recv_pause_rearm_pending);
+        CHECK(conn.recv_armed);
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK(loop->submit_recv(conn));
+        CHECK_EQ(conn.pending_ops, 1u);
+        CHECK(conn.recv_armed);
+    };
+
+    exercise_order(false);
+    exercise_order(true);
     conn.tls_engine.ssl = nullptr;
     loop->shutdown();
 }
@@ -6343,6 +6486,299 @@ TEST(uring, send_wait_into_upstream_wait_rearms_downstream_recv) {
     CHECK_EQ(conn.pending_yield_kind, jit::YieldKind::UpstreamRecv);
     CHECK(conn.recv_armed);
 
+    loop->shutdown();
+}
+
+// A streamed request body on io_uring: the multishot recv keeps appending to
+// recv_buf while the upstream connect/send drains it and no recv slot is set.
+namespace {
+// Proxying connection mid-upload: the initial request is being sent upstream (no
+// recv slot), `buffered` body bytes already sit in recv_buf, the multishot recv is
+// still armed.
+Connection* make_uploading_conn(IoUringEventLoop& loop, u32 buffered, u32 remaining) {
+    Connection* c = loop.alloc_conn();
+    if (c == nullptr) return nullptr;
+    c->fd = 42;
+    c->state = ConnState::Proxying;
+    c->keep_alive = true;
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = remaining;
+    c->recv_armed = true;
+    c->pending_ops = 1;
+    c->recv_buf.reset();
+    u8* dst = c->recv_buf.write_ptr();
+    for (u32 i = 0; i < buffered; i++) dst[i] = static_cast<u8>(i);
+    c->recv_buf.commit(buffered);
+    c->set_slots(nullptr,
+                 nullptr,
+                 &on_early_upstream_recvd_send_inflight<IoUringEventLoop>,
+                 &on_upstream_request_sent<IoUringEventLoop>);
+    return c;
+}
+}  // namespace
+
+// Bytes that arrive behind an in-flight upload are kept, and once fewer than two
+// provided buffers of room remain the recv is paused (resumed by the send
+// completion) so the next CQE cannot overflow recv_buf.
+TEST(uring, request_body_recv_paused_before_recv_buf_fills) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+
+    // Plenty of room left (3000 of 16384 used): nothing to do, and the bytes stay
+    // even though this is a Connection: close request (they used to be reset).
+    Connection* c = make_uploading_conn(*loop, 3000, 40000);
+    REQUIRE(c != nullptr);
+    c->keep_alive = false;
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, 3000));
+    CHECK(!c->recv_paused_for_send);
+    CHECK_EQ(c->recv_buf.len(), 3000u);
+
+    // Only 7384 bytes of room left (< 2 * 4096): pause.
+    Connection* d = make_uploading_conn(*loop, 9000, 40000);
+    REQUIRE(d != nullptr);
+    IoEvent more_data = make_ev(d->id, IoEventType::Recv, 4096);
+    more_data.more = 1;  // multishot recv still live
+    loop->dispatch(more_data);
+    CHECK(d->recv_paused_for_send);
+    CHECK(d->recv_pause_cancel_pending);
+    CHECK_EQ(d->recv_buf.len(), 9000u);  // nothing dropped, nothing duplicated
+
+    // The same state without an upload in flight (body complete) is left alone.
+    Connection* e = make_uploading_conn(*loop, 9000, 0);
+    REQUIRE(e != nullptr);
+    loop->dispatch(make_ev(e->id, IoEventType::Recv, 4096));
+    CHECK(!e->recv_paused_for_send);
+
+    loop->shutdown();
+}
+
+// A CQE that did not fit recv_buf (the backend reports -ENOBUFS after dropping the
+// tail) can no longer be forwarded intact: the client gets 413 + close, not a
+// silent close, and later recv events do not cut that response short.
+TEST(uring, request_body_overflow_chunked_final_send_cancels_recv_immediately) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+    Connection* c = make_uploading_conn(*loop, 16384, 0);
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::Chunked;
+    c->req_chunk_parser.state = ChunkedParser::State::Complete;
+    c->upstream_fd = 99;
+    c->upstream_episode = 1;
+    c->upstream_send_armed = true;
+    c->upstream_recv_armed = false;
+    c->pending_ops = 2;
+    c->on_upstream_send = &on_request_body_sent<IoUringEventLoop>;
+    IoEvent late_loss = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
+    late_loss.more = 1;
+    loop->dispatch(late_loss);
+    CHECK(c->fd >= 0);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->keep_alive);
+    CHECK_FALSE(c->request_upload_complete);
+    CHECK_EQ(c->pending_ops, 3u);
+    CHECK(c->recv_armed);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    CHECK(c->upstream_send_armed);
+    const u32 pending_after_cancel = c->pending_ops;
+    loop->dispatch(late_loss);
+    CHECK_EQ(c->pending_ops, pending_after_cancel);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    loop->dispatch({c->id, 1, 0, 0, IoEventType::UpstreamSend, 0, 0, c->upstream_episode});
+    CHECK(c->request_upload_complete);
+    CHECK_EQ(c->pending_ops, 3u);
+    CHECK(c->recv_armed);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    CHECK(c->recv_paused_for_send);
+    CHECK(c->upstream_recv_armed);
+    CHECK_FALSE(c->upstream_send_armed);
+    CHECK(c->fd >= 0);
+    loop->shutdown();
+}
+
+TEST(uring, initial_request_overflow_cancels_recv_before_send_completion) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+    Connection* c = make_uploading_conn(*loop, 4, 0);
+    REQUIRE(c != nullptr);
+    c->req_body_mode = BodyMode::None;
+    c->req_initial_send_len = 4;
+    c->upstream_send_armed = true;
+    c->pending_ops = 2;
+
+    IoEvent overflow = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
+    overflow.more = 1;
+    loop->dispatch(overflow);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK_FALSE(c->keep_alive);
+    CHECK(c->recv_paused_for_send);
+    CHECK(c->recv_armed);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    CHECK(c->upstream_send_armed);
+    const u32 pending_after_cancel = c->pending_ops;
+    const u32 buffer_boundary = c->recv_buf.len();
+
+    loop->dispatch(overflow);
+    CHECK_EQ(c->pending_ops, pending_after_cancel);
+    CHECK_EQ(c->recv_buf.len(), buffer_boundary);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->upstream_send_armed);
+
+    // The target CQE may terminate before the cancel CQE; both owners stay
+    // accounted for while the initial upstream send remains in flight.
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ECANCELED));
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK_FALSE(c->recv_armed);
+    CHECK(c->upstream_send_armed);
+    loop->dispatch({c->id, -ENOENT, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    CHECK_FALSE(c->recv_pause_cancel_pending);
+    CHECK(c->upstream_send_armed);
+    loop->shutdown();
+}
+
+TEST(uring, abandoned_upload_discards_late_recv_cqes_during_response) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+    Connection* c = make_uploading_conn(*loop, 0, 40000);
+    REQUIRE(c != nullptr);
+    static constexpr char kResponse[] = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE(c->send_buf.write(reinterpret_cast<const u8*>(kResponse), sizeof(kResponse) - 1) ==
+            sizeof(kResponse) - 1);
+    c->req_body_abandoned = true;
+    c->state = ConnState::Sending;
+    c->keep_alive = false;  // an abandoned upload cannot start another request
+    c->send_armed = true;
+    c->recv_armed = true;
+    c->on_send = &on_response_sent<IoUringEventLoop>;
+    c->pending_ops = 2;
+    const u32 response_len = c->send_buf.len();
+    static constexpr char kLate[] = "discard-me";
+    REQUIRE(c->recv_buf.write(reinterpret_cast<const u8*>(kLate), sizeof(kLate) - 1) ==
+            sizeof(kLate) - 1);
+    IoEvent late_positive = make_ev(c->id, IoEventType::Recv, 4096);
+    late_positive.more = 1;
+    loop->dispatch(late_positive);
+    IoEvent late_loss = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
+    late_loss.more = 1;
+    loop->dispatch(late_loss);
+    CHECK(c->fd >= 0);
+    CHECK_EQ(c->send_buf.len(), response_len);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK(c->send_armed);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    const u32 pending_after_cancel = c->pending_ops;
+    IoEvent late_loss_again = make_ev(c->id, IoEventType::Recv, -ENOBUFS);
+    late_loss_again.more = 1;
+    loop->dispatch(late_loss_again);
+    CHECK_EQ(c->pending_ops, pending_after_cancel);
+    CHECK_EQ(c->recv_buf.len(), 0u);
+    CHECK_EQ(c->state, ConnState::Sending);
+    loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    loop->dispatch({c->id, -ECANCELED, 0, 0, IoEventType::Recv, 0, 0});
+    CHECK_FALSE(c->recv_pause_cancel_pending);
+    CHECK_FALSE(c->recv_pause_target_inflight);
+    CHECK_FALSE(c->recv_armed);
+    CHECK(c->recv_pause_rearm_pending);
+    loop->dispatch(make_ev(c->id, IoEventType::Send, static_cast<i32>(response_len)));
+    CHECK(c->fd < 0);
+    loop->shutdown();
+}
+
+TEST(uring, request_body_overflow_is_answered_with_413) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+
+    for (u32 via_body_slot = 0; via_body_slot < 2; via_body_slot++) {
+        Connection* c = make_uploading_conn(*loop, 16384, 40000);
+        REQUIRE(c != nullptr);
+        if (via_body_slot != 0) {
+            c->set_slots(&on_request_body_recvd<IoUringEventLoop>,
+                         nullptr,
+                         &on_early_upstream_recvd<IoUringEventLoop>,
+                         nullptr);
+        }
+        loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+        CHECK(c->fd >= 0);  // not closed
+        CHECK(c->req_body_overflow_rejected);
+        CHECK_EQ(c->state, ConnState::Sending);
+        CHECK_EQ(c->resp_status, static_cast<u16>(413));
+        CHECK(!c->keep_alive);
+        CHECK(buf_contains(reinterpret_cast<const char*>(c->send_buf.data()),
+                           c->send_buf.len(),
+                           "HTTP/1.1 413 Payload Too Large",
+                           30));
+        CHECK(buf_contains(reinterpret_cast<const char*>(c->send_buf.data()),
+                           c->send_buf.len(),
+                           "Connection: close",
+                           17));
+        // More events for the refused request (a second overflow, late data) must not
+        // close the connection before the 413 has been sent.
+        loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+        loop->dispatch(make_ev(c->id, IoEventType::Recv, 4096));
+        CHECK(c->fd >= 0);
+    }
+    loop->shutdown();
+}
+
+// An upstream that already answered (early 401 and the like) keeps priority over the
+// 413: the overflow leaves the connection alone and its buffered response is delivered
+// by the upstream send completion, which abandons the rest of the body.
+TEST(uring, request_body_overflow_defers_to_an_early_upstream_response) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+
+    Connection* c = make_uploading_conn(*loop, 16384, 40000);
+    REQUIRE(c != nullptr);
+    c->upstream_fd = 99;
+    c->upstream_episode = 1;
+    // The upstream's response was detected while the body chunk send is in flight.
+    c->on_upstream_send = &on_body_send_with_early_response<IoUringEventLoop>;
+    loop->dispatch(make_ev(c->id, IoEventType::Recv, -ENOBUFS));
+    CHECK(c->fd >= 0);                      // not closed
+    CHECK(!c->req_body_overflow_rejected);  // no 413 was queued
+    CHECK_EQ(c->state, ConnState::Proxying);
+    CHECK_EQ(c->send_buf.len(), 0u);
+    CHECK_EQ(c->on_upstream_send, &on_body_send_with_early_response<IoUringEventLoop>);
+    loop->shutdown();
+}
+
+// After the in-flight chunk is sent, what arrived behind it is forwarded as the next
+// chunk, the recv pause is lifted, and the multishot recv is re-armed.
+TEST(uring, request_body_sent_forwards_surplus_and_resumes_recv) {
+    auto loop = std::make_unique<IoUringEventLoop>();
+    if (!init_iouring_loop_with_retry(*loop)) SKIP("io_uring unavailable in this environment");
+
+    // 6000 bytes are being sent; 3000 more arrived behind them. The recv was paused
+    // (cancel still in flight).
+    Connection* c = make_uploading_conn(*loop, 9000, 30000);
+    REQUIRE(c != nullptr);
+    c->upstream_fd = 99;
+    c->upstream_episode = 1;
+    c->req_initial_send_len = 6000;
+    c->req_body_streamed = true;
+    c->recv_paused_for_send = true;
+    c->recv_pause_cancel_pending = true;
+    c->set_slots(nullptr,
+                 nullptr,
+                 &on_early_upstream_recvd_send_inflight<IoUringEventLoop>,
+                 &on_request_body_sent<IoUringEventLoop>);
+    loop->dispatch(make_ev(c->id, IoEventType::UpstreamSend, 6000));
+
+    CHECK_EQ(c->on_upstream_send, &on_request_body_sent<IoUringEventLoop>);  // next chunk out
+    CHECK_EQ(c->req_initial_send_len, 3000u);
+    CHECK_EQ(c->req_body_remaining, 30000u - 3000u);
+    CHECK_EQ(c->recv_buf.len(), 3000u);  // the sent prefix was dropped, the rest kept
+    const u8* p = c->recv_buf.data();
+    bool intact = true;
+    for (u32 i = 0; i < 3000; i++) intact = intact && p[i] == static_cast<u8>(6000 + i);
+    CHECK(intact);
+    CHECK(!c->recv_paused_for_send);
+    CHECK(c->recv_pause_rearm_pending);  // re-armed when the pause cancel completes
     loop->shutdown();
 }
 
@@ -6599,11 +7035,19 @@ struct TlsIouringHarness : SmallLoop {
     u32 connection_capacity = SmallLoop::kMaxConns;
     bool sent = false;
     bool closed = false;
+    bool recv_paused = false;
     TlsKeyUpdateDiagnostic* key_update_diagnostic = nullptr;
+    u8 tls_overflow_control_flights_to_emit = 0;
 
     bool submit_send_raw(Connection& /*conn*/, const u8* /*buf*/, u32 len) {
         sent = len > 0;
         return true;
+    }
+
+    bool submit_send_upstream(Connection& conn, const u8* buf, u32 len) {
+        const bool submitted = SmallLoop::submit_send_upstream_impl(conn, buf, len);
+        if (submitted) conn.upstream_send_armed = true;
+        return submitted;
     }
 
     // Keep the raw ciphertext target under test control. TLS tests explicitly
@@ -6666,8 +7110,508 @@ struct TlsIouringHarness : SmallLoop {
         conn.tls_active = false;
     }
 
+    bool pause_recv(Connection& conn) {
+        recv_paused = true;
+        conn.recv_paused_for_send = true;
+        return true;
+    }
+
+    bool process_buffered_tls_input(Connection& conn) {
+        if (conn.tls_out_inflight) return false;
+        if (tls_overflow_control_flights_to_emit != 0) {
+            if (tls_overflow_control_flights_to_emit == 2 && conn.tls_in_buf.len() > 1)
+                conn.tls_in_buf.consume(2);
+            else
+                conn.tls_in_buf.reset();
+            conn.set_tls_recv_overflow_prefix_size(conn.tls_in_buf.len());
+            --tls_overflow_control_flights_to_emit;
+            if (conn.tls_out_buf.write(reinterpret_cast<const u8*>("ctl"), 3) != 3u ||
+                !submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3)) {
+                close_conn(conn);
+                return false;
+            }
+            return conn.tls_active;
+        }
+        tls_process<TlsIouringHarness>(this, conn);
+        return conn.tls_active;
+    }
+
     void disarm_yield_timer(Connection& /*conn*/) {}
 };
+
+TEST(tls_iouring, connect_owner_overflow_preserves_tls_request_prefix) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[128];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.recv_slice = loop.recv_storage[0];
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    static constexpr char kRequest[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\nNEXT";
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(conn);
+    conn.state = ConnState::Proxying;
+    conn.upstream_fd = 43;
+    conn.upstream_connect_armed = true;
+    conn.recv_armed = true;
+    conn.pending_ops = 2;
+    conn.on_upstream_send = &on_upstream_connected<TlsIouringHarness>;
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_FALSE(conn.req_body_overflow_rejected);
+    CHECK(conn.req_body_lossy_successor);
+    CHECK_FALSE(conn.keep_alive);
+    CHECK(conn.recv_paused_for_send);
+    CHECK(loop.recv_paused);
+    CHECK_EQ(conn.req_initial_send_len, sizeof(kRequest) - 1 - 4u);
+    CHECK(__builtin_memcmp(conn.recv_buf.data(), kRequest, conn.req_initial_send_len) == 0);
+}
+
+TEST(tls_iouring, late_recv_after_body_overflow_preserves_413_send) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.req_body_overflow_rejected = true;
+    u8 tls_in_storage[64];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.send_armed = true;
+    conn.recv_armed = true;
+    conn.pending_ops = 1;
+    conn.send_slice = loop.send_storage[0];
+    conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
+    static constexpr char k413[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
+    REQUIRE_EQ(conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1),
+               sizeof(k413) - 1);
+    const u32 send_len = conn.send_buf.len();
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 1, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_EQ(conn.fd, 42);
+    CHECK(conn.send_armed);
+    CHECK_EQ(conn.send_buf.len(), send_len);
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_EQ(conn.fd, 42);
+    CHECK(conn.send_armed);
+    CHECK_EQ(conn.send_buf.len(), send_len);
+}
+
+TEST(tls_iouring, overflow_owned_recv_error_closes_but_unowned_late_input_is_ignored) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.req_body_overflow_rejected = true;
+    u8 tls_in_storage[64];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.send_armed = true;
+    conn.recv_armed = true;
+    conn.pending_ops = 1;
+    conn.send_slice = loop.send_storage[0];
+    conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
+    static constexpr char k413[] = "HTTP/1.1 413 Payload Too Large\r\n\r\n";
+    REQUIRE_EQ(conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1),
+               sizeof(k413) - 1);
+    const u32 send_len = conn.send_buf.len();
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("late"), 4), 4u);
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 1, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.send_buf.len(), send_len);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK(loop.recv_paused);
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK(loop.closed);
+    CHECK_FALSE(conn.tls_active);
+}
+
+TEST(tls_iouring, abandoned_late_recv_discards_ciphertext_and_clears_want_read) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[256];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.req_body_abandoned = true;
+    conn.on_recv = &tls_recv<TlsIouringHarness>;
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.send_armed = true;
+    conn.recv_armed = true;
+    conn.pending_ops = 1;
+
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("late"), 4u), 4u);
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 4, 0, 0, IoEventType::Recv, 1, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK(conn.send_armed);
+    CHECK(loop.recv_paused);
+
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("loss"), 4u), 4u);
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+
+    conn.tls_recv_overflow_prefix_len = 3;
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("park"), 4u), 4u);
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 0, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
+    conn.tls_recv_overflow_prefix_len = 3;
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("eof"), 3u), 3u);
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 0, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK(loop.closed);
+    CHECK_FALSE(conn.tls_active);
+    CHECK_EQ(conn.tls_pending_on_recv, nullptr);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+}
+
+TEST(tls_iouring, early_response_abandons_parked_overflow_prefix) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.upstream_fd = 43;
+    conn.state = ConnState::Proxying;
+    conn.tls_active = true;
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
+    conn.upstream_recv_slice = loop.upstream_recv_storage[0];
+    conn.upstream_recv_buf.bind(loop.upstream_recv_storage[0],
+                                sizeof(loop.upstream_recv_storage[0]));
+    conn.on_recv = &tls_recv<TlsIouringHarness>;
+    conn.req_body_mode = BodyMode::ContentLength;
+    conn.req_body_remaining = 4;
+    conn.req_initial_send_len = 4;
+    conn.tls_recv_overflow_prefix_len = 3;
+    conn.recv_paused_for_send = true;
+    conn.recv_pause_rearm_pending = true;
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("cut"), 3u), 3u);
+    static constexpr char kEarlyResponse[] =
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+    REQUIRE_EQ(conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(kEarlyResponse),
+                                            sizeof(kEarlyResponse) - 1),
+               sizeof(kEarlyResponse) - 1);
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+    u8 stale[4096];
+    while (BIO_ctrl_pending(cl.wbio) != 0) REQUIRE_GT(BIO_read(cl.wbio, stale, sizeof(stale)), 0);
+
+    on_body_send_with_early_response<TlsIouringHarness>(
+        &loop, conn, {conn.id, 4, 0, 0, IoEventType::UpstreamSend, 0});
+    CHECK(conn.req_body_abandoned);
+    CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK_FALSE(loop.closed);
+    CHECK(conn.recv_paused_for_send);
+    CHECK_EQ(conn.resp_status, 401u);
+    CHECK_EQ(conn.state, ConnState::Sending);
+
+    tls_recv<TlsIouringHarness>(&loop, conn, IoEvent{conn.id, 0, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK(conn.tls_active);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    tls_engine_free(conn.tls_engine);
+    cl.destroy();
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls_iouring, final_body_send_overflow_keeps_content_length_and_chunked_owner) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    for (const bool chunked : {false, true}) {
+        conn.reset();
+        conn.id = 0;
+        conn.fd = 42;
+        conn.state = ConnState::Proxying;
+        conn.tls_active = true;
+        conn.on_recv = &tls_recv<TlsIouringHarness>;
+        conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
+        conn.upstream_send_armed = true;
+        conn.pending_ops = 2;  // TLS recv plus the final body send.
+        conn.keep_alive = true;
+        conn.req_body_mode = chunked ? BodyMode::Chunked : BodyMode::ContentLength;
+        conn.req_body_remaining = chunked ? 0u : 0u;
+        if (chunked) conn.req_chunk_parser.state = ChunkedParser::State::Complete;
+
+        tls_recv<TlsIouringHarness>(
+            &loop, conn, IoEvent{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 0, 0, 0});
+
+        CHECK_FALSE(loop.closed);
+        CHECK_EQ(conn.fd, 42);
+        CHECK_FALSE(conn.req_body_overflow_rejected);
+        CHECK_FALSE(conn.keep_alive);
+        CHECK(conn.upstream_send_armed);
+        CHECK_EQ(conn.on_upstream_send, &on_request_body_sent<TlsIouringHarness>);
+        CHECK_FALSE(conn.request_upload_complete);
+    }
+}
+
+TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    for (const u32 body_len : {4u, 2u, 3u, 5u}) {
+        loop.closed = false;
+        loop.recv_paused = false;
+        loop.sent = false;
+        loop.SmallLoop::backend.init(0, -1);
+        loop.backend.send_state[0] = {};
+        const u32 plaintext_len = body_len == 5 ? 4u : body_len;
+        conn.reset();
+        conn.id = 0;
+        conn.fd = 42;
+        conn.tls_active = true;
+        conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+        conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+        conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+        conn.send_buf.bind(loop.send_storage[0], sizeof(loop.send_storage[0]));
+        conn.on_recv = &tls_recv<TlsIouringHarness>;
+        REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+        TlsClientPeer cl;
+        REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl, /*tls13_only=*/true));
+        u8 stale[4096];
+        while (BIO_ctrl_pending(cl.wbio) != 0)
+            REQUIRE_GT(BIO_read(cl.wbio, stale, sizeof(stale)), 0);
+        conn.state = ConnState::Proxying;
+        conn.proxy_resp_started = true;
+        conn.upstream_fd = 43;
+        conn.req_body_mode = BodyMode::ContentLength;
+        conn.req_body_remaining = 4;
+        u32 initial_send_len = 4;
+        if (body_len == 2 || body_len == 5) {
+            static constexpr char kRequest[] =
+                "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n";
+            REQUIRE_EQ(
+                conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+                sizeof(kRequest) - 1);
+            capture_request_metadata(conn);
+            conn.req_initial_send_len = conn.recv_buf.len();
+            initial_send_len = conn.req_initial_send_len;
+            conn.upstream_connect_armed = true;
+            conn.upstream_send_armed = false;
+            conn.proxy_resp_started = false;
+            conn.on_upstream_send = &on_upstream_connected<TlsIouringHarness>;
+            conn.protocol = ConnProtocol::Http11;
+            conn.req_strict_h1_complete = true;
+            conn.req_client_has_content_length = true;
+            conn.req_content_length = 4;
+            conn.req_body_mode = BodyMode::ContentLength;
+            conn.req_body_remaining = 4;
+            REQUIRE(tls_partial_initial_connect_request_owner<TlsIouringHarness>(conn));
+        } else {
+            REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("prev"), 4), 4u);
+            conn.req_initial_send_len = 4;
+        }
+        if (body_len == 4) {
+            conn.upstream_send_armed = true;
+            conn.on_upstream_send = &on_upstream_request_sent<TlsIouringHarness>;
+        } else if (body_len == 3) {
+            conn.upstream_send_armed = true;
+            conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
+        }
+        conn.recv_armed = true;
+        conn.pending_ops = 1;
+        CHECK_EQ(conn.tls_pending_on_recv, nullptr);
+        const char body[] = "DATA";
+        if (body_len == 4) REQUIRE_EQ(SSL_key_update(cl.ssl, SSL_KEY_UPDATE_REQUESTED), 1);
+        REQUIRE_EQ(SSL_write(cl.ssl, body, static_cast<int>(plaintext_len)),
+                   static_cast<int>(plaintext_len));
+        u8 ciphertext[4096];
+        const int cipher_len = BIO_read(cl.wbio, ciphertext, sizeof(ciphertext));
+        REQUIRE_GT(cipher_len, 0);
+        REQUIRE_EQ(conn.tls_in_buf.write(ciphertext, static_cast<u32>(cipher_len)),
+                   static_cast<u32>(cipher_len));
+        REQUIRE_EQ(SSL_write(cl.ssl, "NEXT", 4), 4);
+        u8 successor_ciphertext[4096];
+        const int successor_len =
+            BIO_read(cl.wbio, successor_ciphertext, sizeof(successor_ciphertext));
+        REQUIRE_GT(successor_len, 0);
+        REQUIRE_EQ(conn.tls_in_buf.write(successor_ciphertext, 1), 1u);
+        tls_recv<TlsIouringHarness>(
+            &loop, conn, {conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0, 0});
+        CHECK(conn.tls_recv_overflow_prefix_len != 0);
+        // Model the upstream body-send CQE that opens continue_request_body;
+        // its send slot is no longer armed when the buffered TLS prefix runs.
+        conn.upstream_send_armed = false;
+        if (body_len != 3) {
+            REQUIRE_EQ(conn.tls_out_buf.write(reinterpret_cast<const u8*>("raw"), 3), 3u);
+            REQUIRE(loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3));
+        } else {
+            REQUIRE_EQ(conn.tls_out_buf.write(reinterpret_cast<const u8*>("raw"), 3), 3u);
+            REQUIRE(loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3));
+            ++conn.tls_out_inflight_generation;
+        }
+        if (body_len == 2 || body_len == 5) {
+            // Drive the real connect callback into its initial request send;
+            // the copied TLS prefix must remain parked across this transition.
+            CHECK(conn.tls_recv_overflow_prefix_len != 0);
+            conn.upstream_connect_armed = false;
+            on_upstream_connected<TlsIouringHarness>(
+                &loop, conn, {conn.id, 0, 0, 0, IoEventType::UpstreamConnect, 0});
+            REQUIRE_FALSE(loop.closed);
+            REQUIRE(conn.upstream_send_armed);
+            REQUIRE_EQ(conn.on_upstream_send, &on_upstream_request_sent<TlsIouringHarness>);
+        }
+        if (body_len == 4 || body_len == 2 || body_len == 5) {
+            on_upstream_request_sent<TlsIouringHarness>(
+                &loop,
+                conn,
+                {conn.id, static_cast<i32>(initial_send_len), 0, 0, IoEventType::UpstreamSend, 0});
+        } else {
+            on_request_body_sent<TlsIouringHarness>(
+                &loop, conn, {conn.id, 4, 0, 0, IoEventType::UpstreamSend, 0});
+        }
+        if (body_len == 3) {
+            CHECK(loop.closed);
+            CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
+            CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
+        } else {
+            CHECK(conn.tls_recv_overflow_resume_pending());
+            CHECK(conn.tls_out_inflight);
+            auto drain_tls_output = [&]() {
+                const u32 len = conn.tls_out_inflight_len;
+                const u32 generation = conn.tls_out_inflight_generation;
+                IoEvent drain = {};
+                drain.conn_id = conn.id;
+                drain.result = static_cast<i32>(len);
+                drain.type = IoEventType::Send;
+                drain.non_upstream_generation = generation;
+                conn.send_armed = false;
+                if (conn.pending_ops > 0) conn.pending_ops--;
+                tls_on_out_drain<TlsIouringHarness>(&loop, conn, drain);
+            };
+            drain_tls_output();
+            if (conn.tls_out_inflight) {
+                CHECK(conn.tls_recv_overflow_resume_pending());
+                CHECK(loop.tls_ciphertext_send_is_current(conn));
+                drain_tls_output();
+            }
+            if (body_len == 2) {
+                CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
+                CHECK(conn.req_body_overflow_rejected);
+                CHECK_EQ(conn.req_body_remaining, 2u);
+                CHECK_FALSE(loop.closed);
+                CHECK_EQ(conn.resp_status, 413u);
+                CHECK_EQ(conn.on_send, &on_response_sent<TlsIouringHarness>);
+            } else {
+                CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
+                CHECK(conn.req_body_lossy_successor);
+                CHECK_FALSE(conn.req_body_overflow_rejected);
+                CHECK_EQ(conn.req_body_remaining, 0u);
+                CHECK(conn.upstream_send_armed);
+                CHECK_EQ(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].type,
+                         MockOp::Send);
+                CHECK_EQ(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].send_len,
+                         4u);
+                CHECK(
+                    memcmp(
+                        loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].send_buf,
+                        "DATA",
+                        4) == 0);
+                CHECK(conn.recv_paused_for_send);
+                CHECK(loop.recv_paused);
+            }
+        }
+        if (body_len != 3) {
+            CHECK_EQ(conn.tls_in_buf.len(), 0u);
+            CHECK_FALSE(conn.tls_recv_overflow_prefix_len != 0);
+            CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
+        }
+        tls_engine_free(conn.tls_engine);
+        cl.destroy();
+    }
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+TEST(tls_iouring, overflow_prefix_rebases_across_control_flights_without_recv_rearm) {
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[16];
+    u8 tls_out_storage[16];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.state = ConnState::Proxying;
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>("abc"), 3), 3u);
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("AB"), 2), 2u);
+    conn.tls_recv_overflow_prefix_len = 3;
+    conn.set_tls_recv_overflow_resume_pending(true);
+    conn.set_slots(nullptr, nullptr, nullptr, &on_request_body_sent<TlsIouringHarness>);
+    conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
+    conn.upstream_send_armed = true;
+    conn.req_body_mode = BodyMode::ContentLength;
+    conn.req_body_remaining = 1;
+    conn.req_initial_send_len = 1;
+    conn.recv_paused_for_send = true;
+    conn.recv_armed = false;  // the pause target CQE arrived before the raw drain
+    conn.tls_send_owner_generation = 0;
+    loop.tls_overflow_control_flights_to_emit = 2;
+    REQUIRE_EQ(conn.tls_out_buf.write(reinterpret_cast<const u8*>("raw"), 3), 3u);
+    REQUIRE(loop.submit_tls_ciphertext_send(conn, conn.tls_out_buf.data(), 3));
+
+    auto drain = [&]() {
+        const u32 len = conn.tls_out_inflight_len;
+        const u32 generation = conn.tls_out_inflight_generation;
+        IoEvent event = {};
+        event.conn_id = conn.id;
+        event.result = static_cast<i32>(len);
+        event.type = IoEventType::Send;
+        event.non_upstream_generation = generation;
+        conn.send_armed = false;
+        if (conn.pending_ops > 0) conn.pending_ops--;
+        tls_on_out_drain<TlsIouringHarness>(&loop, conn, event);
+    };
+
+    const u32 recv_ops_before = loop.SmallLoop::backend.count_ops(MockOp::Recv);
+    drain();
+    CHECK(conn.tls_recv_overflow_resume_pending());
+    CHECK_EQ(conn.tls_recv_overflow_prefix_size(), 1u);
+    CHECK(loop.tls_ciphertext_send_is_current(conn));
+    drain();
+    CHECK(conn.tls_recv_overflow_resume_pending());
+    CHECK_EQ(conn.tls_recv_overflow_prefix_size(), 0u);
+    CHECK(loop.tls_ciphertext_send_is_current(conn));
+    drain();
+    CHECK_FALSE(conn.tls_recv_overflow_resume_pending());
+    CHECK(conn.req_body_lossy_successor);
+    CHECK(conn.tls_active);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(loop.SmallLoop::backend.count_ops(MockOp::Recv), recv_ops_before);
+}
 
 enum class TlsKeyUpdatePeer : u8 { Client, Server };
 
@@ -7160,6 +8104,131 @@ TEST(tls_iouring, want_read_resume_state_preserves_pipelined_plaintext_until_raw
     CHECK(g_tls_iouring_next_request_len == sizeof(kLaterRequest) - 1 &&
           memcmp(g_tls_iouring_next_request_buf, kLaterRequest, sizeof(kLaterRequest) - 1) == 0);
 
+    cl.destroy();
+    tls_engine_free(conn.tls_engine);
+    destroy_tls_server_context(tls_ctx.value());
+}
+
+// An early response may leave a real encrypted record in flight while the
+// response's TLS send owns the WANT_READ continuation.  Once that continuation
+// resolves, the plaintext is discarded exactly once and no HTTP callback or
+// replacement recv is installed.
+TEST(tls_iouring, abandoned_positive_want_read_discards_real_tls_plaintext) {
+    auto tls_ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+    REQUIRE(tls_ctx.has_value());
+    TlsIouringHarness loop;
+    Connection& conn = loop.conns[0];
+    u8 tls_in_storage[4096];
+    u8 tls_out_storage[4096];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.req_body_abandoned = true;
+    conn.recv_slice = loop.recv_storage[0];
+    conn.tls_in_slice = tls_in_storage;
+    conn.tls_out_slice = tls_out_storage;
+    conn.recv_buf.bind(loop.recv_storage[0], sizeof(loop.recv_storage[0]));
+    conn.tls_in_buf.bind(tls_in_storage, sizeof(tls_in_storage));
+    conn.tls_out_buf.bind(tls_out_storage, sizeof(tls_out_storage));
+    conn.on_recv = &tls_recv<TlsIouringHarness>;
+    REQUIRE(tls_engine_init(conn.tls_engine, tls_ctx.value()).has_value());
+    TlsClientPeer cl;
+    REQUIRE(tls_engine_handshake_loopback(conn.tls_engine, cl));
+    u8 handshake_trailing[4096]{};
+    u32 handshake_trailing_len = 0;
+    while (BIO_ctrl_pending(cl.wbio) != 0) {
+        REQUIRE_LT(handshake_trailing_len, sizeof(handshake_trailing));
+        const int read =
+            BIO_read(cl.wbio,
+                     handshake_trailing + handshake_trailing_len,
+                     static_cast<int>(sizeof(handshake_trailing) - handshake_trailing_len));
+        REQUIRE_GT(read, 0);
+        handshake_trailing_len += static_cast<u32>(read);
+    }
+    CHECK_EQ(BIO_ctrl_pending(cl.wbio), 0u);
+
+    static constexpr u8 kResponse[] = "resp";
+    static constexpr u8 kNextRequest[] = "GET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    u32 owner_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(owner_generation));
+    conn.tls_send_owner_generation = owner_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = kResponse;
+    conn.tls_send_len = sizeof(kResponse) - 1;
+    conn.tls_pending_on_send = &tls_iouring_logical_send_probe;
+    conn.tls_pending_on_recv = &tls_resume_pending_send_recv<TlsIouringHarness>;
+    g_tls_iouring_logical_send_called = false;
+    g_tls_iouring_logical_send_calls = 0;
+    u32 consumed = 0;
+    REQUIRE_EQ(tls_fill_output<TlsIouringHarness>(&loop, conn, kResponse, 4, consumed),
+               TlsFill::Done);
+    REQUIRE_EQ(consumed, 4u);
+    const u32 raw_len = conn.tls_out_inflight_len;
+    const u32 raw_generation = conn.tls_out_inflight_generation;
+    REQUIRE_GT(raw_len, 0u);
+
+    REQUIRE(SSL_write(cl.ssl, kNextRequest, sizeof(kNextRequest) - 1) ==
+            static_cast<int>(sizeof(kNextRequest) - 1));
+    u8 peer_ciphertext[4096]{};
+    const int cipher_len = BIO_read(cl.wbio, peer_ciphertext, sizeof(peer_ciphertext));
+    REQUIRE_GT(cipher_len, 0);
+    constexpr u32 kPrefixLen = 1;
+    REQUIRE_LE(kPrefixLen, static_cast<u32>(cipher_len));
+    REQUIRE_EQ(conn.tls_in_buf.write(reinterpret_cast<const u8*>(peer_ciphertext), kPrefixLen),
+               kPrefixLen);
+    conn.tls_recv_overflow_prefix_len = kPrefixLen;
+    conn.recv_armed = false;  // this positive CQE has already consumed the raw recv owner
+    tls_recv<TlsIouringHarness>(
+        &loop, conn, IoEvent{conn.id, kPrefixLen, 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
+    CHECK(conn.tls_out_inflight);
+    CHECK_EQ(conn.tls_in_buf.len(), kPrefixLen);
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK_FALSE(g_tls_iouring_logical_send_called);
+    CHECK_EQ(conn.tls_pending_on_recv, &tls_resume_pending_send_recv<TlsIouringHarness>);
+    const u32 suffix_len = static_cast<u32>(cipher_len) - kPrefixLen;
+    REQUIRE_LE(suffix_len, conn.tls_in_buf.write_avail());
+    REQUIRE_EQ(conn.tls_in_buf.write(peer_ciphertext + kPrefixLen, suffix_len), suffix_len);
+    tls_recv<TlsIouringHarness>(
+        &loop,
+        conn,
+        IoEvent{conn.id, static_cast<i32>(suffix_len), 0, 0, IoEventType::Recv, 0, 0, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_in_buf.len(), static_cast<u32>(cipher_len));
+    CHECK_EQ(conn.tls_pending_on_recv, &tls_resume_pending_send_recv<TlsIouringHarness>);
+
+    u32 drain_generation = raw_generation;
+    for (u32 drains = 0; drains < 4 && !g_tls_iouring_logical_send_called; drains++) {
+        const u32 drain_len = conn.tls_out_inflight_len;
+        REQUIRE_GT(drain_len, 0u);
+        REQUIRE_EQ(BIO_write(cl.rbio, conn.tls_out_buf.data(), static_cast<int>(drain_len)),
+                   static_cast<int>(drain_len));
+        auto& state = loop.backend.send_state[conn.id];
+        state.offset = drain_len;
+        state.remaining = 0;
+        drain_generation = conn.tls_out_inflight_generation;
+        conn.pending_ops--;
+        conn.send_armed = false;
+        IoEvent drain = {};
+        drain.conn_id = conn.id;
+        drain.type = IoEventType::Send;
+        drain.result = static_cast<i32>(drain_len);
+        drain.non_upstream_generation = drain_generation;
+        tls_on_out_drain<TlsIouringHarness>(&loop, conn, drain);
+    }
+
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(conn.tls_out_buf.len(), 0u);
+    CHECK_EQ(conn.tls_send_off, conn.tls_send_len);
+    CHECK(g_tls_iouring_logical_send_called);
+    CHECK_EQ(g_tls_iouring_logical_send_calls, 1u);
+    CHECK_EQ(conn.recv_buf.len(), 0u);
+    CHECK_EQ(conn.tls_in_buf.len(), 0u);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_NE(conn.tls_pending_on_recv, &tls_resume_pending_send_recv<TlsIouringHarness>);
     cl.destroy();
     tls_engine_free(conn.tls_engine);
     destroy_tls_server_context(tls_ctx.value());
@@ -21066,6 +22135,1096 @@ TEST(route, forward_set_path_streaming_post_body) {
     }
     engine.shutdown();
     rir.destroy();
+}
+
+// ---- io_uring request-body forwarding ----
+//
+// The io_uring backend keeps a multishot recv armed on the client socket, so body
+// bytes that arrive while the gateway is still connecting to / sending the first
+// part to the origin are appended to recv_buf with no recv slot installed. They
+// are part of the request stream and must reach the origin. They used to be
+// discarded when streaming started (a hang for 4-16 KiB bodies) and after every
+// streamed chunk (a stall mid-upload).
+
+namespace {
+
+u8 req_body_byte(u32 i) {
+    return static_cast<u8>((i * 31u + (i >> 8)) & 0xFFu);
+}
+
+// Case-insensitive match of `name` (lowercase, ends with ':') at hdr[at..), which
+// must sit at the start of a header line.
+bool header_at(const u8* hdr, u32 at, u32 end, const char* name) {
+    u32 k = 0;
+    for (; name[k] != '\0'; k++) {
+        if (at + k >= end || (hdr[at + k] | 0x20) != static_cast<u8>(name[k])) return false;
+    }
+    return true;
+}
+
+// What the origin saw of one request.
+struct SeenRequest {
+    char path[24];
+    u32 body_len;
+    bool chunked;
+    bool complete;    // the whole body (incl. the terminating chunk) arrived
+    bool pattern_ok;  // body bytes matched req_body_byte(i) in order
+};
+
+// Incremental chunked-body decoder: counts payload bytes, validates framing.
+struct ChunkDecoder {
+    enum State : u8 { Size, SizeLf, Data, DataCr, DataLf, TrailerCr, TrailerLf, Done, Bad };
+    State st = Size;
+    u32 size = 0;
+    u32 left = 0;
+    bool have_digit = false;
+
+    // Returns true when `b` is a payload byte.
+    bool feed(u8 b) {
+        switch (st) {
+            case Size: {
+                u32 d = 16;
+                if (b >= '0' && b <= '9')
+                    d = static_cast<u32>(b - '0');
+                else if (b >= 'a' && b <= 'f')
+                    d = static_cast<u32>(b - 'a') + 10;
+                if (d < 16) {
+                    size = size * 16 + d;
+                    have_digit = true;
+                } else if (b == '\r' && have_digit) {
+                    st = SizeLf;
+                } else {
+                    st = Bad;
+                }
+                return false;
+            }
+            case SizeLf:
+                left = size;
+                st = b != '\n' ? Bad : size == 0 ? TrailerCr : Data;
+                return false;
+            case Data:
+                if (--left == 0) st = DataCr;
+                return true;
+            case DataCr:
+                st = b == '\r' ? DataLf : Bad;
+                return false;
+            case DataLf:
+                st = b == '\n' ? Size : Bad;
+                size = 0;
+                have_digit = false;
+                return false;
+            case TrailerCr:
+                st = b == '\r' ? TrailerLf : Bad;
+                return false;
+            case TrailerLf:
+                st = b == '\n' ? Done : Bad;
+                return false;
+            case Done:
+            case Bad:
+                return false;
+        }
+        return false;
+    }
+};
+
+// Origin that drains request bodies exactly (Content-Length or chunked), verifies
+// the byte pattern, and answers 200 once the request is complete. One request per
+// connection, connections served one after another.
+struct DrainingOrigin {
+    static constexpr u32 kMaxSeen = 16;
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+    std::atomic<u32> started_count{0};  // requests begun (accepted)
+    std::atomic<u32> body_seen{0};      // body bytes of the newest request so far
+    std::atomic<u32> seen_count{0};     // requests finished (recorded)
+    SeenRequest seen[kMaxSeen]{};
+
+    ~DrainingOrigin() { teardown(); }
+
+    static void parse_head(const u8* buf, u32 hdr_end, SeenRequest& rec, u32& cl) {
+        u32 p = 0;
+        while (p < hdr_end && buf[p] != ' ') p++;
+        u32 q = ++p;
+        while (q < hdr_end && buf[q] != ' ') q++;
+        for (u32 k = 0; p + k < q && k + 1 < sizeof(rec.path); k++)
+            rec.path[k] = static_cast<char>(buf[p + k]);
+        for (u32 k = 0; k + 2 < hdr_end; k++) {
+            if (buf[k] != '\n') continue;
+            if (header_at(buf, k + 1, hdr_end, "content-length:")) {
+                u32 v = 0;
+                for (u32 j = k + 16; j < hdr_end && buf[j] != '\r'; j++)
+                    if (buf[j] >= '0' && buf[j] <= '9') v = v * 10 + static_cast<u32>(buf[j] - '0');
+                cl = v;
+            } else if (header_at(buf, k + 1, hdr_end, "transfer-encoding:")) {
+                rec.chunked = true;
+            }
+        }
+    }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<DrainingOrigin*>(arg);
+        static u8 buf[65536];
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                usleep(1000);
+                continue;
+            }
+            const u32 idx = s->started_count.load(std::memory_order_acquire);
+            s->body_seen.store(0, std::memory_order_release);
+            s->started_count.fetch_add(1, std::memory_order_acq_rel);
+            SeenRequest rec{};
+            u32 len = 0;
+            u32 hdr_end = 0;
+            while (hdr_end == 0 && len < sizeof(buf)) {
+                const i32 n = recv_timeout(
+                    client, reinterpret_cast<char*>(buf) + len, sizeof(buf) - len, 15000);
+                if (n <= 0) break;
+                len += static_cast<u32>(n);
+                for (u32 k = 3; k < len; k++) {
+                    if (buf[k - 3] == '\r' && buf[k - 2] == '\n' && buf[k - 1] == '\r' &&
+                        buf[k] == '\n') {
+                        hdr_end = k + 1;
+                        break;
+                    }
+                }
+            }
+            if (hdr_end != 0) {
+                u32 cl = 0;
+                parse_head(buf, hdr_end, rec, cl);
+                rec.pattern_ok = true;
+                ChunkDecoder dec;
+                u32 off = hdr_end;
+                for (;;) {
+                    for (; off < len; off++) {
+                        if (rec.chunked ? dec.feed(buf[off]) : true) {
+                            if (buf[off] != req_body_byte(rec.body_len)) rec.pattern_ok = false;
+                            rec.body_len++;
+                        }
+                        if (!rec.chunked && rec.body_len >= cl) {
+                            off++;
+                            break;
+                        }
+                    }
+                    s->body_seen.store(rec.body_len, std::memory_order_release);
+                    const bool done =
+                        rec.chunked ? dec.st == ChunkDecoder::Done : rec.body_len >= cl;
+                    if (done || (rec.chunked && dec.st == ChunkDecoder::Bad)) {
+                        rec.complete = done;
+                        break;
+                    }
+                    const i32 n =
+                        recv_timeout(client, reinterpret_cast<char*>(buf), sizeof(buf), 15000);
+                    if (n <= 0) break;
+                    len = static_cast<u32>(n);
+                    off = 0;
+                }
+            }
+            if (idx < kMaxSeen) s->seen[idx] = rec;
+            s->seen_count.fetch_add(1, std::memory_order_acq_rel);
+            if (rec.complete) {
+                static const char kOk[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                (void)send_all(client, kOk, sizeof(kOk) - 1);
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+
+    bool wait_seen(u32 n, i32 ms) const {
+        for (i32 i = 0; i < ms; i++) {
+            if (seen_count.load(std::memory_order_acquire) >= n) return true;
+            usleep(1000);
+        }
+        return seen_count.load(std::memory_order_acquire) >= n;
+    }
+};
+
+// One request as it goes on the wire, with enough structure to know how much of
+// the body a given wire prefix carries.
+struct WireRequest {
+    static constexpr u32 kMax = (1u << 20) + 64u * 1024u;
+    static constexpr u32 kChunkPayload = 4096;
+    u8* data = nullptr;
+    u32 len = 0;
+    u32 hdr_len = 0;
+    u32 body_len = 0;
+    bool chunked = false;
+
+    // Body bytes carried by the first `off` wire bytes.
+    u32 body_in_prefix(u32 off) const {
+        if (off <= hdr_len) return 0;
+        if (!chunked) return off - hdr_len > body_len ? body_len : off - hdr_len;
+        // Fixed-size chunks: hex size line + payload + CRLF (the last may be shorter).
+        u32 body = 0;
+        u32 pos = hdr_len;
+        u32 left = body_len;
+        while (left > 0 && pos < off) {
+            const u32 pay = left > kChunkPayload ? kChunkPayload : left;
+            u32 hex = 1;
+            for (u32 v = pay; v >= 16; v >>= 4) hex++;
+            const u32 data_start = pos + hex + 2;
+            if (off > data_start) body += (off - data_start) > pay ? pay : (off - data_start);
+            pos = data_start + pay + 2;
+            left -= pay;
+        }
+        return body;
+    }
+};
+
+u32 put_str(u8* out, u32 at, const char* s) {
+    while (*s) out[at++] = static_cast<u8>(*s++);
+    return at;
+}
+
+u32 put_num(u8* out, u32 at, u32 v, u32 base) {
+    char tmp[12];
+    u32 n = 0;
+    do {
+        const u32 d = v % base;
+        tmp[n++] = static_cast<char>(d < 10 ? '0' + d : 'a' + (d - 10));
+        v /= base;
+    } while (v != 0);
+    while (n > 0) out[at++] = static_cast<u8>(tmp[--n]);
+    return at;
+}
+
+WireRequest build_post(u8* out, const char* path, u32 body_len, bool chunked) {
+    WireRequest r;
+    r.data = out;
+    r.body_len = body_len;
+    r.chunked = chunked;
+    u32 at = put_str(out, 0, "POST ");
+    at = put_str(out, at, path);
+    at = put_str(out, at, " HTTP/1.1\r\nHost: x\r\n");
+    if (chunked) {
+        at = put_str(out, at, "Transfer-Encoding: chunked\r\n\r\n");
+    } else {
+        at = put_str(out, at, "Content-Length: ");
+        at = put_num(out, at, body_len, 10);
+        at = put_str(out, at, "\r\n\r\n");
+    }
+    r.hdr_len = at;
+    u32 i = 0;
+    while (i < body_len) {
+        u32 pay = body_len - i;
+        if (chunked) {
+            if (pay > WireRequest::kChunkPayload) pay = WireRequest::kChunkPayload;
+            at = put_num(out, at, pay, 16);
+            at = put_str(out, at, "\r\n");
+        }
+        for (u32 k = 0; k < pay; k++) out[at + k] = req_body_byte(i + k);
+        at += pay;
+        i += pay;
+        if (chunked) at = put_str(out, at, "\r\n");
+    }
+    if (chunked) at = put_str(out, at, "0\r\n\r\n");
+    r.len = at;
+    return r;
+}
+
+// One response: its status (0 = none: EOF/reset/timeout) and whether the peer said
+// Connection: close.
+struct Reply {
+    u32 status = 0;
+    bool conn_close = false;
+    u32 total = 0;
+};
+
+Reply read_reply(i32 fd, i32 ms) {
+    Reply r;
+    char buf[2048];
+    const i64 deadline = test_mono_ms() + ms;
+    u32 body_off = 0;
+    u32 cl = 0;
+    while (r.total < sizeof(buf)) {
+        const i64 left = deadline - test_mono_ms();
+        if (left <= 0) break;
+        const i32 n =
+            recv_timeout(fd, buf + r.total, sizeof(buf) - r.total, static_cast<i32>(left));
+        if (n <= 0) break;
+        r.total += static_cast<u32>(n);
+        if (body_off == 0) {
+            for (u32 k = 3; k < r.total; k++) {
+                if (buf[k - 3] == '\r' && buf[k - 2] == '\n' && buf[k - 1] == '\r' &&
+                    buf[k] == '\n') {
+                    body_off = k + 1;
+                    break;
+                }
+            }
+            if (body_off != 0) {
+                if (r.total >= 12 && buf[9] >= '0' && buf[9] <= '9')
+                    r.status = static_cast<u32>((buf[9] - '0') * 100 + (buf[10] - '0') * 10 +
+                                                (buf[11] - '0'));
+                r.conn_close = buf_contains(buf, body_off, "Connection: close", 17);
+                for (u32 k = 0; k + 2 < body_off; k++) {
+                    if (buf[k] == '\n' &&
+                        header_at(
+                            reinterpret_cast<const u8*>(buf), k + 1, body_off, "content-length:")) {
+                        for (u32 j = k + 16; j < body_off && buf[j] != '\r'; j++)
+                            if (buf[j] >= '0' && buf[j] <= '9')
+                                cl = cl * 10 + static_cast<u32>(buf[j] - '0');
+                    }
+                }
+            }
+        }
+        if (body_off != 0 && r.total >= body_off + cl) break;
+    }
+    return r;
+}
+
+// Send `w` in `piece`-sized writes; before each next write wait until the origin has
+// consumed every body byte sent so far, so at most one piece is ever in flight.
+// Keeps the test deterministic on a loaded machine (no sleep-based pacing).
+bool send_synced(
+    i32 fd, const WireRequest& w, u32 piece, const DrainingOrigin& origin, u32 request_index) {
+    u32 sent = 0;
+    while (sent < w.len) {
+        u32 n = w.len - sent;
+        if (n > piece) n = piece;
+        if (!send_all(fd, reinterpret_cast<const char*>(w.data) + sent, n)) return false;
+        sent += n;
+        if (sent == w.len) break;
+        const u32 need = w.body_in_prefix(sent);
+        for (i32 t = 0; t < 80000; t++) {
+            if (origin.started_count.load(std::memory_order_acquire) > request_index &&
+                origin.body_seen.load(std::memory_order_acquire) >= need)
+                break;
+            usleep(250);
+        }
+    }
+    return true;
+}
+
+// Plain forward routes to a DrainingOrigin over a real io_uring shard.
+struct IoUringBodyProxy {
+    Shard<IoUringEventLoop> shard;
+    RouteConfig cfg{};
+    const RouteConfig* active = &cfg;
+    i32 lfd = -1;
+    u16 port = 0;
+    bool inited = false;
+    bool running = false;
+    TlsServerContext* tls = nullptr;  // terminate TLS on the listener when set
+
+    ~IoUringBodyProxy() { teardown(); }
+
+    // false: io_uring unavailable here (the caller skips).
+    bool setup(u16 origin_port, bool use_tls = false) {
+        if (use_tls) {
+            auto ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
+            if (!ctx.has_value()) return false;
+            tls = ctx.value();
+        }
+        lfd = create_listen_socket(0).value_or(-1);
+        if (lfd < 0) return false;
+        auto init = shard.init(0, lfd);
+        for (u32 attempt = 0; !init && init.error().code == ENOMEM && attempt < 80; attempt++) {
+            usleep(25000);
+            init = shard.init(0, lfd);
+        }
+        if (!init) return false;
+        inited = true;
+        auto id = cfg.add_upstream("o", 0x7F000001, origin_port);
+        if (!id.has_value() || !cfg.add_proxy("/post", 0, id.value()) ||
+            !cfg.add_proxy("/next", 0, id.value()))
+            return false;
+        port = get_port(lfd);
+        shard.loop->config_ptr = &active;
+        if (tls != nullptr) shard.loop->tls_server = tls;
+        if (!shard.spawn(-1).has_value()) return false;
+        running = true;
+        return true;
+    }
+
+    void teardown() {
+        if (running) {
+            shard.stop();
+            shard.join();
+            running = false;
+        }
+        if (inited) {
+            shard.shutdown();
+            inited = false;
+        }
+        if (lfd >= 0) {
+            close(lfd);
+            lfd = -1;
+        }
+        if (tls != nullptr) {
+            destroy_tls_server_context(tls);
+            tls = nullptr;
+        }
+    }
+};
+
+// The socket timeouts beneath SSL_* (SO_RCVTIMEO/SO_SNDTIMEO) make the calls
+// non-restartable, so a signal landing on this thread (timers other tests in the
+// process arm) surfaces as EINTR. The TLS client helpers below retry exactly that.
+bool ssl_eintr(SSL* ssl, int rc) {
+    const int saved_errno = errno;
+    const int err = SSL_get_error(ssl, rc);
+    return saved_errno == EINTR &&
+           (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_SYSCALL);
+}
+
+int ssl_connect_retry_eintr(SSL* ssl) {
+    for (;;) {
+        const int rc = SSL_connect(ssl);
+        if (rc == 1 || !ssl_eintr(ssl, rc)) return rc;
+    }
+}
+
+int ssl_read_retry_eintr(SSL* ssl, char* buf, int len) {
+    for (;;) {
+        const int n = SSL_read(ssl, buf, len);
+        if (n > 0 || !ssl_eintr(ssl, n)) return n;
+    }
+}
+
+bool ssl_write_retry_eintr(SSL* ssl, const char* data, u32 len) {
+    u32 sent = 0;
+    while (sent < len) {
+        const int n = SSL_write(ssl, data + sent, static_cast<int>(len - sent));
+        if (n > 0) {
+            sent += static_cast<u32>(n);
+        } else if (!ssl_eintr(ssl, n)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+u8 g_wire_a[WireRequest::kMax];
+u8 g_wire_b[WireRequest::kMax];
+
+}  // namespace
+
+// Whole request in ONE write (the body lands in the socket before the gateway has
+// even connected upstream): bodies that fit recv_buf arrive intact.
+TEST(proxy_iouring_request_body, single_write_arrives_intact) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    struct Case {
+        u32 body;
+        bool chunked;
+    };
+    const Case cases[] = {{1000, false},
+                          {4060, false},
+                          {8192, false},
+                          {12000, false},
+                          {1000, true},
+                          {8192, true},
+                          {11000, true}};
+    u32 n_done = 0;
+    for (const auto& c : cases) {
+        const WireRequest w = build_post(g_wire_a, "/post", c.body, c.chunked);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        REQUIRE(send_all(fd, reinterpret_cast<const char*>(w.data), w.len));
+        const Reply r = read_reply(fd, 10000);
+        close(fd);
+        CHECK_EQ(r.status, 200u);
+        REQUIRE(origin.wait_seen(n_done + 1, 10000));
+        const SeenRequest& s = origin.seen[n_done];
+        CHECK_EQ(s.body_len, c.body);
+        CHECK(s.complete);
+        CHECK(s.pattern_ok);
+        CHECK_EQ(s.chunked, c.chunked);
+        n_done++;
+    }
+}
+
+// STOPGAP CONTRACT, pinned so the lossless follow-up (parked-CQE FIFO in wait())
+// must change it deliberately. A request (headers + body) written in ONE go is
+// forwarded byte-exact while it fits the 16 KiB recv_buf slice, and refused with
+// 413 + Connection: close as soon as it does not (it used to hang, or be closed
+// silently above 16 KiB). Independent of timing: below the slice nothing can be
+// dropped; above it the whole burst is already queued before the first send ends.
+TEST(proxy_iouring_request_body, single_write_ceiling_is_the_recv_buf_slice) {
+    constexpr u32 kSlice = 16384;  // SlicePool::kSliceSize: recv_buf capacity
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    // Largest body whose whole request is <= kSlice bytes on the wire.
+    u32 fit[2];
+    for (u32 chunked = 0; chunked < 2; chunked++) {
+        fit[chunked] = 16000;
+        while (build_post(g_wire_a, "/post", fit[chunked] + 1, chunked != 0).len <= kSlice)
+            fit[chunked]++;
+    }
+
+    // Up to the limit: byte-exact. (Refused requests come after: whether the origin
+    // even sees such a connection is timing dependent, so they must not shift the
+    // origin's record indices.)
+    u32 n_done = 0;
+    for (u32 round = 0; round < 3; round++) {
+        for (u32 chunked = 0; chunked < 2; chunked++) {
+            const WireRequest at = build_post(g_wire_a, "/post", fit[chunked], chunked != 0);
+            REQUIRE(at.len <= kSlice);
+            REQUIRE(at.len + 8 > kSlice);  // within a few bytes of the limit, not far below
+            i32 fd = connect_to(proxy.port);
+            REQUIRE(fd >= 0);
+            REQUIRE(send_all(fd, reinterpret_cast<const char*>(at.data), at.len));
+            const Reply r = read_reply(fd, 10000);
+            close(fd);
+            CHECK_EQ(r.status, 200u);
+            REQUIRE(origin.wait_seen(n_done + 1, 10000));
+            CHECK_EQ(origin.seen[n_done].body_len, fit[chunked]);
+            CHECK(origin.seen[n_done].complete);
+            CHECK(origin.seen[n_done].pattern_ok);
+            n_done++;
+        }
+    }
+    // One body byte more no longer fits: 413 and close, never a hang or an EOF.
+    for (u32 round = 0; round < 3; round++) {
+        for (u32 chunked = 0; chunked < 2; chunked++) {
+            const WireRequest over = build_post(g_wire_a, "/post", fit[chunked] + 1, chunked != 0);
+            REQUIRE(over.len > kSlice);
+            i32 fd = connect_to(proxy.port);
+            REQUIRE(fd >= 0);
+            (void)send_all(fd, reinterpret_cast<const char*>(over.data), over.len);
+            const Reply r = read_reply(fd, 10000);
+            CHECK_EQ(r.status, 413u);
+            CHECK(r.conn_close);
+            // ... and the connection really is closed behind it, not left open.
+            char tail[16];
+            const i64 t0 = test_mono_ms();
+            CHECK(recv_timeout(fd, tail, sizeof(tail), 5000) <= 0);
+            CHECK(test_mono_ms() - t0 < 4000);
+            close(fd);
+        }
+    }
+    // Much larger bursts behave the same (413, not a silent close).
+    const u32 bodies[] = {20000, 65536, 300000};
+    for (u32 b : bodies) {
+        const WireRequest w = build_post(g_wire_a, "/post", b, false);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        (void)send_all(fd, reinterpret_cast<const char*>(w.data), w.len);
+        const Reply r = read_reply(fd, 10000);
+        close(fd);
+        CHECK_EQ(r.status, 413u);
+        CHECK(r.conn_close);
+    }
+}
+
+// Bodies of any size stream through when the client does not outrun the gateway:
+// each next piece is sent once the origin consumed the previous one, so pieces land
+// behind chunks that are still in flight (the mid-stream path).
+TEST(proxy_iouring_request_body, synced_pieces_stream_large_bodies) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    struct Case {
+        u32 body;
+        bool chunked;
+        u32 piece;
+    };
+    const Case cases[] = {{20000, false, 6000},
+                          {65536, false, 8192},
+                          {1u << 20, false, 8192},
+                          {65536, true, 8192},
+                          {300000, true, 7000}};
+    u32 n_done = 0;
+    for (const auto& c : cases) {
+        const WireRequest w = build_post(g_wire_a, "/post", c.body, c.chunked);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        REQUIRE(send_synced(fd, w, c.piece, origin, n_done));
+        const Reply r = read_reply(fd, 20000);
+        close(fd);
+        CHECK_EQ(r.status, 200u);
+        REQUIRE(origin.wait_seen(n_done + 1, 10000));
+        const SeenRequest& s = origin.seen[n_done];
+        CHECK_EQ(s.body_len, c.body);
+        CHECK(s.complete);
+        CHECK(s.pattern_ok);
+        n_done++;
+    }
+}
+
+// TLS terminates in the io_uring loop: ciphertext lands in tls_in_buf, and while the
+// upload waits on the origin nothing decrypts it. The same contracts hold: a body
+// that does not outrun the gateway streams through intact; a burst that overflows is
+// refused with 413 (over TLS), never hung or closed silently (stopgap, see
+// respond_request_body_overflow).
+TEST(proxy_iouring_request_body, tls_upload) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port, /*use_tls=*/true))
+        SKIP("io_uring unavailable in this environment");
+
+    struct Case {
+        u32 body;
+        bool chunked;
+        bool synced;  // pieces paced on origin progress (else one burst)
+    };
+    const Case cases[] = {
+        {8192, false, false}, {60000, false, true}, {60000, true, true}, {120000, false, false}};
+    SSL_CTX* client_ctx = create_test_client_ctx();
+    REQUIRE(client_ctx != nullptr);
+    for (u32 round = 0; round < 4; round++) {
+        const Case& c = cases[round];
+        const WireRequest w = build_post(g_wire_a, "/post", c.body, c.chunked);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        set_socket_timeouts(fd, 5);
+        SSL* ssl = SSL_new(client_ctx);
+        REQUIRE(ssl != nullptr);
+        REQUIRE(SSL_set_fd(ssl, fd) == 1);
+        REQUIRE(ssl_connect_retry_eintr(ssl) == 1);
+        if (c.synced) {
+            constexpr u32 kPiece = 6000;
+            for (u32 sent = 0; sent < w.len;) {
+                u32 n = w.len - sent;
+                if (n > kPiece) n = kPiece;
+                REQUIRE(
+                    ssl_write_retry_eintr(ssl, reinterpret_cast<const char*>(w.data) + sent, n));
+                sent += n;
+                const u32 need = w.body_in_prefix(sent);
+                for (i32 t = 0; t < 80000 && sent < w.len; t++) {
+                    if (origin.started_count.load() > round && origin.body_seen.load() >= need)
+                        break;
+                    usleep(250);
+                }
+            }
+        } else {
+            (void)ssl_write_retry_eintr(ssl, reinterpret_cast<const char*>(w.data), w.len);
+        }
+        char buf[512];
+        const i32 n = ssl_read_retry_eintr(ssl, buf, sizeof(buf));
+        u32 status = 0;
+        if (n >= 12)
+            status =
+                static_cast<u32>((buf[9] - '0') * 100 + (buf[10] - '0') * 10 + (buf[11] - '0'));
+        SSL_free(ssl);
+        close(fd);
+        // The stopgap ceiling on TLS sits in tls_in_buf (ciphertext; ~33 KB of body
+        // measured), so a 120 KB burst is refused and everything else streams through.
+        CHECK_EQ(status, c.body == 120000 ? 413u : 200u);
+        if (status == 200u) {
+            REQUIRE(origin.wait_seen(round + 1, 10000));
+            CHECK_EQ(origin.seen[round].body_len, c.body);
+            CHECK(origin.seen[round].complete);
+            CHECK(origin.seen[round].pattern_ok);
+        }
+    }
+    SSL_CTX_free(client_ctx);
+}
+
+// A slow sender (real pauses between pieces) was never affected; keep it covered.
+TEST(proxy_iouring_request_body, paced_sender_with_pauses) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    const WireRequest w = build_post(g_wire_a, "/post", 40000, false);
+    i32 fd = connect_to(proxy.port);
+    REQUIRE(fd >= 0);
+    for (u32 sent = 0; sent < w.len;) {
+        u32 n = w.len - sent;
+        if (n > 8192) n = 8192;
+        REQUIRE(send_all(fd, reinterpret_cast<const char*>(w.data) + sent, n));
+        sent += n;
+        usleep(10000);
+    }
+    const Reply r = read_reply(fd, 10000);
+    close(fd);
+    CHECK_EQ(r.status, 200u);
+    REQUIRE(origin.wait_seen(1, 10000));
+    CHECK_EQ(origin.seen[0].body_len, 40000u);
+    CHECK(origin.seen[0].complete);
+    CHECK(origin.seen[0].pattern_ok);
+}
+
+// Two requests with bodies on one keep-alive connection: the second must not be
+// disturbed by leftovers of the first, nor the first by the second.
+TEST(proxy_iouring_request_body, keep_alive_two_large_requests) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    const WireRequest a = build_post(g_wire_a, "/post", 9000, false);
+    const WireRequest b = build_post(g_wire_b, "/post", 50000, true);
+    i32 fd = connect_to(proxy.port);
+    REQUIRE(fd >= 0);
+    REQUIRE(send_all(fd, reinterpret_cast<const char*>(a.data), a.len));
+    Reply r = read_reply(fd, 10000);
+    CHECK_EQ(r.status, 200u);
+    CHECK(!r.conn_close);
+    REQUIRE(send_synced(fd, b, 8192, origin, 1));
+    r = read_reply(fd, 10000);
+    CHECK_EQ(r.status, 200u);
+    close(fd);
+    REQUIRE(origin.wait_seen(2, 10000));
+    CHECK_EQ(origin.seen[0].body_len, 9000u);
+    CHECK(origin.seen[0].pattern_ok);
+    CHECK_EQ(origin.seen[1].body_len, 50000u);
+    CHECK(origin.seen[1].complete);
+    CHECK(origin.seen[1].pattern_ok);
+}
+
+// A body followed by the next request in the same write: the successor's bytes
+// share recv_buf with the body's tail and must be served as its own request, not
+// forwarded as body.
+TEST(proxy_iouring_request_body, pipelined_successor_after_body) {
+    DrainingOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    for (u32 round = 0; round < 2; round++) {
+        const u32 before = origin.seen_count.load();
+        const WireRequest w = build_post(g_wire_a, "/post", round == 0 ? 7000 : 10000, round == 1);
+        u32 total = put_str(
+            g_wire_a, w.len, "POST /next HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc");
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        REQUIRE(send_all(fd, reinterpret_cast<const char*>(g_wire_a), total));
+        const Reply r1 = read_reply(fd, 10000);
+        CHECK_EQ(r1.status, 200u);
+        const Reply r2 = read_reply(fd, 10000);
+        CHECK_EQ(r2.status, 200u);
+        close(fd);
+        REQUIRE(origin.wait_seen(before + 2, 10000));
+        CHECK_EQ(origin.seen[before].body_len, w.body_len);
+        CHECK(origin.seen[before].pattern_ok);
+        CHECK(origin.seen[before].complete);
+        CHECK_EQ(origin.seen[before + 1].body_len, 3u);  // "abc": its own request
+        CHECK_EQ(origin.seen[before + 1].path[1], 'n');  // /next
+    }
+}
+
+// Forward routes compiled from source, one of them with a response-header mutation
+// chain, in front of a DrainingOrigin. The mutation snapshot sets retry_req_send_len
+// when body streaming starts; that must not change how much of recv_buf is treated
+// as already sent (the body used to be corrupted with the request headers replayed
+// inside it: the origin saw "...POST /mpost HTTP/1.1..." in the body).
+struct MutationBodySource {
+    FrontendRirModule rir{};
+    jit::JitEngine engine{};
+    RouteConfig cfg{};
+    bool engine_ready = false;
+
+    ~MutationBodySource() {
+        if (engine_ready) engine.shutdown();
+        rir.destroy();
+    }
+
+    bool compile(u16 origin_port) {
+        std::string source =
+            "upstream origin at \"127.0.0.1:" + std::to_string(origin_port) + "\"\n";
+        source += R"rut(
+func response_headers(_ req: i32, _ resp: Response) -> i32 {
+  resp.set("X-Stage", "after")
+  0
+}
+chain access { after response_headers(req, resp) }
+route POST "/post" {
+  return forward(origin)
+}
+route POST "/mpost" use chain access {
+  return forward(origin)
+}
+)rut";
+        auto lexed = lex({source.data(), static_cast<u32>(source.size())});
+        if (!lexed) return false;
+        auto ast = parse_file(lexed.value());
+        if (!ast) return false;
+        std::unique_ptr<AstFile> ast_owned(ast.value());
+        auto hir = analyze_file(*ast_owned);
+        if (!hir) return false;
+        std::unique_ptr<HirModule> hir_owned(hir.value());
+        auto mir = build_mir(*hir_owned);
+        if (!mir) return false;
+        std::unique_ptr<MirModule> mir_owned(mir.value());
+        if (!lower_to_rir(*mir_owned, rir)) return false;
+        auto cg = jit::codegen(rir.module);
+        if (!cg.ok || !engine.init()) return false;
+        engine_ready = true;
+        if (!engine.compile(cg.mod, cg.ctx)) return false;
+        if (!populate_route_config(cfg, rir.module)) return false;
+        return register_jit_routes(cfg, rir.module, engine);
+    }
+};
+
+template <typename Loop>
+struct MutationBodyProxy {
+    Shard<Loop> shard;
+    MutationBodySource source;
+    i32 lfd = -1;
+    u16 port = 0;
+    bool inited = false;
+    bool running = false;
+
+    ~MutationBodyProxy() { teardown(); }
+
+    // false: the loop is unavailable here (the caller skips).
+    bool setup(u16 origin_port) {
+        if (!source.compile(origin_port)) return false;
+        lfd = create_listen_socket(0).value_or(-1);
+        if (lfd < 0) return false;
+        auto init = shard.init(0, lfd);
+        for (u32 attempt = 0; !init && init.error().code == ENOMEM && attempt < 80; attempt++) {
+            usleep(25000);
+            init = shard.init(0, lfd);
+        }
+        if (!init) return false;
+        inited = true;
+        port = get_port(lfd);
+        shard.route_config = &source.cfg;
+        if (!shard.spawn(-1).has_value()) return false;
+        running = true;
+        return true;
+    }
+
+    void teardown() {
+        if (running) {
+            shard.stop();
+            shard.join();
+            running = false;
+        }
+        if (inited) {
+            shard.shutdown();
+            inited = false;
+        }
+        if (lfd >= 0) {
+            close(lfd);
+            lfd = -1;
+        }
+    }
+};
+
+// Request bodies larger than the first read through the mutation route must arrive at
+// the origin byte-exact (Content-Length and chunked). One-write cases stay within one
+// recv_buf slice (the io_uring stopgap ceiling); larger bodies are paced on origin
+// progress. (Not one-write on epoll either: a fresh upstream connection with a
+// one-write body above one slice is closed by the epoll loop on origin/main too;
+// unrelated to this change.)
+struct MutationBodyCase {
+    const char* path;
+    u32 body;
+    bool chunked;
+    bool synced;  // pieces paced on origin progress, else one write
+};
+
+struct MutationBodyOutcome {
+    static constexpr u32 kMaxCases = 8;
+    u32 count = 0;
+    bool setup_failed = false;
+    bool io_failed = false;  // connect/send/record timeout: outcomes below are partial
+    u32 status[kMaxCases]{};
+    SeenRequest seen[kMaxCases]{};
+};
+
+constexpr MutationBodyCase kMutationBodyCases[] = {{"/mpost", 6000, false, false},
+                                                   {"/mpost", 12000, false, false},
+                                                   {"/mpost", 6000, true, false},
+                                                   {"/mpost", 11000, true, false},
+                                                   {"/post", 12000, false, false},  // no chain
+                                                   {"/mpost", 20000, false, true},
+                                                   {"/mpost", 20000, true, true},
+                                                   {"/mpost", 100000, false, true}};
+
+template <typename Loop>
+void run_mutation_route_bodies(MutationBodyOutcome& out) {
+    DrainingOrigin origin;
+    if (!origin.setup()) {
+        out.setup_failed = true;
+        return;
+    }
+    MutationBodyProxy<Loop> proxy;
+    if (!proxy.setup(origin.port)) {
+        out.setup_failed = true;
+        return;
+    }
+    for (const auto& c : kMutationBodyCases) {
+        const WireRequest w = build_post(g_wire_a, c.path, c.body, c.chunked);
+        i32 fd = connect_to(proxy.port);
+        bool sent = fd >= 0;
+        if (sent) {
+            sent = c.synced ? send_synced(fd, w, 7000, origin, out.count)
+                            : send_all(fd, reinterpret_cast<const char*>(w.data), w.len);
+        }
+        const Reply r = sent ? read_reply(fd, 20000) : Reply{};
+        if (fd >= 0) close(fd);
+        if (!sent || !origin.wait_seen(out.count + 1, 10000)) {
+            out.io_failed = true;
+            return;
+        }
+        out.status[out.count] = r.status;
+        out.seen[out.count] = origin.seen[out.count];
+        out.count++;
+    }
+}
+
+static void check_mutation_outcome(const MutationBodyOutcome& out, rut::test::TestCase* _tc) {
+    REQUIRE(!out.io_failed);
+    REQUIRE_EQ(out.count,
+               static_cast<u32>(sizeof(kMutationBodyCases) / sizeof(kMutationBodyCases[0])));
+    for (u32 i = 0; i < out.count; i++) {
+        const auto& c = kMutationBodyCases[i];
+        CHECK_EQ(out.status[i], 200u);
+        CHECK_EQ(out.seen[i].path[1], c.path[1]);
+        CHECK_EQ(out.seen[i].body_len, c.body);
+        CHECK(out.seen[i].complete);
+        CHECK(out.seen[i].pattern_ok);  // no header bytes replayed inside the body
+        CHECK_EQ(out.seen[i].chunked, c.chunked);
+    }
+}
+
+TEST(proxy_iouring_request_body, mutation_route_body_is_byte_exact_iouring) {
+    MutationBodyOutcome out;
+    run_mutation_route_bodies<IoUringEventLoop>(out);
+    if (out.setup_failed) SKIP("io_uring unavailable in this environment");
+    check_mutation_outcome(out, _tc);
+}
+
+TEST(proxy_iouring_request_body, mutation_route_body_is_byte_exact_epoll) {
+    MutationBodyOutcome out;
+    run_mutation_route_bodies<EpollEventLoop>(out);
+    REQUIRE(!out.setup_failed);
+    check_mutation_outcome(out, _tc);
+}
+
+// An origin that answers as soon as it has the headers (an early 401) and then
+// drains what the client still writes, closing after a quiet period.
+struct EarlyReplyOrigin {
+    i32 listen_fd = -1;
+    u16 port = 0;
+    std::atomic<bool> running{false};
+    bool started = false;
+    pthread_t thread{};
+
+    ~EarlyReplyOrigin() { teardown(); }
+
+    static void* run(void* arg) {
+        auto* s = static_cast<EarlyReplyOrigin*>(arg);
+        static u8 buf[65536];
+        while (s->running.load(std::memory_order_acquire)) {
+            i32 client = accept(s->listen_fd, nullptr, nullptr);
+            if (client < 0) {
+                usleep(1000);
+                continue;
+            }
+            u32 len = 0;
+            bool have_head = false;
+            while (!have_head && len < sizeof(buf)) {
+                const i32 n = recv_timeout(
+                    client, reinterpret_cast<char*>(buf) + len, sizeof(buf) - len, 5000);
+                if (n <= 0) break;
+                len += static_cast<u32>(n);
+                have_head = buf_contains(reinterpret_cast<char*>(buf), len, "\r\n\r\n", 4);
+            }
+            if (have_head) {
+                static const char k401[] =
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno";
+                (void)send_all(client, k401, sizeof(k401) - 1);
+                while (recv_timeout(client, reinterpret_cast<char*>(buf), sizeof(buf), 300) > 0) {
+                }
+            }
+            close(client);
+        }
+        return nullptr;
+    }
+
+    bool setup() {
+        auto lfd = create_listen_socket(0);
+        if (!lfd.has_value()) return false;
+        listen_fd = lfd.value();
+        port = get_port(listen_fd);
+        running.store(true, std::memory_order_release);
+        if (pthread_create(&thread, nullptr, run, this) != 0) {
+            running.store(false, std::memory_order_release);
+            close(listen_fd);
+            listen_fd = -1;
+            return false;
+        }
+        started = true;
+        return true;
+    }
+
+    void teardown() {
+        running.store(false, std::memory_order_release);
+        if (started) {
+            pthread_join(thread, nullptr);
+            started = false;
+        }
+        if (listen_fd >= 0) {
+            close(listen_fd);
+            listen_fd = -1;
+        }
+    }
+};
+
+// The upstream's early response (401 sent right after the headers) is what the
+// client must see: bodies within the ceiling always get it. Larger one-write bodies
+// overflow recv_buf before the gateway has even connected upstream, so the upstream
+// cannot have answered yet and the 413 wins; that is inherent to the stopgap and
+// only checked to be one of the two answers (never a hang or a silent close).
+TEST(proxy_iouring_request_body, early_upstream_response_beats_the_body) {
+    EarlyReplyOrigin origin;
+    REQUIRE(origin.setup());
+    IoUringBodyProxy proxy;
+    if (!proxy.setup(origin.port)) SKIP("io_uring unavailable in this environment");
+
+    const u32 bodies[] = {4000, 12000, 15000, 40000, 300000};
+    for (u32 body : bodies) {
+        const WireRequest w = build_post(g_wire_a, "/post", body, false);
+        i32 fd = connect_to(proxy.port);
+        REQUIRE(fd >= 0);
+        (void)send_all(fd, reinterpret_cast<const char*>(w.data), w.len);
+        const Reply r = read_reply(fd, 10000);
+        close(fd);
+        if (w.len <= 16384) {
+            CHECK_EQ(r.status, 401u);
+        } else {
+            CHECK(r.status == 401u || r.status == 413u);
+        }
+        CHECK(r.conn_close);
+    }
 }
 
 // forward() rejects an unknown kwarg and a duplicated set_path.
