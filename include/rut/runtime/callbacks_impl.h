@@ -561,8 +561,10 @@ inline bool refresh_initial_connect_request_boundary(Connection& conn) {
     request.reset();
     if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &request) !=
             ParseStatus::Complete ||
-        parser.header_end != conn.req_header_end || request.version != HttpVersion::Http11 ||
-        request.upgrade || request.has_upgrade_header || request.target_has_fragment ||
+        parser.header_end != conn.req_header_end ||
+        (request.version != HttpVersion::Http10 && request.version != HttpVersion::Http11) ||
+        static_cast<u8>(request.version) != conn.req_http_version || request.upgrade ||
+        request.has_upgrade_header || request.target_has_fragment ||
         request.method == HttpMethod::Unknown || map_log_method(request.method) != conn.req_method)
         return false;
     const u32 body_len = conn.recv_buf.len() - parser.header_end;
@@ -5319,6 +5321,16 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
     if (initial_connect_request_owner<Loop>(conn)) {
         conn.req_body_lossy_successor = true;
         conn.keep_alive = false;
+        conn.recv_paused_for_send = true;
+        conn.recv_pause_rearm_pending = false;
+        if (conn.recv_armed && !conn.recv_pause_cancel_pending &&
+            !conn.recv_pause_target_inflight) {
+            if constexpr (requires(Loop* lp, Connection& c) { lp->pause_recv(c); }) {
+                if (!loop->pause_recv(conn)) loop->close_conn(conn);
+            } else if constexpr (loop_backend_async_io<Loop>()) {
+                loop->close_conn(conn);
+            }
+        }
         return;
     }
     // The body counters are advanced only when the in-flight send completes. If
@@ -7715,8 +7727,14 @@ void continue_request_body(Loop* loop, Connection& conn, u32 sent) {
     if (conn.recv_paused_for_send && conn.recv_buf.write_avail() >= kRequestBodyRecvHeadroom)
         conn.recv_paused_for_send = false;
     const u32 kBuffered = conn.recv_buf.len();
-    loop->submit_recv(conn);
-    loop->submit_recv_upstream(conn);
+    if (!loop->submit_recv(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
+    if (!loop->submit_recv_upstream(conn)) {
+        loop->close_conn(conn);
+        return;
+    }
     if (kBuffered > 0) {
         IoEvent synth = {conn.id, static_cast<i32>(kBuffered), 0, 0, IoEventType::Recv, 0, 0, 0};
         on_request_body_recvd<Loop>(loop, conn, synth);

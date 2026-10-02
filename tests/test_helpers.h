@@ -39,6 +39,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     bool running = true;
     bool close_on_failed_send = false;
     u32 send_submit_attempts = 0;
+    bool fail_next_recv_submit = false;
+    bool fail_next_upstream_recv_submit = false;
 
     static constexpr u32 kMaxConns = 64;
     static constexpr u32 kBufSize = 4096;  // test buffer size per direction
@@ -109,6 +111,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         running = true;
         close_on_failed_send = false;
         send_submit_attempts = 0;
+        fail_next_recv_submit = false;
+        fail_next_upstream_recv_submit = false;
         draining = false;
         access_log = nullptr;
         live_access_log = nullptr;
@@ -170,7 +174,13 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         c.reset();
         free_stack[free_top++] = cid;
     }
-    bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
+    bool submit_recv_impl(Connection& c) {
+        if (fail_next_recv_submit) {
+            fail_next_recv_submit = false;
+            return false;
+        }
+        return backend.add_recv(c.fd, c.id);
+    }
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         send_submit_attempts++;
         const bool submitted = backend.add_send(c.fd, c.id, buf, len);
@@ -181,6 +191,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         return backend.add_send_upstream(c.upstream_fd, c.id, buf, len, c.upstream_episode);
     }
     bool submit_recv_upstream_impl(Connection& c) {
+        if (fail_next_upstream_recv_submit) {
+            fail_next_upstream_recv_submit = false;
+            return false;
+        }
         return backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
     }
     bool pause_recv(Connection& c) {

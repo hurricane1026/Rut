@@ -76328,6 +76328,31 @@ TEST(request_body_overflow, lossy_successor_final_send_keeps_recv_paused) {
     CHECK(c->recv_armed);
 }
 
+TEST(request_body_overflow, continue_request_body_downstream_recv_submit_failure_closes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    loop.fail_next_recv_submit = true;
+    loop.backend.clear_ops();
+    continue_request_body(&loop, *c, 0);
+    CHECK_LT(c->fd, 0);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
+}
+
+TEST(request_body_overflow, continue_request_body_upstream_recv_submit_failure_closes) {
+    SmallLoop loop;
+    loop.setup();
+    auto* c = setup_body_streaming_proxy(loop, 200, 10);
+    REQUIRE(c != nullptr);
+    loop.fail_next_upstream_recv_submit = true;
+    loop.backend.clear_ops();
+    continue_request_body(&loop, *c, 0);
+    CHECK_LT(c->fd, 0);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 1u);
+}
+
+#ifdef __linux__
 TEST(request_body_overflow, lossy_successor_final_send_does_not_rearm_during_pause_cqes) {
     for (const bool cancel_first : {false, true}) {
         RawDownstreamRecvBatch fixture;
@@ -76378,6 +76403,7 @@ TEST(request_body_overflow, lossy_successor_final_send_does_not_rearm_during_pau
         close(upstream[1]);
     }
 }
+#endif
 
 TEST(request_body_overflow, abandoned_upload_pause_failure_closes_async) {
     AsyncSmallLoop loop;
@@ -76392,6 +76418,94 @@ TEST(request_body_overflow, abandoned_upload_pause_failure_closes_async) {
     loop.fail_pause_recv = true;
     loop.handle_unhandled_recv(*c, make_ev(c->id, IoEventType::Recv, -ENOBUFS));
     CHECK_LT(c->fd, 0);
+}
+
+TEST(request_body_overflow, connect_owner_pause_failure_closes_async) {
+    AsyncSmallLoop loop;
+    loop.setup();
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = dup(STDERR_FILENO);
+    c->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE_GE(c->fd, 0);
+    REQUIRE_GE(c->upstream_fd, 0);
+    static constexpr char kRequests[] =
+        "GET /first HTTP/1.1\r\nHost: x\r\n\r\nGET /next HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequests), sizeof(kRequests) - 1),
+               sizeof(kRequests) - 1);
+    capture_request_metadata(*c);
+    c->state = ConnState::Proxying;
+    c->upstream_connect_armed = true;
+    c->recv_armed = true;
+    c->pending_ops = 2;
+    c->on_upstream_send = &on_upstream_connected<AsyncSmallLoop>;
+    loop.fail_pause_recv = true;
+
+    respond_request_body_overflow(&loop, *c);
+
+    CHECK_LT(c->fd, 0);
+}
+
+#ifdef __linux__
+TEST(request_body_overflow, iouring_connect_owner_http10_cl_boundary_refresh) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2] = {-1, -1};
+    i32 upstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    downstream[0] = -1;
+    upstream[0] = -1;
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    static constexpr char kPartial[] = "POST / HTTP/1.0\r\nContent-Length: 4\r\n\r\nDA";
+    static constexpr char kTail[] = "TA\r\nGET /next HTTP/1.0\r\n\r\n";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kPartial), sizeof(kPartial) - 1),
+               sizeof(kPartial) - 1);
+    capture_request_metadata(*c);
+    CHECK_EQ(c->req_http_version, static_cast<u8>(HttpVersion::Http10));
+    CHECK_EQ(c->req_body_mode, BodyMode::ContentLength);
+    const u32 partial_len = c->req_initial_send_len;
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kTail), sizeof(kTail) - 1),
+               sizeof(kTail) - 1);
+    c->state = ConnState::Proxying;
+    c->upstream_connect_armed = true;
+    c->recv_armed = true;
+    c->pending_ops = 2;
+    c->on_upstream_send = &on_upstream_connected<IoUringEventLoop>;
+    c->upstream_episode = 1;
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0});
+    CHECK_GE(c->fd, 0);
+    CHECK_FALSE(c->req_body_overflow_rejected);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_GT(c->req_initial_send_len, partial_len);
+    CHECK_EQ(c->req_initial_send_len, sizeof(kPartial) - 1 + 2);
+    CHECK_EQ(c->recv_buf.len() - c->req_initial_send_len, sizeof(kTail) - 3);
+    CHECK(c->recv_paused_for_send);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    CHECK_EQ(c->pending_ops, 3u);
+    const u32 cancel_sqe_count = loop->backend.pending;
+    const u32 connect_boundary = c->req_initial_send_len;
+    loop->dispatch({c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0});
+    CHECK_EQ(c->pending_ops, 3u);
+    CHECK_EQ(loop->backend.pending, cancel_sqe_count);
+    CHECK_EQ(c->req_initial_send_len, connect_boundary);
+    CHECK(c->recv_pause_cancel_pending);
+    CHECK(c->recv_pause_target_inflight);
+    c->upstream_connect_armed = false;
+    loop->dispatch({c->id, 0, 0, 0, IoEventType::UpstreamConnect, 0, 0, c->upstream_episode});
+    CHECK_EQ(c->on_upstream_send, &on_upstream_request_sent<IoUringEventLoop>);
+    CHECK_EQ(loop->backend.upstream_send_state[c->id].remaining, connect_boundary);
+    CHECK(__builtin_memcmp(loop->backend.upstream_send_state[c->id].src,
+                           c->recv_buf.data(),
+                           connect_boundary) == 0);
+    close(downstream[1]);
+    close(upstream[1]);
 }
 
 TEST(request_body_overflow, iouring_connect_owner_partial_chunked_refresh) {
@@ -76497,6 +76611,7 @@ TEST(request_body_overflow, iouring_connect_owner_partial_chunked_rejects_bad_su
         close(upstream[1]);
     }
 }
+#endif
 
 TEST(request_body_overflow, intermediate_cl_suffix_shorter_than_remaining_rejects) {
     SmallLoop loop;
