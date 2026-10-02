@@ -7191,7 +7191,7 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
         conn.recv_armed = true;
         conn.pending_ops = 1;
-        conn.tls_pending_on_recv = &on_request_body_recvd<TlsIouringHarness>;
+        CHECK_EQ(conn.tls_pending_on_recv, nullptr);
         const char body[] = "DATA";
         REQUIRE_EQ(SSL_write(cl.ssl, body, static_cast<int>(body_len)), static_cast<int>(body_len));
         u8 ciphertext[4096];
@@ -7218,11 +7218,15 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
             CHECK_FALSE(conn.req_body_overflow_rejected);
             CHECK_EQ(conn.req_body_remaining, 0u);
             CHECK(conn.upstream_send_armed);
-            CHECK_EQ(loop.backend.ops[loop.backend.op_count - 1].type, MockOp::Send);
-            CHECK_EQ(loop.backend.ops[loop.backend.op_count - 1].send_len, 4u);
-            CHECK(memcmp(loop.backend.ops[loop.backend.op_count - 1].send_buf, "DATA", 4) == 0);
+            CHECK_EQ(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].type,
+                     MockOp::Send);
+            CHECK_EQ(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].send_len,
+                     4u);
+            CHECK(memcmp(loop.SmallLoop::backend.ops[loop.SmallLoop::backend.op_count - 1].send_buf,
+                         "DATA",
+                         4) == 0);
             CHECK(conn.recv_paused_for_send);
-            CHECK_FALSE(conn.recv_armed);
+            CHECK(loop.recv_paused);
         } else {
             CHECK_FALSE(conn.req_body_lossy_successor);
             CHECK(conn.req_body_overflow_rejected);
