@@ -15,12 +15,12 @@ import tempfile
 import time
 
 
-def check_startup(server, source, explicit, environment=None):
+def check_startup(server, source, explicit, environment=None, preexec_fn=None):
     command = [str(server.resolve())]
     command += ["--compile", str(source)] if explicit else [str(source)]
     command += ["--shards", "1", "--no-pin", "--drain", "0"]
     process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                               env=environment)
+                               env=environment, preexec_fn=preexec_fn)
     diagnostic = b""
     ready = None
     try:
@@ -64,7 +64,8 @@ def check_startup(server, source, explicit, environment=None):
             process.wait()
 
 
-def check_startup_cancellation(server, source, header, image, signal_name, mode, root):
+def check_startup_cancellation(server, source, header, image, signal_name, mode, root,
+                               grandchild=False):
     """Terminate startup while the compiler is blocked at each pipe boundary."""
     pid_file = root / f"producer-{signal_name}-{mode}.pid"
     helper = root / "rut-compile"
@@ -72,11 +73,13 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
     write = "" if mode == "header" else (
         f"sys.stdout.buffer.write(bytes.fromhex({frame.hex()!r}));sys.stdout.flush()\n")
     close = "os.close(1)\n" if mode == "eof" else ""
-    marker = (f"tmp={str(pid_file)!r}+'.tmp';open(tmp,'w').write(str(os.getpid()));"
+    child_setup = ("grand=os.fork();\nif grand==0: time.sleep(30)\n" if grandchild else
+                   "grand=0\n")
+    marker = (f"tmp={str(pid_file)!r}+'.tmp';open(tmp,'w').write(str(os.getpid())+','+str(grand));"
               f"os.replace(tmp,{str(pid_file)!r})\n")
     helper.write_text(
         f"#!{sys.executable}\nimport os,sys,time\n"
-        f"{write}{close}{marker}time.sleep(30)\n")
+        f"{write}{close}{child_setup}{marker}time.sleep(30)\n")
     helper.chmod(0o700)
     process = subprocess.Popen(
         [str(server), "--compile", str(source), "--shards", "1", "--no-pin"],
@@ -86,17 +89,20 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
         while time.monotonic() < deadline and not pid_file.exists():
             time.sleep(0.01)
         assert pid_file.exists(), f"producer did not start: {mode}"
-        producer_pid = int(pid_file.read_text())
+        producer_pid, grandchild_pid = map(int, pid_file.read_text().split(','))
         os.kill(process.pid, getattr(signal, signal_name))
         process.wait(timeout=3)
         diagnostic = process.stderr.read().decode()
         assert process.returncode != 0 and "startup cancelled" in diagnostic, diagnostic
-        try:
-            os.kill(producer_pid, 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise AssertionError((mode, producer_pid))
+        for dead_pid in (producer_pid, grandchild_pid):
+            if not dead_pid:
+                continue
+            try:
+                os.kill(dead_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise AssertionError((mode, dead_pid))
         print(json.dumps({"case": f"{signal_name} during {mode}", "producer_reaped": True}))
     finally:
         if process.poll() is None:
@@ -120,6 +126,9 @@ def main():
             source.write_text('listen 127.0.0.1:0\n'
                               'route GET "/" { return response(200, body: "native") }\n')
             check_startup(args.server, source, explicit)
+        if sys.platform != "win32":
+            check_startup(args.server, source, True, preexec_fn=lambda: signal.signal(signal.SIGCHLD, signal.SIG_IGN))
+            check_startup(args.server, source, True, preexec_fn=lambda: (os.close(0), os.close(1)))
         source.write_text('listen 127.0.0.1:0\n'
                           'route GET "/" { return response(200, body: "native") }\n')
         check_startup(args.server, source, True, {})
@@ -141,6 +150,8 @@ def main():
                 source.write_text('route GET "/" { return 200 }\n')
                 check_startup_cancellation(
                     server, source, header, image, signal_name, mode, root)
+            check_startup_cancellation(
+                server, source, header, image, signal_name, "header", root, grandchild=True)
         cases = (
             ("mismatched build", wrong, b"", 30, "build mismatch"),
             ("truncated image", header, image[:16], 0, "truncated compiler artifact"),
