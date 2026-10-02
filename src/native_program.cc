@@ -389,7 +389,8 @@ bool load_native_program(
             return fail("invalid native relocation");
         const void* ptr =
             r.blob_offset ? bytes + r.blob_offset : reinterpret_cast<u8*>(&c) + r.config_offset;
-        memcpy(reinterpret_cast<u8*>(&c) + r.field, static_cast<const void*>(&ptr), sizeof(ptr));
+        memcpy(
+            reinterpret_cast<u8*>(&c) + r.field, reinterpret_cast<const void*>(&ptr), sizeof(ptr));
     }
     for (u32 i = 0; i < h.symbol_count; i++) {
         const auto& s = symbols[i];
@@ -397,7 +398,7 @@ bool load_native_program(
             return fail("invalid native symbol");
         void* fn = dlsym(out.library, s.name);
         if (!fn) return fail("missing native handler symbol");
-        memcpy(reinterpret_cast<u8*>(&c) + s.field, static_cast<const void*>(&fn), sizeof(fn));
+        memcpy(reinterpret_cast<u8*>(&c) + s.field, reinterpret_cast<const void*>(&fn), sizeof(fn));
     }
     if (!out.arena.init(4096)) return fail("cannot allocate native program arena");
     out.regex_handles = out.arena.alloc_array<void*>(h.regex_count);
