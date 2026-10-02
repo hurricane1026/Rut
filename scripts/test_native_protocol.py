@@ -24,8 +24,11 @@ def wait_dead(pid, timeout=2):
             return "gone"
         if sys.platform.startswith("linux"):
             stat = Path(f"/proc/{pid}/stat")
-            if stat.exists() and stat.read_text().split()[2] == "Z":
-                return "zombie"
+            try:
+                if stat.read_text().split()[2] == "Z":
+                    return "zombie"
+            except FileNotFoundError:
+                return "gone"
         time.sleep(0.01)
     raise AssertionError(("still alive", pid))
 
@@ -115,8 +118,10 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
         diagnostic = process.stderr.read().decode()
         assert process.returncode != 0 and "startup cancelled" in diagnostic, (process.returncode, diagnostic)
         states = {"producer": wait_dead(producer_pid)}
+        producer_pid = 0
         if grandchild:
             states["grandchild"] = wait_dead(grandchild_pid)
+            grandchild_pid = 0
         print(json.dumps({"case": f"{signal_name} during {mode}{suffix}", **states}))
     finally:
         if process.poll() is None:

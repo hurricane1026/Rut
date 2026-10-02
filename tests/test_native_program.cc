@@ -286,6 +286,11 @@ TEST(native_program, preserves_sigchld_disposition) {
     REQUIRE(source.append("route GET \"/\" { return 200 }\n"));
     Source bad;
     REQUIRE(bad.append("route GET \"/\" { broken\n"));
+#ifdef SA_NOCLDWAIT
+    constexpr int kSaNoClDWait = SA_NOCLDWAIT;
+#else
+    constexpr int kSaNoClDWait = 0;
+#endif
     void (*const dispositions[])(int) = {
         SIG_IGN,
 #ifdef SA_NOCLDWAIT
@@ -309,14 +314,12 @@ TEST(native_program, preserves_sigchld_disposition) {
         struct sigaction observed{};
         REQUIRE_EQ(sigaction(SIGCHLD, nullptr, &observed), 0);
         CHECK_EQ(observed.sa_handler, requested.sa_handler);
-        CHECK_EQ(observed.sa_flags & static_cast<int>(SA_NOCLDWAIT),
-                 requested.sa_flags & static_cast<int>(SA_NOCLDWAIT));
+        CHECK_EQ(observed.sa_flags & kSaNoClDWait, requested.sa_flags & kSaNoClDWait);
         owner.p->destroy();
         CHECK_FALSE(load_native_program(bad.path, *owner.p, error, sizeof(error)));
         REQUIRE_EQ(sigaction(SIGCHLD, nullptr, &observed), 0);
         CHECK_EQ(observed.sa_handler, requested.sa_handler);
-        CHECK_EQ(observed.sa_flags & static_cast<int>(SA_NOCLDWAIT),
-                 requested.sa_flags & static_cast<int>(SA_NOCLDWAIT));
+        CHECK_EQ(observed.sa_flags & kSaNoClDWait, requested.sa_flags & kSaNoClDWait);
     }
 }
 
