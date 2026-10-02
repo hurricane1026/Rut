@@ -6914,6 +6914,12 @@ struct TlsIouringHarness : SmallLoop {
         return true;
     }
 
+    bool submit_send_upstream(Connection& conn, const u8* buf, u32 len) {
+        const bool submitted = SmallLoop::submit_send_upstream_impl(conn, buf, len);
+        if (submitted) conn.upstream_send_armed = true;
+        return submitted;
+    }
+
     // Keep the raw ciphertext target under test control. TLS tests explicitly
     // drive the final drain callback rather than relying on a kernel CQE.
     bool submit_tls_ciphertext_send(Connection& conn, const u8* buf, u32 len) {
@@ -7179,6 +7185,8 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         conn.upstream_fd = 43;
         conn.req_body_mode = BodyMode::ContentLength;
         conn.req_body_remaining = 4;
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("prev"), 4), 4u);
+        conn.req_initial_send_len = 4;
         conn.upstream_send_armed = true;
         conn.on_upstream_send = &on_request_body_sent<TlsIouringHarness>;
         conn.recv_armed = true;
@@ -7200,32 +7208,30 @@ TEST(tls_iouring, encrypted_body_prefix_is_classified_after_tls_body_progress) {
         tls_recv<TlsIouringHarness>(
             &loop, conn, {conn.id, -ENOBUFS, 0, 0, IoEventType::Recv, 1, 0, 0});
         CHECK(conn.tls_recv_overflow_pending);
-        // The actual TLS engine consumes the saved current-body record before
-        // the overflow classifier runs.  The tail byte represents the
-        // successor prefix that the overflowing CQE lost.
-        tls_engine_set_input(conn.tls_engine, conn.tls_in_buf.data(), conn.tls_in_buf.len());
-        TlsOp tls_status = TlsOp::Ok;
-        u8 plaintext[32];
-        const i32 plaintext_len =
-            tls_engine_read(conn.tls_engine, plaintext, sizeof(plaintext), tls_status);
-        REQUIRE_EQ(plaintext_len, static_cast<i32>(body_len));
-        conn.tls_in_buf.consume(tls_engine_input_consumed(conn.tls_engine));
-        REQUIRE_EQ(conn.recv_buf.write(plaintext, static_cast<u32>(plaintext_len)), body_len);
-        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>("N"), 1), 1u);
-        conn.req_body_remaining -= body_len;
-        conn.req_initial_send_len = body_len;
-        conn.tls_recv_overflow_pending = false;
-        conn.tls_recv_overflow_prefix_len = 0;
-        respond_request_body_overflow<TlsIouringHarness>(&loop, conn);
+        // Model the upstream body-send CQE that opens continue_request_body;
+        // its send slot is no longer armed when the buffered TLS prefix runs.
+        conn.upstream_send_armed = false;
+        on_request_body_sent<TlsIouringHarness>(
+            &loop, conn, {conn.id, 4, 0, 0, IoEventType::UpstreamSend, 0});
         if (body_len == 4) {
             CHECK(conn.req_body_lossy_successor);
             CHECK_FALSE(conn.req_body_overflow_rejected);
+            CHECK_EQ(conn.req_body_remaining, 0u);
+            CHECK(conn.upstream_send_armed);
+            CHECK_EQ(loop.backend.ops[loop.backend.op_count - 1].type, MockOp::Send);
+            CHECK_EQ(loop.backend.ops[loop.backend.op_count - 1].send_len, 4u);
+            CHECK(memcmp(loop.backend.ops[loop.backend.op_count - 1].send_buf, "DATA", 4) == 0);
+            CHECK(conn.recv_paused_for_send);
+            CHECK_FALSE(conn.recv_armed);
         } else {
             CHECK_FALSE(conn.req_body_lossy_successor);
             CHECK(conn.req_body_overflow_rejected);
+            CHECK_EQ(conn.req_body_remaining, 2u);
+            CHECK(loop.closed);
         }
-        conn.tls_in_buf.reset();  // discard the saved incomplete successor record
         CHECK_EQ(conn.tls_in_buf.len(), 0u);
+        CHECK_FALSE(conn.tls_recv_overflow_pending);
+        CHECK_EQ(conn.tls_recv_overflow_prefix_len, 0u);
         tls_engine_free(conn.tls_engine);
         cl.destroy();
     }
