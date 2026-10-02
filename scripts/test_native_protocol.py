@@ -93,7 +93,7 @@ def check_startup_cancellation(server, source, header, image, signal_name, mode,
         os.kill(process.pid, getattr(signal, signal_name))
         process.wait(timeout=3)
         diagnostic = process.stderr.read().decode()
-        assert process.returncode != 0 and "startup cancelled" in diagnostic, diagnostic
+        assert process.returncode != 0 and "startup cancelled" in diagnostic, (process.returncode, diagnostic)
         for dead_pid in (producer_pid, grandchild_pid):
             if not dead_pid:
                 continue
