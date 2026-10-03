@@ -19,7 +19,7 @@ A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 ```swift
 // PR #184 adds standalone examples; no tokenBucket helper is importable yet.
 import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
-// Imports nest at most 8 levels deep (main → a → …, kMaxImportNestingDepth);
+// Imports nest at most 2 levels deep (main → a → b, kMaxImportNestingDepth);
 // a deeper chain is a compile error at the offending `import`, never a crash.
 
 listen :8080                      // one cleartext IPv4 wildcard listener

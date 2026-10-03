@@ -2846,7 +2846,7 @@ Rules:
 - `using name = module.symbol` creates an alias
 - `using` is only for alias/import syntax; it must not be reused for protocol conformance
 - Circular imports are a compile error
-- Import nesting is limited to 8 levels below the main file; a deeper `import` is a compile error at that `import` statement. The bound keeps nested analysis within the default 8 MiB thread stack after the analyzer scratch storage was moved out of recursive frames.
+- Import nesting is limited to 2 levels below the main file; a deeper `import` is a compile error at that `import` statement. Analyzer frames fit the default 8 MiB thread stack after scratch storage was moved out, but each active level retains a fixed-capacity `HirModule` (about 126 MiB in the current 64-bit layout). The main file plus two imported modules retain about 377 MiB of HIR alone; nine modules at depth 8 would retain about 1.1 GiB before AST, source, and other temporary storage. Keep the conservative bound until route storage is made lazy.
 - Importing a symbol that doesn't exist is a compile error
 - Duplicate imports of the same file are silently deduplicated
 - Relative `import` is resolved from the importing file path
