@@ -1232,7 +1232,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         // connection-owned mutation log while deciding whether pre-route must
         // fence this method before the legacy prepared-forward 503.
         ParsedRequest pending_req;
-        if (h2_headers_to_request(headers, nheaders, &pending_req)) {
+        const bool pending_headers_valid = h2_headers_to_request(headers, nheaders, &pending_req);
+        if (pending_headers_valid) {
             const u8 pending_method_key = route_method_key(pending_req.method);
             if (config != nullptr && config->pre_route_policy_id(pending_method_key) != 0) {
                 d.close_after_process = true;
@@ -1245,6 +1246,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             d.close_after_process = true;
             d.resp_len = 0;
             d.overflow = false;
+            return;
+        }
+        if (pending_req.target_has_fragment) {
+            h2_emit_status(d, stream_id, 400);
             return;
         }
         h2_emit_status(d, stream_id, 503);
@@ -1271,6 +1276,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
+        return;
+    }
+    if (req.target_has_fragment) {
+        h2_emit_status(d, stream_id, 400);
         return;
     }
     if (end_stream && req.has_content_length && req.content_length != 0) {
