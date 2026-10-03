@@ -20926,6 +20926,73 @@ static Connection* dispatch_unmatched_request(SmallLoop& loop,
     return conn;
 }
 
+TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(config.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
+    pre_route_root_handler_calls = 0;
+    const char* requests[] = {
+        "CONNECT / HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT /admin?x=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT //example.test:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT / HTTP/1.0\r\n\r\n",
+        "CONNECT / HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
+    };
+    for (const char* request : requests) {
+        loop.backend.clear_ops();
+        auto* conn = dispatch_unmatched_request(loop, config, request);
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_FALSE(conn->keep_alive);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_EQ(conn->upstream_attempts, 0u);
+        CHECK_EQ(pre_route_root_handler_calls, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        loop.inject_and_dispatch(
+            make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
+    RouteConfig proxy{};
+    REQUIRE(proxy.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(proxy.add_proxy("/", kRouteMethodAny, 0));
+    loop.backend.clear_ops();
+    auto* proxied = dispatch_unmatched_request(loop, proxy, requests[0]);
+    REQUIRE(proxied != nullptr);
+    CHECK_EQ(proxied->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.close_conn(*proxied);
+    RouteConfig local{};
+    REQUIRE(local.add_static("/", kRouteMethodAny, 204));
+    auto* rejected = dispatch_unmatched_request(loop, local, requests[0]);
+    REQUIRE(rejected != nullptr);
+    CHECK_EQ(rejected->resp_status, 400u);
+    loop.close_conn(*rejected);
+    auto* trace = dispatch_unmatched_request(loop, local, "TRACE / HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(trace != nullptr);
+    CHECK_EQ(trace->resp_status, 204u);
+    loop.close_conn(*trace);
+    auto* authority = dispatch_unmatched_request(
+        loop, local, "CONNECT example.test:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(authority != nullptr);
+    CHECK_NE(authority->resp_status, 204u);
+    CHECK_EQ(pre_route_root_handler_calls, 0u);
+    loop.close_conn(*authority);
+    loop.backend.fail_send = true;
+    const RouteConfig* active = &local;
+    loop.config_ptr = &active;
+    rejected = loop.alloc_conn();
+    REQUIRE(rejected != nullptr);
+    rejected->fd = 42;
+    const u32 len = static_cast<u32>(strlen(requests[0]));
+    REQUIRE_EQ(rejected->recv_buf.write(reinterpret_cast<const u8*>(requests[0]), len), len);
+    on_header_received<SmallLoop>(
+        &loop, *rejected, make_ev(rejected->id, IoEventType::Recv, static_cast<i32>(len)));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+}
+
 TEST(request_admission, fragment_rejected_before_handler_or_upstream) {
     SmallLoop loop;
     loop.setup();
@@ -20996,6 +21063,70 @@ TEST(request_admission, fragment_rejected_before_handler_or_upstream) {
     REQUIRE(encoded != nullptr);
     CHECK_EQ(encoded->resp_status, 204u);
     loop.close_conn(*encoded);
+}
+
+TEST(request_admission, h2_origin_connect_rejected_and_pending_owner_preserved) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
+    pre_route_root_handler_calls = 0;
+    for (u32 mode = 0; mode != 3; ++mode) {
+        const u32 pending = mode == 1 ? 1 : 0;
+        if (mode == 2) REQUIRE(install_representation200_exact(config, "/"));
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        h2.pending_prepared_forward = pending != 0;
+        h2.pending_stream = pending ? 1 : 0;
+        h2.pending_synth[0] = 0xA5;
+        h2.pending_synth_len = pending;
+        conn->h2 = &h2;
+        conn->request_config = &config;
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"CONNECT", 7}},
+            {{":scheme", 7}, {"https", 5}},
+            {{":authority", 10}, {"example.test", 12}},
+            {{":path", 5}, {"/", 1}},
+        };
+        u8 response[512]{};
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+        loop.backend.clear_ops();
+        h2_on_headers_cb<SmallLoop>(&dispatch, h2, 3, headers, 4, true);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(pre_route_root_handler_calls, 0u);
+        CHECK_EQ(h2.pending_prepared_forward, pending != 0);
+        CHECK_EQ(h2.pending_stream, pending ? 1u : 0u);
+        CHECK_EQ(h2.pending_synth[0], static_cast<u8>(0xA5));
+        if (mode == 2) {
+            CHECK_EQ(dispatch.resp_len, 0u);
+            CHECK(dispatch.close_after_process);
+            loop.close_conn(*conn);
+            continue;
+        }
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &frame), ParseStatus::Complete);
+        CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+        CHECK((frame.flags & http2_flag::kEndStream) != 0);
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header fields[8];
+        u8 scratch[512]{};
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoded,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           fields,
+                                           8,
+                                           &count));
+        REQUIRE_EQ(count, 1u);
+        CHECK(fields[0].name.eq(lit_str(":status")));
+        CHECK(fields[0].value.eq(lit_str("400")));
+        loop.close_conn(*conn);
+    }
 }
 
 TEST(request_admission, h2_fragment_rejected_before_handler_or_upstream) {
