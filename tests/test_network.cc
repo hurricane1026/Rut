@@ -20926,6 +20926,165 @@ static Connection* dispatch_unmatched_request(SmallLoop& loop,
     return conn;
 }
 
+TEST(request_admission, fragment_rejected_before_handler_or_upstream) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(config.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
+    const char* requests[] = {
+        "GET /admin#frag HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /admin?x=1#frag HTTP/1.1\r\nHost: x\r\n\r\n",
+        "HEAD /admin# HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST /admin#frag HTTP/1.0\r\nContent-Length: 4\r\n\r\nbody",
+    };
+    pre_route_root_handler_calls = 0;
+    for (const char* request : requests) {
+        loop.backend.clear_ops();
+        Connection* conn = dispatch_unmatched_request(loop, config, request);
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK_FALSE(conn->keep_alive);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_EQ(conn->upstream_attempts, 0u);
+        CHECK_EQ(pre_route_root_handler_calls, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                           conn->send_buf.len(),
+                           "400 Bad Request",
+                           15));
+        loop.inject_and_dispatch(
+            make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
+
+    RouteConfig local{};
+    REQUIRE(local.add_static("/admin", kRouteMethodGet, 204));
+    Connection* rejected = dispatch_unmatched_request(loop, local, requests[0]);
+    REQUIRE(rejected != nullptr);
+    CHECK_EQ(rejected->resp_status, 400u);
+    loop.close_conn(*rejected);
+    RouteConfig fallback{};
+    rejected = dispatch_unmatched_request(loop, fallback, requests[0]);
+    REQUIRE(rejected != nullptr);
+    CHECK_EQ(rejected->resp_status, 400u);
+    loop.close_conn(*rejected);
+
+    // Encoded '#' is legal data; a query-only encoded delimiter must not
+    // prevent the normal local route from being selected.
+    Connection* encoded =
+        dispatch_unmatched_request(loop, local, "GET /admin?x=%23frag HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(encoded != nullptr);
+    CHECK_EQ(encoded->resp_status, 204u);
+    loop.close_conn(*encoded);
+}
+
+TEST(request_admission, h2_fragment_rejected_before_handler_or_upstream) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_static("/admin", kRouteMethodGet, 204));
+    REQUIRE(config.add_jit_handler("/forward", kRouteMethodAny, &pre_route_root_handler, false));
+    pre_route_root_handler_calls = 0;
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    const char* targets[] = {"/forward#frag", "/forward?x=1#frag", "/admin?x=%23frag"};
+    for (const char* target : targets) {
+        Connection* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        Http2Conn h2{};
+        h2.init();
+        conn->h2 = &h2;
+        conn->request_config = &config;
+        const hpack::Header headers[] = {
+            {{":method", 7}, {"GET", 3}},
+            {{":scheme", 7}, {"https", 5}},
+            {{":authority", 10}, {"example.test", 12}},
+            {{":path", 5}, {target, static_cast<u32>(strlen(target))}},
+        };
+        u8 response[512]{};
+        H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+        loop.backend.clear_ops();
+        h2_on_headers_cb<SmallLoop>(&dispatch, h2, 1, headers, 4, true);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(pre_route_root_handler_calls, 0u);
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &frame), ParseStatus::Complete);
+        CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Headers));
+        CHECK((frame.flags & http2_flag::kEndStream) != 0);
+        hpack::DynamicTable decoded;
+        decoded.init(kDefaultHeaderTableSize);
+        hpack::Header fields[8];
+        u8 scratch[512]{};
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(decoded,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           fields,
+                                           8,
+                                           &count));
+        bool saw_status = false;
+        for (u32 i = 0; i < count; i++) {
+            if (fields[i].name.eq(lit_str(":status"))) {
+                saw_status = true;
+                CHECK(fields[i].value.eq(lit_str(target == targets[2] ? "204" : "400")));
+            }
+        }
+        CHECK(saw_status);
+        loop.close_conn(*conn);
+    }
+}
+
+TEST(request_admission, fragmented_and_pipelined_fragment_targets_close) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_static("/admin", kRouteMethodGet, 204));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const char prefix[] = "GET /admin?x=1#frag HTTP/1.1\r\nHost: x\r\n";
+    const char suffix[] = "\r\nGET /admin HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(prefix), sizeof(prefix) - 1),
+               sizeof(prefix) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(prefix) - 1));
+    CHECK_EQ(conn->state, ConnState::ReadingHeader);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(suffix), sizeof(suffix) - 1),
+               sizeof(suffix) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(suffix) - 1));
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_FALSE(conn->keep_alive);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+
+    // A fragment in a successor cannot inherit the valid predecessor's
+    // admission; it must produce its own 400 and discard any later request.
+    loop.backend.clear_ops();
+    conn = dispatch_unmatched_request(loop,
+                                      config,
+                                      "GET /admin HTTP/1.1\r\nHost: x\r\n\r\n"
+                                      "GET /admin#frag HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(conn != nullptr);
+    REQUIRE_EQ(conn->resp_status, 204u);
+    loop.config_ptr = &active;
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+}
+
 TEST(unmatched_local_response, exact_any_precedence_matched_wins_and_no_slot_legacy) {
     SmallLoop loop;
     loop.setup();

@@ -1273,6 +1273,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         d.overflow = false;
         return;
     }
+    if (req.target_has_fragment) {
+        h2_emit_status(d, stream_id, 400);
+        return;
+    }
     if (end_stream && req.has_content_length && req.content_length != 0) {
         h2_emit_status(d, stream_id, 400);
         return;

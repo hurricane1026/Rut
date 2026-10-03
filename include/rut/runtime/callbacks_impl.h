@@ -2399,6 +2399,17 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     }
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
+    // The raw target witness covers both path and query. A literal fragment
+    // delimiter is invalid before any route, handler or upstream effect;
+    // percent-encoded %23 remains ordinary request-target data.
+    if (conn.req_target_has_fragment) {
+        conn.resp_status = 400;
+        format_static_response(conn, 400, /*keep_alive=*/false);
+        conn.keep_alive = false;
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        return;
+    }
     if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
         conn.resp_status = 403;
         format_static_response(conn, 403, /*keep_alive=*/false);

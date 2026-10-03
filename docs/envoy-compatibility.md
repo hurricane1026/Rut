@@ -150,55 +150,23 @@ above (Rut forwards where Envoy fails closed, recorded separately from the
 per-request divergence tables because Rut does not merely refuse the
 request): a request target containing a `#` fragment.
 
-**Bug (mis-forward, not fail-closed), `host: .upstream` (ID1/ID2/ID3)
-only — historical, still current for these policies:** for an origin-form
-target such as `GET /admin#frag HTTP/1.1`, Envoy rejects the request. The
-accepted HCM shape here cannot set `strip_fragment_from_path` (the milestone
-parser does not expose that field at all) and its default is `false`
-(`envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.strip_fragment_from_path`);
-with fragment stripping off, Envoy's universal header validator rejects the
-`#` in the `:path` pseudo-header (`kPathHeaderCharTableWithAdditionalCharacters`
-explicitly excludes `?`/`#`,
-`source/extensions/http/header_validators/envoy_default/http1_header_validator.cc`),
-so the request never reaches an upstream. Rut instead records the fragment
-(`HttpParser::parse` sets `target_has_fragment`, `src/runtime/http_parser.cc`)
-and canonicalizes the *routing* path at the `#` (`finalize_path_canonical`),
-but `apply_request_policy` — the function that builds the forwarded request
-line for `forward(..., request_policy: {...})` with `host: .upstream`
-(`include/rut/runtime/callbacks_impl.h`) — copies the parser's raw
-`req.path` (which still includes everything after the `#`) verbatim and
-never consults `target_has_fragment`, so the request is forwarded to the
-upstream with the fragment intact. Live observation on
-`envoy/lower-increment-2` (head `ca7f0dce`) with a `route "/" { return
-forward(backend, request_policy: { host: .upstream, ... }) }` route:
-`GET /admin#frag HTTP/1.1` got a real `200 OK` from the origin, and the
-origin received `GET /admin#frag HTTP/1.1\r\nHost:
-127.0.0.1:29011\r\n\r\n` — the fragment reached the upstream unchanged. This
-remains a runtime bug in `apply_request_policy` for every `host: .upstream`
-policy (ID1/ID2/ID3) today, not something the converter can gate around
-(a route emitting one of these policies is any-method/any-path by
-construction, and the runtime forwards the fragment regardless of which
-capabilities the converter has enabled).
+**Fixed by request admission (#709):** HTTP/1 requests and HTTP/2 `:path`
+values containing a literal `#`, including after a query delimiter, are rejected
+before ordinary route matching, handler invocation or upstream contact. HTTP/1
+returns a generic `400 Bad Request` and closes the connection; HTTP/2 returns a
+status-only 400 for the stream. Existing exact/pre-route strict policy fences
+retain their zero-byte fail-closed behavior. Percent-encoded `%23` remains legal
+request-target data.
 
-**Fixed for `host: .preserve` (ID4 `Http11PreserveHostLowercase`) on this
-branch (`envoy/rut-request-envoy-h1`):** `apply_preserve_host_lowercase_
-request_policy` (`include/rut/runtime/callbacks_impl.h:5934`) checks
-`req.target_has_fragment` immediately after parsing and fails the whole
-request closed (`400 Bad Request`, no upstream contact) rather than copying
-the raw fragment-bearing path through -- the same defect described above,
-fixed for exactly the policy this milestone's converter now emits
-(`put_forward_route`, `helpers/envoy/converter.cc`, unconditionally selects ID4
-once `validate()` clears every capability gate; `kShippedRutCapabilities` is
-now all true, so the shipped CLI reaches this code path for the milestone-S
-bootstrap -- see the `TE: trailers` row above). This is
-not byte-identical to Envoy's own rejection (Envoy's header validator
-rejects the request differently, and Rut's is a generic `400`), but it is a
-fail-closed refusal instead of a mis-forward, matching the behavioral class
-Envoy exhibits for this shape. Unit-tested directly (`request_policy.
-preserve_host_lowercase_wire_and_fail_closed_host`, `tests/test_network.cc`:
-`GET /smoke#admin HTTP/1.1` via `apply_request_policy(conn, endpoint,
-kPreserveHost)` returns `false` with no bytes written); no live Envoy/Rut
-differential run yet for this exact ID4 shape.
+The parser already recorded `target_has_fragment`, but the ordinary HTTP/1
+entry previously allowed `host: .upstream` policies to copy the raw target
+verbatim. ID4 (`Http11PreserveHostLowercase`) had its own policy-level check;
+the shared admission check now also protects transparent forwarding, local
+routes and the no-route fallback. This fixes the refusal-versus-forwarding
+behavior; it does not claim a byte-identical Envoy error response. Focused
+`request_admission` network tests cover HTTP/1 and HTTP/2, fragments in paths
+and queries, fragmented headers, pipelined successors, absence of upstream
+work, close/reclaim, and an encoded-delimiter control.
 
 Per-request divergences found in the PR #692 round-6 review (same
 non-gating rule as round-2/round-3 above; verified by reading Envoy v1.39.1
