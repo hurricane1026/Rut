@@ -12873,9 +12873,13 @@ static FrontendResult<void> load_imported_modules(
         const auto normalized =
             (base_dir / str_to_std_string(item.import_decl.path)).lexically_normal().string();
         for (const auto& active_import : import_stack) {
+            // A failed top-level analysis releases the shared imported-source
+            // storage. Keep the cycle detail independent of those source views;
+            // the offending import span is a value and remains safe to return.
             if (active_import == normalized)
-                return frontend_error(
-                    FrontendError::UnsupportedSyntax, item.import_decl.span, item.import_decl.path);
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      item.import_decl.span,
+                                      lit_str("import cycle detected"));
         }
         ImportedModuleInfo* existing_info = nullptr;
         for (u32 ii = 0; ii < out.len; ii++) {

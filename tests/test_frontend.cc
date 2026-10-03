@@ -1414,7 +1414,8 @@ static u64 write_import_chain(const std::string& dir, u32 depth, bool cycle) {
 }
 
 TEST(frontend, nested_import_chain_analyzes_on_default_linux_stack) {
-    const std::string dir = "/tmp/rut_frontend_import_chain_stack";
+    const std::string dir =
+        std::filesystem::temp_directory_path().string() + "/rut_frontend_import_chain_stack";
     write_import_chain(dir, kImportChainDepth, false);
     ImportChainRun run;
     run.main_path = dir + "/main.rut";
@@ -1425,23 +1426,35 @@ TEST(frontend, nested_import_chain_analyzes_on_default_linux_stack) {
 }
 
 TEST(frontend, nested_import_cycle_is_diagnosed_on_default_linux_stack) {
-    // The last file imports m1 again: the cycle is detected at the deepest
-    // level the acyclic chain above reaches, and must surface as a cycle
-    // diagnostic rather than as the depth limit.
-    const std::string dir = "/tmp/rut_frontend_import_cycle_stack";
-    write_import_chain(dir, kImportChainDepth, true);
-    ImportChainRun run;
-    run.main_path = dir + "/main.rut";
-    REQUIRE(run_import_chain_on_bounded_stack(run));
-    CHECK_FALSE(run.analyzed);
-    CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
-    CHECK_EQ(run.imports_analyzed, kImportChainDepth);
+    // Cover a self-cycle and every admitted depth up to the deepest acyclic
+    // chain above: each must surface a cycle diagnostic, not the depth limit.
+    const std::string dir =
+        std::filesystem::temp_directory_path().string() + "/rut_frontend_import_cycle_stack";
+    for (u32 depth = 1; depth <= kImportChainDepth; ++depth) {
+        write_import_chain(dir, depth, true);
+        ImportChainRun run;
+        run.main_path = dir + "/main.rut";
+        // Copy after analyze_file has destroyed failed module/source storage, then
+        // also read the original diagnostic after the analysis thread has exited.
+        run.copy_detail = true;
+        REQUIRE(run_import_chain_on_bounded_stack(run));
+        CHECK_FALSE(run.analyzed);
+        CHECK_EQ(run.error.code, FrontendError::UnsupportedSyntax);
+        CHECK_EQ(run.imports_analyzed, depth);
+        CHECK(run.error.detail.eq(lit("import cycle detected")));
+        CHECK_EQ(run.error_detail, "import cycle detected");
+        CHECK_EQ(run.error.span.line, 2u);
+        CHECK_EQ(run.error.span.col, 1u);
+        CHECK_EQ(run.error.span.start, 1u);
+        CHECK(run.error.span.end > run.error.span.start);
+    }
     std::filesystem::remove_all(dir);
 }
 
 TEST(frontend, nested_import_source_budget_is_diagnosed_on_default_linux_stack) {
     // The budget admits every file but the deepest, so reading it fails.
-    const std::string dir = "/tmp/rut_frontend_import_budget_stack";
+    const std::string dir =
+        std::filesystem::temp_directory_path().string() + "/rut_frontend_import_budget_stack";
     const u64 admitted = write_import_chain(dir, kImportChainDepth, false);
     ImportChainRun run;
     run.main_path = dir + "/main.rut";
@@ -1463,7 +1476,8 @@ TEST(frontend, nested_import_depth_limit_is_diagnosed_not_crashed) {
     // detail and the span of the `import` in m<limit> (line 2, col 1), which
     // stays valid after the failed modules are released.
     static_assert(kMaxImportNestingDepth >= 1);
-    const std::string dir = "/tmp/rut_frontend_import_depth_limit";
+    const std::string dir =
+        std::filesystem::temp_directory_path().string() + "/rut_frontend_import_depth_limit";
     const u64 read_bytes = write_import_chain(dir, kMaxImportNestingDepth + 1, false);
     ImportChainRun run;
     run.main_path = dir + "/main.rut";
