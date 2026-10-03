@@ -1,0 +1,39 @@
+{
+  "code_commit": "60ed148deb0a9214af8c9861a9279f966c8d08aa",
+  "ci_run_repaired": "37105983560",
+  "causes": {
+    "connection_layout": "Connection grew from 3616 to 3648 bytes due to the immutable 32-byte direct-recv target owner; update the explicit layout regression guard",
+    "strict304": "one-shot positive terminal removes live Recv ownership; strict 304 D2 admission must accept an exactly witnessed consumed terminal"
+  },
+  "rejected_local_candidate": "93a97173 broadened the configured-HEAD exact-terminal boolean and would close incomplete fragmented headers; never pushed",
+  "final_scope": "304 shape only; unchanged original configured-HEAD boolean; no additional exact-terminal lookup for ordinary 200/206/body responses",
+  "validation": {
+    "focused_304_terminal_and_incomplete": {
+      "passed": 12,
+      "checks": 314
+    },
+    "full_network": {
+      "passed": 1531,
+      "checks": 348202,
+      "skipped": 0
+    },
+    "full_iouring_idle_trim": {
+      "passed": 29,
+      "checks": 6400,
+      "skipped": 0
+    },
+    "real_pinned_nginx529": {
+      "passed": 1,
+      "total": 1,
+      "seconds": 3.03,
+      "docker_access": "existing docker group via sg docker",
+      "binary": "build-pr-clang/src/rut",
+      "binary_sha256": "b808569642e40c2a09486cfb571b9200e956e43491d69058a25e12583ea5f092",
+      "binary_mtime_utc": "2026-10-03T08:01:46.189602+00:00"
+    },
+    "affected_format": "passed",
+    "diff_check": "passed"
+  },
+  "performance_rerun": false,
+  "benchmark_archive_unchanged_sha256": "a709c8005bb920df7784a88ca178da3fcb04bfc48adc24188aa621e2c7215a57"
+}

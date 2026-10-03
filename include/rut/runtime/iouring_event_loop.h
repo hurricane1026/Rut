@@ -1559,22 +1559,26 @@ public:
 
     // Use the existing separate receive ring so a large buffered origin
     // cannot consume all buffers needed by downstream TLS requests.
-    bool add_response_read_recv(Connection& c) {
-        return backend.add_first_response_recv(
-            c.upstream_fd,
-            c.id,
-            c.upstream_episode,
-            forward_response_buffering_uses_content_length_machinery(
-                c.response_read_deadline_buffering));
+    bool add_response_read_recv(Connection& c, bool direct_buffered_body = false) {
+        if (direct_buffered_body) return arm_response_read_direct_body_recv(c);
+        const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
+            c.response_read_deadline_buffering);
+        // Keep the header/first-body target on the dedicated provided ring.
+        // Direct tail reads begin only after a later body recv's natural
+        // terminal has been authenticated by whole-batch settlement.
+        return backend.add_first_response_recv(c.upstream_fd,
+                                               c.id,
+                                               c.upstream_episode,
+                                               complete_buffering,
+                                               /*one_shot=*/complete_buffering);
     }
 
     // A one-shot recv of the rest of a buffered Content-Length body
     // straight into the chain's tail node, with no provided-buffer copy.
-    // It is only ever armed as the connection's first body recv, never as a
-    // mid-body replacement for a cancelled provided-buffer recv: that switch
-    // dropped the connection when the origin was still sending. Bounded
-    // response buffering is the caller. The recv never reads past the
-    // response, because `len` is capped at the remaining declared body.
+    // It is armed only after the previous one-shot provided-buffer recv has
+    // naturally terminated. The capacity is capped at the response body limit
+    // plus one byte, so a same-CQE Content-Length overrun remains observable
+    // and fail-closed instead of being silently truncated.
     //
     // Deliberately not MSG_WAITALL: settle_response_read_deadline_batch
     // refreshes the inactivity deadline only on a positive recv CQE, so a
@@ -1587,16 +1591,30 @@ public:
             return false;
         const u32 declared = c.response_read_deadline_post_commit_declared_body;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
-        if (received >= declared) return false;
-        const u32 remaining = declared - received;
+        const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
+        if (received >= declared || raw_header_end == 0 ||
+            raw_header_end > 0xFFFFFFFFu - received ||
+            c.buffered_response_len() != raw_header_end + received ||
+            !response_read_deadline_identity_is_stable(c) || c.chain_direct_recv_owner.active ||
+            c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
+            c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
+            c.upstream_recv_terminal_stale || c.upstream_fd < 0 ||
+            !valid_upstream_episode(c.upstream_episode))
+            return false;
         const u32 bulk_after = c.tls_active ? ResponseBodyChain::kBulkAfterTls
                                             : ResponseBodyChain::kBulkAfterPlaintext;
         if (!c.response_body_tail.reserve_tail(pool, bulk_after)) return false;
         const u32 avail = c.response_body_tail.write_avail(pool);
-        if (avail == 0) return false;
-        const u32 len = remaining < avail ? remaining : avail;
+        const u32 body_room = ResponseBodyChain::kMaxBody - received + 1u;
+        const u32 len = avail < body_room ? avail : body_room;
+        if (len == 0) return false;
         u8* dst = c.response_body_tail.write_ptr(pool);
-        return backend.add_recv_upstream_direct(c.upstream_fd, c.id, c.upstream_episode, dst, len);
+        if (!backend.add_recv_upstream_direct(c.upstream_fd, c.id, c.upstream_episode, dst, len))
+            return false;
+        c.chain_direct_recv_owner = {c.response_body_tail.tail, dst, len, c.upstream_episode, true};
+        c.upstream_recv_direct_armed = true;
+        c.upstream_recv_pause_rearm_pending = false;
+        return true;
     }
 
     // Exact one-dispatch witness for a positive terminal upstream Recv.  The
@@ -1750,16 +1768,16 @@ public:
                 ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
             c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::ConfiguredForwardFailure;
-        const bool exact_consumed_terminal = selected_targets == 0 &&
-                                             consumed_terminal != nullptr &&
-                                             (strict_head || configured_forward_failure) &&
-                                             current_terminal_response_recv_is_exact(
-                                                 c,
-                                                 *consumed_terminal,
-                                                 c.http1_prebuilt_deadline_generation,
-                                                 c.http1_prebuilt_deadline_profile,
-                                                 c.http1_prebuilt_deadline_method,
-                                                 c.http1_prebuilt_deadline_upload.upload_episode);
+        const bool exact_consumed_terminal =
+            selected_targets == 0 && consumed_terminal != nullptr &&
+            (strict_head || strict_no_body_metadata || configured_forward_failure) &&
+            current_terminal_response_recv_is_exact(
+                c,
+                *consumed_terminal,
+                c.http1_prebuilt_deadline_generation,
+                c.http1_prebuilt_deadline_profile,
+                c.http1_prebuilt_deadline_method,
+                c.http1_prebuilt_deadline_upload.upload_episode);
         const bool header_only_head_timeout =
             c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
             c.http1_prebuilt_response_purpose ==
@@ -2821,6 +2839,7 @@ public:
     void reclaim_slot(u32 cid) {
         if (cid >= slots_initialized || response_read_batch_reuse_pinned(cid) ||
             strict_upstream_retirement_blocks_reclaim(conns[cid]) ||
+            conns[cid].chain_direct_recv_owner.active ||
             !conns[cid].response_read_timer_owner_is_neutral())
             return;
         bool was_pending = false;
@@ -2868,6 +2887,7 @@ public:
             u32 cid = pending_free[i];
             if (!response_read_batch_reuse_pinned(cid) && conns[cid].pending_ops == 0 &&
                 !strict_upstream_retirement_blocks_reclaim(conns[cid]) &&
+                !conns[cid].chain_direct_recv_owner.active &&
                 conns[cid].response_read_timer_owner_is_neutral()) {
                 if (conns[cid].recv_slice) {
                     pool.free(conns[cid].recv_slice);
@@ -2985,7 +3005,8 @@ public:
         }
         // Reclaim immediately only after ordinary ops and the separately
         // accounted response-read timer have both drained.
-        if (c.pending_ops == 0 && !response_read_batch_reuse_pinned(cid) &&
+        if (c.pending_ops == 0 && !c.chain_direct_recv_owner.active &&
+            !response_read_batch_reuse_pinned(cid) &&
             !strict_upstream_retirement_blocks_reclaim(c) &&
             c.response_read_timer_owner_is_neutral()) {
             if (c.recv_slice) pool.free(c.recv_slice);
@@ -3005,6 +3026,8 @@ public:
         u8* rs = c.recv_slice;
         u8* ss = c.send_slice;
         auto response_body_tail = c.response_body_tail;
+        const auto chain_direct_recv_owner = c.chain_direct_recv_owner;
+        const bool upstream_recv_direct_armed = c.upstream_recv_direct_armed;
         u8* us = c.upstream_recv_slice;
         u8* relay = c.upstream_relay_slice;
         u8* hs = c.response_header_slice;
@@ -3034,6 +3057,8 @@ public:
         conns[cid].recv_slice_capacity = rs != nullptr ? SlicePool::kSliceSize : 0;
         conns[cid].send_slice = ss;
         conns[cid].response_body_tail = response_body_tail;
+        conns[cid].chain_direct_recv_owner = chain_direct_recv_owner;
+        conns[cid].upstream_recv_direct_armed = upstream_recv_direct_armed;
         conns[cid].upstream_recv_slice = us;
         conns[cid].upstream_relay_slice = relay;
         conns[cid].response_header_slice = hs;
@@ -5165,7 +5190,8 @@ public:
         if (owner.terminal_fault) return false;
         if (owner.saw_terminal && !c.upstream_recv_armed) {
             if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_pause_rearm_pending ||
-                c.upstream_recv_cancel_inflight || !add_response_read_recv(c))
+                c.upstream_recv_cancel_inflight ||
+                !add_response_read_recv(c, /*direct_buffered_body=*/owner.post_commit_at_start))
                 return false;
             c.pending_ops++;
             c.upstream_recv_armed = true;
@@ -5451,14 +5477,14 @@ public:
                         close_conn(c);
                     continue;
                 }
-                // The body keeps arriving through the provided-buffer recv.
-                // A mid-body cancel-and-switch to a direct recv into the
-                // chain tail dropped the connection whenever the origin was
-                // still sending, so this path never switches.
+                // The body recv is a one-shot provided-buffer receive. Once
+                // its natural terminal CQE has settled with positive progress,
+                // the next episode can target the chain tail directly.
                 if (owner.saw_terminal && !c.upstream_recv_armed) {
                     if (c.upstream_recv_pause_cancel_pending ||
                         c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
-                        !add_response_read_recv(c)) {
+                        owner.terminal_fault || owner.clean_eof || !owner.saw_positive ||
+                        !add_response_read_recv(c, /*direct_buffered_body=*/true)) {
                         close_conn(c);
                         continue;
                     }

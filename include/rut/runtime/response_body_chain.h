@@ -36,6 +36,10 @@ struct ResponseBodyChain {
     Node* tail = nullptr;
     SlicePool* owner = nullptr;
     u32 size = 0;
+    // Bytes a direct recv has physically written into the current tail beyond
+    // its committed logical length. Kept separately so a late/stale CQE can be
+    // zeroed on release without publishing those bytes to the response.
+    u32 tail_dirty_end = 0;
 
     const u8* data() const { return head ? payload(head) + head->offset : nullptr; }
     u32 front_size() const { return head ? head->len - head->offset : 0; }
@@ -87,7 +91,10 @@ struct ResponseBodyChain {
             tail->next = first;
         else
             head = first;
-        if (last) tail = last;
+        if (last) {
+            tail = last;
+            tail_dirty_end = 0;
+        }
         owner = &pool;
         size += len;
         while (len != 0) {
@@ -118,6 +125,7 @@ struct ResponseBodyChain {
         if (!head) {
             tail = nullptr;
             owner = nullptr;
+            tail_dirty_end = 0;
         }
     }
 
@@ -130,6 +138,7 @@ struct ResponseBodyChain {
         tail = nullptr;
         owner = nullptr;
         size = 0;
+        tail_dirty_end = 0;
     }
 
     // --- Direct-recv tail API ---
@@ -156,6 +165,7 @@ struct ResponseBodyChain {
         else
             head = node;
         tail = node;
+        tail_dirty_end = 0;
         owner = &pool;
         return true;
     }
@@ -177,11 +187,30 @@ struct ResponseBodyChain {
         size += n;
     }
 
+    // Record physical writes before deciding whether their CQE still owns a
+    // logical response. Only the current tail can have a direct recv in flight:
+    // complete-buffered responses do not consume or send body nodes while the
+    // origin recv is active, and close defers chain release until its CQE drains.
+    bool record_direct_write(const Node* node, const u8* ptr, u32 n, const SlicePool& pool) {
+        if (node == nullptr || node != tail || ptr == nullptr) return false;
+        const u64 begin = reinterpret_cast<u64>(payload(node));
+        const u64 address = reinterpret_cast<u64>(ptr);
+        const u32 capacity = payload_capacity(pool, node);
+        if (address < begin || address - begin > capacity ||
+            n > capacity - static_cast<u32>(address - begin))
+            return false;
+        const u32 end = static_cast<u32>(address - begin) + n;
+        if (end > tail_dirty_end) tail_dirty_end = end;
+        return true;
+    }
+
 private:
-    // Payload bytes are only ever written at [0, len), so that is all a
-    // bulk node has to re-zero on return.
+    // Ordinary writes publish [0, len); a direct recv can dirty a longer
+    // prefix before its CQE is accepted, tracked by tail_dirty_end.
     void release_node(Node* node) {
-        owner->free_written(reinterpret_cast<u8*>(node), kHeader + node->len);
+        const u32 dirty = node == tail && tail_dirty_end > node->len ? tail_dirty_end : node->len;
+        owner->free_written(reinterpret_cast<u8*>(node), kHeader + dirty);
+        if (node == tail) tail_dirty_end = 0;
     }
 };
 

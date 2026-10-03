@@ -1,0 +1,13 @@
+Test project /home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang
+    Start 27: test_network
+1/2 Test #27: test_network .....................   Passed    8.76 sec
+    Start 28: test_iouring_idle_trim
+2/2 Test #28: test_iouring_idle_trim ...........   Passed    0.58 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Label Time Summary:
+network    =   9.34 sec*proc (2 tests)
+unit       =   9.34 sec*proc (2 tests)
+
+Total Test time (real) =   9.35 sec

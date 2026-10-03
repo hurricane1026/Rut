@@ -1,0 +1,12 @@
+{
+  "baseline": {
+    "rut": "74701843a2545122bc0e965e31f410726ce37fe32c00ffb3d8efed59067b1e3a",
+    "rut-compile": "b89d8bac5cbfef46446d449447988900e278269d75ea1f5c5fddd93d13d14bfa",
+    "rut-nginx-convert": "19ce3b2228186966fe14194d995169eab9fd8e5afcc09b74c0a813ec8ec5d6ab"
+  },
+  "candidate": {
+    "rut": "6a69ccec50b3be32c3b098a8d485fcf197bde904ce7c8ca9a51230ca95355060",
+    "rut-compile": "486e71d7e674195be9b74077d5caa7c286354a1dbde38a79256ed6309ac4ff0b",
+    "rut-nginx-convert": "19ce3b2228186966fe14194d995169eab9fd8e5afcc09b74c0a813ec8ec5d6ab"
+  }
+}

@@ -928,6 +928,53 @@ TEST(response_body_chain, exhausted_reservation_is_atomic_and_reusable) {
     pool.destroy();
 }
 
+TEST(response_body_chain, direct_dirty_extent_is_zeroed_without_logical_commit) {
+    SlicePool pool;
+    constexpr u32 kTestBulk = 1;
+    REQUIRE(pool.init(2, 0, SlicePool::kMaxCachedSlices, kTestBulk).has_value());
+    ResponseBodyChain chain;
+    static u8 prefix[ResponseBodyChain::kPayload]{};
+    REQUIRE(chain.append(pool, prefix, sizeof(prefix)));
+    REQUIRE(chain.reserve_tail(pool));
+    auto* node = chain.tail;
+    REQUIRE(pool.is_bulk(reinterpret_cast<const u8*>(node)));
+    u8* dst = chain.write_ptr(pool);
+    constexpr u32 kDirty = 113;
+    __builtin_memset(dst, 0xD3, kDirty);
+    REQUIRE(chain.record_direct_write(node, dst, kDirty, pool));
+    CHECK_EQ(chain.size, sizeof(prefix));
+    CHECK_EQ(chain.tail->len, 0u);
+    CHECK_EQ(chain.tail_dirty_end, kDirty);
+    chain.release();
+
+    u8* reused = pool.alloc_bulk();
+    REQUIRE(reused != nullptr);
+    for (u32 i = 0; i < ResponseBodyChain::kHeader + kDirty; ++i) CHECK_EQ(reused[i], 0u);
+    pool.free(reused);
+    pool.destroy();
+}
+
+TEST(response_body_chain, direct_dirty_extent_resets_when_tail_changes) {
+    SlicePool pool;
+    REQUIRE(pool.init(4).has_value());
+    ResponseBodyChain chain;
+    u8 prefix[ResponseBodyChain::kPayload];
+    __builtin_memset(prefix, 0x31, sizeof(prefix));
+    REQUIRE(chain.reserve_tail(pool));
+    u8* dst = chain.write_ptr(pool);
+    __builtin_memset(dst, 0xE7, 1);
+    REQUIRE(chain.record_direct_write(chain.tail, dst, 1, pool));
+    chain.commit(1);
+    REQUIRE(chain.append(pool, prefix, sizeof(prefix) - 1u));
+    REQUIRE(chain.append(pool, prefix, 1));
+    REQUIRE(chain.tail != nullptr);
+    CHECK_EQ(chain.tail->len, 1u);
+    CHECK_EQ(chain.tail_dirty_end, 0u);
+    chain.release();
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
+
 TEST(response_body_chain, proven_large_body_moves_into_bulk_nodes) {
     SlicePool pool;
     constexpr u32 kTestBulk = 8;

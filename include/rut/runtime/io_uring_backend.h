@@ -271,7 +271,8 @@ struct IoUringBackend {
     bool add_first_response_recv(i32 fd,
                                  u32 conn_id,
                                  u32 upstream_episode,
-                                 bool separate_body_ring = false);
+                                 bool separate_body_ring = false,
+                                 bool one_shot = false);
 
     // Pause downstream recv while a send wait is pending.
     // The cancel completion is tagged so ownership is retained until it drains.

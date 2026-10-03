@@ -1082,9 +1082,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     r.loop->timer.remove(c);
     r.loop->timer.add(c, r.loop->keepalive_timeout);  // a bare add
     CHECK(!c->idle_trim_examined);
-    // Keep the slot-size assertion explicit: the deferred TLS overflow prefix
-    // witness occupies existing tail padding in the connection layout.
-    CHECK_EQ(sizeof(Connection), 3616u);
+    // ChainDirectRecvOwner is a 32-byte immutable CQE target snapshot. Keep the
+    // slot-size assertion explicit so future owner fields cannot grow the hot
+    // connection layout unnoticed.
+    CHECK_EQ(sizeof(Connection), 3648u);
 }
 
 TEST(iouring_idle_trim,

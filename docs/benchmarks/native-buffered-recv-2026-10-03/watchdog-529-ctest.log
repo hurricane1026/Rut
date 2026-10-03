@@ -1,0 +1,15 @@
+Test project /home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang
+    Start 145: test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential
+1/1 Test #145: test_nginx_issue529_converter_default_buffering_304_content_length_metadata_differential ...   Passed    3.03 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Label Time Summary:
+differential    =   3.03 sec*proc (1 test)
+docker          =   3.03 sec*proc (1 test)
+integration     =   3.03 sec*proc (1 test)
+io_uring        =   3.03 sec*proc (1 test)
+network         =   3.03 sec*proc (1 test)
+nginx           =   3.03 sec*proc (1 test)
+
+Total Test time (real) =   3.03 sec

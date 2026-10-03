@@ -1,0 +1,16 @@
+{
+  "source_commit": "60ed148deb0a9214af8c9861a9279f966c8d08aa",
+  "based_on_remote_head": "8e0af749887861bf5851e415f1e346c092fc6b65",
+  "note": "Correctness repair source hashes. Original measured candidate hashes remain in delivery-source-sha256.json and the frozen evidence archive. No performance rerun for this repair.",
+  "files": {
+    "include/rut/runtime/response_body_chain.h": "bba60385aea00a1ade64cf60e16759ef0a3939e0f037dea579b283afa3ac31c5",
+    "include/rut/runtime/connection_base.h": "001efa73f6067e5bc97edbe8924572483a7fab5d92c1ef01ecd740f60993e219",
+    "include/rut/runtime/iouring_event_loop.h": "ee24e51c9364ac0f2ea4b42e14f22d8a23c0f3db55bcad24a893061dd8db908a",
+    "src/runtime/io_uring_backend.cc": "d46cf86d87f6197fad71919b8fd6a0bfb9c0925754fb5c9829b28c7dd1f72820",
+    "include/rut/runtime/io_uring_backend.h": "7c6be4441946f42ae2f92bc45f730eab81f50e97a85f384b375e916cb568d828",
+    "tests/test_network.cc": "f567de848dfb7d68ee5b9a8d4f8148733d83ad9a99fdb85366e516d1291727d5",
+    "tests/test_arena.cc": "5599223d7233bc591c8051d1713950fcd5d4724316703201b639d560fd9f9b8e",
+    "include/rut/runtime/callbacks_impl.h": "995cd55f652065b485d22b51176ee47f75b78a8c3b80df8ac16f70a2a8c39bca",
+    "tests/test_iouring_idle_trim.cc": "d5e33046718bf629b116f16443dc724f1078e4e534749d2284e6c9594ada8f94"
+  }
+}
