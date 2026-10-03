@@ -1459,13 +1459,60 @@ static bool make_temp_directory_template(const char* configured_tmp,
                                          const char* name_template,
                                          char* output,
                                          size_t output_capacity) {
-    const char* tmp_root =
-        configured_tmp == nullptr || configured_tmp[0] == '\0' ? "/tmp" : configured_tmp;
-    std::string path_template(tmp_root);
-    if (path_template.back() != '/') path_template += '/';
-    path_template += name_template;
-    if (path_template.size() >= output_capacity) return false;
-    memcpy(output, path_template.c_str(), path_template.size() + 1u);
+    constexpr char kFallbackRoot[] = "/tmp";
+    constexpr char kAccessLogSuffix[] = "/nginx-access.log";
+    const size_t name_len = strlen(name_template);
+    const size_t suffix_len = sizeof(kAccessLogSuffix) - 1u;
+    const auto root_is_clean = [](const char* root, size_t length) {
+        if (length == 0u || root[0] != '/') return false;
+        if (length == 1u) return true;
+        size_t segment_start = 1u;
+        const auto valid_segment = [&](size_t end) {
+            const size_t segment_len = end - segment_start;
+            return segment_len != 0u && !(segment_len == 1u && root[segment_start] == '.') &&
+                   !(segment_len == 2u && root[segment_start] == '.' &&
+                     root[segment_start + 1u] == '.');
+        };
+        for (size_t i = 1u; i < length; ++i) {
+            if (root[i] != '/') {
+                const unsigned char byte = static_cast<unsigned char>(root[i]);
+                if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                      (byte >= '0' && byte <= '9') || byte == '.' || byte == '_' || byte == '-'))
+                    return false;
+                continue;
+            }
+            if (!valid_segment(i)) return false;
+            segment_start = i + 1u;
+        }
+        if (segment_start == length) return root[length - 1u] == '/' && root[length - 2u] != '/';
+        return valid_segment(length);
+    };
+
+    const char* root = configured_tmp;
+    size_t root_len = root == nullptr ? 0u : strnlen(root, 257u);
+    bool valid =
+        root != nullptr && root_len != 0u && root_len <= 256u && root_is_clean(root, root_len);
+    if (valid && root_len > 1u && root[root_len - 1u] == '/') --root_len;
+    size_t separator_len = root_len == 1u && root[0] == '/' ? 0u : 1u;
+    size_t candidate_len = root_len + separator_len + name_len;
+    valid = valid && candidate_len + suffix_len <= rut::nginx::kMaxAccessLogPathLen &&
+            candidate_len + 1u <= output_capacity;
+    if (!valid) {
+        root = kFallbackRoot;
+        root_len = sizeof(kFallbackRoot) - 1u;
+        separator_len = 1u;
+        candidate_len = root_len + separator_len + name_len;
+        if (candidate_len + suffix_len > rut::nginx::kMaxAccessLogPathLen ||
+            candidate_len + 1u > output_capacity)
+            return false;
+    }
+
+    memcpy(output, root, root_len);
+    size_t cursor = root_len;
+    if (separator_len != 0u) output[cursor++] = '/';
+    memcpy(output + cursor, name_template, name_len);
+    cursor += name_len;
+    output[cursor] = '\0';
     return true;
 }
 
@@ -2232,27 +2279,65 @@ static std::string child_exit_readiness_diagnostic(const Child& child) {
 static bool child_exit_readiness_diagnostic_self_check() {
     char root_selection[256] = {};
     static constexpr char kTempTemplate[] = "rut-nginx-differential-XXXXXX";
-    const size_t suffix_len = sizeof(kTempTemplate) - 1u;
-    const std::string near_limit_root(254u - suffix_len, 'n');
-    const std::string over_limit_root(255u - suffix_len, 'o');
-    char near_limit_path[256] = {};
-    char over_limit_path[256] = {};
-    const bool temp_root_selection_ok =
-        make_temp_directory_template(
-            nullptr, kTempTemplate, root_selection, sizeof(root_selection)) &&
-        strcmp(root_selection, "/tmp/rut-nginx-differential-XXXXXX") == 0 &&
-        make_temp_directory_template("", kTempTemplate, root_selection, sizeof(root_selection)) &&
-        strcmp(root_selection, "/tmp/rut-nginx-differential-XXXXXX") == 0 &&
-        make_temp_directory_template(
-            "/cache/tmp", kTempTemplate, root_selection, sizeof(root_selection)) &&
-        strcmp(root_selection, "/cache/tmp/rut-nginx-differential-XXXXXX") == 0 &&
-        make_temp_directory_template(
-            near_limit_root.c_str(), kTempTemplate, near_limit_path, sizeof(near_limit_path)) &&
-        strlen(near_limit_path) == sizeof(near_limit_path) - 1u &&
+    const auto derived_access_log_is_clean = [](const char* temporary_path) {
+        char source[512];
+        const int length = snprintf(source,
+                                    sizeof(source),
+                                    "http {\n"
+                                    "  log_format compat \"$request_length\";\n"
+                                    "  access_log %s/nginx-access.log compat;\n"
+                                    "  server { listen 8080; location / { proxy_pass "
+                                    "http://127.0.0.1:9000; } }\n"
+                                    "}\n",
+                                    temporary_path);
+        if (length < 0 || static_cast<size_t>(length) >= sizeof(source)) return false;
+        const auto parsed =
+            rut::nginx::parse_http_profile({source, static_cast<u32>(static_cast<size_t>(length))});
+        return parsed && parsed.value().access_log.path.len ==
+                             strlen(temporary_path) + sizeof("/nginx-access.log") - 1u;
+    };
+    const auto check_root = [&](const char* configured, const char* expected) {
+        return make_temp_directory_template(
+                   configured, kTempTemplate, root_selection, sizeof(root_selection)) &&
+               strcmp(root_selection, expected) == 0 && root_selection[0] == '/' &&
+               derived_access_log_is_clean(root_selection);
+    };
+    if (!check_root(nullptr, "/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("", "/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("relative/cache", "/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("/cache/with space", "/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("/cache:with-colon", "/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("/cache/./tmp", "/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("/cache/../tmp", "/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("/cache//tmp", "/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("/cache/tmp", "/cache/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("/cache/tmp/", "/cache/tmp/rut-nginx-differential-XXXXXX") ||
+        !check_root("/", "/rut-nginx-differential-XXXXXX")) {
+        std::cerr << "FAIL: TMPDIR selection or derived access-log grammar\n";
+        return false;
+    }
+
+    const size_t name_len = sizeof(kTempTemplate) - 1u;
+    static constexpr char kAccessLogSuffix[] = "/nginx-access.log";
+    const size_t exact_root_len =
+        rut::nginx::kMaxAccessLogPathLen - name_len - (sizeof(kAccessLogSuffix) - 1u) - 1u;
+    const std::string exact_root = "/" + std::string(exact_root_len - 1u, 'e');
+    const std::string overflow_root = exact_root + "e";
+    if (!check_root(exact_root.c_str(), (exact_root + "/" + kTempTemplate).c_str()) ||
+        !check_root(overflow_root.c_str(), "/tmp/rut-nginx-differential-XXXXXX")) {
+        std::cerr << "FAIL: exact derived access-log path boundary\n";
+        return false;
+    }
+    char tiny_output[8] = {};
+    char long_root[300];
+    memset(long_root, 'l', sizeof(long_root) - 1u);
+    long_root[0] = '/';
+    long_root[sizeof(long_root) - 1u] = '\0';
+    if (make_temp_directory_template("/tmp", kTempTemplate, tiny_output, sizeof(tiny_output)) ||
         !make_temp_directory_template(
-            over_limit_root.c_str(), kTempTemplate, over_limit_path, sizeof(over_limit_path));
-    if (!temp_root_selection_ok) {
-        std::cerr << "FAIL: temporary directory root selection or path bounds\n";
+            long_root, kTempTemplate, root_selection, sizeof(root_selection)) ||
+        strcmp(root_selection, "/tmp/rut-nginx-differential-XXXXXX") != 0) {
+        std::cerr << "FAIL: TMPDIR output and input bounds\n";
         return false;
     }
 
