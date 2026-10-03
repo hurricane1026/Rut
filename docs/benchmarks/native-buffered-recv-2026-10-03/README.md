@@ -57,3 +57,7 @@
 [证据归档](evidence.tar.gz)（[SHA256](evidence.sha256)、[文件清单](archive-manifest.json)）保存原始样本、摘要、环境/命令、测试与接收日志、候选 patch 和源码/二进制 SHA256；排除私钥、证书、正文 payload 和二进制。原始实验工作目录为 `/home/hurricane/private/code/rut-native-opt-20261003`，冻结二进制仍保存在该目录的 baseline/candidate。
 
 未重跑整个 96 坐标矩阵，未验证真实 NIC/RTT、HTTP/2、多 shard、epoll 性能、ASan、全仓库测试或全量 tidy。没有 syscall/CQE 计数或硬件 profiling，无法证明具体内核瓶颈或硬件极限。此结论仅支持保留本次完整缓冲接收候选，并继续按弱项分别验证。
+
+## PR 隔离验证
+
+创建 PR 时从最新 main（`f7cb12fc`）建立独立分支，仅复制七个源码/测试文件与本报告。候选生产源码与性能测量 SHA256 一致，main 上这些文件的基线与实验基线一致。C/C++ 均使用 Clang，Release O2、JIT ON、IPO OFF；主程序及相关测试重新构建成功。独立分支的 6 个 CTest 全部通过，network 1529 passed、348172 checks、无跳过，Arena 68 passed。受影响文件格式及 diff 检查通过。见 [测试日志](isolated-main-ctest.log) 与 [验证记录](isolated-main-validation.json)。独立分支未重新跑性能实验，性能数字仍来自前述冻结 ABBA 构建。

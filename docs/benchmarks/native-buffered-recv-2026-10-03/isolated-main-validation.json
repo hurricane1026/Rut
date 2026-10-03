@@ -1,0 +1,38 @@
+{
+  "base": "f7cb12fc",
+  "runtime_commit": "32dc415b",
+  "build_type": "Release",
+  "cc": "clang",
+  "cxx": "clang++",
+  "jit": true,
+  "ipo": false,
+  "ctest_command": "ctest --test-dir build-pr-clang --output-on-failure --no-tests=error -j 1 -R '^(test_network|test_arena|test_native_program|test_native_protocol|test_serve_loader|test_harness)$'",
+  "ctest_passed": 6,
+  "network": {
+    "passed": 1529,
+    "checks": 348172,
+    "skipped": 0
+  },
+  "arena": {
+    "passed": 68,
+    "checks": 1073620
+  },
+  "affected_format_check": "passed",
+  "diff_check": "passed",
+  "performance_rerun": false,
+  "production_source_matches_measured_candidate": true,
+  "compile_commands_selected": [
+    {
+      "directory": "/home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang",
+      "command": "/usr/bin/clang++ -I/home/hurricane/private/code/rut-pr-native-buffered-recv/include -I/home/hurricane/private/code/rut-pr-native-buffered-recv/src -I/home/hurricane/private/code/rut-pr-native-buffered-recv/src/runtime/simd -I/home/hurricane/private/code/rut-pr-native-buffered-recv/third_party/zstd/lib -I/home/hurricane/private/code/rut-pr-native-buffered-recv/third_party/zstd/lib/common -I/home/hurricane/private/code/rut-pr-native-buffered-recv/third_party/boringssl/include  -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -Wall -Wextra -Wpedantic -Wswitch-enum -O2 -DNDEBUG -std=c++23 -Werror=unused-result -o src/CMakeFiles/rut_runtime.dir/runtime/io_uring_backend.cc.o -c /home/hurricane/private/code/rut-pr-native-buffered-recv/src/runtime/io_uring_backend.cc",
+      "file": "/home/hurricane/private/code/rut-pr-native-buffered-recv/src/runtime/io_uring_backend.cc",
+      "output": "/home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang/src/CMakeFiles/rut_runtime.dir/runtime/io_uring_backend.cc.o"
+    },
+    {
+      "directory": "/home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang",
+      "command": "/usr/bin/clang++ -DRUT_ENABLE_JIT=1 -Drut_EXPORTS -I/home/hurricane/private/code/rut-pr-native-buffered-recv/include -I/home/hurricane/private/code/rut-pr-native-buffered-recv/third_party/zstd/lib -I/home/hurricane/private/code/rut-pr-native-buffered-recv/third_party/zstd/lib/common -I/home/hurricane/private/code/rut-pr-native-buffered-recv/third_party/boringssl/include -I/home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang/generated -I/home/hurricane/private/code/rut-pr-native-buffered-recv/third_party/vectorscan/src -I/home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang/src/third_party/vectorscan -I/home/hurricane/private/code/rut-pr-native-buffered-recv/third_party/vectorscan/include  -fno-exceptions -fno-rtti -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -Wall -Wextra -Wpedantic -Wswitch-enum -O2 -DNDEBUG -std=c++23 -o src/CMakeFiles/rut.dir/main.cc.o -c /home/hurricane/private/code/rut-pr-native-buffered-recv/src/main.cc",
+      "file": "/home/hurricane/private/code/rut-pr-native-buffered-recv/src/main.cc",
+      "output": "/home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang/src/CMakeFiles/rut.dir/main.cc.o"
+    }
+  ]
+}

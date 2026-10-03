@@ -1,0 +1,23 @@
+Test project /home/hurricane/private/code/rut-pr-native-buffered-recv/build-pr-clang
+    Start  27: test_network
+1/6 Test  #27: test_network .....................   Passed    8.71 sec
+    Start  38: test_arena
+2/6 Test  #38: test_arena .......................   Passed    0.01 sec
+    Start 257: test_native_program
+3/6 Test #257: test_native_program ..............   Passed    1.25 sec
+    Start 258: test_native_protocol
+4/6 Test #258: test_native_protocol .............   Passed    1.02 sec
+    Start 259: test_serve_loader
+5/6 Test #259: test_serve_loader ................   Passed    5.30 sec
+    Start 263: test_harness
+6/6 Test #263: test_harness .....................   Passed    1.23 sec
+
+100% tests passed, 0 tests failed out of 6
+
+Label Time Summary:
+harness    =   1.23 sec*proc (1 test)
+jit        =   7.57 sec*proc (3 tests)
+network    =   8.71 sec*proc (1 test)
+unit       =  17.51 sec*proc (6 tests)
+
+Total Test time (real) =  17.52 sec
