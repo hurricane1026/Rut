@@ -20937,6 +20937,10 @@ TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
         "CONNECT / HTTP/1.1\r\nHost: x\r\n\r\n",
         "CONNECT /admin?x=1 HTTP/1.1\r\nHost: x\r\n\r\n",
         "CONNECT //example.test:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT urn:example:animal HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT example.test HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT example.test:abc HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT example.test:99999 HTTP/1.1\r\nHost: x\r\n\r\n",
         "CONNECT / HTTP/1.0\r\n\r\n",
         "CONNECT / HTTP/1.1\r\nContent-Length: 4\r\n\r\nbody",
     };
@@ -20980,6 +20984,29 @@ TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
     CHECK_NE(authority->resp_status, 204u);
     CHECK_EQ(pre_route_root_handler_calls, 0u);
     loop.close_conn(*authority);
+    auto* ipv6_authority = dispatch_unmatched_request(
+        loop, local, "CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(ipv6_authority != nullptr);
+    CHECK_NE(ipv6_authority->resp_status, 400u);
+    CHECK_FALSE(ipv6_authority->req_target_form_unsupported);
+    CHECK_EQ(pre_route_root_handler_calls, 0u);
+    loop.close_conn(*ipv6_authority);
+    auto* embedded_ipv4_authority = dispatch_unmatched_request(
+        loop, local, "CONNECT [::ffff:192.0.2.1]:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(embedded_ipv4_authority != nullptr);
+    CHECK_FALSE(embedded_ipv4_authority->req_target_form_unsupported);
+    CHECK_NE(embedded_ipv4_authority->resp_status, 400u);
+    loop.close_conn(*embedded_ipv4_authority);
+    for (const char* request : {"CONNECT []:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT [2001:::1]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT [1:2:3:4:5:6:7:8:]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT [1:2:3:4:5:6:7::8]:443 HTTP/1.1\r\nHost: x\r\n\r\n"}) {
+        auto* invalid_ipv6 = dispatch_unmatched_request(loop, local, request);
+        REQUIRE(invalid_ipv6 != nullptr);
+        CHECK_EQ(invalid_ipv6->resp_status, 400u);
+        CHECK(invalid_ipv6->req_target_form_unsupported);
+        loop.close_conn(*invalid_ipv6);
+    }
     loop.backend.fail_send = true;
     const RouteConfig* active = &local;
     loop.config_ptr = &active;
@@ -21107,6 +21134,25 @@ TEST(request_admission, absolute_target_unmatched_and_exact_inventory_precedence
     auto* closed = dispatch_unmatched_request(loop, strict, request);
     REQUIRE(closed != nullptr);
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+
+    StrictLocalResponsePolicySpec pre_route = make_representation200_policy();
+    RouteConfig pre_route_config{};
+    REQUIRE_EQ(pre_route_config.add_strict_local_response_policy(pre_route), 1u);
+    REQUIRE(pre_route_config.set_pre_route_policy_id(kRouteMethodGet, 1));
+    loop.backend.clear_ops();
+    auto* pre_route_rejected = dispatch_unmatched_request(loop, pre_route_config, request);
+    REQUIRE(pre_route_rejected != nullptr);
+    CHECK_EQ(pre_route_rejected->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.close_conn(*pre_route_rejected);
+
+    const char* fragment = "GET /#fragment HTTP/1.1\r\nHost: x\r\n\r\n";
+    loop.backend.clear_ops();
+    auto* fragment_closed = dispatch_unmatched_request(loop, strict, fragment);
+    REQUIRE(fragment_closed != nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
 }

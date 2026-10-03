@@ -29624,9 +29624,9 @@ TEST(route, forward_request_policy_rebuilds_nginx_h11_headers) {
     };
     const RejectedVector rejected[] = {
         {"GET /api HTTP/1.1\r\nHost: client.example\r\ntRaNsFeR-EnCoDiNg: identity\r\n\r\n", "400"},
-        // Absolute-form cannot route to this origin-form entry, so the existing
-        // unmatched-route fallback is 200; importantly it still never connects.
-        {"GET http://client.example/api HTTP/1.1\r\nHost: client.example\r\n\r\n", "200"},
+        // Absolute-form is rejected before pre-route admission and never
+        // connects to the upstream.
+        {"GET http://client.example/api HTTP/1.1\r\nHost: client.example\r\n\r\n", "400"},
         {"GET /api HTTP/1.1\r\nHost: client.example\r\nConnection: Upgrade\r\n"
          "Upgrade: websocket\r\n\r\n",
          "400"},

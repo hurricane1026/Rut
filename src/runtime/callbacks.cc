@@ -17,6 +17,8 @@
 #include "rut/runtime/route_canon.h"
 #include "rut/runtime/traffic_capture.h"
 
+#include <arpa/inet.h>
+
 namespace rut {
 
 #ifdef __APPLE__
@@ -103,6 +105,43 @@ u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len) {
     return static_cast<u8>(LogHttpMethod::Other);
 }
 
+static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end) {
+    if (!data || end <= start) return false;
+    u32 host_end = start;
+    if (data[start] == '[') {
+        host_end++;
+        while (host_end < end && data[host_end] != ']') host_end++;
+        if (host_end == start + 1 || host_end >= end || data[host_end] != ']') return false;
+        const u32 host_len = host_end - start - 1;
+        char host[128];
+        if (host_len >= sizeof(host)) return false;
+        __builtin_memcpy(host, data + start + 1, host_len);
+        host[host_len] = '\0';
+        in6_addr address{};
+        if (inet_pton(AF_INET6, host, &address) != 1) return false;
+        host_end++;
+    } else {
+        while (host_end < end && data[host_end] != ':') host_end++;
+        if (host_end == start) return false;
+        for (u32 i = start; i < host_end; i++) {
+            const u8 c = data[i];
+            const bool alpha_num =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+            if (!alpha_num && c != '.' && c != '-' && c != '_') return false;
+        }
+    }
+    if (host_end >= end || data[host_end++] != ':') return false;
+    if (host_end == end) return false;
+    u32 port = 0;
+    for (; host_end < end; host_end++) {
+        const u8 c = data[host_end];
+        if (c < '0' || c > '9') return false;
+        port = port * 10u + static_cast<u32>(c - '0');
+        if (port > 65535u) return false;
+    }
+    return port != 0;
+}
+
 void capture_request_metadata(Connection& conn) {
     conn.begin_request_metadata_episode();
     conn.req_strict_h1_complete = false;
@@ -187,7 +226,9 @@ void capture_request_metadata(Connection& conn) {
             const bool origin = data[target_start] == '/';
             const bool asterisk = target_end == target_start + 1 && data[target_start] == '*';
             conn.req_target_form_unsupported =
-                connect ? (origin || target_has_slash) : (!origin && !asterisk);
+                connect ? (origin || target_has_slash ||
+                           !connect_authority_target_is_valid(data, target_start, target_end))
+                        : (!origin && !asterisk);
         }
     }
 
