@@ -158,11 +158,31 @@ void capture_request_metadata(Connection& conn) {
     const u32 kLen = conn.recv_buf.len();
     if (!data || kLen == 0) return;
 
+    // Keep this safety witness independent of strict method parsing.  An
+    // extension or malformed method can make HttpParser return before it
+    // reaches the target, but a fragment is still invalid request-target
+    // input and must never reach an any-method route or upstream.
+    u32 target_start = 0;
+    while (target_start < kLen && data[target_start] != ' ' && data[target_start] != '\r' &&
+           data[target_start] != '\n')
+        target_start++;
+    if (target_start < kLen && data[target_start] == ' ') {
+        target_start++;
+        for (u32 i = target_start; i < kLen && data[i] != ' ' && data[i] != '\r' &&
+                      data[i] != '\n';
+             i++) {
+            if (data[i] == '#') {
+                conn.req_target_has_fragment = true;
+                break;
+            }
+        }
+    }
+
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
     const ParseStatus parse_status = parser.parse(data, kLen, &req);
-    conn.req_target_has_fragment = req.target_has_fragment;
+    conn.req_target_has_fragment |= req.target_has_fragment;
     if (parse_status == ParseStatus::Complete) {
         u32 raw_target_offset = 0;
         u32 raw_target_length = 0;
@@ -757,14 +777,18 @@ static void write_response_headers(Connection& conn,
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
 }
 
-void format_static_response(Connection& conn, u16 code, bool keep_alive) {
+void format_static_response(Connection& conn, u16 code, bool keep_alive, bool headers_only) {
     const char* reason = status_reason(code);
     u32 reason_len = 0;
     while (reason[reason_len]) reason_len++;
     const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const bool kSuppressBody = kNoBody || headers_only;
+    // HEAD carries the representation length in Content-Length while emitting
+    // no body bytes on the wire.
     const u32 kBodyLen = kNoBody ? 0 : reason_len;
     write_response_headers(conn, code, reason, reason_len, kBodyLen, keep_alive, nullptr, 0);
-    if (kBodyLen > 0) conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
+    if (!kSuppressBody && kBodyLen > 0)
+        conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
 }
 
 void format_response_with_body(Connection& conn,

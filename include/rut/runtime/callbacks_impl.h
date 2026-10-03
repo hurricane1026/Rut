@@ -952,7 +952,10 @@ const char* status_reason(u16 code);
 // `Code` value -- rather than being rejected. Only fails (returns false)
 // when `out` is null; every `u16` code otherwise gets a phrase.
 bool canonical_status_reason(u16 code, Str* out);
-void format_static_response(Connection& conn, u16 code, bool keep_alive);
+void format_static_response(Connection& conn,
+                            u16 code,
+                            bool keep_alive,
+                            bool headers_only = false);
 // Custom-body variant: writes status line + Content-Length matching
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
 // bytes. For codes that must have no body (1xx / 204 / 304) falls
@@ -2404,10 +2407,14 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // percent-encoded %23 remains ordinary request-target data.
     if (conn.req_target_has_fragment) {
         conn.resp_status = 400;
-        format_static_response(conn, 400, /*keep_alive=*/false);
+        format_static_response(conn,
+                               400,
+                               /*keep_alive=*/false,
+                               conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.keep_alive = false;
         conn.transition_to_sending(&on_response_sent<Loop>);
-        client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+        if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))
+            close_conn_if_live(loop, conn);
         return;
     }
     if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
