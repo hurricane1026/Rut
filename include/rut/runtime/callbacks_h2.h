@@ -1248,7 +1248,9 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             d.overflow = false;
             return;
         }
-        if (pending_req.target_has_fragment) {
+        if (pending_req.target_has_fragment ||
+            (pending_req.method == HttpMethod::CONNECT && pending_req.path.len != 0 &&
+             pending_req.path.ptr[0] == '/')) {
             h2_emit_status(d, stream_id, 400);
             return;
         }
@@ -1272,13 +1274,16 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     }
     const u8 kMethodKey = route_method_key(req.method);
     const u16 pre_route_policy_id = config != nullptr ? config->pre_route_policy_id(kMethodKey) : 0;
-    if ((has_exact_inventory || pre_route_policy_id != 0) && req.target_has_fragment) {
+    const bool origin_form_connect =
+        req.method == HttpMethod::CONNECT && req.path.len != 0 && req.path.ptr[0] == '/';
+    if ((has_exact_inventory || pre_route_policy_id != 0) &&
+        (req.target_has_fragment || origin_form_connect)) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
         return;
     }
-    if (req.target_has_fragment) {
+    if (req.target_has_fragment || origin_form_connect) {
         h2_emit_status(d, stream_id, 400);
         return;
     }

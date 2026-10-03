@@ -109,12 +109,19 @@ with raw sockets and a scripted Python origin.
 | Upstream response with a duplicate Envoy-inline single-value header -- every Envoy inline response header, pinned v1.39.1, from both (1) the unconditional macro-defined set (`envoy/http/header_map.h` `INLINE_RESP_HEADERS` + `INLINE_REQ_RESP_HEADERS` + `INLINE_RESP_HEADERS_TRAILERS` -- the last inherited via `ResponseHeaderOrTrailerMap`, which both `ResponseHeaderMap` and `ResponseTrailerMap` mix in, so despite the "_TRAILERS" macro name `grpc-status`/`grpc-message` are inline on an ordinary response header map too (Codex round-17 review of #698, correcting a round-9-era gap in this inventory), response-relevant subset): `content-type`, `date`, `keep-alive`, `location`, `proxy-connection`, `proxy-status`, `upgrade`, `via`, `x-envoy-attempt-count`, `x-envoy-decorator-operation`, `x-envoy-degraded`, `x-envoy-immediate-health-check-fail`, `x-envoy-ratelimited`, `x-envoy-upstream-canary`, `x-envoy-upstream-healthchecked-cluster`, `x-envoy-upstream-service-time`, `x-request-id`, `grpc-status`, `grpc-message`; and (2) every header a stock (all-extensions-linked) Envoy binary registers as a custom inline slot at static init via a file-scope `Http::RegisterCustomInlineHeader<Type::ResponseHeaders>`, enumerated with `gh api search/code -f q='repo:envoyproxy/envoy RegisterCustomInlineHeader'` and confirmed present at the v1.39.1 tag (`source/extensions/filters/http/{cache,cache_v2}/cache_custom_headers.cc`, `compressor/compressor_filter.cc`, `decompressor/decompressor_filter.cc`, `cors/cors_filter.cc`, `stat_sinks/hystrix/hystrix.cc`): `cache-control`, `content-encoding`, `last-modified`, `etag`, `age`, `expires`, `vary`, `access-control-allow-origin`, `access-control-allow-credentials`, `access-control-allow-methods`, `access-control-allow-headers`, `access-control-max-age`, `access-control-expose-headers`, `access-control-allow-private-network` -- coalesced by Envoy's `HeaderMapImpl` into one entry (comma-joined) rather than forwarded as two physical lines (custom-inlined single-value headers, `source/common/http/header_map_impl.h`) | yes: milestone bootstrap admission does not depend on per-response header duplication | yes: the emitted route's response_policy has no duplicate-header knob, no capability gate | no, fails closed rather than reproducing the join, but only for a name this policy actually forwards: the `header_order: .upstream` (Envoy H1) profile forwards headers verbatim in upstream order instead of rebuilding a HeaderMap, so it cannot comma-join a duplicate; a second occurrence of a name in the `kEnvoyInlineResponseHeaders` table makes `build_upstream_order_response_headers` return false, tripping `reject_strict_response` for a `502 Bad Gateway` before any byte reaches the client, *except* for a name that will never reach the wire either way: `keep-alive`, `upgrade`, and `proxy-connection` are unconditionally dropped by the same fixed hop-by-hop set the serializer always strips (`hide_headers` or not), and any table entry the policy's own `hide_headers` names is dropped the same way -- a duplicate of either can never produce two physical lines, so it is accepted rather than rejected (Codex round-15 review of #698, correcting a round-10-era over-reject; `include/rut/runtime/callbacks_impl.h`). `Content-Length` duplicates were already rejected by the existing `content_length_count != 1` precondition and a duplicate `Server` is deliberately deduplicated first-wins rather than rejected, per the row above; `Transfer-Encoding` keeps its own pre-existing check (any occurrence at all, not just a duplicate, is rejected as a protocol error) -- none of those three is in the generic table. `Connection` is not in the table either, and is no longer counted at all (Codex round-16 review of #698, correcting a round-15-era gap): it is one more name the fixed hop-by-hop set always drops regardless of `hide_headers`, so a duplicate can never reach the wire and is accepted like the three always-dropped table exemptions -- a dedicated `connection_count` check that used to reject it on duplicate served no purpose and was removed. The response's own persistence decision does not depend on this check: `resp.keep_alive`/`resp.connection_close` are computed once by the parser across every physical `Connection` field with `close` sticky, so a mixed duplicate (`keep-alive` plus `close`) still vetoes upstream pooling exactly as a single `close` field would. This is a code-search-based inventory: it would miss a custom registration in a file deleted from Envoy's default branch since v1.39.1 was cut, though every hit the search did find was individually confirmed present at the pinned tag | unit-tested (`tests/test_network.cc: response_policy.upstream_header_order_rejects_duplicate_of_every_inline_header`, iterating the whole table -- now split between the still-fail-closed entries and the three always-dropped exemptions -- plus a non-inline `x-custom` header proving ordinary headers may still repeat; `response_policy.upstream_header_order_accepts_duplicate_of_hidden_inline_header`, proving a `hide_headers`-named duplicate is also accepted while the same duplicate with no hide entry still fails closed; `response_policy.upstream_header_order_accepts_duplicate_connection_header`, proving two `Connection` fields are accepted and never forwarded; `upstream_reuse.upstream_order_profile_accepts_duplicate_connection_and_honors_close`, proving a `keep-alive`+`close` duplicate is accepted and still vetoes upstream pooling; `response_policy.kEnvoyInlineResponseHeaders_matches_full_envoy_inline_inventory`, independently transcribing the complete macro-defined and custom-registered inline sets and asserting the runtime table is exactly their union -- catching the `grpc-status`/`grpc-message` gap and guarding against a similar future one); no live pinned-Envoy differential-pair observation of the joined value yet | PARTIAL |
 | Upstream failure replies differentiated by cause: Envoy maps `LocalConnectionFailure`/`RemoteConnectionFailure`/`ConnectionTimeout` to one local-reply text and `ConnectionTermination` (reset after the stream was established) to another, and protocol errors to `502` versus other resets to `503` (`source/common/router/router.cc`, `StreamResetReason` → `CoreResponseFlag` mapping) | n/a (per-request runtime behavior, not a parser concern) | yes: the emitted route has exactly one `failure_policy` for every non-timeout upstream failure, no capability gate | no, and worse than "one generic text for every cause": a genuine connect refusal fires the route's configured `failure_policy` (the exact body/status the bootstrap's failure policy specifies), but an upstream that accepts the connection, receives the request, and then resets before sending any response byte gets no local-reply text at all — see behavior test | live observation on the same nginx-era `failure_policy` (502 "Bad Gateway" HTML body): stopping the origin entirely (connect refused) got the client the exact configured `HTTP/1.1 502 Bad Gateway` body; an origin that accepted the connection, read the request, and closed without writing any bytes got the client connection closed with no response bytes at all | NOT_IMPLEMENTED |
 
-The any-method `route "/"` also matches `CONNECT` (`route_table.h`: "method 0
-in a route entry matches any request method"), which is a bug, not a
-fail-closed divergence — recorded separately below rather than in the table
-above because Rut does not merely refuse the request, it forwards it.
+The any-method `route "/"` historically matched origin-form `CONNECT`
+(`route_table.h`: "method 0 in a route entry matches any request method").
+The mis-forward and its runtime admission fix are recorded below.
 
-**Bug (mis-forward, not fail-closed):** `CONNECT / HTTP/1.1` against the
+**Fixed (#708):** shared runtime admission now rejects origin-form `CONNECT`
+with a local 400 before static routes, handlers, or upstream effects. HTTP/1
+closes after the response; HTTP/2 emits a status-only 400, including while a
+prepared Forward owns another stream. Existing strict-policy zero-byte fences
+retain precedence. Authority-form CONNECT retains its existing unmatched
+behavior, and TRACE remains eligible for method-any routing. No CONNECT/TRACE
+language spelling or tunnel capability is added.
+
+**Historical bug evidence:** `CONNECT / HTTP/1.1` against the
 milestone's any-method route opens the upstream connection and relays the
 origin's response back to the client. Envoy rejects this request locally
 (a non-empty `:path` on a `CONNECT` request fails
@@ -130,8 +137,8 @@ time: (1) splitting the any-method route into one explicit `route <METHOD>
 932 (`include/rut/compiler/lexer.h:135`), once duplicated across all 7
 non-HEAD forwarded methods (confirmed by compiling that shape with `rut`);
 #697 has since raised `kMaxTokens` to 4096, and whether that specific shape
-now fits has not been re-measured, so this row's status is unchanged pending
-that check; (2) a
+now fits has not been re-measured; the runtime fix no longer depends on
+that expansion; (2) a
 `guard req.method == GET \|\| … else { return 400 }` inside the existing
 any-method route stays within the token budget, but `CONNECT` and `TRACE`
 are both plain identifiers with no `req.method == <KW>` expression form and
@@ -140,7 +147,7 @@ no `route <METHOD> "/"` declaration spelling of their own (confirmed live:
 parse errors — `pre_route`/`unmatched` bodies are fixed-shape local-response
 policies only), so a guard that excludes `CONNECT` is indistinguishable from
 one that also excludes `TRACE`, and Envoy forwards `TRACE` like any other
-method. This needs either a runtime capability (an expression-level `CONNECT`
+method. At the time this needed a runtime capability (an expression-level `CONNECT`
 literal, a per-route method exclusion list, or a higher token budget) before
 the converter can prevent it without trading the `CONNECT` mis-forward for a
 new `TRACE` divergence.
@@ -465,12 +472,13 @@ the stricter checks.
   nginx-era policy fixture (`tests/fixtures/nginx373_hide.inc`) instead of
   the milestone's exact emitted text — see docs/envoy-converter.md, "Round-3
   review edge cases (PR #692)". None of the six is gated behind a
-  `RutCapabilities` flag, for the same reason as round-2. A seventh finding —
-  `CONNECT` matching the any-method route — is a mis-forward, not a
-  fail-closed refusal, and is recorded separately above (not as a numbered
-  table row) with the two converter-level fixes that were tried and found
-  infeasible within the lexer's token budget and the language's expression
-  grammar.
+  `RutCapabilities` flag, for the same reason as round-2. A seventh,
+  historical finding at that review head — `CONNECT` matching the any-method
+  route — was a mis-forward, not a fail-closed refusal. It is recorded
+  separately above (not as a numbered table row) with the two converter-level
+  fixes that were tried and found infeasible within the lexer's token budget
+  and the language's expression grammar; runtime admission now fixes the
+  origin-form case as described above.
 - PR 2 (envoy-pr-plan.md): pinned
   `envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4`
   (`v1.39.1`, `tests/pinned-envoy-image.txt`) and added the docker-gated

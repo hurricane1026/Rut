@@ -941,8 +941,13 @@ emitted text, since that still doesn't compile on this branch.
    even the generic one. `failure_policy` fires only for a connect-establishment
    failure; a post-accept reset with zero response bytes takes a different,
    silent path.
-7. **`CONNECT` matching the any-method route (bug, not a fail-closed
-   divergence).** `route_table.h`'s own comment states "method 0 in a route
+7. **Origin-form `CONNECT` admission (fixed by #708).** Shared runtime
+   admission rejects `CONNECT /` with a local 400 before any route or upstream
+   effect; HTTP/1 closes and HTTP/2 returns a status-only 400. Existing strict
+   zero-byte fences retain precedence. Authority-form CONNECT retains its
+   unmatched behavior, and TRACE still reaches method-any routes. No converter
+   route expansion or new language keyword is needed. The following is the
+   historical evidence for the original bug. `route_table.h`'s own comment states "method 0 in a route
    entry matches any request method"; a method-omitted `route "/"` therefore
    matches `CONNECT` too. Envoy's HCM rejects a `CONNECT` request whose
    `:path` is non-empty before ever reaching the router
@@ -982,12 +987,14 @@ emitted text, since that still doesn't compile on this branch.
      the `CONNECT` mis-forward for a new `TRACE` divergence rather than fix
      anything.
 
-   Fixing this without introducing a new divergence needs a runtime or
-   language capability this milestone does not have today: an
-   expression-position `CONNECT` (and `TRACE`) method literal, a per-route
-   method-exclusion list, or a lexer token budget large enough for one
-   explicit route per forwarded method. Recorded as a bug (not a
-   `NOT_IMPLEMENTED`/`PARTIAL` row) in docs/envoy-compatibility.md.
+   Before #708, fixing this solely in the converter without introducing a new
+   divergence would have needed a runtime or language capability that the
+   milestone did not have: an expression-position `CONNECT` (and `TRACE`)
+   method literal, a per-route method-exclusion list, or a lexer token budget
+   large enough for one explicit route per forwarded method. The runtime
+   admission fix in #708 supersedes those converter-only alternatives; this
+   paragraph is retained as historical analysis, while the current status is
+   the fixed behavior described above.
 
 **Round-4 review edge cases (PR #692)**
 
