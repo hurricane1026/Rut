@@ -14,8 +14,10 @@ one client send per upstream chunk. The current model is:
   (`consume_upstream_sent`) **after** that send completes.
 - The io_uring TLS send path (`submit_send_impl` → `tls_pump_send`) encrypts the
   plaintext **lazily**: it holds a pointer `tls_send_src = upstream_recv_buf.data()`
-  and `SSL_write`s a record at a time into `tls_out_slice`, flushing each, until
-  the whole chunk has drained — only then firing the upper-layer continuation.
+  and `SSL_write`s a record at a time into `tls_out_slice`, flushing each. For
+  a connection-closing direct response, the first drain is deferred while the
+  current logical send is still being encrypted; the upper-layer continuation
+  still fires only after the real drain CQE.
 
 This is a strictly **serialized single-send model**: the proxy assumes exactly
 one outstanding client send, tracked by one `upstream_send_len`, sent from
@@ -206,6 +208,8 @@ The one primitive both send shapes use. It must **loop on partial writes** and
 
 ```text
 fill_output(conn, src, len) -> (consumed, status):    # status ∈ {Done, NeedRoom, NeedRead, Fatal}
+  defer_first = (!tls_out_inflight && tls_out_buf.empty() && !conn.keep_alive &&
+                 tls_single_shot_send_owner_is_current(conn))
   off = 0
   while off < len:
      set_output(engine, tls_out_buf.write_ptr, tls_out_buf.write_avail)
@@ -214,8 +218,14 @@ fill_output(conn, src, len) -> (consumed, status):    # status ∈ {Done, NeedRo
      # returns (incl. on WantWrite), so commit whatever it produced EVERY pass —
      # else those bytes never drain and the low watermark never arrives.
      tls_out_buf.commit(tls_engine_output_len(engine))
-     if !ensure_draining(conn): return (off, Fatal)        # submit_send_raw failure → close
-     if w > 0: off += w; continue                          # PARTIAL_WRITE: positive < len is legal
+     if w > 0:
+        previous = off
+        off += w                                            # PARTIAL_WRITE is legal
+        if !defer_first or off == len:
+           if !ensure_draining(conn): return (previous, Fatal) # fail closed; no completion published
+           defer_first = false
+        continue
+     if !ensure_draining(conn): return (off, Fatal)         # all non-positive exits drain
      if st == WantWrite: return (off, NeedRoom)            # buffer full mid-chunk
      if st == WantRead:  return (off, NeedRead)            # post-handshake control needs a read
      return (off, Fatal)

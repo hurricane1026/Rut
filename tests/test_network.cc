@@ -13415,6 +13415,85 @@ TEST(tls_iouring, strict_tls_constrained_output_needroom_keeps_raw_owner_and_rec
     CHECK_EQ(loop.pending_free_count, 0u);
     CHECK_EQ(loop.free_top, 1u);
 }
+
+TEST(tls_iouring, closing_single_shot_defers_first_drain_and_keepalive_stays_capped) {
+    auto context_result = create_tls_server_context(RUT_TESTDATA_DIR "/localhost_cert.pem",
+                                                    RUT_TESTDATA_DIR "/localhost_key.pem");
+    REQUIRE(context_result.has_value());
+    std::unique_ptr<TlsServerContext, decltype(&destroy_tls_server_context)> context(
+        context_result.value(), destroy_tls_server_context);
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn.fd, 0);
+    loop.free_top = 0;
+    loop.tls_server = context.get();
+    REQUIRE(loop.tls_setup(conn));
+    TlsMemoryClientPeer client;
+    REQUIRE(client.init());
+    REQUIRE(tls_engine_handshake_with_memory_client(conn.tls_engine, client.ssl));
+    conn.tls_handshake_complete = true;
+    conn.keep_alive = false;
+    conn.tls_out_buf.reset();
+
+    static u8 payload[49254];
+    __builtin_memset(payload, 0x5a, sizeof(payload));
+    u32 logical_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+    conn.tls_send_owner_generation = logical_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = payload;
+    conn.tls_send_len = sizeof(payload);
+    conn.tls_send_off = 0;
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+    g_tls_pending_send_called = false;
+
+    u32 consumed = 0;
+    REQUIRE_EQ(tls_fill_output<IoUringEventLoop>(&loop, conn, payload, sizeof(payload), consumed),
+               TlsFill::Done);
+    REQUIRE_EQ(consumed, sizeof(payload));
+    conn.tls_send_off = consumed;
+    REQUIRE(conn.tls_out_inflight);
+    REQUIRE_EQ(conn.tls_out_inflight_len, conn.tls_out_buf.len());
+    REQUIRE_GT(conn.tls_out_inflight_len, 2u * IoUringEventLoop::kTlsDrainChunk);
+    CHECK_EQ(guard.sq_tail, 1u);
+
+    const u32 raw_generation = conn.tls_out_inflight_generation;
+    loop.backend.send_state[conn.id].remaining = 0;
+    loop.backend.send_state[conn.id].offset = conn.tls_out_inflight_len;
+    guard.sq_head = guard.sq_tail;
+    loop.backend.pending = 0;
+    loop.dispatch(
+        tls_send_event(conn.id, static_cast<i32>(conn.tls_out_inflight_len), raw_generation));
+    CHECK(g_tls_pending_send_called);
+    CHECK_EQ(g_tls_pending_send_result, sizeof(payload));
+    CHECK_FALSE(conn.tls_out_inflight);
+
+    conn.keep_alive = true;
+    conn.tls_out_buf.reset();
+    REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+    conn.tls_send_owner_generation = logical_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    conn.tls_send_src = payload;
+    conn.tls_send_len = sizeof(payload);
+    conn.tls_send_off = 0;
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+    REQUIRE_EQ(tls_fill_output<IoUringEventLoop>(&loop, conn, payload, sizeof(payload), consumed),
+               TlsFill::Done);
+    REQUIRE(conn.tls_out_inflight);
+    CHECK_GT(conn.tls_out_inflight_len, 0u);
+    CHECK_LE(conn.tls_out_inflight_len, IoUringEventLoop::kTlsDrainChunk);
+    CHECK_LT(conn.tls_out_inflight_len, conn.tls_out_buf.len());
+    guard.sq_head = guard.sq_tail;
+    loop.backend.pending = 0;
+    loop.close_conn(conn);
+}
 #endif  // __linux__
 
 TEST(tls_engine, accessor_helpers_track_ciphertext_offsets) {
