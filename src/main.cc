@@ -377,13 +377,14 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
     static UpstreamConcurrency upstream_cc;
     upstream_cc.reset();
 
-    // Create one SO_REUSEPORT listen socket per shard.
+    // A single shard binds exclusively. Multiple shards use SO_REUSEPORT.
     // If port==0 (ephemeral), create shard 0 first to get the assigned port,
     // then create remaining sockets on that concrete port.
     for (u32 i = 0; i < shard_count; i++) {
         ListenerContext derived_context{};
         const ListenerContext* expected_context = i == 0 ? nullptr : &bound_listener_context;
-        auto lfd_result = bind_listener_shard(listener, port, expected_context, &derived_context);
+        auto lfd_result = bind_listener_shard(
+            listener, port, expected_context, &derived_context, shard_count > 1);
         if (!lfd_result) {
             write_str("Failed to create listen socket for shard ");
             write_u32(i);

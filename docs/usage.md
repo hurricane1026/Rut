@@ -162,7 +162,7 @@ gracefully before exiting.
 | `<port>` (positional) | Listen port (`0` = ephemeral) | `8080` |
 | `<path.rut>` (positional) | Program to load and serve | none (route-less) |
 | `--compile PATH` | Compile and serve a program using the managed compiler subprocess | none |
-| `--shards N` | Number of per-core shards | auto (CPU count) |
+| `--shards N` | Number of per-core shards; one shard binds exclusively, multiple shards share the port with `SO_REUSEPORT` on Linux | auto (CPU count) |
 | `--no-pin` | Do not pin shard threads to CPUs | pin on |
 | `--drain N` | Graceful drain window, seconds | `30` |
 | `--opt N` | JIT optimization level: `0` (low, fastest startup) .. `3` (high) | `2` |
