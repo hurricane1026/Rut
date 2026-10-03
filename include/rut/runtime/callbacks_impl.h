@@ -9285,7 +9285,20 @@ void on_response_body_recvd(void* lp, Connection& conn, IoEvent ev) {
         }
     }
 
-    if (start_upstream_body_relay<Loop>(loop, conn, send_len)) return;
+    if constexpr (requires(Loop* candidate, Connection& c, u32 n) {
+                      candidate->arm_response_splice_after_prefix(c, n);
+                  }) {
+        if (loop->arm_response_splice_after_prefix(conn, send_len)) {
+            // The serialized prefix is sent by the ordinary Send owner.  The
+            // splice state machine is admitted only from its completion, after
+            // upstream_recv_buf and all old recv ownership are neutral.
+            conn.relay_owner.admit_after_prefix = true;
+        } else if (start_upstream_body_relay<Loop>(loop, conn, send_len)) {
+            return;
+        }
+    } else if (start_upstream_body_relay<Loop>(loop, conn, send_len)) {
+        return;
+    }
 
     conn.resp_body_sent += send_len;
     conn.upstream_send_len = send_len;
@@ -9524,6 +9537,17 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
 
     conn.clear_slots();
     const u32 kRemaining = consume_upstream_sent(conn);
+
+    if constexpr (requires(Loop* candidate, Connection& c) {
+                      candidate->start_response_splice(c);
+                  }) {
+        if (conn.relay_owner.admit_after_prefix) {
+            conn.relay_owner.admit_after_prefix = false;
+            if (loop->start_response_splice(conn)) return;
+            // Pipe setup/SQE admission failed before any byte entered the
+            // pipe. Continue through the existing copy path.
+        }
+    }
 
     bool body_done = false;
     if (conn.resp_body_mode == BodyMode::ContentLength) {

@@ -359,7 +359,8 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    i32 access_log_level,
                                    SourceAccessLogFd* source_live_fd,
                                    const RouteConfig* route_config,
-                                   bool serve_metrics) {
+                                   bool serve_metrics,
+                                   bool relay_stats_enabled) {
     u16 port = listener.port;
     ListenerContext bound_listener_context{};
     Shard<EventLoopType> shards[kMaxShards];
@@ -606,6 +607,29 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             access_log_fd = -1;
         }
         if (!finish_source_live()) success = false;
+        if (relay_stats_enabled) {
+            if constexpr (requires {
+                              shards[0].loop->relay_admissions;
+                              shards[0].loop->relay_pulled_bytes;
+                              shards[0].loop->relay_written_bytes;
+                          }) {
+                u64 admissions = 0;
+                u64 pulled = 0;
+                u64 written = 0;
+                for (u32 i = 0; i < shard_count; ++i) {
+                    admissions += shards[i].loop->relay_admissions;
+                    pulled += shards[i].loop->relay_pulled_bytes;
+                    written += shards[i].loop->relay_written_bytes;
+                }
+                write_str("RUT_RELAY_STATS admissions=");
+                write_u64(admissions);
+                write_str(" pulled_bytes=");
+                write_u64(pulled);
+                write_str(" written_bytes=");
+                write_u64(written);
+                write_str("\n");
+            }
+        }
         for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
         return success;
     };
@@ -781,6 +805,7 @@ int main(int argc, char** argv) {
     bool access_log_compress = false;
     bool cli_access_log_compress_present = false;
     bool environment_access_log_compress_present = false;
+    bool relay_stats_enabled = false;
     // Advertise HTTP/2 over ALPN. Opt-in for now: h2 serves static/return-status
     // routes; JIT-handler and proxy routes answer 503 over h2 (follow-up).
     bool offer_h2 = false;
@@ -969,6 +994,13 @@ int main(int argc, char** argv) {
             if (str_eq(*e, kEnv)) {
                 access_log_compress = true;
                 environment_access_log_compress_present = true;
+                break;
+            }
+        }
+        static const char kRelayEnv[] = "RUT_BENCH_RELAY_STATS=1";
+        for (char** e = environ; *e; e++) {
+            if (str_eq(*e, kRelayEnv)) {
+                relay_stats_enabled = true;
                 break;
             }
         }
@@ -1197,7 +1229,8 @@ int main(int argc, char** argv) {
                                           access_log_level,
                                           source_live_fd_ptr,
                                           route_config,
-                                          serve_metrics);
+                                          serve_metrics,
+                                          relay_stats_enabled);
 #else
     // io_uring now terminates TLS too (event-loop TlsEngine), so it is preferred
     // whenever available — TLS no longer forces the epoll fallback.
@@ -1215,7 +1248,8 @@ int main(int argc, char** argv) {
                                                access_log_level,
                                                source_live_fd_ptr,
                                                route_config,
-                                               serve_metrics);
+                                               serve_metrics,
+                                               relay_stats_enabled);
         if (outcome.kind == RunShardsOutcomeKind::IoUringStartupFailure && tls_server) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
             outcome = run_shards<EpollEventLoop>(listener,
@@ -1230,7 +1264,8 @@ int main(int argc, char** argv) {
                                                  access_log_level,
                                                  source_live_fd_ptr,
                                                  route_config,
-                                                 serve_metrics);
+                                                 serve_metrics,
+                                                 relay_stats_enabled);
         }
     } else {
         write_str(tls_server ? "Backend: epoll (TLS)\n" : "Backend: epoll\n");
@@ -1246,7 +1281,8 @@ int main(int argc, char** argv) {
                                              access_log_level,
                                              source_live_fd_ptr,
                                              route_config,
-                                             serve_metrics);
+                                             serve_metrics,
+                                             relay_stats_enabled);
     }
 #endif
     destroy_tls_server_context(tls_server);

@@ -131,7 +131,7 @@ void IoUringBackend::decode_user_data(u64 data, u32& conn_id, IoEventType& type,
 void IoUringBackend::decode_user_data(
     u64 data, u32& conn_id, IoEventType& type, u32& aux, u32& upstream_episode) {
     type = static_cast<IoEventType>(data & 0xFFu);
-    if (io_event_is_upstream(type)) {
+    if (io_event_uses_upstream_episode(type)) {
         conn_id = static_cast<u32>((data >> 8) & kIoUserDataMaxConnId);
         aux = static_cast<u8>(data >> 56);
         upstream_episode = static_cast<u32>((data >> 32) & kIoUserDataMaxUpstreamEpisode);
@@ -680,6 +680,23 @@ bool IoUringBackend::add_recv_upstream_direct(
     return true;
 }
 
+bool IoUringBackend::add_relay_poll(i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode) {
+    if (fd < 0 || conn_id >= connection_capacity ||
+        (type != IoEventType::RelayRead && type != IoEventType::RelayWrite) ||
+        !valid_upstream_episode(upstream_episode))
+        return false;
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_POLL_ADD;
+    sqe->fd = fd;
+    sqe->poll32_events = type == IoEventType::RelayRead ? POLLIN : POLLOUT;
+    sqe->user_data = encode_upstream_user_data(conn_id, type, upstream_episode);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 bool IoUringBackend::add_first_response_recv(
     i32 fd, u32 conn_id, u32 upstream_episode, bool separate_body_ring, bool one_shot) {
     if (fd < 0 || conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode))
@@ -727,7 +744,7 @@ bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episo
 }
 
 bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32 upstream_episode) {
-    if (conn_id >= connection_capacity || !io_event_is_upstream(type) ||
+    if (conn_id >= connection_capacity || !io_event_uses_upstream_episode(type) ||
         !valid_upstream_episode(upstream_episode))
         return false;
     return cancel_by_user_data(encode_upstream_user_data(conn_id, type, upstream_episode),
@@ -1070,7 +1087,7 @@ bool IoUringBackend::cancel_by_user_data(
     u64 target, u32 conn_id, IoEventType type, u32 aux, u32 upstream_episode) {
     if (conn_id != kCancelConnId && (connection_capacity == 0 || conn_id >= connection_capacity))
         return false;
-    if (io_event_is_upstream(type) &&
+    if (io_event_uses_upstream_episode(type) &&
         (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)))
         return false;
     io_uring_sqe* sqe = get_sqe_flushing();
@@ -1085,7 +1102,7 @@ bool IoUringBackend::cancel_by_user_data(
     // cancels use the real conn_id so dispatch can account pending_ops; mid-wait
     // timeout disarms use kCancelConnId so the cancel CQE is consumed silently.
     sqe->user_data =
-        io_event_is_upstream(type)
+        io_event_uses_upstream_episode(type)
             ? encode_upstream_user_data(conn_id, type, upstream_episode, static_cast<u8>(aux))
             : encode_user_data(conn_id, type, aux);
 

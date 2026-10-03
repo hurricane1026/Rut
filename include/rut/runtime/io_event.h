@@ -13,6 +13,11 @@ enum class IoEventType : u8 {
     UpstreamConnect,
     UpstreamRecv,
     UpstreamSend,
+    // A response-body splice owns a pipe rather than an upstream buffer or
+    // downstream SendState.  These remain upstream-episode tokens so stale
+    // completions cannot be accepted after pooling or slot reuse.
+    RelayRead,
+    RelayWrite,
     Timeout,            // 1-second TimerWheel tick (keepalive driver)
     HandlerTimer,       // JIT handler yield timer expired. Precise to ms.
                         // io_uring: IORING_OP_TIMEOUT — conn_id identifies the
@@ -25,7 +30,7 @@ enum class IoEventType : u8 {
     Count,
 };
 
-static_assert(static_cast<u8>(IoEventType::Count) == 9u,
+static_assert(static_cast<u8>(IoEventType::Count) == 11u,
               "IoEventType should keep all runtime event tags and remain small");
 
 // Future upstream-event token layout in the existing 64-bit user_data budget:
@@ -49,6 +54,11 @@ inline constexpr bool io_event_is_upstream(IoEventType type) {
            type == IoEventType::UpstreamSend;
 }
 
+inline constexpr bool io_event_uses_upstream_episode(IoEventType type) {
+    return io_event_is_upstream(type) || type == IoEventType::RelayRead ||
+           type == IoEventType::RelayWrite;
+}
+
 struct UpstreamEventToken {
     u32 conn_id = 0;
     IoEventType type = IoEventType::Count;
@@ -68,7 +78,7 @@ inline constexpr u32 kResponseReadTimerCancelBit = 0x80000000u;
 inline constexpr u32 kResponseReadTimerGenerationMask = 0x7FFFFFFFu;
 
 inline constexpr bool valid_upstream_event_token(const UpstreamEventToken& token) {
-    return token.conn_id <= kIoUserDataMaxConnId && io_event_is_upstream(token.type) &&
+    return token.conn_id <= kIoUserDataMaxConnId && io_event_uses_upstream_episode(token.type) &&
            token.episode != 0 && token.episode <= kIoUserDataMaxUpstreamEpisode;
 }
 
@@ -97,7 +107,7 @@ inline constexpr bool decode_upstream_event_token(u64 data, UpstreamEventToken* 
 inline constexpr bool valid_non_upstream_user_data(const NonUpstreamUserData& value) {
     if (value.conn_id > kIoUserDataMaxConnId ||
         static_cast<u8>(value.type) >= static_cast<u8>(IoEventType::Count) ||
-        io_event_is_upstream(value.type))
+        io_event_uses_upstream_episode(value.type))
         return false;
     if (value.type == IoEventType::ResponseReadTimer)
         return (value.generation & kResponseReadTimerGenerationMask) != 0;
@@ -198,7 +208,7 @@ inline constexpr bool valid_response_read_timer_transport_event(const IoEvent& e
 }
 
 inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {
-    return io_event_is_upstream(event.type) &&
+    return io_event_uses_upstream_episode(event.type) &&
            (event.upstream_episode == kInvalidUpstreamEventEpisode ||
             (event.upstream_episode != 0 && event.upstream_episode != current_episode));
 }

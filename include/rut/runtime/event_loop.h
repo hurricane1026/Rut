@@ -143,6 +143,12 @@ public:
             case IoEventType::UpstreamConnect:
                 if (conn.on_upstream_send) conn.on_upstream_send(&self(), conn, ev);
                 break;
+            case IoEventType::RelayRead:
+            case IoEventType::RelayWrite:
+                // Relay completions are consumed by the concrete proactor's
+                // dedicated state machine; they must never enter Recv/Send
+                // callback slots.
+                break;
             case IoEventType::Accept:
             case IoEventType::Timeout:
             case IoEventType::HandlerTimer:
@@ -1263,6 +1269,11 @@ public:
                         }
                     }
                 }
+                break;
+            case IoEventType::RelayRead:
+            case IoEventType::RelayWrite:
+                // Concrete proactors own relay poll retirement.  Keep these
+                // out of the legacy upstream accounting path.
                 break;
             case IoEventType::ResponseReadTimer:
                 if (ev.conn_id < connection_capacity &&
