@@ -375,11 +375,11 @@ i32 bind_loopback_listener(u16 first_port, u16 last_port, u16& port) {
     return -1;
 }
 
-void record_one_proxy_request(i32 listener, ProxyBackendResult& result) {
+void record_one_proxy_request(i32 listener, ProxyBackendResult& result, u32 accept_timeout_ms) {
     static constexpr char kResponse[] =
         "HTTP/1.1 204 No Content\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
     struct pollfd ready{listener, POLLIN, 0};
-    if (poll(&ready, 1, 5000) <= 0) {
+    if (poll(&ready, 1, static_cast<i32>(accept_timeout_ms)) <= 0) {
         result.timed_out = true;
         close(listener);
         return;
@@ -591,6 +591,8 @@ struct SourceLiveProxyResult {
     ProxyBackendResult backend;
     std::string response;
     bool request_completed = false;
+    bool backend_started = false;
+    bool backend_joined = false;
     bool backend_joined_live = false;
     bool sink_prefixes_valid = true;
     bool sink_observed_live = false;
@@ -703,7 +705,8 @@ void report_source_live_failure(const SourceLiveProxyResult& result) {
                   "backend_accept_ms=%lld\n"
                   "      client: attempted=%d connected=%d connect_errno=%d written=%d eof=%d "
                   "read_errno=%d idle_polls=%u response_bytes=%zu\n"
-                  "      backend: accepts=%u sends=%u timed_out=%d request_bytes=%zu\n"
+                  "      backend: started=%d joined=%d accepts=%u sends=%u timed_out=%d "
+                  "request_bytes=%zu\n"
                   "      process: shutdown_sent=%d forced_kill=%d status_valid=%d status=0x%x\n"
                   "      recheck (reachability only, not ownership): done=%d connect_errno=%d\n"
                   "      specific-address bind 127.0.0.1:<port>: errno=%d (%s)\n"
@@ -721,6 +724,8 @@ void report_source_live_failure(const SourceLiveProxyResult& result) {
                   result.client.read_errno,
                   result.client.idle_polls,
                   result.response.size(),
+                  result.backend_started ? 1 : 0,
+                  result.backend_joined ? 1 : 0,
                   result.backend.accepts,
                   result.backend.sends,
                   result.backend.timed_out ? 1 : 0,
@@ -773,13 +778,14 @@ bool is_prefix_of(const std::string& value, const char* expected) {
            std::memcmp(value.data(), expected, value.size()) == 0;
 }
 
-SourceLiveProxyResult run_source_live_proxy(
-    const std::vector<std::string>& args,
-    const std::string& sink,
-    i32 backend_listener,
-    const char* request,
-    size_t request_length,
-    SourceLiveProxyMode mode = SourceLiveProxyMode::Success) {
+SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args,
+                                            const std::string& sink,
+                                            i32 backend_listener,
+                                            const char* request,
+                                            size_t request_length,
+                                            SourceLiveProxyMode mode = SourceLiveProxyMode::Success,
+                                            u32 child_pre_exec_delay_ms = 0u,
+                                            u32 backend_accept_timeout_ms = 5000u) {
     SourceLiveProxyResult result{};
     i32 output_pipe[2];
     if (pipe(output_pipe) != 0) {
@@ -796,6 +802,8 @@ SourceLiveProxyResult run_source_live_proxy(
         if (mode == SourceLiveProxyMode::FileSizeWriteFatal) {
             if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR) _exit(124);
         }
+        if (child_pre_exec_delay_ms != 0u)
+            (void)poll(nullptr, 0, static_cast<i32>(child_pre_exec_delay_ms));
         std::vector<char*> argv;
         argv.reserve(args.size() + 1u);
         for (const std::string& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
@@ -811,7 +819,8 @@ SourceLiveProxyResult run_source_live_proxy(
     }
     close(output_pipe[1]);
     result.forked_at_ns = monotonic_ns();
-    std::thread backend(record_one_proxy_request, backend_listener, std::ref(result.backend));
+    std::thread backend;
+    bool backend_listener_owned = true;
     const i32 old_flags = fcntl(output_pipe[0], F_GETFL);
     if (old_flags >= 0) (void)fcntl(output_pipe[0], F_SETFL, old_flags | O_NONBLOCK);
 
@@ -859,6 +868,15 @@ SourceLiveProxyResult run_source_live_proxy(
                 }
             }
 #endif
+            // Anchor the backend accept budget at listener readiness. Starting
+            // the worker immediately after fork lets JIT startup consume its
+            // timeout before rut has opened the frontend or begun forwarding.
+            backend = std::thread(record_one_proxy_request,
+                                  backend_listener,
+                                  std::ref(result.backend),
+                                  backend_accept_timeout_ms);
+            result.backend_started = true;
+            backend_listener_owned = false;
             result.request_completed =
                 transact_loopback(port, request, request_length, result.response, result.client);
             result.transact_done_ns = monotonic_ns();
@@ -872,9 +890,10 @@ SourceLiveProxyResult run_source_live_proxy(
                 result.specific_bind_errno = probe_specific_loopback_bind(port);
             }
         }
-        if (transaction_attempted && !backend_joined) {
+        if (transaction_attempted && result.backend_started && !backend_joined) {
             backend.join();
             backend_joined = true;
+            result.backend_joined = true;
             backend_joined_this_iteration = true;
         }
         pid_t waited;
@@ -900,7 +919,12 @@ SourceLiveProxyResult run_source_live_proxy(
         }
         if (waited < 0 && errno != ECHILD) break;
     }
-    if (!backend_joined) backend.join();
+    if (result.backend_started && !backend_joined) {
+        backend.join();
+        backend_joined = true;
+        result.backend_joined = true;
+    }
+    if (backend_listener_owned) close(backend_listener);
     if (!reaped) {
         result.process.forced_kill = true;
         (void)kill(child, SIGKILL);
@@ -989,7 +1013,7 @@ TEST(access_log_startup, listening_port_waits_for_the_complete_readiness_line) {
     CHECK_EQ(listening_port("Listening on port 123456 with 1 shard(s)\n"), 0u);
 }
 
-TEST(access_log_startup, public_main_source_live_publishes_downstream_size_before_shutdown) {
+TEST(access_log_startup, public_main_source_live_backend_budget_starts_after_readiness) {
     const std::string dir = make_temp_dir("/tmp/rut-access-log-startup-main-XXXXXX");
     REQUIRE_FALSE(dir.empty());
     const std::string program = dir + "/app.rut";
@@ -1021,15 +1045,22 @@ TEST(access_log_startup, public_main_source_live_publishes_downstream_size_befor
         sink,
         backend_listener,
         kClientRequest,
-        sizeof(kClientRequest) - 1u);
+        sizeof(kClientRequest) - 1u,
+        SourceLiveProxyMode::Success,
+        500u,  // Controlled pre-exec delay exceeds the backend's accept budget.
+        300u);
     if (!live.request_completed || !live.sink_observed_live || live.process.forced_kill)
         report_source_live_failure(live);
     CHECK(live.request_completed);
+    CHECK(live.backend_started);
+    CHECK(live.backend_joined);
     CHECK(live.backend_joined_live);
     CHECK(live.sink_prefixes_valid);
     CHECK(live.sink_observed_live);
     CHECK_FALSE(live.backend.timed_out);
     CHECK_EQ(live.backend.accepts, 1u);
+    CHECK_GE(live.backend.accepted_at_ns, live.listening_seen_ns);
+    CHECK_GE(ms_since(live.forked_at_ns, live.listening_seen_ns), 450LL);
     CHECK_EQ(live.backend.sends, 1u);
     CHECK_EQ(live.backend.request, expected_backend);
     CHECK_EQ(live.response, kBackendResponse);
@@ -1088,9 +1119,12 @@ TEST(access_log_startup, public_main_source_live_write_fatal_exits_without_retry
         sizeof(kClientRequest) - 1u,
         SourceLiveProxyMode::FileSizeWriteFatal);
     CHECK(fatal.request_completed);
+    CHECK(fatal.backend_started);
+    CHECK(fatal.backend_joined);
     CHECK(fatal.sink_prefixes_valid);
     CHECK_FALSE(fatal.backend.timed_out);
     CHECK_EQ(fatal.backend.accepts, 1u);
+    CHECK_GE(fatal.backend.accepted_at_ns, fatal.listening_seen_ns);
     CHECK_EQ(fatal.backend.sends, 1u);
     CHECK_EQ(fatal.backend.request, expected_backend);
     CHECK_EQ(fatal.response, kBackendResponse);
