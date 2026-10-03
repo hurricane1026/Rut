@@ -10800,6 +10800,166 @@ struct ReuseUpstream {
     }
 };
 
+enum class KeepaliveBenchPhase {
+    None,
+    NonblockingSetup,
+    RequestWrite,
+    ResponseHeader,
+    ResponseBody
+};
+
+static constexpr u32 kKeepaliveBenchRequestCount = 5000u;
+// Neither per-request progress nor intermittent SSL bytes extend these absolute deadlines.
+static constexpr u64 kKeepaliveBenchRequestDeadlineNs = 15'000'000'000ull;
+static constexpr u64 kKeepaliveBenchOverallDeadlineNs = 180'000'000'000ull;
+
+struct KeepaliveBenchFailure {
+    bool failed = false;
+    bool timed_out = false;
+    bool overall_deadline_expired = false;
+    u32 request_index = 0;
+    u32 completed = 0;
+    KeepaliveBenchPhase phase = KeepaliveBenchPhase::None;
+    int ssl_result = 0;
+    int ssl_error = SSL_ERROR_NONE;
+    int error_number = 0;
+    u32 response_bytes = 0;
+    u32 response_header_bytes = 0;
+    u32 response_body_bytes = 0;
+    u64 request_elapsed_ns = 0;
+    u64 overall_elapsed_ns = 0;
+    u32 upstream_accepts = 0;
+    u32 upstream_closed = 0;
+};
+
+static u64 keepalive_bench_now_ns() {
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return static_cast<u64>(time.tv_sec) * 1000000000ull + static_cast<u64>(time.tv_nsec);
+}
+
+static bool keepalive_bench_poll_until(int fd, short events, u64 deadline_ns, int& error_number) {
+    for (;;) {
+        const u64 now = keepalive_bench_now_ns();
+        if (now >= deadline_ns) {
+            error_number = ETIMEDOUT;
+            return false;
+        }
+        const u64 remaining_ns = deadline_ns - now;
+        const u64 remaining_ms = (remaining_ns + 999'999u) / 1'000'000u;
+        const int timeout_ms =
+            remaining_ms > static_cast<u64>(INT_MAX) ? INT_MAX : static_cast<int>(remaining_ms);
+        struct pollfd descriptor{fd, events, 0};
+        const int rc = poll(&descriptor, 1, timeout_ms);
+        if (rc > 0) {
+            if ((descriptor.revents & POLLNVAL) != 0) {
+                error_number = EBADF;
+                return false;
+            }
+            if ((descriptor.revents & (events | POLLERR | POLLHUP)) != 0) return true;
+            continue;
+        }
+        if (rc == 0) {
+            error_number = ETIMEDOUT;
+            return false;
+        }
+        if (errno == EINTR) continue;
+        error_number = errno;
+        return false;
+    }
+}
+
+static bool keepalive_bench_wait_for_ssl(
+    SSL* ssl, int ssl_error, u64 request_deadline_ns, u64 overall_deadline_ns, int& error_number) {
+    const int fd = SSL_get_fd(ssl);
+    if (fd < 0) {
+        error_number = EBADF;
+        return false;
+    }
+    const short events = ssl_error == SSL_ERROR_WANT_WRITE ? POLLOUT : POLLIN;
+    return keepalive_bench_poll_until(
+        fd, events, std::min(request_deadline_ns, overall_deadline_ns), error_number);
+}
+
+static const char* keepalive_bench_phase_name(KeepaliveBenchPhase phase) {
+    switch (phase) {
+        case KeepaliveBenchPhase::NonblockingSetup:
+            return "nonblocking_setup";
+        case KeepaliveBenchPhase::RequestWrite:
+            return "SSL_write";
+        case KeepaliveBenchPhase::ResponseHeader:
+            return "response_header";
+        case KeepaliveBenchPhase::ResponseBody:
+            return "response_body";
+        default:
+            return "none";
+    }
+}
+
+static int format_keepalive_bench_failure(const KeepaliveBenchFailure& failure,
+                                          char* output,
+                                          size_t output_capacity) {
+    return snprintf(output,
+                    output_capacity,
+                    "[bench] keepalive_latency_bench failure request=%u completed=%u/%u "
+                    "phase=%s timed_out=%u overall_deadline_expired=%u ssl_result=%d "
+                    "ssl_error=%d errno=%d "
+                    "response_bytes=%u response_header_bytes=%u response_body_bytes=%u "
+                    "request_elapsed_ms=%.3f overall_elapsed_ms=%.3f "
+                    "request_deadline_ms=%u overall_deadline_ms=%u "
+                    "upstream_accepts=%u upstream_closed=%u\n",
+                    failure.request_index,
+                    failure.completed,
+                    kKeepaliveBenchRequestCount,
+                    keepalive_bench_phase_name(failure.phase),
+                    failure.timed_out ? 1u : 0u,
+                    failure.overall_deadline_expired ? 1u : 0u,
+                    failure.ssl_result,
+                    failure.ssl_error,
+                    failure.error_number,
+                    failure.response_bytes,
+                    failure.response_header_bytes,
+                    failure.response_body_bytes,
+                    static_cast<double>(failure.request_elapsed_ns) / 1e6,
+                    static_cast<double>(failure.overall_elapsed_ns) / 1e6,
+                    static_cast<u32>(kKeepaliveBenchRequestDeadlineNs / 1'000'000u),
+                    static_cast<u32>(kKeepaliveBenchOverallDeadlineNs / 1'000'000u),
+                    failure.upstream_accepts,
+                    failure.upstream_closed);
+}
+
+static bool keepalive_bench_deadline_self_check() {
+    int fds[2] = {-1, -1};
+    if (pipe(fds) != 0) return false;
+    const u64 started = keepalive_bench_now_ns();
+    int error_number = 0;
+    const bool ready =
+        keepalive_bench_poll_until(fds[0], POLLIN, started + 25'000'000u, error_number);
+    const u64 elapsed_ns = keepalive_bench_now_ns() - started;
+    close(fds[0]);
+    close(fds[1]);
+
+    KeepaliveBenchFailure failure{};
+    failure.failed = true;
+    failure.timed_out = !ready && error_number == ETIMEDOUT;
+    failure.request_index = 7;
+    failure.completed = 7;
+    failure.phase = KeepaliveBenchPhase::ResponseHeader;
+    failure.error_number = error_number;
+    failure.request_elapsed_ns = elapsed_ns;
+    failure.overall_elapsed_ns = elapsed_ns;
+    failure.upstream_accepts = 7;
+    failure.upstream_closed = 6;
+    char diagnostic[512];
+    const int diagnostic_len =
+        format_keepalive_bench_failure(failure, diagnostic, sizeof(diagnostic));
+    return !ready && error_number == ETIMEDOUT && elapsed_ns >= 25'000'000u && diagnostic_len > 0 &&
+           static_cast<size_t>(diagnostic_len) < sizeof(diagnostic) &&
+           strstr(diagnostic, "phase=response_header timed_out=1") != nullptr &&
+           strstr(diagnostic, "request=7 completed=7/5000") != nullptr &&
+           strstr(diagnostic, "upstream_accepts=7 upstream_closed=6") != nullptr;
+}
+
 // Regression for the upstream-recv cancel-collision (now fixed by cancel-by-fd):
 // many keep-alive proxied requests over one TLS connection, each ending in a body
 // completion that cancels the upstream recv. A stale cancel matching the next
@@ -10936,15 +11096,20 @@ TEST(proxy_tls_iouring, keepalive_reuse_post_body_no_cancel_collision) {
 // req/s and p50/p99 per-request latency to the log so a change like cancel-by-fd
 // (off the per-byte path → expected no-op) can be eyeballed against history. NOT a
 // pass/fail perf gate (shared CI runners are too noisy for a stable threshold) — it
-// asserts only that every request completes, so a gross regression that hangs or
-// truncates still fails the job.
+// asserts only that every request completes within finite request/run deadlines, so a
+// gross regression that stalls or truncates still fails the job with phase diagnostics.
 TEST(proxy_tls_iouring, keepalive_latency_bench) {
     if (std::getenv("RUT_BENCH") == nullptr) SKIP("set RUT_BENCH=1 to run the proxy bench");
+    if (!keepalive_bench_deadline_self_check()) {
+        fprintf(stderr, "FAIL: keepalive benchmark finite-poll/diagnostic self-check\n");
+        CHECK(false);
+        return;
+    }
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
     using namespace rut;
 
     constexpr u32 kBody = 4u * 1024u;
-    constexpr u32 kN = 5000u;
+    constexpr u32 kN = kKeepaliveBenchRequestCount;
     ReuseUpstream backend;
     REQUIRE(backend.setup(kBody));
 
@@ -10981,20 +11146,197 @@ TEST(proxy_tls_iouring, keepalive_latency_bench) {
     static u8 in[64u * 1024u];
     static u64 lat_ns[kN];
     u32 completed = 0;
-    auto now_ns = []() -> u64 {
-        struct timespec t;
-        clock_gettime(CLOCK_MONOTONIC, &t);
-        return static_cast<u64>(t.tv_sec) * 1000000000ull + static_cast<u64>(t.tv_nsec);
+    const u64 t0 = keepalive_bench_now_ns();
+    const u64 overall_deadline_ns = t0 + kKeepaliveBenchOverallDeadlineNs;
+    KeepaliveBenchFailure failure{};
+    const auto record_failure = [&](u32 request_index,
+                                    u64 request_started_ns,
+                                    KeepaliveBenchPhase phase,
+                                    bool timed_out,
+                                    int ssl_result,
+                                    int ssl_error,
+                                    int error_number,
+                                    u32 response_bytes,
+                                    u32 response_header_bytes,
+                                    u32 response_body_bytes) {
+        if (failure.failed) return;
+        const u64 now = keepalive_bench_now_ns();
+        failure.failed = true;
+        failure.timed_out = timed_out;
+        failure.overall_deadline_expired = timed_out && now >= overall_deadline_ns;
+        failure.request_index = request_index;
+        failure.completed = completed;
+        failure.phase = phase;
+        failure.ssl_result = ssl_result;
+        failure.ssl_error = ssl_error;
+        failure.error_number = error_number;
+        failure.response_bytes = response_bytes;
+        failure.response_header_bytes = response_header_bytes;
+        failure.response_body_bytes = response_body_bytes;
+        failure.request_elapsed_ns = now - request_started_ns;
+        failure.overall_elapsed_ns = now - t0;
+        failure.upstream_accepts = backend.accept_count.load(std::memory_order_acquire);
+        failure.upstream_closed = backend.closed_count.load(std::memory_order_acquire);
     };
-    const u64 t0 = now_ns();
+
+    const int socket_flags = fcntl(c, F_GETFL, 0);
+    if (socket_flags < 0 || fcntl(c, F_SETFL, socket_flags | O_NONBLOCK) != 0) {
+        const int saved_errno = errno;
+        record_failure(0,
+                       t0,
+                       KeepaliveBenchPhase::NonblockingSetup,
+                       false,
+                       0,
+                       SSL_ERROR_NONE,
+                       saved_errno,
+                       0,
+                       0,
+                       0);
+    }
     for (u32 r = 0; r < kN; r++) {
-        const u64 ta = now_ns();
-        if (!ssl_write_all(ssl, kReq, sizeof(kReq) - 1)) break;
+        if (failure.failed) break;
+        const u64 ta = keepalive_bench_now_ns();
+        const u64 request_deadline_ns =
+            std::min(ta + kKeepaliveBenchRequestDeadlineNs, overall_deadline_ns);
+        u32 request_sent = 0;
+        while (request_sent < sizeof(kReq) - 1u) {
+            if (keepalive_bench_now_ns() >= request_deadline_ns) {
+                record_failure(r + 1u,
+                               ta,
+                               KeepaliveBenchPhase::RequestWrite,
+                               true,
+                               0,
+                               SSL_ERROR_NONE,
+                               ETIMEDOUT,
+                               0,
+                               0,
+                               0);
+                break;
+            }
+            ERR_clear_error();
+            errno = 0;
+            const i32 n = SSL_write(
+                ssl, kReq + request_sent, static_cast<i32>(sizeof(kReq) - 1u - request_sent));
+            const u64 write_completed_ns = n > 0 ? keepalive_bench_now_ns() : 0;
+            const int saved_errno = errno;
+            if (n > 0) {
+                request_sent += static_cast<u32>(n);
+                if (write_completed_ns >= request_deadline_ns) {
+                    record_failure(r + 1u,
+                                   ta,
+                                   KeepaliveBenchPhase::RequestWrite,
+                                   true,
+                                   n,
+                                   SSL_ERROR_NONE,
+                                   ETIMEDOUT,
+                                   0,
+                                   0,
+                                   0);
+                    break;
+                }
+                continue;
+            }
+            const int ssl_error = SSL_get_error(ssl, n);
+            if (saved_errno == EINTR) continue;
+            if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                int wait_error = 0;
+                if (keepalive_bench_wait_for_ssl(
+                        ssl, ssl_error, request_deadline_ns, overall_deadline_ns, wait_error))
+                    continue;
+                record_failure(r + 1u,
+                               ta,
+                               KeepaliveBenchPhase::RequestWrite,
+                               wait_error == ETIMEDOUT,
+                               n,
+                               ssl_error,
+                               wait_error,
+                               0,
+                               0,
+                               0);
+                break;
+            }
+            record_failure(r + 1u,
+                           ta,
+                           KeepaliveBenchPhase::RequestWrite,
+                           false,
+                           n,
+                           ssl_error,
+                           saved_errno,
+                           0,
+                           0,
+                           0);
+            break;
+        }
+        if (failure.failed) break;
+        if (keepalive_bench_now_ns() >= request_deadline_ns) {
+            record_failure(r + 1u,
+                           ta,
+                           KeepaliveBenchPhase::RequestWrite,
+                           true,
+                           0,
+                           SSL_ERROR_NONE,
+                           ETIMEDOUT,
+                           0,
+                           0,
+                           0);
+            break;
+        }
         u32 total = 0, body_off = 0, body_seen = 0;
         bool hdr_done = false;
         while (body_seen < kBody && total < sizeof(in)) {
+            if (keepalive_bench_now_ns() >= request_deadline_ns) {
+                record_failure(r + 1u,
+                               ta,
+                               hdr_done ? KeepaliveBenchPhase::ResponseBody
+                                        : KeepaliveBenchPhase::ResponseHeader,
+                               true,
+                               0,
+                               SSL_ERROR_NONE,
+                               ETIMEDOUT,
+                               total,
+                               hdr_done ? body_off : total,
+                               body_seen);
+                break;
+            }
+            ERR_clear_error();
+            errno = 0;
             const i32 n = SSL_read(ssl, in + total, static_cast<i32>(sizeof(in) - total));
-            if (n <= 0) break;
+            const u64 read_completed_ns = n > 0 ? keepalive_bench_now_ns() : 0;
+            const int saved_errno = errno;
+            if (n <= 0) {
+                const int ssl_error = SSL_get_error(ssl, n);
+                if (saved_errno == EINTR) continue;
+                if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                    int wait_error = 0;
+                    if (keepalive_bench_wait_for_ssl(
+                            ssl, ssl_error, request_deadline_ns, overall_deadline_ns, wait_error))
+                        continue;
+                    record_failure(r + 1u,
+                                   ta,
+                                   hdr_done ? KeepaliveBenchPhase::ResponseBody
+                                            : KeepaliveBenchPhase::ResponseHeader,
+                                   wait_error == ETIMEDOUT,
+                                   n,
+                                   ssl_error,
+                                   wait_error,
+                                   total,
+                                   hdr_done ? body_off : total,
+                                   body_seen);
+                    break;
+                }
+                record_failure(r + 1u,
+                               ta,
+                               hdr_done ? KeepaliveBenchPhase::ResponseBody
+                                        : KeepaliveBenchPhase::ResponseHeader,
+                               false,
+                               n,
+                               ssl_error,
+                               saved_errno,
+                               total,
+                               hdr_done ? body_off : total,
+                               body_seen);
+                break;
+            }
             total += static_cast<u32>(n);
             if (!hdr_done) {
                 for (u32 i = 3; i < total; i++) {
@@ -11007,17 +11349,98 @@ TEST(proxy_tls_iouring, keepalive_latency_bench) {
                 }
             }
             if (hdr_done) body_seen = total - body_off;
+            if (read_completed_ns >= request_deadline_ns) {
+                record_failure(r + 1u,
+                               ta,
+                               hdr_done ? KeepaliveBenchPhase::ResponseBody
+                                        : KeepaliveBenchPhase::ResponseHeader,
+                               true,
+                               n,
+                               SSL_ERROR_NONE,
+                               ETIMEDOUT,
+                               total,
+                               hdr_done ? body_off : total,
+                               body_seen);
+                break;
+            }
         }
-        if (!hdr_done || body_seen < kBody) break;
-        lat_ns[completed++] = now_ns() - ta;
+        if (failure.failed) break;
+        if (!hdr_done || body_seen < kBody) {
+            const bool timed_out = keepalive_bench_now_ns() >= request_deadline_ns;
+            record_failure(
+                r + 1u,
+                ta,
+                hdr_done ? KeepaliveBenchPhase::ResponseBody : KeepaliveBenchPhase::ResponseHeader,
+                timed_out,
+                0,
+                SSL_ERROR_NONE,
+                timed_out ? ETIMEDOUT : EMSGSIZE,
+                total,
+                hdr_done ? body_off : total,
+                body_seen);
+            break;
+        }
+        const u64 completed_ns = keepalive_bench_now_ns();
+        if (completed_ns >= request_deadline_ns) {
+            record_failure(r + 1u,
+                           ta,
+                           KeepaliveBenchPhase::ResponseBody,
+                           true,
+                           0,
+                           SSL_ERROR_NONE,
+                           ETIMEDOUT,
+                           total,
+                           body_off,
+                           body_seen);
+            break;
+        }
+        lat_ns[completed++] = completed_ns - ta;
     }
-    const u64 total_ns = now_ns() - t0;
+    const u64 total_ns = keepalive_bench_now_ns() - t0;
+    if (completed != kN && !failure.failed) {
+        const u64 now = keepalive_bench_now_ns();
+        failure.failed = true;
+        failure.completed = completed;
+        failure.phase = KeepaliveBenchPhase::None;
+        failure.error_number = EIO;
+        failure.overall_elapsed_ns = now - t0;
+        failure.upstream_accepts = backend.accept_count.load(std::memory_order_acquire);
+        failure.upstream_closed = backend.closed_count.load(std::memory_order_acquire);
+    }
+
+    if (failure.failed) {
+        char diagnostic[512];
+        const int diagnostic_len =
+            format_keepalive_bench_failure(failure, diagnostic, sizeof(diagnostic));
+        if (diagnostic_len > 0 && static_cast<size_t>(diagnostic_len) < sizeof(diagnostic))
+            fputs(diagnostic, stderr);
+        else
+            fprintf(stderr,
+                    "[bench] keepalive_latency_bench diagnostics could not be formatted "
+                    "request=%u completed=%u/%u\n",
+                    failure.request_index,
+                    failure.completed,
+                    kN);
+    }
 
     // Tear down BEFORE asserting. Shard has no destructor that stops its thread, so an
     // early return on a failed assertion would leave the io_uring shard running with
     // pointers to this frame's config/TLS state — a leaked thread and a later flaky
     // crash. Stop everything first, then report and assert.
-    SSL_shutdown(ssl);
+    ERR_clear_error();
+    errno = 0;
+    const int shutdown_result = SSL_shutdown(ssl);
+    const int shutdown_errno = errno;
+    const int shutdown_error =
+        shutdown_result < 0 ? SSL_get_error(ssl, shutdown_result) : SSL_ERROR_NONE;
+    if (failure.failed && shutdown_result < 0)
+        fprintf(stderr,
+                "[bench] keepalive_latency_bench failure phase=teardown "
+                "SSL_shutdown result=%d "
+                "ssl_error=%d errno=%d\n",
+                shutdown_result,
+                shutdown_error,
+                shutdown_errno);
     SSL_free(ssl);
     close(c);
     SSL_CTX_free(client_ctx);
