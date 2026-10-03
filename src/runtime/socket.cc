@@ -21,7 +21,9 @@ core::Expected<void, Error> set_nonblocking(i32 fd) {
     return {};
 }
 
-core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared, u16 requested_port) {
+core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared,
+                                                u16 requested_port,
+                                                bool reuse_port) {
     if (!declared.valid())
         return core::make_unexpected(Error::make(EAFNOSUPPORT, Error::Source::Socket));
     if (declared.port != 0u && declared.port != requested_port)
@@ -33,7 +35,13 @@ core::Expected<i32, Error> create_listen_socket(const ListenerSpec& declared, u1
     i32 one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #ifdef __linux__
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+    if (reuse_port && setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) < 0) {
+        auto err = Error::from_errno(Error::Source::Socket);
+        close(fd);
+        return core::make_unexpected(err);
+    }
+#else
+    (void)reuse_port;
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 

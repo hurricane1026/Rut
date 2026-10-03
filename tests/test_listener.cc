@@ -166,6 +166,78 @@ TEST(listener, exact_ipv4_resolution_preserves_address_and_rejects_invalid_metad
     CHECK(invalid_cli.error() == ListenerResolutionError::InvalidListenerSpec);
 }
 
+namespace {
+struct ListenerFd {
+    i32 value;
+    ~ListenerFd() { close(value); }
+};
+}  // namespace
+
+TEST(listener, exclusive_bind_rejects_competing_listener) {
+    const ListenerAddress addresses[] = {ListenerAddress::IPv4Wildcard, ListenerAddress::IPv4Exact};
+    for (ListenerAddress address : addresses) {
+        ListenerSpec declared{};
+        declared.address = address;
+        declared.ipv4_host = address == ListenerAddress::IPv4Exact ? 0x7f000001u : 0u;
+        declared.port = 0;
+        ListenerContext context{};
+        auto first = bind_listener_shard(declared, 0, nullptr, &context, false);
+        REQUIRE(first);
+        ListenerFd first_fd{first.value()};
+        REQUIRE(context.valid());
+#ifdef __linux__
+        i32 reuse = -1;
+        socklen_t len = sizeof(reuse);
+        REQUIRE_EQ(getsockopt(first_fd.value, SOL_SOCKET, SO_REUSEPORT, &reuse, &len), 0);
+        CHECK_EQ(reuse, 0);
+#endif
+        // A same-UID process must fail even if it opts into SO_REUSEPORT.
+        const bool reuse_ports[] = {false, true};
+        for (bool reuse_port : reuse_ports) {
+            ListenerContext other{};
+            auto competing =
+                bind_listener_shard(declared, context.port, nullptr, &other, reuse_port);
+            CHECK_FALSE(competing);
+            if (competing) {
+                close(competing.value());
+            } else {
+                CHECK_EQ(competing.error().code, EADDRINUSE);
+                CHECK_FALSE(other.valid());
+            }
+        }
+        // An explicitly requested port follows the same exclusive path.
+        close(first_fd.value);
+        first_fd.value = -1;
+        declared.port = context.port;
+        auto rebound = bind_listener_shard(declared, declared.port, nullptr, &context, false);
+        REQUIRE(rebound);
+        ListenerFd rebound_fd{rebound.value()};
+    }
+}
+
+TEST(listener, reuse_port_allows_multiple_shards_on_one_ephemeral_port) {
+    ListenerSpec declared{};
+    declared.port = 0;
+    ListenerContext first_context{};
+    auto first = bind_listener_shard(declared, 0, nullptr, &first_context, true);
+    REQUIRE(first);
+    ListenerFd first_fd{first.value()};
+    ListenerContext second_context{};
+    auto second =
+        bind_listener_shard(declared, first_context.port, &first_context, &second_context, true);
+#ifdef __linux__
+    REQUIRE(second);
+    ListenerFd second_fd{second.value()};
+    CHECK(second_context.equivalent(first_context));
+#else
+    CHECK_FALSE(second);
+    if (second)
+        close(second.value());
+    else
+        CHECK_EQ(second.error().code, EADDRINUSE);
+#endif
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

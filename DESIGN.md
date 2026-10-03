@@ -3828,7 +3828,9 @@ Resource estimation (8 cores, C100K):
 
 ### 4.2 Accept Distribution
 
-Using `SO_REUSEPORT`: each shard binds and listens on the same port. The kernel distributes incoming connections across shards. Combined with `IORING_ACCEPT_MULTISHOT`, one SQE continuously accepts new connections.
+Single-shard servers bind without `SO_REUSEPORT`, so a competing listener
+fails with `EADDRINUSE` rather than sharing traffic. With multiple shards on
+Linux, each shard binds and listens on the same port using `SO_REUSEPORT`. The kernel distributes incoming connections across shards. Combined with `IORING_ACCEPT_MULTISHOT`, one SQE continuously accepts new connections.
 
 ```
 ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐

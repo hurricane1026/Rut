@@ -80,7 +80,8 @@ inline core::Expected<ListenerContext, ListenerContextError> derive_listener_con
 inline core::Expected<i32, Error> bind_listener_shard(const ListenerSpec& declared,
                                                       u16 requested_port,
                                                       const ListenerContext* expected,
-                                                      ListenerContext* out_context) {
+                                                      ListenerContext* out_context,
+                                                      bool reuse_port = true) {
     if (out_context == nullptr)
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     *out_context = {};
@@ -91,7 +92,7 @@ inline core::Expected<i32, Error> bind_listener_shard(const ListenerSpec& declar
     if (!declared.valid() || (expected != nullptr && !expected->valid()))
         return core::make_unexpected(Error::make(EAFNOSUPPORT, Error::Source::Socket));
 
-    auto fd_result = create_listen_socket(declared, requested_port);
+    auto fd_result = create_listen_socket(declared, requested_port, reuse_port);
     if (!fd_result) return fd_result;
     const i32 fd = fd_result.value();
 

@@ -2264,17 +2264,9 @@ bool envoy_log_confirms_listener(const std::string& contents) {
     return contents.find("starting main dispatch loop") != std::string::npos;
 }
 
-// Round-12 review, "Detect concurrent SO_REUSEPORT owners before accepting
-// readiness": `rut` sets SO_REUSEPORT on every listener it binds
-// (src/runtime/socket.cc:33-36), so a second, same-UID `rut` process racing
-// this harness for a probe-allocated port does not fail with EADDRINUSE the
-// way every other collision this harness detects does -- both binds
-// succeed, the losing process still logs the same "Listening on port N"
-// evidence, and the kernel load-balances new connections between the two,
-// so later pair-case traffic can land on whichever instance the kernel
-// happens to pick. Neither the protocol probe nor the log-confirmation
-// check above can tell the two apart: both are real, both answer
-// identically, both logged startup on this exact port.
+// Listener-count defense for the Envoy side of the differential harness.
+// Protocol and log probes cannot distinguish identical configurations when
+// same-UID sockets share a port. RUT's --shards 1 now binds exclusively.
 //
 // Counts how many rows of a /proc/net/tcp- or /proc/net/tcp6-style table are
 // in the LISTEN state (`st` field "0A", i.e. decimal 10), bound to `port`,
@@ -3594,18 +3586,8 @@ bool fill_upstream_bytes(std::vector<CaseResult>* results,
 // monitoring for the whole batch, which the kernel gives no primitive to
 // do atomically from outside the process that owns the socket) at which
 // such a co-owner would ever appear in `count_listeners_on_port()`'s
-// snapshot. `rut` unconditionally sets `SO_REUSEPORT` on every listener,
-// on every platform build, with no option to disable it
-// (src/runtime/socket.cc:35-37's `#ifdef __linux__` guards only the
-// syscall's availability, not whether it's requested); Envoy does not set
-// it by default, so this asymmetry is specific to `rut`'s own listeners.
-// Closing this for real needs a runtime opt-out (e.g. an exclusive-bind
-// mode for single-shard runs), not another harness-side sampling trick --
-// tracked as issue #719, filed from this same review. `uid` is the uid of
-// the process being checked -- pass `kEnvoyContainerUid` for an Envoy
-// phase, `getuid()` for a RUT phase (round-19 review, "Count Envoy
-// listeners using the container's UID"). Returns empty on success, else a
-// human-readable reason.
+// snapshot. Single-shard RUT prevents that race with an exclusive bind;
+// this sampling helper remains for the Envoy side.
 std::string check_no_reuseport_collision_after_batch(uint16_t port, uid_t uid) {
     const int count = count_listeners_on_port(port, uid);
     if (count > 1) {
@@ -4640,12 +4622,8 @@ bool rut_probe_confirms_ownership(uint16_t port, RutInstance& rut, int64_t deadl
 // readiness. `confirm_ms` bounds the probe phase separately from
 // `timeout_ms` (which wait_ready() may already have spent waiting for the
 // initial TCP accept).
-bool wait_ready_and_confirm_ownership(uint16_t port,
-                                      RutInstance& rut,
-                                      int timeout_ms,
-                                      int confirm_ms,
-                                      std::string* error,
-                                      bool* reuseport_collision = nullptr) {
+bool wait_ready_and_confirm_ownership(
+    uint16_t port, RutInstance& rut, int timeout_ms, int confirm_ms, std::string* error) {
     if (!wait_ready(port, rut, timeout_ms, error)) return false;
     if (!rut_probe_confirms_ownership(port, rut, now_ms() + confirm_ms)) {
         *error =
@@ -4654,22 +4632,7 @@ bool wait_ready_and_confirm_ownership(uint16_t port,
             "exited while this harness was confirming ownership";
         return false;
     }
-    // Round-12 review, "Detect concurrent SO_REUSEPORT owners before
-    // accepting readiness": `rut` sets SO_REUSEPORT on every listener it
-    // binds (src/runtime/socket.cc:33-36), so a second, same-UID `rut`
-    // sharing this exact port passes the probe above identically -- see
-    // count_listeners_on_port()'s comment. Exactly one LISTEN row for
-    // `port` is the healthy case; more than one means a co-owner exists.
-    // Checked against this harness's own getuid(): unlike Envoy, `rut` is a
-    // plain host process, not a container running under a fixed uid
-    // (round-19 review, "Count Envoy listeners using the container's UID").
-    if (count_listeners_on_port(port, getuid()) > 1) {
-        if (reuseport_collision != nullptr) *reuseport_collision = true;
-        *error = "more than one LISTEN socket is bound to port " + std::to_string(port) +
-                 " (a concurrent rut process shares it via SO_REUSEPORT); a different process "
-                 "likely raced this port";
-        return false;
-    }
+    // --shards 1 binds exclusively; another process cannot join the listener.
     return true;
 }
 
@@ -4734,19 +4697,11 @@ bool launch_rut_with_port_retry(const std::string& dir,
             *error = "could not fork/exec rut";
             return false;
         }
-        bool reuseport_collision = false;
-        if (wait_ready_and_confirm_ownership(
-                *listen_port, *rut, 15'000, 5'000, error, &reuseport_collision))
-            return true;
+        if (wait_ready_and_confirm_ownership(*listen_port, *rut, 15'000, 5'000, error)) return true;
 
-        // Round-12 review, "Detect concurrent SO_REUSEPORT owners before
-        // accepting readiness": a co-owner detected by
-        // count_listeners_on_port() never leaves rut's own log naming an
-        // address-in-use collision (its bind() genuinely succeeded), so
-        // that signal alone is folded into `collided` here to take the
-        // same retry-on-a-fresh-port path as a real bind collision.
-        const bool collided =
-            reuseport_collision || rut_log_indicates_address_in_use(rut->log_path);
+        // Exclusive listening turns both early and late competing binds into
+        // EADDRINUSE; retry only when this child's log confirms that failure.
+        const bool collided = rut_log_indicates_address_in_use(rut->log_path);
         rut->stop();
         if (!collided || attempt == kMaxListenPortAttempts) return false;
 
@@ -5550,14 +5505,6 @@ int run_pair_milestone_s(const std::string& rut_binary,
         // and validate the asserted-phase RUT instance before inspecting
         // the recording upstream's log.
         auto rut_asserted_results = run_case_batch(listen_port1, asserted_cases);
-        const std::string rut_asserted_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port1, getuid());
-        if (!rut_asserted_reuseport_error.empty()) {
-            std::cerr << "FAIL: " << rut_asserted_reuseport_error << "\n";
-            rut_asserted.stop();
-            upstream.stop();
-            return 1;
-        }
         if (!rut_asserted.stop()) {
             std::cerr << "FAIL: rut exited unexpectedly before teardown ("
                       << rut_asserted.unexpected_exit_description << ")\n";
@@ -5604,17 +5551,6 @@ int run_pair_milestone_s(const std::string& rut_binary,
             return 1;
         }
         auto rut_record_only_results = run_case_batch(listen_port1, record_only_cases);
-        // Never fatal here, same reasoning as the Envoy phase above. The
-        // CHECK itself must still run before stop() below, but sweep-3
-        // review, "Preserve crashes alongside reuse-port ambiguity":
-        // applying its mark_upstream_ambiguous() call is deferred until
-        // AFTER the crash check just below, so a same-batch crash is never
-        // masked by a coincident reuseport collision.
-        const std::string rut_record_only_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port1, getuid());
-        if (!rut_record_only_reuseport_error.empty()) {
-            std::cerr << "NOTE: " << rut_record_only_reuseport_error << "\n";
-        }
         // This instance only ever ran the record-only batch, so a stop()
         // failure here is unambiguously attributable to it (round-12/
         // round-15 review). Round-18 review, "Stop record-only proxies
@@ -5636,10 +5572,6 @@ int run_pair_milestone_s(const std::string& rut_binary,
             dump_rut_log(rut_record_only.log_path);
             note_record_only_phase_crash(
                 "rut", rut_record_only.unexpected_exit_description, &rut_record_only_results);
-        }
-        if (!rut_record_only_reuseport_error.empty()) {
-            for (auto& r : rut_record_only_results)
-                mark_upstream_ambiguous(&r, AmbiguityReason::kReuseportCollision);
         }
         // Round-20 review, "Reject asserted evidence when upstream
         // quiescence times out": record-only phases downgrade the same
@@ -5732,16 +5664,6 @@ int run_pair_milestone_s(const std::string& rut_binary,
             std::cerr << "WARN: case connect_failure (rut) exchange did not complete cleanly ("
                       << describe_incomplete_exchange(c.rut) << ")\n";
         c.rut.name = "connect_failure";
-        // Round-19 review, "Recheck listener ownership after the
-        // connect-failure case": same reasoning as the Envoy half above,
-        // checked against the harness's own uid for the RUT phase.
-        const std::string rut_run2_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port2, getuid());
-        if (!rut_run2_reuseport_error.empty()) {
-            std::cerr << "FAIL: " << rut_run2_reuseport_error << "\n";
-            rut.stop();
-            return 1;
-        }
         if (!rut.stop()) {
             std::cerr << "FAIL: rut exited unexpectedly before teardown ("
                       << rut.unexpected_exit_description << ")\n";
@@ -12742,17 +12664,9 @@ bool self_test_rut_port_retry(const std::string& rut_binary, const std::string& 
     const uint16_t first_candidate = listen_port;
 
     // Pre-bind the first candidate port live and hold it for the duration of
-    // rut's first bind attempt -- deliberately without SO_REUSEPORT, so
-    // rut's own SO_REUSEPORT bind() (create_listen_socket(),
-    // src/runtime/socket.cc) still collides: Linux only shares a port across
-    // SO_REUSEPORT sockets when every socket that ever bound it, including
-    // the first, opted in. Deliberately bind()-only, no listen(): a bound
-    // socket already reserves the port for EADDRINUSE purposes, and leaving
-    // it out of LISTEN state makes an incoming connect() fail closed
-    // (ECONNREFUSED) instead of being silently accepted by this held socket
-    // itself -- wait_ready()/tcp_port_open() otherwise cannot tell "rut is
-    // ready" apart from "something else answered the probe", which would
-    // false-positive the very race this test forces.
+    // rut's exclusive first bind must fail while this socket reserves the
+    // candidate port. Deliberately bind-only: leaving it out of LISTEN state
+    // makes connect() fail instead of supplying misleading readiness evidence.
     const int held_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (held_fd < 0) {
         std::cerr << "FAIL [self-test rut port retry]: could not create a socket to hold the "
@@ -12877,23 +12791,6 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         for (const auto& spec : all_cases)
             if (is_asserted_case(spec.name)) live_asserted.push_back(spec);
         auto live_results = run_case_batch(listen_port, live_asserted);
-        // Sweep-1 review, "Recheck RUT listener ownership in the real-binary
-        // self-test": this asserted batch used to proceed straight from
-        // run_case_batch() to rut.stop() with no post-batch listener-count
-        // check, unlike every production asserted phase (and pair mode's
-        // own self-test-adjacent paths). A same-uid RUT co-owner that joined
-        // this port's SO_REUSEPORT group after the startup ownership check
-        // could otherwise receive some of these asserted connections and
-        // either cause a spurious failure or, for an identical
-        // configuration, let foreign evidence silently pass.
-        const std::string rut_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port, getuid());
-        if (!rut_reuseport_error.empty()) {
-            std::cerr << "FAIL [self-test rut]: " << rut_reuseport_error << "\n";
-            rut.stop();
-            upstream.stop();
-            return false;
-        }
         const bool rut_stopped_cleanly = rut.stop();
         // Round-19 review, "Wait for upstream quiescence in the RUT oracle
         // self-test": same reasoning as the production asserted phases --
@@ -12988,17 +12885,6 @@ bool run_self_test_rut_pass(const std::string& rut_binary, const std::string& co
         r.name = "connect_failure";
         // The connect_failure exchange above is done; safe to release now.
         closed_reservation.release();
-        // Sweep-1 review, "Recheck RUT listener ownership in the real-binary
-        // self-test": the connect_failure phase repeated the same omission
-        // as the live-recording-upstream phase above -- recheck before
-        // stopping RUT here too.
-        const std::string rut_connect_failure_reuseport_error =
-            check_no_reuseport_collision_after_batch(listen_port, getuid());
-        if (!rut_connect_failure_reuseport_error.empty()) {
-            std::cerr << "FAIL [self-test rut]: " << rut_connect_failure_reuseport_error << "\n";
-            rut.stop();
-            return false;
-        }
         if (!rut.stop()) {
             std::cerr << "FAIL [self-test rut]: rut exited unexpectedly before teardown ("
                       << rut.unexpected_exit_description << ")\n";
@@ -13171,7 +13057,6 @@ int run_route_boundaries(const std::string& rut_binary,
             std::cerr << (matched ? "MATCH native " : "FAIL native ") << c.first << "\n";
             ok &= matched;
         }
-        ok &= check_no_reuseport_collision_after_batch(listen_port, getuid()).empty();
         ok &= rut.stop();
         if (!ok || !wait_port_closed(listen_port, 5000)) return 1;
     }
@@ -13255,9 +13140,8 @@ int run_route_boundaries(const std::string& rut_binary,
             return 1;
         }
         auto results = run_case_batch(listen_port, cases);
-        bool ok = check_no_reuseport_collision_after_batch(
-                      listen_port, side == 0 ? kEnvoyContainerUid : getuid())
-                      .empty();
+        bool ok = side != 0 ||
+                  check_no_reuseport_collision_after_batch(listen_port, kEnvoyContainerUid).empty();
         ok &= side == 0 ? envoy.stop() : rut.stop();
         for (auto& upstream : upstreams) ok &= upstream.wait_idle(2000);
         if (!ok || !wait_port_closed(listen_port, 5000)) return 1;
