@@ -13479,6 +13479,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             !conn.send_armed && conn.on_send == nullptr && !conn.upstream_send_armed &&
             conn.on_upstream_send == nullptr && !ev.more && !conn.upstream_recv_armed &&
             !conn.upstream_recv_cancel_inflight) {
+            // The reused socket may have accepted this non-idempotent request
+            // before closing. Keep the selected failure status/body, but close
+            // downstream so pipelined bytes cannot be mistaken for a safe
+            // successor after an ambiguous request outcome.
+            conn.keep_alive = false;
             respond_upstream_connect_failure(loop, conn);
             return;
         }

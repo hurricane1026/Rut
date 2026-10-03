@@ -6810,6 +6810,13 @@ Implementation:
     7. Timer wheel checks idle connections → close if expired
 ```
 
+If a request sent on a reused upstream socket receives EOF or a reset before
+any response byte, the runtime never replays a non-idempotent request because
+the origin may already have acted on it. The configured failure status and body
+remain available, but the downstream response closes the client connection.
+This prevents pipelined successor bytes from being treated as a safe next
+request after an ambiguous POST or other non-idempotent outcome.
+
 ### 13.4 TLS for Outbound Connections
 
 ```swift

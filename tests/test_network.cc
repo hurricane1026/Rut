@@ -17009,6 +17009,136 @@ TEST(upstream_reuse, request_sent_reused_snapshots_before_pipeline_stash) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+TEST(upstream_reuse, non_idempotent_empty_response_failure_closes_pipelined_client) {
+    static constexpr char kPost[] =
+        "POST /one HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "Content-Length: 3\r\n\r\n"
+        "abc";
+    // Keep GET2 longer than POST so a stale request-1 framing boundary cannot
+    // accidentally look like a valid boundary for successor bytes.
+    static constexpr char kGet2[] =
+        "GET /two HTTP/1.1\r\n"
+        "Host: client.example\r\n"
+        "X-Pipeline-Padding: successor-is-longer-than-the-post\r\n\r\n";
+    constexpr u32 kPostLen = sizeof(kPost) - 1u;
+    constexpr u32 kGet2Len = sizeof(kGet2) - 1u;
+    static_assert(kGet2Len > kPostLen);
+
+    enum class PipelineSource { None, LateRecvBuf, SameBatchStash };
+    static constexpr PipelineSource kPipelineSources[] = {
+        PipelineSource::None, PipelineSource::LateRecvBuf, PipelineSource::SameBatchStash};
+    for (const PipelineSource pipeline_source : kPipelineSources) {
+        const bool same_batch_stash = pipeline_source == PipelineSource::SameBatchStash;
+        for (const i32 terminal_result : {0, -ECONNRESET}) {
+            SmallLoop loop;
+            loop.setup();
+            RouteConfig config{};
+            REQUIRE(config.add_upstream("api", 0x7F000001, 8080).has_value());
+            REQUIRE(config.add_static("/two", kRouteMethodGet, 204));
+            ForwardFailurePolicySpec failure{};
+            failure.version = ForwardFailurePolicyVersion::Http11;
+            failure.status_code = 503;
+            failure.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+            failure.date = ForwardFailurePolicyDate::Current;
+            failure.connection = ForwardFailurePolicyConnection::Request;
+            failure.head_mode = FailurePolicyHeadMode::Reject;
+            failure.reason = {"Service Unavailable", 19};
+            failure.content_type = {"text/plain", 10};
+            failure.server = {"envoy", 5};
+            failure.body = {"upstream failure", 16};
+            REQUIRE_EQ(config.add_failure_policy(failure), 1u);
+
+            const RouteConfig* active = &config;
+            loop.config_ptr = &active;
+            Connection* conn = loop.alloc_conn();
+            REQUIRE(conn != nullptr);
+            conn->fd = dup(STDERR_FILENO);
+            conn->upstream_fd = dup(STDERR_FILENO);
+            REQUIRE_GE(conn->fd, 0);
+            REQUIRE_GE(conn->upstream_fd, 0);
+            REQUIRE(loop.alloc_upstream_buf(*conn));
+            REQUIRE(loop.alloc_response_header_buf(*conn));
+            REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPost), kPostLen),
+                       kPostLen);
+            capture_request_metadata(*conn);
+            conn->request_config = &config;
+            conn->upstream_idx = 0;
+            conn->upstream_backend_idx = 0;
+            conn->upstream_reused = true;
+            conn->request_upload_complete = false;
+            conn->upstream_request_incomplete = false;
+            conn->req_initial_send_len = kPostLen;
+            conn->req_body_remaining = 0;
+            conn->retry_req_send_len = 0;
+            conn->retry_req_snapshot_replayable = false;
+            conn->failure_policy_id = 1;
+            conn->keep_alive = true;
+            if (same_batch_stash) {
+                REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kGet2), kGet2Len),
+                           kGet2Len);
+            }
+            conn->state = ConnState::Proxying;
+            conn->set_slots(nullptr, &on_upstream_request_sent<SmallLoop>, nullptr, nullptr);
+            loop.backend.clear_ops();
+
+            // Complete the real upstream send transition. It snapshots the POST,
+            // stashes same-batch GET2 when present, and resets recv_buf to the
+            // request boundary before any late downstream bytes can arrive.
+            rut::on_upstream_request_sent<SmallLoop>(
+                &loop,
+                *conn,
+                make_ev(conn->id, IoEventType::UpstreamSend, static_cast<i32>(kPostLen)));
+            REQUIRE(conn->request_upload_complete);
+            REQUIRE_EQ(conn->retry_req_send_len, kPostLen);
+            REQUIRE_EQ(conn->recv_buf.len(), 0u);
+            CHECK_EQ(conn->pipeline_stash_len, same_batch_stash ? kGet2Len : 0u);
+            if (same_batch_stash) {
+                REQUIRE_EQ(conn->send_buf.len(), kPostLen + kGet2Len);
+                CHECK(__builtin_memcmp(conn->send_buf.data() + kPostLen, kGet2, kGet2Len) == 0);
+            }
+            if (pipeline_source == PipelineSource::LateRecvBuf) {
+                REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kGet2), kGet2Len),
+                           kGet2Len);
+            }
+
+            // This is the persistence counterfactual before the failure handler:
+            // request 1 is a fully sent POST and the receive buffer is either empty,
+            // a true successor at offset zero, or GET2 in the generated send stash.
+            if (pipeline_source == PipelineSource::LateRecvBuf) {
+                CHECK(conn->keep_alive);
+                CHECK(rut::ordinary_local_response_may_persist(&loop, *conn, true));
+            }
+
+            conn->set_slots(nullptr, nullptr, &on_upstream_response<SmallLoop>, nullptr);
+            loop.backend.clear_ops();
+            on_upstream_response<SmallLoop>(
+                &loop, *conn, {conn->id, terminal_result, 0, 0, IoEventType::UpstreamRecv, 0});
+
+            CHECK_FALSE(conn->upstream_reused);
+            CHECK_FALSE(conn->keep_alive);
+            CHECK_EQ(conn->resp_status, 503u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+            CHECK(buf_has(conn->send_buf.data(),
+                          conn->send_buf.len(),
+                          "HTTP/1.1 503 Service Unavailable\r\n"));
+            CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "connection: close\r\n"));
+            CHECK_EQ(conn->pipeline_stash_len, same_batch_stash ? kGet2Len : 0u);
+
+            const u32 id = conn->id;
+            const u32 response_len = conn->send_buf.len();
+            loop.inject_and_dispatch(
+                make_ev(id, IoEventType::Send, static_cast<i32>(response_len)));
+            CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+            CHECK_EQ(loop.conns[id].fd, -1);
+            CHECK_EQ(loop.conns[id].upstream_fd, -1);
+            loop.config_ptr = nullptr;
+        }
+    }
+}
+
 // Dynamic response mutations may borrow req.path/req.header slices from recv_buf.
 // Even a fresh upstream must preserve those bytes before releasing recv_buf.
 TEST(response_headers, request_backed_forward_mutation_survives_recv_reuse) {
