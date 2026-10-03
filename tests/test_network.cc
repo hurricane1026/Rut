@@ -28704,6 +28704,7 @@ TEST(access_request_size,
     loop.backend.clear_ops();
     handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, false);
 
+    CHECK(conn->response_header_slice != nullptr);
     REQUIRE_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
     REQUIRE_EQ(conn->recv_buf.len(), kUpstreamRequestLen);
     CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), kUpstreamRequest, kUpstreamRequestLen), 0);
@@ -28725,21 +28726,30 @@ TEST(access_request_size,
     REQUIRE_EQ(conn->state, ConnState::Sending);
     const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
     REQUIRE(downstream_send != nullptr);
-    REQUIRE_EQ(kMockHttpResponseLen, 40u);
+    static constexpr char kCloseHeader[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    constexpr u32 kCloseHeaderLen = sizeof(kCloseHeader) - 1u;
     REQUIRE_EQ(downstream_send->fd, conn->fd);
-    REQUIRE_EQ(downstream_send->send_len, kMockHttpResponseLen);
-    REQUIRE_EQ(__builtin_memcmp(downstream_send->send_buf, kMockHttpResponse, kMockHttpResponseLen),
-               0);
+    REQUIRE_EQ(downstream_send->send_len, kCloseHeaderLen);
+    REQUIRE_EQ(__builtin_memcmp(downstream_send->send_buf, kCloseHeader, kCloseHeaderLen), 0);
     REQUIRE_EQ(conn->send_buf.len(), 0u);
-    const u32 response_len = downstream_send->send_len;
     const u32 completed_id = conn->id;
-    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, response_len));
+    AccessLogEntry extra{};
+    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, kCloseHeaderLen));
+    downstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(downstream_send != nullptr);
+    REQUIRE_EQ(downstream_send->send_len, 2u);
+    REQUIRE_EQ(__builtin_memcmp(downstream_send->send_buf, "OK", 2), 0);
+    CHECK_FALSE(ring.pop(extra));
+    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, 2));
 
     AccessLogEntry proxy_access{};
     REQUIRE(ring.pop(proxy_access));
     CHECK_EQ(proxy_access.req_size, kClientRequestLen);
     CHECK_NE(proxy_access.req_size, kUpstreamRequestLen);
-    AccessLogEntry extra{};
     CHECK_FALSE(ring.pop(extra));
 
     Connection* reused = loop.alloc_conn();
@@ -29284,21 +29294,31 @@ TEST(access_request_size,
     const MockOp* downstream_send = loop.backend.last_op(MockOp::Send);
     REQUIRE(downstream_send != nullptr);
     CHECK_EQ(downstream_send->fd, 42);
-    CHECK_EQ(downstream_send->send_len, kUpstreamResponseLen);
-    CHECK_EQ(__builtin_memcmp(downstream_send->send_buf, kUpstreamResponse, kUpstreamResponseLen),
-             0);
+    static constexpr char kCloseHeader[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    constexpr u32 kCloseHeaderLen = sizeof(kCloseHeader) - 1u;
+    CHECK_EQ(downstream_send->send_len, kCloseHeaderLen);
+    CHECK_EQ(__builtin_memcmp(downstream_send->send_buf, kCloseHeader, kCloseHeaderLen), 0);
     CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
     CHECK_FALSE(ring.pop(absent));
 
     const u32 completed_id = conn->id;
-    loop.inject_and_dispatch(
-        make_ev(completed_id, IoEventType::Send, static_cast<i32>(kUpstreamResponseLen)));
+    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, kCloseHeaderLen));
+    downstream_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(downstream_send != nullptr);
+    CHECK_EQ(downstream_send->send_len, 2u);
+    CHECK_EQ(__builtin_memcmp(downstream_send->send_buf, "OK", 2), 0);
+    CHECK_FALSE(ring.pop(absent));
+    loop.inject_and_dispatch(make_ev(completed_id, IoEventType::Send, 2));
 
     AccessLogEntry access{};
     REQUIRE(ring.pop(access));
     CHECK_EQ(access.req_size, kClientRequestLen);
     CHECK_NE(access.req_size, kUpstreamRequestLen);
-    CHECK_EQ(access.resp_size, kUpstreamResponseLen);
+    CHECK_EQ(access.resp_size, kCloseHeaderLen + 2u);
     CHECK_EQ(access.status, 200u);
     CHECK_EQ(access.method, static_cast<u8>(LogHttpMethod::Get));
     CHECK_EQ(access.target_state, AccessLogTargetState::Complete);
@@ -29306,7 +29326,7 @@ TEST(access_request_size,
     CHECK_EQ(std::string(access.upstream), "backend");
     CHECK_FALSE(ring.pop(absent));
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
-    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 3u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 4u);
     CHECK_EQ(access_request_size_connect_failure_handler_calls, 1u);
     CHECK_EQ(loop.conns[completed_id].fd, -1);
     CHECK_EQ(loop.conns[completed_id].upstream_fd, -1);
@@ -40032,6 +40052,123 @@ TEST(iouring_upstream_response, native_client_close_marks_downstream_before_body
                                             conn.upstream_episode});
     CHECK(conn.keep_alive);
     fixture.cleanup();
+}
+
+TEST(iouring_upstream_response,
+     request_policy_close_rewrites_streaming_header_and_keeps_origin_poolable) {
+    static constexpr u8 kHeader[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n";
+
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    REQUIRE(loop->alloc_response_header_buf(conn));
+    conn.protocol = ConnProtocol::Http11;
+    conn.req_http_version = static_cast<u8>(HttpVersion::Http11);
+    conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.req_keep_alive = true;
+    conn.req_client_keep_alive = false;
+    conn.req_client_connection_close = true;
+    conn.req_client_connection_close_exact = true;
+    conn.req_client_connection_count = 1;
+    conn.req_wants_upgrade = false;
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
+
+    on_upstream_response<IoUringEventLoop>(loop,
+                                           conn,
+                                           {conn.id,
+                                            static_cast<i32>(sizeof(kHeader) - 1u),
+                                            0,
+                                            0,
+                                            IoEventType::UpstreamRecv,
+                                            0,
+                                            0,
+                                            conn.upstream_episode});
+
+    const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                          conn.response_header_buf.len());
+    CHECK_FALSE(conn.keep_alive);
+    CHECK(conn.upstream_keep_alive);
+    CHECK_EQ(conn.resp_body_mode, BodyMode::ContentLength);
+    CHECK_EQ(conn.resp_body_remaining, 4u);
+    CHECK(out.find("Connection: keep-alive") == std::string::npos);
+    CHECK(out.find("Connection: close\r\n") != std::string::npos);
+    CHECK(out.find("Content-Length: 4\r\n") != std::string::npos);
+    CHECK_EQ(conn.upstream_send_len, static_cast<u32>(sizeof(kHeader) - 1u));
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_response,
+     request_policy_close_header_allocation_failure_stops_before_connect) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7F000001, 9000).has_value());
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    conn->fd = downstream[0];
+    conn->request_config = &config;
+    conn->req_start_us = monotonic_us();
+    static constexpr char kRequest[] =
+        "GET /ledger HTTP/1.1\r\nHost: client.example\r\nConnection: close\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1u),
+               sizeof(kRequest) - 1u);
+    capture_request_metadata(*conn);
+    const u32 old_max = loop->pool.max_count;
+    loop->pool.max_count = loop->pool.count;
+    std::vector<u8*> held;
+    while (loop->pool.available() != 0) {
+        u8* slice = loop->pool.alloc();
+        REQUIRE(slice != nullptr);
+        held.push_back(slice);
+    }
+    REQUIRE_EQ(loop->pool.available(), 0u);
+    const u32 sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 backend_pending_before = loop->backend.pending;
+    const u32 conn_pending_before = conn->pending_ops;
+    const auto send_state_before = loop->backend.send_state[conn->id];
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    outcome.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    handle_jit_outcome<IoUringEventLoop>(loop, *conn, outcome, nullptr, false);
+
+    CHECK_EQ(conn->resp_status, kStatusInternalServerError);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_EQ(conn->response_header_slice, nullptr);
+    CHECK_FALSE(conn->upstream_connect_armed);
+    CHECK_EQ(conn->state, ConnState::Sending);
+    CHECK(conn->send_armed);
+    const u32 sq_tail_after = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+    REQUIRE_EQ(sq_tail_after, sq_tail_before + 1u);
+    const auto& send_sqe = loop->backend.sq_entries[sq_tail_before & *loop->backend.sq_ring_mask];
+    CHECK(send_sqe.opcode == IORING_OP_SEND || send_sqe.opcode == IORING_OP_NOP);
+    u32 decoded_conn = 0;
+    u32 decoded_generation = 0;
+    IoEventType decoded_type = IoEventType::Count;
+    IoUringBackend::decode_user_data(send_sqe.user_data, decoded_conn, decoded_type,
+                                     decoded_generation);
+    CHECK_EQ(decoded_conn, conn->id);
+    CHECK_EQ(decoded_type, IoEventType::Send);
+    if (send_sqe.opcode == IORING_OP_SEND) CHECK_EQ(send_sqe.fd, downstream[0]);
+    loop->pool.max_count = old_max;
+    for (u8* slice : held) loop->pool.free(slice);
+    __atomic_store_n(loop->backend.sq_tail, sq_tail_before, __ATOMIC_RELEASE);
+    loop->backend.pending = backend_pending_before;
+    conn->pending_ops = conn_pending_before;
+    conn->send_armed = false;
+    conn->direct_write_completion_pending = false;
+    loop->backend.send_state[conn->id] = send_state_before;
+    loop->close_conn(*conn);
+    close(downstream[1]);
 }
 
 TEST(iouring_upstream_recv, one_shot_moves_slice_sized_chunks_through_dedicated_ring) {
@@ -81814,6 +81951,77 @@ TEST(response_headers, forwarded_mutations_keep_drain_close_signal) {
     CHECK(out.find("Connection: keep-alive") == std::string::npos);
     CHECK(out.find("Connection: close\r\n") != std::string::npos);
     CHECK(out.find("X-Test: yes\r\n") != std::string::npos);
+}
+
+TEST(response_headers, force_downstream_close_rewrites_unmutated_origin_header) {
+    for (const char* response :
+         {"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 4\r\n\r\nbody",
+          "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody"}) {
+        Connection conn;
+        conn.reset();
+        conn.resp_status = 200;
+        u8 upstream_storage[256]{};
+        u8 header_storage[256]{};
+        conn.upstream_recv_buf.bind(upstream_storage, sizeof(upstream_storage));
+        conn.response_header_slice = header_storage;
+        conn.response_header_buf.bind(header_storage, sizeof(header_storage));
+        const u32 response_len = static_cast<u32>(strlen(response));
+        REQUIRE_EQ(
+            conn.upstream_recv_buf.write(reinterpret_cast<const u8*>(response), response_len),
+            response_len);
+        const u32 header_len = response_len - 4u;
+
+        REQUIRE(build_h1_forward_response_headers(
+            conn, header_len, /*draining=*/false, /*force_connection_close=*/true));
+        const std::string out(reinterpret_cast<const char*>(conn.response_header_buf.data()),
+                              conn.response_header_buf.len());
+        CHECK_EQ(conn.resp_header_mutation_count, 0u);
+        CHECK_EQ(out.find("Connection: keep-alive"), std::string::npos);
+        const std::string::size_type close_pos = out.find("Connection: close\r\n");
+        REQUIRE_NE(close_pos, std::string::npos);
+        CHECK_EQ(close_pos, out.rfind("Connection: close\r\n"));
+        CHECK_EQ(out.find("Content-Length: 4\r\n"), out.rfind("Content-Length: 4\r\n"));
+        CHECK(out.ends_with("\r\n\r\n"));
+        CHECK(__builtin_memcmp(conn.upstream_recv_buf.data() + header_len, "body", 4) == 0);
+    }
+}
+
+TEST(request_policy, downstream_close_header_candidate_is_narrow) {
+    Connection conn;
+    conn.reset();
+    conn.protocol = ConnProtocol::Http11;
+    conn.req_http_version = static_cast<u8>(HttpVersion::Http11);
+    conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+    conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    conn.req_keep_alive = true;
+    conn.req_client_connection_close = true;
+    conn.req_client_connection_close_exact = true;
+    conn.req_client_connection_count = 1;
+    CHECK(request_policy_downstream_close_shape(conn));
+
+    const auto reject = [&](auto mutate) {
+        mutate(conn);
+        CHECK_FALSE(request_policy_downstream_close_shape(conn));
+        conn.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+        conn.req_client_keep_alive = false;
+        conn.req_method = static_cast<u8>(LogHttpMethod::Get);
+        conn.req_body_mode = BodyMode::None;
+        conn.tls_active = false;
+        conn.protocol = ConnProtocol::Http11;
+        conn.req_wants_upgrade = false;
+        conn.response_read_deadline_state = ResponseReadDeadlineState::None;
+        conn.resp_header_mutation_count = 0;
+    };
+    reject([](Connection& c) { c.request_policy_id = 0; });
+    reject([](Connection& c) { c.req_client_keep_alive = true; });
+    reject([](Connection& c) { c.req_method = static_cast<u8>(LogHttpMethod::Post); });
+    reject([](Connection& c) { c.req_body_mode = BodyMode::ContentLength; });
+    reject([](Connection& c) { c.tls_active = true; });
+    reject([](Connection& c) { c.protocol = ConnProtocol::Http2; });
+    reject([](Connection& c) { c.req_wants_upgrade = true; });
+    reject(
+        [](Connection& c) { c.response_read_deadline_state = ResponseReadDeadlineState::Armed; });
+    reject([](Connection& c) { c.resp_header_mutation_count = 1; });
 }
 
 TEST(response_headers, forwarded_mutations_reject_runtime_header_injection) {

@@ -3165,12 +3165,33 @@ inline bool response_mutation_survives(const Connection& conn, u32 index) {
     return true;
 }
 
+inline bool request_policy_downstream_close_shape(const Connection& conn) {
+    return conn.response_policy_id == 0 &&
+           conn.request_policy_id == static_cast<u16>(RequestPolicyId::Http11FixedStrip) &&
+           conn.pending_forward_request_policy_id == 0 && !conn.request_policy_body_pending &&
+           conn.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+           conn.req_body_mode == BodyMode::None && conn.req_body_remaining == 0 &&
+           !conn.request_body_fully_buffered && !conn.req_body_streamed && conn.req_keep_alive &&
+           conn.req_http_version == static_cast<u8>(HttpVersion::Http11) &&
+           conn.protocol == ConnProtocol::Http11 && !conn.tls_active && !conn.req_wants_upgrade &&
+           !conn.req_client_keep_alive && conn.req_client_connection_close &&
+           conn.req_client_connection_close_exact && conn.req_client_connection_count == 1 &&
+           conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
+           conn.response_read_deadline_profile == ResponseReadDeadlineProfile::None &&
+           conn.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
+           conn.resp_header_mutation_count == 0 && conn.resp_header_mutation_pending_count == 0 &&
+           !conn.resp_header_mutation_pending_overflow && !conn.resp_header_mutation_overflow;
+}
+
 // Serialize only the rewritten upstream HTTP/1 header block into dedicated,
 // response-lifetime storage. The original upstream buffer (including its body)
 // stays untouched and is streamed after this header send completes.
-inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, bool draining) {
-    if (conn.resp_header_mutation_count == 0 || conn.resp_header_mutation_overflow ||
-        !conn.response_header_buf.valid() || header_len < 4 ||
+inline bool build_h1_forward_response_headers(Connection& conn,
+                                              u32 header_len,
+                                              bool draining,
+                                              bool force_connection_close = false) {
+    if ((conn.resp_header_mutation_count == 0 && !force_connection_close) ||
+        conn.resp_header_mutation_overflow || !conn.response_header_buf.valid() || header_len < 4 ||
         header_len > conn.upstream_recv_buf.len())
         return false;
 
@@ -3268,7 +3289,7 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
         // field that frames the already-parsed body. Preserve that field and
         // force downstream close below so the message stays self-delimiting.
         if (framing) return false;
-        if ((draining || nominated_framing) &&
+        if ((draining || force_connection_close || nominated_framing) &&
             http_header_name_eq_ci(name, name_len, "connection", 10))
             return true;
         if (upstream_connection_nominates(name, name_len)) return true;
@@ -3385,7 +3406,8 @@ inline bool build_h1_forward_response_headers(Connection& conn, u32 header_len, 
     }
     static const char kConnectionClose[] = "Connection: close\r\n";
     if (nominated_framing) conn.keep_alive = false;
-    if ((draining || nominated_framing) && !write(kConnectionClose, sizeof(kConnectionClose) - 1))
+    if ((draining || force_connection_close || nominated_framing) &&
+        !write(kConnectionClose, sizeof(kConnectionClose) - 1))
         return false;
     return write(kCrLf, 2);
 }
@@ -4650,6 +4672,16 @@ void handle_jit_outcome(Loop* loop,
                     reject_request_policy(loop, conn);
                     return;
                 }
+            }
+
+            if (forward_response_policy_id == 0 && request_policy_downstream_close_shape(conn) &&
+                !loop->alloc_response_header_buf(conn)) {
+                conn.resp_status = kStatusInternalServerError;
+                format_static_response(conn, 500, /*keep_alive=*/false);
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
             }
 
             if (strict_pipeline_successor) {
@@ -14155,11 +14187,21 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     conn.upstream_keep_alive = resp.keep_alive && !resp.connection_close &&
                                conn.resp_body_mode != BodyMode::UntilClose && conn.req_keep_alive;
 
+    // A request-policy rewrite may make the upstream request reusable while the
+    // original downstream request still requires this client connection to close.
+    // For the narrow native streaming shape below, serialize that downstream
+    // close into a dedicated header buffer while leaving the origin framing and
+    // the pooled upstream socket untouched.
+    const bool force_downstream_close_header =
+        request_policy_downstream_close_shape(conn) && resp.version == HttpVersion::Http11 &&
+        resp.status_code == 200 && resp.content_length_count == 1 && resp.has_content_length &&
+        !resp.chunked && resp.keep_alive && !resp.connection_close;
+
     const u32 kHeaderLen = resp_parser.header_end;
     const u32 kTotalLen = conn.upstream_recv_buf.len();
     const u32 kInitialBodyLen = (kTotalLen > kHeaderLen) ? kTotalLen - kHeaderLen : 0;
 
-    if (conn.resp_header_mutation_count != 0) {
+    if (conn.resp_header_mutation_count != 0 || force_downstream_close_header) {
         // Keep the body in upstream_recv_buf while rewritten headers drain, but
         // validate any chunk bytes already received before committing a success
         // response downstream. The streaming callback will parse the same bytes
@@ -14193,7 +14235,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     break;
             }
         }
-        if (!build_h1_forward_response_headers(conn, kHeaderLen, loop->is_draining())) {
+        if (!build_h1_forward_response_headers(
+                conn, kHeaderLen, loop->is_draining(), force_downstream_close_header)) {
             loop->close_conn(conn);
             return;
         }
