@@ -166,11 +166,19 @@ bool tls_discard_abandoned_input(Self* loop, Connection& c) {
     return true;
 }
 
-// Ensure exactly one raw send is draining tls_out_buf. Submits at most
-// kTlsDrainChunk per SQE so the drain handler runs at record granularity (the
-// backend has full-send semantics — see the design doc), and records the
-// SQE-captured length so read-ahead appends don't confuse the drain. Returns
-// false (caller fails closed) if the send can't be queued.
+// Ensure exactly one raw send is draining tls_out_buf. Proxy streaming retains
+// record-sized CQEs because its watermark accounting depends on each drain; a
+// connection-closing non-streaming single-shot owner can submit the currently
+// queued ciphertext in one full-send, reducing repeated raw drain rounds. The
+// SQE-captured length stays immutable, so ciphertext appended while it is in
+// flight remains a suffix for the next drain. Returns false (caller fails
+// closed) if the send cannot be queued.
+template <class Self>
+u32 tls_drain_submission_len(const Connection& c, u32 available) {
+    if (!c.keep_alive && tls_single_shot_send_owner_is_current<Self>(c)) return available;
+    return available < Self::kTlsDrainChunk ? available : Self::kTlsDrainChunk;
+}
+
 template <class Self>
 bool tls_ensure_draining(Self* loop, Connection& c) {
     if (c.tls_out_inflight) {
@@ -186,7 +194,7 @@ bool tls_ensure_draining(Self* loop, Connection& c) {
     }
     if (c.tls_out_buf.len() == 0) return true;
     const u32 kAvail = c.tls_out_buf.len();
-    const u32 kN = kAvail < Self::kTlsDrainChunk ? kAvail : Self::kTlsDrainChunk;
+    const u32 kN = tls_drain_submission_len<Self>(c, kAvail);
     return loop->submit_tls_ciphertext_send(c, c.tls_out_buf.data(), kN);
 }
 

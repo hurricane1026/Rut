@@ -13183,7 +13183,13 @@ TEST(tls_iouring, strict_tls_logical_send_completion_bridges_each_phase_after_ra
         const u32 first_ciphertext_len = conn.tls_out_inflight_len;
         REQUIRE_GT(first_ciphertext_len, 0u);
         const bool has_second_raw = conn.tls_out_buf.len() > first_ciphertext_len;
-        if (kind == ResponseReadDeadlineSendKind::Combined) REQUIRE(has_second_raw);
+        if (kind == ResponseReadDeadlineSendKind::Combined) {
+            // A closing single-shot owner submits the complete current prefix;
+            // the keepalive record-cap path is covered by the policy fixture.
+            REQUIRE_FALSE(has_second_raw);
+            REQUIRE_GT(first_ciphertext_len, IoUringEventLoop::kTlsDrainChunk);
+            CHECK_EQ(first_ciphertext_len, conn.tls_out_buf.len());
+        }
         if (has_second_raw) {
             loop.backend.send_state[conn.id].offset = first_ciphertext_len;
             loop.backend.send_state[conn.id].remaining = 0;
@@ -14202,6 +14208,100 @@ TEST(tls_iouring, ensure_draining_empty_buffer_is_noop) {
     // tls_out_buf is empty — nothing to submit, no loop deref.
     CHECK(tls_ensure_draining<IoUringEventLoop>(nullptr, conn));
     CHECK(!conn.tls_out_inflight);
+}
+
+TEST(tls_iouring, drain_submission_policy_keeps_proxy_record_bound) {
+    Connection conn;
+    conn.reset();
+    constexpr u32 kAvailable = 3 * IoUringEventLoop::kTlsDrainChunk;
+    CHECK_EQ(tls_drain_submission_len<IoUringEventLoop>(conn, kAvailable),
+             IoUringEventLoop::kTlsDrainChunk);
+    conn.tls_proxy_stream = true;
+    CHECK_EQ(tls_drain_submission_len<IoUringEventLoop>(conn, kAvailable),
+             IoUringEventLoop::kTlsDrainChunk);
+    conn.tls_proxy_stream = false;
+    conn.tls_active = true;
+    conn.keep_alive = false;
+    conn.fd = 42;
+    conn.tls_send_owner_generation = 1;
+    conn.tls_send_owner_fd = conn.fd;
+    static const u8 kOwnerSrc = 0;
+    conn.tls_send_src = &kOwnerSrc;
+    conn.tls_send_len = 1;
+    CHECK_EQ(tls_drain_submission_len<IoUringEventLoop>(conn, kAvailable), kAvailable);
+    CHECK_EQ(tls_drain_submission_len<IoUringEventLoop>(conn, 7u), 7u);
+    conn.keep_alive = true;
+    CHECK_EQ(tls_drain_submission_len<IoUringEventLoop>(conn, kAvailable),
+             IoUringEventLoop::kTlsDrainChunk);
+}
+
+TEST(tls_iouring, single_shot_full_prefix_keeps_appended_suffix_immutable) {
+    ScopedTlsRawSendLoop guard;
+    REQUIRE(guard.init());
+    IoUringEventLoop& loop = *guard.loop;
+    Connection& conn = loop.conns[0];
+    conn.reset();
+    conn.id = 0;
+    conn.fd = 42;
+    conn.tls_active = true;
+    conn.keep_alive = false;
+    conn.tls_engine.ssl = reinterpret_cast<SSL*>(static_cast<uintptr_t>(1));
+    conn.tls_engine.handshake_done = true;
+    conn.tls_handshake_complete = true;
+    conn.recv_armed = true;  // keep the storage-only fixture out of recv setup
+    conn.pending_ops++;
+    u32 logical_generation = 0;
+    REQUIRE(conn.next_non_upstream_send_generation(logical_generation));
+    conn.tls_send_owner_generation = logical_generation;
+    conn.tls_send_owner_fd = conn.fd;
+    conn.tls_send_owner_handler_generation = conn.handler_gen;
+    static const u8 logical_src = 0;
+    conn.tls_send_src = &logical_src;
+    conn.tls_send_len = 1;
+    conn.tls_send_off = 1;
+    conn.tls_pending_on_send = &tls_pending_send_probe;
+    conn.on_send = &tls_pending_send_probe;
+    static u8 storage[2 * IoUringEventLoop::kTlsDrainChunk + 137];
+    memset(storage, 0xA5, sizeof(storage));
+    conn.tls_out_buf.bind(storage, sizeof(storage));
+    const u32 prefix_len = 2 * IoUringEventLoop::kTlsDrainChunk;
+    const u32 suffix_len = 137;
+    conn.tls_out_buf.commit(prefix_len);
+    REQUIRE(tls_ensure_draining<IoUringEventLoop>(&loop, conn));
+    const u32 first_generation = conn.tls_out_inflight_generation;
+    REQUIRE_NE(first_generation, 0u);
+    REQUIRE_EQ(conn.tls_out_inflight_len, prefix_len);
+    REQUIRE_EQ(loop.backend.send_state[conn.id].remaining, prefix_len);
+    REQUIRE_EQ(conn.tls_out_inflight_src, conn.tls_out_buf.data());
+    conn.tls_out_buf.commit(suffix_len);
+    REQUIRE(tls_ensure_draining<IoUringEventLoop>(&loop, conn));
+    CHECK_EQ(conn.tls_out_inflight_generation, first_generation);
+    CHECK_EQ(conn.tls_out_inflight_len, prefix_len);
+    CHECK_EQ(loop.backend.send_state[conn.id].remaining, prefix_len);
+
+    loop.backend.send_state[conn.id].offset = prefix_len;
+    loop.backend.send_state[conn.id].remaining = 0;
+    guard.sq_head = guard.sq_tail;
+    loop.backend.pending = 0;
+    loop.dispatch(tls_send_event(conn.id, static_cast<i32>(prefix_len), first_generation));
+    REQUIRE(conn.tls_out_inflight);
+    const u32 suffix_generation = conn.tls_out_inflight_generation;
+    REQUIRE_NE(suffix_generation, first_generation);
+    CHECK_EQ(conn.tls_out_inflight_len, suffix_len);
+    CHECK_EQ(conn.tls_out_inflight_src, conn.tls_out_buf.data());
+    CHECK_EQ(loop.backend.send_state[conn.id].remaining, suffix_len);
+
+    loop.backend.send_state[conn.id].offset = suffix_len;
+    loop.backend.send_state[conn.id].remaining = 0;
+    guard.sq_head = guard.sq_tail;
+    loop.backend.pending = 0;
+    g_tls_pending_send_called = false;
+    loop.dispatch(tls_send_event(conn.id, static_cast<i32>(suffix_len), suffix_generation));
+    CHECK(g_tls_pending_send_called);
+    CHECK_EQ(g_tls_pending_send_result, 1u);
+    CHECK_FALSE(conn.tls_out_inflight);
+    CHECK_EQ(conn.tls_out_buf.len(), 0u);
+    CHECK_EQ(conn.pending_ops, 1u);
 }
 
 // A response started while a control/handshake flight is in flight overwrites
