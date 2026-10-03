@@ -261,6 +261,17 @@ struct RawRequestTargetWitnessResult {
 static_assert(static_cast<u8>(ConnState::Count) == 6u,
               "ConnState count is part of the static network state contract");
 
+// Transport ownership for a direct upstream recv targeting a complete-buffered
+// response chain. The CQE uses this immutable snapshot even after connection
+// teardown resets the logical response-deadline state.
+struct ChainDirectRecvOwner {
+    ResponseBodyChain::Node* node = nullptr;
+    u8* ptr = nullptr;
+    u32 len = 0;
+    u32 episode = 0;
+    bool active = false;
+};
+
 struct ConnectionBase {
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
@@ -1691,6 +1702,7 @@ struct ConnectionBase {
     u8* upstream_recv_slice;
     Buffer upstream_recv_buf;
     ResponseBodyChain response_body_tail{};
+    ChainDirectRecvOwner chain_direct_recv_owner{};
 
     // io_uring only: true while a *direct* one-shot upstream recv (straight
     // into either upstream_recv_buf's bulk-sized destination, or — for a
@@ -1766,6 +1778,7 @@ struct ConnectionBase {
 
     void reset() {
         response_body_tail = {};
+        chain_direct_recv_owner = {};
         on_recv = nullptr;
         on_send = nullptr;
         on_upstream_recv = nullptr;

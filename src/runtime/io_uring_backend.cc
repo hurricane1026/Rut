@@ -642,10 +642,8 @@ bool IoUringBackend::add_recv_upstream_direct(
     return true;
 }
 
-bool IoUringBackend::add_first_response_recv(i32 fd,
-                                             u32 conn_id,
-                                             u32 upstream_episode,
-                                             bool separate_body_ring) {
+bool IoUringBackend::add_first_response_recv(
+    i32 fd, u32 conn_id, u32 upstream_episode, bool separate_body_ring, bool one_shot) {
     if (fd < 0 || conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode))
         return false;
     io_uring_sqe* sqe = get_sqe_flushing();
@@ -658,7 +656,7 @@ bool IoUringBackend::add_first_response_recv(i32 fd,
     sqe->len = large ? kLargeProvidedBufSize : kProvidedBufSize;
     sqe->buf_group = large ? kLargeBufGroupId : kBufGroupId;
     sqe->flags = IOSQE_BUFFER_SELECT;
-    sqe->ioprio = IORING_RECV_MULTISHOT;
+    if (!one_shot) sqe->ioprio = IORING_RECV_MULTISHOT;
     sqe->user_data =
         encode_upstream_user_data(conn_id, IoEventType::UpstreamRecv, upstream_episode);
 
@@ -1669,6 +1667,94 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         }
 
         // --- #4b: Direct recv handling (bulk-buffer one-shot upstream recv) ---
+        // Complete-buffered body recvs have a separate immutable target owner:
+        // Connection::reset() may already have cleared the logical Buffering
+        // phase when close deferred this slot for the outstanding kernel write.
+        if (type == IoEventType::UpstreamRecv && aux == 0 && conns != nullptr &&
+            conn_id < max_conns && conns[conn_id].chain_direct_recv_owner.active &&
+            upstream_episode == conns[conn_id].chain_direct_recv_owner.episode) {
+            Connection& conn = conns[conn_id];
+            const ChainDirectRecvOwner target = conn.chain_direct_recv_owner;
+            const bool more = (cqe->flags & IORING_CQE_F_MORE) != 0;
+            if (more || (cqe->flags & IORING_CQE_F_BUFFER) != 0) {
+                protocol_failure();
+                break;
+            }
+            if (cqe->res > 0) {
+                const u32 nbytes = static_cast<u32>(cqe->res);
+                if (nbytes > target.len || response_pool == nullptr ||
+                    !conn.response_body_tail.record_direct_write(
+                        target.node, target.ptr, nbytes, *response_pool)) {
+                    protocol_failure();
+                    break;
+                }
+            }
+
+            const bool stale_target =
+                conn.fd < 0 || conn.upstream_fd < 0 || !conn.upstream_recv_armed ||
+                target.episode != conn.upstream_episode ||
+                conn.response_read_deadline_post_commit_phase !=
+                    ResponseReadDeadlinePostCommitPhase::Buffering ||
+                conn.response_read_deadline_post_commit_episode != target.episode;
+            const u32 declared = conn.response_read_deadline_post_commit_declared_body;
+            const u32 received = conn.response_read_deadline_post_commit_origin_received;
+            const bool logical_commit =
+                cqe->res > 0 && !stale_target && received <= declared &&
+                static_cast<u32>(cqe->res) <= declared - received &&
+                received <= ResponseBodyChain::kMaxBody &&
+                static_cast<u32>(cqe->res) <= ResponseBodyChain::kMaxBody - received &&
+                target.node == conn.response_body_tail.tail && response_pool != nullptr &&
+                target.ptr == conn.response_body_tail.write_ptr(*response_pool);
+            const bool deadline_active =
+                (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
+                 conn.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete) &&
+                conn.response_read_deadline_owner_generation != 0 &&
+                conn.response_read_deadline_owner_generation ==
+                    conn.response_read_deadline_generation;
+            const bool deadline_owner =
+                deadline_active && conn.response_read_deadline_upstream_episode == target.episode;
+            const bool deadline_copy_eligible =
+                deadline_owner && ((last_read_owner_valid && head == last_read_owner_head + 1u &&
+                                    cqe->user_data == last_read_owner_token) ||
+                                   response_deadline_copy_owner(conn, target.episode, aux));
+            i32 direct_result = cqe->res;
+            if (logical_commit) {
+                const u32 copy_begin = conn.buffered_response_len();
+                conn.response_body_tail.commit(static_cast<u32>(cqe->res));
+                direct_result = cqe->res;
+                events[count].copy_witness =
+                    deadline_copy_eligible ? IoEventCopyWitness::Full : IoEventCopyWitness::Invalid;
+                events[count].copy_deadline_generation = conn.response_read_deadline_generation;
+                events[count].copy_deadline_profile =
+                    static_cast<u8>(conn.response_read_deadline_profile);
+                events[count].copy_deadline_method = conn.response_read_deadline_method;
+                if (events[count].copy_witness == IoEventCopyWitness::Full) {
+                    events[count].copy_begin = copy_begin;
+                    events[count].copy_end = conn.buffered_response_len();
+                }
+            } else if (cqe->res > 0 && deadline_active) {
+                events[count].copy_witness = IoEventCopyWitness::Invalid;
+                events[count].copy_deadline_generation = conn.response_read_deadline_generation;
+                events[count].copy_deadline_profile =
+                    static_cast<u8>(conn.response_read_deadline_profile);
+                events[count].copy_deadline_method = conn.response_read_deadline_method;
+            }
+
+            conn.chain_direct_recv_owner = {};
+            conn.upstream_recv_direct_armed = false;
+            events[count].conn_id = conn_id;
+            events[count].type = type;
+            events[count].result = direct_result;
+            events[count].buf_id = 0;
+            events[count].has_buf = 0;
+            events[count].more = 0;
+            events[count].aux = static_cast<u8>(aux);
+            events[count].upstream_episode = upstream_episode;
+            head++;
+            count++;
+            continue;
+        }
+
         // A direct recv (add_recv_upstream_direct) owns no provided buffer, so
         // its CQE never carries IORING_CQE_F_BUFFER — the kernel already wrote
         // the bytes straight into the destination captured at arm time. Only a
@@ -1684,7 +1770,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
         // release_upstream_relay_slice, take_relay_recv_buffer) safely reuse
         // that buffer once dispatch observes this event.
         if (type == IoEventType::UpstreamRecv && aux == 0 && conns != nullptr &&
-            conn_id < max_conns && conns[conn_id].upstream_recv_direct_armed) {
+            conn_id < max_conns && conns[conn_id].upstream_recv_direct_armed &&
+            !conns[conn_id].chain_direct_recv_owner.active) {
             Connection& conn = conns[conn_id];
             conn.upstream_recv_direct_armed = false;
 
@@ -1723,21 +1810,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                                     cqe->user_data == last_read_owner_token) ||
                                    response_deadline_copy_owner(conn, upstream_episode, aux));
 
-            // A response_read_deadline connection in Buffering phase
-            // targets the ResponseBodyChain tail instead of
-            // upstream_recv_buf (see arm_response_read_direct_body_recv).
-            // Both destinations were sized to exactly write_avail() at arm
-            // time and stay pinned until this CQE, so the same bound and
-            // commit shape apply — only which buffer differs.
-            const bool targets_chain =
-                response_pool != nullptr && conn.response_read_deadline_post_commit_phase ==
-                                                ResponseReadDeadlinePostCommitPhase::Buffering;
             i32 direct_result = cqe->res;
             if (cqe->res > 0 && !stale_direct) {
                 const u32 nbytes = static_cast<u32>(cqe->res);
-                const u32 target_avail = targets_chain
-                                             ? conn.response_body_tail.write_avail(*response_pool)
-                                             : conn.upstream_recv_buf.write_avail();
+                const u32 target_avail = conn.upstream_recv_buf.write_avail();
                 if (nbytes > target_avail) {
                     // A direct recv's destination length was set from write_avail()
                     // at arm time and is pinned until this CQE; the kernel can never
@@ -1747,10 +1823,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 }
                 const u32 copy_begin =
                     deadline_owner ? conn.buffered_response_len() : conn.upstream_recv_buf.len();
-                if (targets_chain)
-                    conn.response_body_tail.commit(nbytes);
-                else
-                    conn.upstream_recv_buf.commit(nbytes);
+                conn.upstream_recv_buf.commit(nbytes);
                 direct_result = static_cast<i32>(nbytes);
                 if (deadline_owner) {
                     events[count].copy_witness = deadline_copy_eligible
@@ -1818,7 +1891,8 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
             add_first_response_recv(conns[conn_id].upstream_fd,
                                     conn_id,
                                     upstream_episode,
-                                    /*separate_body_ring=*/true)) {
+                                    /*separate_body_ring=*/true,
+                                    /*one_shot=*/true)) {
             head++;
             continue;
         }
