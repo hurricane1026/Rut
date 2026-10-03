@@ -1455,8 +1455,22 @@ static bool run_named_docker_probe(const std::string& name,
     return true;
 }
 
+static bool make_temp_directory_template(const char* configured_tmp,
+                                         const char* name_template,
+                                         char* output,
+                                         size_t output_capacity) {
+    const char* tmp_root =
+        configured_tmp == nullptr || configured_tmp[0] == '\0' ? "/tmp" : configured_tmp;
+    std::string path_template(tmp_root);
+    if (path_template.back() != '/') path_template += '/';
+    path_template += name_template;
+    if (path_template.size() >= output_capacity) return false;
+    memcpy(output, path_template.c_str(), path_template.size() + 1u);
+    return true;
+}
+
 struct TempDir {
-    char path[64] = "/tmp/rut-nginx-differential-XXXXXX";
+    char path[256] = {};
     bool created = false;
     std::string source;
     std::string nginx_config;
@@ -1475,7 +1489,10 @@ struct TempDir {
     u16 retained_backend_port = 0u;
 
     bool create() {
-        if (!mkdtemp(path)) return false;
+        if (!make_temp_directory_template(
+                getenv("TMPDIR"), "rut-nginx-differential-XXXXXX", path, sizeof(path)) ||
+            !mkdtemp(path))
+            return false;
         created = true;
         source = std::string(path) + "/generated.rut";
         nginx_config = std::string(path) + "/nginx.conf";
@@ -2164,6 +2181,187 @@ static bool read_bounded_file(const std::string& path, std::string& contents, st
     return true;
 }
 
+static bool is_io_uring_enomem_startup_log(const std::string& output) {
+    static constexpr char kPrefix[] = "Failed to init shard ";
+    static constexpr char kFailure[] = " (errno=12, source=2)";
+    size_t line_begin = 0;
+    while (line_begin < output.size()) {
+        const size_t line_end = output.find('\n', line_begin);
+        const size_t end = line_end == std::string::npos ? output.size() : line_end;
+        const std::string line = output.substr(line_begin, end - line_begin);
+        if (line.compare(0, sizeof(kPrefix) - 1u, kPrefix) == 0) {
+            size_t digit = sizeof(kPrefix) - 1u;
+            const size_t first_digit = digit;
+            while (digit < line.size() && line[digit] >= '0' && line[digit] <= '9') digit++;
+            if (digit > first_digit && line.compare(digit, sizeof(kFailure) - 1u, kFailure) == 0 &&
+                digit + sizeof(kFailure) - 1u == line.size())
+                return true;
+        }
+        if (line_end == std::string::npos) break;
+        line_begin = line_end + 1u;
+    }
+    return false;
+}
+
+static std::string child_exit_readiness_diagnostic(const Child& child) {
+    const std::string status = child_status_description(child);
+    std::string output;
+    std::string read_error;
+    const bool log_read = read_bounded_file(child.log_path, output, read_error);
+    std::string diagnostic = "process exited before readiness (" + status;
+    if (child.status_valid && WIFEXITED(child.status) && WEXITSTATUS(child.status) != 0 &&
+        log_read && is_io_uring_enomem_startup_log(output)) {
+        diagnostic += "; classified as io_uring startup ENOMEM (errno=12, source=2)";
+    } else if (child.status_valid && WIFSIGNALED(child.status)) {
+        diagnostic += "; classified as child terminated by signal";
+    } else if (child.status_valid && WIFEXITED(child.status)) {
+        diagnostic += "; classified as non-io_uring child exit";
+    } else {
+        diagnostic += "; child exit status unavailable";
+    }
+    if (log_read) {
+        diagnostic += "; child log: ";
+        diagnostic += output.empty() ? "<empty>" : output;
+    } else {
+        diagnostic += "; child log unavailable: " + read_error;
+    }
+    diagnostic += ')';
+    return diagnostic;
+}
+
+static bool child_exit_readiness_diagnostic_self_check() {
+    char root_selection[256] = {};
+    static constexpr char kTempTemplate[] = "rut-nginx-differential-XXXXXX";
+    const size_t suffix_len = sizeof(kTempTemplate) - 1u;
+    const std::string near_limit_root(254u - suffix_len, 'n');
+    const std::string over_limit_root(255u - suffix_len, 'o');
+    char near_limit_path[256] = {};
+    char over_limit_path[256] = {};
+    const bool temp_root_selection_ok =
+        make_temp_directory_template(
+            nullptr, kTempTemplate, root_selection, sizeof(root_selection)) &&
+        strcmp(root_selection, "/tmp/rut-nginx-differential-XXXXXX") == 0 &&
+        make_temp_directory_template("", kTempTemplate, root_selection, sizeof(root_selection)) &&
+        strcmp(root_selection, "/tmp/rut-nginx-differential-XXXXXX") == 0 &&
+        make_temp_directory_template(
+            "/cache/tmp", kTempTemplate, root_selection, sizeof(root_selection)) &&
+        strcmp(root_selection, "/cache/tmp/rut-nginx-differential-XXXXXX") == 0 &&
+        make_temp_directory_template(
+            near_limit_root.c_str(), kTempTemplate, near_limit_path, sizeof(near_limit_path)) &&
+        strlen(near_limit_path) == sizeof(near_limit_path) - 1u &&
+        !make_temp_directory_template(
+            over_limit_root.c_str(), kTempTemplate, over_limit_path, sizeof(over_limit_path));
+    if (!temp_root_selection_ok) {
+        std::cerr << "FAIL: temporary directory root selection or path bounds\n";
+        return false;
+    }
+
+    char directory_template[256] = {};
+    if (!make_temp_directory_template(getenv("TMPDIR"),
+                                      "rut-child-readiness-diagnostic-XXXXXX",
+                                      directory_template,
+                                      sizeof(directory_template)))
+        return false;
+    char* created_directory = mkdtemp(directory_template);
+    if (created_directory == nullptr) return false;
+    const std::string directory(created_directory);
+    const std::string path = directory + "/child.log";
+
+    Child child{};
+    child.status_valid = true;
+    child.status = 1 << 8;
+    child.log_path = path;
+    bool ok = true;
+    const auto expect = [&](const char* label, const std::string& expected) {
+        const std::string actual = child_exit_readiness_diagnostic(child);
+        if (actual == expected) return true;
+        std::cerr << "FAIL: " << label << "\nexpected: " << expected << "\nactual: " << actual
+                  << "\n";
+        return false;
+    };
+    const auto check_log =
+        [&](const char* label, const char* log, size_t log_len, const char* classification) {
+            if (!write_file(path, log, log_len)) {
+                std::cerr << "FAIL: " << label << " could not write fixture log errno=" << errno
+                          << "\n";
+                return false;
+            }
+            std::string expected = "process exited before readiness (exit 1; ";
+            expected += classification;
+            expected += "; child log: ";
+            expected += log_len == 0 ? "<empty>" : std::string(log, log_len);
+            expected += ')';
+            return expect(label, expected);
+        };
+
+    static constexpr char kIoUringEnomem[] = "Failed to init shard 12 (errno=12, source=2)\n";
+    ok = check_log("exact io_uring ENOMEM classification",
+                   kIoUringEnomem,
+                   sizeof(kIoUringEnomem) - 1u,
+                   "classified as io_uring startup ENOMEM (errno=12, source=2)") &&
+         ok;
+    static constexpr char kOtherSource[] = "Failed to init shard 0 (errno=12, source=1)\n";
+    ok = check_log("other startup source classification",
+                   kOtherSource,
+                   sizeof(kOtherSource) - 1u,
+                   "classified as non-io_uring child exit") &&
+         ok;
+    static constexpr char kOtherErrno[] = "Failed to init shard 0 (errno=11, source=2)\n";
+    ok = check_log("other errno classification",
+                   kOtherErrno,
+                   sizeof(kOtherErrno) - 1u,
+                   "classified as non-io_uring child exit") &&
+         ok;
+    static constexpr char kExtraText[] =
+        "Failed to init shard 0 (errno=12, source=2) followed by extra text\n";
+    ok = check_log("non-exact ENOMEM line classification",
+                   kExtraText,
+                   sizeof(kExtraText) - 1u,
+                   "classified as non-io_uring child exit") &&
+         ok;
+
+    child.status = SIGTERM;
+    static constexpr char kSignalLog[] = "Failed to init shard 0 (errno=12, source=2)\n";
+    ok = write_file(path, kSignalLog, sizeof(kSignalLog) - 1u) &&
+         expect("signal classification",
+                "process exited before readiness (signal 15; classified as child terminated by "
+                "signal; child log: Failed to init shard 0 (errno=12, source=2)\n)") &&
+         ok;
+
+    child.status = 1 << 8;
+    ok = check_log("empty child log", "", 0u, "classified as non-io_uring child exit") && ok;
+    std::string oversized(8193u, 'x');
+    if (write_file(path, oversized.data(), oversized.size())) {
+        ok = expect("oversized child log",
+                    "process exited before readiness (exit 1; classified as non-io_uring child "
+                    "exit; child log unavailable: diagnostic output exceeded bounded capture)") &&
+             ok;
+    } else {
+        std::cerr << "FAIL: oversized child log could not write fixture errno=" << errno << "\n";
+        ok = false;
+    }
+
+    child.log_path = directory + "/missing.log";
+    const std::string missing_expected =
+        "process exited before readiness (exit 1; classified as non-io_uring child exit; child "
+        "log unavailable: could not read diagnostic file errno=" +
+        std::to_string(ENOENT) + ')';
+    ok = expect("missing child log", missing_expected) && ok;
+    child.log_path = directory;
+    const std::string read_failure_expected =
+        "process exited before readiness (exit 1; classified as non-io_uring child exit; child "
+        "log unavailable: could not read diagnostic file errno=" +
+        std::to_string(EISDIR) + ')';
+    ok = expect("child log read failure", read_failure_expected) && ok;
+
+    unlink(path.c_str());
+    rmdir(directory.c_str());
+    if (ok)
+        std::cerr
+            << "PASS: child exit readiness diagnostics preserve status and bounded log evidence\n";
+    return ok;
+}
+
 static bool remove_preload_container_bounded(const std::string& name) {
     for (unsigned attempt = 0u; attempt < 2u; attempt++) {
         ChildGuard remover;
@@ -2513,10 +2711,17 @@ static int connect_once(u16 port) {
     return fd;
 }
 
-static bool wait_ready(u16 port, Child& child, std::string& error) {
+static bool wait_ready(u16 port,
+                       Child& child,
+                       std::string& error,
+                       const char* child_exit_context = nullptr) {
     for (int attempt = 0; attempt < 200; attempt++) {
         if (poll_child(child)) {
-            error = "process exited before readiness (" + child_status_description(child) + ")";
+            if (child_exit_context != nullptr) {
+                error = std::string(child_exit_context) + child_exit_readiness_diagnostic(child);
+            } else {
+                error = "process exited before readiness (" + child_status_description(child) + ")";
+            }
             return false;
         }
         const int fd = connect_once(port);
@@ -76299,7 +76504,7 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
             !spawn_child({rut_path, temp.source, "--shards", "1", "--no-pin", "--drain", "0"},
                          temp.rut_log,
                          nginx.child) ||
-            !wait_ready(frontend_port, nginx.child, error)) {
+            !wait_ready(frontend_port, nginx.child, error, "#270 custom-hide generated RUT ")) {
             if (error.empty()) error = "#270 custom-hide generated RUT failed readiness";
             return false;
         }
@@ -76310,7 +76515,8 @@ static bool run_pinned_nginx_custom_hide_timeout_probe(
                 !log_contains(temp.rut_log, listener.c_str())) &&
                std::chrono::steady_clock::now() < ready_deadline) {
             if (poll_child(nginx.child)) {
-                error = "#270 custom-hide generated RUT exited before readiness";
+                error = "#270 custom-hide generated RUT " +
+                        child_exit_readiness_diagnostic(nginx.child);
                 return false;
             }
             usleep(1000);
@@ -81003,6 +81209,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--pinned-nginx-proxy-hide-header-name-oracle") == 0;
     const bool proxy_hide_header_source_self_check =
         argc == 2 && strcmp(argv[1], "--converter-proxy-hide-header-source-self-check") == 0;
+    const bool child_exit_readiness_self_check =
+        argc == 2 && strcmp(argv[1], "--child-exit-readiness-diagnostic-self-check") == 0;
     const bool explicit_timeout_head_source_self_check =
         argc == 2 && strcmp(argv[1], "--converter-explicit-timeout-head-source-self-check") == 0;
     const bool explicit_timeout_head_generated_episode =
@@ -81398,9 +81606,9 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_name_oracle && !proxy_hide_header_source_self_check &&
-         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
-         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
-         !keepalive_timeout_head_differential &&
+         !child_exit_readiness_self_check && !proxy_hide_header_generated_side_self_check &&
+         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
+         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -82009,6 +82217,9 @@ int main(int argc, char** argv) {
                "modes\n";
         return 0;
     }
+
+    if (child_exit_readiness_self_check)
+        return child_exit_readiness_diagnostic_self_check() ? 0 : 1;
 
     if (proxy_hide_header_source_self_check) {
         std::string source_error;
