@@ -20984,6 +20984,23 @@ TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
     CHECK_NE(authority->resp_status, 204u);
     CHECK_EQ(pre_route_root_handler_calls, 0u);
     loop.close_conn(*authority);
+    for (const char* request : {"CONNECT foo~bar:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT foo!$&'()*+,;=:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT foo%41bar:443 HTTP/1.1\r\nHost: x\r\n\r\n"}) {
+        auto* reg_name = dispatch_unmatched_request(loop, local, request);
+        REQUIRE(reg_name != nullptr);
+        CHECK_FALSE(reg_name->req_target_form_unsupported);
+        CHECK_NE(reg_name->resp_status, 400u);
+        loop.close_conn(*reg_name);
+    }
+    for (const char* request : {"CONNECT foo%4:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT foo%ZZbar:443 HTTP/1.1\r\nHost: x\r\n\r\n"}) {
+        auto* invalid_reg_name = dispatch_unmatched_request(loop, local, request);
+        REQUIRE(invalid_reg_name != nullptr);
+        CHECK(invalid_reg_name->req_target_form_unsupported);
+        CHECK_EQ(invalid_reg_name->resp_status, 400u);
+        loop.close_conn(*invalid_reg_name);
+    }
     auto* ipv6_authority = dispatch_unmatched_request(
         loop, local, "CONNECT [2001:db8::1]:443 HTTP/1.1\r\nHost: x\r\n\r\n");
     REQUIRE(ipv6_authority != nullptr);
@@ -21148,6 +21165,32 @@ TEST(request_admission, absolute_target_unmatched_and_exact_inventory_precedence
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     loop.close_conn(*pre_route_rejected);
+
+    RouteConfig connect_pre_route{};
+    REQUIRE_EQ(connect_pre_route.add_strict_local_response_policy(pre_route), 1u);
+    REQUIRE(connect_pre_route.set_pre_route_policy_id(kRouteMethodConnect, 1));
+    const char* connect_origin = "CONNECT / HTTP/1.1\r\nHost: x\r\n\r\n";
+    loop.backend.clear_ops();
+    auto* connect_closed = dispatch_unmatched_request(loop, connect_pre_route, connect_origin);
+    REQUIRE(connect_closed != nullptr);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    const char* connect_strict = "CONNECT / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    loop.backend.clear_ops();
+    auto* connect_rejected = dispatch_unmatched_request(loop, connect_pre_route, connect_strict);
+    REQUIRE(connect_rejected != nullptr);
+    CHECK_EQ(connect_rejected->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    loop.close_conn(*connect_rejected);
+    const char* connect_invalid_authority =
+        "CONNECT urn:example:animal HTTP/1.1\r\nHost: x\r\n\r\n";
+    loop.backend.clear_ops();
+    auto* connect_invalid =
+        dispatch_unmatched_request(loop, connect_pre_route, connect_invalid_authority);
+    REQUIRE(connect_invalid != nullptr);
+    CHECK_EQ(connect_invalid->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    loop.close_conn(*connect_invalid);
 
     const char* fragment = "GET /#fragment HTTP/1.1\r\nHost: x\r\n\r\n";
     loop.backend.clear_ops();
@@ -26309,11 +26352,13 @@ TEST(pipeline, request_generation_token_rejects_handler_wrap_and_resets) {
     conn->http1_pipeline_boundary_owners_settled = true;
     conn->req_target_has_fragment = true;
     conn->req_target_form_unsupported = true;
+    conn->req_target_form_reject_before_pre_route = true;
     conn->reset();
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
     CHECK_FALSE(conn->http1_pipeline_boundary_owners_settled);
     CHECK_FALSE(conn->req_target_has_fragment);
     CHECK_FALSE(conn->req_target_form_unsupported);
+    CHECK_FALSE(conn->req_target_form_reject_before_pre_route);
 }
 
 TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_witness) {
@@ -26326,6 +26371,7 @@ TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_
     source.http1_pipeline_boundary_owners_settled = true;
     source.req_target_has_fragment = true;
     source.req_target_form_unsupported = true;
+    source.req_target_form_reject_before_pre_route = true;
     source.req_metadata_episode = 40;
     source.req_raw_target_episode = 40;
     source.req_raw_target_offset = 4;
@@ -26341,6 +26387,7 @@ TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_
     CHECK(destination.http1_pipeline_boundary_owners_settled);
     CHECK(destination.req_target_has_fragment);
     CHECK(destination.req_target_form_unsupported);
+    CHECK(destination.req_target_form_reject_before_pre_route);
     CHECK_EQ(destination.req_metadata_episode, 0u);
     CHECK_EQ(destination.req_raw_target_episode, 0u);
     CHECK_EQ(destination.req_raw_target_offset, 0u);

@@ -2391,7 +2391,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    if (conn.req_target_form_unsupported) {
+    if (conn.req_target_form_reject_before_pre_route) {
         loop->epoch_enter();
         if (loop->metrics) loop->metrics->on_request_start();
         conn.resp_status = 400;
@@ -2418,7 +2418,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // percent-encoded %23 remains ordinary request-target data.
     // A literal fragment delimiter is invalid before any route, handler or
     // upstream effect; percent-encoded %23 remains ordinary request-target data.
-    if (conn.req_target_has_fragment) {
+    if (conn.req_target_has_fragment || conn.req_target_form_unsupported) {
         conn.resp_status = 400;
         format_static_response(conn,
                                400,

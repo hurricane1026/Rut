@@ -127,10 +127,26 @@ static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end
             const u8 c = data[i];
             const bool alpha_num =
                 (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-            if (!alpha_num && c != '.' && c != '-' && c != '_') return false;
+            const bool unreserved = alpha_num || c == '-' || c == '.' || c == '_' || c == '~';
+            const bool subdelim = c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' ||
+                                  c == ')' || c == '*' || c == '+' || c == ',' || c == ';' ||
+                                  c == '=';
+            if (c == '%') {
+                if (i + 2 >= host_end) return false;
+                const u8 h = data[i + 1], l = data[i + 2];
+                const bool hex_h =
+                    (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
+                const bool hex_l =
+                    (l >= '0' && l <= '9') || (l >= 'a' && l <= 'f') || (l >= 'A' && l <= 'F');
+                if (!hex_h || !hex_l) return false;
+                i += 2;
+            } else if (!unreserved && !subdelim) {
+                return false;
+            }
         }
     }
-    if (host_end >= end || data[host_end++] != ':') return false;
+    if (host_end >= end || data[host_end] != ':') return false;
+    host_end++;
     if (host_end == end) return false;
     u32 port = 0;
     for (; host_end < end; host_end++) {
@@ -147,6 +163,7 @@ void capture_request_metadata(Connection& conn) {
     conn.req_strict_h1_complete = false;
     conn.req_target_has_fragment = false;
     conn.req_target_form_unsupported = false;
+    conn.req_target_form_reject_before_pre_route = false;
     conn.req_method = static_cast<u8>(LogHttpMethod::Other);
     conn.downstream_req_size = conn.recv_buf.len();
     conn.req_size = conn.downstream_req_size;
@@ -225,10 +242,13 @@ void capture_request_metadata(Connection& conn) {
         if (target_end > target_start) {
             const bool origin = data[target_start] == '/';
             const bool asterisk = target_end == target_start + 1 && data[target_start] == '*';
+            const bool connect_authority_valid =
+                !connect || connect_authority_target_is_valid(data, target_start, target_end);
             conn.req_target_form_unsupported =
-                connect ? (origin || target_has_slash ||
-                           !connect_authority_target_is_valid(data, target_start, target_end))
+                connect ? (origin || target_has_slash || !connect_authority_valid)
                         : (!origin && !asterisk);
+            conn.req_target_form_reject_before_pre_route =
+                conn.req_target_form_unsupported && !(connect && origin);
         }
     }
 
