@@ -472,12 +472,13 @@ the stricter checks.
   nginx-era policy fixture (`tests/fixtures/nginx373_hide.inc`) instead of
   the milestone's exact emitted text — see docs/envoy-converter.md, "Round-3
   review edge cases (PR #692)". None of the six is gated behind a
-  `RutCapabilities` flag, for the same reason as round-2. A seventh finding —
-  `CONNECT` matching the any-method route — is a mis-forward, not a
-  fail-closed refusal, and is recorded separately above (not as a numbered
-  table row) with the two converter-level fixes that were tried and found
-  infeasible within the lexer's token budget and the language's expression
-  grammar.
+  `RutCapabilities` flag, for the same reason as round-2. A seventh,
+  historical finding at that review head — `CONNECT` matching the any-method
+  route — was a mis-forward, not a fail-closed refusal. It is recorded
+  separately above (not as a numbered table row) with the two converter-level
+  fixes that were tried and found infeasible within the lexer's token budget
+  and the language's expression grammar; runtime admission now fixes the
+  origin-form case as described above.
 - PR 2 (envoy-pr-plan.md): pinned
   `envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4`
   (`v1.39.1`, `tests/pinned-envoy-image.txt`) and added the docker-gated

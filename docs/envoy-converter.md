@@ -987,12 +987,14 @@ emitted text, since that still doesn't compile on this branch.
      the `CONNECT` mis-forward for a new `TRACE` divergence rather than fix
      anything.
 
-   Fixing this without introducing a new divergence needs a runtime or
-   language capability this milestone does not have today: an
-   expression-position `CONNECT` (and `TRACE`) method literal, a per-route
-   method-exclusion list, or a lexer token budget large enough for one
-   explicit route per forwarded method. Recorded as a bug (not a
-   `NOT_IMPLEMENTED`/`PARTIAL` row) in docs/envoy-compatibility.md.
+   Before #708, fixing this solely in the converter without introducing a new
+   divergence would have needed a runtime or language capability that the
+   milestone did not have: an expression-position `CONNECT` (and `TRACE`)
+   method literal, a per-route method-exclusion list, or a lexer token budget
+   large enough for one explicit route per forwarded method. The runtime
+   admission fix in #708 supersedes those converter-only alternatives; this
+   paragraph is retained as historical analysis, while the current status is
+   the fixed behavior described above.
 
 **Round-4 review edge cases (PR #692)**
 
