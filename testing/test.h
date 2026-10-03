@@ -119,10 +119,34 @@ struct TestCase {
     const char* fail_expr;
     bool skipped;
     const char* skip_reason;
+    char external_failure[192]{};
 };
 
 inline TestCase* g_head = nullptr;
 inline TestCase** g_tail = &g_head;
+inline thread_local TestCase* g_current_test_case = nullptr;
+
+inline void report_external_failure(const char* file, int line, const char* expr) {
+    TestCase* tc = g_current_test_case;
+    if (tc == nullptr) return;
+    tc->checks_failed++;
+    tc->fail_file = file;
+    tc->fail_line = line;
+    unsigned length = 0;
+    while (expr[length] != '\0' && length + 1 < sizeof(tc->external_failure)) {
+        tc->external_failure[length] = expr[length];
+        length++;
+    }
+    tc->external_failure[length] = '\0';
+    tc->fail_expr = tc->external_failure;
+    out("    check: ");
+    out(file);
+    out(":");
+    out_int(line);
+    out(" -> ");
+    out(expr);
+    out("\n");
+}
 
 inline void register_test(TestCase* tc) {
     tc->next = nullptr;
@@ -231,11 +255,16 @@ inline void register_test(TestCase* tc) {
 
 #define FAIL(msg) REQUIRE_MSG(false, msg)
 
-#define SKIP(msg)                 \
-    do {                          \
-        _tc->skipped = true;      \
-        _tc->skip_reason = (msg); \
-        return;                   \
+#define SKIP(msg)                       \
+    do {                                \
+        if (_tc->checks_failed == 0) {  \
+            _tc->skipped = true;        \
+            _tc->skip_reason = (msg);   \
+        } else {                        \
+            _tc->skipped = false;       \
+            _tc->skip_reason = nullptr; \
+        }                               \
+        return;                         \
     } while (0)
 
 // --- Test definition ---
@@ -621,6 +650,8 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
         tc->checks_failed = 0;
         tc->fail_file = nullptr;
         tc->fail_line = 0;
+        tc->fail_expr = nullptr;
+        tc->external_failure[0] = '\0';
         if (!str_starts_with(tc->name, "DISABLED_")) tc->skip_reason = nullptr;
 
         if (!tc->skipped) {
@@ -629,7 +660,9 @@ inline int run_all(int argc = 0, char** argv = nullptr) {
             out(".");
             out(tc->name);
             out("\n");
+            g_current_test_case = tc;
             tc->fn(tc);
+            g_current_test_case = nullptr;
         }
         total_checks += tc->checks_passed;
         total_check_fail += tc->checks_failed;

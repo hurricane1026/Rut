@@ -16,6 +16,7 @@
 #include "rut/runtime/route_method.h"
 #include "rut/serve_loader.h"
 #include "test.h"
+#include "test_helpers.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"  // WsMessageHandlerFn / WsFrameAction / WsOpcode
 #endif
@@ -82,10 +83,16 @@ struct ScopedPublicIoUringLoop {
                        MAP_PRIVATE | MAP_ANONYMOUS,
                        -1,
                        0);
-        if (storage == MAP_FAILED) return false;
+        if (storage == MAP_FAILED) {
+            report_unexpected_io_uring_init_failure(Error::from_errno(Error::Source::Mmap),
+                                                    "public io_uring test storage mmap");
+            return false;
+        }
         loop = new (storage) IoUringEventLoop();
         auto result = loop->init(0, -1);
         initialized = result.has_value();
+        if (!initialized && !io_uring_init_error_is_unsupported(result.error()))
+            report_unexpected_io_uring_init_failure(result.error(), "public io_uring loop.init");
         return initialized;
     }
 

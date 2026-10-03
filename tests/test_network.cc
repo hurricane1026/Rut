@@ -38078,9 +38078,13 @@ struct ScopedIoUringLoopForRetirement {
                        MAP_PRIVATE | MAP_ANONYMOUS,
                        -1,
                        0);
-        if (storage == MAP_FAILED) return false;
+        if (storage == MAP_FAILED) {
+            report_unexpected_io_uring_init_failure(Error::from_errno(Error::Source::Mmap),
+                                                    "retirement-test storage mmap");
+            return false;
+        }
         loop = new (storage) IoUringEventLoop();
-        initialized = init_iouring_loop_with_retry(*loop);
+        initialized = init_iouring_loop_with_retry(*loop, "retirement-test loop.init");
         return initialized;
     }
 
@@ -70522,7 +70526,7 @@ TEST(timeout_policy, explicit_policy_epoll_remains_zero_byte_fail_closed) {
 TEST(iouring_episode, upstream_submissions_carry_episode_and_aux) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
-    if (!initialized) SKIP("io_uring unavailable");
+    SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(initialized, "upstream episode backend.init");
 
     const u32 first_tail = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
     constexpr u32 kConnId = 3;
@@ -70979,7 +70983,7 @@ TEST(iouring_final_response, direct_write_is_limited_to_closing_plaintext_local_
 TEST(iouring_episode, invalid_upstream_episodes_do_not_acquire_sqe_or_state) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
-    if (!initialized) SKIP("io_uring unavailable");
+    SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(initialized, "upstream episode backend.init");
 
     constexpr u32 kConnId = 3;
     static const u8 payload[] = {'x', 'y', 'z'};
@@ -74107,7 +74111,7 @@ TEST(iouring_send_generation, backend_wait_stale_then_current_in_one_batch) {
 TEST(iouring_episode, stale_partial_send_does_not_touch_reused_episode_state) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
-    if (!initialized) SKIP("io_uring unavailable");
+    SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(initialized, "stale partial-send backend.init");
 
     constexpr u32 kConnId = 0;
     constexpr u32 kOldEpisode = 1;
@@ -74160,7 +74164,7 @@ TEST(iouring_episode, stale_partial_send_does_not_touch_reused_episode_state) {
 TEST(iouring_episode, current_partial_send_resubmits_with_current_episode) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
-    if (!initialized) SKIP("io_uring unavailable");
+    SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(initialized, "current partial-send backend.init");
 
     constexpr u32 kConnId = 0;
     constexpr u32 kEpisode = 7;
@@ -74279,7 +74283,7 @@ TEST(iouring_episode, generic_async_dispatch_reclaims_closed_stale_slot_once) {
 TEST(iouring_episode, stale_provided_recv_returns_buffer_without_copy) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
-    if (!initialized) SKIP("io_uring unavailable");
+    SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(initialized, "stale provided-recv backend.init");
 
     i32 fds[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
@@ -74327,7 +74331,7 @@ TEST(iouring_episode, stale_provided_recv_returns_buffer_without_copy) {
 TEST(iouring_episode, stale_provided_buffer_is_reusable) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
-    if (!initialized) SKIP("io_uring unavailable");
+    SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(initialized, "stale provided-buffer backend.init");
 
     i32 fds[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
@@ -74405,7 +74409,7 @@ TEST(iouring_episode, stale_provided_buffer_is_reusable) {
 TEST(iouring_episode, malformed_upstream_cqe_is_tagged_stale_and_returns_buffer) {
     IoUringBackend backend{};
     auto initialized = backend.init(0, -1);
-    if (!initialized) SKIP("io_uring unavailable");
+    SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(initialized, "malformed upstream CQE backend.init");
 
     Connection conns[1]{};
     conns[0].reset();

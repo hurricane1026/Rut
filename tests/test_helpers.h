@@ -10,6 +10,7 @@
 #else
 #include "rut/runtime/epoll_event_loop.h"
 #endif
+#include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/route_table.h"
@@ -17,12 +18,14 @@
 #include "rut/runtime/socket.h"
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/traffic_capture.h"
+#include "test.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -1020,19 +1023,56 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
     void dispatch(const IoEvent&) {}
 };
 
-// The kernel releases a closed ring's memlock charge asynchronously, so a ring
-// created right after another was torn down can see a transient ENOMEM. Retry
-// briefly; a persistent failure still reports unavailable.
+// Keep the existing bounded retry for transient ENOMEM. Persistent ENOMEM and
+// every non-unsupported setup/mmap error fail the current test instead of being
+// hidden by its legacy SKIP call.
+inline bool io_uring_init_error_is_unsupported(Error error) {
+    return error.source == Error::Source::IoUring &&
+           (error.code == ENOSYS || error.code == EOPNOTSUPP || error.code == EPERM ||
+            error.code == EACCES);
+}
+
+inline void report_unexpected_io_uring_init_failure(const Error& error, const char* stage) {
+    char message[192];
+    (void)snprintf(message,
+                   sizeof(message),
+                   "unexpected io_uring initialization failure at %s (errno=%d, source=%u)",
+                   stage,
+                   error.code,
+                   static_cast<unsigned>(error.source));
+    rut::test::report_external_failure(__FILE__, __LINE__, message);
+}
+
+inline void report_unexpected_test_setup_failure(const char* message) {
+    rut::test::report_external_failure(__FILE__, __LINE__, message);
+}
+
 template <typename Loop>
-inline bool init_iouring_loop_with_retry(Loop& loop) {
+inline bool init_iouring_loop_with_retry(Loop& loop, const char* stage = "loop.init") {
+    Error failure{};
+    bool failed = false;
     for (u32 attempt = 0; attempt < 40; attempt++) {
         auto result = loop.init(0, -1);
         if (result.has_value()) return true;
-        if (result.error().code != ENOMEM) return false;
+        failure = result.error();
+        failed = true;
+        if (failure.code != ENOMEM) break;
         usleep(25000);
     }
+    if (failed && !io_uring_init_error_is_unsupported(failure))
+        report_unexpected_io_uring_init_failure(failure, stage);
     return false;
 }
+
+#define SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(init_result, stage)                               \
+    do {                                                                                       \
+        if (!(init_result)) {                                                                  \
+            const Error init_error_ = (init_result).error();                                   \
+            if (io_uring_init_error_is_unsupported(init_error_)) SKIP("io_uring unavailable"); \
+            report_unexpected_io_uring_init_failure(init_error_, (stage));                     \
+            return;                                                                            \
+        }                                                                                      \
+    } while (0)
 
 // io_uring loops leave conns[] untouched until alloc_conn() hands a slot out
 // (see IoUringEventLoop::slots_initialized). Tests that poke conns[i] directly

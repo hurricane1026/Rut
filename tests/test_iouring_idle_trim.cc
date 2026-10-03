@@ -36,6 +36,7 @@ const u8* g_fail_slice_b = nullptr;
 // Once the retry budget proves that this process cannot create a ring, later
 // test cases must skip immediately instead of repeating the same 10-second wait.
 bool g_iouring_permanently_unavailable = false;
+Error g_iouring_last_init_error{};
 
 }  // namespace
 
@@ -145,29 +146,39 @@ struct TrimRig {
 
     // capacity: slot count. server_sndbuf != 0 shrinks accepted sockets' send buffers.
     bool init(u32 capacity, bool listen_socket, u32 server_sndbuf = 0) {
-        if (g_iouring_permanently_unavailable) return false;
+        if (g_iouring_permanently_unavailable) {
+            report_unexpected_io_uring_init_failure(g_iouring_last_init_error,
+                                                    "cached prior io_uring init failure");
+            return false;
+        }
         storage = mmap(nullptr,
                        sizeof(IoUringEventLoop),
                        PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS,
                        -1,
                        0);
-        if (storage == MAP_FAILED) return false;
+        if (storage == MAP_FAILED) {
+            report_unexpected_io_uring_init_failure(Error::from_errno(Error::Source::Mmap),
+                                                    "idle-trim test storage mmap");
+            return false;
+        }
         loop = new (storage) IoUringEventLoop();
         if (listen_socket) {
             auto l = create_listen_socket(0);
-            if (!l.has_value()) return false;
+            if (!l.has_value()) {
+                report_unexpected_io_uring_init_failure(l.error(), "idle-trim listener creation");
+                return false;
+            }
             lfd = l.value();
             port = get_port(lfd);
             if (server_sndbuf != 0)
                 setsockopt(lfd, SOL_SOCKET, SO_SNDBUF, &server_sndbuf, sizeof(server_sndbuf));
             listening = true;
         }
-        // Rings are charged to the per-user RLIMIT_MEMLOCK, so concurrent test
-        // processes can transiently exhaust it (ENOMEM): retry briefly before
-        // treating io_uring as unavailable.
+        // Keep the existing bounded ENOMEM retry, then report persistent resource
+        // failure instead of calling it unavailable.
         bool inited = false;
-        bool saw_enomem = false;
+        Error init_error{};
         for (u32 attempt = 0; attempt < 40 && !inited; attempt++) {
             if (attempt != 0) {
                 usleep(250 * 1000);
@@ -176,11 +187,18 @@ struct TrimRig {
             }
             auto r = loop->init(0, lfd, 0, capacity);
             inited = r.has_value();
-            if (!inited && r.error().code != ENOMEM) break;
-            if (!inited) saw_enomem = true;
+            if (!inited) {
+                init_error = r.error();
+                if (io_uring_init_error_is_unsupported(init_error) || init_error.code != ENOMEM)
+                    break;
+            }
         }
         if (!inited) {
-            if (saw_enomem) g_iouring_permanently_unavailable = true;
+            if (!io_uring_init_error_is_unsupported(init_error)) {
+                g_iouring_last_init_error = init_error;
+                g_iouring_permanently_unavailable = true;
+                report_unexpected_io_uring_init_failure(init_error, "idle-trim loop.init");
+            }
             return false;
         }
         up = true;
