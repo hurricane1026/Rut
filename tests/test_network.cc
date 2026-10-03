@@ -28697,7 +28697,9 @@ TEST(access_request_size,
 
     Connection* conn = loop.alloc_conn();
     REQUIRE(conn != nullptr);
-    conn->fd = 42;
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    const i32 client_fd = conn->fd;
     REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kClientRequest), kClientRequestLen),
                kClientRequestLen);
     access_request_size_connect_failure_handler_calls = 0;
@@ -28750,7 +28752,7 @@ TEST(access_request_size,
     CHECK_EQ(__builtin_memcmp(conn->send_buf.data(), kLegacy502, kLegacy502Len), 0);
     const MockOp* failure_send = loop.backend.last_op(MockOp::Send);
     REQUIRE(failure_send != nullptr);
-    CHECK_EQ(failure_send->fd, 42);
+    CHECK_EQ(failure_send->fd, client_fd);
     CHECK_NE(failure_send->fd, failed_upstream_fd);
     CHECK_EQ(failure_send->send_len, kLegacy502Len);
     CHECK_EQ(__builtin_memcmp(failure_send->send_buf, kLegacy502, kLegacy502Len), 0);
