@@ -42605,18 +42605,12 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     fixture.guard.loop->backend.downstream_recv_progress_head = 37;
     fixture.guard.loop->backend.downstream_recv_progress_valid = true;
     auto reinit_result = fixture.guard.loop->backend.init(0, -1);
-    // A ring opened right after one was closed can see a transient ENOMEM (the
-    // kernel releases the memlock charge asynchronously); retry briefly.
-    for (u32 attempt = 0; !reinit_result && reinit_result.error().code == ENOMEM && attempt < 40;
-         attempt++) {
-        usleep(25000);
-        reinit_result = fixture.guard.loop->backend.init(0, -1);
-    }
     if (!reinit_result) {
+        const Error first_error = reinit_result.error();
         std::cerr << "FAIL test=iouring_downstream_recv_barrier.absolute_cq_positions_wrap_and_"
-                     "shutdown_clears_state phase=reinit error_source="
-                  << static_cast<unsigned>(reinit_result.error().source)
-                  << " error_code=" << reinit_result.error().code << "\n";
+                     "shutdown_clears_state phase=reinit attempt=first error_source="
+                  << static_cast<unsigned>(first_error.source) << " error_code=" << first_error.code
+                  << "\n";
     }
     REQUIRE(reinit_result.has_value());
     CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
