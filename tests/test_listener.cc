@@ -2,7 +2,6 @@
 #include "rut/runtime/listener_context.h"
 #include "test.h"
 #include <cstddef>
-#include <initializer_list>
 #include <type_traits>
 
 using namespace rut;
@@ -175,7 +174,8 @@ struct ListenerFd {
 }  // namespace
 
 TEST(listener, exclusive_bind_rejects_competing_listener) {
-    for (ListenerAddress address : {ListenerAddress::IPv4Wildcard, ListenerAddress::IPv4Exact}) {
+    const ListenerAddress addresses[] = {ListenerAddress::IPv4Wildcard, ListenerAddress::IPv4Exact};
+    for (ListenerAddress address : addresses) {
         ListenerSpec declared{};
         declared.address = address;
         declared.ipv4_host = address == ListenerAddress::IPv4Exact ? 0x7f000001u : 0u;
@@ -192,7 +192,8 @@ TEST(listener, exclusive_bind_rejects_competing_listener) {
         CHECK_EQ(reuse, 0);
 #endif
         // A same-UID process must fail even if it opts into SO_REUSEPORT.
-        for (bool reuse_port : {false, true}) {
+        const bool reuse_ports[] = {false, true};
+        for (bool reuse_port : reuse_ports) {
             ListenerContext other{};
             auto competing =
                 bind_listener_shard(declared, context.port, nullptr, &other, reuse_port);
