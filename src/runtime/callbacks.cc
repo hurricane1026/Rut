@@ -107,6 +107,7 @@ void capture_request_metadata(Connection& conn) {
     conn.begin_request_metadata_episode();
     conn.req_strict_h1_complete = false;
     conn.req_target_has_fragment = false;
+    conn.req_target_form_unsupported = false;
     conn.req_method = static_cast<u8>(LogHttpMethod::Other);
     conn.downstream_req_size = conn.recv_buf.len();
     conn.req_size = conn.downstream_req_size;
@@ -168,12 +169,25 @@ void capture_request_metadata(Connection& conn) {
         target_start++;
     if (target_start < kLen && data[target_start] == ' ') {
         target_start++;
-        for (u32 i = target_start; i < kLen && data[i] != ' ' && data[i] != '\r' && data[i] != '\n';
-             i++) {
-            if (data[i] == '#') {
-                conn.req_target_has_fragment = true;
-                break;
-            }
+        u32 target_end = target_start;
+        bool target_has_slash = false;
+        while (target_end < kLen && data[target_end] != ' ' && data[target_end] != '\r' &&
+               data[target_end] != '\n') {
+            conn.req_target_has_fragment |= data[target_end] == '#';
+            target_has_slash |= data[target_end] == '/';
+            target_end++;
+        }
+        // Ordinary routing supports origin-form, plus the existing asterisk
+        // responder and CONNECT authority handling. Absolute-form is not
+        // implemented: reject it before application routing, including when
+        // an extension method bypasses the strict parser. A leading "//" is
+        // still origin-form path data, not an absolute URI.
+        const bool connect = target_start == 8 && __builtin_memcmp(data, "CONNECT ", 8) == 0;
+        if (target_end > target_start) {
+            const bool origin = data[target_start] == '/';
+            const bool asterisk = target_end == target_start + 1 && data[target_start] == '*';
+            conn.req_target_form_unsupported =
+                connect ? (origin || target_has_slash) : (!origin && !asterisk);
         }
     }
 

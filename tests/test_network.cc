@@ -20993,6 +20993,124 @@ TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
     CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
 }
 
+TEST(request_admission, absolute_target_rejected_before_handler_or_upstream) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(config.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
+    pre_route_root_handler_calls = 0;
+    const char* requests[] = {
+        "GET http://example.test/ HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET https://example.test/admin?x=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+        "HEAD http://example.test/admin HTTP/1.1\r\nHost: x\r\n\r\n",
+        "POST http://example.test/ HTTP/1.0\r\nContent-Length: 4\r\n\r\nbody",
+        "PROPFIND http://example.test/ HTTP/1.1\r\nHost: x\r\n\r\n",
+        "CONNECT http://example.test:443/ HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET http:example.test HTTP/1.1\r\nHost: x\r\n\r\n",
+    };
+    for (const char* request : requests) {
+        loop.backend.clear_ops();
+        auto* conn = dispatch_unmatched_request(loop, config, request);
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, 400u);
+        CHECK(conn->req_target_form_unsupported);
+        CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                           conn->send_buf.len(),
+                           "400 Bad Request",
+                           15));
+        if (request[0] == 'H') {
+            CHECK_FALSE(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                                     conn->send_buf.len(),
+                                     "\r\n\r\nBad Request",
+                                     15));
+            CHECK(buf_contains(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len(),
+                               "Content-Length: 11\r\n",
+                               19));
+        }
+        CHECK_FALSE(conn->keep_alive);
+        CHECK_EQ(conn->upstream_fd, -1);
+        CHECK_EQ(conn->upstream_attempts, 0u);
+        CHECK_EQ(pre_route_root_handler_calls, 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        loop.inject_and_dispatch(
+            make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+        CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    }
+    RouteConfig proxy{};
+    REQUIRE(proxy.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(proxy.add_proxy("/", kRouteMethodAny, 0));
+    loop.backend.clear_ops();
+    auto* proxied = dispatch_unmatched_request(loop, proxy, requests[0]);
+    REQUIRE(proxied != nullptr);
+    CHECK_EQ(proxied->resp_status, 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    loop.close_conn(*proxied);
+    RouteConfig local{};
+    REQUIRE(local.add_static("/", kRouteMethodAny, 204));
+    auto* rejected = dispatch_unmatched_request(loop, local, requests[0]);
+    REQUIRE(rejected != nullptr);
+    CHECK_EQ(rejected->resp_status, 400u);
+    loop.close_conn(*rejected);
+    auto* trace = dispatch_unmatched_request(loop, local, "TRACE / HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(trace != nullptr);
+    CHECK_EQ(trace->resp_status, 204u);
+    loop.close_conn(*trace);
+    auto* authority = dispatch_unmatched_request(
+        loop, local, "CONNECT example.test:443 HTTP/1.1\r\nHost: x\r\n\r\n");
+    REQUIRE(authority != nullptr);
+    CHECK_NE(authority->resp_status, 204u);
+    CHECK_EQ(pre_route_root_handler_calls, 0u);
+    loop.close_conn(*authority);
+    // "//" is a legal origin-form path, and percent-encoded URI-like data
+    // in a path/query must not be classified as an absolute target.
+    for (const char* request : {"GET //double-slash HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "GET /?url=http://example.test/ HTTP/1.1\r\nHost: x\r\n\r\n"}) {
+        auto* origin = dispatch_unmatched_request(loop, local, request);
+        REQUIRE(origin != nullptr);
+        CHECK_FALSE(origin->req_target_form_unsupported);
+        CHECK_EQ(origin->resp_status, 204u);
+        loop.close_conn(*origin);
+    }
+    loop.backend.fail_send = true;
+    const RouteConfig* active = &local;
+    loop.config_ptr = &active;
+    rejected = loop.alloc_conn();
+    REQUIRE(rejected != nullptr);
+    rejected->fd = 42;
+    const u32 len = static_cast<u32>(strlen(requests[0]));
+    REQUIRE_EQ(rejected->recv_buf.write(reinterpret_cast<const u8*>(requests[0]), len), len);
+    on_header_received<SmallLoop>(
+        &loop, *rejected, make_ev(rejected->id, IoEventType::Recv, static_cast<i32>(len)));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+}
+
+TEST(request_admission, absolute_target_unmatched_and_exact_inventory_precedence) {
+    SmallLoop loop;
+    loop.setup();
+    const char* request = "GET http://example.test/ HTTP/1.1\r\nHost: x\r\n\r\n";
+    RouteConfig fallback{};
+    auto* unmatched = dispatch_unmatched_request(loop, fallback, request);
+    REQUIRE(unmatched != nullptr);
+    CHECK_EQ(unmatched->resp_status, 400u);
+    loop.close_conn(*unmatched);
+    // Keep the stronger exact inventory's zero-byte rejection contract.
+    StrictLocalResponsePolicySpec policy = make_representation200_policy();
+    u16 unmatched_ids[kStrictLocalResponseMethodSlots]{};
+    ExactStrictLocalResponseBinding exact[kMaxExactStrictLocalResponseBindings]{};
+    exact[0] = make_exact_local_binding("/", kRouteMethodAny, 1);
+    RouteConfig strict{};
+    REQUIRE(strict.install_strict_local_response_table(&policy, 1, unmatched_ids, exact, 1));
+    loop.backend.clear_ops();
+    auto* closed = dispatch_unmatched_request(loop, strict, request);
+    REQUIRE(closed != nullptr);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+}
+
 TEST(request_admission, fragment_rejected_before_handler_or_upstream) {
     SmallLoop loop;
     loop.setup();
@@ -26144,10 +26262,12 @@ TEST(pipeline, request_generation_token_rejects_handler_wrap_and_resets) {
     conn->http1_pipeline_request_generation = 37;
     conn->http1_pipeline_boundary_owners_settled = true;
     conn->req_target_has_fragment = true;
+    conn->req_target_form_unsupported = true;
     conn->reset();
     CHECK_EQ(conn->http1_pipeline_request_generation, 0u);
     CHECK_FALSE(conn->http1_pipeline_boundary_owners_settled);
     CHECK_FALSE(conn->req_target_has_fragment);
+    CHECK_FALSE(conn->req_target_form_unsupported);
 }
 
 TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_witness) {
@@ -26159,6 +26279,7 @@ TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_
     source.http1_pipeline_request_generation = 41;
     source.http1_pipeline_boundary_owners_settled = true;
     source.req_target_has_fragment = true;
+    source.req_target_form_unsupported = true;
     source.req_metadata_episode = 40;
     source.req_raw_target_episode = 40;
     source.req_raw_target_offset = 4;
@@ -26173,6 +26294,7 @@ TEST(pipeline, simulation_state_copy_preserves_generation_boundary_and_fragment_
     CHECK_EQ(destination.http1_pipeline_request_generation, 41u);
     CHECK(destination.http1_pipeline_boundary_owners_settled);
     CHECK(destination.req_target_has_fragment);
+    CHECK(destination.req_target_form_unsupported);
     CHECK_EQ(destination.req_metadata_episode, 0u);
     CHECK_EQ(destination.req_raw_target_episode, 0u);
     CHECK_EQ(destination.req_raw_target_offset, 0u);

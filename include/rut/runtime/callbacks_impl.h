@@ -2402,14 +2402,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // The raw target witness covers both path and query. A literal fragment
     // delimiter is invalid before any route, handler or upstream effect;
     // percent-encoded %23 remains ordinary request-target data.
-    // CONNECT requires authority-form. An origin-form target must never
-    // reach even a method-any handler or proxy route.
-    // Inspect the bounded raw target, not req_path's legacy "/" fallback:
-    // malformed authority-form requests can retain that fallback path.
-    const bool origin_form_connect = conn.req_method == static_cast<u8>(LogHttpMethod::Connect) &&
-                                     conn.recv_buf.len() > 8 && conn.recv_buf.data()[7] == ' ' &&
-                                     conn.recv_buf.data()[8] == '/';
-    if (conn.req_target_has_fragment || origin_form_connect) {
+    // Unsupported target forms must not become a route-level local response
+    // or reach a handler/proxy, even through legacy method-parser fallback.
+    if (conn.req_target_has_fragment || conn.req_target_form_unsupported) {
         conn.resp_status = 400;
         format_static_response(conn,
                                400,

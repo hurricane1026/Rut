@@ -1212,7 +1212,8 @@ struct ConnectionBase {
         http1_pipeline_request_generation = source.http1_pipeline_request_generation;
         http1_pipeline_boundary_owners_settled = source.http1_pipeline_boundary_owners_settled;
         req_target_has_fragment = source.req_target_has_fragment;
-        // Unlike the fragment fact above, raw-target offsets are owned by one
+        req_target_form_unsupported = source.req_target_form_unsupported;
+        // Unlike the admission facts above, raw-target offsets are owned by one
         // concrete recv_buf episode.  A metadata-only state copy cannot prove
         // that ownership, so it deliberately leaves the destination neutral.
         req_metadata_episode = 0;
@@ -1291,6 +1292,8 @@ struct ConnectionBase {
     // Full raw request-target fragment witness for the current request. This is
     // deliberately independent of the bounded req_path copy and canonical view.
     bool req_target_has_fragment;
+    // Raw H1 target-form admission, independent of strict method parsing.
+    bool req_target_form_unsupported;
     // Access-log-only owned copy of the original strict-H1 target. It is
     // populated only when access logging is enabled and remains valid after the
     // borrowed recv_buf witness is cleared by rewrite/consume/reset paths.
@@ -1943,6 +1946,7 @@ struct ConnectionBase {
         req_raw_target_offset = 0;
         req_raw_target_length = 0;
         req_target_has_fragment = false;
+        req_target_form_unsupported = false;
         clear_access_log_target_snapshot();
         req_keep_alive = false;
         req_client_keep_alive = false;
