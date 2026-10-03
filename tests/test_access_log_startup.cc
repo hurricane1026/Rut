@@ -792,6 +792,11 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
         close(backend_listener);
         return result;
     }
+    // The child may consume its controlled pre-exec delay while the parent is
+    // descheduled immediately after fork. Anchor elapsed readiness diagnostics
+    // before fork so the parent's scheduling gap cannot make that healthy delay
+    // appear shorter than it was.
+    result.forked_at_ns = monotonic_ns();
     const pid_t child = fork();
     if (child == 0) {
         close(output_pipe[0]);
@@ -818,7 +823,6 @@ SourceLiveProxyResult run_source_live_proxy(const std::vector<std::string>& args
         return result;
     }
     close(output_pipe[1]);
-    result.forked_at_ns = monotonic_ns();
     std::thread backend;
     bool backend_listener_owned = true;
     const i32 old_flags = fcntl(output_pipe[0], F_GETFL);
