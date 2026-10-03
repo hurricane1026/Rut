@@ -18,7 +18,9 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
@@ -30,6 +32,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/io_uring.h>
 #include <poll.h>
@@ -816,6 +819,333 @@ struct Child {
     bool status_valid = false;
 };
 
+static constexpr size_t kDockerProcSnapshotMaxBytes = 4096;
+static constexpr size_t kDockerProcSnapshotErrorMaxBytes = 512;
+static constexpr size_t kDockerProcSnapshotFdLimit = 12;
+static constexpr size_t kDockerProcSnapshotDirEntryLimit = 64;
+static constexpr auto kDockerProcSnapshotBudget = std::chrono::milliseconds(50);
+
+struct DockerProcSnapshot {
+    char text[kDockerProcSnapshotMaxBytes + 1]{};
+    size_t text_size = 0;
+    char errors[kDockerProcSnapshotErrorMaxBytes + 1]{};
+    size_t errors_size = 0;
+    bool truncated = false;
+    bool deadline_exceeded = false;
+    bool fd_scan_complete = false;
+    u64 budget_ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(kDockerProcSnapshotBudget).count());
+    u64 elapsed_ns = 0;
+    size_t fd_scan_entries = 0;
+    size_t fd_count = 0;
+    int fd_numbers[kDockerProcSnapshotFdLimit]{};
+};
+
+static void append_bounded(
+    char* dst, size_t& dst_size, size_t limit, const char* data, size_t size, bool& truncated) {
+    const size_t available = limit > dst_size ? limit - dst_size : 0;
+    const size_t take = std::min(available, size);
+    if (take != 0) memcpy(dst + dst_size, data, take);
+    dst_size += take;
+    dst[dst_size] = '\0';
+    if (take != size) truncated = true;
+}
+
+static bool bounded_contains(const char* data, size_t size, const char* needle) {
+    const size_t needle_size = strlen(needle);
+    if (needle_size > size) return false;
+    for (size_t i = 0; i <= size - needle_size; ++i)
+        if (memcmp(data + i, needle, needle_size) == 0) return true;
+    return false;
+}
+
+static void append_proc_error(DockerProcSnapshot& snapshot, const char* field, int error_number) {
+    char record[96];
+    const int length = snprintf(record, sizeof(record), "%s_errno=%d\n", field, error_number);
+    if (length <= 0) return;
+    append_bounded(snapshot.errors,
+                   snapshot.errors_size,
+                   kDockerProcSnapshotErrorMaxBytes,
+                   record,
+                   std::min(static_cast<size_t>(length), sizeof(record) - 1),
+                   snapshot.truncated);
+}
+
+static bool proc_snapshot_deadline_expired(DockerProcSnapshot& snapshot,
+                                           std::chrono::steady_clock::time_point deadline) {
+    if (std::chrono::steady_clock::now() < deadline) return false;
+    snapshot.deadline_exceeded = true;
+    snapshot.truncated = true;
+    return true;
+}
+
+static bool read_proc_item(const char* path,
+                           char* buffer,
+                           size_t capacity,
+                           size_t& size,
+                           int& error_number,
+                           bool& truncated,
+                           DockerProcSnapshot& snapshot,
+                           std::chrono::steady_clock::time_point deadline) {
+    if (proc_snapshot_deadline_expired(snapshot, deadline)) return false;
+    const int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) {
+        error_number = errno;
+        return false;
+    }
+    ssize_t count;
+    for (;;) {
+        if (proc_snapshot_deadline_expired(snapshot, deadline)) {
+            close(fd);
+            return false;
+        }
+        count = read(fd, buffer, capacity);
+        if (count >= 0 || errno != EINTR) break;
+    }
+    const int read_error = count < 0 ? errno : 0;
+    close(fd);
+    if (count < 0) {
+        error_number = read_error;
+        return false;
+    }
+    size = static_cast<size_t>(count);
+    truncated = size == capacity;
+    return true;
+}
+
+static DockerProcSnapshot snapshot_docker_child_proc(
+    pid_t pid, std::chrono::milliseconds budget = kDockerProcSnapshotBudget) {
+    constexpr size_t kProcFieldBytes = 2048;
+    const auto started = std::chrono::steady_clock::now();
+    DockerProcSnapshot snapshot;
+    if (budget < std::chrono::milliseconds::zero()) budget = std::chrono::milliseconds::zero();
+    snapshot.budget_ns =
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(budget).count());
+    const auto deadline = started + budget;
+    char base[48];
+    snprintf(base, sizeof(base), "/proc/%ld/", static_cast<long>(pid));
+    auto add_item = [&](const char* field, const char* name, bool command_line = false) {
+        if (proc_snapshot_deadline_expired(snapshot, deadline)) return;
+        char path[64];
+        snprintf(path, sizeof(path), "%s%s", base, name);
+        char buffer[kProcFieldBytes];
+        size_t size = 0;
+        int error_number = 0;
+        bool item_truncated = false;
+        if (!read_proc_item(path,
+                            buffer,
+                            sizeof(buffer),
+                            size,
+                            error_number,
+                            item_truncated,
+                            snapshot,
+                            deadline)) {
+            if (error_number != 0) append_proc_error(snapshot, field, error_number);
+            return;
+        }
+        if (command_line) {
+            for (size_t i = 0; i < size; ++i)
+                if (buffer[i] == '\0') buffer[i] = ' ';
+        }
+        append_bounded(snapshot.text,
+                       snapshot.text_size,
+                       kDockerProcSnapshotMaxBytes,
+                       field,
+                       strlen(field),
+                       snapshot.truncated);
+        append_bounded(snapshot.text,
+                       snapshot.text_size,
+                       kDockerProcSnapshotMaxBytes,
+                       "=",
+                       1,
+                       snapshot.truncated);
+        append_bounded(snapshot.text,
+                       snapshot.text_size,
+                       kDockerProcSnapshotMaxBytes,
+                       buffer,
+                       size,
+                       snapshot.truncated);
+        append_bounded(snapshot.text,
+                       snapshot.text_size,
+                       kDockerProcSnapshotMaxBytes,
+                       "\n",
+                       1,
+                       snapshot.truncated);
+        snapshot.truncated = snapshot.truncated || item_truncated;
+    };
+
+    char status_path[64];
+    snprintf(status_path, sizeof(status_path), "%sstatus", base);
+    char status_buffer[kProcFieldBytes];
+    size_t status_size = 0;
+    int status_error = 0;
+    bool status_truncated = false;
+    if (!proc_snapshot_deadline_expired(snapshot, deadline) && read_proc_item(status_path,
+                                                                              status_buffer,
+                                                                              sizeof(status_buffer),
+                                                                              status_size,
+                                                                              status_error,
+                                                                              status_truncated,
+                                                                              snapshot,
+                                                                              deadline)) {
+        constexpr const char* wanted[] = {"State:",
+                                          "PPid:",
+                                          "Threads:",
+                                          "voluntary_ctxt_switches:",
+                                          "nonvoluntary_ctxt_switches:"};
+        size_t pos = 0;
+        while (pos < status_size) {
+            if (proc_snapshot_deadline_expired(snapshot, deadline)) break;
+            const char* newline =
+                static_cast<const char*>(memchr(status_buffer + pos, '\n', status_size - pos));
+            const size_t end =
+                newline == nullptr ? status_size : static_cast<size_t>(newline - status_buffer);
+            const size_t length = end - pos;
+            for (const char* field : wanted) {
+                if (proc_snapshot_deadline_expired(snapshot, deadline)) break;
+                const size_t field_size = strlen(field);
+                if (length >= field_size && memcmp(status_buffer + pos, field, field_size) == 0) {
+                    append_bounded(snapshot.text,
+                                   snapshot.text_size,
+                                   kDockerProcSnapshotMaxBytes,
+                                   status_buffer + pos,
+                                   length,
+                                   snapshot.truncated);
+                    append_bounded(snapshot.text,
+                                   snapshot.text_size,
+                                   kDockerProcSnapshotMaxBytes,
+                                   "\n",
+                                   1,
+                                   snapshot.truncated);
+                    break;
+                }
+            }
+            if (snapshot.deadline_exceeded || newline == nullptr) break;
+            pos = end + 1;
+        }
+        snapshot.truncated = snapshot.truncated || status_truncated;
+    } else if (status_error != 0) {
+        append_proc_error(snapshot, "status", status_error);
+    }
+    add_item("wchan", "wchan");
+    add_item("syscall", "syscall");
+    add_item("cmdline", "cmdline", true);
+
+    char fd_path[48];
+    snprintf(fd_path, sizeof(fd_path), "%sfd", base);
+    if (!proc_snapshot_deadline_expired(snapshot, deadline)) {
+        DIR* directory = opendir(fd_path);
+        if (directory == nullptr) {
+            append_proc_error(snapshot, "fd_dir", errno);
+        } else {
+            int fds[kDockerProcSnapshotFdLimit]{};
+            size_t count = 0;
+            size_t scanned = 0;
+            bool complete = false;
+            bool fd_output_limited = false;
+            int directory_error = 0;
+            while (scanned < kDockerProcSnapshotDirEntryLimit) {
+                if (proc_snapshot_deadline_expired(snapshot, deadline)) break;
+                errno = 0;
+                dirent* entry = readdir(directory);
+                if (entry == nullptr) {
+                    directory_error = errno;
+                    complete = directory_error == 0;
+                    break;
+                }
+                ++scanned;  // Includes dot entries and non-numeric names.
+                char* end = nullptr;
+                errno = 0;
+                const long number = strtol(entry->d_name, &end, 10);
+                if (errno != 0 || end == entry->d_name || *end != '\0' || number < 0 ||
+                    number > INT_MAX)
+                    continue;
+                size_t at = 0;
+                while (at < count && fds[at] < number) ++at;
+                if (count < kDockerProcSnapshotFdLimit) {
+                    for (size_t move = count; move > at; --move) fds[move] = fds[move - 1];
+                    fds[at] = static_cast<int>(number);
+                    ++count;
+                } else {
+                    fd_output_limited = true;
+                    if (at < count) {
+                        for (size_t move = count - 1; move > at; --move) fds[move] = fds[move - 1];
+                        fds[at] = static_cast<int>(number);
+                    }
+                }
+            }
+            snapshot.fd_scan_entries = scanned;
+            snapshot.fd_scan_complete = complete;
+            snapshot.fd_count = count;
+            for (size_t i = 0; i < count; ++i) snapshot.fd_numbers[i] = fds[i];
+            if (!complete || fd_output_limited) snapshot.truncated = true;
+            if (directory_error != 0) append_proc_error(snapshot, "fd_readdir", directory_error);
+            for (size_t i = 0; i < count; ++i) {
+                if (proc_snapshot_deadline_expired(snapshot, deadline)) break;
+                char link_path[64];
+                snprintf(link_path, sizeof(link_path), "%s/%d", fd_path, fds[i]);
+                char target[256];
+                const ssize_t length = readlink(link_path, target, sizeof(target));
+                if (length < 0) {
+                    append_proc_error(snapshot, "fd_readlink", errno);
+                    continue;
+                }
+                const size_t target_size = static_cast<size_t>(length);
+                char fd_prefix[24];
+                const int prefix_size = snprintf(fd_prefix, sizeof(fd_prefix), "fd=%d:", fds[i]);
+                if (prefix_size > 0)
+                    append_bounded(snapshot.text,
+                                   snapshot.text_size,
+                                   kDockerProcSnapshotMaxBytes,
+                                   fd_prefix,
+                                   static_cast<size_t>(prefix_size),
+                                   snapshot.truncated);
+                append_bounded(snapshot.text,
+                               snapshot.text_size,
+                               kDockerProcSnapshotMaxBytes,
+                               target,
+                               target_size,
+                               snapshot.truncated);
+                if (target_size == sizeof(target)) {
+                    append_bounded(snapshot.text,
+                                   snapshot.text_size,
+                                   kDockerProcSnapshotMaxBytes,
+                                   "[truncated]",
+                                   sizeof("[truncated]") - 1,
+                                   snapshot.truncated);
+                    snapshot.truncated = true;
+                }
+                if (target_size >= 8 && memcmp(target, "socket:[", 8) == 0) {
+                    append_bounded(snapshot.text,
+                                   snapshot.text_size,
+                                   kDockerProcSnapshotMaxBytes,
+                                   " socket_inode=",
+                                   sizeof(" socket_inode=") - 1,
+                                   snapshot.truncated);
+                    append_bounded(snapshot.text,
+                                   snapshot.text_size,
+                                   kDockerProcSnapshotMaxBytes,
+                                   target + 8,
+                                   target_size - 8,
+                                   snapshot.truncated);
+                }
+                append_bounded(snapshot.text,
+                               snapshot.text_size,
+                               kDockerProcSnapshotMaxBytes,
+                               "\n",
+                               1,
+                               snapshot.truncated);
+            }
+            closedir(directory);
+        }
+    }
+    (void)proc_snapshot_deadline_expired(snapshot, deadline);
+    snapshot.elapsed_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - started)
+                                               .count());
+    return snapshot;
+}
+
 enum class DockerInfoOutcome { SpawnFailed, WaitFailed, TimedOut, Exited, Signaled };
 enum class DockerSnapshotState { Missing, Empty, NonEmpty, ReadError, Overflow };
 
@@ -838,6 +1168,7 @@ struct DockerInfoResult {
     std::string snapshot;
     std::string snapshot_error;
     DockerSnapshotState snapshot_state = DockerSnapshotState::Missing;
+    DockerProcSnapshot proc_snapshot;
     enum class LaunchStage : uint8_t {
         None,
         BeforeLogOpen,
@@ -1056,7 +1387,8 @@ static bool reap_child_bounded(Child& child, int timeout_ms, int& wait_error) {
 static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& args,
                                                const std::string& log_path,
                                                int timeout_ms = 10'000,
-                                               bool protect_inner_parent = false) {
+                                               bool protect_inner_parent = false,
+                                               pid_t proc_snapshot_pid_override = 0) {
     DockerInfoResult result;
     result.configured_timeout_ms = timeout_ms;
     result.status_pipe_closed = true;
@@ -1269,6 +1601,8 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
             } else {
                 drain_launch_channel();
                 result.launch_evidence_frozen = true;
+                result.proc_snapshot = snapshot_docker_child_proc(
+                    proc_snapshot_pid_override > 0 ? proc_snapshot_pid_override : result.child.pid);
                 result.kill_attempted = true;
                 if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
                     result.kill_failed = true;
@@ -1289,6 +1623,8 @@ static DockerInfoResult run_docker_info_runner(const std::vector<std::string>& a
             result.outcome = DockerInfoOutcome::TimedOut;
             drain_launch_channel();
             result.launch_evidence_frozen = true;
+            result.proc_snapshot = snapshot_docker_child_proc(
+                proc_snapshot_pid_override > 0 ? proc_snapshot_pid_override : result.child.pid);
             result.kill_attempted = true;
             if (kill(result.child.pid, SIGKILL) != 0 && errno != ESRCH) {
                 result.kill_failed = true;
@@ -1625,6 +1961,69 @@ static int docker_info_return_code(DockerInfoDecision decision, bool required) {
 
 static bool docker_info_missing_prerequisite(const DockerInfoResult& result);
 
+static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot, int requested_open_fds) {
+    int ready_pipe[2] = {-1, -1};
+    if (pipe2(ready_pipe, O_CLOEXEC) != 0) return false;
+    for (int i = 0; i < 2; ++i) {
+        if (ready_pipe[i] >= 3) continue;
+        const int moved = fcntl(ready_pipe[i], F_DUPFD_CLOEXEC, 3);
+        if (moved < 0) {
+            close(ready_pipe[0]);
+            close(ready_pipe[1]);
+            return false;
+        }
+        close(ready_pipe[i]);
+        ready_pipe[i] = moved;
+    }
+    const pid_t child = fork();
+    if (child < 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return false;
+    }
+    if (child == 0) {
+        close(ready_pipe[0]);
+        const int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
+            dup2(null_fd, STDERR_FILENO) < 0)
+            _exit(2);
+        for (int fd = 3; fd < 1024; ++fd)
+            if (fd != ready_pipe[1]) close(fd);
+        int opened = 0;
+        for (int i = 0; i < requested_open_fds; ++i) {
+            const int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (fd < 0) break;
+            ++opened;
+        }
+        const ssize_t wrote = write(ready_pipe[1], &opened, sizeof(opened));
+        if (wrote != static_cast<ssize_t>(sizeof(opened))) _exit(3);
+        for (;;) pause();
+    }
+    close(ready_pipe[1]);
+    int opened = 0;
+    ssize_t count;
+    do {
+        count = read(ready_pipe[0], &opened, sizeof(opened));
+    } while (count < 0 && errno == EINTR);
+    close(ready_pipe[0]);
+    if (count != static_cast<ssize_t>(sizeof(opened)) || opened != requested_open_fds) {
+        (void)kill(child, SIGKILL);
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+        return false;
+    }
+
+    snapshot = snapshot_docker_child_proc(child, std::chrono::milliseconds(500));
+    (void)kill(child, SIGKILL);
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+}
+
 static bool run_docker_info_preflight_self_check(std::string& error) {
     char fixture_path[] = "/tmp/rut-docker-info-selfcheck-XXXXXX";
     if (mkdtemp(fixture_path) == nullptr) {
@@ -1666,6 +2065,91 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         cleanup();
         return false;
     }
+    DockerInfoResult proc_race =
+        run_docker_info_runner({"sh", "-c", "exec sleep 1"}, log, 50, false, 2147483647);
+    unlink(log.c_str());
+    char missing_status_error[48];
+    snprintf(missing_status_error,
+             sizeof(missing_status_error),
+             "status_errno=%d",
+             static_cast<int>(ENOENT));
+    if (proc_race.outcome != DockerInfoOutcome::TimedOut || !proc_race.kill_attempted ||
+        proc_race.kill_failed || proc_race.reap_failed || proc_race.ownership_unresolved ||
+        !proc_race.child.reaped || !proc_race.child.status_valid ||
+        !WIFSIGNALED(proc_race.child.status) || WTERMSIG(proc_race.child.status) != SIGKILL ||
+        !proc_race.status_pipe_closed ||
+        !bounded_contains(proc_race.proc_snapshot.errors,
+                          proc_race.proc_snapshot.errors_size,
+                          missing_status_error)) {
+        error = "missing /proc diagnostic changed timeout cleanup or verdict";
+        cleanup();
+        return false;
+    }
+    DockerProcSnapshot missing_proc = snapshot_docker_child_proc(2147483647);
+    if (!bounded_contains(missing_proc.errors, missing_proc.errors_size, missing_status_error) ||
+        missing_proc.text_size > kDockerProcSnapshotMaxBytes ||
+        missing_proc.errors_size > kDockerProcSnapshotErrorMaxBytes) {
+        error = "missing /proc child diagnostic control failed";
+        cleanup();
+        return false;
+    }
+    DockerProcSnapshot expired_proc =
+        snapshot_docker_child_proc(getpid(), std::chrono::milliseconds(0));
+    if (!expired_proc.deadline_exceeded || !expired_proc.truncated || expired_proc.budget_ns != 0 ||
+        expired_proc.text_size != 0) {
+        error = "zero-budget /proc diagnostic deadline control failed";
+        cleanup();
+        return false;
+    }
+    DockerProcSnapshot fd_limited_proc;
+    if (!snapshot_fd_limit_self_check(fd_limited_proc, 32) || !fd_limited_proc.fd_scan_complete ||
+        fd_limited_proc.fd_scan_entries > kDockerProcSnapshotDirEntryLimit ||
+        fd_limited_proc.fd_count != kDockerProcSnapshotFdLimit || !fd_limited_proc.truncated) {
+        error = "bounded proc fd output/lowest-fd control failed";
+        cleanup();
+        return false;
+    }
+    for (size_t i = 1; i < fd_limited_proc.fd_count; ++i) {
+        if (fd_limited_proc.fd_numbers[i - 1] >= fd_limited_proc.fd_numbers[i]) {
+            error = "completed proc fd scan did not return sorted unique lowest descriptors";
+            cleanup();
+            return false;
+        }
+    }
+    for (int fd = 0; fd < static_cast<int>(kDockerProcSnapshotFdLimit); ++fd) {
+        if (fd_limited_proc.fd_numbers[fd] != fd) {
+            error = "completed proc fd scan missed a lower descriptor";
+            cleanup();
+            return false;
+        }
+    }
+    DockerProcSnapshot entry_limited_proc;
+    if (!snapshot_fd_limit_self_check(entry_limited_proc, 96) ||
+        entry_limited_proc.fd_scan_complete ||
+        entry_limited_proc.fd_scan_entries != kDockerProcSnapshotDirEntryLimit ||
+        entry_limited_proc.fd_count != kDockerProcSnapshotFdLimit ||
+        !entry_limited_proc.truncated) {
+        error = "bounded proc directory scan did not report a partial result";
+        cleanup();
+        return false;
+    }
+    for (size_t i = 1; i < entry_limited_proc.fd_count; ++i) {
+        if (entry_limited_proc.fd_numbers[i - 1] >= entry_limited_proc.fd_numbers[i]) {
+            error = "partial proc fd scan descriptors were not sorted";
+            cleanup();
+            return false;
+        }
+    }
+    char bounded[kDockerProcSnapshotMaxBytes + 1]{};
+    size_t bounded_size = kDockerProcSnapshotMaxBytes;
+    bool bounded_truncated = false;
+    memset(bounded, 'x', kDockerProcSnapshotMaxBytes);
+    append_bounded(bounded, bounded_size, kDockerProcSnapshotMaxBytes, "y", 1, bounded_truncated);
+    if (bounded_size != kDockerProcSnapshotMaxBytes || !bounded_truncated) {
+        error = "bounded proc diagnostic truncation control failed";
+        cleanup();
+        return false;
+    }
     // An exec'd process inherits no launch records after CLOEXEC closes the
     // status writer.  This is distinct from pre-exec FIFO blocking: EOF here
     // is only launch-channel closure, never proof of successful exec.
@@ -1693,6 +2177,44 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         !silent_postexec.child.reaped || !silent_postexec.child.status_valid ||
         !WIFSIGNALED(silent_postexec.child.status) ||
         WTERMSIG(silent_postexec.child.status) != SIGKILL || !silent_snapshot_ok ||
+        !bounded_contains(silent_postexec.proc_snapshot.text,
+                          silent_postexec.proc_snapshot.text_size,
+                          "State:") ||
+        !bounded_contains(
+            silent_postexec.proc_snapshot.text, silent_postexec.proc_snapshot.text_size, "PPid:") ||
+        !bounded_contains(silent_postexec.proc_snapshot.text,
+                          silent_postexec.proc_snapshot.text_size,
+                          "Threads:") ||
+        !bounded_contains(silent_postexec.proc_snapshot.text,
+                          silent_postexec.proc_snapshot.text_size,
+                          "voluntary_ctxt_switches:") ||
+        !bounded_contains(silent_postexec.proc_snapshot.text,
+                          silent_postexec.proc_snapshot.text_size,
+                          "nonvoluntary_ctxt_switches:") ||
+        (!bounded_contains(silent_postexec.proc_snapshot.text,
+                           silent_postexec.proc_snapshot.text_size,
+                           "wchan=") &&
+         !bounded_contains(silent_postexec.proc_snapshot.errors,
+                           silent_postexec.proc_snapshot.errors_size,
+                           "wchan_errno=")) ||
+        (!bounded_contains(silent_postexec.proc_snapshot.text,
+                           silent_postexec.proc_snapshot.text_size,
+                           "syscall=") &&
+         !bounded_contains(silent_postexec.proc_snapshot.errors,
+                           silent_postexec.proc_snapshot.errors_size,
+                           "syscall_errno=")) ||
+        !bounded_contains(silent_postexec.proc_snapshot.text,
+                          silent_postexec.proc_snapshot.text_size,
+                          "cmdline=sleep") ||
+        (!bounded_contains(silent_postexec.proc_snapshot.text,
+                           silent_postexec.proc_snapshot.text_size,
+                           "fd=1:") &&
+         !bounded_contains(silent_postexec.proc_snapshot.text,
+                           silent_postexec.proc_snapshot.text_size,
+                           "fd=2:")) ||
+        silent_postexec.proc_snapshot.text_size > kDockerProcSnapshotMaxBytes ||
+        silent_postexec.proc_snapshot.errors_size > kDockerProcSnapshotErrorMaxBytes ||
+        silent_postexec.proc_snapshot.budget_ns == 0 ||
         silent_snapshot_state != DockerSnapshotState::Empty ||
         docker_info_return_code(docker_info_decision(silent_postexec), true) != 1 ||
         docker_info_return_code(docker_info_decision(silent_postexec), false) != 1 ||
@@ -2103,6 +2625,26 @@ static void print_docker_info_result(const DockerInfoResult& result) {
               << (result.launch_channel_closed_before_cleanup ? 1 : 0)
               << " launch_integrity_error=" << (result.launch_integrity_error ? 1 : 0)
               << " launch_records=" << result.launch_observations.size() << "\n";
+    if (result.outcome == DockerInfoOutcome::TimedOut || result.proc_snapshot.elapsed_ns != 0) {
+        std::cerr << "Docker info proc snapshot budget_ns=" << result.proc_snapshot.budget_ns
+                  << " elapsed_ns=" << result.proc_snapshot.elapsed_ns
+                  << " deadline_exceeded=" << (result.proc_snapshot.deadline_exceeded ? 1 : 0)
+                  << " bytes=" << result.proc_snapshot.text_size
+                  << " fd_limit=" << kDockerProcSnapshotFdLimit
+                  << " fd_scan_entry_limit=" << kDockerProcSnapshotDirEntryLimit
+                  << " fd_scan_entries=" << result.proc_snapshot.fd_scan_entries
+                  << " fd_scan_complete=" << (result.proc_snapshot.fd_scan_complete ? 1 : 0)
+                  << " fd_count=" << result.proc_snapshot.fd_count
+                  << " truncated=" << (result.proc_snapshot.truncated ? 1 : 0) << "\n";
+        if (result.proc_snapshot.text_size != 0) {
+            std::cerr << "Docker info proc snapshot:\n";
+            std::cerr.write(result.proc_snapshot.text, result.proc_snapshot.text_size);
+        }
+        if (result.proc_snapshot.errors_size != 0) {
+            std::cerr << "Docker info proc snapshot errors:\n";
+            std::cerr.write(result.proc_snapshot.errors, result.proc_snapshot.errors_size);
+        }
+    }
     for (const auto& observation : result.launch_observations) {
         const auto stage_name = [](DockerInfoResult::LaunchStage stage) {
             switch (stage) {
