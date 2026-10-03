@@ -1768,16 +1768,16 @@ public:
                 ResponseReadDeadlineProfile::FixedContentLengthUploadHeaderOnlyHead &&
             c.http1_prebuilt_response_purpose ==
                 Http1PrebuiltResponsePurpose::ConfiguredForwardFailure;
-        const bool exact_consumed_terminal = selected_targets == 0 &&
-                                             consumed_terminal != nullptr &&
-                                             (strict_head || configured_forward_failure) &&
-                                             current_terminal_response_recv_is_exact(
-                                                 c,
-                                                 *consumed_terminal,
-                                                 c.http1_prebuilt_deadline_generation,
-                                                 c.http1_prebuilt_deadline_profile,
-                                                 c.http1_prebuilt_deadline_method,
-                                                 c.http1_prebuilt_deadline_upload.upload_episode);
+        const bool exact_consumed_terminal =
+            selected_targets == 0 && consumed_terminal != nullptr &&
+            (strict_head || strict_no_body_metadata || configured_forward_failure) &&
+            current_terminal_response_recv_is_exact(
+                c,
+                *consumed_terminal,
+                c.http1_prebuilt_deadline_generation,
+                c.http1_prebuilt_deadline_profile,
+                c.http1_prebuilt_deadline_method,
+                c.http1_prebuilt_deadline_upload.upload_episode);
         const bool header_only_head_timeout =
             c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
             c.http1_prebuilt_response_purpose ==

@@ -13684,18 +13684,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             explicit_buffering == ForwardResponseBufferingMode::None && resp.status_code == 200 &&
             resp.content_length > 0 && raw_header_end <= conn.upstream_recv_buf.capacity() &&
             raw_total - raw_header_end <= resp.content_length;
-        bool strict_no_body_metadata_origin_open = true;
-        if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
-                          candidate->current_response_read_batch_keeps_origin_open(c, event);
-                      }) {
-            strict_no_body_metadata_origin_open =
-                loop->current_response_read_batch_keeps_origin_open(conn, ev);
-        }
         // This runtime seam proves only the 304 response shape and transport
         // owners. Conditional request/ETag correlation remains origin-owned.
-        const bool strict_no_body_metadata_304 =
-            strict_common && strict_no_body_metadata_origin_open && !fixed_upload &&
-            resp.status_code == 304 &&
+        const bool strict_no_body_metadata_shape =
+            strict_common && !fixed_upload && resp.status_code == 304 &&
             explicit_profile == ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
             forward_response_buffering_uses_content_length_machinery(explicit_buffering) &&
             explicit_method == static_cast<u8>(LogHttpMethod::Get) &&
@@ -13710,6 +13702,31 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 explicit_bundle_id,
                 ResponseReadDeadlineOwnerPhase::ActiveAfterCopy,
                 &on_upstream_response<Loop>);
+        bool strict_no_body_metadata_origin_open = true;
+        bool strict_no_body_metadata_exact_terminal = false;
+        if (strict_no_body_metadata_shape) {
+            if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
+                              candidate->current_response_read_batch_keeps_origin_open(c, event);
+                          }) {
+                strict_no_body_metadata_origin_open =
+                    loop->current_response_read_batch_keeps_origin_open(conn, ev);
+            }
+            if constexpr (requires(Loop* candidate, const Connection& c, const IoEvent& event) {
+                              candidate->current_terminal_response_recv_is_exact(
+                                  c, event, u32{}, ResponseReadDeadlineProfile::None, u8{}, u32{});
+                          }) {
+                strict_no_body_metadata_exact_terminal =
+                    loop->current_terminal_response_recv_is_exact(conn,
+                                                                  ev,
+                                                                  explicit_generation,
+                                                                  explicit_profile,
+                                                                  explicit_method,
+                                                                  explicit_upload.upload_episode);
+            }
+        }
+        const bool strict_no_body_metadata_304 =
+            strict_no_body_metadata_shape &&
+            (strict_no_body_metadata_origin_open || strict_no_body_metadata_exact_terminal);
         if (!strict_cl0 && !strict_positive_complete_buffering && !strict_positive_streaming_get &&
             !strict_positive_head && !strict_no_body_metadata_304) {
             if (try_configured_head_failure(
@@ -13849,7 +13866,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                     selected_targets,
                     Http1RequestBufferDisposition::ExistingPipeline,
                     conn.retry_req_send_len,
-                    exact_terminal_response_recv ? &ev : nullptr)) {
+                    (strict_no_body_metadata_304 ? strict_no_body_metadata_exact_terminal
+                                                 : exact_terminal_response_recv)
+                        ? &ev
+                        : nullptr)) {
                 if (conn.fd >= 0) loop->close_conn(conn);
                 return;
             }

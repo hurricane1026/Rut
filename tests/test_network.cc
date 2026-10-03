@@ -64748,6 +64748,12 @@ static IoEvent stage_strict_304_metadata_response(Connection& conn) {
     return response_read_copy_event(conn, len, true, 0, len);
 }
 
+static IoEvent stage_strict_304_metadata_terminal_response(Connection& conn) {
+    IoEvent event = stage_strict_304_metadata_response(conn);
+    event.more = 0;
+    return event;
+}
+
 #ifdef __linux__
 static void drain_strict_304_timer_cancel(rut::test::TestCase* _tc,
                                           IoUringEventLoop* loop,
@@ -64864,6 +64870,75 @@ TEST(response_read_deadline_get_304_metadata,
     loop->resume_deferred_http1_boundaries();
     CHECK_EQ(conn.state, ConnState::ReadingHeader);
     CHECK_GE(conn.fd, 0);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline_get_304_metadata, one_shot_terminal_full_copy_preserves_keep_alive) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    const IoEvent response = stage_strict_304_metadata_terminal_response(conn);
+    REQUIRE_EQ(response.result, static_cast<i32>(sizeof(kStrict304MetadataResponse) - 1u));
+    loop->dispatch_batch(&response, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK_FALSE(conn.upstream_recv_armed);
+    REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+               Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+    CHECK_FALSE(conn.upstream_retirement_active);
+    CHECK_EQ(conn.http1_prebuilt_wait, kHttp1WaitHeaderSend);
+    drain_strict_304_timer_cancel(_tc, loop, conn, false);
+    complete_prebuilt_d2_header(loop, conn);
+    REQUIRE(conn.http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK(conn.keep_alive);
+    cleanup_prebuilt_d2(loop, fixture);
+}
+
+TEST(response_read_deadline_get_304_metadata,
+     one_shot_fragmented_header_rearms_before_terminal_keep_alive) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    RouteConfig config{};
+    PrebuiltD2Fixture fixture{};
+    REQUIRE(stage_live_precise_get(loop, config, &fixture));
+    Connection& conn = *fixture.conn;
+    constexpr u32 split = 64u;
+    constexpr u32 total = sizeof(kStrict304MetadataResponse) - 1u;
+    REQUIRE_LT(split, total);
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kStrict304MetadataResponse, split), split);
+    IoEvent partial = response_read_copy_event(conn, split, false, 0, split);
+    loop->dispatch_batch(&partial, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_FALSE(conn.upstream_abandoned);
+    CHECK_EQ(conn.response_header_buf.len(), 0u);
+
+    const u32 begin = conn.upstream_recv_buf.len();
+    REQUIRE_EQ(conn.upstream_recv_buf.write(kStrict304MetadataResponse + split, total - split),
+               total - split);
+    IoEvent finish = response_read_copy_event(conn, total - split, false, begin, total);
+    loop->dispatch_batch(&finish, 1);
+
+    REQUIRE_GE(conn.fd, 0);
+    REQUIRE_EQ(conn.resp_status, 304u);
+    REQUIRE_EQ(conn.http1_prebuilt_response_purpose,
+               Http1PrebuiltResponsePurpose::StrictNoBodyMetadataSuccess);
+    CHECK_FALSE(conn.upstream_recv_armed);
+    CHECK_FALSE(conn.upstream_retirement_active);
+    drain_strict_304_timer_cancel(_tc, loop, conn, false);
+    complete_prebuilt_d2_header(loop, conn);
+    REQUIRE(conn.http1_boundary_ready);
+    loop->resume_deferred_http1_boundaries();
+    CHECK_EQ(conn.state, ConnState::ReadingHeader);
+    CHECK(conn.keep_alive);
     cleanup_prebuilt_d2(loop, fixture);
 }
 
