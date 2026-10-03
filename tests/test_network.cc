@@ -21014,6 +21014,25 @@ TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
     CHECK_FALSE(embedded_ipv4_authority->req_target_form_unsupported);
     CHECK_NE(embedded_ipv4_authority->resp_status, 400u);
     loop.close_conn(*embedded_ipv4_authority);
+    for (const char* request : {"CONNECT [v1.foo]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT [VFF.!$&'()*+,;=:_-~]:443 HTTP/1.1\r\nHost: x\r\n\r\n"}) {
+        auto* ipv_future = dispatch_unmatched_request(loop, local, request);
+        REQUIRE(ipv_future != nullptr);
+        CHECK_FALSE(ipv_future->req_target_form_unsupported);
+        CHECK_NE(ipv_future->resp_status, 400u);
+        loop.close_conn(*ipv_future);
+    }
+    for (const char* request : {"CONNECT [v.foo]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT [v1foo]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT [vG.foo]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT [v1.foo%]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
+                                "CONNECT [v1.]:443 HTTP/1.1\r\nHost: x\r\n\r\n"}) {
+        auto* invalid_ipv_future = dispatch_unmatched_request(loop, local, request);
+        REQUIRE(invalid_ipv_future != nullptr);
+        CHECK(invalid_ipv_future->req_target_form_unsupported);
+        CHECK_EQ(invalid_ipv_future->resp_status, 400u);
+        loop.close_conn(*invalid_ipv_future);
+    }
     for (const char* request : {"CONNECT []:443 HTTP/1.1\r\nHost: x\r\n\r\n",
                                 "CONNECT [2001:::1]:443 HTTP/1.1\r\nHost: x\r\n\r\n",
                                 "CONNECT [1:2:3:4:5:6:7:8:]:443 HTTP/1.1\r\nHost: x\r\n\r\n",

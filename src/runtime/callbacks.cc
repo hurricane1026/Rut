@@ -112,14 +112,43 @@ static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end
         host_end++;
         while (host_end < end && data[host_end] != ']') host_end++;
         if (host_end == start + 1 || host_end >= end || data[host_end] != ']') return false;
-        const u32 host_len = host_end - start - 1;
-        char host[128];
-        if (host_len >= sizeof(host)) return false;
-        __builtin_memcpy(host, data + start + 1, host_len);
-        host[host_len] = '\0';
-        in6_addr address{};
-        if (inet_pton(AF_INET6, host, &address) != 1) return false;
-        host_end++;
+        u32 ipv_future = start + 1;
+        if (data[ipv_future] == 'v' || data[ipv_future] == 'V') {
+            ipv_future++;
+            const u32 version_start = ipv_future;
+            while (ipv_future < host_end) {
+                const u8 c = data[ipv_future];
+                const bool hex =
+                    (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                if (!hex) break;
+                ipv_future++;
+            }
+            if (ipv_future == version_start || ipv_future >= host_end || data[ipv_future] != '.')
+                return false;
+            ipv_future++;
+            const u32 payload_start = ipv_future;
+            for (; ipv_future < host_end; ipv_future++) {
+                const u8 c = data[ipv_future];
+                const bool alpha_num =
+                    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+                const bool unreserved = alpha_num || c == '-' || c == '.' || c == '_' || c == '~';
+                const bool subdelim = c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' ||
+                                      c == ')' || c == '*' || c == '+' || c == ',' || c == ';' ||
+                                      c == '=';
+                if (!unreserved && !subdelim && c != ':') return false;
+            }
+            if (ipv_future == payload_start) return false;
+            host_end++;
+        } else {
+            const u32 host_len = host_end - start - 1;
+            char host[128];
+            if (host_len >= sizeof(host)) return false;
+            __builtin_memcpy(host, data + start + 1, host_len);
+            host[host_len] = '\0';
+            in6_addr address{};
+            if (inet_pton(AF_INET6, host, &address) != 1) return false;
+            host_end++;
+        }
     } else {
         while (host_end < end && data[host_end] != ':') host_end++;
         if (host_end == start) return false;
