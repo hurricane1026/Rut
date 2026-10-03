@@ -619,8 +619,12 @@ are recorded from the pinned Envoy build, not assumed.
   `unmatched` policies for every method and for the catch-all, as the nginx
   converter does.
 - Envoy's HTTP/1 codec rejects `CONNECT` and absolute-form targets in specific
-  ways, and TRACE is forwarded like any other method. Method-specific behavior
-  is recorded per method and each method is a separate matrix row.
+  ways, and TRACE is forwarded like any other method. Rut's shared HTTP/1
+  admission now rejects absolute-form before routing with a closing 400,
+  including extension-method fallback (#713). Origin-form `//double-slash`
+  stays ordinary path data. Exact local-response inventories keep their
+  stronger zero-byte rejection contract. Method-specific behavior is recorded
+  per method and each method is a separate matrix row.
 
 **Request to upstream**
 

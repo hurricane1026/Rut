@@ -2391,6 +2391,20 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    if (conn.req_target_form_reject_before_pre_route) {
+        loop->epoch_enter();
+        if (loop->metrics) loop->metrics->on_request_start();
+        conn.resp_status = 400;
+        format_static_response(conn,
+                               400,
+                               /*keep_alive=*/false,
+                               conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+        conn.keep_alive = false;
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))
+            close_conn_if_live(loop, conn);
+        return;
+    }
     if (pre_route_policy_id != 0 &&
         !pre_route_strict_local_response_request_is_admitted(conn, request_method_key)) {
         conn.req_start_us = 0;
@@ -2402,14 +2416,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // The raw target witness covers both path and query. A literal fragment
     // delimiter is invalid before any route, handler or upstream effect;
     // percent-encoded %23 remains ordinary request-target data.
-    // CONNECT requires authority-form. An origin-form target must never
-    // reach even a method-any handler or proxy route.
-    // Inspect the bounded raw target, not req_path's legacy "/" fallback:
-    // malformed authority-form requests can retain that fallback path.
-    const bool origin_form_connect = conn.req_method == static_cast<u8>(LogHttpMethod::Connect) &&
-                                     conn.recv_buf.len() > 8 && conn.recv_buf.data()[7] == ' ' &&
-                                     conn.recv_buf.data()[8] == '/';
-    if (conn.req_target_has_fragment || origin_form_connect) {
+    // A literal fragment delimiter is invalid before any route, handler or
+    // upstream effect; percent-encoded %23 remains ordinary request-target data.
+    if (conn.req_target_has_fragment || conn.req_target_form_unsupported) {
         conn.resp_status = 400;
         format_static_response(conn,
                                400,

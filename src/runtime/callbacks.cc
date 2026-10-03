@@ -17,6 +17,8 @@
 #include "rut/runtime/route_canon.h"
 #include "rut/runtime/traffic_capture.h"
 
+#include <arpa/inet.h>
+
 namespace rut {
 
 #ifdef __APPLE__
@@ -103,10 +105,94 @@ u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len) {
     return static_cast<u8>(LogHttpMethod::Other);
 }
 
+static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end) {
+    if (!data || end <= start) return false;
+    u32 host_end = start;
+    if (data[start] == '[') {
+        host_end++;
+        while (host_end < end && data[host_end] != ']') host_end++;
+        if (host_end == start + 1 || host_end >= end || data[host_end] != ']') return false;
+        u32 ipv_future = start + 1;
+        if (data[ipv_future] == 'v' || data[ipv_future] == 'V') {
+            ipv_future++;
+            const u32 version_start = ipv_future;
+            while (ipv_future < host_end) {
+                const u8 c = data[ipv_future];
+                const bool hex =
+                    (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                if (!hex) break;
+                ipv_future++;
+            }
+            if (ipv_future == version_start || ipv_future >= host_end || data[ipv_future] != '.')
+                return false;
+            ipv_future++;
+            const u32 payload_start = ipv_future;
+            for (; ipv_future < host_end; ipv_future++) {
+                const u8 c = data[ipv_future];
+                const bool alpha_num =
+                    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+                const bool unreserved = alpha_num || c == '-' || c == '.' || c == '_' || c == '~';
+                const bool subdelim = c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' ||
+                                      c == ')' || c == '*' || c == '+' || c == ',' || c == ';' ||
+                                      c == '=';
+                if (!unreserved && !subdelim && c != ':') return false;
+            }
+            if (ipv_future == payload_start) return false;
+            host_end++;
+        } else {
+            const u32 host_len = host_end - start - 1;
+            char host[128];
+            if (host_len >= sizeof(host)) return false;
+            __builtin_memcpy(host, data + start + 1, host_len);
+            host[host_len] = '\0';
+            in6_addr address{};
+            if (inet_pton(AF_INET6, host, &address) != 1) return false;
+            host_end++;
+        }
+    } else {
+        while (host_end < end && data[host_end] != ':') host_end++;
+        if (host_end == start) return false;
+        for (u32 i = start; i < host_end; i++) {
+            const u8 c = data[i];
+            const bool alpha_num =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+            const bool unreserved = alpha_num || c == '-' || c == '.' || c == '_' || c == '~';
+            const bool subdelim = c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' ||
+                                  c == ')' || c == '*' || c == '+' || c == ',' || c == ';' ||
+                                  c == '=';
+            if (c == '%') {
+                if (i + 2 >= host_end) return false;
+                const u8 h = data[i + 1], l = data[i + 2];
+                const bool hex_h =
+                    (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
+                const bool hex_l =
+                    (l >= '0' && l <= '9') || (l >= 'a' && l <= 'f') || (l >= 'A' && l <= 'F');
+                if (!hex_h || !hex_l) return false;
+                i += 2;
+            } else if (!unreserved && !subdelim) {
+                return false;
+            }
+        }
+    }
+    if (host_end >= end || data[host_end] != ':') return false;
+    host_end++;
+    if (host_end == end) return false;
+    u32 port = 0;
+    for (; host_end < end; host_end++) {
+        const u8 c = data[host_end];
+        if (c < '0' || c > '9') return false;
+        port = port * 10u + static_cast<u32>(c - '0');
+        if (port > 65535u) return false;
+    }
+    return port != 0;
+}
+
 void capture_request_metadata(Connection& conn) {
     conn.begin_request_metadata_episode();
     conn.req_strict_h1_complete = false;
     conn.req_target_has_fragment = false;
+    conn.req_target_form_unsupported = false;
+    conn.req_target_form_reject_before_pre_route = false;
     conn.req_method = static_cast<u8>(LogHttpMethod::Other);
     conn.downstream_req_size = conn.recv_buf.len();
     conn.req_size = conn.downstream_req_size;
@@ -168,12 +254,30 @@ void capture_request_metadata(Connection& conn) {
         target_start++;
     if (target_start < kLen && data[target_start] == ' ') {
         target_start++;
-        for (u32 i = target_start; i < kLen && data[i] != ' ' && data[i] != '\r' && data[i] != '\n';
-             i++) {
-            if (data[i] == '#') {
-                conn.req_target_has_fragment = true;
-                break;
-            }
+        u32 target_end = target_start;
+        bool target_has_slash = false;
+        while (target_end < kLen && data[target_end] != ' ' && data[target_end] != '\r' &&
+               data[target_end] != '\n') {
+            conn.req_target_has_fragment |= data[target_end] == '#';
+            target_has_slash |= data[target_end] == '/';
+            target_end++;
+        }
+        // Ordinary routing supports origin-form, plus the existing asterisk
+        // responder and CONNECT authority handling. Absolute-form is not
+        // implemented: reject it before application routing, including when
+        // an extension method bypasses the strict parser. A leading "//" is
+        // still origin-form path data, not an absolute URI.
+        const bool connect = target_start == 8 && __builtin_memcmp(data, "CONNECT ", 8) == 0;
+        if (target_end > target_start) {
+            const bool origin = data[target_start] == '/';
+            const bool asterisk = target_end == target_start + 1 && data[target_start] == '*';
+            const bool connect_authority_valid =
+                !connect || connect_authority_target_is_valid(data, target_start, target_end);
+            conn.req_target_form_unsupported =
+                connect ? (origin || target_has_slash || !connect_authority_valid)
+                        : (!origin && !asterisk);
+            conn.req_target_form_reject_before_pre_route =
+                conn.req_target_form_unsupported && !(connect && origin);
         }
     }
 
