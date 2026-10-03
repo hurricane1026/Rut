@@ -1,6 +1,6 @@
 # 原生 complete-buffered 接收优化：2026-10-03
 
-候选已保留。Sol 负责架构、问题拆解、实现审核和独立数值核验；Luna 负责实现与验证脚本。HTTP 1MiB、并发 32 的吞吐提高 36–48%，p99 降低约 30%，前端每请求 CPU 时间降低 32–39%。该长连接坐标的候选吞吐约为 nginx 的 1.09 倍；短连接仍落后约 9%。不能据此宣称整个矩阵全面追平 nginx。
+原始候选已保留；下述性能数字来自冻结的初始候选，后续正确性修订见末节。Sol 负责架构、问题拆解、实现审核和独立数值核验；Luna 负责实现与验证脚本。HTTP 1MiB、并发 32 的吞吐提高 36–48%，p99 降低约 30%，前端每请求 CPU 时间降低 32–39%。该长连接坐标的候选吞吐约为 nginx 的 1.09 倍；短连接仍落后约 9%。不能据此宣称整个矩阵全面追平 nginx。
 
 ## 改动与合同
 
@@ -41,7 +41,7 @@
 - 单 worker/shard，Rut 日志确认 io_uring；server CPU 2、origin CPU 3、clients CPU 4/5，使用不同物理核。未锁频，宿主机非独占。
 - 使用已有固定 nginx 镜像与仓库 `scripts/nginx_benchmark/run.py`，HTTP/1.1，converter-strict，完整缓冲响应，关闭 upstream reuse。每次 warmup 1 秒，正式测量至少 5 秒；每组和重复交替引擎先后顺序。负载串行执行。
 - 四套实验 primary 48、concurrency 96、small 48、tls-r2 48，共 240 条；10 个不同坐标。原始数据、计划、环境、命令、摘要和状态保留供复核。
-- baseline HEAD 为 `1e460cf7a9b0a5d69640de50b7ee5f8e7eddf730`，工作树已有先前实验改动；这不是干净提交的基线。两套冻结构建共享这些改动，差异限定为本次七个文件；生产源文件在测量后未变，保留候选 patch 与 hash。
+- baseline HEAD 为 `1e460cf7a9b0a5d69640de50b7ee5f8e7eddf730`，工作树已有先前实验改动；这不是干净提交的基线。两套冻结构建共享这些改动，差异限定为本次七个文件；这些冻结构建的源码、patch 与 hash 保留不变。`delivery-source-sha256.json` 对应初始 PR 候选（`8e0af749`）的七个文件，后续修订的源码记录另见末节。
 - 首次 TLS 尝试因实验复制证书继承 SELinux 标签而在 nginx readiness 前失败，未产生样本。仅修复实验目录文件标签后以 tls-r2 重跑；失败证据单独保留，不混入正式结果。使用已有 BoringSSL 测试证书，没有新增系统 OpenSSL 依赖。
 
 ## 正确性与静态检查
@@ -60,4 +60,14 @@
 
 ## PR 隔离验证
 
-创建 PR 时从最新 main（`f7cb12fc`）建立独立分支，仅复制七个源码/测试文件与本报告。候选生产源码与性能测量 SHA256 一致，main 上这些文件的基线与实验基线一致。C/C++ 均使用 Clang，Release O2、JIT ON、IPO OFF；主程序及相关测试重新构建成功。独立分支的 6 个 CTest 全部通过，network 1529 passed、348172 checks、无跳过，Arena 68 passed。受影响文件格式及 diff 检查通过。见 [测试日志](isolated-main-ctest.log) 与 [验证记录](isolated-main-validation.json)。独立分支未重新跑性能实验，性能数字仍来自前述冻结 ABBA 构建。
+创建 PR 时从最新 main（`f7cb12fc`）建立独立分支，仅复制七个源码/测试文件与本报告。初始 PR 候选（`8e0af749`）的生产源码与性能测量 SHA256 一致，main 上这些文件的基线与实验基线一致。C/C++ 均使用 Clang，Release O2、JIT ON、IPO OFF；主程序及相关测试重新构建成功。独立分支的 6 个 CTest 全部通过，network 1529 passed、348172 checks、无跳过，Arena 68 passed。受影响文件格式及 diff 检查通过。见 [测试日志](isolated-main-ctest.log) 与 [验证记录](isolated-main-validation.json)。独立分支未重新跑性能实验，性能数字仍来自前述冻结 ABBA 构建。
+
+## Watchdog 正确性修订
+
+CI 发现旧布局守卫仍要求 `Connection` 为 3616 字节，而初始优化新增 32 字节的不可变接收目标，实际为 3648 字节；保留明确大小守卫并更新预期。nginx 差分还发现 one-shot 正向终结后，严格 304 响应的 D2 校验不接受已消费的 Recv owner，导致下游 keep-alive 被关闭。
+
+修订（代码提交 `60ed148deb0a`）保留原 configured-HEAD 校验，只在已完整解析且满足严格 304 shape 时查验当前批次的精确终结 witness，允许 owner-free tombstone 退休 origin。普通 200/206 与大正文不新增该校验；不重 arm 已消费操作、不伪造 owner，也不放宽同批 EOF/error 的关闭合同。首版本地修复因会错误关闭分片响应头而被 Sol 拒绝，未推送。
+
+最终完整网络测试 1531 passed、348202 checks；完整 idle-trim 测试 29 passed、6400 checks，两者无跳过。重建主程序后，真实 pinned-nginx #529 差分测试通过；聚焦测试覆盖完整/分片 one-shot 304、既有 terminal incomplete 和同批 EOF/error。见 [网络与 idle-trim 日志](watchdog-network-idle-ctest.log)、[#529 日志](watchdog-529-ctest.log)、[修订验证](watchdog-repair-validation.json) 与 [修订源码 hash](watchdog-repair-source-sha256.json)。
+
+该正确性修订尚未重新测量性能。保留初始冻结 ABBA 数据与原归档，不将原 36–48% 收益冒称为修订提交的重测结果；新源码 hash 与初始候选 hash 分别记录。
