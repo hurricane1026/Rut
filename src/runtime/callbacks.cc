@@ -168,8 +168,7 @@ void capture_request_metadata(Connection& conn) {
         target_start++;
     if (target_start < kLen && data[target_start] == ' ') {
         target_start++;
-        for (u32 i = target_start; i < kLen && data[i] != ' ' && data[i] != '\r' &&
-                      data[i] != '\n';
+        for (u32 i = target_start; i < kLen && data[i] != ' ' && data[i] != '\r' && data[i] != '\n';
              i++) {
             if (data[i] == '#') {
                 conn.req_target_has_fragment = true;

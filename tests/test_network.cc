@@ -20970,8 +20970,7 @@ TEST(request_admission, fragment_rejected_before_handler_or_upstream) {
                 }
             }
             REQUIRE_NE(header_end, 0u);
-            CHECK_EQ(conn->send_buf.len(),
-                     header_end);
+            CHECK_EQ(conn->send_buf.len(), header_end);
         }
         loop.inject_and_dispatch(
             make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
@@ -21134,8 +21133,7 @@ TEST(request_admission, h2_pending_prepared_forward_fragment_keeps_owner) {
             {{":authority", 10}, {"example.test", 12}},
             {{":path", 5}, {"/admin#frag", 11}},
         };
-        h2_on_headers_cb<SmallLoop>(
-            &strict_dispatch, strict_h2, 3, strict_headers, 4, true);
+        h2_on_headers_cb<SmallLoop>(&strict_dispatch, strict_h2, 3, strict_headers, 4, true);
         CHECK_EQ(strict_dispatch.resp_len, 0u);
         CHECK(strict_dispatch.close_after_process);
         CHECK(strict_h2.pending_prepared_forward);

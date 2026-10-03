@@ -952,10 +952,7 @@ const char* status_reason(u16 code);
 // `Code` value -- rather than being rejected. Only fails (returns false)
 // when `out` is null; every `u16` code otherwise gets a phrase.
 bool canonical_status_reason(u16 code, Str* out);
-void format_static_response(Connection& conn,
-                            u16 code,
-                            bool keep_alive,
-                            bool headers_only = false);
+void format_static_response(Connection& conn, u16 code, bool keep_alive, bool headers_only = false);
 // Custom-body variant: writes status line + Content-Length matching
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
 // bytes. For codes that must have no body (1xx / 204 / 304) falls
