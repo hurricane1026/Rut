@@ -39,6 +39,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     bool running = true;
     bool close_on_failed_send = false;
     u32 send_submit_attempts = 0;
+    UpstreamConcurrency* upstream_cc = nullptr;
     bool fail_next_recv_submit = false;
     bool fail_next_upstream_recv_submit = false;
 
@@ -74,6 +75,12 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     }
 
     bool is_draining() const { return draining; }
+    bool upstream_acquire(u16 uid, u32 max) {
+        return upstream_cc ? upstream_cc->try_acquire(uid, max) : true;
+    }
+    void upstream_release(u16 uid) {
+        if (upstream_cc) upstream_cc->release(uid);
+    }
 
     // Per-shard control plane pointers (mirrors EventLoop for testing).
     const RouteConfig** config_ptr = nullptr;
