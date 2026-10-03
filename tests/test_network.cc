@@ -16696,6 +16696,201 @@ TEST(upstream_reuse, fallback_skips_non_idempotent_method) {
     if (c->upstream_fd >= 0) close(c->upstream_fd);
 }
 
+// A reused socket can accept a non-idempotent request and then reset before
+// returning its first response.  It must never be replayed, but the completed
+// request still gets the ordinary configured (or default) connect failure.
+TEST(upstream_reuse, post_first_response_eof_publishes_failure_without_retry) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    ForwardFailurePolicySpec policy{};
+    policy.version = ForwardFailurePolicyVersion::Http11;
+    policy.status_code = 503;
+    policy.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    policy.date = ForwardFailurePolicyDate::Current;
+    policy.connection = ForwardFailurePolicyConnection::Request;
+    policy.head_mode = FailurePolicyHeadMode::Reject;
+    policy.reason = {"Service Unavailable", 19};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"reused failure", 14};
+    REQUIRE_EQ(cfg.add_failure_policy(policy), 1u);
+
+    for (const i32 terminal_result : {static_cast<i32>(0), -ECONNRESET}) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* c = loop.find_fd(42);
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*c));
+        c->request_config = &cfg;
+        c->upstream_idx = static_cast<u16>(upstream.value());
+        c->upstream_backend_idx = 0;
+        c->req_method = static_cast<u8>(LogHttpMethod::Post);
+        c->upstream_reused = true;
+        c->request_upload_complete = true;
+        c->upstream_slot_held = true;
+        c->upstream_fd = dup(STDERR_FILENO);
+        REQUIRE(c->upstream_fd >= 0);
+        c->failure_policy_id = 1;
+        c->on_upstream_recv = &on_upstream_response<SmallLoop>;
+        loop.backend.clear_ops();
+
+        on_upstream_response<SmallLoop>(
+            &loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, terminal_result));
+
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+        CHECK_EQ(c->resp_status, 503u);
+        CHECK(c->upstream_abandoned);
+        CHECK_EQ(c->upstream_fd, -1);
+        CHECK_FALSE(c->upstream_slot_held);
+        CHECK_EQ(c->on_upstream_recv, nullptr);
+        CHECK_EQ(c->on_upstream_send, nullptr);
+        CHECK(
+            buf_has(c->send_buf.data(), c->send_buf.len(), "HTTP/1.1 503 Service Unavailable\r\n"));
+        CHECK(buf_has(c->send_buf.data(), c->send_buf.len(), "reused failure"));
+        loop.close_conn(*c);
+    }
+
+    // With no selected policy, the same safe terminal branch uses the legacy
+    // closing 502 response rather than silently dropping the client request.
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(upstream.value());
+    c->upstream_backend_idx = 0;
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);
+    c->upstream_reused = true;
+    c->request_upload_complete = true;
+    c->upstream_slot_held = true;
+    c->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE(c->upstream_fd >= 0);
+    c->on_upstream_recv = &on_upstream_response<SmallLoop>;
+    loop.backend.clear_ops();
+    on_upstream_response<SmallLoop>(&loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, 0));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(c->resp_status, kStatusBadGateway);
+    CHECK_FALSE(c->keep_alive);
+    CHECK(buf_has(c->send_buf.data(), c->send_buf.len(), "HTTP/1.1 502 Bad Gateway\r\n"));
+    CHECK_EQ(c->upstream_fd, -1);
+    loop.close_conn(*c);
+}
+
+TEST(upstream_reuse, first_response_eof_with_live_recv_owner_closes) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);
+    c->upstream_reused = true;
+    c->request_upload_complete = true;
+    c->upstream_recv_armed = true;
+    c->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE(c->upstream_fd >= 0);
+    loop.backend.clear_ops();
+    IoEvent terminal = make_ev(c->id, IoEventType::UpstreamRecv, 0);
+    terminal.more = 1;
+    on_upstream_response<SmallLoop>(&loop, *c, terminal);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(c->fd, -1);
+}
+
+TEST(upstream_reuse, post_request_sent_then_first_response_eof_uses_failure) {
+    RouteConfig cfg;
+    auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    ForwardFailurePolicySpec policy{};
+    policy.version = ForwardFailurePolicyVersion::Http11;
+    policy.status_code = 503;
+    policy.header_order = FailurePolicyHeaderOrder::LengthTypeDateServer;
+    policy.date = ForwardFailurePolicyDate::Current;
+    policy.connection = ForwardFailurePolicyConnection::Request;
+    policy.head_mode = FailurePolicyHeadMode::Reject;
+    policy.reason = {"Service Unavailable", 19};
+    policy.content_type = {"text/plain", 10};
+    policy.server = {"rut", 3};
+    policy.body = {"reused failure", 14};
+    REQUIRE_EQ(cfg.add_failure_policy(policy), 1u);
+    SmallLoop loop;
+    loop.setup();
+    UpstreamConcurrency concurrency;
+    concurrency.reset();
+    loop.upstream_cc = &concurrency;
+    REQUIRE(concurrency.try_acquire(static_cast<u16>(upstream.value()), 1));
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* c = loop.find_fd(42);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.alloc_upstream_buf(*c));
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+    REQUIRE_EQ(c->recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    c->request_config = &cfg;
+    c->upstream_idx = static_cast<u16>(upstream.value());
+    c->upstream_reused = true;
+    c->req_method = static_cast<u8>(LogHttpMethod::Post);
+    c->req_body_mode = BodyMode::ContentLength;
+    c->req_body_remaining = 0;
+    c->req_initial_send_len = sizeof(kRequest) - 1;
+    c->upstream_fd = dup(STDERR_FILENO);
+    REQUIRE(c->upstream_fd >= 0);
+    c->failure_policy_id = 1;
+    c->upstream_slot_held = true;
+    c->upstream_slot_uid = static_cast<u16>(upstream.value());
+    on_upstream_request_sent<SmallLoop>(
+        &loop, *c, make_ev(c->id, IoEventType::UpstreamSend, sizeof(kRequest) - 1));
+    CHECK(c->request_upload_complete);
+    CHECK_EQ(c->retry_req_send_len, sizeof(kRequest) - 1);
+    CHECK_EQ(c->on_upstream_recv, &on_upstream_response<SmallLoop>);
+    c->upstream_recv_armed = false;
+    on_upstream_response<SmallLoop>(
+        &loop, *c, make_ev(c->id, IoEventType::UpstreamRecv, -ECONNRESET));
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(c->resp_status, 503u);
+    CHECK_EQ(c->upstream_fd, -1);
+    CHECK_FALSE(c->upstream_slot_held);
+    CHECK_EQ(concurrency.inflight[upstream.value()].load(std::memory_order_relaxed), 0u);
+    loop.close_conn(*c);
+    CHECK_EQ(concurrency.inflight[upstream.value()].load(std::memory_order_relaxed), 0u);
+}
+
+TEST(upstream_reuse, first_response_failure_guards_negative_states) {
+    for (const u32 scenario : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u}) {
+        SmallLoop loop;
+        loop.setup();
+        loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+        auto* c = loop.find_fd(42);
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.alloc_upstream_buf(*c));
+        c->req_method = static_cast<u8>(LogHttpMethod::Post);
+        c->upstream_reused = scenario != 0;
+        c->request_upload_complete = scenario != 4;
+        c->upstream_request_incomplete = scenario == 1;
+        c->proxy_resp_started = scenario == 2;
+        c->send_armed = scenario == 3;
+        c->upstream_recv_armed = scenario == 5;
+        c->upstream_recv_cancel_inflight = scenario == 6;
+        c->upstream_fd = dup(STDERR_FILENO);
+        REQUIRE(c->upstream_fd >= 0);
+        loop.backend.clear_ops();
+        IoEvent event = make_ev(c->id, IoEventType::UpstreamRecv, 0);
+        event.more = scenario == 7;
+        on_upstream_response<SmallLoop>(&loop, *c, event);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+        CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+        CHECK_EQ(c->fd, -1);
+    }
+}
+
 // A non-reused (freshly-connected) failure never triggers the fallback.
 TEST(upstream_reuse, fallback_noop_when_not_reused) {
     SmallLoop loop;

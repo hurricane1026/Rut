@@ -693,6 +693,14 @@ See `docs/language-card.md` for the exhaustive per-field/per-status grammar
 and `docs/envoy-converter.md` for the byte-level Envoy oracle these layouts
 reproduce.
 
+When a request has been sent on an idle pooled upstream connection and that
+connection returns EOF or RST before any response byte, Rut does not replay a
+non-idempotent request. After the terminal receive owner has been settled, the
+request instead receives its selected `failure_policy`, or the legacy closing
+502 response when no policy was selected. This response is published only
+before downstream response bytes or a response send owner exist; a partial or
+already-started upstream response remains fail-closed.
+
 #### 3.3.6 State Types
 
 > **Revised 2026-07 (decisions in docs/state-types.md):** the taxonomy is
