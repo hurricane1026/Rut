@@ -2062,14 +2062,26 @@ static int docker_info_return_code(DockerInfoDecision decision, bool required) {
 
 static bool docker_info_missing_prerequisite(const DockerInfoResult& result);
 
-static bool close_self_check_inherited_fds(bool force_proc_fallback = false) {
+static bool close_self_check_inherited_fds(bool force_proc_fallback = false,
+                                           bool inject_close_range_eperm = false) {
 #if defined(SYS_close_range)
     if (!force_proc_fallback) {
-        if (syscall(SYS_close_range, 4u, UINT_MAX, 0u) == 0) return true;
-        if (errno != ENOSYS && errno != EINVAL) return false;
+        int close_range_error = 0;
+        if (inject_close_range_eperm) {
+            // Exercise the same errno dispatch used when seccomp denies
+            // close_range on a real runner.
+            close_range_error = EPERM;
+        } else {
+            if (syscall(SYS_close_range, 4u, UINT_MAX, 0u) == 0) return true;
+            close_range_error = errno;
+        }
+        if (close_range_error != ENOSYS && close_range_error != EINVAL &&
+            close_range_error != EPERM)
+            return false;
     }
 #else
     (void)force_proc_fallback;
+    (void)inject_close_range_eperm;
 #endif
     DIR* directory = opendir("/proc/self/fd");
     if (directory == nullptr) return false;
@@ -2101,7 +2113,8 @@ static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot,
                                          rlim_t child_nofile_limit = 0,
                                          bool verify_high_fd_close = false,
                                          bool* high_fd_closed = nullptr,
-                                         bool force_proc_fallback = false) {
+                                         bool force_proc_fallback = false,
+                                         bool inject_close_range_eperm = false) {
     int inherited_high_fd = -1;
     if (verify_high_fd_close) {
         const int null_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -2140,7 +2153,8 @@ static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot,
             if (dup2(ready_pipe[1], 3) < 0) _exit(2);
             close(ready_pipe[1]);
         }
-        if (!close_self_check_inherited_fds(force_proc_fallback)) _exit(2);
+        if (!close_self_check_inherited_fds(force_proc_fallback, inject_close_range_eperm))
+            _exit(2);
         const bool high_fd_is_closed =
             inherited_high_fd < 0 || (fcntl(inherited_high_fd, F_GETFD) < 0 && errno == EBADF);
         if (child_nofile_limit != 0) {
@@ -2266,6 +2280,17 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
                           proc_race.proc_snapshot.errors_size,
                           missing_status_error)) {
         error = "missing /proc diagnostic changed timeout cleanup or verdict";
+        cleanup();
+        return false;
+    }
+    const std::string long_argv0(3072, 'a');
+    DockerInfoResult long_cmdline = run_docker_info_runner(
+        {"/bin/bash", "-c", "exec -a \"$1\" sleep 1", "bash", long_argv0}, log, 100);
+    unlink(log.c_str());
+    if (long_cmdline.outcome != DockerInfoOutcome::TimedOut ||
+        !long_cmdline.proc_snapshot.truncated || long_cmdline.proc_snapshot.fd_output_truncated ||
+        !proc_fd_snapshot_matches_complete_entries(long_cmdline.proc_snapshot)) {
+        error = "long command line truncation contaminated complete proc fd output";
         cleanup();
         return false;
     }
@@ -2439,7 +2464,9 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         !proc_fd_snapshot_matches_complete_entries(fd_limited_proc) ||
         fd_limited_proc.fd_scan_entries != static_cast<size_t>(fd_limited_opened + 6) ||
         fd_limited_proc.fd_scan_entries > kDockerProcSnapshotDirEntryLimit ||
-        !fd_limited_proc.fd_output_truncated || !fd_limited_proc.truncated) {
+        fd_limited_proc.fd_output_truncated !=
+            (static_cast<size_t>(fd_limited_opened + 4) > kDockerProcSnapshotFdLimit) ||
+        (fd_limited_proc.fd_output_truncated && !fd_limited_proc.truncated)) {
         error = "complete proc fd output/lowest-fd/high-inherited-fd control failed";
         cleanup();
         return false;
@@ -2457,6 +2484,18 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
             cleanup();
             return false;
         }
+        DockerProcSnapshot eperm_fd_proc;
+        int eperm_fd_opened = 0;
+        bool eperm_high_fd_closed = false;
+        if (!snapshot_fd_limit_self_check(
+                eperm_fd_proc, 4, eperm_fd_opened, 0, true, &eperm_high_fd_closed, false, true) ||
+            !eperm_high_fd_closed || eperm_fd_opened != 4 ||
+            !proc_fd_snapshot_matches_complete_entries(eperm_fd_proc) ||
+            eperm_fd_proc.fd_output_truncated) {
+            error = "EPERM close_range fallback failed to close an inherited high descriptor";
+            cleanup();
+            return false;
+        }
     }
     for (size_t i = 1; i < fd_limited_proc.fd_count; ++i) {
         if (fd_limited_proc.fd_numbers[i - 1] >= fd_limited_proc.fd_numbers[i]) {
@@ -2465,7 +2504,7 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
             return false;
         }
     }
-    for (int fd = 0; fd < static_cast<int>(kDockerProcSnapshotFdLimit); ++fd) {
+    for (int fd = 0; fd < static_cast<int>(fd_limited_proc.fd_count); ++fd) {
         if (fd_limited_proc.fd_numbers[fd] != fd) {
             error = "completed proc fd scan missed a lower descriptor";
             cleanup();
@@ -2477,7 +2516,7 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
     if (!snapshot_fd_limit_self_check(small_complete_proc, 4, small_complete_opened) ||
         small_complete_opened != 4 ||
         !proc_fd_snapshot_matches_complete_entries(small_complete_proc) ||
-        small_complete_proc.fd_output_truncated || small_complete_proc.truncated) {
+        small_complete_proc.fd_output_truncated) {
         error = "small complete proc fd output control failed";
         cleanup();
         return false;
@@ -2517,8 +2556,8 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
             std::min(kDockerProcSnapshotFdLimit, entry_control_descriptors) ||
         entry_limited_proc.fd_output_truncated !=
             (entry_control_descriptors > kDockerProcSnapshotFdLimit) ||
-        entry_limited_proc.truncated !=
-            (!entry_limited_proc.fd_scan_complete || entry_limited_proc.fd_output_truncated)) {
+        ((entry_limited_proc.fd_output_truncated || !entry_limited_proc.fd_scan_complete) &&
+         !entry_limited_proc.truncated)) {
         error = "proc fd output count/truncation did not match available child descriptors";
         cleanup();
         return false;
