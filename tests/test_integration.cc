@@ -14746,7 +14746,7 @@ struct SettlementTrace {
     struct Event {
         u32 conn_id = UINT32_MAX;
         i32 result = 0;
-        u32 generation_or_episode = 0;
+        u32 generation_episode_or_aux = 0;
         u64 reconstructed_token = kInvalidIoUserData;
         u16 buf_id = 0;
         u8 type = 0;
@@ -14803,6 +14803,25 @@ struct SettlementTrace {
     u32 event_next = 0;
 };
 
+inline u32 settlement_event_generation_or_episode(const IoEvent& event) {
+    if (io_event_is_upstream(event.type)) return event.upstream_episode;
+    return event.type == IoEventType::Recv ? event.aux : event.non_upstream_generation;
+}
+
+inline u64 settlement_event_reconstructed_token(const IoEvent& event) {
+    if (io_event_is_upstream(event.type))
+        return encode_upstream_event_token(
+            {event.conn_id, event.type, event.upstream_episode, event.aux});
+    const u32 generation =
+        event.type == IoEventType::Recv ? event.aux : event.non_upstream_generation;
+    return encode_non_upstream_user_data({event.conn_id, event.type, generation});
+}
+
+template <typename LoopT, typename Fn>
+void for_each_initialized_settlement_slot(const LoopT& loop, Fn&& fn) {
+    for (u32 id = 0; id < loop.slots_initialized; id++) fn(id, loop.conns[id]);
+}
+
 template <typename ShardT>
 void settle_stopped_iouring_shard(ShardT& shard, SettlementTrace* trace = nullptr) {
     auto* loop = shard.loop;
@@ -14830,18 +14849,9 @@ void settle_stopped_iouring_shard(ShardT& shard, SettlementTrace* trace = nullpt
                     captured.more = events[i].more;
                     captured.has_buf = events[i].has_buf;
                     captured.buf_id = events[i].buf_id;
-                    captured.generation_or_episode = io_event_is_upstream(events[i].type)
-                                                         ? events[i].upstream_episode
-                                                         : events[i].non_upstream_generation;
-                    captured.reconstructed_token =
-                        io_event_is_upstream(events[i].type)
-                            ? encode_upstream_event_token({events[i].conn_id,
-                                                           events[i].type,
-                                                           events[i].upstream_episode,
-                                                           events[i].aux})
-                            : encode_non_upstream_user_data({events[i].conn_id,
-                                                             events[i].type,
-                                                             events[i].non_upstream_generation});
+                    captured.generation_episode_or_aux =
+                        settlement_event_generation_or_episode(events[i]);
+                    captured.reconstructed_token = settlement_event_reconstructed_token(events[i]);
                     trace->event_next = (trace->event_next + 1u) % SettlementTrace::kMaxEvents;
                     if (trace->event_count < SettlementTrace::kMaxEvents) trace->event_count++;
                 }
@@ -14856,8 +14866,7 @@ void settle_stopped_iouring_shard(ShardT& shard, SettlementTrace* trace = nullpt
                 batch->active = loop->active_count();
                 batch->pending_free = loop->pending_free_count;
                 batch->pool_in_use = loop->pool.in_use();
-                for (u32 id = 0; id < loop->connection_capacity; id++) {
-                    const auto& conn = loop->conns[id];
+                for_each_initialized_settlement_slot(*loop, [&](u32 id, const auto& conn) {
                     const auto& downstream = loop->backend.send_state[id];
                     const auto& upstream = loop->backend.upstream_send_state[id];
                     const bool owns_work = conn.pending_ops != 0 || conn.recv_armed ||
@@ -14871,10 +14880,10 @@ void settle_stopped_iouring_shard(ShardT& shard, SettlementTrace* trace = nullpt
                                            conn.upstream_close_target_owned != 0 ||
                                            conn.upstream_close_cancel_owned != 0 ||
                                            downstream.remaining != 0 || upstream.remaining != 0;
-                    if (!owns_work) continue;
+                    if (!owns_work) return;
                     if (batch->owner_count == SettlementTrace::kMaxOwnersPerBatch) {
                         batch->owners_truncated = true;
-                        break;
+                        return;
                     }
                     auto& owner = batch->owners[batch->owner_count++];
                     owner.conn_id = id;
@@ -14908,7 +14917,7 @@ void settle_stopped_iouring_shard(ShardT& shard, SettlementTrace* trace = nullpt
                     owner.upstream_send_generation = upstream.generation;
                     owner.upstream_send_episode = upstream.upstream_episode;
                     owner.upstream_send_type = static_cast<u8>(upstream.type);
-                }
+                });
             }
         }
     }
@@ -14993,13 +15002,13 @@ void emit_settlement_trace_if_nonzero(FILE* output,
         const auto& e = trace.events[(first + i) % SettlementTrace::kMaxEvents];
         fprintf(output,
                 "[settlement-trace] cqe id=%u type=%u result=%d aux=%u more=%u "
-                "generation_or_episode=%u reconstructed_token=0x%llx has_buf=%u buf_id=%u\n",
+                "generation_episode_or_aux=%u reconstructed_token=0x%llx has_buf=%u buf_id=%u\n",
                 e.conn_id,
                 static_cast<u32>(e.type),
                 e.result,
                 static_cast<u32>(e.aux),
                 static_cast<u32>(e.more),
-                e.generation_or_episode,
+                e.generation_episode_or_aux,
                 static_cast<unsigned long long>(e.reconstructed_token),
                 static_cast<u32>(e.has_buf),
                 static_cast<u32>(e.buf_id));
@@ -15013,8 +15022,8 @@ void print_settlement_trace_if_nonzero(const ShardT& shard,
                                        FILE* output = stderr) {
     const auto* loop = shard.loop;
     u64 pending_ops = 0;
-    for (u32 id = 0; id < loop->connection_capacity; id++)
-        pending_ops += loop->conns[id].pending_ops;
+    for_each_initialized_settlement_slot(
+        *loop, [&](u32, const auto& conn) { pending_ops += conn.pending_ops; });
     emit_settlement_trace_if_nonzero(output,
                                      loop->active_count(),
                                      loop->pending_free_count,
@@ -15042,16 +15051,19 @@ TEST(route, settlement_trace_formatter_uses_fixed_sink_and_ring_order) {
     trace.event_next = 2;
     trace.events[31].conn_id = 11;
     trace.events[31].type = static_cast<u8>(IoEventType::Recv);
-    trace.events[31].reconstructed_token =
-        encode_non_upstream_user_data({11, IoEventType::Recv, 1});
+    trace.events[31].aux = kPauseCancelAux;
+    trace.events[31].reconstructed_token = settlement_event_reconstructed_token(
+        IoEvent{11, 0, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
     trace.events[0].conn_id = 12;
     trace.events[0].type = static_cast<u8>(IoEventType::UpstreamConnect);
-    trace.events[0].generation_or_episode = 2;
+    trace.events[0].generation_episode_or_aux = 2;
     trace.events[0].reconstructed_token =
         encode_upstream_event_token({12, IoEventType::UpstreamConnect, 2, 0});
     trace.events[1].conn_id = 13;
     trace.events[1].type = static_cast<u8>(IoEventType::Recv);
-    trace.events[1].reconstructed_token = encode_non_upstream_user_data({13, IoEventType::Recv, 3});
+    trace.events[1].aux = kDownstreamCloseCancelAux;
+    trace.events[1].reconstructed_token = settlement_event_reconstructed_token(
+        IoEvent{13, 0, 0, 0, IoEventType::Recv, 0, kDownstreamCloseCancelAux});
 
     char output[8192]{};
     FILE* sink = fmemopen(output, sizeof(output), "w");
@@ -15070,6 +15082,69 @@ TEST(route, settlement_trace_formatter_uses_fixed_sink_and_ring_order) {
     REQUIRE(third != nullptr);
     CHECK_LT(first, second);
     CHECK_LT(second, third);
+}
+
+TEST(route, settlement_trace_tokens_preserve_aux_and_scan_initialized_prefix) {
+    IoEvent recv{};
+    recv.conn_id = 7;
+    recv.type = IoEventType::Recv;
+    CHECK_EQ(settlement_event_reconstructed_token(recv),
+             encode_non_upstream_user_data({7, IoEventType::Recv, 0}));
+    recv.aux = kDownstreamCloseCancelAux;
+    CHECK_EQ(settlement_event_generation_or_episode(recv),
+             static_cast<u32>(kDownstreamCloseCancelAux));
+    CHECK_EQ(settlement_event_reconstructed_token(recv),
+             encode_non_upstream_user_data(
+                 {7, IoEventType::Recv, static_cast<u32>(kDownstreamCloseCancelAux)}));
+
+    IoEvent send{};
+    send.conn_id = 8;
+    send.type = IoEventType::Send;
+    send.non_upstream_generation = 0x1234u;
+    CHECK_EQ(settlement_event_generation_or_episode(send), 0x1234u);
+    CHECK_EQ(settlement_event_reconstructed_token(send),
+             encode_non_upstream_user_data({8, IoEventType::Send, 0x1234u}));
+
+    IoEvent upstream{};
+    upstream.conn_id = 9;
+    upstream.type = IoEventType::UpstreamRecv;
+    upstream.upstream_episode = 0x5678u;
+    upstream.aux = kUpstreamRetirementCancelAux;
+    CHECK_EQ(settlement_event_generation_or_episode(upstream), 0x5678u);
+    CHECK_EQ(settlement_event_reconstructed_token(upstream),
+             encode_upstream_event_token(
+                 {9, IoEventType::UpstreamRecv, 0x5678u, kUpstreamRetirementCancelAux}));
+
+    struct LazySlots {
+        struct Item {
+            u32 value;
+        };
+        struct View {
+            Item items[16]{};
+            mutable u32 read_count = 0;
+            mutable u32 out_of_prefix_reads = 0;
+
+            const Item& operator[](u32 id) const {
+                if (id >= 3u) {
+                    out_of_prefix_reads++;
+                    return items[0];
+                }
+                read_count++;
+                return items[id];
+            }
+        } conns{};
+        u32 connection_capacity = 16;
+        u32 slots_initialized = 3;
+    } lazy{};
+    u32 visited = 0;
+    for_each_initialized_settlement_slot(lazy, [&](u32 id, const auto&) {
+        CHECK_LT(id, lazy.slots_initialized);
+        visited++;
+    });
+    CHECK_EQ(lazy.connection_capacity, 16u);
+    CHECK_EQ(visited, 3u);
+    CHECK_EQ(lazy.conns.read_count, 3u);
+    CHECK_EQ(lazy.conns.out_of_prefix_reads, 0u);
 }
 
 template <typename ShardT>
