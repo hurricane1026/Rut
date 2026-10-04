@@ -13462,11 +13462,31 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         // Post-send first-recv EOF/RST with no response byte. For a reused pooled
         // socket whose origin FIN/RST landed just after take_idle's MSG_PEEK probe,
         // the request write completed locally and the dead socket only surfaces
-        // here. on_upstream_request_sent kept recv_buf for the reused case, so an
-        // idempotent request whose full bytes are still buffered can fall back to a
-        // fresh connect (request_fully_resendable inside the helper enforces this, so
-        // a streamed body upload is never replayed). Otherwise fail closed.
+        // here. on_upstream_request_sent kept a retry snapshot for the reused case,
+        // so an idempotent request whose full bytes are still buffered can fall back
+        // to a fresh connect (request_fully_resendable inside the helper enforces
+        // this, so a streamed body upload is never replayed). Otherwise fail closed
+        // or publish the selected/default connect-failure response below.
+        const bool reused_upstream = conn.upstream_reused;
         if (retry_reused_upstream(loop, conn)) return;
+        // A reused socket may have accepted a non-idempotent request before its
+        // EOF/RST. It is unsafe to replay that request, but a configured or
+        // legacy default failure can still be published because no upstream
+        // response or downstream response bytes exist yet.
+        if (reused_upstream && conn.request_upload_complete && !conn.upstream_request_incomplete &&
+            !conn.failure_policy_suppress_body && !conn.proxy_resp_started &&
+            conn.resp_status == 0 && conn.resp_body_sent == 0 && conn.send_progress == 0 &&
+            !conn.send_armed && conn.on_send == nullptr && !conn.upstream_send_armed &&
+            conn.on_upstream_send == nullptr && !ev.more && !conn.upstream_recv_armed &&
+            !conn.upstream_recv_cancel_inflight) {
+            // The reused socket may have accepted this non-idempotent request
+            // before closing. Keep the selected failure status/body, but close
+            // downstream so pipelined bytes cannot be mistaken for a safe
+            // successor after an ambiguous request outcome.
+            conn.keep_alive = false;
+            respond_upstream_connect_failure(loop, conn);
+            return;
+        }
         loop->close_conn(conn);
         return;
     }
