@@ -8,6 +8,7 @@
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
+#include "rut/runtime/io_uring_init_failure.h"
 #include "rut/runtime/metrics.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard_control.h"
@@ -60,6 +61,9 @@ struct Shard {
 
     // EventLoop — mmap'd due to size (~130MB from Connection[16384])
     EventLoopType* loop = nullptr;
+    IoUringInitFailureDetail last_init_failure_detail = IoUringInitFailureDetail::None;
+
+    IoUringInitFailureDetail init_failure_detail() const { return last_init_failure_detail; }
 
     // Per-request scratch arena (reset after each request cycle)
     MmapArena scratch;
@@ -104,6 +108,7 @@ struct Shard {
                                      i32 lfd,
                                      u32 pool_prealloc = 0,
                                      u32 capacity = kDefaultConnectionCapacity) {
+        last_init_failure_detail = IoUringInitFailureDetail::None;
         if (!validate_connection_capacity(capacity))
             return core::make_unexpected(Error::make(EINVAL, Error::Source::Mmap));
         if constexpr (!(requires { loop->init(shard_id, listen_fd, pool_prealloc, capacity); })) {
@@ -130,6 +135,11 @@ struct Shard {
                 return loop->init(shard_id, listen_fd, pool_prealloc);
         }();
         if (!loop_result) {
+            if constexpr (requires { loop->init_failure_detail(); }) {
+                last_init_failure_detail = loop->init_failure_detail();
+            } else if constexpr (requires { loop->backend.init_failure_detail(); }) {
+                last_init_failure_detail = loop->backend.init_failure_detail();
+            }
             loop->~EventLoopType();
             munmap(loop, sizeof(EventLoopType));
             loop = nullptr;

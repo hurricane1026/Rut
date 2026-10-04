@@ -4765,15 +4765,18 @@ TEST(tls_state_machine, spurious_epollout_with_empty_tls_send_state_is_ignored) 
 
 // Verify IoUringBackend::init creates a timerfd
 TEST(uring, init_creates_timerfd) {
-    // io_uring requires Linux 6.0+. If init fails, skip gracefully.
+    // io_uring requires Linux 6.0+; skip only if the kernel or policy explicitly
+    // rejects setup, and fail resource or mapping errors with their diagnostics.
     IoUringBackend backend;
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     auto rc = backend.init(0, lfd);
     if (!rc) {
-        // io_uring not available — skip
+        const Error error = rc.error();
         close(lfd);
-        CHECK(true);
+        if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+            SKIP("io_uring unavailable");
+        report_unexpected_io_uring_init_failure(error, "init_creates_timerfd backend.init");
         return;
     }
     CHECK(backend.timer_fd >= 0);
@@ -4788,8 +4791,11 @@ TEST(uring, return_buffer_no_crash) {
     REQUIRE(lfd >= 0);
     auto rc = backend.init(0, lfd);
     if (!rc) {
+        const Error error = rc.error();
         close(lfd);
-        CHECK(true);
+        if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+            SKIP("io_uring unavailable");
+        report_unexpected_io_uring_init_failure(error, "return_buffer backend.init");
         return;
     }
     // Return buffer 0 — should not crash
@@ -4807,8 +4813,11 @@ TEST(uring, wait_emits_timeout_tick) {
     REQUIRE(lfd >= 0);
     auto rc = backend.init(0, lfd);
     if (!rc) {
+        const Error error = rc.error();
         close(lfd);
-        CHECK(true);
+        if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+            SKIP("io_uring unavailable");
+        report_unexpected_io_uring_init_failure(error, "wait_emits_timeout backend.init");
         return;
     }
 
@@ -4834,7 +4843,13 @@ TEST(uring, precise_response_read_timer_expires_with_exact_transport_identity) {
     using namespace rut;
     IoUringBackend backend;
     auto rc = backend.init(0, -1);
-    if (!rc) SKIP("io_uring unavailable");
+    if (!rc) {
+        const Error error = rc.error();
+        if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+            SKIP("io_uring unavailable");
+        report_unexpected_io_uring_init_failure(error, "response-read timer backend.init");
+        return;
+    }
 
     TestConn tc;
     tc.init(0, -1);
@@ -4889,7 +4904,13 @@ TEST(uring, precise_response_read_timer_cancel_emits_target_and_tagged_cancel_on
     using namespace rut;
     IoUringBackend backend;
     auto rc = backend.init(0, -1);
-    if (!rc) SKIP("io_uring unavailable");
+    if (!rc) {
+        const Error error = rc.error();
+        if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+            SKIP("io_uring unavailable");
+        report_unexpected_io_uring_init_failure(error, "response-read cancel backend.init");
+        return;
+    }
 
     TestConn tc;
     tc.init(0, -1);
@@ -5123,7 +5144,14 @@ TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
     // default 1024 soft limit.
     constexpr u32 kPeers = 300;
     IoUringBackend backend;
-    if (!backend.init(0, -1, kPeers)) SKIP("io_uring unavailable");
+    auto init_result = backend.init(0, -1, kPeers);
+    if (!init_result) {
+        const Error error = init_result.error();
+        if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+            SKIP("io_uring unavailable");
+        report_unexpected_io_uring_init_failure(error, "peer-close burst backend.init");
+        return;
+    }
 
     auto conns = std::make_unique<Connection[]>(kPeers);
     auto local = std::make_unique<i32[]>(kPeers);
@@ -5184,20 +5212,142 @@ TEST(uring, simultaneous_peer_close_burst_does_not_fail_backend) {
     CHECK_FALSE(out_of_range_seen);
 }
 
-// Skip only when the host cannot give us a ring (memlock budget, no io_uring, no
-// permission). Any other init failure, such as EINVAL from a bad ring size, is a bug
-// and must fail instead of turning the suite into silent skips.
-#define INIT_URING_OR_SKIP(backend, listen_fd, capacity)                                \
-    do {                                                                                \
-        auto init_result_ = (backend).init(0, (listen_fd), (capacity));                 \
-        if (!init_result_) {                                                            \
-            const i32 init_errno_ = init_result_.error().code;                          \
-            if (init_errno_ == ENOMEM || init_errno_ == ENOSYS || init_errno_ == EPERM) \
-                SKIP("io_uring unavailable");                                           \
-            CHECK_EQ(init_errno_, 0);                                                   \
-            return;                                                                     \
-        }                                                                               \
+// Skip only when the kernel or policy explicitly rejects io_uring setup. ENOMEM,
+// mmap failures, and other resource/setup errors fail instead of becoming skips.
+#define INIT_URING_OR_SKIP(backend, listen_fd, capacity)                                          \
+    do {                                                                                          \
+        auto init_result_ = (backend).init(0, (listen_fd), (capacity));                           \
+        if (!init_result_) {                                                                      \
+            const Error init_error_ = init_result_.error();                                       \
+            if (io_uring_init_error_is_unsupported(init_error_, (backend).init_failure_detail())) \
+                SKIP("io_uring unavailable");                                                     \
+            report_unexpected_io_uring_init_failure(init_error_, "backend.init");                 \
+            return;                                                                               \
+        }                                                                                         \
     } while (0)
+
+TEST(uring, init_error_skip_classification_is_source_aware) {
+    const auto unavailable = [](i32 code,
+                                IoUringInitFailureDetail detail = IoUringInitFailureDetail::None) {
+        return io_uring_init_error_is_unsupported(
+            rut::Error::make(code, rut::Error::Source::IoUring), detail);
+    };
+    CHECK(unavailable(ENOSYS));
+    CHECK(unavailable(EOPNOTSUPP));
+    CHECK(unavailable(EPERM));
+    CHECK(unavailable(EACCES));
+    CHECK_FALSE(unavailable(ENOMEM));
+    CHECK_FALSE(unavailable(EINVAL));
+    CHECK(unavailable(EINVAL, IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported));
+    CHECK(unavailable(EINVAL, IoUringInitFailureDetail::ProvidedBufferRingUnsupported));
+    CHECK_FALSE(unavailable(EINVAL, IoUringInitFailureDetail::QueueSetup));
+    CHECK_FALSE(unavailable(EINVAL, IoUringInitFailureDetail::RingSizeInvariant));
+    CHECK_FALSE(unavailable(EINVAL, IoUringInitFailureDetail::ProvidedBufferRingRegistration));
+    CHECK_FALSE(
+        io_uring_init_error_is_unsupported(rut::Error::make(EPERM, rut::Error::Source::Mmap)));
+    CHECK_FALSE(
+        io_uring_init_error_is_unsupported(rut::Error::make(ENOMEM, rut::Error::Source::Mmap)));
+}
+
+TEST(uring, init_failure_detail_resets_between_attempts) {
+    IoUringBackend backend{};
+    backend.last_init_failure_detail = IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported;
+    auto invalid_capacity = backend.init(0, -1, 0);
+    REQUIRE_FALSE(invalid_capacity);
+    CHECK_EQ(backend.init_failure_detail(), IoUringInitFailureDetail::SendStateStorage);
+    CHECK_FALSE(io_uring_init_error_is_unsupported(invalid_capacity.error(),
+                                                   backend.init_failure_detail()));
+    backend.shutdown();
+
+    // Reuse the same backend after the deliberately stale detail. Any result from
+    // the new attempt must describe that attempt, including resource failures.
+    backend.last_init_failure_detail = IoUringInitFailureDetail::SendStateStorage;
+    auto next_attempt = backend.init(0, -1, 1);
+    CHECK(backend.init_failure_detail() != IoUringInitFailureDetail::SendStateStorage);
+    if (next_attempt) CHECK_EQ(backend.init_failure_detail(), IoUringInitFailureDetail::None);
+    backend.shutdown();
+}
+
+struct ShardInitDetailTestBackend {
+    IoUringInitFailureDetail detail = IoUringInitFailureDetail::None;
+    IoUringInitFailureDetail init_failure_detail() const { return detail; }
+};
+
+struct ShardInitDetailTestLoop : EventLoop<MockBackend> {
+    inline static IoUringInitFailureDetail next_detail = IoUringInitFailureDetail::None;
+    inline static bool destructor_called = false;
+    ShardInitDetailTestBackend backend;
+    UpstreamPool* upstream = nullptr;
+
+    ~ShardInitDetailTestLoop() { destructor_called = true; }
+
+    core::Expected<void, Error> init(u32, i32, u32, u32) {
+        backend.detail = next_detail;
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
+    }
+};
+
+TEST(uring, shard_preserves_init_failure_detail_after_loop_teardown) {
+    ShardInitDetailTestLoop::destructor_called = false;
+    ShardInitDetailTestLoop::next_detail =
+        IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported;
+    Shard<ShardInitDetailTestLoop> shard;
+    auto feature_failure = shard.init(0, -1);
+    REQUIRE_FALSE(feature_failure);
+    CHECK(shard.loop == nullptr);
+    CHECK(ShardInitDetailTestLoop::destructor_called);
+    CHECK_EQ(shard.init_failure_detail(),
+             IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported);
+    CHECK(io_uring_init_error_is_unsupported(feature_failure.error(), shard.init_failure_detail()));
+
+    ShardInitDetailTestLoop::destructor_called = false;
+    ShardInitDetailTestLoop::next_detail = IoUringInitFailureDetail::QueueSetup;
+    auto ordinary_failure = shard.init(0, -1);
+    REQUIRE_FALSE(ordinary_failure);
+    CHECK(shard.loop == nullptr);
+    CHECK(ShardInitDetailTestLoop::destructor_called);
+    CHECK_EQ(shard.init_failure_detail(), IoUringInitFailureDetail::QueueSetup);
+    CHECK_FALSE(
+        io_uring_init_error_is_unsupported(ordinary_failure.error(), shard.init_failure_detail()));
+    shard.shutdown();
+}
+
+struct PersistentIoUringEnomemResult {
+    rut::Error failure = rut::Error::make(ENOMEM, rut::Error::Source::IoUring);
+    bool has_value() const { return false; }
+    const rut::Error& error() const { return failure; }
+};
+
+struct PersistentIoUringEnomemLoop {
+    rut::u32 attempts = 0;
+    PersistentIoUringEnomemResult init(int, int) {
+        attempts++;
+        return {};
+    }
+};
+
+static void legacy_io_uring_skip(rut::test::TestCase* tc) {
+    rut::test::TestCase* _tc = tc;
+    SKIP("io_uring unavailable");
+}
+
+TEST(uring, persistent_enomem_is_reported_and_cannot_be_skipped) {
+    rut::test::TestCase nested{};
+    rut::test::TestCase* const previous = rut::test::g_current_test_case;
+    rut::test::g_current_test_case = &nested;
+    PersistentIoUringEnomemLoop loop;
+    const bool initialized = init_iouring_loop_with_retry(loop, "deterministic ENOMEM fixture");
+    rut::test::g_current_test_case = previous;
+
+    CHECK_FALSE(initialized);
+    CHECK_EQ(loop.attempts, 40u);
+    CHECK_EQ(nested.checks_failed, 1);
+    CHECK(rut::test::str_contains(nested.fail_expr, "errno=12"));
+    CHECK(rut::test::str_contains(nested.fail_expr, "source=2"));
+    CHECK(rut::test::str_contains(nested.fail_expr, "deterministic ENOMEM fixture"));
+    legacy_io_uring_skip(&nested);
+    CHECK_FALSE(nested.skipped);
+}
 
 // Queue real recvs until the SQ has no free slot. Each add only flushes when it finds
 // the ring full, so this stops at the first full ring with every entry still pending.
@@ -5266,9 +5416,10 @@ TEST(uring, full_sq_accept_submission_flushes_and_retries) {
         auto init_result = backend.init(0, listener, 4);
         if (!init_result) {
             close(listener);
-            const i32 err = init_result.error().code;
-            if (err == ENOMEM || err == ENOSYS || err == EPERM) SKIP("io_uring unavailable");
-            CHECK_EQ(err, 0);
+            const Error error = init_result.error();
+            if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+                SKIP("io_uring unavailable");
+            report_unexpected_io_uring_init_failure(error, "full-SQ accept backend.init");
             return;
         }
     }
@@ -5351,9 +5502,10 @@ TEST(uring, full_sq_connect_flushes_and_completes) {
         auto init_result = backend.init(0, -1, 4);
         if (!init_result) {
             close(listener);
-            const i32 err = init_result.error().code;
-            if (err == ENOMEM || err == ENOSYS || err == EPERM) SKIP("io_uring unavailable");
-            CHECK_EQ(err, 0);
+            const Error error = init_result.error();
+            if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+                SKIP("io_uring unavailable");
+            report_unexpected_io_uring_init_failure(error, "full-SQ connect backend.init");
             return;
         }
     }
@@ -5388,9 +5540,10 @@ TEST(uring, full_sq_cancel_accept_flushes_and_cancels) {
         auto init_result = backend.init(0, listener, 4);
         if (!init_result) {
             close(listener);
-            const i32 err = init_result.error().code;
-            if (err == ENOMEM || err == ENOSYS || err == EPERM) SKIP("io_uring unavailable");
-            CHECK_EQ(err, 0);
+            const Error error = init_result.error();
+            if (io_uring_init_error_is_unsupported(error, backend.init_failure_detail()))
+                SKIP("io_uring unavailable");
+            report_unexpected_io_uring_init_failure(error, "full-SQ cancel-accept backend.init");
             return;
         }
     }
@@ -9009,14 +9162,26 @@ namespace {
 // io_uring serving test where it can't run while still exercising it on CI.
 bool iouring_socket_live() {
     Shard<IoUringEventLoop> shard;
-    i32 lfd = create_listen_socket(0).value_or(-1);
-    if (lfd < 0) return false;
-    if (!shard.init(0, lfd).has_value()) {
+    auto listener = create_listen_socket(0);
+    if (!listener) {
+        report_unexpected_io_uring_init_failure(listener.error(), "socket-liveness listener");
+        return false;
+    }
+    i32 lfd = listener.value();
+    auto init_result = shard.init(0, lfd);
+    if (!init_result) {
+        if (!io_uring_init_error_is_unsupported(init_result.error(),
+                                                io_uring_init_failure_detail(shard)))
+            report_unexpected_io_uring_init_failure(init_result.error(),
+                                                    "socket-liveness shard.init");
         close(lfd);
         return false;
     }
     u16 port = get_port(lfd);
-    if (!shard.spawn(-1).has_value()) {
+    auto spawn_result = shard.spawn(-1);
+    if (!spawn_result) {
+        report_unexpected_io_uring_init_failure(spawn_result.error(),
+                                                "socket-liveness shard.spawn");
         shard.shutdown();
         close(lfd);
         return false;
@@ -9049,8 +9214,12 @@ TEST(shard, serves_http1_cleartext_iouring_cross_thread) {
     REQUIRE(lfd >= 0);
     auto initialized = shard.init(0, lfd);
     if (!initialized) {
+        const Error error = initialized.error();
         close(lfd);
-        SKIP("io_uring cannot initialize in this environment");
+        if (io_uring_init_error_is_unsupported(error, io_uring_init_failure_detail(shard)))
+            SKIP("io_uring cannot initialize in this environment");
+        report_unexpected_io_uring_init_failure(error, "cross-thread shard.init");
+        return;
     }
     struct ShardGuard {
         Shard<IoUringEventLoop>& shard;
@@ -9086,16 +9255,23 @@ TEST(shard, iouring_lazy_slots_serve_and_watermark_tracks_peak) {
     i32 lfd = create_listen_socket(0).value_or(-1);
     REQUIRE(lfd >= 0);
     auto initialized = shard.init(0, lfd);
-    // A ring created right after another was closed can see a transient ENOMEM
-    // (the kernel releases the memlock charge asynchronously); retry briefly.
-    for (u32 attempt = 0; !initialized && initialized.error().code == ENOMEM && attempt < 40;
-         attempt++) {
+    // Keep the existing bounded ENOMEM retry; persistent failure is reported below.
+    Error init_error{};
+    for (u32 attempt = 0; !initialized && attempt < 40; attempt++) {
+        init_error = initialized.error();
+        if (init_error.code != ENOMEM ||
+            io_uring_init_error_is_unsupported(init_error, io_uring_init_failure_detail(shard)))
+            break;
         usleep(25000);
         initialized = shard.init(0, lfd);
     }
     if (!initialized) {
+        init_error = initialized.error();
         close(lfd);
-        SKIP("io_uring cannot initialize in this environment");
+        if (io_uring_init_error_is_unsupported(init_error, io_uring_init_failure_detail(shard)))
+            SKIP("io_uring cannot initialize in this environment");
+        report_unexpected_io_uring_init_failure(init_error, "lazy-slot shard.init");
+        return;
     }
     constexpr u32 kClients = 5;
     struct ShardGuard {
@@ -22540,30 +22716,53 @@ struct IoUringBodyProxy {
 
     ~IoUringBodyProxy() { teardown(); }
 
-    // false: io_uring unavailable here (the caller skips).
+    // Returns false only for explicitly unsupported io_uring; all other setup
+    // failures are recorded on the current testcase before the caller's SKIP.
     bool setup(u16 origin_port, bool use_tls = false) {
         if (use_tls) {
             auto ctx = create_tls_server_context(kTestCertPath, kTestKeyPath);
-            if (!ctx.has_value()) return false;
+            if (!ctx.has_value()) {
+                report_unexpected_test_setup_failure(
+                    "IoUringBodyProxy TLS server context creation failed");
+                return false;
+            }
             tls = ctx.value();
         }
-        lfd = create_listen_socket(0).value_or(-1);
-        if (lfd < 0) return false;
+        auto listener = create_listen_socket(0);
+        if (!listener) {
+            report_unexpected_io_uring_init_failure(listener.error(),
+                                                    "IoUringBodyProxy listener creation");
+            return false;
+        }
+        lfd = listener.value();
         auto init = shard.init(0, lfd);
         for (u32 attempt = 0; !init && init.error().code == ENOMEM && attempt < 80; attempt++) {
             usleep(25000);
             init = shard.init(0, lfd);
         }
-        if (!init) return false;
+        if (!init) {
+            if (!io_uring_init_error_is_unsupported(init.error(),
+                                                    io_uring_init_failure_detail(shard)))
+                report_unexpected_io_uring_init_failure(init.error(),
+                                                        "IoUringBodyProxy shard.init");
+            return false;
+        }
         inited = true;
         auto id = cfg.add_upstream("o", 0x7F000001, origin_port);
         if (!id.has_value() || !cfg.add_proxy("/post", 0, id.value()) ||
-            !cfg.add_proxy("/next", 0, id.value()))
+            !cfg.add_proxy("/next", 0, id.value())) {
+            report_unexpected_test_setup_failure("IoUringBodyProxy route configuration failed");
             return false;
+        }
         port = get_port(lfd);
         shard.loop->config_ptr = &active;
         if (tls != nullptr) shard.loop->tls_server = tls;
-        if (!shard.spawn(-1).has_value()) return false;
+        auto spawned = shard.spawn(-1);
+        if (!spawned) {
+            report_unexpected_io_uring_init_failure(spawned.error(),
+                                                    "IoUringBodyProxy shard.spawn");
+            return false;
+        }
         running = true;
         return true;
     }
@@ -23001,21 +23200,41 @@ struct MutationBodyProxy {
 
     ~MutationBodyProxy() { teardown(); }
 
-    // false: the loop is unavailable here (the caller skips).
+    // Returns false only for explicitly unsupported io_uring; all other setup
+    // failures are recorded on the current testcase before the caller's SKIP.
     bool setup(u16 origin_port) {
-        if (!source.compile(origin_port)) return false;
-        lfd = create_listen_socket(0).value_or(-1);
-        if (lfd < 0) return false;
+        if (!source.compile(origin_port)) {
+            report_unexpected_test_setup_failure("MutationBodyProxy source compilation failed");
+            return false;
+        }
+        auto listener = create_listen_socket(0);
+        if (!listener) {
+            report_unexpected_io_uring_init_failure(listener.error(),
+                                                    "MutationBodyProxy listener creation");
+            return false;
+        }
+        lfd = listener.value();
         auto init = shard.init(0, lfd);
         for (u32 attempt = 0; !init && init.error().code == ENOMEM && attempt < 80; attempt++) {
             usleep(25000);
             init = shard.init(0, lfd);
         }
-        if (!init) return false;
+        if (!init) {
+            if (!io_uring_init_error_is_unsupported(init.error(),
+                                                    io_uring_init_failure_detail(shard)))
+                report_unexpected_io_uring_init_failure(init.error(),
+                                                        "MutationBodyProxy shard.init");
+            return false;
+        }
         inited = true;
         port = get_port(lfd);
         shard.route_config = &source.cfg;
-        if (!shard.spawn(-1).has_value()) return false;
+        auto spawned = shard.spawn(-1);
+        if (!spawned) {
+            report_unexpected_io_uring_init_failure(spawned.error(),
+                                                    "MutationBodyProxy shard.spawn");
+            return false;
+        }
         running = true;
         return true;
     }

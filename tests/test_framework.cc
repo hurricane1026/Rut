@@ -254,6 +254,26 @@ TEST(framework, explicit_skip) {
     CHECK(false);
 }
 
+static void report_external_failure_then_skip(rut::test::TestCase* tc) {
+    rut::test::TestCase* _tc = tc;
+    rut::test::g_current_test_case = tc;
+    char message[] = "synthetic io_uring init failure (errno=12, source=2)";
+    rut::test::report_external_failure("fixture.cc", 71, message);
+    message[0] = 'X';  // the failure message must outlive this stack buffer.
+    SKIP("must not hide a failure");
+}
+
+TEST(framework, skip_does_not_mask_prior_failure) {
+    rut::test::TestCase nested{};
+    rut::test::TestCase* const previous = rut::test::g_current_test_case;
+    report_external_failure_then_skip(&nested);
+    rut::test::g_current_test_case = previous;
+    CHECK_FALSE(nested.skipped);
+    CHECK_EQ(nested.checks_failed, 1);
+    CHECK(rut::test::str_contains(nested.fail_expr, "errno=12"));
+    CHECK(rut::test::str_contains(nested.fail_expr, "source=2"));
+}
+
 TEST(framework, DISABLED_skip_by_name) {
     CHECK(false);
 }
