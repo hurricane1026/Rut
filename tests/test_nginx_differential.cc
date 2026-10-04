@@ -2203,7 +2203,7 @@ static bool proc_fd_snapshot_matches_complete_entries(const DockerProcSnapshot& 
     const size_t numeric_total = snapshot.fd_scan_entries - 2;  // Ignore `.` and `..`.
     const size_t expected_count = std::min(kDockerProcSnapshotFdLimit, numeric_total);
     return snapshot.fd_count == expected_count &&
-           snapshot.truncated == (numeric_total > kDockerProcSnapshotFdLimit);
+           snapshot.fd_output_truncated == (numeric_total > kDockerProcSnapshotFdLimit);
 }
 
 static bool run_docker_info_preflight_self_check(std::string& error) {
@@ -2493,7 +2493,8 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
                    unrelated_truncation.truncated);
     if (!unrelated_truncation.truncated || unrelated_truncation.fd_output_truncated ||
         !unrelated_truncation.fd_scan_complete ||
-        unrelated_truncation.fd_count != small_complete_proc.fd_count) {
+        unrelated_truncation.fd_count != small_complete_proc.fd_count ||
+        !proc_fd_snapshot_matches_complete_entries(unrelated_truncation)) {
         error = "aggregate text truncation was conflated with complete fd output";
         cleanup();
         return false;
