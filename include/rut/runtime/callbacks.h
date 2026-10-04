@@ -162,12 +162,12 @@ inline bool preserved_response_drain_owner(const Connection& conn) {
 
 template <typename Loop>
 inline bool preserved_response_late_recv_owner(const Connection& conn) {
-    const bool response_owner = conn.on_send == &on_proxy_response_sent<Loop> ||
-                                conn.on_send == &on_response_sent<Loop> ||
-                                conn.on_send == &on_response_header_sent<Loop> ||
-                                conn.on_send == &on_response_body_sent<Loop> ||
-                                conn.on_send == &on_complete_response_sent<Loop> ||
-                                conn.on_upstream_recv == &on_response_body_recvd<Loop>;
+    const bool response_owner =
+        conn.on_send == &on_proxy_response_sent<Loop> || conn.on_send == &on_response_sent<Loop> ||
+        conn.on_send == &on_response_header_sent<Loop> ||
+        conn.on_send == &on_response_body_sent<Loop> ||
+        conn.on_send == &on_complete_response_sent<Loop> ||
+        conn.on_upstream_recv == &on_response_body_recvd<Loop> || conn.relay_owner.active();
     return conn.state == ConnState::Sending && !conn.upstream_request_incomplete &&
            conn.proxy_resp_started && response_owner;
 }

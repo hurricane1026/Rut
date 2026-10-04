@@ -285,6 +285,83 @@ TEST(iouring_splice, positive_progress_refreshes_relay_timer_but_eagain_does_not
     }
 }
 
+TEST(iouring_splice, active_relay_preserves_response_on_late_recv_overflow) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    i32 upstream[2] = {-1, -1};
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], 128 * 1024);
+    REQUIRE(c != nullptr);
+    upstream[0] = downstream[0] = -1;
+    REQUIRE(loop.test_start_response_splice(*c));
+    REQUIRE(c->relay_owner.active());
+
+    c->state = ConnState::Sending;
+    c->proxy_resp_started = true;
+    c->clear_slots();
+    CHECK(preserved_response_late_recv_owner<IoUringEventLoop>(*c));
+    const IoEvent overflow{c->id, -ENOBUFS, 0, 0, IoEventType::Recv, 0};
+    loop.dispatch_event(*c, overflow);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->keep_alive);
+    CHECK_GE(c->fd, 0);
+    CHECK_GE(c->upstream_fd, 0);
+    CHECK(c->relay_owner.active());
+    CHECK_EQ(c->recv_buf.len(), 0u);
+
+    const u8 late_bytes[] = {'l', 'a', 't', 'e'};
+    REQUIRE_EQ(c->recv_buf.write(late_bytes, sizeof(late_bytes)), sizeof(late_bytes));
+    const IoEvent late_recv{
+        c->id, static_cast<i32>(sizeof(late_bytes)), 0, 0, IoEventType::Recv, 0};
+    loop.dispatch_event(*c, late_recv);
+    CHECK(c->req_body_lossy_successor);
+    CHECK_FALSE(c->keep_alive);
+    CHECK_GE(c->fd, 0);
+    CHECK_GE(c->upstream_fd, 0);
+    CHECK(c->relay_owner.active());
+    CHECK_EQ(c->recv_buf.len(), 0u);
+
+    close(upstream[1]);
+    close(downstream[1]);
+    if (c->fd >= 0 || c->upstream_fd >= 0) loop.close_conn(*c);
+}
+
+TEST(iouring_splice, shutdown_closes_relay_pipe_after_cancel_is_queued) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    i32 upstream[2] = {-1, -1};
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], 128 * 1024);
+    REQUIRE(c != nullptr);
+    upstream[0] = downstream[0] = -1;
+    REQUIRE(loop.test_start_response_splice(*c));
+    REQUIRE(c->relay_owner.read_armed);
+    const int pipe_read = c->relay_owner.pipe_read;
+    const int pipe_write = c->relay_owner.pipe_write;
+    REQUIRE_GE(pipe_read, 0);
+    REQUIRE_GE(pipe_write, 0);
+    loop.close_conn(*c);
+    CHECK(c->relay_owner.close_pending);
+    CHECK_EQ(fcntl(pipe_read, F_GETFD) >= 0, true);
+    CHECK_EQ(fcntl(pipe_write, F_GETFD) >= 0, true);
+
+    loop.shutdown();
+    guard.initialized = false;
+    CHECK_EQ(fcntl(pipe_read, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_EQ(fcntl(pipe_write, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_EQ(loop.relay_cancel_retry_count, 0u);
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
 TEST(iouring_splice, large_owner_set_shares_budget_before_batch_flush) {
     ScopedIoUringLoop guard;
     if (!guard.init()) SKIP("io_uring unavailable");

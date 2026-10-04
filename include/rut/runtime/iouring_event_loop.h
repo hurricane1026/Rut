@@ -715,6 +715,11 @@ public:
             idle_trim_pidfd = -1;
         }
         backend.shutdown();
+        // No further CQE can retire relay polls after the backend has stopped.
+        // Close every connection-owned pipe explicitly before destroying the
+        // mmap-backed slots; integer pipe descriptors are not owned by reset().
+        for (u32 i = 0; i < slots_initialized; ++i) close_response_splice_pipe(conns[i]);
+        relay_cancel_retry_count = 0;
         // No CQE can arrive after the backend is stopped.  Release any
         // deferred config epochs now so shutdown does not leave a shard pinned
         // forever when the kernel never returned a cancelled Send.
