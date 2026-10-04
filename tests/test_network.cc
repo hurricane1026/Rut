@@ -7,6 +7,7 @@
 #include "rut/runtime/http2_conn.h"
 #ifdef __linux__
 #include "rut/runtime/io_uring_backend.h"
+#include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/iouring_event_loop.h"
 #endif
 #include "rut/runtime/rate_limit.h"
@@ -38614,7 +38615,7 @@ struct ScopedIoUringLoopForRetirement {
     IoUringEventLoop* loop = nullptr;
     bool initialized = false;
 
-    bool init() {
+    bool init(u32 connection_capacity = kDefaultConnectionCapacity) {
         storage = mmap(nullptr,
                        sizeof(IoUringEventLoop),
                        PROT_READ | PROT_WRITE,
@@ -38627,7 +38628,8 @@ struct ScopedIoUringLoopForRetirement {
             return false;
         }
         loop = new (storage) IoUringEventLoop();
-        initialized = init_iouring_loop_with_retry(*loop, "retirement-test loop.init");
+        initialized =
+            init_iouring_loop_with_retry(*loop, "retirement-test loop.init", connection_capacity);
         return initialized;
     }
 
@@ -42154,8 +42156,10 @@ struct RawDownstreamRecvBatch {
     Connection* conns[2] = {nullptr, nullptr};
     u16 next_buf_id = 101;
 
-    bool init(u32 count = 1) {
-        if (count == 0 || count > 2 || !guard.init()) return false;
+    bool init(u32 count = 1, u32 connection_capacity = kDefaultConnectionCapacity) {
+        if (count == 0 || count > 2 || count > connection_capacity ||
+            !guard.init(connection_capacity))
+            return false;
         for (u32 i = 0; i < count; i++) {
             conns[i] = guard.loop->alloc_conn();
             if (conns[i] == nullptr) return false;
@@ -43161,8 +43165,14 @@ TEST(iouring_downstream_recv_barrier, recv_aux_and_cancel_metadata_mutations_fai
 
 TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_clears_state) {
     RawDownstreamRecvBatch fixture;
-    if (!fixture.init()) SKIP("io_uring unavailable");
+    constexpr u32 kCapacity = 2;
+    if (!fixture.init(1, kCapacity)) SKIP("io_uring unavailable");
     Connection& conn = *fixture.conns[0];
+    const IoUringRingSizes expected_rings = io_uring_ring_sizes(kCapacity);
+    CHECK_EQ(fixture.guard.loop->connection_capacity, kCapacity);
+    CHECK_EQ(fixture.guard.loop->backend.connection_capacity, kCapacity);
+    CHECK_EQ(fixture.guard.loop->backend.sq_ring_entries, expected_rings.sq_entries);
+    CHECK_EQ(fixture.guard.loop->backend.cq_ring_entries, expected_rings.cq_entries);
     REQUIRE_EQ(fixture.head(), fixture.tail());
     constexpr u32 kWrappedStart = UINT32_MAX - 1u;
     __atomic_store_n(fixture.guard.loop->backend.cq_head, kWrappedStart, __ATOMIC_RELEASE);
@@ -43197,21 +43207,18 @@ TEST(iouring_downstream_recv_barrier, absolute_cq_positions_wrap_and_shutdown_cl
     fixture.guard.loop->backend.downstream_recv_terminal_window_count = 1;
     fixture.guard.loop->backend.downstream_recv_progress_head = 37;
     fixture.guard.loop->backend.downstream_recv_progress_valid = true;
-    auto reinit_result = fixture.guard.loop->backend.init(0, -1);
-    // A ring opened right after one was closed can see a transient ENOMEM (the
-    // kernel releases the memlock charge asynchronously); retry briefly.
-    for (u32 attempt = 0; !reinit_result && reinit_result.error().code == ENOMEM && attempt < 40;
-         attempt++) {
-        usleep(25000);
-        reinit_result = fixture.guard.loop->backend.init(0, -1);
-    }
+    auto reinit_result = fixture.guard.loop->backend.init(0, -1, kCapacity);
     if (!reinit_result) {
+        const Error first_error = reinit_result.error();
         std::cerr << "FAIL test=iouring_downstream_recv_barrier.absolute_cq_positions_wrap_and_"
-                     "shutdown_clears_state phase=reinit error_source="
-                  << static_cast<unsigned>(reinit_result.error().source)
-                  << " error_code=" << reinit_result.error().code << "\n";
+                     "shutdown_clears_state phase=reinit attempt=first error_source="
+                  << static_cast<unsigned>(first_error.source) << " error_code=" << first_error.code
+                  << "\n";
     }
     REQUIRE(reinit_result.has_value());
+    CHECK_EQ(fixture.guard.loop->backend.connection_capacity, kCapacity);
+    CHECK_EQ(fixture.guard.loop->backend.sq_ring_entries, expected_rings.sq_entries);
+    CHECK_EQ(fixture.guard.loop->backend.cq_ring_entries, expected_rings.cq_entries);
     CHECK_FALSE(fixture.guard.loop->backend.deferred_downstream_recv.active);
     CHECK_EQ(fixture.guard.loop->backend.downstream_recv_terminal_window_count, 0u);
     CHECK_FALSE(fixture.guard.loop->backend.downstream_recv_progress_valid);
