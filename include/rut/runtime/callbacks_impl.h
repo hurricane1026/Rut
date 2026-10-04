@@ -3490,6 +3490,18 @@ void handle_jit_outcome(Loop* loop,
                                         outcome.status_code != 204 && outcome.status_code != 304 &&
                                         cfg->response_bodies[outcome.response_body_idx - 1].len >
                                             RouteConfig::kResponseBodyPoolBytes;
+            bool direct_file_body = false;
+            // io_uring can send a sealed memfd after the header completes. Keep
+            // the segmented formatter header-only for every large body; this
+            // flag only decides whether the later prefix copy is unnecessary.
+            if constexpr (requires(Loop* candidate, Connection& c) {
+                              candidate->submit_send_file(c, 0, 0u, 0u);
+                          }) {
+                if (segmented_body && !conn.tls_active) {
+                    const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
+                    direct_file_body = body.data != nullptr && body.file_fd() >= 0;
+                }
+            }
             const bool has_header_set =
                 outcome.response_headers_idx != 0 && cfg != nullptr &&
                 outcome.response_headers_idx <= cfg->response_header_set_count;
@@ -3566,8 +3578,10 @@ void handle_jit_outcome(Loop* loop,
             }
             if (segmented_body && response_formatted) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
-                const u32 n =
-                    body.len < conn.send_buf.write_avail() ? body.len : conn.send_buf.write_avail();
+                const u32 n = direct_file_body ? 0
+                                               : (body.len < conn.send_buf.write_avail()
+                                                      ? body.len
+                                                      : conn.send_buf.write_avail());
                 conn.local_response_size = conn.send_buf.len() + body.len;
                 conn.send_buf.write(reinterpret_cast<const u8*>(body.data), n);
                 conn.local_body_cursor = reinterpret_cast<const u8*>(body.data) + n;
