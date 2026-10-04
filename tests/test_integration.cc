@@ -14804,16 +14804,33 @@ struct SettlementTrace {
 };
 
 inline u32 settlement_event_generation_or_episode(const IoEvent& event) {
-    if (io_event_is_upstream(event.type)) return event.upstream_episode;
-    return event.type == IoEventType::Recv ? event.aux : event.non_upstream_generation;
+    if (io_event_uses_upstream_episode(event.type)) return event.upstream_episode;
+    switch (event.type) {
+        case IoEventType::Recv:
+            return event.aux;
+        case IoEventType::HandlerTimer:
+            return static_cast<u32>(event.result);
+        case IoEventType::Send:
+        case IoEventType::ResponseReadTimer:
+            return event.non_upstream_generation;
+        case IoEventType::Accept:
+        case IoEventType::Timeout:
+        case IoEventType::UpstreamConnect:
+        case IoEventType::UpstreamRecv:
+        case IoEventType::UpstreamSend:
+        case IoEventType::RelayRead:
+        case IoEventType::RelayWrite:
+        case IoEventType::Count:
+            return 0;
+    }
+    return 0;
 }
 
 inline u64 settlement_event_reconstructed_token(const IoEvent& event) {
-    if (io_event_is_upstream(event.type))
+    if (io_event_uses_upstream_episode(event.type))
         return encode_upstream_event_token(
             {event.conn_id, event.type, event.upstream_episode, event.aux});
-    const u32 generation =
-        event.type == IoEventType::Recv ? event.aux : event.non_upstream_generation;
+    const u32 generation = settlement_event_generation_or_episode(event);
     return encode_non_upstream_user_data({event.conn_id, event.type, generation});
 }
 
@@ -15085,35 +15102,45 @@ TEST(route, settlement_trace_formatter_uses_fixed_sink_and_ring_order) {
 }
 
 TEST(route, settlement_trace_tokens_preserve_aux_and_scan_initialized_prefix) {
-    IoEvent recv{};
-    recv.conn_id = 7;
-    recv.type = IoEventType::Recv;
-    CHECK_EQ(settlement_event_reconstructed_token(recv),
-             encode_non_upstream_user_data({7, IoEventType::Recv, 0}));
-    recv.aux = kDownstreamCloseCancelAux;
-    CHECK_EQ(settlement_event_generation_or_episode(recv),
-             static_cast<u32>(kDownstreamCloseCancelAux));
-    CHECK_EQ(settlement_event_reconstructed_token(recv),
-             encode_non_upstream_user_data(
-                 {7, IoEventType::Recv, static_cast<u32>(kDownstreamCloseCancelAux)}));
-
-    IoEvent send{};
-    send.conn_id = 8;
-    send.type = IoEventType::Send;
-    send.non_upstream_generation = 0x1234u;
-    CHECK_EQ(settlement_event_generation_or_episode(send), 0x1234u);
-    CHECK_EQ(settlement_event_reconstructed_token(send),
-             encode_non_upstream_user_data({8, IoEventType::Send, 0x1234u}));
-
-    IoEvent upstream{};
-    upstream.conn_id = 9;
-    upstream.type = IoEventType::UpstreamRecv;
-    upstream.upstream_episode = 0x5678u;
-    upstream.aux = kUpstreamRetirementCancelAux;
-    CHECK_EQ(settlement_event_generation_or_episode(upstream), 0x5678u);
-    CHECK_EQ(settlement_event_reconstructed_token(upstream),
-             encode_upstream_event_token(
-                 {9, IoEventType::UpstreamRecv, 0x5678u, kUpstreamRetirementCancelAux}));
+    struct EventCase {
+        IoEventType type;
+        u8 aux;
+        i32 result;
+        u32 generation;
+        u32 episode;
+        u32 expected_high;
+        bool uses_episode;
+    };
+    const EventCase cases[] = {
+        {IoEventType::Accept, 0, 0, 0, 0, 0, false},
+        {IoEventType::Recv, 0, 0, 0, 0, 0, false},
+        {IoEventType::Recv, kDownstreamCloseCancelAux, 0, 0, 0, kDownstreamCloseCancelAux, false},
+        {IoEventType::Send, 0, 0, 0x1234u, 0, 0x1234u, false},
+        {IoEventType::UpstreamConnect, kUpstreamRetirementCancelAux, 0, 0, 0x5678u, 0x5678u, true},
+        {IoEventType::UpstreamRecv, kUpstreamCloseCancelAux, 0, 0, 0x5679u, 0x5679u, true},
+        {IoEventType::UpstreamSend, kPauseCancelAux, 0, 0, 0x567Au, 0x567Au, true},
+        {IoEventType::RelayRead, 2, 0, 0, 0x567Bu, 0x567Bu, true},
+        {IoEventType::RelayWrite, 3, 0, 0, 0x567Cu, 0x567Cu, true},
+        {IoEventType::Timeout, 0, 0, 0, 0, 0, false},
+        {IoEventType::HandlerTimer, 0, 0x2345, 0, 0, 0x2345u, false},
+        {IoEventType::ResponseReadTimer, 0, 0, 0x3456u, 0, 0x3456u, false},
+    };
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const auto& test = cases[i];
+        IoEvent event{};
+        event.conn_id = 7u + i;
+        event.type = test.type;
+        event.aux = test.aux;
+        event.result = test.result;
+        event.non_upstream_generation = test.generation;
+        event.upstream_episode = test.episode;
+        CHECK_EQ(settlement_event_generation_or_episode(event), test.expected_high);
+        const u64 expected =
+            test.uses_episode
+                ? encode_upstream_event_token({event.conn_id, test.type, test.episode, test.aux})
+                : encode_non_upstream_user_data({event.conn_id, test.type, test.expected_high});
+        CHECK_EQ(settlement_event_reconstructed_token(event), expected);
+    }
 
     struct LazySlots {
         struct Item {
