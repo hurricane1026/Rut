@@ -272,6 +272,37 @@ struct ChainDirectRecvOwner {
     bool active = false;
 };
 
+enum class RelayPhase : u8 { Idle, Reading, Writing, Closing };
+
+// One serialized upstream->pipe->downstream response segment.  The owner is
+// deliberately independent from UpstreamRecv/SendState: a splice completion
+// must never commit bytes to an upstream buffer or advance the ordinary send
+// proactor.
+struct RelayOwner {
+    i32 pipe_read = -1;
+    i32 pipe_write = -1;
+    RelayPhase phase = RelayPhase::Idle;
+    u32 upstream_episode = 0;
+    i32 source_fd = -1;
+    i32 destination_fd = -1;
+    u32 segment_len = 0;
+    u32 segment_sent = 0;
+    u32 body_bytes = 0;
+    bool read_armed = false;
+    bool write_armed = false;
+    bool close_pending = false;
+    bool read_cancel_retry = false;
+    bool write_cancel_retry = false;
+    bool read_cancel_owned = false;
+    bool write_cancel_owned = false;
+    bool admit_after_prefix = false;
+    // Set only when the first relay poll could not be admitted.  The caller
+    // may then decline to the ordinary copy path; once a byte was pulled the
+    // same failure is terminal and never sets this marker.
+    bool initial_declined = false;
+    bool active() const { return phase != RelayPhase::Idle; }
+};
+
 struct ConnectionBase {
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
@@ -1708,6 +1739,7 @@ struct ConnectionBase {
     Buffer upstream_recv_buf;
     ResponseBodyChain response_body_tail{};
     ChainDirectRecvOwner chain_direct_recv_owner{};
+    RelayOwner relay_owner{};
 
     // io_uring only: true while a *direct* one-shot upstream recv (straight
     // into either upstream_recv_buf's bulk-sized destination, or — for a
@@ -1784,6 +1816,7 @@ struct ConnectionBase {
     void reset() {
         response_body_tail = {};
         chain_direct_recv_owner = {};
+        relay_owner = {};
         on_recv = nullptr;
         on_send = nullptr;
         on_upstream_recv = nullptr;

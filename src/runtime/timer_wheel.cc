@@ -8,7 +8,8 @@ namespace rut {
 
 // The idle-trim mark should share the cache line timer_node is about to dirty, so
 // the clear in add() costs no extra line on every arm. alignof(Connection) is 8 and
-// sizeof is 3616 (32 mod 64), so a slot's offsets may sit 32 bytes off a line
+// sizeof(Connection) is 3696 (48 mod 64), so a slot's offsets may sit 48 bytes
+// off a cache line; keep the layout assertion in test_iouring_idle_trim.cc.
 // boundary: only a 32-byte-aligned block is guaranteed to share a line in every
 // slot. Require the mark and all of timer_node inside one such block.
 static_assert(offsetof(Connection, idle_trim_examined) / 32 ==

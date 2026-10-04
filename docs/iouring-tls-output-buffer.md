@@ -14,8 +14,10 @@ one client send per upstream chunk. The current model is:
   (`consume_upstream_sent`) **after** that send completes.
 - The io_uring TLS send path (`submit_send_impl` → `tls_pump_send`) encrypts the
   plaintext **lazily**: it holds a pointer `tls_send_src = upstream_recv_buf.data()`
-  and `SSL_write`s a record at a time into `tls_out_slice`, flushing each, until
-  the whole chunk has drained — only then firing the upper-layer continuation.
+  and `SSL_write`s a record at a time into `tls_out_slice`, flushing each. For
+  a connection-closing direct response, the first drain is deferred while the
+  current logical send is still being encrypted; the upper-layer continuation
+  still fires only after the real drain CQE.
 
 This is a strictly **serialized single-send model**: the proxy assumes exactly
 one outstanding client send, tracked by one `upstream_send_len`, sent from
@@ -85,8 +87,8 @@ findings.
 This design also splits cleanly into two layers, which matters for future TLS
 hardware/kernel offload (see §7):
 
-- **Generic transport layer** — owned output buffer, one in-flight (chunked)
-  send, high/low watermark backpressure. Single-shot sends carry a continuation
+- **Generic transport layer** — owned output buffer, one in-flight raw send,
+  high/low watermark backpressure. Single-shot sends carry a continuation
   fired on the real drain CQE; proxy streaming carries **none** (it completes on
   fully-buffered + drained, per §3.0). Independent of how the bytes are produced.
 - **Output provider** — the "plaintext → sendable bytes" step. Today there is one
@@ -171,10 +173,10 @@ kTlsRecordMax  = SlicePool::kSliceSize + 256;  // worst-case ciphertext for one 
 kTlsOutBufCap  = 4 * SlicePool::kSliceSize;     // 64 KiB — bounded; throughput/memory knob
 kTlsOutHigh    = kTlsOutBufCap - kTlsRecordMax; // pause upstream recv above this …
 kTlsOutLow     = kTlsOutBufCap / 4;             // … resume below this
-kTlsDrainChunk = SlicePool::kSliceSize;         // raw send submits at most this much at once
+kTlsDrainChunk = SlicePool::kSliceSize;         // record-sized raw-send cap for streaming/keepalive
 ```
 
-**Why chunk the drain (codex P2):** the io_uring backend enforces *full-send*
+**Why most drains are chunked (codex P2):** the io_uring backend enforces *full-send*
 proactor semantics — a partial `IORING_OP_SEND` is re-submitted **inside** the
 backend, and a Send event is emitted only once the entire submitted length has
 drained. So if `ensure_draining` submitted the whole `tls_out_buf` (up to 64 KiB),
@@ -184,6 +186,13 @@ fully drained". Submitting at most `kTlsDrainChunk` per raw send makes the drain
 handler run at slice granularity, so the `≤ kTlsOutLow` resume check actually
 fires near the low watermark. (One TLS record ≈ one slice, so this adds no
 record-level overhead.)
+
+The direct connection-closing single-shot path is the bounded exception. After
+`tls_single_shot_send_owner_is_current` validates the live owner and `keep_alive`
+is false, `ensure_draining` submits the currently queued ciphertext prefix in
+one send. The captured in-flight length remains immutable; ciphertext appended
+behind it is submitted only by the next drain. Proxy streaming, ownerless
+control flights, and keepalive responses retain the record-sized cap.
 
 **Invariant (codex P2):** `kTlsOutBufCap − kTlsOutHigh ≥ kTlsRecordMax`, i.e. the
 guaranteed free space above the high watermark must cover one full upstream chunk
@@ -199,6 +208,8 @@ The one primitive both send shapes use. It must **loop on partial writes** and
 
 ```text
 fill_output(conn, src, len) -> (consumed, status):    # status ∈ {Done, NeedRoom, NeedRead, Fatal}
+  defer_first = (!tls_out_inflight && tls_out_buf.empty() && !conn.keep_alive &&
+                 tls_single_shot_send_owner_is_current(conn))
   off = 0
   while off < len:
      set_output(engine, tls_out_buf.write_ptr, tls_out_buf.write_avail)
@@ -207,8 +218,14 @@ fill_output(conn, src, len) -> (consumed, status):    # status ∈ {Done, NeedRo
      # returns (incl. on WantWrite), so commit whatever it produced EVERY pass —
      # else those bytes never drain and the low watermark never arrives.
      tls_out_buf.commit(tls_engine_output_len(engine))
-     if !ensure_draining(conn): return (off, Fatal)        # submit_send_raw failure → close
-     if w > 0: off += w; continue                          # PARTIAL_WRITE: positive < len is legal
+     if w > 0:
+        previous = off
+        off += w                                            # PARTIAL_WRITE is legal
+        if !defer_first or off == len:
+           if !ensure_draining(conn): return (previous, Fatal) # fail closed; no completion published
+           defer_first = false
+        continue
+     if !ensure_draining(conn): return (off, Fatal)         # all non-positive exits drain
      if st == WantWrite: return (off, NeedRoom)            # buffer full mid-chunk
      if st == WantRead:  return (off, NeedRead)            # post-handshake control needs a read
      return (off, Fatal)
@@ -216,7 +233,10 @@ fill_output(conn, src, len) -> (consumed, status):    # status ∈ {Done, NeedRo
 
 ensure_draining(conn):                                      # one in-flight send draining the buffer
   if !tls_out_inflight and tls_out_buf.len() > 0:
-     n = min(tls_out_buf.len(), kTlsDrainChunk)            # chunk the drain (codex P2) — slice-granular
+     if tls_single_shot_send_owner_is_current(conn) and not conn.keep_alive:
+         n = tls_out_buf.len()                            # closing direct response prefix
+     else:
+         n = min(tls_out_buf.len(), kTlsDrainChunk)        # record-granular cap
      if !submit_send_raw(conn, tls_out_buf.data(), n): return false   # codex P2: fail closed
      tls_out_inflight = true
      tls_out_inflight_len = n                              # SQE covers exactly n; full-send → CQE result == n
@@ -413,7 +433,7 @@ existing path's bookkeeping, plus precise drain mechanics):
 |---|---|
 | P1 — mark completion after parked final bytes | §3.4(a) sets `resp_fully_buffered` when the parked remainder is the last of the body, so completion isn't lost. |
 | P1 — reset proxy-stream flags per request | `proxy_stream_complete` clears `tls_proxy_stream`/`resp_fully_buffered` at the keep-alive boundary, not only `reset()` (§3.4(c), §3.5(7)). |
-| P2 — account for full-send io_uring completions | The backend re-submits partial sends internally, so the drain runs only at chunk boundaries; `ensure_draining` submits `≤ kTlsDrainChunk` so the low watermark is actually observed (§3.1, §3.2). |
+| P2 — account for full-send io_uring completions | The backend re-submits partial sends internally, so capped drains run at chunk boundaries; `ensure_draining` keeps the `≤ kTlsDrainChunk` cap for proxy, ownerless, and keepalive paths, while a closing single-shot owner submits its current prefix (§3.1, §3.2). |
 | P2 — check drain resubmission failures | The drain-path next-chunk `ensure_draining` now fails closed too (§3.4). |
 | P2 — saturate the socket buffer in the backpressure test | Shrink `SO_RCVBUF`/`SO_SNDBUF` below `kTlsOutBufCap` + a many-×-cap body to force the kernel send buffer to fill (§5). |
 | P2 — remove the per-chunk continuation invariant | §3 transport-layer description now distinguishes single-shot (continuation) from continuation-free proxy streaming. |
@@ -527,7 +547,7 @@ This design is intentionally a stepping stone toward offloading the data-path
 crypto to the kernel (kTLS) or the NIC (kTLS + hardware inline offload), which
 Rut lists as a follow-up. The key is the §3 split:
 
-- **Generic transport layer** (owned buffer + one in-flight chunked send +
+- **Generic transport layer** (owned buffer + one in-flight raw send +
   watermark backpressure; single-shot continuation on drain, continuation-free
   streaming) is **provider-agnostic** — keep as-is.
 - **Output provider** is the only thing offload swaps.
@@ -540,7 +560,7 @@ So userspace records and kTLS are two providers of one seam, not two code paths:
 | `Ktls` | BoringSSL in userspace, then keys installed into the socket | write **plaintext** to the fd; kernel (or NIC) frames + AES-GCM encrypts inline | plaintext |
 
 What carries over **unchanged** to kTLS: own-the-bytes (no aliasing
-`upstream_recv_buf` across a send), one in-flight chunked send draining `out_buf`,
+`upstream_recv_buf` across a send), one in-flight raw send draining `out_buf`,
 high/low watermark pause/resume, the single-shot-continuation-on-drain /
 continuation-free-streaming split. kTLS is in fact **simpler** — no ciphertext
 expansion, no `SSL_write` `WANT_WRITE`/`WANT_READ` handling, and the §3.5(1)

@@ -166,11 +166,19 @@ bool tls_discard_abandoned_input(Self* loop, Connection& c) {
     return true;
 }
 
-// Ensure exactly one raw send is draining tls_out_buf. Submits at most
-// kTlsDrainChunk per SQE so the drain handler runs at record granularity (the
-// backend has full-send semantics — see the design doc), and records the
-// SQE-captured length so read-ahead appends don't confuse the drain. Returns
-// false (caller fails closed) if the send can't be queued.
+// Ensure exactly one raw send is draining tls_out_buf. Proxy streaming retains
+// record-sized CQEs because its watermark accounting depends on each drain; a
+// connection-closing non-streaming single-shot owner can submit the currently
+// queued ciphertext in one full-send, reducing repeated raw drain rounds. The
+// SQE-captured length stays immutable, so ciphertext appended while it is in
+// flight remains a suffix for the next drain. Returns false (caller fails
+// closed) if the send cannot be queued.
+template <class Self>
+u32 tls_drain_submission_len(const Connection& c, u32 available) {
+    if (!c.keep_alive && tls_single_shot_send_owner_is_current<Self>(c)) return available;
+    return available < Self::kTlsDrainChunk ? available : Self::kTlsDrainChunk;
+}
+
 template <class Self>
 bool tls_ensure_draining(Self* loop, Connection& c) {
     if (c.tls_out_inflight) {
@@ -186,7 +194,7 @@ bool tls_ensure_draining(Self* loop, Connection& c) {
     }
     if (c.tls_out_buf.len() == 0) return true;
     const u32 kAvail = c.tls_out_buf.len();
-    const u32 kN = kAvail < Self::kTlsDrainChunk ? kAvail : Self::kTlsDrainChunk;
+    const u32 kN = tls_drain_submission_len<Self>(c, kAvail);
     return loop->submit_tls_ciphertext_send(c, c.tls_out_buf.data(), kN);
 }
 
@@ -198,21 +206,33 @@ bool tls_ensure_draining(Self* loop, Connection& c) {
 // `out_consumed` returns how much plaintext was encrypted.
 template <class Self>
 TlsFill tls_fill_output(Self* loop, Connection& c, const u8* src, u32 len, u32& out_consumed) {
+    // With an empty output buffer, no raw send in flight, and a validated
+    // closing owner, this first batch cannot share a prefix with unrelated
+    // ciphertext. Keep it together until SSL_write reaches Done or needs
+    // room/input; all other paths retain the existing per-pass drain ordering.
+    const bool kDeferInitialDrain = !c.tls_out_inflight && c.tls_out_buf.len() == 0 &&
+                                    !c.keep_alive && tls_single_shot_send_owner_is_current<Self>(c);
+    bool defer_initial_drain = kDeferInitialDrain;
     u32 off = 0;
     while (off < len) {
         tls_engine_set_output(c.tls_engine, c.tls_out_buf.write_ptr(), c.tls_out_buf.write_avail());
         TlsOp st = TlsOp::Ok;
         const i32 kW = tls_engine_write(c.tls_engine, src + off, len - off, st);
         c.tls_out_buf.commit(tls_engine_output_len(c.tls_engine));  // commit every pass
-        if (!tls_ensure_draining<Self>(loop, c)) {
-            out_consumed = off;
-            return TlsFill::Fatal;
-        }
         if (kW > 0) {
             off += static_cast<u32>(kW);
+            if (!defer_initial_drain || off == len) {
+                if (!tls_ensure_draining<Self>(loop, c)) {
+                    out_consumed = off - static_cast<u32>(kW);
+                    return TlsFill::Fatal;
+                }
+                defer_initial_drain = false;
+            }
             continue;
         }
         out_consumed = off;
+        if (!tls_ensure_draining<Self>(loop, c)) return TlsFill::Fatal;
+        defer_initial_drain = false;
         if (st == TlsOp::WantWrite) return TlsFill::NeedRoom;
         if (st == TlsOp::WantRead) return TlsFill::NeedRead;
         return TlsFill::Fatal;

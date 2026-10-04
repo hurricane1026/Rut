@@ -268,6 +268,7 @@ struct IoUringBackend {
     // gap under the timeout) but fills `len` more slowly than the timeout
     // would be expired as idle.
     bool add_recv_upstream_direct(i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len);
+    bool add_relay_poll(i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode);
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.

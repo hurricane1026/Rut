@@ -1007,9 +1007,13 @@ public:
                     }
                 }
                 break;
-            // io_uring-only transport primitive; deliberately inert here.
+            case IoEventType::RelayRead:
+            case IoEventType::RelayWrite:
             case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
+                // Relay splice is an io_uring-only optimization. kqueue
+                // remains on the ordinary copy path; the timer/count cases
+                // are inert here as well.
                 break;
         }
         if (!dispatching_event_batch_) drain_deferred_health_sweep();

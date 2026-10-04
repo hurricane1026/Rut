@@ -134,6 +134,9 @@ inline jit::YieldKind yield_kind_from_event(IoEventType type) {
             return jit::YieldKind::UpstreamRecv;
         case IoEventType::UpstreamSend:
             return jit::YieldKind::UpstreamSend;
+        case IoEventType::RelayRead:
+        case IoEventType::RelayWrite:
+            return jit::YieldKind::HttpGet;
         case IoEventType::Timeout:
         case IoEventType::HandlerTimer:
             return jit::YieldKind::Timer;
