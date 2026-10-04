@@ -1075,11 +1075,18 @@ inline void report_unexpected_test_setup_failure(const char* message) {
 }
 
 template <typename Loop>
-inline bool init_iouring_loop_with_retry(Loop& loop, const char* stage = "loop.init") {
+inline bool init_iouring_loop_with_retry(Loop& loop,
+                                         const char* stage = "loop.init",
+                                         u32 connection_capacity = kDefaultConnectionCapacity) {
     Error failure{};
     bool failed = false;
     for (u32 attempt = 0; attempt < 40; attempt++) {
-        auto result = loop.init(0, -1);
+        auto result = [&] {
+            if constexpr (requires { loop.init(0, -1, 0, connection_capacity); })
+                return loop.init(0, -1, 0, connection_capacity);
+            else
+                return loop.init(0, -1);
+        }();
         if (result.has_value()) return true;
         failure = result.error();
         failed = true;
