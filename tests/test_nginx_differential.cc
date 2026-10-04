@@ -2137,6 +2137,14 @@ static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot,
     return waited == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
 }
 
+static bool proc_fd_snapshot_matches_complete_entries(const DockerProcSnapshot& snapshot) {
+    if (!snapshot.fd_scan_complete || snapshot.fd_scan_entries < 2) return false;
+    const size_t numeric_total = snapshot.fd_scan_entries - 2;  // Ignore `.` and `..`.
+    const size_t expected_count = std::min(kDockerProcSnapshotFdLimit, numeric_total);
+    return snapshot.fd_count == expected_count &&
+           snapshot.truncated == (numeric_total > kDockerProcSnapshotFdLimit);
+}
+
 static bool run_docker_info_preflight_self_check(std::string& error) {
     char fixture_path[] = "/tmp/rut-docker-info-selfcheck-XXXXXX";
     if (mkdtemp(fixture_path) == nullptr) {
@@ -2357,10 +2365,9 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
     DockerProcSnapshot fd_limited_proc;
     int fd_limited_opened = 0;
     if (!snapshot_fd_limit_self_check(fd_limited_proc, 32, fd_limited_opened) ||
-        fd_limited_opened <= 0 || !fd_limited_proc.fd_scan_complete ||
+        fd_limited_opened <= 0 || !proc_fd_snapshot_matches_complete_entries(fd_limited_proc) ||
         fd_limited_proc.fd_scan_entries != static_cast<size_t>(fd_limited_opened + 6) ||
-        fd_limited_proc.fd_scan_entries > kDockerProcSnapshotDirEntryLimit ||
-        fd_limited_proc.fd_count != kDockerProcSnapshotFdLimit || !fd_limited_proc.truncated) {
+        fd_limited_proc.fd_scan_entries > kDockerProcSnapshotDirEntryLimit) {
         error = "bounded proc fd output/lowest-fd control failed";
         cleanup();
         return false;
@@ -2412,22 +2419,32 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
     }
     DockerProcSnapshot low_limit_proc;
     int low_limit_opened = 0;
-    if (!snapshot_fd_limit_self_check(low_limit_proc, 96, low_limit_opened, 48) ||
-        low_limit_opened <= 0 || low_limit_opened >= opened_fds_to_reach_entry_limit ||
-        !low_limit_proc.fd_scan_complete ||
+    if (!snapshot_fd_limit_self_check(low_limit_proc, 96, low_limit_opened, 8) ||
+        low_limit_opened <= 0 || !proc_fd_snapshot_matches_complete_entries(low_limit_proc) ||
         low_limit_proc.fd_scan_entries != static_cast<size_t>(low_limit_opened + 6) ||
-        low_limit_proc.fd_scan_entries >= kDockerProcSnapshotDirEntryLimit ||
-        low_limit_proc.fd_count != kDockerProcSnapshotFdLimit || !low_limit_proc.truncated) {
+        low_limit_proc.fd_scan_entries >= kDockerProcSnapshotDirEntryLimit) {
         error = "low-RLIMIT proc fd control did not complete with a bounded sorted result";
         cleanup();
         return false;
     }
+    if (low_limit_proc.fd_count != static_cast<size_t>(low_limit_opened + 4)) {
+        error = "low-RLIMIT proc fd control did not retain its complete descriptor set";
+        cleanup();
+        return false;
+    }
     for (size_t i = 1; i < low_limit_proc.fd_count; ++i) {
-        if (low_limit_proc.fd_numbers[i - 1] >= low_limit_proc.fd_numbers[i]) {
+        if (low_limit_proc.fd_numbers[i - 1] >= low_limit_proc.fd_numbers[i] ||
+            low_limit_proc.fd_numbers[i - 1] != static_cast<int>(i - 1)) {
             error = "low-RLIMIT proc fd result was not sorted";
             cleanup();
             return false;
         }
+    }
+    if (low_limit_proc.fd_count == 0 || low_limit_proc.fd_numbers[low_limit_proc.fd_count - 1] !=
+                                            static_cast<int>(low_limit_proc.fd_count - 1)) {
+        error = "low-RLIMIT proc fd result did not contain every low descriptor";
+        cleanup();
+        return false;
     }
     char bounded[kDockerProcSnapshotMaxBytes + 1]{};
     size_t bounded_size = kDockerProcSnapshotMaxBytes;
