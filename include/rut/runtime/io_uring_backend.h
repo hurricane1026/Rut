@@ -5,6 +5,7 @@
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
+#include "rut/runtime/io_uring_init_failure.h"
 #include "rut/runtime/mapped_array.h"
 #include <atomic>
 
@@ -52,6 +53,7 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 // shard = one ring = one submitting thread already holds by construction.
 //
 struct IoUringBackend {
+    IoUringInitFailureDetail last_init_failure_detail = IoUringInitFailureDetail::None;
     SlicePool* response_pool = nullptr;
     // io_uring is async: the kernel may still access user buffers between
     // SQE submission and CQE completion. EventLoop uses this trait to
@@ -216,6 +218,7 @@ struct IoUringBackend {
     core::Expected<void, Error> init(u32 shard_id,
                                      i32 listen_fd,
                                      u32 capacity = kDefaultConnectionCapacity);
+    IoUringInitFailureDetail init_failure_detail() const { return last_init_failure_detail; }
 
     // Submit a multishot accept on the listen socket. Returns false if it could
     // not be armed (no SQE, no ring, or listener closed); the caller retries.

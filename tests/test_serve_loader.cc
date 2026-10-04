@@ -91,7 +91,8 @@ struct ScopedPublicIoUringLoop {
         loop = new (storage) IoUringEventLoop();
         auto result = loop->init(0, -1);
         initialized = result.has_value();
-        if (!initialized && !io_uring_init_error_is_unsupported(result.error()))
+        if (!initialized && !io_uring_init_error_is_unsupported(
+                                result.error(), loop->backend.init_failure_detail()))
             report_unexpected_io_uring_init_failure(result.error(), "public io_uring loop.init");
         return initialized;
     }

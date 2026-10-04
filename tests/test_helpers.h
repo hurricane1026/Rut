@@ -13,6 +13,7 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/event_loop.h"
 #include "rut/runtime/io_event.h"
+#include "rut/runtime/io_uring_init_failure.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/shard_control.h"
 #include "rut/runtime/socket.h"
@@ -1026,10 +1027,29 @@ struct FailRecvAsyncSmallLoop : EventLoopCRTP<FailRecvAsyncSmallLoop> {
 // Keep the existing bounded retry for transient ENOMEM. Persistent ENOMEM and
 // every non-unsupported setup/mmap error fail the current test instead of being
 // hidden by its legacy SKIP call.
-inline bool io_uring_init_error_is_unsupported(Error error) {
-    return error.source == Error::Source::IoUring &&
-           (error.code == ENOSYS || error.code == EOPNOTSUPP || error.code == EPERM ||
-            error.code == EACCES);
+inline bool io_uring_init_error_is_unsupported(
+    Error error, IoUringInitFailureDetail detail = IoUringInitFailureDetail::None) {
+    if (error.source != Error::Source::IoUring) return false;
+    if (error.code == ENOSYS || error.code == EOPNOTSUPP || error.code == EPERM ||
+        error.code == EACCES)
+        return true;
+    return error.code == EINVAL &&
+           (detail == IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported ||
+            detail == IoUringInitFailureDetail::ProvidedBufferRingUnsupported);
+}
+
+template <typename LoopOrBackend>
+inline IoUringInitFailureDetail io_uring_init_failure_detail(const LoopOrBackend& value) {
+    if constexpr (requires { value.init_failure_detail(); }) {
+        return value.init_failure_detail();
+    } else if constexpr (requires { value.backend.init_failure_detail(); }) {
+        return value.backend.init_failure_detail();
+    } else if constexpr (requires { value.loop->backend.init_failure_detail(); }) {
+        return value.loop != nullptr ? value.loop->backend.init_failure_detail()
+                                     : IoUringInitFailureDetail::None;
+    } else {
+        return IoUringInitFailureDetail::None;
+    }
 }
 
 inline void report_unexpected_io_uring_init_failure(const Error& error, const char* stage) {
@@ -1059,19 +1079,21 @@ inline bool init_iouring_loop_with_retry(Loop& loop, const char* stage = "loop.i
         if (failure.code != ENOMEM) break;
         usleep(25000);
     }
-    if (failed && !io_uring_init_error_is_unsupported(failure))
+    if (failed && !io_uring_init_error_is_unsupported(failure, io_uring_init_failure_detail(loop)))
         report_unexpected_io_uring_init_failure(failure, stage);
     return false;
 }
 
-#define SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(init_result, stage)                               \
-    do {                                                                                       \
-        if (!(init_result)) {                                                                  \
-            const Error init_error_ = (init_result).error();                                   \
-            if (io_uring_init_error_is_unsupported(init_error_)) SKIP("io_uring unavailable"); \
-            report_unexpected_io_uring_init_failure(init_error_, (stage));                     \
-            return;                                                                            \
-        }                                                                                      \
+#define SKIP_IF_IO_URING_UNSUPPORTED_OR_FAIL(init_result, backend, stage)                  \
+    do {                                                                                   \
+        if (!(init_result)) {                                                              \
+            const Error init_error_ = (init_result).error();                               \
+            if (io_uring_init_error_is_unsupported(init_error_,                            \
+                                                   io_uring_init_failure_detail(backend))) \
+                SKIP("io_uring unavailable");                                              \
+            report_unexpected_io_uring_init_failure(init_error_, (stage));                 \
+            return;                                                                        \
+        }                                                                                  \
     } while (0)
 
 // io_uring loops leave conns[] untouched until alloc_conn() hands a slot out

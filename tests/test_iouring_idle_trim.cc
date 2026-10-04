@@ -179,6 +179,7 @@ struct TrimRig {
         // failure instead of calling it unavailable.
         bool inited = false;
         Error init_error{};
+        IoUringInitFailureDetail init_detail = IoUringInitFailureDetail::None;
         for (u32 attempt = 0; attempt < 40 && !inited; attempt++) {
             if (attempt != 0) {
                 usleep(250 * 1000);
@@ -189,12 +190,14 @@ struct TrimRig {
             inited = r.has_value();
             if (!inited) {
                 init_error = r.error();
-                if (io_uring_init_error_is_unsupported(init_error) || init_error.code != ENOMEM)
+                init_detail = loop->backend.init_failure_detail();
+                if (io_uring_init_error_is_unsupported(init_error, init_detail) ||
+                    init_error.code != ENOMEM)
                     break;
             }
         }
         if (!inited) {
-            if (!io_uring_init_error_is_unsupported(init_error)) {
+            if (!io_uring_init_error_is_unsupported(init_error, init_detail)) {
                 g_iouring_last_init_error = init_error;
                 g_iouring_permanently_unavailable = true;
                 report_unexpected_io_uring_init_failure(init_error, "idle-trim loop.init");

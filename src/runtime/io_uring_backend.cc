@@ -224,11 +224,17 @@ void IoUringBackend::destroy_send_state_storage() {
 }
 
 core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 capacity) {
+    last_init_failure_detail = IoUringInitFailureDetail::None;
     if ((connection_capacity != 0 && connection_capacity != capacity) || ring_fd >= 0 ||
-        timer_fd >= 0)
+        timer_fd >= 0) {
+        last_init_failure_detail = IoUringInitFailureDetail::InvalidLifecycle;
         return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
+    }
     auto storage = init_send_state_storage(capacity);
-    if (!storage) return core::make_unexpected(storage.error());
+    if (!storage) {
+        last_init_failure_detail = IoUringInitFailureDetail::SendStateStorage;
+        return core::make_unexpected(storage.error());
+    }
     listen_fd = lfd;
     // Explicitly init fds to -1: mmap-zeroed memory skips default member initializers,
     // so timer_fd/ring_fd could be 0. If init fails early and calls shutdown(), closing
@@ -265,6 +271,18 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     ring_fd = io_uring_setup(sizes.sq_entries, &params);
     if (ring_fd < 0) {
         i32 err = -ring_fd;
+        last_init_failure_detail = IoUringInitFailureDetail::QueueSetup;
+        if (err == EINVAL) {
+            struct io_uring_params baseline_params;
+            memset(&baseline_params, 0, sizeof(baseline_params));
+            baseline_params.cq_entries = sizes.cq_entries;
+            baseline_params.flags =
+                params.flags & ~(IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG);
+            const i32 baseline_fd = io_uring_setup(sizes.sq_entries, &baseline_params);
+            if (baseline_fd >= 0 && close(baseline_fd) == 0)
+                last_init_failure_detail =
+                    IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported;
+        }
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::IoUring));
     }
@@ -282,6 +300,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
                        IORING_OFF_SQ_RING);
     if (sq_ring_ptr == MAP_FAILED) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::SqRingMapping;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
@@ -303,6 +322,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
                     IORING_OFF_SQES);
     if (sqes_ptr == MAP_FAILED) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::SqeMapping;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
@@ -318,6 +338,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
                        IORING_OFF_CQ_RING);
     if (cq_ring_ptr == MAP_FAILED) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::CqRingMapping;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
@@ -332,6 +353,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     // the worst case of one window per CQ slot, plus an 8-byte-per-connection
     // side table.  Both are demand-paged so an idle shard pays nothing.
     if ((cq_ring_entries & (cq_ring_entries - 1u)) != 0 || cq_ring_entries == 0) {
+        last_init_failure_detail = IoUringInitFailureDetail::RingSizeInvariant;
         shutdown();
         return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
     }
@@ -340,6 +362,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
         mmap(nullptr, windows_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (windows_mem == MAP_FAILED) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::TerminalWindowMapping;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
@@ -350,6 +373,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
         mmap(nullptr, slots_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (slots_mem == MAP_FAILED) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::TerminalSlotMapping;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
@@ -364,6 +388,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (timer_fd < 0) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::TimerfdCreate;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Timerfd));
     }
@@ -373,6 +398,7 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
     ts.it_value.tv_sec = 1;
     if (timerfd_settime(timer_fd, 0, &ts, nullptr) < 0) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::TimerfdSettime;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Timerfd));
     }
@@ -396,6 +422,7 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
                                      0));
     if (buf_base == MAP_FAILED) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::ProvidedBufferMapping;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
@@ -410,6 +437,7 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
                           0);
     if (ring_mem == MAP_FAILED) {
         i32 err = errno;
+        last_init_failure_detail = IoUringInitFailureDetail::ProvidedBufferRingMapping;
         shutdown();
         return core::make_unexpected(Error::make(err, Error::Source::Mmap));
     }
@@ -424,6 +452,17 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
 
     i32 rc = io_uring_register(ring_fd, IORING_REGISTER_PBUF_RING, &reg, 1);
     if (rc < 0) {
+        last_init_failure_detail = IoUringInitFailureDetail::ProvidedBufferRingRegistration;
+        const long page_size = sysconf(_SC_PAGESIZE);
+        bool registration_is_valid =
+            page_size > 0 && reg.ring_addr != 0 &&
+            (reg.ring_addr % static_cast<u64>(page_size)) == 0 &&
+            reg.ring_entries == kProvidedBufCount && reg.ring_entries != 0 &&
+            (reg.ring_entries & (reg.ring_entries - 1u)) == 0 && reg.ring_entries < 65536u &&
+            reg.bgid == kBufGroupId && reg.flags == 0 && reg.min_left == 0;
+        for (u32 reserved : reg.resv) registration_is_valid &= reserved == 0;
+        if (rc == -EINVAL && registration_is_valid)
+            last_init_failure_detail = IoUringInitFailureDetail::ProvidedBufferRingUnsupported;
         shutdown();
         return core::make_unexpected(Error::make(-rc, Error::Source::IoUring));
     }
