@@ -5268,6 +5268,50 @@ TEST(uring, init_failure_detail_resets_between_attempts) {
     backend.shutdown();
 }
 
+struct ShardInitDetailTestBackend {
+    IoUringInitFailureDetail detail = IoUringInitFailureDetail::None;
+    IoUringInitFailureDetail init_failure_detail() const { return detail; }
+};
+
+struct ShardInitDetailTestLoop : EventLoop<MockBackend> {
+    inline static IoUringInitFailureDetail next_detail = IoUringInitFailureDetail::None;
+    inline static bool destructor_called = false;
+    ShardInitDetailTestBackend backend;
+    UpstreamPool* upstream = nullptr;
+
+    ~ShardInitDetailTestLoop() { destructor_called = true; }
+
+    core::Expected<void, Error> init(u32, i32, u32, u32) {
+        backend.detail = next_detail;
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::IoUring));
+    }
+};
+
+TEST(uring, shard_preserves_init_failure_detail_after_loop_teardown) {
+    ShardInitDetailTestLoop::destructor_called = false;
+    ShardInitDetailTestLoop::next_detail =
+        IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported;
+    Shard<ShardInitDetailTestLoop> shard;
+    auto feature_failure = shard.init(0, -1);
+    REQUIRE_FALSE(feature_failure);
+    CHECK(shard.loop == nullptr);
+    CHECK(ShardInitDetailTestLoop::destructor_called);
+    CHECK_EQ(shard.init_failure_detail(),
+             IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported);
+    CHECK(io_uring_init_error_is_unsupported(feature_failure.error(), shard.init_failure_detail()));
+
+    ShardInitDetailTestLoop::destructor_called = false;
+    ShardInitDetailTestLoop::next_detail = IoUringInitFailureDetail::QueueSetup;
+    auto ordinary_failure = shard.init(0, -1);
+    REQUIRE_FALSE(ordinary_failure);
+    CHECK(shard.loop == nullptr);
+    CHECK(ShardInitDetailTestLoop::destructor_called);
+    CHECK_EQ(shard.init_failure_detail(), IoUringInitFailureDetail::QueueSetup);
+    CHECK_FALSE(
+        io_uring_init_error_is_unsupported(ordinary_failure.error(), shard.init_failure_detail()));
+    shard.shutdown();
+}
+
 struct PersistentIoUringEnomemResult {
     rut::Error failure = rut::Error::make(ENOMEM, rut::Error::Source::IoUring);
     bool has_value() const { return false; }

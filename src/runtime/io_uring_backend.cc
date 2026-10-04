@@ -459,8 +459,7 @@ core::Expected<void, Error> IoUringBackend::setup_buf_ring() {
             (reg.ring_addr % static_cast<u64>(page_size)) == 0 &&
             reg.ring_entries == kProvidedBufCount && reg.ring_entries != 0 &&
             (reg.ring_entries & (reg.ring_entries - 1u)) == 0 && reg.ring_entries < 65536u &&
-            reg.bgid == kBufGroupId && reg.flags == 0 && reg.min_left == 0;
-        for (u32 reserved : reg.resv) registration_is_valid &= reserved == 0;
+            reg.bgid == kBufGroupId && reg.flags == 0;
         if (rc == -EINVAL && registration_is_valid)
             last_init_failure_detail = IoUringInitFailureDetail::ProvidedBufferRingUnsupported;
         shutdown();
