@@ -40,6 +40,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -2058,7 +2059,10 @@ static int docker_info_return_code(DockerInfoDecision decision, bool required) {
 
 static bool docker_info_missing_prerequisite(const DockerInfoResult& result);
 
-static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot, int requested_open_fds) {
+static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot,
+                                         int requested_open_fds,
+                                         int& opened_fds,
+                                         rlim_t child_nofile_limit = 0) {
     int ready_pipe[2] = {-1, -1};
     if (pipe2(ready_pipe, O_CLOEXEC) != 0) return false;
     for (int i = 0; i < 2; ++i) {
@@ -2080,6 +2084,12 @@ static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot, int reque
     }
     if (child == 0) {
         close(ready_pipe[0]);
+        if (child_nofile_limit != 0) {
+            struct rlimit limit{};
+            if (getrlimit(RLIMIT_NOFILE, &limit) != 0) _exit(2);
+            limit.rlim_cur = std::min(limit.rlim_cur, child_nofile_limit);
+            if (setrlimit(RLIMIT_NOFILE, &limit) != 0) _exit(2);
+        }
         const int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
         if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
             dup2(null_fd, STDERR_FILENO) < 0)
@@ -2089,7 +2099,10 @@ static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot, int reque
         int opened = 0;
         for (int i = 0; i < requested_open_fds; ++i) {
             const int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
-            if (fd < 0) break;
+            if (fd < 0) {
+                if (errno != EMFILE && errno != ENFILE) _exit(4);
+                break;
+            }
             ++opened;
         }
         const ssize_t wrote = write(ready_pipe[1], &opened, sizeof(opened));
@@ -2103,13 +2116,16 @@ static bool snapshot_fd_limit_self_check(DockerProcSnapshot& snapshot, int reque
         count = read(ready_pipe[0], &opened, sizeof(opened));
     } while (count < 0 && errno == EINTR);
     close(ready_pipe[0]);
-    if (count != static_cast<ssize_t>(sizeof(opened)) || opened != requested_open_fds) {
+    if (count != static_cast<ssize_t>(sizeof(opened))) {
         (void)kill(child, SIGKILL);
         int status = 0;
         while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
         }
         return false;
     }
+    // Reaching EMFILE is an expected part of this control when the inherited
+    // descriptor limit is lower than the requested directory-scan fixture.
+    opened_fds = opened;
 
     snapshot = snapshot_docker_child_proc(child, std::chrono::milliseconds(500));
     (void)kill(child, SIGKILL);
@@ -2339,7 +2355,10 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         return false;
     }
     DockerProcSnapshot fd_limited_proc;
-    if (!snapshot_fd_limit_self_check(fd_limited_proc, 32) || !fd_limited_proc.fd_scan_complete ||
+    int fd_limited_opened = 0;
+    if (!snapshot_fd_limit_self_check(fd_limited_proc, 32, fd_limited_opened) ||
+        fd_limited_opened <= 0 || !fd_limited_proc.fd_scan_complete ||
+        fd_limited_proc.fd_scan_entries != static_cast<size_t>(fd_limited_opened + 6) ||
         fd_limited_proc.fd_scan_entries > kDockerProcSnapshotDirEntryLimit ||
         fd_limited_proc.fd_count != kDockerProcSnapshotFdLimit || !fd_limited_proc.truncated) {
         error = "bounded proc fd output/lowest-fd control failed";
@@ -2361,18 +2380,51 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         }
     }
     DockerProcSnapshot entry_limited_proc;
-    if (!snapshot_fd_limit_self_check(entry_limited_proc, 96) ||
-        entry_limited_proc.fd_scan_complete ||
-        entry_limited_proc.fd_scan_entries != kDockerProcSnapshotDirEntryLimit ||
+    int entry_limited_opened = 0;
+    if (!snapshot_fd_limit_self_check(entry_limited_proc, 96, entry_limited_opened) ||
         entry_limited_proc.fd_count != kDockerProcSnapshotFdLimit ||
         !entry_limited_proc.truncated) {
-        error = "bounded proc directory scan did not report a partial result";
+        error = "bounded proc directory scan did not retain available descriptors";
+        cleanup();
+        return false;
+    }
+    // The child has three standard descriptors, the readiness pipe, and the
+    // proc directory contributes two dot entries to the bounded scan.
+    const int opened_fds_to_reach_entry_limit =
+        static_cast<int>(kDockerProcSnapshotDirEntryLimit) - 6;
+    const bool enough_fds_to_reach_entry_limit =
+        entry_limited_opened >= opened_fds_to_reach_entry_limit;
+    if (enough_fds_to_reach_entry_limit
+            ? (entry_limited_proc.fd_scan_complete ||
+               entry_limited_proc.fd_scan_entries != kDockerProcSnapshotDirEntryLimit)
+            : (!entry_limited_proc.fd_scan_complete ||
+               entry_limited_proc.fd_scan_entries >= kDockerProcSnapshotDirEntryLimit)) {
+        error = "proc fd scan completion did not match the available child descriptor limit";
         cleanup();
         return false;
     }
     for (size_t i = 1; i < entry_limited_proc.fd_count; ++i) {
         if (entry_limited_proc.fd_numbers[i - 1] >= entry_limited_proc.fd_numbers[i]) {
             error = "partial proc fd scan descriptors were not sorted";
+            cleanup();
+            return false;
+        }
+    }
+    DockerProcSnapshot low_limit_proc;
+    int low_limit_opened = 0;
+    if (!snapshot_fd_limit_self_check(low_limit_proc, 96, low_limit_opened, 48) ||
+        low_limit_opened <= 0 || low_limit_opened >= opened_fds_to_reach_entry_limit ||
+        !low_limit_proc.fd_scan_complete ||
+        low_limit_proc.fd_scan_entries != static_cast<size_t>(low_limit_opened + 6) ||
+        low_limit_proc.fd_scan_entries >= kDockerProcSnapshotDirEntryLimit ||
+        low_limit_proc.fd_count != kDockerProcSnapshotFdLimit || !low_limit_proc.truncated) {
+        error = "low-RLIMIT proc fd control did not complete with a bounded sorted result";
+        cleanup();
+        return false;
+    }
+    for (size_t i = 1; i < low_limit_proc.fd_count; ++i) {
+        if (low_limit_proc.fd_numbers[i - 1] >= low_limit_proc.fd_numbers[i]) {
+            error = "low-RLIMIT proc fd result was not sorted";
             cleanup();
             return false;
         }
