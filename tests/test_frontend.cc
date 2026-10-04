@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <pthread.h>
+#include <unistd.h>
 using namespace rut;
 
 TEST(hir, function_moves_preserve_non_response_statement_effect) {
@@ -641,14 +642,19 @@ TEST(frontend, access_log_exact_field_inventory_and_profiles_reject_mutations) {
 }
 
 TEST(frontend, imported_access_log_declaration_is_rejected_at_main_import) {
-    const std::string dir = "/tmp/rut_frontend_access_log_import";
+    const std::string dir = std::filesystem::temp_directory_path().string() +
+                            "/rut_frontend_access_log_import_" +
+                            std::to_string(static_cast<unsigned long long>(::getpid()));
     std::filesystem::remove_all(dir);
-    std::filesystem::create_directories(dir);
+    REQUIRE(std::filesystem::create_directories(dir));
     {
         std::ofstream out(dir + "/dep.rut", std::ios::binary);
         out << "accessLog { path: \"/var/log/import.log\", format: downstreamRequestBytes, "
                "publication: live }\n";
+        out.flush();
+        REQUIRE(out.good());
     }
+    REQUIRE(std::filesystem::file_size(dir + "/dep.rut") != 0);
     const std::string main_source = "import \"dep.rut\"\nroute GET \"/\" { return 200 }\n";
     auto lexed = lex({main_source.data(), static_cast<u32>(main_source.size())});
     REQUIRE(lexed);
@@ -1313,27 +1319,14 @@ TEST(frontend, lex_mapped_matches_lex_and_reuses_mapped_storage) {
     CHECK_EQ(bad.error().code, FrontendError::UnterminatedString);
 }
 
-// Nested-import analysis re-enters analyze_file_internal -- a ~1.3 MiB frame
-// in optimized builds -- once per import level, and load_imported_modules
-// stays live across each recursion. Token buffers (~160 KiB at the current
-// LexedTokens capacity) must not sit in that recursive frame. Run the whole
-// frontend on a thread whose stack equals Linux's default 8 MiB main-thread
-// limit so a regression faults here instead of only in the `rut` driver.
-// Unoptimized and sanitized builds have far larger frames, so they keep the
-// logic coverage on a larger stack.
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
-#define RUT_TEST_IMPORT_CHAIN_SANITIZED 1
-#endif
-#endif
-#if defined(__OPTIMIZE__) && !defined(RUT_TEST_IMPORT_CHAIN_SANITIZED) && \
-    !defined(__SANITIZE_ADDRESS__)
+// Nested-import analysis re-enters analyze_file_internal once per import
+// level, and load_imported_modules stays live across each recursion. Token
+// buffers (~160 KiB at the current LexedTokens capacity) must not sit in that
+// recursive frame. Keep this at Linux's default 8 MiB stack in every build,
+// including sanitizer builds, so instrumentation cannot hide a regression.
 static constexpr size_t kImportChainStackBytes = 8uz << 20;
-#else
-static constexpr size_t kImportChainStackBytes = 256uz << 20;
-#endif
-// main.rut + the deepest acyclic chain the analyzer admits
-// (kMaxImportNestingDepth imported files): the worst-case analyzer stack.
+// Import nesting counts imported files, not main.rut. Keep exactly the
+// maximum admitted imported-file chain beneath main.rut for worst-case depth.
 static constexpr u32 kImportChainDepth = kMaxImportNestingDepth;
 
 struct ImportChainRun {
@@ -1346,11 +1339,17 @@ struct ImportChainRun {
     Diagnostic error{};
     std::string error_detail;
     u32 imports_analyzed = 0;
+    u32 route_count = 0;
+    u32 first_route_guard_count = 0;
 };
 
 static void* run_import_chain(void* arg) {
     auto& run = *static_cast<ImportChainRun*>(arg);
-    static constexpr char kMain[] = "import \"m1.rut\"\nroute GET \"/\" { return 200 }\n";
+    // Keep a real route and guard in the bounded-stack regression so the
+    // final-slot route construction and guard scratch storage are exercised.
+    static constexpr char kMain[] =
+        "import \"m1.rut\"\n"
+        "route GET \"/\" { guard req.http11 else { return 400 } return 200 }\n";
     std::unique_ptr<AstFile> ast;
     {
         MappedArray<LexedTokens> tokens;
@@ -1375,6 +1374,10 @@ static void* run_import_chain(void* arg) {
         if (run.copy_detail)
             run.error_detail.assign(hir.error().detail.ptr, hir.error().detail.len);
         return nullptr;
+    }
+    run.route_count = hir.value()->routes.len;
+    if (run.route_count != 0) {
+        run.first_route_guard_count = hir.value()->routes[0].guards.len;
     }
     delete hir.value();
     run.analyzed = true;
@@ -1408,30 +1411,42 @@ static u64 write_import_chain(const std::string& dir, u32 depth, bool cycle) {
         body += "func f" + std::to_string(i) + "() -> i32 => " + std::to_string(i) + "\n";
         std::ofstream out(dir + "/m" + std::to_string(i) + ".rut", std::ios::binary);
         out << body;
+        out.flush();
+        if (!out.good()) return ~u64{0};
+        out.close();
+        std::error_code ec;
+        if (std::filesystem::file_size(dir + "/m" + std::to_string(i) + ".rut", ec) !=
+                body.size() ||
+            ec)
+            return ~u64{0};
         if (i < depth) bytes_before_last += body.size();
     }
     return bytes_before_last;
 }
 
 TEST(frontend, nested_import_chain_analyzes_on_default_linux_stack) {
-    const std::string dir =
-        std::filesystem::temp_directory_path().string() + "/rut_frontend_import_chain_stack";
-    write_import_chain(dir, kImportChainDepth, false);
+    const std::string dir = std::filesystem::temp_directory_path().string() +
+                            "/rut_frontend_import_chain_stack_" +
+                            std::to_string(static_cast<unsigned long long>(::getpid()));
+    REQUIRE(write_import_chain(dir, kImportChainDepth, false) != ~u64{0});
     ImportChainRun run;
     run.main_path = dir + "/main.rut";
     REQUIRE(run_import_chain_on_bounded_stack(run));
     CHECK(run.analyzed);
     CHECK_EQ(run.imports_analyzed, kImportChainDepth);
+    CHECK_EQ(run.route_count, 1u);
+    CHECK_EQ(run.first_route_guard_count, 1u);
     std::filesystem::remove_all(dir);
 }
 
 TEST(frontend, nested_import_cycle_is_diagnosed_on_default_linux_stack) {
     // Cover a self-cycle and every admitted depth up to the deepest acyclic
     // chain above: each must surface a cycle diagnostic, not the depth limit.
-    const std::string dir =
-        std::filesystem::temp_directory_path().string() + "/rut_frontend_import_cycle_stack";
+    const std::string dir = std::filesystem::temp_directory_path().string() +
+                            "/rut_frontend_import_cycle_stack_" +
+                            std::to_string(static_cast<unsigned long long>(::getpid()));
     for (u32 depth = 1; depth <= kImportChainDepth; ++depth) {
-        write_import_chain(dir, depth, true);
+        REQUIRE(write_import_chain(dir, depth, true) != ~u64{0});
         ImportChainRun run;
         run.main_path = dir + "/main.rut";
         // Copy after analyze_file has destroyed failed module/source storage, then
@@ -1451,11 +1466,80 @@ TEST(frontend, nested_import_cycle_is_diagnosed_on_default_linux_stack) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(frontend, route_slot_preserves_decorator_and_user_guard_storage) {
+    // User route decorators are not part of the accepted DSL surface yet.
+    // Keep the source fixture valid, then inject the AstDecorator directly to
+    // exercise the analyzer's real decorator-signature/inlining/guard-rotation
+    // path alongside a source-written route guard.
+    const char* src = R"rut(
+func authorize(_ req: i32) -> i32 => 0
+route GET "/" { guard req.http11 == true else { return 400 } return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+
+    AstItem* route_item = nullptr;
+    for (u32 i = 0; i < ast->items.len; i++) {
+        if (ast->items[i].kind == AstItemKind::Route) {
+            route_item = &ast->items[i];
+            break;
+        }
+    }
+    REQUIRE(route_item != nullptr);
+    AstDecorator decorator{};
+    decorator.name = lit("authorize");
+    decorator.span = route_item->route.span;
+    REQUIRE(route_item->route.decorators.push(decorator));
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes.len, 1u);
+    const HirRoute& route = hir->routes[0];
+    REQUIRE_EQ(route.decorator_guard_count, 1u);
+    REQUIRE_EQ(route.guards.len, 2u);
+    REQUIRE_EQ(route.decorators.len, 1u);
+
+    const auto expr_is_in_route_pool = [&route](const HirExpr* expr) {
+        for (u32 i = 0; i < route.exprs.len; i++) {
+            if (&route.exprs[i] == expr) return true;
+        }
+        return false;
+    };
+    const HirGuard& decorator_guard = route.guards[0];
+    const HirGuard& user_guard = route.guards[1];
+    CHECK(route.decorators[0].name.eq(lit("authorize")));
+    CHECK(route.decorators[0].function_index < hir->functions.len);
+    CHECK_EQ(static_cast<u8>(decorator_guard.cond.kind), static_cast<u8>(HirExprKind::Eq));
+    REQUIRE(decorator_guard.cond.lhs != nullptr);
+    REQUIRE(decorator_guard.cond.rhs != nullptr);
+    CHECK(expr_is_in_route_pool(decorator_guard.cond.lhs));
+    CHECK(expr_is_in_route_pool(decorator_guard.cond.rhs));
+    CHECK_EQ(decorator_guard.fail_kind, HirGuard::FailKind::Term);
+    CHECK_EQ(static_cast<u8>(decorator_guard.cond.lhs->kind),
+             static_cast<u8>(HirExprKind::LocalRef));
+    CHECK_EQ(decorator_guard.fail_term.source_kind, HirTerminatorSourceKind::LocalRef);
+    CHECK_EQ(decorator_guard.cond.lhs->local_index, decorator_guard.fail_term.local_ref_index);
+    CHECK_EQ(static_cast<u8>(decorator_guard.cond.rhs->kind), static_cast<u8>(HirExprKind::IntLit));
+    CHECK_EQ(decorator_guard.cond.rhs->int_value, 0);
+
+    CHECK(user_guard.span.start > decorator_guard.span.start);
+    CHECK_EQ(user_guard.fail_term.status_code, 400u);
+    REQUIRE(user_guard.cond.lhs != nullptr);
+    REQUIRE(user_guard.cond.rhs != nullptr);
+    CHECK_EQ(static_cast<u8>(user_guard.cond.kind), static_cast<u8>(HirExprKind::Eq));
+    CHECK(expr_is_in_route_pool(user_guard.cond.lhs));
+    CHECK(expr_is_in_route_pool(user_guard.cond.rhs));
+}
+
 TEST(frontend, nested_import_source_budget_is_diagnosed_on_default_linux_stack) {
     // The budget admits every file but the deepest, so reading it fails.
-    const std::string dir =
-        std::filesystem::temp_directory_path().string() + "/rut_frontend_import_budget_stack";
+    const std::string dir = std::filesystem::temp_directory_path().string() +
+                            "/rut_frontend_import_budget_stack_" +
+                            std::to_string(static_cast<unsigned long long>(::getpid()));
     const u64 admitted = write_import_chain(dir, kImportChainDepth, false);
+    REQUIRE(admitted != ~u64{0});
     ImportChainRun run;
     run.main_path = dir + "/main.rut";
     run.budget.max_bytes = admitted;
@@ -1476,9 +1560,11 @@ TEST(frontend, nested_import_depth_limit_is_diagnosed_not_crashed) {
     // detail and the span of the `import` in m<limit> (line 2, col 1), which
     // stays valid after the failed modules are released.
     static_assert(kMaxImportNestingDepth >= 1);
-    const std::string dir =
-        std::filesystem::temp_directory_path().string() + "/rut_frontend_import_depth_limit";
+    const std::string dir = std::filesystem::temp_directory_path().string() +
+                            "/rut_frontend_import_depth_limit_" +
+                            std::to_string(static_cast<unsigned long long>(::getpid()));
     const u64 read_bytes = write_import_chain(dir, kMaxImportNestingDepth + 1, false);
+    REQUIRE(read_bytes != ~u64{0});
     ImportChainRun run;
     run.main_path = dir + "/main.rut";
     run.copy_detail = true;

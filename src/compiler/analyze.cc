@@ -4,6 +4,7 @@
 #include "rut/common/shard_limits.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
+#include "rut/runtime/mapped_array.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
@@ -18389,7 +18390,13 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // returns 200 (the timer path ignores the status). Non-empty bodies
         // must end in an explicit terminal statement, like a route body.
         if (is_timer_item && item.timer.statements.len == 0) {
-            HirRoute route{};
+            if (mod.routes.full())
+                return frontend_error(FrontendError::TooManyItems, item.timer.span);
+            // Analyze directly in the module's stable route slot: HirRoute has
+            // internal expression pointers that must remain self-relative.
+            HirRoute& route = mod.routes.data[mod.routes.len];
+            route.~HirRoute();
+            ::new (static_cast<void*>(&route)) HirRoute{};
             route.span = item.timer.span;
             route.path = item.timer.name;
             route.method = route_method_key_from_token(static_cast<u8>(TokenType::KwGet));
@@ -18400,13 +18407,15 @@ static FrontendResult<HirModule*> analyze_file_internal(
             route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
             route.control.direct_term.source_kind = HirTerminatorSourceKind::Literal;
             route.control.direct_term.status_code = 200;
-            if (!mod.routes.push(route))
-                return frontend_error(FrontendError::TooManyItems, item.timer.span);
+            mod.routes.len++;
             continue;
         }
         const AstRouteDecl& route_decl = is_timer_item ? *timer_route_view : item.route;
 
-        HirRoute route{};
+        if (mod.routes.full()) return frontend_error(FrontendError::TooManyItems, route_decl.span);
+        HirRoute& route = mod.routes.data[mod.routes.len];
+        route.~HirRoute();
+        ::new (static_cast<void*>(&route)) HirRoute{};
         route.span = route_decl.span;
         route.path = route_decl.path;
         route.method = route_decl.method_is_any ? kRouteMethodAny
@@ -20049,10 +20058,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
         const u32 num_deco_guards = route.guards.len - first_decorator_guard_index;
         route.decorator_guard_count = num_deco_guards;
         if (num_deco_guards > 0 && num_user_guards > 0) {
-            HirGuard tmp[HirRoute::kMaxGuards];
-            for (u32 i = 0; i < route.guards.len; i++) tmp[i] = route.guards[i];
-            for (u32 i = 0; i < num_deco_guards; i++) route.guards[i] = tmp[num_user_guards + i];
-            for (u32 i = 0; i < num_user_guards; i++) route.guards[num_deco_guards + i] = tmp[i];
+            MappedArray<HirGuard> guard_storage;
+            if (!guard_storage.init(HirRoute::kMaxGuards))
+                return frontend_error(FrontendError::OutOfMemory, route_decl.span);
+            for (u32 i = 0; i < route.guards.len; i++) guard_storage[i] = route.guards[i];
+            for (u32 i = 0; i < num_deco_guards; i++)
+                route.guards[i] = guard_storage[num_user_guards + i];
+            for (u32 i = 0; i < num_user_guards; i++)
+                route.guards[num_deco_guards + i] = guard_storage[i];
         }
         if (route.waits.len != 0 && route.decorator_guard_count != 0) {
             const u32 first_wait_start = route.waits[0].span.start;
@@ -20133,8 +20146,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
         }
         if (!route.is_timer) http_route_count++;
-        if (!mod.routes.push(route))
-            return frontend_error(FrontendError::TooManyItems, route_decl.span);
+        mod.routes.len++;
     }
 
     if (source_path.len != 0 && !import_stack.empty()) import_stack.pop_back();
