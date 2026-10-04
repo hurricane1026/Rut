@@ -72,6 +72,9 @@ void observe_iouring_tls_low_water_resume_for_test() {
 
 }  // namespace rut
 
+rut::u32 settlement_event_token_conn_id(const rut::IoEvent& event);
+rut::u64 settlement_event_reconstructed_token(const rut::IoEvent& event);
+
 // Helper: Connection with local buffer storage (for tests that use raw backends).
 static constexpr u32 kTestBufSize = 4096;
 
@@ -4834,6 +4837,10 @@ TEST(uring, wait_emits_timeout_tick) {
     CHECK_GE(events[0].result, 1);
     CHECK_EQ(events[0].has_buf, 0u);
     CHECK_EQ(events[0].buf_id, 0u);
+    CHECK_EQ(events[0].conn_id, 0u);
+    CHECK_EQ(settlement_event_token_conn_id(events[0]), kIoUserDataMaxConnId - 1u);
+    CHECK_EQ(settlement_event_reconstructed_token(events[0]),
+             encode_non_upstream_user_data({kIoUserDataMaxConnId - 1u, IoEventType::Timeout, 0}));
 
     backend.shutdown();
     close(lfd);
@@ -14826,12 +14833,17 @@ inline u32 settlement_event_generation_or_episode(const IoEvent& event) {
     return 0;
 }
 
+inline u32 settlement_event_token_conn_id(const IoEvent& event) {
+    return event.type == IoEventType::Timeout ? kIoUserDataMaxConnId - 1u : event.conn_id;
+}
+
 inline u64 settlement_event_reconstructed_token(const IoEvent& event) {
     if (io_event_uses_upstream_episode(event.type))
         return encode_upstream_event_token(
-            {event.conn_id, event.type, event.upstream_episode, event.aux});
+            {settlement_event_token_conn_id(event), event.type, event.upstream_episode, event.aux});
     const u32 generation = settlement_event_generation_or_episode(event);
-    return encode_non_upstream_user_data({event.conn_id, event.type, generation});
+    return encode_non_upstream_user_data(
+        {settlement_event_token_conn_id(event), event.type, generation});
 }
 
 template <typename LoopT, typename Fn>
@@ -15128,17 +15140,20 @@ TEST(route, settlement_trace_tokens_preserve_aux_and_scan_initialized_prefix) {
     for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         const auto& test = cases[i];
         IoEvent event{};
-        event.conn_id = 7u + i;
+        event.conn_id =
+            test.type == IoEventType::Accept || test.type == IoEventType::Timeout ? 0u : 7u + i;
         event.type = test.type;
         event.aux = test.aux;
         event.result = test.result;
         event.non_upstream_generation = test.generation;
         event.upstream_episode = test.episode;
         CHECK_EQ(settlement_event_generation_or_episode(event), test.expected_high);
+        const u32 expected_conn_id =
+            test.type == IoEventType::Timeout ? kIoUserDataMaxConnId - 1u : event.conn_id;
         const u64 expected =
             test.uses_episode
-                ? encode_upstream_event_token({event.conn_id, test.type, test.episode, test.aux})
-                : encode_non_upstream_user_data({event.conn_id, test.type, test.expected_high});
+                ? encode_upstream_event_token({expected_conn_id, test.type, test.episode, test.aux})
+                : encode_non_upstream_user_data({expected_conn_id, test.type, test.expected_high});
         CHECK_EQ(settlement_event_reconstructed_token(event), expected);
     }
 
