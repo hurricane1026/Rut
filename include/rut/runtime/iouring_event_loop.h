@@ -3834,6 +3834,16 @@ public:
         return true;
     }
 
+    void refresh_relay_progress_timer(Connection& c) {
+        if (!c.throttle_paused &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::Armed &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::ExpiryPending &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
+            c.response_read_deadline_state != ResponseReadDeadlineState::RefreshPending)
+            timer.refresh(&c,
+                          c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
+    }
+
     bool start_response_splice(Connection& c) {
         if (!response_splice_eligible(c)) return false;
         if (c.relay_owner.pipe_read < 0 || c.relay_owner.pipe_write < 0) {
@@ -3944,6 +3954,7 @@ public:
             r.segment_sent = 0;
             r.body_bytes += r.segment_len;
             c.resp_body_remaining -= r.segment_len;
+            refresh_relay_progress_timer(c);
             r.write_armed = true;
             const IoEvent ready{
                 c.id, POLLOUT, 0, 0, IoEventType::RelayWrite, 0, 0, c.upstream_episode};
@@ -3971,6 +3982,7 @@ public:
         relay_budget_bytes -= static_cast<u32>(n);
         relay_written_bytes += static_cast<u32>(n);
         c.resp_body_sent += static_cast<u32>(n);
+        refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
             // A partial synchronous splice is still runnable.  Spend the
             // remaining turn budget before yielding to POLLOUT; otherwise a

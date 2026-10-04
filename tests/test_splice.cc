@@ -206,6 +206,85 @@ TEST(iouring_splice, shared_budget_yields_and_finishes_exact_body) {
     CHECK_EQ(loop.relay_written_bytes, kTotalBody);
 }
 
+TEST(iouring_splice, positive_progress_refreshes_relay_timer_but_eagain_does_not) {
+    {
+        ScopedIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto& loop = *guard.loop;
+        constexpr u32 kBody = 128 * 1024;
+        static u8 body[kBody];
+        fill_pattern(body, kBody);
+        i32 upstream[2] = {-1, -1};
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+        Connection* c = make_eligible(loop, upstream[0], downstream[0], kBody);
+        REQUIRE(c != nullptr);
+        upstream[0] = downstream[0] = -1;
+        loop.upstream_timeout = 3;
+        loop.timer.add(c, 1);
+
+        auto timer_slot_contains = [&](u32 slot) {
+            ListNode* head = &loop.timer.slots[slot & (TimerWheel::kSlots - 1)];
+            for (ListNode* node = head->next; node != head; node = node->next)
+                if (node == &c->timer_node) return true;
+            return false;
+        };
+        REQUIRE(loop.test_start_response_splice(*c));
+        CHECK(c->relay_owner.read_armed);
+        CHECK(timer_slot_contains(1));
+        REQUIRE(send_all(upstream[1], body, 64 * 1024));
+        REQUIRE(pump_once(loop));
+
+        CHECK(timer_slot_contains(3));
+        CHECK_FALSE(timer_slot_contains(1));
+        u32 expired = 0;
+        loop.timer.tick([&](Connection* expired_conn) {
+            CHECK_EQ(expired_conn, c);
+            ++expired;
+        });
+        loop.timer.tick([&](Connection* expired_conn) {
+            CHECK_EQ(expired_conn, c);
+            ++expired;
+        });
+        CHECK_EQ(expired, 0u);
+        close(upstream[1]);
+        close(downstream[1]);
+        if (c->fd >= 0 || c->upstream_fd >= 0) loop.close_conn(*c);
+    }
+
+    {
+        ScopedIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto& loop = *guard.loop;
+        i32 upstream[2] = {-1, -1};
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+        Connection* c = make_eligible(loop, upstream[0], downstream[0], 128 * 1024);
+        REQUIRE(c != nullptr);
+        upstream[0] = downstream[0] = -1;
+        loop.upstream_timeout = 3;
+        loop.timer.add(c, 1);
+        REQUIRE(loop.test_start_response_splice(*c));
+        CHECK(c->relay_owner.read_armed);
+
+        u32 expired = 0;
+        loop.timer.tick([&](Connection* expired_conn) {
+            CHECK_EQ(expired_conn, c);
+            ++expired;
+        });
+        loop.timer.tick([&](Connection* expired_conn) {
+            CHECK_EQ(expired_conn, c);
+            ++expired;
+        });
+        CHECK_EQ(expired, 1u);
+        close(upstream[1]);
+        close(downstream[1]);
+        if (c->fd >= 0 || c->upstream_fd >= 0) loop.close_conn(*c);
+    }
+}
+
 TEST(iouring_splice, large_owner_set_shares_budget_before_batch_flush) {
     ScopedIoUringLoop guard;
     if (!guard.init()) SKIP("io_uring unavailable");
