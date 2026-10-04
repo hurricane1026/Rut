@@ -2220,7 +2220,116 @@ static bool proc_fd_snapshot_matches_complete_entries(const DockerProcSnapshot& 
            snapshot.fd_output_truncated == (numeric_total > kDockerProcSnapshotFdLimit);
 }
 
-static bool run_docker_info_preflight_self_check(std::string& error) {
+// Exec the current test binary with a deliberately long argv[0]. The parent
+// holds extra descriptors across fork; the child applies the existing
+// descriptor normalization helper before exec so the proc snapshot can
+// distinguish cmdline truncation from FD-output truncation.
+static bool snapshot_long_cmdline_self_check(DockerProcSnapshot& snapshot,
+                                             size_t& inherited_fd_count) {
+    inherited_fd_count = 0;
+    int ready_pipe[2] = {-1, -1};
+    if (pipe2(ready_pipe, O_CLOEXEC) != 0) return false;
+
+    int inherited_fds[80];
+    for (int& fd : inherited_fds) fd = -1;
+    for (int& fd : inherited_fds) {
+        fd = open("/dev/null", O_RDONLY);
+        if (fd < 0) {
+            if (errno == EMFILE || errno == ENFILE) break;
+            for (int opened : inherited_fds)
+                if (opened >= 0) close(opened);
+            close(ready_pipe[0]);
+            close(ready_pipe[1]);
+            return false;
+        }
+        ++inherited_fd_count;
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        for (int fd : inherited_fds)
+            if (fd >= 0) close(fd);
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return false;
+    }
+    if (child == 0) {
+        close(ready_pipe[0]);
+        if (ready_pipe[1] != 3) {
+            if (dup2(ready_pipe[1], 3) < 0) _exit(2);
+            close(ready_pipe[1]);
+        } else {
+            const int flags = fcntl(3, F_GETFD);
+            if (flags < 0 || fcntl(3, F_SETFD, flags & ~FD_CLOEXEC) != 0) _exit(2);
+        }
+        if (!close_self_check_inherited_fds()) _exit(2);
+        char argv0[3073];
+        memset(argv0, 'a', sizeof(argv0) - 1u);
+        argv0[sizeof(argv0) - 1u] = '\0';
+        char* const argv[] = {
+            argv0, const_cast<char*>("--docker-info-cmdline-fixture-child"), nullptr};
+        execv("/proc/self/exe", argv);
+        _exit(127);
+    }
+
+    close(ready_pipe[1]);
+    for (int fd : inherited_fds)
+        if (fd >= 0) close(fd);
+
+    bool ready = false;
+    bool pipe_closed = false;
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    pollfd poll_fd{ready_pipe[0], POLLIN | POLLHUP, 0};
+    while (std::chrono::steady_clock::now() < ready_deadline) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   ready_deadline - std::chrono::steady_clock::now())
+                                   .count();
+        const int rc = poll(&poll_fd, 1, remaining > 1 ? static_cast<int>(remaining) : 1);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0) break;
+        char byte = 0;
+        ssize_t n;
+        do {
+            n = read(ready_pipe[0], &byte, 1);
+        } while (n < 0 && errno == EINTR);
+        ready = n == 1 && byte == 'R';
+        break;
+    }
+    while (ready && std::chrono::steady_clock::now() < ready_deadline) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   ready_deadline - std::chrono::steady_clock::now())
+                                   .count();
+        const int rc = poll(&poll_fd, 1, remaining > 1 ? static_cast<int>(remaining) : 1);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc <= 0) break;
+        char extra = 0;
+        ssize_t n;
+        do {
+            n = read(ready_pipe[0], &extra, 1);
+        } while (n < 0 && errno == EINTR);
+        if (n == 0)
+            pipe_closed = true;
+        else
+            ready = false;
+        break;
+    }
+    close(ready_pipe[0]);
+    ready = ready && pipe_closed;
+
+    if (ready) snapshot = snapshot_docker_child_proc(child, std::chrono::milliseconds(500));
+    const int kill_rc = kill(child, SIGKILL);
+    const int kill_error = errno;
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return ready && (kill_rc == 0 || kill_error == ESRCH) && waited == child &&
+           WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+}
+
+static bool run_docker_info_preflight_self_check(std::string& error,
+                                                 bool require_many_inherited_fds = false) {
     char fixture_path[] = "/tmp/rut-docker-info-selfcheck-XXXXXX";
     if (mkdtemp(fixture_path) == nullptr) {
         error = "could not create self-check fixture directory";
@@ -2283,17 +2392,22 @@ static bool run_docker_info_preflight_self_check(std::string& error) {
         cleanup();
         return false;
     }
-    const std::string long_argv0(3072, 'a');
-    DockerInfoResult long_cmdline = run_docker_info_runner(
-        {"/bin/bash", "-c", "exec -a \"$1\" sleep 1", "bash", long_argv0}, log, 100);
-    unlink(log.c_str());
-    if (long_cmdline.outcome != DockerInfoOutcome::TimedOut ||
-        !long_cmdline.proc_snapshot.truncated || long_cmdline.proc_snapshot.fd_output_truncated ||
-        !proc_fd_snapshot_matches_complete_entries(long_cmdline.proc_snapshot)) {
+    DockerProcSnapshot long_cmdline;
+    size_t inherited_fd_count = 0;
+    if (!snapshot_long_cmdline_self_check(long_cmdline, inherited_fd_count) ||
+        !long_cmdline.truncated || long_cmdline.fd_output_truncated ||
+        !proc_fd_snapshot_matches_complete_entries(long_cmdline) || long_cmdline.fd_count != 3u ||
+        long_cmdline.status_scan_state != DockerProcScanState::Complete ||
+        !bounded_contains(long_cmdline.text, long_cmdline.text_size, "cmdline=") ||
+        (require_many_inherited_fds && inherited_fd_count <= 12u)) {
         error = "long command line truncation contaminated complete proc fd output";
         cleanup();
         return false;
     }
+    std::cerr << "Docker-info long-cmdline fixture inherited_fds=" << inherited_fd_count
+              << " child_fd_count=" << long_cmdline.fd_count
+              << " cmdline_truncated=" << (long_cmdline.truncated ? 1 : 0)
+              << " fd_output_truncated=" << (long_cmdline.fd_output_truncated ? 1 : 0) << "\n";
     DockerProcSnapshot missing_proc = snapshot_docker_child_proc(2147483647);
     if (!bounded_contains(missing_proc.errors, missing_proc.errors_size, missing_status_error) ||
         missing_proc.text_size > kDockerProcSnapshotMaxBytes ||
@@ -81944,6 +82058,15 @@ static bool run_issue630_head_same_file_pair(const char* rut_path,
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && strcmp(argv[1], "--docker-info-cmdline-fixture-child") == 0) {
+        const char ready = 'R';
+        ssize_t written;
+        do {
+            written = write(3, &ready, 1);
+        } while (written < 0 && errno == EINTR);
+        if (written != 1 || close(3) != 0) return 2;
+        for (;;) pause();
+    }
     const bool nginx_preload_loader_preflight =
         argc == 3 && strcmp(argv[1], "--nginx-preload-loader-preflight") == 0;
     const bool nginx_gate_spike = argc == 3 && strcmp(argv[1], "--nginx-gate-spike") == 0;
@@ -82142,8 +82265,11 @@ int main(int argc, char** argv) {
         strcmp(argv[1], "--pinned-nginx-positive-cl-head-default-buffering-oracle") == 0;
     const bool pinned_nginx_lifecycle_self_check =
         argc == 2 && strcmp(argv[1], "--pinned-nginx-lifecycle-self-check") == 0;
+    const bool docker_info_preflight_require_many_fds =
+        argc == 2 && strcmp(argv[1], "--docker-info-preflight-self-check-many-fds") == 0;
     const bool docker_info_preflight_self_check =
-        argc == 2 && strcmp(argv[1], "--docker-info-preflight-self-check") == 0;
+        (argc == 2 && strcmp(argv[1], "--docker-info-preflight-self-check") == 0) ||
+        docker_info_preflight_require_many_fds;
     const bool docker_info_launch_diagnostic =
         argc == 2 && strcmp(argv[1], "--docker-info-launch-diagnostic") == 0;
     const bool zero_response_stall_self_check =
@@ -82962,7 +83088,8 @@ int main(int argc, char** argv) {
 
     if (docker_info_preflight_self_check) {
         std::string preflight_error;
-        if (!run_docker_info_preflight_self_check(preflight_error)) {
+        if (!run_docker_info_preflight_self_check(preflight_error,
+                                                  docker_info_preflight_require_many_fds)) {
             std::cerr << "FAIL [#619 Docker-info preflight self-check]: " << preflight_error
                       << "\n";
             return 1;
