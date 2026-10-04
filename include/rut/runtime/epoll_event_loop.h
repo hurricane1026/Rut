@@ -1098,12 +1098,11 @@ public:
                 break;
             case IoEventType::RelayRead:
             case IoEventType::RelayWrite:
-                // io_uring owns relay poll events; epoll stays on the copy
-                // fallback and must never route these into legacy callbacks.
-                break;
-            // io_uring-only transport primitive; deliberately inert here.
             case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
+                // io_uring owns relay poll events; epoll stays on the copy
+                // fallback and must never route these into legacy callbacks.
+                // These io_uring-only cases are inert for epoll too.
                 break;
         }
         if (!dispatching_event_batch_) drain_deferred_health_sweep();

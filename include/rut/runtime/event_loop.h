@@ -145,15 +145,15 @@ public:
                 break;
             case IoEventType::RelayRead:
             case IoEventType::RelayWrite:
-                // Relay completions are consumed by the concrete proactor's
-                // dedicated state machine; they must never enter Recv/Send
-                // callback slots.
-                break;
             case IoEventType::Accept:
             case IoEventType::Timeout:
             case IoEventType::HandlerTimer:
             case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
+                // Relay completions are consumed by the concrete proactor's
+                // dedicated state machine; they must never enter Recv/Send
+                // callback slots. The remaining cases are inert in this
+                // generic dispatcher as well.
                 break;
         }
     }
