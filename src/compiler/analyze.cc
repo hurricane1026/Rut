@@ -1704,15 +1704,57 @@ static const HirImplMethod* find_impl_method(const HirImpl& impl, Str name) {
     return nullptr;
 }
 
+struct GeneratedNameSegment {
+    const char* ptr;
+    u32 len;
+};
+
+struct GeneratedNameNode {
+    GeneratedNameNode* next;
+    char* text;
+};
+
+// Process-lifetime intrusive list owning fallibly-allocated generated names.
+// A file-scope root keeps the buffers reachable for LeakSanitizer while HIR
+// retains non-owning Str views. The list never needs releasing because names
+// stay valid for the whole process, matching intern_generated_name.
+static GeneratedNameNode* g_fallible_generated_names = nullptr;
+
+// Concatenate segments into one permanent, nothrow-allocated name. Allocation
+// failure maps to FrontendError::OutOfMemory instead of terminating the
+// -fno-exceptions build, preserving the callers' FrontendResult contract.
+static FrontendResult<Str> intern_generated_name_fallible(const GeneratedNameSegment* segments,
+                                                          u32 segment_count) {
+    u32 len = 0;
+    for (u32 i = 0; i < segment_count; i++) {
+        if (segments[i].len > 0xffffffffu - len)
+            return frontend_error(FrontendError::OutOfMemory, {});
+        len += segments[i].len;
+    }
+    auto* buf = new (std::nothrow) char[len];
+    if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
+    u32 off = 0;
+    for (u32 i = 0; i < segment_count; i++) {
+        for (u32 j = 0; j < segments[i].len; j++) buf[off++] = segments[i].ptr[j];
+    }
+    auto* node = new (std::nothrow) GeneratedNameNode;
+    if (node == nullptr) {
+        delete[] buf;
+        return frontend_error(FrontendError::OutOfMemory, {});
+    }
+    node->next = g_fallible_generated_names;
+    node->text = buf;
+    g_fallible_generated_names = node;
+    return Str{buf, len};
+}
+
 static FrontendResult<Str> make_protocol_default_function_name(Str protocol_name, Str method_name) {
-    // HIR stores function names as non-owning Str views, so the generated name
-    // must outlive the module. Intern it in the process-lifetime store rather
-    // than leaking a raw heap buffer.
-    std::string out = "__proto_";
-    out.append(protocol_name.ptr, protocol_name.len);
-    out.push_back('_');
-    out.append(method_name.ptr, method_name.len);
-    return intern_generated_name(out);
+    static constexpr char kPrefix[] = "__proto_";
+    const GeneratedNameSegment segments[] = {{kPrefix, sizeof(kPrefix) - 1u},
+                                             {protocol_name.ptr, protocol_name.len},
+                                             {"_", 1u},
+                                             {method_name.ptr, method_name.len}};
+    return intern_generated_name_fallible(segments, sizeof(segments) / sizeof(segments[0]));
 }
 
 static bool impl_targets_overlap(const HirModule& mod,
@@ -1745,13 +1787,14 @@ static FrontendResult<Str> make_impl_function_name(Str protocol_name,
                                                    Str method_name) {
     // See make_protocol_default_function_name: intern so the non-owning Str in
     // HIR stays valid without leaking an unfreed raw buffer.
-    std::string out = "__impl_";
-    out.append(protocol_name.ptr, protocol_name.len);
-    out.push_back('_');
-    out.append(type_name.ptr, type_name.len);
-    out.push_back('_');
-    out.append(method_name.ptr, method_name.len);
-    return intern_generated_name(out);
+    static constexpr char kPrefix[] = "__impl_";
+    const GeneratedNameSegment segments[] = {{kPrefix, sizeof(kPrefix) - 1u},
+                                             {protocol_name.ptr, protocol_name.len},
+                                             {"_", 1u},
+                                             {type_name.ptr, type_name.len},
+                                             {"_", 1u},
+                                             {method_name.ptr, method_name.len}};
+    return intern_generated_name_fallible(segments, sizeof(segments) / sizeof(segments[0]));
 }
 
 static FrontendResult<Str> make_impl_target_name(const AstTypeRef& ref) {
