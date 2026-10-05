@@ -4730,6 +4730,56 @@ TEST(frontend, parse_return_response_with_body) {
     rir.destroy();
 }
 
+TEST(frontend, parse_return_response_byte_body_decodes_exact_bytes) {
+    // `body: b"..."` is the exact-byte form. Cover newline, backslash, quote,
+    // a NUL, and a non-ASCII byte through parser → AST → HIR → RIR.
+    const char* src =
+        "route GET \"/x\" { return response(200, body: b\"A\\nB\\\\C\\\"D\\x00E\\xff\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
+    const AstStatement& stmt = *ast->items[0].route.statements[0];
+    CHECK_EQ(stmt.status_code, 200u);
+    CHECK(stmt.has_response_body);
+    static const unsigned char kExpected[] = {'A', '\n', 'B', '\\', 'C', '"', 'D', 0x00, 'E', 0xff};
+    REQUIRE_EQ(stmt.response_body.len, sizeof(kExpected));
+    CHECK(memcmp(stmt.response_body.ptr, kExpected, sizeof(kExpected)) == 0);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(term.response_body.len, sizeof(kExpected));
+    CHECK(memcmp(term.response_body.ptr, kExpected, sizeof(kExpected)) == 0);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    REQUIRE_EQ(rir.module.response_bodies[0].len, sizeof(kExpected));
+    CHECK(memcmp(rir.module.response_bodies[0].ptr, kExpected, sizeof(kExpected)) == 0);
+    rir.destroy();
+}
+
+TEST(frontend, parse_return_response_byte_body_rejects_bad_escapes) {
+    // Unknown escape and truncated `\x` hex both reject before publication.
+    const char* cases[] = {
+        "route GET \"/x\" { return response(200, body: b\"a\\q\") }\n",
+        "route GET \"/x\" { return response(200, body: b\"a\\x1\") }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    }
+}
+
 TEST(frontend, parse_return_response_empty_body_is_noop) {
     // `body: ""` has the explicit-empty flag but zero bytes; HIR
     // preserves the kwarg (ptr != nullptr, len == 0 — the documented

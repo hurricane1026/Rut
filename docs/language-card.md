@@ -244,6 +244,13 @@ storage; `LoadedProgram` keeps that storage alive through teardown and reload
 retirement. This documents the configured local/static response path and does
 not make dynamic `resp.body` mutation available.
 
+`body: "..."` keeps the raw source spelling of backslash sequences. To place
+exact bytes — newline, quote, backslash, a `\xNN` byte, or a non-ASCII byte —
+use the byte-string form `body: b"..."`, which decodes `\n`, `\r`, `\t`, `\\`,
+`\"`, and `\xNN` and is limited to 4096 decoded bytes (the same exact-byte bound
+as failure/strict response bodies). Invalid or truncated escapes reject at parse
+time, so a bad literal never reaches a published config.
+
 ## State types (top-level, per-shard, bounded)
 
 ```swift
