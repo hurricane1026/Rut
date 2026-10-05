@@ -1705,16 +1705,14 @@ static const HirImplMethod* find_impl_method(const HirImpl& impl, Str name) {
 }
 
 static FrontendResult<Str> make_protocol_default_function_name(Str protocol_name, Str method_name) {
-    const char prefix[] = "__proto_";
-    const u32 len = static_cast<u32>(sizeof(prefix) - 1) + protocol_name.len + 1 + method_name.len;
-    auto* buf = new (std::nothrow) char[len];
-    if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
-    u32 off = 0;
-    for (u32 i = 0; i < sizeof(prefix) - 1; i++) buf[off++] = prefix[i];
-    for (u32 i = 0; i < protocol_name.len; i++) buf[off++] = protocol_name.ptr[i];
-    buf[off++] = '_';
-    for (u32 i = 0; i < method_name.len; i++) buf[off++] = method_name.ptr[i];
-    return Str{buf, len};
+    // HIR stores function names as non-owning Str views, so the generated name
+    // must outlive the module. Intern it in the process-lifetime store rather
+    // than leaking a raw heap buffer.
+    std::string out = "__proto_";
+    out.append(protocol_name.ptr, protocol_name.len);
+    out.push_back('_');
+    out.append(method_name.ptr, method_name.len);
+    return intern_generated_name(out);
 }
 
 static bool impl_targets_overlap(const HirModule& mod,
@@ -1745,19 +1743,15 @@ static bool impl_matches_exact_target(const HirImpl& impl,
 static FrontendResult<Str> make_impl_function_name(Str protocol_name,
                                                    Str type_name,
                                                    Str method_name) {
-    const char prefix[] = "__impl_";
-    const u32 len = static_cast<u32>(sizeof(prefix) - 1) + protocol_name.len + 1 + type_name.len +
-                    1 + method_name.len;
-    auto* buf = new (std::nothrow) char[len];
-    if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
-    u32 off = 0;
-    for (u32 i = 0; i < sizeof(prefix) - 1; i++) buf[off++] = prefix[i];
-    for (u32 i = 0; i < protocol_name.len; i++) buf[off++] = protocol_name.ptr[i];
-    buf[off++] = '_';
-    for (u32 i = 0; i < type_name.len; i++) buf[off++] = type_name.ptr[i];
-    buf[off++] = '_';
-    for (u32 i = 0; i < method_name.len; i++) buf[off++] = method_name.ptr[i];
-    return Str{buf, len};
+    // See make_protocol_default_function_name: intern so the non-owning Str in
+    // HIR stays valid without leaking an unfreed raw buffer.
+    std::string out = "__impl_";
+    out.append(protocol_name.ptr, protocol_name.len);
+    out.push_back('_');
+    out.append(type_name.ptr, type_name.len);
+    out.push_back('_');
+    out.append(method_name.ptr, method_name.len);
+    return intern_generated_name(out);
 }
 
 static FrontendResult<Str> make_impl_target_name(const AstTypeRef& ref) {
