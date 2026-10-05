@@ -421,18 +421,21 @@ bool JitEngine::compile(LLVMModuleRef mod, LLVMContextRef ctx) {
     if (triple) LLVMSetTarget(mod, triple);
 
     char* verify_msg = nullptr;
-    if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &verify_msg)) {
-        if (verify_msg) {
-            auto write_str = [](const char* s) {
-                int len = 0;
-                while (s[len]) len++;
-                (void)::write(2, s, len);
-            };
-            write_str("jit: module verification failed: ");
-            write_str(verify_msg);
-            write_str("\n");
-            LLVMDisposeMessage(verify_msg);
-        }
+    const bool verify_failed = LLVMVerifyModule(mod, LLVMReturnStatusAction, &verify_msg) != 0;
+    // LLVM may populate OutMessage even when verification succeeds (observed as a
+    // 1-byte empty strdup on LLVM 22), so it must always be disposed when set.
+    if (verify_failed && verify_msg) {
+        auto write_str = [](const char* s) {
+            int len = 0;
+            while (s[len]) len++;
+            (void)::write(2, s, len);
+        };
+        write_str("jit: module verification failed: ");
+        write_str(verify_msg);
+        write_str("\n");
+    }
+    if (verify_msg) LLVMDisposeMessage(verify_msg);
+    if (verify_failed) {
         LLVMDisposeModule(mod);
         LLVMContextDispose(ctx);
         return false;
