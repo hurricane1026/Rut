@@ -1,128 +1,95 @@
-#Rutlang Language Card
+# Rutlang Language Card
 
 Canonical syntax reference for generating `.rut` code. One blessed idiom per
 task — if a form is not on this card, do not invent it. Derived from DESIGN.md
-§3 (the authoritative spec);
-keep the two in sync.
+§3 (the authoritative spec); keep the two in sync.
 
-        Core contract : **Swift -
-        exact or
-    absent** — anything that looks like Swift behaves exactly like Swift;
-near -
-    miss variants do not exist in this language.
+Core contract: **Swift-exact or absent** — anything that looks like Swift
+behaves exactly like Swift; near-miss variants do not exist in this language.
 
-        * *Implementation status * * : this card documents the target surface.The front -
-    end migration is in progress(TODO.md → "Front-End Migration");
-forms marked ⏳ are specified but* * not yet accepted by the current compiler *
-        * — they fail to compile today rather than misbehave.Everything unmarked works
-              .
+**Implementation status**: this card documents the target surface. The
+front-end migration is in progress (TODO.md → "Front-End Migration"); forms
+marked ⏳ are specified but **not yet accepted by the current compiler** —
+they fail to compile today rather than misbehave. Everything unmarked works.
 
-          ##File anatomy
+## File anatomy
 
-              A `.rut` file is a flat list of top -
-    level declarations(any order, no `main`)
-    :
+A `.rut` file is a flat list of top-level declarations (any order, no `main`):
 
 ```swift
-      // PR #184 adds standalone examples; no tokenBucket helper is importable yet.
-      import "middleware/auth.rut"  // file stem = namespace: auth.jwtAuth
-      // Imports nest at most 2 levels deep (main → a → b, kMaxImportNestingDepth);
-      // a deeper chain is a compile error at the offending `import`, never a crash.
+// PR #184 adds standalone examples; no tokenBucket helper is importable yet.
+import "middleware/auth.rut"                        // file stem = namespace: auth.jwtAuth
+// Imports nest at most 2 levels deep (main → a → b, kMaxImportNestingDepth);
+// a deeper chain is a compile error at the offending `import`, never a crash.
 
-      listen : 8080  // one cleartext IPv4 wildcard listener
-      tls "api.example.com",
-cert : env("CERT"),
-       key : env("KEY") defaults{clientMaxBodySize : 10mb}
+listen :8080                      // one cleartext IPv4 wildcard listener
+tls "api.example.com", cert: env("CERT"), key: env("KEY")
+defaults { clientMaxBodySize: 10mb }
 
-             let users = upstream{"10.0.0.1:8080"}            // upstreams
-             let buckets = Cache<IP, i64>(capacity : 100000)  // lossy per-key state
+let users = upstream { "10.0.0.1:8080" }            // upstreams
+let buckets = Cache<IP, i64>(capacity: 100000)     // lossy per-key state
 
-             struct Ctx {
-    userId : str
-}                                            // types
-func auth(_ req : Request, role : str){...}  // middleware/helpers
-timer cleanup,
-    every : 1m {...}  // background tasks (1s+ intervals; body: no req/forward/wait)
-timer push,
-    every : 5s,
-    shard : 0 {...}                      // shard-pinned singleton (default: every shard)
-                init{...} shutdown{...}  // lifecycle hooks
-                route GET "/health" {return 200}  // zero or more top-level route declarations
+struct Ctx { userId: str }        // types
+func auth(_ req: Request, role: str) { ... }     // middleware/helpers
+timer cleanup, every: 1m { ... }  // background tasks (1s+ intervals; body: no req/forward/wait)
+timer push, every: 5s, shard: 0 { ... }   // shard-pinned singleton (default: every shard)
+init { ... }    shutdown { ... }  // lifecycle hooks
+route GET "/health" { return 200 } // zero or more top-level route declarations
 ```
 
-`var` is allowed only inside func
-                /
-                handler bodies — never at top level.
+`var` is allowed only inside func/handler bodies — never at top level.
 
-                ##Lexical
+## Lexical
 
 ```swift
-                // Literals
-                42                   // number (plain integer)
-                3.14 0xFF 1_000_000  // ⏳ float / hex / underscored (lexer takes plain digit runs
-                                     // only)
-                "text"
-                "\(req.path)/x"       // strings, \() interpolation (ONLY form)
-                500ms 1s 5m 1h        // Duration (1d ⏳ — lexer knows ms/s/m/h only)
-                64b 1kb 16kb 1mb 1gb  // ⏳ ByteSize (no byte-size literal in lexer)
-                10.0.0.0 /
-                8                // CIDR
-                : 8080           // Port
-                re "^/api/v\d+"  // Regex (compile-time validated)
-                true false nil json({
-                    users : [],
-                    total : 0
-                })  // object literal syntax ✅; json() lowering/runtime ⏳
+// Literals
+42                                      // number (plain integer)
+3.14   0xFF   1_000_000                 // ⏳ float / hex / underscored (lexer takes plain digit runs only)
+"text"   "\(req.path)/x"                // strings, \() interpolation (ONLY form)
+500ms  1s  5m  1h                       // Duration (1d ⏳ — lexer knows ms/s/m/h only)
+64b  1kb  16kb  1mb  1gb                // ⏳ ByteSize (no byte-size literal in lexer)
+10.0.0.0/8                              // CIDR
+:8080                                   // Port
+re"^/api/v\d+"                          // Regex (compile-time validated)
+true  false  nil
+json({ users: [], total: 0 })           // object literal syntax ✅; json() lowering/runtime ⏳
 
-            // Operators — each symbol has exactly one meaning in expressions
-            &&
-        || !                       // boolean (identical to Swift)
-               |                   // pipeline ONLY (see below)
-               +-*/ %              // arithmetic (i32/i64, same-width operands; wraps on
-                                   // overflow; x / 0 == 0, x % 0 == 0; literal / 0 is a
-                                   // compile error; -x OK)
-                       i64(x)      // widen i32 → i64 (the ONLY conversion; literals that
-                                   // don't fit i32 are i64 automatically; no user i64
-                                   // annotations; Cache<K,i64> is fixed built-in grammar;
-                                   // typed route captures such as :id(i64) are ⏳;
-                                   // no narrowing or match on i64; bitwise.* works at
-                                   // both widths)
-                   == != <> <= >=  // comparison
-    = >                            // single-expression body / match arm
-              ->                   // function return type
-              @                    // decorator
+// Operators — each symbol has exactly one meaning in expressions
+&&  ||  !                               // boolean (identical to Swift)
+|                                       // pipeline ONLY (see below)
++  -  *  /  %                           // arithmetic (i32/i64, same-width operands; wraps on
+                                        // overflow; x / 0 == 0, x % 0 == 0; literal / 0 is a
+                                        // compile error; -x OK)
+i64(x)                                  // widen i32 → i64 (the ONLY conversion; literals that
+                                        // don't fit i32 are i64 automatically; no user i64
+                                        // annotations; Cache<K,i64> is fixed built-in grammar;
+                                        // typed route captures such as :id(i64) are ⏳;
+                                        // no narrowing or match on i64; bitwise.* works at
+                                        // both widths)
+==  !=  <  >  <=  >=                    // comparison
+=>                                      // single-expression body / match arm
+->                                      // function return type
+@                                       // decorator
 
-              // Bitwise = named functions, never symbols (i32/i64 same-width, bare
-              // literals adopt the i64 side; shift amounts share the operand width and
-              // saturate out of range: shiftLeft → 0, shiftRight → sign fill)
-              bitwise.and
-          (a, b) bitwise.or
-      (a, b) bitwise.xor (a, b) bitwise.flip(a) bitwise.shiftLeft(a, n) bitwise
-                             .shiftRight(a, n)
+// Bitwise = named functions, never symbols (i32/i64 same-width, bare
+// literals adopt the i64 side; shift amounts share the operand width and
+// saturate out of range: shiftLeft → 0, shiftRight → sign fill)
+bitwise.and(a, b)  bitwise.or(a, b)  bitwise.xor(a, b)
+bitwise.flip(a)    bitwise.shiftLeft(a, n)  bitwise.shiftRight(a, n)
 ```
 
-                         Statements end at newline(no semicolons)
-                             .Blocks need no commas between items.Comments : `  // line only`.
+Statements end at newline (no semicolons). Blocks need no commas between items.
+Comments: `// line only`.
 
-    ##Bindings and control flow
+## Bindings and control flow
 
-```swift let x = 42           // immutable (default)
-    var n = 0                  // ⏳ mutable, handler-local only
-    const key = env("SECRET")  // must be compile-time evaluable
+```swift
+let x = 42                    // immutable (default)
+var n = 0                     // ⏳ mutable, handler-local only
+const key = env("SECRET")     // must be compile-time evaluable
 
-    if cond {
-    ...
-}
-else {
-    ...
-}  // bool branch — always braces
-if let
-    v = expr {
-        ...
-    }
-else {
-    ...
-}                                         // bind usable value in then-branch; error-capable AND
+if cond { ... } else { ... }              // bool branch — always braces
+if let v = expr { ... } else { ... }      // bind usable value in then-branch; error-capable AND
                                           // pure-optional exprs (req.query/header) both work
 guard cond else { return 400 }            // cond MUST be bool; else must exit
 guard let v = expr else { return 400 }    // bind or exit; error-capable AND pure-optional
@@ -136,9 +103,8 @@ match status {                            // general dispatch — no `case` keyw
 }
 
 for item in order.items {                 // ⏳ finite collections only, no while
-    if item
-        .qty == 0 {continue}  // ⏳ break / continue allowed
-                    guard item.qty > 0 else {return 400}
+    if item.qty == 0 { continue }         // ⏳ break / continue allowed
+    guard item.qty > 0 else { return 400 }
 }
 
 defer conn.close()                        // ⏳ runs on every exit path, LIFO (no defer in parser yet)
@@ -149,13 +115,7 @@ Nil/error handling — pick by situation, nothing else exists:
 | Situation | Write |
 |---|---|
 | fallback value | `req.query("page").or("1")` (eager sugar for `any(x, default)`) |
-| branch if present | `if let v = expr {
-    ...
-}
-else {
-    ...
-}
-` |
+| branch if present | `if let v = expr { ... } else { ... }` |
 | stop if absent/failed | `guard let v = expr else { return 400 }` |
 | bare presence test | `x != nil` / `x == nil` (nil and error are uniformly "absent"; never-nil sources are a compile error) |
 | failure *reason* matters | `match` on the error |
@@ -168,23 +128,20 @@ exceptions, no try/catch. `!` is logical not only.
 - **Handler** (route entry body): its value IS the response → `return 200`,
   `return 200, body`, `return resp`, `return forward(x)`.
 - **Middleware/helper func**: `return` only produces the function's normal
-  value (or passes through);
-to end the whole request immediately use**`respond`** : `respond 401` / `respond 401,
-    "expired"` / `respond resp`.A helper -
-        local Response may carry ordered
-                literal `set`/`add`/`remove` mutations
-                                        .A `chain after` helper may receive the
-                                            runtime `Response` and add ordered header effects to a
-                                                successful handler response
-                                        .
+  value (or passes through); to end the whole request immediately use
+  **`respond`**: `respond 401` / `respond 401, "expired"` / `respond resp`.
+  A helper-local Response may carry ordered literal `set`/`add`/`remove`
+  mutations. A `chain after` helper may receive the runtime `Response` and add
+  ordered header effects to a successful handler response.
 
-```swift func auth(_ req : Request, role : str) -> User {
-    let token =
-        req.authorization.or ("") guard token.hasPrefix("Bearer ") else {respond 401} let claims =
-            jwtDecode(token.trimPrefix("Bearer "), secret : env("JWT_SECRET"))
-                guard let claims else {respond 401} guard claims.role ==
-            role else {respond 403} return User(id : claims.sub,
-                                                role : claims.role)  // normal value
+```swift
+func auth(_ req: Request, role: str) -> User {
+    let token = req.authorization.or("")
+    guard token.hasPrefix("Bearer ") else { respond 401 }
+    let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
+    guard let claims else { respond 401 }
+    guard claims.role == role else { respond 403 }
+    return User(id: claims.sub, role: claims.role)   // normal value
 }
 ```
 
@@ -213,7 +170,8 @@ tuples `(a, b)` — ⏳ `.0`/`.1` projection and `let (x, y) = pair` destructuri
 
 ```swift
 struct User {                 // fields: name: type — newline-separated, no commas
-    id : str role : str
+    id: str
+    role: str
 }
 variant NetError {            // closed sum type
     timeout
@@ -282,8 +240,7 @@ resumable, stream-owned runtime Response object.
 
 The literal `response(status, body: "...")` form is limited to 1 MiB. Its bytes
 are a non-owning view into the loaded program's RIR/module response-body
-storage;
-`LoadedProgram` keeps that storage alive through teardown and reload
+storage; `LoadedProgram` keeps that storage alive through teardown and reload
 retirement. This documents the configured local/static response path and does
 not make dynamic `resp.body` mutation available.
 
@@ -335,49 +292,40 @@ route GET "/users/:id" {                         // capture: req.params.id
     return forward(userService)
 }
 
-@rateLimit(limit : 1000, window : 1m)  // official decorator applies
-    route POST "/form" {return 204}    // to this one route
+@rateLimit(limit: 1000, window: 1m)               // official decorator applies
+route POST "/form" { return 204 }                 // to this one route
 ```
 
-    The shipped parser accepts repeated top
-    - level `route METHOD "pattern"` declarations and the method - omitted form `route "pattern"`,
-    which matches all HTTP methods.Literal routes match a complete segment prefix : `/ api` matches
-`/ api` and `/ api / x`, but not `/ apifoo`;
-`/` supplies the fallback.This applies to both scalar and JIT
-        dispatch.Query strings do not affect this selection.There is no `ANY` route keyword;
-write the omitted - method form.The grouped `route {
-    ...
-}
-` surface(middleware pattern bindings,
-          host / path groups,
-          method unions,
-          typed captures,
-          expression entries,
-          and `_` catch - all) is ⏳ target syntax and must not be emitted yet.
+The shipped parser accepts repeated top-level `route METHOD "pattern"`
+declarations and the method-omitted form `route "pattern"`, which matches all
+HTTP methods. Literal routes match a complete segment prefix: `/api` matches
+`/api` and `/api/x`, but not `/apifoo`; `/` supplies the fallback. This applies
+to both scalar and JIT dispatch. Query strings do not affect this selection.
+There is no `ANY` route keyword; write the omitted-method form.
+The grouped `route { ... }` surface (middleware pattern
+bindings, host/path groups, method unions, typed captures, expression entries,
+and `_` catch-all) is ⏳ target syntax and must not be emitted yet.
 
-    Precedence : literal segment
-    > `: param` > `* rest`;
-exact host > wildcard > `_`.Indistinguishable routes are a compile error
-                            .Stable middleware uses an explicit
-`chain` direction :
+Precedence: literal segment > `:param` > `*rest`; exact host > wildcard > `_`.
+Indistinguishable routes are a compile error. Stable middleware uses an explicit
+`chain` direction:
 
-```swift func add_trace(_ req : i32, _ resp : Response)
-                                -> i32{resp.set("X-Request-Path", req.path) 0} chain observability{
-                                    after add_trace(req, resp)} route GET
-    "/users" use chain observability {
-    return forward(users)
+```swift
+func add_trace(_ req: i32, _ resp: Response) -> i32 {
+    resp.set("X-Request-Path", req.path)
+    0
 }
+chain observability { after add_trace(req, resp) }
+route GET "/users" use chain observability { return forward(users) }
 ```
 
-`before` helpers may gate a route;
-`after` currently supports Response header effects only.Full buffered body /
-    status middleware remains ⏳.
+`before` helpers may gate a route; `after` currently supports Response header
+effects only. Full buffered body/status middleware remains ⏳.
 
-    ##I /
-    O
+## I/O
 
-        HTTP policy selectors use contextual enum members(`.case`, lowerCamelCase)
-            .Quoted selectors and bare identifiers are rejected; diagnostics list the
+HTTP policy selectors use contextual enum members (`.case`, lowerCamelCase).
+Quoted selectors and bare identifiers are rejected; diagnostics list the
 members allowed for the field. There are no legacy string aliases.
 
 | Field | Implemented members (subject to the policy's combination constraints) |
@@ -609,20 +557,12 @@ return forward(users, request_policy: {
 // local_response header_order: .dateServerLength is the empty-body
 // no-route shape (`date, server, [connection: close,] content-length: 0`):
 // requires `body: b""` and `content_type` absent, 4xx/5xx status only.
-unmatched {
-    return local_response({
-        version :.http11,
-        status : 404,
-        reason : "Not Found",
-        server : "envoy",
-        date :.current,
-        connection :.request,
-        connection_header :.closeOnly,
-        header_names :.lowercase,
-        header_order :.dateServerLength,
-        head_mode :.suppressBody,
-        body : b ""
-    }) }
+unmatched { return local_response({
+    version: .http11, status: 404, reason: "Not Found", server: "envoy",
+    date: .current, connection: .request, connection_header: .closeOnly,
+    header_names: .lowercase, header_order: .dateServerLength,
+    head_mode: .suppressBody, body: b""
+}) }
 // local_response header_order: .lengthTypeDateServer is the bodied
 // shape (`content-length, content-type, date, server, [connection: close]`):
 // follows the fixed-order layout's content_type/body rules on a 4xx/5xx
@@ -661,14 +601,11 @@ guard let content = read(path: "/a/b.html") else { return 404 }   // buffered
 // WebSocket proxy
 guard req.upgrade == .websocket else { return 400 }
 return websocket(chat)                          // transparent
-websocket(chat, maxMessageSize: 64kb) {
-    frame in  // per-frame inspection
-        if frame.direction ==.client&& frame.isText {
-        guard !frame.text.matches(re "(?i)spam") else {
-            return.drop
-        }
+websocket(chat, maxMessageSize: 64kb) { frame in    // per-frame inspection
+    if frame.direction == .client && frame.isText {
+        guard !frame.text.matches(re"(?i)spam") else { return .drop }
     }
-    return.forward  // .forward .drop .close(reason:) .send(t) .inject(t)
+    return .forward       // .forward .drop .close(reason:) .send(t) .inject(t)
 }
 
 // HTTP calls — native syntax, async is invisible (no await anywhere)
@@ -677,48 +614,46 @@ let res = post http://orders/create {
     Body: order
     Timeout: 10s
 }
-guard let res else {return 502} guard res.status == 200 else {return 502}
+guard let res else { return 502 }
+guard res.status == 200 else { return 502 }
 
-    fire post http :  // audit/log { Body: json(evt) } // fire-and-forget, non-terminal
+fire post http://audit/log { Body: json(evt) } // fire-and-forget, non-terminal
 
-                      // Concurrency — submit/wait, single yield point
-                      let h1 = submit get http :  // svc-a/x
-                                                  let h2 = submit get http
-    :  // svc-b/y
-       let(r1, r2) = wait(h1, h2) guard let r1 else {return 502} guard let resp =
-           any(wait(h1, 5s)) else {return 504}  // timeout race
-       wait(2s)                                 // sleep
+// Concurrency — submit/wait, single yield point
+let h1 = submit get http://svc-a/x
+let h2 = submit get http://svc-b/y
+let (r1, r2) = wait(h1, h2)
+guard let r1 else { return 502 }
+guard let resp = any(wait(h1, 5s)) else { return 504 }   // timeout race
+wait(2s)                                                  // sleep
 
-       // Raw TCP/UDP
-       guard let conn = tcp("redis:6379") else {return 502} defer conn
-                            .close()  // ⏳ (no defer in parser yet)
-                        conn.send("PING\r\n") guard let data =
-           conn.recv(maxSize : 4kb) else {return 502}
+// Raw TCP/UDP
+guard let conn = tcp("redis:6379") else { return 502 }
+defer conn.close()                             // ⏳ (no defer in parser yet)
+conn.send("PING\r\n")
+guard let data = conn.recv(maxSize: 4kb) else { return 502 }
 
-           // Bandwidth limit (inside handler, before the I/O)
-           throttle(downstream : 100kb per 1s, burst : 256kb)
+// Bandwidth limit (inside handler, before the I/O)
+throttle(downstream: 100kb per 1s, burst: 256kb)
 
-           // Background / lifecycle
-           timer checkHealth,
-                          every : 5s,
-                          shard : 0 {...}  // shard: omitted = every shard
-init{...}                                  // per-shard, before accepting
-shutdown {
-    ...
-}  // per-shard, after drain
+// Background / lifecycle
+timer checkHealth, every: 5s, shard: 0 { ... }   // shard: omitted = every shard
+init { ... }         // per-shard, before accepting
+shutdown { ... }     // per-shard, after drain
 ```
 
-    ##Rate limiting in
-    Rut(the blessed algorithms — examples / ratelimit.rut)
+## Rate limiting in Rut (the blessed algorithms — examples/ratelimit.rut)
 
-```swift let buckets = Cache<IP, i64>(capacity : 100000)
+```swift
+let buckets = Cache<IP, i64>(capacity: 100000)
 
-        route GET "/api" {      // GCRA token bucket
-    let now = time.nowMicros()  // latched per request
-              let tat = max(buckets.get(req.remoteAddr).or (0), now) if tat - now <=
-                        600000 {                                           // tau = emit
-                                buckets.set(req.remoteAddr, tat + 600000)  // emit = 600ms/token
-                                return 200} else {return 429}
+route GET "/api" {                                   // GCRA token bucket
+    let now = time.nowMicros()                       // latched per request
+    let tat = max(buckets.get(req.remoteAddr).or(0), now)
+    if tat - now <= 600000 {                         // tau = emit
+        buckets.set(req.remoteAddr, tat + 600000)    // emit = 600ms/token
+        return 200
+    } else { return 429 }
 }
 ```
 
@@ -736,23 +671,18 @@ boundary bursts and is not a sliding-window limit.
 let buckets = Cache<IP, i64>(capacity: 100000)   // top-level; per-shard lossy slots
 
 route GET "/api" {
-    let prev = buckets.get(req.remoteAddr).or
-               (0)                                            // i64? — a MISS IS NORMAL
-                       buckets.set(req.remoteAddr, prev + 1)  // bare set: before guards/for;
-                                                              // ALL cache ops reject wait routes
-                       if prev +
-                       1 >
-                   100 {return 429} else {return 200}
+    let prev = buckets.get(req.remoteAddr).or(0) // i64? — a MISS IS NORMAL
+    buckets.set(req.remoteAddr, prev + 1)        // bare set: before guards/for;
+                                                 // ALL cache ops reject wait routes
+    if prev + 1 > 100 { return 429 } else { return 200 }
 }
 ```
 
-        - `get->i64
-    ?`
-    : nil means never - seen OR evicted — the two are indistinguishable by design;
-`.or (default)` / `guard let` are the only ways to consume it.-
-         Entries may be evicted by colliding writes at any occupancy
-    : never store anything whose absence gives a wrong answer.Capacity =
-    slot count(rounded up to a power of two); provision ~2× your expected key count.
+- `get -> i64?`: nil means never-seen OR evicted — the two are indistinguishable
+  by design; `.or(default)` / `guard let` are the only ways to consume it.
+- Entries may be evicted by colliding writes at any occupancy: never store
+  anything whose absence gives a wrong answer. Capacity = slot count (rounded
+  up to a power of two); provision ~2× your expected key count.
 - A leading state write runs at handler entry and must precede guards/for. A
   write inside a selected `if`/`match` branch runs only on that branch, after
   its local prelude guards and before its terminator. Routes containing
@@ -782,8 +712,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 |---|---|
 | `and` / `or` / `not` | `&&` / `\|\|` / `!` |
 | `x?` , `x?.y` , `a ?? b` , `x!` | `guard let` / `if let` / `.or(default)` / `!= nil` |
-| `guard claims else {}
-` (non - bool) | `guard let claims else {}` |
+| `guard claims else {}` (non-bool) | `guard let claims else {}` |
 | `req.X-Request-ID` | `req.header("X-Request-ID")` |
 | `resp.Server = nil` | `resp.remove("Server")` |
 | `req.id` (route capture) | `req.params.id` |
@@ -794,37 +723,33 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 | `while cond {}` | `for x in xs {}` (bounded) or `timer` |
 | `a & b`, `a << 2`, `~a` | `bitwise.and(a, b)`, `bitwise.shiftLeft(a, 2)`, `bitwise.flip(a)` |
 | `x \| f(y)` (no placeholder) | `x \| f(y, _)` — show where the value lands |
-| `cond ? a :
-b` | `if cond {
-    ...
-}
-else {
-    ...
-}
-` or `match` | | `async` / `await` / callbacks / closures |
-         plain sequential code — compiler handles async |
-         | `let g = f` (function value) | call `f` directly;
-no function values | | recursion | unroll or restructure;
-all calls inline |
+| `cond ? a : b` | `if cond { ... } else { ... }` or `match` |
+| `async` / `await` / callbacks / closures | plain sequential code — compiler handles async |
+| `let g = f` (function value) | call `f` directly; no function values |
+| recursion | unroll or restructure; all calls inline |
 
-    ##Minimal complete example
+## Minimal complete example
 
-```swift listen : 80  // one cleartext IPv4 wildcard listener
-    let users = upstream{"10.0.0.1:8080"}
+```swift
+listen :80                         // one cleartext IPv4 wildcard listener
+let users = upstream { "10.0.0.1:8080" }
 // A standalone Cache/GCRA implementation lives in examples/ratelimit.rut.
 // ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
 // is no shipped top-level catch-all syntax yet. Configure the surrounding
 // listener/proxy to return 404 for traffic outside these declared routes.
 
-route GET "/health" {return 200}
+route GET "/health" { return 200 }
 
-@rateLimit(limit : 1000, window : 1m) route GET "/users/:id" {return forward(users)}
+@rateLimit(limit: 1000, window: 1m)
+route GET "/users/:id" { return forward(users) }
 
 route POST "/users" {
-    guard let user = req.body(User) else {return 400} return forward(users)
+    guard let user = req.body(User) else { return 400 }
+    return forward(users)
 }
 
 struct User {
-    id : str role : str
+    id: str
+    role: str
 }
 ```
