@@ -20414,34 +20414,44 @@ TEST(route, dsl_response_205_large_body_real_socket) {
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
     const char kReq[] = "GET /reset HTTP/1.1\r\nHost: x\r\n\r\n";
-    send_all(c, kReq, sizeof(kReq) - 1);
     char buf[2048];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
-    CHECK_GT(n, 0);
-    const Str response{buf, static_cast<u32>(n)};
-    auto has = [&](const char* needle, u32 nlen) {
-        return buf_contains(
-            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    // Accumulate through the header terminator; a single recv may return a
+    // partial status line or header block.
+    auto recv_through_headers = [&](u32& out_len) {
+        out_len = 0;
+        while (out_len < sizeof(buf)) {
+            const i32 r =
+                recv_timeout(c, buf + out_len, static_cast<i32>(sizeof(buf) - out_len), 1000);
+            if (r <= 0) break;
+            out_len += static_cast<u32>(r);
+            if (buf_contains(buf, out_len, "\r\n\r\n", 4)) break;
+        }
     };
-    CHECK(has("205 Reset Content", 17));
-    CHECK(has("Content-Length: 0\r\n", 19));
-    CHECK_FALSE(has("Content-Type:", 13));
-    CHECK_FALSE(has("aaaa", 4));
-    // The response ends exactly at the header terminator: no representation
-    // body or trailing bytes follow, even for the large segmented body.
-    REQUIRE_GE(response.len, 4u);
-    CHECK_EQ(memcmp(response.ptr + response.len - 4, "\r\n\r\n", 4), 0);
+    u32 n = 0;
+    send_all(c, kReq, sizeof(kReq) - 1);
+    recv_through_headers(n);
+    REQUIRE_GT(n, 0u);
+    CHECK(buf_contains(buf, n, "205 Reset Content", 17));
+    CHECK(buf_contains(buf, n, "Content-Length: 0\r\n", 19));
+    CHECK_FALSE(buf_contains(buf, n, "Content-Type:", 13));
+    CHECK_FALSE(buf_contains(buf, n, "aaaa", 4));
+    // The accumulated bytes end exactly at the header terminator: no
+    // representation body or trailing bytes follow, even for the large
+    // segmented body.
+    REQUIRE_GE(n, 4u);
+    CHECK_EQ(memcmp(buf + n - 4, "\r\n\r\n", 4), 0);
+    // No body bytes follow the headers on a keep-alive connection.
+    char extra[64];
+    CHECK_LE(recv_timeout(c, extra, static_cast<i32>(sizeof(extra)), 150), 0);
 
     // Keep-alive: a second request on the same connection still gets a clean
     // 205, proving the suppressed body did not corrupt the stream.
     send_all(c, kReq, sizeof(kReq) - 1);
-    i32 n2 = recv_timeout(c, buf, sizeof(buf), 1000);
-    CHECK_GT(n2, 0);
-    const Str response2{buf, static_cast<u32>(n2)};
-    CHECK(buf_contains(
-        reinterpret_cast<const char*>(response2.ptr), response2.len, "205 Reset Content", 17));
-    REQUIRE_GE(response2.len, 4u);
-    CHECK_EQ(memcmp(response2.ptr + response2.len - 4, "\r\n\r\n", 4), 0);
+    recv_through_headers(n);
+    REQUIRE_GT(n, 0u);
+    CHECK(buf_contains(buf, n, "205 Reset Content", 17));
+    REQUIRE_GE(n, 4u);
+    CHECK_EQ(memcmp(buf + n - 4, "\r\n\r\n", 4), 0);
 
     close(c);
     lt.stop();

@@ -1,4 +1,4 @@
-# Rutlang: Design Document
+#Rutlang : Design Document
 
 > A strongly-typed DSL and high-performance L7 ingress runtime. API gateway, WAF, reverse proxy, mesh sidecar, CDN edge — one language, multiple compilation targets.
 
@@ -38,14 +38,24 @@ This is intentionally coarse-grained. It exists to separate "designed" from
 | HTTP parsing and proxying runtime | **Implemented** | Production-oriented runtime paths and tests exist |
 | RIR data model + builder + printer | **Implemented** | RIR is real and exercised by tests |
 | LLVM ORC JIT integration | **Implemented** | Userspace handler JIT engine and codegen paths exist |
-| `firewall {}` → eBPF / XDP compilation target | **Designed** | Packet-level kernel path is a first-class compilation target in this design |
-| Offline manifest → RIR → JIT simulate flow | **Implemented** | Current compile-like path is intentionally narrow |
-| Full Rutlang lexer / parser / type checker | **Partial / in progress** | Token surface is declared, but the front-end is not yet complete |
-| Route conflict analysis and full diagnostics | **Designed** | Mentioned throughout this doc, not fully enforced end-to-end today |
-| Full surface language in examples below | **Designed** | Many examples are target syntax, not necessarily accepted by current code |
-| Cross-shard language primitives (`notify`, `consistent`) | **Designed** | Runtime direction is defined here; treat semantics as target contract |
-| External state backends (`backend: .redis`) | **Designed** | Not a current repository guarantee |
-| Zero-downtime hot reload of full `.rut` programs | **Partially designed / partial runtime pieces** | Runtime has design direction; full language-level flow is not complete yet |
+| `firewall {}
+` → eBPF / XDP compilation target | **Designed ** |
+    Packet - level kernel path is a first - class compilation target in this design | |
+    Offline manifest → RIR → JIT simulate flow | **Implemented ** |
+    Current compile - like path is intentionally narrow | |
+    Full Rutlang lexer / parser / type checker | **Partial / in progress ** |
+    Token surface is declared,
+    but the front - end is not yet complete | | Route conflict analysis and
+        full diagnostics | **Designed * *| Mentioned throughout this doc,
+    not fully enforced end - to - end today | | Full surface language in examples below |
+        **Designed * *| Many examples are target syntax,
+    not necessarily accepted by current code | |
+        Cross - shard language primitives(`notify`, `consistent`) | **Designed * *|
+        Runtime direction is defined here;
+treat semantics as target contract | | External state backends(`backend :.redis`) |
+    **Designed** | Not a current repository guarantee |
+    | Zero - downtime hot reload of full `.rut` programs |
+    **Partially designed / partial runtime pieces** | Runtime has design direction; full language-level flow is not complete yet |
 
 ### Document Restructure Plan
 
@@ -144,25 +154,32 @@ status matrix above.
 
 ### 3.1 Design Principles
 
-- **Low ambiguity first**: every feature should have a narrow role, predictable
-  grammar, and a small number of accepted idioms. If two constructs solve the
-  same common problem equally well, one should usually be removed or made
-  clearly secondary.
-- **LLM-safe by construction**: Rut should reduce the blast radius of generated
-  code by constraining the language, making invalid intent easy to diagnose, and
-  avoiding clever surface forms that look plausible but mean different things.
-- **Swift-inspired syntax where it reduces ambiguity**: guard statements, named
-  parameters, and string interpolation are useful when their semantics remain
-  mechanically simple. Symbol-heavy convenience forms stay non-core until they
-  prove clearer than named forms.
-- **HTTP concepts are native objects**: methods, status codes, headers, URLs, CIDR, media types are first-class language constructs, not strings
-- **All functions inline at compile time**: no runtime function calls, each route compiles to a single flat state machine
-- **Async suspension is explicit**: no async/await/future/promise, but every
-  operation that can suspend a handler must be visible as `wait`, `forward`, or
-  another explicit async boundary. The compiler lowers these points into state
-  machines; ordinary helper functions should not hide new yield points.
-- **Strong typing with domain types**: Duration, ByteSize, StatusCode, IP, CIDR, MediaType with compile-time validation
-- **Middleware = ordinary functions**: `respond <status>` short-circuits the request; falling through (or plain `return`) passes through. `return` keeps a single meaning everywhere — produce the function's value
+- **Low ambiguity first**:
+every feature should have a narrow role, predictable grammar,
+    and a small number of accepted idioms.If two constructs solve the same common problem equally
+            well,
+    one should usually be removed or
+        made clearly secondary.- **LLM -
+            safe by construction ** : Rut should reduce the blast radius of generated code by
+                                          constraining the language,
+    making invalid intent easy to diagnose,
+    and avoiding clever surface forms that look plausible but mean different things.- **Swift -
+        inspired syntax where it reduces ambiguity ** : guard statements,
+    named parameters,
+    and string interpolation are useful when their semantics remain mechanically simple.Symbol -
+        heavy convenience forms stay non - core until they prove clearer than named forms.-
+        **HTTP concepts are native objects ** : methods,
+    status codes, headers, URLs, CIDR, media types are first - class language constructs,
+    not strings - **All functions inline at compile time * * : no runtime function calls,
+    each route compiles to a single flat state machine -
+        **Async suspension is explicit ** : no async / await / future / promise,
+    but every operation that can suspend a handler must be visible as `wait`, `forward`,
+    or another explicit async boundary.The compiler lowers these points into state machines;
+ordinary helper functions should not hide new yield points.-
+    **Strong typing with domain types** : Duration,
+    ByteSize, StatusCode, IP, CIDR,
+    MediaType with compile - time validation - ** Middleware =
+        ordinary functions** : `respond<status>` short - circuits the request; falling through (or plain `return`) passes through. `return` keeps a single meaning everywhere — produce the function's value
 - **Bounded execution**: no `while`, no recursion, `for` only iterates finite collections — every handler has a compile-time execution bound, cannot stall a shard
 - **Replay and simulation are first-class**: route semantics should be
   deterministic enough that captured traffic can be replayed through the same
@@ -245,18 +262,20 @@ bitwise.shiftLeft(a, n)    bitwise.shiftRight(a, n)
 Arithmetic is total over `i32` and `i64`: overflow wraps two's-complement, and
 `x / 0` / `x % 0` evaluate to `0` — no traps, no undefined behavior (a SIGFPE
 would take down the whole shard; totality is the eBPF-style boundary the
-runtime needs). `INT_MIN / -1` wraps to `INT_MIN`; `INT_MIN % -1` is `0` (same
-at 64 bits). A literal zero divisor is a compile-time error. Unary minus is
-ordinary negation (`-x` is `0 - x`); `-2147483648` is a valid literal.
+runtime needs). `INT_MIN / -1` wraps to `INT_MIN`;
+`INT_MIN % -1` is `0` (same at 64 bits).A literal zero divisor is a compile
+    - time error.Unary minus is ordinary negation(`- x` is `0 - x`);
+`- 2147483648` is a valid literal.
 
-The two integer widths never mix implicitly:
+    The two integer widths never mix implicitly :
 
-- An int literal types as `i32` when it fits, else `i64` (`60000000000` just
-  works); beyond the i64 range it is a compile error.
-- `i64(x)` is the conversion (Swift-initializer style): it widens an i32
-  value, folds on literals, and is identity on i64. A user function named
-  `i64` shadows the builtin. There is no narrowing conversion yet.
-- Arithmetic and comparisons require same-width operands; mixing a non-literal
+    -An int literal types as `i32` when it fits,
+    else `i64` (`60000000000` just works);
+beyond the i64 range it is a compile error.- `i64(x)` is the conversion(Swift - initializer style)
+    : it widens an i32 value,
+folds on literals, and is identity on i64.A user function named
+  `i64` shadows the builtin.There is no narrowing conversion yet.- Arithmetic
+                       and comparisons require same - width operands; mixing a non-literal
   i32 with an i64 is a compile error with an `i64(x)` fix-it. A bare int
   literal adopts the i64 side (`i64(x) + 1` works).
 - `i64` is deliberately unavailable in user-declared type positions (like
@@ -280,8 +299,12 @@ Rut Core intentionally avoids symbolic optional chaining, null-coalescing, and
 force-unwrap. Use named fallback and explicit binding instead:
 
 - `value.or(default)` for "usable value or fallback"
-- `if let x = expr { ... }` to branch on and bind a usable value
-- `guard let x = expr else { ... }` when absence/failure must stop the route
+- `if let x = expr {
+    ...
+}
+` to branch on and bind a usable value - `guard let x = expr else {
+    ...
+}` when absence/failure must stop the route
 - `x == nil` / `x != nil` for a bare presence test
 - `match` when the reason for absence/failure matters
 
@@ -430,61 +453,52 @@ let r = re"^/api/v\d+"              // Regex literal, compile-time validated
 **Port** — 1..65535
 
 ```swift
-let p = :8080                        // Port literal
-p.number                             // i32 — 8080
+let p = :
+8080          // Port literal
+    p.number  // i32 — 8080
 ```
 
-#### 3.3.2 User-Defined Types
+    ####3.3.2 User -
+    Defined Types
 
-```swift
-struct User {
-    id: string
-    role: string
-    name: string
+```swift struct User {
+    id : string role : string name : string
 }
 
 struct Order {
-    items: [OrderItem]
-    total: f64
+    items : [OrderItem] total : f64
 }
 
 struct OrderItem {
-    sku: string
-    qty: i32
-    price: f64
+    sku : string qty : i32 price : f64
 }
 ```
 
-**variant** — closed sum type; `match` dispatches on cases and must be
-exhaustive (all cases or a `_ =>` fallback):
+        * *
+    variant * * — closed sum type;
+`match` dispatches on cases and must be exhaustive(all cases or a `_ = >` fallback)
+    :
 
-```swift
-variant NetError {
-    timeout
-    refused
-    dns(string)          // case with payload
-}
+```swift variant NetError{
+        timeout refused dns(string)  // case with payload
+    }
 
-let e = NetError.dns("no such host")
-match e {
-    .timeout   => log.warn("timeout")
-    .dns(host) => log.warn("dns failure", host: host)
-    _          => log.warn("net error")
+      let e = NetError.dns("no such host") match e {
+    .timeout = > log.warn("timeout").dns(host) = > log.warn("dns failure", host : host) _ =
+                                                     > log.warn("net error")
 }
 ```
 
-Case references are `.case` (short form) or `Type.case` (qualified); bare case
-names are not accepted. Payload binding is single-layer.
+    Case references are `.case` (short form) or `Type.case` (qualified);
+    bare case names are not accepted.Payload binding is single
+    - layer.
 
-**protocol / impl** — explicit interface conformance:
+          * *protocol / impl * * — explicit interface conformance:
 
-```swift
-protocol Hashable {
-    func hash() -> u64
-}
+```swift protocol Hashable{func hash()->u64}
 
-impl User: Hashable {
-    func hash() -> u64 => fnv64(self.id)
+impl User : Hashable {
+    func hash() -> u64 = > fnv64(self.id)
 }
 ```
 
@@ -574,49 +588,50 @@ The request context `req.ctx` requires a user-declared `Ctx` struct:
 
 ```swift
 struct Ctx {
-    userId: string
-    userRole: string
-    startTime: Time
+    userId : string userRole : string startTime : Time
 }
 ```
 
-The compiler verifies that fields read in a handler were set by a decorator in
-the chain. Accessing an unset field is a compile error.
+    The compiler verifies that fields read in a handler were set by a decorator in the
+        chain.Accessing an unset field is a compile error.
 
-#### 3.3.5 Response Object
+    ####3.3.5 Response Object
 
 ```swift
-// Simple responses
-return 200                           // empty body
-return 401, "custom message"         // with body string
-return 200, json(data)               // with JSON body
+    // Simple responses
+    return 200  // empty body
+    return 401,
+    "custom message"  // with body string
+    return 200,
+    json(data)  // with JSON body
 
-// With headers — build response object, no { } ambiguity
-let resp = response(429)
-resp.set("Retry-After", "60")
-return resp
+    // With headers — build response object, no { } ambiguity
+    let resp = response(429) resp.set("Retry-After", "60") return resp
 
-let resp = response(200)
-resp.set("Content-Type", "application/json")
-resp.body = json(stats())
-return resp
+               let resp = response(200) resp.set("Content-Type", "application/json") resp.body =
+        json(stats()) return resp
 
-// Redirect
-let resp = response(301)
-resp.set("Location", "https://example.com\(req.path)")
-return resp
+    // Redirect
+    let resp = response(301) resp
+                   .set("Location", "https://example.com\(req.path)") return resp
 
-// Multi-value headers on response
-resp.add("Set-Cookie", "a=1; Path=/")
-resp.add("Set-Cookie", "b=2; Path=/")
+               // Multi-value headers on response
+               resp.add("Set-Cookie", "a=1; Path=/") resp
+                   .add("Set-Cookie", "b=2; Path=/")
 
-// Delete header
-resp.remove("Server")
+               // Delete header
+               resp.remove("Server")
 ```
 
-`response(status)` is a built-in function that creates a Response object.
-A `{ }` after a status is never a header map — braces in statement position are
-always code blocks. Anonymous object literals `{ key: value }` exist only as
+`response(status)` is a built
+               - in function that creates a Response object.A `{
+}
+` after a status is never a header map — braces in statement position are always code
+    blocks.Anonymous object literals `{
+key:
+    value
+}
+` exist only as
 call arguments (see §3.2.1), not as response construction.
 
 For a configured local/static response, `response(status, body: "...")` is the
@@ -628,28 +643,38 @@ runtime response-body buffer: dynamic `resp.body` mutation remains a separate,
 resumable runtime feature.
 
 Statuses that cannot carry a representation body — `1xx`, `204`, `205`, and
-`304` — always serialize with `Content-Length: 0` and no body bytes on both the
-HTTP/1 and HTTP/2 ordinary response paths. A configured body for one of those
-statuses is dropped on the wire rather than committed; it is not a commit
-failure.
+`304` — always serialize with no representation body on both the HTTP/1 and
+HTTP/2 ordinary response paths. HTTP/1 emits `Content-Length: 0`; HTTP/2 emits
+an END_STREAM HEADERS frame with no DATA and no synthesized `content-length`
+(the header is omitted for zero length over HTTP/2). A configured body for one
+of those statuses is dropped on the wire rather than committed; it is not a
+commit failure.
 
 #### 3.3.5.1 Local Response and Forward Failure Policies (Envoy H1)
 
 `local_response({...})` is a compiler-validated builtin for a strict, fully
 specified local response — every header and the body are literal, closed
-vocabulary; there is no fallback shape and no implicit header. It shares one
-block grammar across three route forms:
+vocabulary;
+there is no fallback shape and no implicit header.It shares one block grammar across three route
+    forms :
 
-```swift
-unmatched { return local_response({
-    version: .http11, status: 404, reason: "Not Found",
-    content_type: "text/plain", server: "rut", date: .current,
-    connection: .request, head_mode: .suppressBody, body: b"Not Found"
-}) }
+```swift unmatched{return local_response({
+        version :.http11,
+        status : 404,
+        reason : "Not Found",
+        content_type : "text/plain",
+        server : "rut",
+        date :.current,
+        connection :.request,
+        head_mode :.suppressBody,
+        body : b "Not Found"
+    })}
 
-unmatched get { return local_response({ ... }) }        // per-method no-route
-pre_route options { return local_response({ ... }) }    // pre-routing strict reply
-route exact GET "/healthz" { return local_response({ ... }) }  // exact-path bypass
+    unmatched get{return local_response({...})}      // per-method no-route
+    pre_route options{return local_response({...})}  // pre-routing strict reply
+    route exact GET "/healthz" {
+    return local_response({...})
+}  // exact-path bypass
 ```
 
 `version` (`"HTTP/1.1"` only), `status`, `reason`, `server`, `date`
@@ -761,11 +786,11 @@ let cache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 
 get /users/:id {
     let key = "/users/\(req.params.id)"
-    // miss + in-flight → auto wait for first request
-    if let cached = cache.get(key) { return 200, cached }
-    let resp = forward(userService, buffered: true)
-    cache.set(key, resp.body)        // stores result + wakes all waiting connections
-    return resp
+        // miss + in-flight → auto wait for first request
+        if let cached = cache.get(key){return 200, cached} let resp =
+            forward(userService, buffered : true)
+                cache.set(key, resp.body)  // stores result + wakes all waiting connections
+            return resp
 }
 ```
 
@@ -795,89 +820,118 @@ examples and their real-socket parity test live in `examples/ratelimit.rut`;
 `@rateLimit` remains the concise built-in form.
 
 **Bloom\<T>** — probabilistic set, memory-efficient for large cardinalities.
-No false negatives; possible false positives.
+No false negatives;
+possible false positives.
 
-```swift
-let seenRequests = Bloom<string>(capacity: 1000000, errorRate: 0.01)
+```swift let seenRequests = Bloom<string>(capacity : 1000000, errorRate : 0.01)
 
-seenRequests.add(key)
-seenRequests.mayContain(key)           // bool — "not in" is certain, "in" may be false positive
+                                 seenRequests.add(key) seenRequests.mayContain(
+                                     key)  // bool — "not in" is certain, "in" may be false positive
 ```
 
-Use cases: request deduplication, cache penetration defense, large-scale blacklists.
+                             Use cases : request deduplication,
+              cache penetration defense,
+              large -
+                  scale blacklists.
 
-**Bitmap** — fixed-size bit array.
+                      ** Bitmap** — fixed -
+                  size bit array.
 
-```swift
-let features = Bitmap(size: 256)
+```swift let features = Bitmap(size : 256)
 
-features.set(12)                       // set bit
-features.clear(12)                     // clear bit
-features.test(12)                      // bool
-features.count()                       // popcount — number of set bits
+                             features
+                                 .set(12)    // set bit
+                         features.clear(12)  // clear bit
+                         features.test(12)   // bool
+                         features.count()    // popcount — number of set bits
 ```
 
-Use cases: feature flags, upstream health status, compact boolean arrays.
+                         Use cases : feature flags,
+              upstream health status,
+              compact boolean arrays.
 
-**Common parameters:**
+                      ** Common parameters : **
 
-| Parameter | Applies to | Description |
-|-----------|-----------|-------------|
-| `capacity:` | all (required) | Max entries, compile-time bound |
-| `ttl:` | LRU | Entry expiry time (Cache has no ttl — expiry is lazy, packed into the value) |
-| `errorRate:` | Bloom (required) | False positive rate, determines memory usage |
-| `size:` | Bitmap (required) | Number of bits |
-| `persist: true` | all | Preserve data across hot reload; compile error if struct layout changed |
-| `consistent: true` | Cache, Set | Single-owner routing by key hash (removes shard divergence; lossy containers stay approximate); SPSC round-trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
+                  | Parameter | Applies to | Description | | -- -- -- -- -- -| -- -- -- -- -- -|
+                  -- -- -- -- -- -- -| | `capacity :` | all(required) | Max entries,
+              compile - time bound | | `ttl :` | LRU |
+    Entry expiry time(Cache has no ttl — expiry is lazy, packed into the value) | | `errorRate :` |
+    Bloom(required) | False positive rate,
+              determines memory usage | | `size :` | Bitmap(required) | Number of bits |
+    | `persist : true` | all | Preserve data across hot reload;
+compile error if struct layout changed | | `consistent : true` | Cache,
+    Set | Single - owner routing by key hash(removes shard divergence;
+                                             lossy containers stay approximate);
+SPSC round - trip cost; compiler warning, suppress with `// rut:allow(consistent)` |
 | `coalesce: true` | LRU | Request coalescing — on cache miss with in-flight request for same key, suspend and wait instead of sending duplicate upstream request |
-| `backend: .redis(addr)` | — (reserved) | ⏳ Future cross-node storage; no Cache form is specified until reads have an explicit freshness/refresh contract |
+| `backend: .redis(addr)` | — (reserved) | ⏳ Future cross-node storage;
+no Cache form is specified until reads have an explicit freshness / refresh contract |
 
-**All state is per-shard by default.** Each shard owns an independent copy, single-threaded access,
-zero locking. Per-shard counters are approximate (effective limit ≈ `limit × shard_count`).
+    **All state is per - shard by default.**Each shard owns an independent copy,
+    single - threaded access,
+    zero locking.Per -
+        shard counters are approximate(effective limit ≈ `limit × shard_count`)
+            .
 
-**Cross-shard communication: `notify`**
+                **Cross
+        -
+        shard communication : `notify`**
 
 `notify` is Rutlang's only cross-shard primitive. Two forms:
 
-```swift
-notify all expr                    // all shards — eventual consistency
-notify(key) expr                   // hash(key) → owner shard — targeted
+```swift notify all expr  // all shards — eventual consistency
+    notify(key)
+expr  // hash(key) → owner shard — targeted
 
-let blacklist = Set<IP>(capacity: 100000)
+    let blacklist = Set<IP>(capacity : 100000)
 
-post /admin/ban {
-    guard let ip = req.body(IP) else { return 400 }
-    blacklist.add(ip)              // local shard — immediate
-    notify all blacklist.add(ip)   // all other shards — next event loop tick
-    return 200
-}
+                            post /
+                        admin /
+                        ban{guard let ip = req.body(IP) else {return 400} blacklist
+                                               .add(ip)  // local shard — immediate
+                                           notify all blacklist.add(
+                                               ip)  // all other shards — next event loop tick
+                                           return 200}
 ```
 
-- `notify all` — fan-out to N-1 shards, eventual consistency
-- `notify(key)` — hash(key) to determine owner shard, send to that shard only
+                    - `notify all` — fan - out to N - 1 shards,
+        eventual consistency - `notify(key)` — hash(key) to determine owner shard,
+        send to that shard only
 
-Implementation: each shard pair has a wait-free SPSC (single-producer single-consumer)
-ring buffer. `notify` enqueues the operation using `relaxed` stores with `release`
-on the tail pointer. Receiving shards drain their queues on each event loop tick
-with `acquire` on the tail read. No `seq_cst`, no full barrier, no cache line
-contention (head and tail on separate cache lines).
+            Implementation : each shard pair has a wait
+                             -
+                             free SPSC(single - producer single - consumer) ring buffer
+                                 . `notify` enqueues the operation
+                             using `relaxed` stores with `release` on the tail pointer
+                                 .Receiving shards drain their queues on each event loop tick
+                             with `acquire` on the tail read.No `seq_cst`,
+        no full barrier,
+        no cache line contention(head and tail on separate cache lines)
+            .
 
-Cost: `notify all` = N-1 relaxed writes. `notify(key)` = 1 relaxed write.
-Propagation latency is one event loop tick (~microseconds).
+        Cost
+    : `notify all` = N - 1 relaxed writes. `notify(key)` =
+                         1 relaxed write.Propagation latency is one event loop tick(~microseconds).
 
-**Single-owner state: `consistent: true`**
+                             * *Single
+                         -
+                         owner state : `consistent : true`* *
 
-To remove per-shard divergence (all shards see one copy of the state),
-declare with `consistent: true`. Operations route to the owner shard
-(determined by key hash), processed sequentially — no locks, just SPSC
-message round-trip. On a `Cache` this is single-owner but still
-approximate (see below); exact global limiting is future work.
+                                                            To remove per
+                         - shard divergence(all shards see one copy of the state),
+        declare with `consistent : true`.Operations route to the owner
+                                   shard(determined by key hash),
+        processed sequentially — no locks,
+        just SPSC message round - trip.On a `Cache` this is single
+            - owner but still approximate(see below);
+exact global limiting is future work.
 
 ```swift
-// rut:allow(consistent)
-let ownerBuckets = Cache<IP, i64>(capacity: 100000, consistent: true)
+    // rut:allow(consistent)
+    let ownerBuckets = Cache<IP, i64>(capacity : 100000, consistent : true)
 
-get /api/*path {
+                           get /
+                       api/*path {
     // Compiler generates: hash(remoteAddr) → owner shard → SPSC send → yield → receive
     let tat = ownerBuckets.get(req.remoteAddr).or(0)
     // ... GCRA over tat (see examples/ratelimit.rut)
