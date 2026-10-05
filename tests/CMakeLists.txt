@@ -1681,7 +1681,9 @@ if(RUT_ENABLE_JIT)
         LABELS "nginx;docker"
         RUN_SERIAL TRUE
         RESOURCE_LOCK nginx-differential
-        TIMEOUT 60
+        # Above the sum of the self-check's internal bounded waits (initial
+        # docker rm, readiness poll, tree reap, inspect probe, final rm).
+        TIMEOUT 150
     )
     add_test(
         NAME test_nginx_issue270_converter_explicit_timeout_head_source_self_check

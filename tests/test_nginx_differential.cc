@@ -3662,8 +3662,14 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
     if (control == 0) {
         close(ready_pipe[0]);
         if (setpgid(0, 0) != 0) _exit(40);
-        Child sentinel;
-        if (!spawn_child({"sleep", "300"}, temp_dir + "/sentinel.log", sentinel)) _exit(41);
+        // In-process sentinel: no external CLI dependency, and it closes the
+        // readiness write end so the control's death still produces EOF.
+        const pid_t sentinel = fork();
+        if (sentinel < 0) _exit(41);
+        if (sentinel == 0) {
+            close(ready_pipe[1]);
+            for (;;) pause();
+        }
         Child docker_launch;
         if (!spawn_child({"docker", "create", "--name", container, kNginxImage, "true"},
                          temp_dir + "/docker.log",
@@ -3683,6 +3689,9 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
         socklen_t addr_len = sizeof(addr);
         if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &addr_len) != 0) _exit(47);
         const u16 port = ntohs(addr.sin_port);
+        // Prove a live owned descendant exists before declaring readiness, so
+        // the cleanup always has a whole tree to reap.
+        if (kill(sentinel, 0) != 0) _exit(49);
         const unsigned char payload[3] = {
             1, static_cast<unsigned char>(port >> 8), static_cast<unsigned char>(port & 0xff)};
         ssize_t written = 0;
@@ -3751,7 +3760,6 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
             close(fd);
         }
     }
-    unlink((temp_dir + "/sentinel.log").c_str());
     unlink((temp_dir + "/docker.log").c_str());
     rmdir(temp_dir.c_str());
     (void)docker_remove(container);
