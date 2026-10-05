@@ -365,6 +365,91 @@ struct Parser {
         return owned;
     }
 
+    // `body: b"..."` for an ordinary `response(...)` body. Same exact-byte
+    // escape grammar and bound as the other byte-string forms; the decoded
+    // bytes are stored in the AstFile so they outlive the source buffer.
+    FrontendResult<Str> parse_response_body_literal() {
+        if (cur().type == TokenType::Eof)
+            return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
+        if (cur().type != TokenType::Ident || !cur().text.eq({"b", 1}))
+            return frontend_error(FrontendError::UnexpectedToken, span_from(cur()), cur().text);
+        const Token& prefix = toks->tokens[pos++];
+        auto literal = expect(TokenType::StringLit);
+        if (!literal) return core::make_unexpected(literal.error());
+        if (literal.value()->start != prefix.end + 1)
+            return frontend_error(
+                FrontendError::UnexpectedToken, span_from(*literal.value()), literal.value()->text);
+
+        u8 decoded[kMaxStrictLocalResponseBodyLen];
+        u32 decoded_len = 0;
+        const Str raw = literal.value()->text;
+        auto hex = [](u8 c, u8& out) {
+            if (c >= '0' && c <= '9') {
+                out = static_cast<u8>(c - '0');
+                return true;
+            }
+            if (c >= 'a' && c <= 'f') {
+                out = static_cast<u8>(c - 'a' + 10);
+                return true;
+            }
+            if (c >= 'A' && c <= 'F') {
+                out = static_cast<u8>(c - 'A' + 10);
+                return true;
+            }
+            return false;
+        };
+        for (u32 i = 0; i < raw.len; i++) {
+            u8 value = static_cast<u8>(raw.ptr[i]);
+            if (value == '\\') {
+                if (++i >= raw.len)
+                    return frontend_error(
+                        FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
+                const u8 esc = static_cast<u8>(raw.ptr[i]);
+                switch (esc) {
+                    case 'n':
+                        value = '\n';
+                        break;
+                    case 'r':
+                        value = '\r';
+                        break;
+                    case 't':
+                        value = '\t';
+                        break;
+                    case '\\':
+                        value = '\\';
+                        break;
+                    case '"':
+                        value = '"';
+                        break;
+                    case 'x': {
+                        if (i + 2 >= raw.len)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
+                        u8 hi = 0, lo = 0;
+                        if (!hex(static_cast<u8>(raw.ptr[i + 1]), hi) ||
+                            !hex(static_cast<u8>(raw.ptr[i + 2]), lo))
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
+                        value = static_cast<u8>((hi << 4) | lo);
+                        i += 2;
+                        break;
+                    }
+                    default:
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*literal.value()), raw);
+                }
+            }
+            if (decoded_len >= kMaxStrictLocalResponseBodyLen)
+                return frontend_error(
+                    FrontendError::TooManyItems, span_from(*literal.value()), raw);
+            decoded[decoded_len++] = value;
+        }
+        Str owned{};
+        if (!file->add_response_body(decoded, decoded_len, owned))
+            return frontend_error(FrontendError::TooManyItems, span_from(prefix), raw);
+        return owned;
+    }
+
     FrontendResult<Str> parse_redirect_body_literal() {
         if (cur().type == TokenType::Eof)
             return frontend_error(FrontendError::UnexpectedEof, span_from(cur()));
@@ -1742,11 +1827,19 @@ struct Parser {
             stmt.status_code = parsed.value();
             stmt.span = Span{start.start, status.value()->end, start.line, start.col};
             if (take(TokenType::Comma)) {
-                auto body_tok = expect(TokenType::StringLit);
-                if (!body_tok) return core::make_unexpected(body_tok.error());
-                stmt.response_body = body_tok.value()->text;
+                if (cur().type == TokenType::Ident && cur().text.eq({"b", 1}) &&
+                    peek().type == TokenType::StringLit) {
+                    auto body = parse_response_body_literal();
+                    if (!body) return core::make_unexpected(body.error());
+                    stmt.response_body = body.value();
+                    stmt.span.end = toks->tokens[pos - 1].end;
+                } else {
+                    auto body_tok = expect(TokenType::StringLit);
+                    if (!body_tok) return core::make_unexpected(body_tok.error());
+                    stmt.response_body = body_tok.value()->text;
+                    stmt.span.end = body_tok.value()->end;
+                }
                 stmt.has_response_body = true;
-                stmt.span.end = body_tok.value()->end;
             }
             return stmt;
         }
@@ -2894,10 +2987,18 @@ struct Parser {
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
                         }
-                        auto body_tok = expect(TokenType::StringLit);
-                        if (!body_tok) return core::make_unexpected(body_tok.error());
-                        // Lexer strips the surrounding quotes already.
-                        stmt.response_body = body_tok.value()->text;
+                        if (cur().type == TokenType::Ident && cur().text.eq({"b", 1}) &&
+                            peek().type == TokenType::StringLit) {
+                            auto body = parse_response_body_literal();
+                            if (!body) return core::make_unexpected(body.error());
+                            stmt.response_body = body.value();
+                        } else {
+                            auto body_tok = expect(TokenType::StringLit);
+                            if (!body_tok) return core::make_unexpected(body_tok.error());
+                            // Lexer strips the surrounding quotes but keeps the
+                            // raw spelling; `b"..."` is the exact-byte form.
+                            stmt.response_body = body_tok.value()->text;
+                        }
                         stmt.has_response_body = true;
                     } else if (kw_text.eq({"headers", 7})) {
                         if (seen_headers) {

@@ -675,6 +675,9 @@ struct AstFile {
     static constexpr u32 kFailurePolicyBodyPoolBytes =
         kMaxForwardFailurePolicies * kMaxFailurePolicyBodyLen;
     static constexpr u32 kStrictLocalResponseBodyPoolBytes = kMaxStrictLocalResponsePolicyBytes;
+    // Decoded bytes for `response(status, body: b"...")` exact-byte literals.
+    // One per route at the shared exact-byte literal bound.
+    static constexpr u32 kResponseBodyPoolBytes = kMaxItems * kMaxStrictLocalResponseBodyLen;
     static constexpr u32 kRedirectPolicyBodyPoolBytes = kMaxRedirectPolicies * kMaxRedirectBodyLen;
     FixedVec<AstItem, kMaxItems> items;
     FixedVec<AstExpr, kMaxExprPool> expr_pool;
@@ -690,6 +693,15 @@ struct AstFile {
     FixedVec<ExactStrictLocalResponseBinding, kMaxExactStrictLocalResponseBindings>
         exact_strict_local_response_bindings;
     FixedVec<u8, kStrictLocalResponseBodyPoolBytes> strict_local_response_body_pool;
+    FixedVec<u8, kResponseBodyPoolBytes> response_body_pool;
+    struct ResponseBodyEntry {
+        u32 offset = 0;
+        u32 len = 0;
+    };
+    // Bounded index of distinct decoded response bodies so repeated identical
+    // byte literals (e.g. the same body in many if/match branches) share one
+    // pool entry instead of exhausting the pool.
+    FixedVec<ResponseBodyEntry, kMaxStmtPool> response_body_entries;
     FixedVec<RedirectPolicySpec, kMaxRedirectPolicies> redirect_policies;
     FixedVec<u8, kRedirectPolicyBodyPoolBytes> redirect_policy_body_pool;
     bool has_package_decl = false;
@@ -708,6 +720,8 @@ struct AstFile {
           strict_local_response_policies(other.strict_local_response_policies),
           exact_strict_local_response_bindings(other.exact_strict_local_response_bindings),
           strict_local_response_body_pool(other.strict_local_response_body_pool),
+          response_body_pool(other.response_body_pool),
+          response_body_entries(other.response_body_entries),
           redirect_policies(other.redirect_policies),
           redirect_policy_body_pool(other.redirect_policy_body_pool) {
         for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
@@ -728,6 +742,8 @@ struct AstFile {
         strict_local_response_policies = other.strict_local_response_policies;
         exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
         strict_local_response_body_pool = other.strict_local_response_body_pool;
+        response_body_pool = other.response_body_pool;
+        response_body_entries = other.response_body_entries;
         for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
             pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
@@ -748,6 +764,8 @@ struct AstFile {
           strict_local_response_policies(other.strict_local_response_policies),
           exact_strict_local_response_bindings(other.exact_strict_local_response_bindings),
           strict_local_response_body_pool(other.strict_local_response_body_pool),
+          response_body_pool(other.response_body_pool),
+          response_body_entries(other.response_body_entries),
           redirect_policies(other.redirect_policies),
           redirect_policy_body_pool(other.redirect_policy_body_pool) {
         for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
@@ -768,6 +786,8 @@ struct AstFile {
         strict_local_response_policies = other.strict_local_response_policies;
         exact_strict_local_response_bindings = other.exact_strict_local_response_bindings;
         strict_local_response_body_pool = other.strict_local_response_body_pool;
+        response_body_pool = other.response_body_pool;
+        response_body_entries = other.response_body_entries;
         for (u32 i = 0; i < kStrictLocalResponseMethodSlots; i++) {
             pre_route_policy_ids[i] = other.pre_route_policy_ids[i];
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
@@ -819,6 +839,38 @@ struct AstFile {
             if (!strict_local_response_body_pool.push(bytes[i])) return false;
         }
         out = {reinterpret_cast<const char*>(&strict_local_response_body_pool.data[start]), len};
+        return true;
+    }
+
+    bool add_response_body(const u8* bytes, u32 len, Str& out) {
+        if ((bytes == nullptr && len != 0) || len > kMaxStrictLocalResponseBodyLen) return false;
+        // Reuse an identical previously decoded body so repeated literals share
+        // one pool entry.
+        for (u32 i = 0; i < response_body_entries.len; i++) {
+            const ResponseBodyEntry& entry = response_body_entries[i];
+            if (entry.len != len) continue;
+            bool same = true;
+            for (u32 j = 0; j < len; j++) {
+                if (response_body_pool.data[entry.offset + j] != bytes[j]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                out = {reinterpret_cast<const char*>(&response_body_pool.data[entry.offset]), len};
+                return true;
+            }
+        }
+        if (response_body_entries.len >= kMaxStmtPool) return false;
+        if (response_body_pool.len > kResponseBodyPoolBytes ||
+            len > kResponseBodyPoolBytes - response_body_pool.len)
+            return false;
+        const u32 start = response_body_pool.len;
+        for (u32 i = 0; i < len; i++) {
+            if (!response_body_pool.push(bytes[i])) return false;
+        }
+        if (!response_body_entries.push({start, len})) return false;
+        out = {reinterpret_cast<const char*>(&response_body_pool.data[start]), len};
         return true;
     }
 
@@ -983,8 +1035,18 @@ private:
         }
     }
 
+    void rebase_response_body(const AstFile& other, Str& body) {
+        if (body.ptr == nullptr) return;
+        const char* begin = reinterpret_cast<const char*>(&other.response_body_pool.data[0]);
+        const char* end = begin + other.response_body_pool.len;
+        if (body.ptr < begin || body.ptr > end) return;
+        const u32 index = static_cast<u32>(body.ptr - begin);
+        body.ptr = reinterpret_cast<const char*>(&response_body_pool.data[index]);
+    }
+
     void rebase_stmt(const AstFile& other, AstStatement& stmt) {
         if (stmt.has_type) rebase_type_ref(other, stmt.type);
+        if (stmt.has_response_body) rebase_response_body(other, stmt.response_body);
         rebase_expr(other, stmt.expr);
         rebase_stmt_ptr(other, stmt.then_stmt);
         rebase_stmt_ptr(other, stmt.else_stmt);

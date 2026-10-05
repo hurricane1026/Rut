@@ -634,6 +634,14 @@ an END_STREAM HEADERS frame with no DATA and omits `content-length` for the zero
 length. A configured body for one of those statuses is dropped on the wire
 rather than committed; it is not a commit failure.
 
+The `body: b"..."` byte-string form is the exact-byte alternative: it decodes
+`\n`, `\r`, `\t`, `\\`, `\"`, and `\xNN` to exact bytes and is limited to 4096
+decoded bytes (the same bound as the failure/strict exact-byte bodies), while
+`body: "..."` keeps the raw source spelling of backslash sequences. Invalid or
+truncated escapes reject at parse time. The guard-failure terminator accepts the
+same byte body after its status, e.g.
+`guard ok else { respond 401, b"a\x00b" }`.
+
 #### 3.3.5.1 Local Response and Forward Failure Policies (Envoy H1)
 
 `local_response({...})` is a compiler-validated builtin for a strict, fully

@@ -20462,6 +20462,87 @@ TEST(route, dsl_response_205_large_body_real_socket) {
     rir.destroy();
 }
 
+// End-to-end: a `body: b"..."` exact-byte literal must reach the wire with
+// its decoded bytes (newline and backslash here) and a matching Content-Length.
+TEST(route, dsl_response_byte_body_real_socket) {
+    using namespace rut;
+
+    const char* src = "route GET \"/x\" { return response(200, body: b\"a\\nb\\\\c\") }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        const auto& body = rir.module.response_bodies[i];
+        const u16 idx = cfg.add_response_body(body.ptr, body.len);
+        REQUIRE_EQ(idx, static_cast<u16>(i + 1));
+    }
+    REQUIRE(cfg.add_jit_handler("/x", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[2048];
+    u32 n = 0;
+    // Accumulate through the header terminator and the 5-byte body; a single
+    // recv may return only part of the response.
+    while (n < sizeof(buf)) {
+        const i32 r = recv_timeout(c, buf + n, static_cast<i32>(sizeof(buf) - n), 1000);
+        if (r <= 0) break;
+        n += static_cast<u32>(r);
+        if (buf_contains(buf, n, "\r\n\r\na\nb\\c", sizeof("\r\n\r\na\nb\\c") - 1)) break;
+    }
+    REQUIRE_GT(n, 0u);
+    auto has = [&](const char* needle, u32 nlen) { return buf_contains(buf, n, needle, nlen); };
+    CHECK(has("200 OK", 6));
+    CHECK(has("Content-Length: 5\r\n", 19));
+    // Decoded body is exactly `a\nb\\c`.
+    CHECK(has("\r\n\r\na\nb\\c", sizeof("\r\n\r\na\nb\\c") - 1));
+    REQUIRE_GE(n, 5u);
+    CHECK_EQ(memcmp(buf + n - 5, "a\nb\\c", 5), 0);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 // End-to-end: compile a route with custom headers (user-supplied
 // Content-Type must suppress the default text/plain) and assert the
 // real-socket response contains exactly what we expect. Reserved

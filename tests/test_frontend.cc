@@ -4730,6 +4730,134 @@ TEST(frontend, parse_return_response_with_body) {
     rir.destroy();
 }
 
+TEST(frontend, parse_return_response_byte_body_decodes_exact_bytes) {
+    // `body: b"..."` is the exact-byte form. Cover newline, backslash, quote,
+    // a NUL, and a non-ASCII byte through parser → AST → HIR → RIR.
+    const char* src =
+        "route GET \"/x\" { return response(200, body: b\"A\\nB\\\\C\\\"D\\x00E\\xff\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    REQUIRE_EQ(ast->items.len, 1u);
+    REQUIRE_EQ(ast->items[0].route.statements.len, 1u);
+    const AstStatement& stmt = *ast->items[0].route.statements[0];
+    CHECK_EQ(stmt.status_code, 200u);
+    CHECK(stmt.has_response_body);
+    static const unsigned char kExpected[] = {'A', '\n', 'B', '\\', 'C', '"', 'D', 0x00, 'E', 0xff};
+    REQUIRE_EQ(stmt.response_body.len, sizeof(kExpected));
+    CHECK(memcmp(stmt.response_body.ptr, kExpected, sizeof(kExpected)) == 0);
+
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(term.response_body.len, sizeof(kExpected));
+    CHECK(memcmp(term.response_body.ptr, kExpected, sizeof(kExpected)) == 0);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    REQUIRE_EQ(rir.module.response_bodies[0].len, sizeof(kExpected));
+    CHECK(memcmp(rir.module.response_bodies[0].ptr, kExpected, sizeof(kExpected)) == 0);
+    rir.destroy();
+}
+
+TEST(frontend, parse_return_response_byte_body_rejects_bad_escapes) {
+    // Unknown escape and truncated `\x` hex both reject before publication.
+    const char* cases[] = {
+        "route GET \"/x\" { return response(200, body: b\"a\\q\") }\n",
+        "route GET \"/x\" { return response(200, body: b\"a\\x1\") }\n",
+    };
+    for (const char* src : cases) {
+        auto lexed = lex(lit(src));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(!ast);
+        CHECK_EQ(ast.error().code, FrontendError::UnexpectedToken);
+    }
+}
+
+TEST(frontend, imported_byte_body_survives_imported_ast_teardown) {
+    // A byte-literal body in an imported helper must not point into the
+    // imported file's temporary AstFile pool after analysis; the bytes are
+    // copied into the root HIR owned-strings store.
+    const std::string dir = "/tmp/rut_import_byte_body_frontend";
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir + "/helper.rut", std::ios::binary);
+        out << "func require(ok: bool) -> i32 { guard ok else { respond 401, b\"a\\x00b\" } 7 }\n";
+    }
+    const auto src = R"rut(
+import "helper.rut"
+route GET "/x" { let code = require(req.http11) if code == 7 { return 200 } else { return 500 } }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    static const unsigned char kExpected[] = {'a', 0x00, 'b'};
+    bool found = false;
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        if (rir.module.response_bodies[i].len == sizeof(kExpected) &&
+            memcmp(rir.module.response_bodies[i].ptr, kExpected, sizeof(kExpected)) == 0)
+            found = true;
+    }
+    CHECK(found);
+    rir.destroy();
+}
+
+TEST(frontend, copied_hir_keeps_byte_body_after_original_destroyed) {
+    // Body bytes live in a refcounted HIR-owned store shared across copies, so
+    // a copy remains valid after the original module is destroyed.
+    const char* src = "route GET \"/x\" { return response(200, body: b\"a\\x00b\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto copy = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    auto mir = build_mir_heap(*copy);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    static const unsigned char kExpected[] = {'a', 0x00, 'b'};
+    bool found = false;
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        if (rir.module.response_bodies[i].len == sizeof(kExpected) &&
+            memcmp(rir.module.response_bodies[i].ptr, kExpected, sizeof(kExpected)) == 0)
+            found = true;
+    }
+    CHECK(found);
+    rir.destroy();
+}
+
+TEST(frontend, identical_byte_bodies_share_pool_storage) {
+    const char* src =
+        "route GET \"/a\" { return response(200, body: b\"same\") }\n"
+        "route GET \"/b\" { return response(200, body: b\"same\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    // The identical 4-byte body is stored once, so many duplicate literals
+    // cannot exhaust the bounded AST pool.
+    CHECK_EQ(ast->response_body_pool.len, 4u);
+    CHECK_EQ(ast->response_body_entries.len, 1u);
+}
+
 TEST(frontend, parse_return_response_empty_body_is_noop) {
     // `body: ""` has the explicit-empty flag but zero bytes; HIR
     // preserves the kwarg (ptr != nullptr, len == 0 — the documented
