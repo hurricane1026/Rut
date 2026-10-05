@@ -15971,7 +15971,7 @@ TEST(frontend, analyze_rejects_route_match_arm_guard_without_wildcard) {
     CHECK_EQ(static_cast<u8>(hir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
 TEST(frontend, build_mir_rejects_last_match_arm_guard_fallthrough) {
-    auto* hir = new HirModule{};
+    auto hir = std::make_unique<HirModule>();
     HirRoute route{};
     route.span = {1, 1, 1, 1};
     route.method = 'G';
@@ -15995,7 +15995,7 @@ TEST(frontend, build_mir_rejects_last_match_arm_guard_fallthrough) {
     REQUIRE(route.control.match_arms.push(arm));
     REQUIRE(hir->routes.push(route));
 
-    auto mir = build_mir(*hir);
+    auto mir = build_mir_heap(*hir);
     REQUIRE_FALSE(mir.has_value());
     CHECK_EQ(static_cast<u8>(mir.error().code), static_cast<u8>(FrontendError::UnsupportedSyntax));
 }
@@ -16629,7 +16629,7 @@ TEST(frontend, guard_let_on_known_error_alias_folds_to_else_branch) {
     CHECK_FALSE(hir->routes[0].guards[0].cond.bool_value);
 }
 TEST(frontend, build_mir_preserves_runtime_or_value) {
-    auto* hir = new HirModule{};
+    auto hir = std::make_unique<HirModule>();
     HirRoute route{};
     route.span = {1, 1, 1, 1};
     route.method = 'G';
@@ -16668,22 +16668,22 @@ TEST(frontend, build_mir_preserves_runtime_or_value) {
     route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
     route.control.direct_term.status_code = 200;
     REQUIRE(hir->routes.push(route));
-    auto mir = build_mir(*hir);
+    auto mir = build_mir_heap(*hir);
     REQUIRE(mir);
-    REQUIRE_EQ(mir.value()->functions.len, 1u);
-    REQUIRE_EQ(mir.value()->functions[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.kind),
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
              static_cast<u8>(MirValueKind::Or));
-    REQUIRE_NE(mir.value()->functions[0].locals[1].init.lhs, nullptr);
-    REQUIRE_NE(mir.value()->functions[0].locals[1].init.rhs, nullptr);
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.lhs->kind),
+    REQUIRE_NE(mir->functions[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(mir->functions[0].locals[1].init.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.lhs->kind),
              static_cast<u8>(MirValueKind::LocalRef));
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.rhs->kind),
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.rhs->kind),
              static_cast<u8>(MirValueKind::IntConst));
 }
 
 TEST(frontend, build_mir_preserves_runtime_all_value) {
-    auto* hir = new HirModule{};
+    auto hir = std::make_unique<HirModule>();
     HirRoute route{};
     route.span = {1, 1, 1, 1};
     route.method = 'G';
@@ -16744,24 +16744,24 @@ TEST(frontend, build_mir_preserves_runtime_all_value) {
     route.control.direct_term.status_code = 200;
     REQUIRE(hir->routes.push(route));
 
-    auto mir = build_mir(*hir);
+    auto mir = build_mir_heap(*hir);
     REQUIRE(mir);
-    REQUIRE_EQ(mir.value()->functions.len, 1u);
-    REQUIRE_EQ(mir.value()->functions[0].locals.len, 2u);
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.kind),
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].locals.len, 2u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.kind),
              static_cast<u8>(MirValueKind::IfElse));
-    REQUIRE_NE(mir.value()->functions[0].locals[1].init.lhs, nullptr);
-    REQUIRE_NE(mir.value()->functions[0].locals[1].init.rhs, nullptr);
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.lhs->kind),
+    REQUIRE_NE(mir->functions[0].locals[1].init.lhs, nullptr);
+    REQUIRE_NE(mir->functions[0].locals[1].init.rhs, nullptr);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.lhs->kind),
              static_cast<u8>(MirValueKind::HasValue));
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.rhs->kind),
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.rhs->kind),
              static_cast<u8>(MirValueKind::IntConst));
-    REQUIRE_EQ(mir.value()->functions[0].locals[1].init.args.len, 1u);
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].locals[1].init.args[0]->kind),
+    REQUIRE_EQ(mir->functions[0].locals[1].init.args.len, 1u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].locals[1].init.args[0]->kind),
              static_cast<u8>(MirValueKind::MissingOf));
 }
 TEST(frontend, build_mir_preserves_runtime_no_error_guard) {
-    auto* hir = new HirModule{};
+    auto hir = std::make_unique<HirModule>();
     HirRoute route{};
     route.span = {1, 1, 1, 1};
     route.method = 'G';
@@ -16793,20 +16793,20 @@ TEST(frontend, build_mir_preserves_runtime_no_error_guard) {
     route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
     route.control.direct_term.status_code = 200;
     REQUIRE(hir->routes.push(route));
-    auto mir = build_mir(*hir);
+    auto mir = build_mir_heap(*hir);
     REQUIRE(mir);
-    REQUIRE_EQ(mir.value()->functions.len, 1u);
-    REQUIRE_EQ(mir.value()->functions[0].blocks.len, 3u);
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].blocks[0].term.kind),
+    REQUIRE_EQ(mir->functions.len, 1u);
+    REQUIRE_EQ(mir->functions[0].blocks.len, 3u);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.kind),
              static_cast<u8>(MirTerminatorKind::Branch));
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].blocks[0].term.cond.kind),
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.kind),
              static_cast<u8>(MirValueKind::NoError));
-    REQUIRE_NE(mir.value()->functions[0].blocks[0].term.cond.lhs, nullptr);
-    CHECK_EQ(static_cast<u8>(mir.value()->functions[0].blocks[0].term.cond.lhs->kind),
+    REQUIRE_NE(mir->functions[0].blocks[0].term.cond.lhs, nullptr);
+    CHECK_EQ(static_cast<u8>(mir->functions[0].blocks[0].term.cond.lhs->kind),
              static_cast<u8>(MirValueKind::LocalRef));
 }
 TEST(frontend, lower_to_rir_supports_runtime_optional_or_value) {
-    auto* hir = new HirModule{};
+    auto hir = std::make_unique<HirModule>();
     HirRoute route{};
     route.span = {1, 1, 1, 1};
     route.method = 'G';
@@ -16845,10 +16845,10 @@ TEST(frontend, lower_to_rir_supports_runtime_optional_or_value) {
     route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
     route.control.direct_term.status_code = 200;
     REQUIRE(hir->routes.push(route));
-    auto mir = build_mir(*hir);
+    auto mir = build_mir_heap(*hir);
     REQUIRE(mir);
     FrontendRirModule rir{};
-    auto lowered = lower_to_rir(*mir.value(), rir);
+    auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     REQUIRE_EQ(rir.module.func_count, 1u);
     const auto& fn = rir.module.functions[0];
@@ -16865,7 +16865,7 @@ TEST(frontend, lower_to_rir_supports_runtime_optional_or_value) {
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_error_or_value) {
-    auto* mir = new MirModule{};
+    auto mir = std::make_unique<MirModule>();
     MirFunction fn{};
     fn.span = Span{0, 0, 1, 1};
     fn.method = 'G';
@@ -16930,7 +16930,7 @@ TEST(frontend, lower_to_rir_supports_runtime_error_or_value) {
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_optional_error_or_value) {
-    auto* mir = new MirModule{};
+    auto mir = std::make_unique<MirModule>();
     MirFunction fn{};
     fn.span = Span{0, 0, 1, 1};
     fn.method = 'G';
@@ -16996,7 +16996,7 @@ TEST(frontend, lower_to_rir_supports_runtime_optional_error_or_value) {
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_optional_str_or_value) {
-    auto* mir = new MirModule{};
+    auto mir = std::make_unique<MirModule>();
     MirFunction fn{};
     fn.span = Span{0, 0, 1, 1};
     fn.method = 'G';
@@ -17062,7 +17062,7 @@ TEST(frontend, lower_to_rir_supports_runtime_optional_str_or_value) {
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_all_int_value) {
-    auto* mir = new MirModule{};
+    auto mir = std::make_unique<MirModule>();
     MirFunction fn{};
     fn.span = Span{0, 0, 1, 1};
     fn.method = 'G';
@@ -17197,7 +17197,7 @@ TEST(frontend, lower_to_rir_supports_runtime_all_optional_query_fallback_call_ea
 }
 
 TEST(frontend, lower_to_rir_supports_runtime_no_error_guard) {
-    auto* hir = new HirModule{};
+    auto hir = std::make_unique<HirModule>();
     HirRoute route{};
     route.span = {1, 1, 1, 1};
     route.method = 'G';
@@ -17229,10 +17229,10 @@ TEST(frontend, lower_to_rir_supports_runtime_no_error_guard) {
     route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
     route.control.direct_term.status_code = 200;
     REQUIRE(hir->routes.push(route));
-    auto mir = build_mir(*hir);
+    auto mir = build_mir_heap(*hir);
     REQUIRE(mir);
     FrontendRirModule rir{};
-    auto lowered = lower_to_rir(*mir.value(), rir);
+    auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     REQUIRE_EQ(rir.module.func_count, 1u);
     const auto& fn = rir.module.functions[0];
@@ -17246,7 +17246,7 @@ TEST(frontend, lower_to_rir_supports_runtime_no_error_guard) {
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_no_error_guard_on_optional_error) {
-    auto* hir = new HirModule{};
+    auto hir = std::make_unique<HirModule>();
     HirRoute route{};
     route.span = {1, 1, 1, 1};
     route.method = 'G';
@@ -17280,10 +17280,10 @@ TEST(frontend, lower_to_rir_supports_runtime_no_error_guard_on_optional_error) {
     route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
     route.control.direct_term.status_code = 200;
     REQUIRE(hir->routes.push(route));
-    auto mir = build_mir(*hir);
+    auto mir = build_mir_heap(*hir);
     REQUIRE(mir);
     FrontendRirModule rir{};
-    auto lowered = lower_to_rir(*mir.value(), rir);
+    auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     const auto& fn = rir.module.functions[0];
     REQUIRE_EQ(fn.block_count, 3u);
@@ -17296,7 +17296,7 @@ TEST(frontend, lower_to_rir_supports_runtime_no_error_guard_on_optional_error) {
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_error_code_field) {
-    auto* hir = new HirModule{};
+    auto hir = std::make_unique<HirModule>();
     HirRoute route{};
     route.span = {1, 1, 1, 1};
     route.method = 'G';
@@ -17331,10 +17331,10 @@ TEST(frontend, lower_to_rir_supports_runtime_error_code_field) {
     route.control.direct_term.kind = HirTerminatorKind::ReturnStatus;
     route.control.direct_term.status_code = 200;
     REQUIRE(hir->routes.push(route));
-    auto mir = build_mir(*hir);
+    auto mir = build_mir_heap(*hir);
     REQUIRE(mir);
     FrontendRirModule rir{};
-    auto lowered = lower_to_rir(*mir.value(), rir);
+    auto lowered = lower_to_rir(mir.value(), rir);
     REQUIRE(lowered);
     const auto& fn = rir.module.functions[0];
     CHECK(block_has_op(fn.blocks[0], rir::Opcode::StructField));
@@ -17342,7 +17342,7 @@ TEST(frontend, lower_to_rir_supports_runtime_error_code_field) {
     rir.destroy();
 }
 TEST(frontend, lower_to_rir_supports_runtime_error_kind_match) {
-    auto* mir = new MirModule{};
+    auto mir = std::make_unique<MirModule>();
     MirVariant err_variant{};
     err_variant.span = {1, 1, 1, 1};
     err_variant.name = lit("AuthError");

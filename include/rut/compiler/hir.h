@@ -1392,6 +1392,40 @@ struct HirCacheDecl {
     u32 capacity = 0;
 };
 
+// One analyzer-synthesized function name. HIR stores function names as
+// non-owning Str views, so this node owns the bytes for the module's lifetime.
+struct HirGeneratedName {
+    HirGeneratedName* next = nullptr;
+    char* text = nullptr;
+    u32 len = 0;
+};
+
+// Owns the generated function names of one analysis tree. The root module owns
+// the store; imported modules write into the root's store and HirModule copies
+// share it, so every merged or copied function keeps a valid name view. The
+// store is reference-counted and freed when the last owner is destroyed.
+struct HirGeneratedNames {
+    u32 refs = 1;
+    HirGeneratedName* head = nullptr;
+
+    HirGeneratedNames() = default;
+    HirGeneratedNames(const HirGeneratedNames&) = delete;
+    HirGeneratedNames& operator=(const HirGeneratedNames&) = delete;
+
+    void retain() { refs++; }
+    void release() {
+        if (--refs != 0) return;
+        HirGeneratedName* node = head;
+        while (node != nullptr) {
+            HirGeneratedName* next = node->next;
+            delete[] node->text;
+            delete node;
+            node = next;
+        }
+        delete this;
+    }
+};
+
 struct HirModule {
     static constexpr u32 kMaxUpstreams = 32;
     static constexpr u32 kMaxImports = 64;
@@ -1447,6 +1481,7 @@ struct HirModule {
     FixedVec<HirRoute, kMaxRoutes + kMaxTimers> routes;
     FixedVec<HirTypeShape, kMaxTypeShapes> type_shapes;
     std::deque<std::string> owned_strings;
+    HirGeneratedNames* generated_names = nullptr;
     bool has_package_decl = false;
     Span package_span{};
     Str package_name{};
@@ -1478,6 +1513,7 @@ struct HirModule {
           routes(other.routes),
           type_shapes(other.type_shapes),
           owned_strings(other.owned_strings),
+          generated_names(other.generated_names),
           has_package_decl(other.has_package_decl),
           package_span(other.package_span),
           package_name(other.package_name) {
@@ -1486,9 +1522,12 @@ struct HirModule {
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         }
         rebase_type_alias_storage_ptrs(other);
+        if (generated_names != nullptr) generated_names->retain();
     }
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
+        if (generated_names != nullptr) generated_names->release();
+        generated_names = nullptr;
         upstreams = other.upstreams;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
@@ -1522,10 +1561,15 @@ struct HirModule {
         package_span = other.package_span;
         package_name = other.package_name;
         rebase_type_alias_storage_ptrs(other);
+        generated_names = other.generated_names;
+        if (generated_names != nullptr) generated_names->retain();
         return *this;
     }
     HirModule(HirModule&& other) noexcept = delete;
     HirModule& operator=(HirModule&& other) noexcept = delete;
+    ~HirModule() {
+        if (generated_names != nullptr) generated_names->release();
+    }
 
     void rebase_type_alias_storage_ptrs(const HirModule& other) {
         for (u32 i = 0; i < type_aliases.len; i++) {
