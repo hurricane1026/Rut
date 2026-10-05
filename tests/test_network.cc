@@ -10195,6 +10195,43 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize - sizeof(body)));
 }
 
+TEST(http2, configured_205_body_is_suppressed) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 body[64];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i + 1);
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)), 1u);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 205;
+    outcome.response_body_idx = 1;
+    u8 response[512]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    h2_emit_outcome(dispatch, 1, outcome, &cfg);
+    CHECK_EQ(h2_staged_status(response, dispatch.resp_len, 1), 205u);
+    CHECK_EQ(h2.outbound_body_len, 0u);
+    // Exactly one HEADERS frame carrying END_STREAM; no DATA frame follows.
+    Http2FrameHeader headers_frame{};
+    REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &headers_frame),
+               ParseStatus::Complete);
+    CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((headers_frame.flags & http2_flag::kEndStream) != 0);
+    CHECK_EQ(dispatch.resp_len, kFrameHeaderSize + headers_frame.length);
+}
+
 TEST(http2, flow_controlled_route_body_boundaries_and_window_resume) {
     SmallLoop loop;
     loop.setup();

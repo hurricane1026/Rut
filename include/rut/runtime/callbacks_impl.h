@@ -3487,7 +3487,8 @@ void handle_jit_outcome(Loop* loop,
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
             const bool segmented_body = has_body && outcome.status_code >= 200 &&
-                                        outcome.status_code != 204 && outcome.status_code != 304 &&
+                                        outcome.status_code != 204 && outcome.status_code != 205 &&
+                                        outcome.status_code != 304 &&
                                         cfg->response_bodies[outcome.response_body_idx - 1].len >
                                             RouteConfig::kResponseBodyPoolBytes;
             bool direct_file_body = false;

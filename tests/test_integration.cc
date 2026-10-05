@@ -20357,12 +20357,16 @@ TEST(route, dsl_response_body_real_socket) {
 }
 
 // End-to-end: an ordinary configured-body 205 must emit the zero-content
-// framing (no representation bytes) even though the source supplies a body.
-TEST(route, dsl_response_205_body_real_socket) {
+// framing (no representation bytes) even when the body is large enough to take
+// the segmented/file-backed path. A large body must not be appended after the
+// header-only 205, and the downstream keep-alive connection must stay usable.
+TEST(route, dsl_response_205_large_body_real_socket) {
     using namespace rut;
 
-    const char* src = "route GET \"/reset\" { return response(205, body: \"ignored-body\") }\n";
-    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    std::string src = "route GET \"/reset\" { return response(205, body: \"";
+    src.append(RouteConfig::kResponseBodyPoolBytes + 1024u, 'a');
+    src += "\") }\n";
+    auto lexed = lex(Str{src.data(), static_cast<u32>(src.size())});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
     REQUIRE(ast);
@@ -20385,9 +20389,12 @@ TEST(route, dsl_response_205_body_real_socket) {
     REQUIRE(handler_fn != nullptr);
 
     RouteConfig cfg{};
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    REQUIRE_GT(rir.module.response_bodies[0].len, RouteConfig::kResponseBodyPoolBytes);
     for (u32 i = 0; i < rir.module.response_body_count; i++) {
         const auto& body = rir.module.response_bodies[i];
-        const u16 idx = cfg.add_response_body(body.ptr, body.len);
+        // View (not copy): the body exceeds the 8 KiB copy pool.
+        const u16 idx = cfg.add_response_body_view(body.ptr, body.len);
         REQUIRE_EQ(idx, static_cast<u16>(i + 1));
     }
     REQUIRE(cfg.add_jit_handler("/reset", 'G', handler_fn));
@@ -20419,11 +20426,22 @@ TEST(route, dsl_response_205_body_real_socket) {
     CHECK(has("205 Reset Content", 17));
     CHECK(has("Content-Length: 0\r\n", 19));
     CHECK_FALSE(has("Content-Type:", 13));
-    CHECK_FALSE(has("ignored-body", 12));
+    CHECK_FALSE(has("aaaa", 4));
     // The response ends exactly at the header terminator: no representation
-    // body or trailing bytes follow.
+    // body or trailing bytes follow, even for the large segmented body.
     REQUIRE_GE(response.len, 4u);
     CHECK_EQ(memcmp(response.ptr + response.len - 4, "\r\n\r\n", 4), 0);
+
+    // Keep-alive: a second request on the same connection still gets a clean
+    // 205, proving the suppressed body did not corrupt the stream.
+    send_all(c, kReq, sizeof(kReq) - 1);
+    i32 n2 = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n2, 0);
+    const Str response2{buf, static_cast<u32>(n2)};
+    CHECK(buf_contains(
+        reinterpret_cast<const char*>(response2.ptr), response2.len, "205 Reset Content", 17));
+    REQUIRE_GE(response2.len, 4u);
+    CHECK_EQ(memcmp(response2.ptr + response2.len - 4, "\r\n\r\n", 4), 0);
 
     close(c);
     lt.stop();

@@ -627,6 +627,12 @@ teardown, and reload retirement. This form does not imply a general mutable
 runtime response-body buffer: dynamic `resp.body` mutation remains a separate,
 resumable runtime feature.
 
+Statuses that cannot carry a representation body — `1xx`, `204`, `205`, and
+`304` — always serialize with `Content-Length: 0` and no body bytes on both the
+HTTP/1 and HTTP/2 ordinary response paths. A configured body for one of those
+statuses is dropped on the wire rather than committed; it is not a commit
+failure.
+
 #### 3.3.5.1 Local Response and Forward Failure Policies (Envoy H1)
 
 `local_response({...})` is a compiler-validated builtin for a strict, fully
