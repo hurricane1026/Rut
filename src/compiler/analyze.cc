@@ -1704,57 +1704,18 @@ static const HirImplMethod* find_impl_method(const HirImpl& impl, Str name) {
     return nullptr;
 }
 
-struct GeneratedNameSegment {
-    const char* ptr;
-    u32 len;
-};
-
-struct GeneratedNameNode {
-    GeneratedNameNode* next;
-    char* text;
-};
-
-// Process-lifetime intrusive list owning fallibly-allocated generated names.
-// A file-scope root keeps the buffers reachable for LeakSanitizer while HIR
-// retains non-owning Str views. The list never needs releasing because names
-// stay valid for the whole process, matching intern_generated_name.
-static GeneratedNameNode* g_fallible_generated_names = nullptr;
-
-// Concatenate segments into one permanent, nothrow-allocated name. Allocation
-// failure maps to FrontendError::OutOfMemory instead of terminating the
-// -fno-exceptions build, preserving the callers' FrontendResult contract.
-static FrontendResult<Str> intern_generated_name_fallible(const GeneratedNameSegment* segments,
-                                                          u32 segment_count) {
-    u32 len = 0;
-    for (u32 i = 0; i < segment_count; i++) {
-        if (segments[i].len > 0xffffffffu - len)
-            return frontend_error(FrontendError::OutOfMemory, {});
-        len += segments[i].len;
-    }
-    auto* buf = new (std::nothrow) char[len];
-    if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
-    u32 off = 0;
-    for (u32 i = 0; i < segment_count; i++) {
-        for (u32 j = 0; j < segments[i].len; j++) buf[off++] = segments[i].ptr[j];
-    }
-    auto* node = new (std::nothrow) GeneratedNameNode;
-    if (node == nullptr) {
-        delete[] buf;
-        return frontend_error(FrontendError::OutOfMemory, {});
-    }
-    node->next = g_fallible_generated_names;
-    node->text = buf;
-    g_fallible_generated_names = node;
-    return Str{buf, len};
-}
-
-static FrontendResult<Str> make_protocol_default_function_name(Str protocol_name, Str method_name) {
-    static constexpr char kPrefix[] = "__proto_";
-    const GeneratedNameSegment segments[] = {{kPrefix, sizeof(kPrefix) - 1u},
-                                             {protocol_name.ptr, protocol_name.len},
-                                             {"_", 1u},
-                                             {method_name.ptr, method_name.len}};
-    return intern_generated_name_fallible(segments, sizeof(segments) / sizeof(segments[0]));
+// Generated names are stored in the HIR-owned string store so they are freed
+// with the module instead of accumulating for the whole process. HIR keeps
+// function names as non-owning Str views, so the stored std::string is the
+// owner and must outlive every use of the name.
+static FrontendResult<Str> make_protocol_default_function_name(std::deque<std::string>& store,
+                                                               Str protocol_name,
+                                                               Str method_name) {
+    std::string out = "__proto_";
+    out.append(protocol_name.ptr, protocol_name.len);
+    out.push_back('_');
+    out.append(method_name.ptr, method_name.len);
+    return stash_owned_string(store, out);
 }
 
 static bool impl_targets_overlap(const HirModule& mod,
@@ -1782,19 +1743,18 @@ static bool impl_matches_exact_target(const HirImpl& impl,
            impl.is_generic_template == is_generic_template;
 }
 
-static FrontendResult<Str> make_impl_function_name(Str protocol_name,
+static FrontendResult<Str> make_impl_function_name(std::deque<std::string>& store,
+                                                   Str protocol_name,
                                                    Str type_name,
                                                    Str method_name) {
-    // See make_protocol_default_function_name: intern so the non-owning Str in
-    // HIR stays valid without leaking an unfreed raw buffer.
-    static constexpr char kPrefix[] = "__impl_";
-    const GeneratedNameSegment segments[] = {{kPrefix, sizeof(kPrefix) - 1u},
-                                             {protocol_name.ptr, protocol_name.len},
-                                             {"_", 1u},
-                                             {type_name.ptr, type_name.len},
-                                             {"_", 1u},
-                                             {method_name.ptr, method_name.len}};
-    return intern_generated_name_fallible(segments, sizeof(segments) / sizeof(segments[0]));
+    // See make_protocol_default_function_name: the HIR owns the stored name.
+    std::string out = "__impl_";
+    out.append(protocol_name.ptr, protocol_name.len);
+    out.push_back('_');
+    out.append(type_name.ptr, type_name.len);
+    out.push_back('_');
+    out.append(method_name.ptr, method_name.len);
+    return stash_owned_string(store, out);
 }
 
 static FrontendResult<Str> make_impl_target_name(const AstTypeRef& ref) {
@@ -17392,7 +17352,8 @@ static FrontendResult<HirModule*> analyze_file_internal(
             if (method == nullptr)
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, item.protocol.span, method_ast.name);
-            auto mangled = make_protocol_default_function_name(item.protocol.name, method_ast.name);
+            auto mangled = make_protocol_default_function_name(
+                *owned_strings, item.protocol.name, method_ast.name);
             if (!mangled) return core::make_unexpected(mangled.error());
             if (find_function_index(mod, mangled.value()) != mod.functions.len)
                 return frontend_error(
@@ -17941,8 +17902,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             auto type_name = make_impl_target_name(item.impl_decl.target);
             if (!type_name) return core::make_unexpected(type_name.error());
-            auto mangled = make_impl_function_name(
-                mod.protocols[impl.protocol_index].name, type_name.value(), method_ast.name);
+            auto mangled = make_impl_function_name(*owned_strings,
+                                                   mod.protocols[impl.protocol_index].name,
+                                                   type_name.value(),
+                                                   method_ast.name);
             if (!mangled) return core::make_unexpected(mangled.error());
             if (find_function_index(mod, mangled.value()) != mod.functions.len)
                 return frontend_error(
