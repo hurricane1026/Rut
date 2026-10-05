@@ -627,6 +627,13 @@ teardown, and reload retirement. This form does not imply a general mutable
 runtime response-body buffer: dynamic `resp.body` mutation remains a separate,
 resumable runtime feature.
 
+Statuses that cannot carry a representation body — `1xx`, `204`, `205`, and
+`304` — always serialize with no representation body on both the HTTP/1 and
+HTTP/2 ordinary response paths. HTTP/1 emits `Content-Length: 0`; HTTP/2 emits
+an END_STREAM HEADERS frame with no DATA and omits `content-length` for the zero
+length. A configured body for one of those statuses is dropped on the wire
+rather than committed; it is not a commit failure.
+
 The `body: b"..."` byte-string form is the exact-byte alternative: it decodes
 `\n`, `\r`, `\t`, `\\`, `\"`, and `\xNN` to exact bytes and is limited to 4096
 decoded bytes (the same bound as the failure/strict exact-byte bodies), while

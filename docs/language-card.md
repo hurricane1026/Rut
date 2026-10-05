@@ -129,8 +129,7 @@ exceptions, no try/catch. `!` is logical not only.
   `return 200, body`, `return resp`, `return forward(x)`.
 - **Middleware/helper func**: `return` only produces the function's normal
   value (or passes through); to end the whole request immediately use
-  **`respond`**: `respond 401` / `respond 401, "expired"` / `respond 401, b"\x00"` /
-  `respond resp`.
+  **`respond`**: `respond 401` / `respond 401, "expired"` / `respond resp`.
   A helper-local Response may carry ordered literal `set`/`add`/`remove`
   mutations. A `chain after` helper may receive the runtime `Response` and add
   ordered header effects to a successful handler response.
@@ -251,6 +250,13 @@ use the byte-string form `body: b"..."`, which decodes `\n`, `\r`, `\t`, `\\`,
 `\"`, and `\xNN` and is limited to 4096 decoded bytes (the same exact-byte bound
 as failure/strict response bodies). Invalid or truncated escapes reject at parse
 time, so a bad literal never reaches a published config.
+
+Statuses that cannot carry a representation body — `1xx`, `204`, `205`, and
+`304` — are serialized with no representation body. HTTP/1 emits
+`Content-Length: 0`; HTTP/2 emits an END_STREAM HEADERS frame with no DATA and
+omits `content-length` for the zero length. A configured body for one of those
+statuses is dropped on the wire (it is not a commit failure), matching the
+ordinary local-response framing for the other no-body statuses.
 
 ## State types (top-level, per-shard, bounded)
 
