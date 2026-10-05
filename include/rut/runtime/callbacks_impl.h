@@ -12258,10 +12258,23 @@ inline u32 strict_response_dec(char* out, u32 value) {
 }
 
 inline u32 strict_response_date(char* out, u64 now_us) {
+    // HTTP dates have second precision. Each shard runs on one thread, so
+    // reuse that thread's formatted second without sharing mutable state.
+    struct DateCache {
+        u64 second = 0;
+        char bytes[29]{};
+        bool valid = false;
+    };
+    static thread_local DateCache cache{};
+    const u64 kSecond = now_us / 1000000ULL;
+    if (cache.valid && cache.second == kSecond) {
+        __builtin_memcpy(out, cache.bytes, sizeof(cache.bytes));
+        return sizeof(cache.bytes);
+    }
     static constexpr const char* kWeek[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     static constexpr const char* kMonth[] = {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-    time_t t = static_cast<time_t>(now_us / 1000000ULL);
+    time_t t = static_cast<time_t>(kSecond);
     struct tm tm;
     if (gmtime_r(&t, &tm) == nullptr) return 0;
     char* p = out;
@@ -12291,7 +12304,13 @@ inline u32 strict_response_date(char* out, u64 now_us) {
     *p++ = 'G';
     *p++ = 'M';
     *p++ = 'T';
-    return static_cast<u32>(p - out);
+    const u32 kLen = static_cast<u32>(p - out);
+    if (kLen == sizeof(cache.bytes)) {
+        __builtin_memcpy(cache.bytes, out, sizeof(cache.bytes));
+        cache.second = kSecond;
+        cache.valid = true;
+    }
+    return kLen;
 }
 
 struct RedirectAuthorityView {

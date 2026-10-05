@@ -84221,6 +84221,108 @@ TEST(response_read_deadline_fixed_upload_head_terminal_unreachable,
 }
 #endif
 
+TEST(http_date, exact_seconds_rollovers_and_clock_rewind) {
+    struct Case {
+        u64 second;
+        const char* expected;
+    };
+    static constexpr Case kCases[] = {
+        {0, "Thu, 01 Jan 1970 00:00:00 GMT"},
+        {1709164799, "Wed, 28 Feb 2024 23:59:59 GMT"},
+        {1709164800, "Thu, 29 Feb 2024 00:00:00 GMT"},
+        {1709251199, "Thu, 29 Feb 2024 23:59:59 GMT"},
+        {1709251200, "Fri, 01 Mar 2024 00:00:00 GMT"},
+        {1893455999, "Mon, 31 Dec 2029 23:59:59 GMT"},
+        {1893456000, "Tue, 01 Jan 2030 00:00:00 GMT"},
+        {1893456001, "Tue, 01 Jan 2030 00:00:01 GMT"},
+        {1893456000, "Tue, 01 Jan 2030 00:00:00 GMT"},
+        {0, "Thu, 01 Jan 1970 00:00:00 GMT"},
+    };
+    for (const auto& item : kCases) {
+        for (u64 micros : {0ULL, 1ULL, 999999ULL}) {
+            char out[32];
+            __builtin_memset(out, 0x5a, sizeof(out));
+            REQUIRE_EQ(strict_response_date(out + 1, item.second * 1000000ULL + micros), 29u);
+            CHECK_EQ(__builtin_memcmp(out + 1, item.expected, 29), 0);
+            CHECK_EQ(out[0], 0x5a);
+            CHECK_EQ(out[30], 0x5a);
+            CHECK_EQ(out[31], 0x5a);
+            // Caller-owned output may change after serialization; it must not
+            // become the storage reused by another response in the same second.
+            __builtin_memset(out + 1, '!', 29);
+            REQUIRE_EQ(strict_response_date(out + 1, item.second * 1000000ULL + micros), 29u);
+            CHECK_EQ(__builtin_memcmp(out + 1, item.expected, 29), 0);
+        }
+    }
+}
+
+namespace {
+struct HttpDateThreadGate {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+    u32 ready = 0;
+    bool start = false;
+};
+
+struct HttpDateThreadContext {
+    HttpDateThreadGate* gate;
+    u64 second;
+    const char* expected;
+    bool passed = true;
+};
+
+void* check_http_date_thread(void* argument) {
+    auto& context = *static_cast<HttpDateThreadContext*>(argument);
+    pthread_mutex_lock(&context.gate->mutex);
+    context.gate->ready++;
+    pthread_cond_broadcast(&context.gate->condition);
+    while (!context.gate->start) pthread_cond_wait(&context.gate->condition, &context.gate->mutex);
+    pthread_mutex_unlock(&context.gate->mutex);
+    for (u32 i = 0; i < 20000; i++) {
+        char out[29];
+        if (strict_response_date(out, context.second * 1000000ULL + i) != 29u ||
+            __builtin_memcmp(out, context.expected, sizeof(out)) != 0) {
+            context.passed = false;
+            break;
+        }
+    }
+    return nullptr;
+}
+}  // namespace
+
+TEST(http_date, concurrent_threads_and_repeated_thread_lifetimes) {
+    // Each new thread starts with its own cache. Different seconds expose
+    // accidental sharing while every formatter writes caller-owned storage.
+    for (u32 lifecycle = 0; lifecycle < 2; lifecycle++) {
+        HttpDateThreadGate gate;
+        HttpDateThreadContext contexts[] = {
+            {&gate, 0, "Thu, 01 Jan 1970 00:00:00 GMT"},
+            {&gate, 1709164800, "Thu, 29 Feb 2024 00:00:00 GMT"},
+            {&gate, 1709251200, "Fri, 01 Mar 2024 00:00:00 GMT"},
+            {&gate, 1893456000, "Tue, 01 Jan 2030 00:00:00 GMT"},
+        };
+        pthread_t threads[4];
+        u32 created = 0;
+        for (; created < 4; created++) {
+            if (pthread_create(
+                    &threads[created], nullptr, check_http_date_thread, &contexts[created]) != 0)
+                break;
+        }
+        pthread_mutex_lock(&gate.mutex);
+        while (gate.ready < created) pthread_cond_wait(&gate.condition, &gate.mutex);
+        gate.start = true;
+        pthread_cond_broadcast(&gate.condition);
+        pthread_mutex_unlock(&gate.mutex);
+        for (u32 i = 0; i < created; i++) {
+            CHECK_EQ(pthread_join(threads[i], nullptr), 0);
+            CHECK(contexts[i].passed);
+        }
+        CHECK_EQ(created, 4u);
+        CHECK_EQ(pthread_cond_destroy(&gate.condition), 0);
+        CHECK_EQ(pthread_mutex_destroy(&gate.mutex), 0);
+    }
+}
+
 TEST(response_read_deadline, http_date_normalization_accepts_only_imf_fixdate_shape) {
     static constexpr char kValid[] = "Tue, 01 Jan 2030 00:00:00 GMT";
     static constexpr char kBadWeekday[] = "Tux, 01 Jan 2030 00:00:00 GMT";
