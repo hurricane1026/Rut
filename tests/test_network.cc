@@ -12795,6 +12795,9 @@ TEST(iouring_send, pipelined_burst_sync_completion_accounts_once_and_serves_next
     ShardMetrics metrics{};
     metrics.init();
     loop.metrics = &metrics;
+    ShardEpoch epoch{};
+    epoch.epoch.store(1, std::memory_order_relaxed);
+    loop.epoch = &epoch;
 
     const i32 listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     REQUIRE_GE(listener, 0);
@@ -12807,6 +12810,9 @@ TEST(iouring_send, pipelined_burst_sync_completion_accounts_once_and_serves_next
     REQUIRE_EQ(getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
     const i32 client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     REQUIRE_GE(client, 0);
+    const timeval receive_timeout{5, 0};
+    REQUIRE_EQ(
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout)), 0);
     REQUIRE_EQ(connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
     const i32 server = accept4(listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     REQUIRE_GE(server, 0);
@@ -12855,9 +12861,24 @@ TEST(iouring_send, pipelined_burst_sync_completion_accounts_once_and_serves_next
     REQUIRE(conn->send_armed);
     REQUIRE_EQ(conn->local_body_file_fd, file);
     REQUIRE_GT(conn->local_body_remaining, 0u);
+    CHECK_EQ(conn->local_body_cursor, body_bytes.data());
+    CHECK_EQ(conn->local_body_remaining, kBodyLen);
+    u32 header_end = 0;
+    for (u32 i = 0; i + 4 <= conn->send_buf.len(); ++i) {
+        if (memcmp(conn->send_buf.data() + i, "\r\n\r\n", 4) == 0) {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(conn->send_buf.len(), header_end);
+    CHECK_EQ(conn->local_response_size, header_end + kBodyLen);
+    const u64 epoch_while_body_pending = epoch.epoch.load(std::memory_order_acquire);
     // Exactly one SQE so far: request 1's header send. The body chunk isn't
     // touched until that header send "completes".
     CHECK_EQ(guard.sq_tail, sq_before_header1 + 1u);
+    CHECK_EQ(guard.sq_entries[sq_before_header1 & guard.sq_mask].msg_flags,
+             static_cast<u32>(MSG_NOSIGNAL | MSG_MORE));
 
     // Drive the header send's completion by hand, clearing send_armed and
     // pending_ops the way the real CQE-harvesting dispatch() does before
@@ -12865,11 +12886,25 @@ TEST(iouring_send, pipelined_burst_sync_completion_accounts_once_and_serves_next
     // actually waiting on the mocked ring for it.
     conn->send_armed = false;
     if (conn->pending_ops > 0) conn->pending_ops--;
-    const u32 kSendLen = conn->send_buf.len();
+    const u32 kSendLen = header_end;
+    const u32 kPartialHeader = kSendLen / 2u;
+    REQUIRE_GT(kPartialHeader, 0u);
+    on_response_sent<IoUringEventLoop>(
+        &loop, *conn, {conn->id, static_cast<i32>(kPartialHeader), 0, 0, IoEventType::Send, 0});
+    CHECK_EQ(conn->send_progress, kPartialHeader);
+    CHECK_EQ(conn->local_body_send_len, 0u);
+    CHECK_EQ(conn->local_body_remaining, kBodyLen);
+    CHECK_EQ(epoch.epoch.load(std::memory_order_acquire), epoch_while_body_pending);
+    CHECK_EQ(guard.sq_entries[(guard.sq_tail - 1u) & guard.sq_mask].msg_flags,
+             static_cast<u32>(MSG_NOSIGNAL | MSG_MORE));
+    conn->send_armed = false;
+    if (conn->pending_ops > 0) conn->pending_ops--;
     const u32 sq_before_sendfile = guard.sq_tail;
 
     on_response_sent<IoUringEventLoop>(
-        &loop, *conn, {conn->id, static_cast<i32>(kSendLen), 0, 0, IoEventType::Send, 0});
+        &loop,
+        *conn,
+        {conn->id, static_cast<i32>(kSendLen - kPartialHeader), 0, 0, IoEventType::Send, 0});
 
     // The body completed synchronously: zero SQEs for it. The only SQE
     // queued past this point is request 2's header send — the pipeline
@@ -12877,10 +12912,21 @@ TEST(iouring_send, pipelined_burst_sync_completion_accounts_once_and_serves_next
     CHECK_EQ(guard.sq_tail, sq_before_sendfile + 1u);
     CHECK_EQ(backend.send_state[conn->id].file_fd, -1);
     CHECK_EQ(metrics.requests_total, 1u);  // request 1 accounted exactly once
-    CHECK_EQ(conn->resp_status, 204u);     // request 2 was matched and answered
+    CHECK_GT(epoch.epoch.load(std::memory_order_acquire), epoch_while_body_pending);
+    CHECK_EQ(conn->resp_status, 204u);  // request 2 was matched and answered
     CHECK_GE(conn->fd, 0);
     CHECK_EQ(loop.in_sync_send_completion.depth, 0u);
     CHECK_EQ(loop.in_sync_send_completion.max_depth, 1u);
+
+    std::vector<u8> received_body(kBodyLen);
+    u32 received_len = 0;
+    while (received_len < kBodyLen) {
+        const ssize_t n =
+            recv(client, received_body.data() + received_len, kBodyLen - received_len, 0);
+        REQUIRE_GT(n, 0);
+        received_len += static_cast<u32>(n);
+    }
+    CHECK_EQ(memcmp(received_body.data(), body_bytes.data(), kBodyLen), 0);
 
     close(file);
     close(server);
@@ -81958,6 +82004,7 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
         outcome.response_body_idx = 1;
         outcome.response_headers_idx = custom_headers ? 1 : 0;
         handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+        CHECK_EQ(conn->local_body_file_fd, -1);
         const u8* slice = conn->send_buf.data();
         const u32 capacity = conn->send_buf.capacity();
         u32 header_end = 0;
