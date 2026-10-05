@@ -786,7 +786,11 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
             nhdrs++;
         }
     }
-    if (body_len != 0) {
+    // Statuses that cannot carry a representation body are serialized without
+    // one over HTTP/2 too, matching the ordinary HTTP/1 formatter.
+    const bool bodyless_status =
+        o.status_code < 200 || o.status_code == 204 || o.status_code == 205 || o.status_code == 304;
+    if (body_len != 0 && !bodyless_status) {
         if (!h2_stage_owned_response(d,
                                      stream_id,
                                      o.status_code,

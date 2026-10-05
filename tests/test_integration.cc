@@ -20356,6 +20356,112 @@ TEST(route, dsl_response_body_real_socket) {
     rir.destroy();
 }
 
+// End-to-end: an ordinary configured-body 205 must emit the zero-content
+// framing (no representation bytes) even when the body is large enough to take
+// the segmented/file-backed path. A large body must not be appended after the
+// header-only 205, and the downstream keep-alive connection must stay usable.
+TEST(route, dsl_response_205_large_body_real_socket) {
+    using namespace rut;
+
+    std::string src = "route GET \"/reset\" { return response(205, body: \"";
+    src.append(RouteConfig::kResponseBodyPoolBytes + 1024u, 'a');
+    src += "\") }\n";
+    auto lexed = lex(Str{src.data(), static_cast<u32>(src.size())});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    REQUIRE_EQ(rir.module.response_body_count, 1u);
+    REQUIRE_GT(rir.module.response_bodies[0].len, RouteConfig::kResponseBodyPoolBytes);
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        const auto& body = rir.module.response_bodies[i];
+        // View (not copy): the body exceeds the 8 KiB copy pool.
+        const u16 idx = cfg.add_response_body_view(body.ptr, body.len);
+        REQUIRE_EQ(idx, static_cast<u16>(i + 1));
+    }
+    REQUIRE(cfg.add_jit_handler("/reset", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /reset HTTP/1.1\r\nHost: x\r\n\r\n";
+    char buf[2048];
+    // Accumulate through the header terminator; a single recv may return a
+    // partial status line or header block.
+    auto recv_through_headers = [&](u32& out_len) {
+        out_len = 0;
+        while (out_len < sizeof(buf)) {
+            const i32 r =
+                recv_timeout(c, buf + out_len, static_cast<i32>(sizeof(buf) - out_len), 1000);
+            if (r <= 0) break;
+            out_len += static_cast<u32>(r);
+            if (buf_contains(buf, out_len, "\r\n\r\n", 4)) break;
+        }
+    };
+    u32 n = 0;
+    send_all(c, kReq, sizeof(kReq) - 1);
+    recv_through_headers(n);
+    REQUIRE_GT(n, 0u);
+    CHECK(buf_contains(buf, n, "205 Reset Content", 17));
+    CHECK(buf_contains(buf, n, "Content-Length: 0\r\n", 19));
+    CHECK_FALSE(buf_contains(buf, n, "Content-Type:", 13));
+    CHECK_FALSE(buf_contains(buf, n, "aaaa", 4));
+    // The accumulated bytes end exactly at the header terminator: no
+    // representation body or trailing bytes follow, even for the large
+    // segmented body.
+    REQUIRE_GE(n, 4u);
+    CHECK_EQ(memcmp(buf + n - 4, "\r\n\r\n", 4), 0);
+    // No body bytes follow the headers on a keep-alive connection.
+    char extra[64];
+    CHECK_LE(recv_timeout(c, extra, static_cast<i32>(sizeof(extra)), 150), 0);
+
+    // Keep-alive: a second request on the same connection still gets a clean
+    // 205, proving the suppressed body did not corrupt the stream.
+    send_all(c, kReq, sizeof(kReq) - 1);
+    recv_through_headers(n);
+    REQUIRE_GT(n, 0u);
+    CHECK(buf_contains(buf, n, "205 Reset Content", 17));
+    REQUIRE_GE(n, 4u);
+    CHECK_EQ(memcmp(buf + n - 4, "\r\n\r\n", 4), 0);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 // End-to-end: compile a route with custom headers (user-supplied
 // Content-Type must suppress the default text/plain) and assert the
 // real-socket response contains exactly what we expect. Reserved

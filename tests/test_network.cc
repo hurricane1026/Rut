@@ -10195,6 +10195,43 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize - sizeof(body)));
 }
 
+TEST(http2, configured_205_body_is_suppressed) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    static u8 body[64];
+    for (u32 i = 0; i < sizeof(body); i++) body[i] = static_cast<u8>(i + 1);
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)), 1u);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 205;
+    outcome.response_body_idx = 1;
+    u8 response[512]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    h2_emit_outcome(dispatch, 1, outcome, &cfg);
+    CHECK_EQ(h2_staged_status(response, dispatch.resp_len, 1), 205u);
+    CHECK_EQ(h2.outbound_body_len, 0u);
+    // Exactly one HEADERS frame carrying END_STREAM; no DATA frame follows.
+    Http2FrameHeader headers_frame{};
+    REQUIRE_EQ(parse_frame_header(response, dispatch.resp_len, &headers_frame),
+               ParseStatus::Complete);
+    CHECK_EQ(headers_frame.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK((headers_frame.flags & http2_flag::kEndStream) != 0);
+    CHECK_EQ(dispatch.resp_len, kFrameHeaderSize + headers_frame.length);
+}
+
 TEST(http2, flow_controlled_route_body_boundaries_and_window_resume) {
     SmallLoop loop;
     loop.setup();
@@ -33909,6 +33946,7 @@ TEST(metadata, format_static_response_wire_format) {
         {200, "OK", 2, true},
         {201, "Created", 7, false},
         {204, "No Content", 0, true},
+        {205, "Reset Content", 0, true},
         {301, "Moved Permanently", 17, false},
         {302, "Found", 5, true},
         {304, "Not Modified", 0, false},
@@ -34000,6 +34038,62 @@ TEST(metadata, format_static_response_wire_format) {
         }
 
         conn.send_buf.bind(nullptr, 0);
+    }
+}
+
+TEST(metadata, ordinary_205_response_suppresses_representation_body) {
+    const auto wire = [](Connection& conn) {
+        return std::string(reinterpret_cast<const char*>(conn.send_buf.data()),
+                           conn.send_buf.len());
+    };
+
+    // Status-only 205 via the static/reason-phrase formatter.
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_static_response(conn, 205, /*keep_alive=*/true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    // A configured 205 body must be dropped by the ordinary body formatter.
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_response_with_body(conn, 205, "ignored-body", 12, /*keep_alive=*/true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    // Same via the custom-header formatter, which must also skip the default
+    // Content-Type for a bodyless 205.
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        ResponseHeaderKV headers[] = {{"X-Test", 6, "yes", 3}};
+        format_response_with_body_and_headers(
+            conn, 205, "ignored-body", 12, headers, 1, /*keep_alive=*/true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\nX-Test: yes\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    // Neighboring bodies stay intact: 200 keeps its representation body.
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_response_with_body(conn, 200, "ok", 2, /*keep_alive=*/true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                 "Content-Type: text/plain; charset=utf-8\r\n"
+                 "Connection: keep-alive\r\n\r\nok");
     }
 }
 

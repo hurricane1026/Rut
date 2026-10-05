@@ -616,6 +616,8 @@ const char* status_reason(u16 code) {
             return "Created";
         case 204:
             return "No Content";
+        case 205:
+            return "Reset Content";
         case 301:
             return "Moved Permanently";
         case 302:
@@ -884,7 +886,7 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive, bool he
     const char* reason = status_reason(code);
     u32 reason_len = 0;
     while (reason[reason_len]) reason_len++;
-    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     const bool kSuppressBody = kNoBody || headers_only;
     // HEAD carries the representation length in Content-Length while emitting
     // no body bytes on the wire.
@@ -902,7 +904,7 @@ void format_response_with_body(Connection& conn,
                                bool headers_only) {
     // 204 / 304 / 1xx carry no body per HTTP spec; fall back to the
     // default formatter for those codes even if a body was supplied.
-    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     if (kNoBody) {
         format_static_response(conn, code, keep_alive);
         return;
@@ -1000,7 +1002,7 @@ bool format_response_with_body_and_headers(Connection& conn,
                                            bool body_is_fallback_reason_phrase,
                                            bool suppress_default_content_type,
                                            bool headers_only) {
-    const bool kNoBody = (code < 200 || code == 204 || code == 304);
+    const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     const u32 body_len_emit = kNoBody ? 0 : body_len;
     const char* reason = status_reason(code);
     u32 reason_len = 0;
