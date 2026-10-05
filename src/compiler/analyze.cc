@@ -30,7 +30,7 @@ namespace {
 // imported file's temporary AstFile and any HirModule copy. The store is
 // shared across copies, so the non-owning Str views stay valid. Analysis is
 // single-threaded per shard.
-static HirGeneratedNames** g_analyze_owned_buffers = nullptr;
+static thread_local HirGeneratedNames** g_analyze_owned_buffers = nullptr;
 
 struct GeneratedNameSegment {
     const char* ptr;
