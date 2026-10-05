@@ -14,6 +14,7 @@
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
 #include <deque>
+#include <new>
 #include <string>
 
 namespace rut {
@@ -1392,6 +1393,37 @@ struct HirCacheDecl {
     u32 capacity = 0;
 };
 
+// One analyzer-synthesized function name. HIR stores function names as
+// non-owning Str views, so this node owns the bytes for the module's lifetime.
+struct HirGeneratedName {
+    HirGeneratedName* next = nullptr;
+    char* text = nullptr;
+    u32 len = 0;
+};
+
+// Owns the generated function names of one analysis tree. The root module owns
+// the store; imported modules write into the root's store so their merged
+// functions keep valid names. Freed with the owning module.
+struct HirGeneratedNames {
+    HirGeneratedName* head = nullptr;
+
+    HirGeneratedNames() = default;
+    HirGeneratedNames(const HirGeneratedNames&) = delete;
+    HirGeneratedNames& operator=(const HirGeneratedNames&) = delete;
+    ~HirGeneratedNames() { release(); }
+
+    void release() {
+        HirGeneratedName* node = head;
+        while (node != nullptr) {
+            HirGeneratedName* next = node->next;
+            delete[] node->text;
+            delete node;
+            node = next;
+        }
+        head = nullptr;
+    }
+};
+
 struct HirModule {
     static constexpr u32 kMaxUpstreams = 32;
     static constexpr u32 kMaxImports = 64;
@@ -1447,6 +1479,7 @@ struct HirModule {
     FixedVec<HirRoute, kMaxRoutes + kMaxTimers> routes;
     FixedVec<HirTypeShape, kMaxTypeShapes> type_shapes;
     std::deque<std::string> owned_strings;
+    HirGeneratedNames generated_names;
     bool has_package_decl = false;
     Span package_span{};
     Str package_name{};
@@ -1486,9 +1519,11 @@ struct HirModule {
             unmatched_policy_ids[i] = other.unmatched_policy_ids[i];
         }
         rebase_type_alias_storage_ptrs(other);
+        copy_generated_names_from(other);
     }
     HirModule& operator=(const HirModule& other) {
         if (this == &other) return *this;
+        generated_names.release();
         upstreams = other.upstreams;
         response_policies = other.response_policies;
         failure_policies = other.failure_policies;
@@ -1522,10 +1557,47 @@ struct HirModule {
         package_span = other.package_span;
         package_name = other.package_name;
         rebase_type_alias_storage_ptrs(other);
+        copy_generated_names_from(other);
         return *this;
     }
     HirModule(HirModule&& other) noexcept = delete;
     HirModule& operator=(HirModule&& other) noexcept = delete;
+
+    // Deep-copy generated-name buffers and rebase function-name Str views onto
+    // the copy. Best-effort under allocation failure: un-mapped views keep
+    // pointing at the source, which is still alive while copying.
+    void copy_generated_names_from(const HirModule& other) {
+        HirGeneratedName** tail = &generated_names.head;
+        const HirGeneratedName* src = other.generated_names.head;
+        while (src != nullptr) {
+            char* buf = new (std::nothrow) char[src->len];
+            auto* node = new (std::nothrow) HirGeneratedName;
+            if (buf == nullptr || node == nullptr) {
+                delete[] buf;
+                delete node;
+                break;
+            }
+            for (u32 i = 0; i < src->len; i++) buf[i] = src->text[i];
+            node->text = buf;
+            node->len = src->len;
+            node->next = nullptr;
+            *tail = node;
+            tail = &node->next;
+            src = src->next;
+        }
+        for (u32 fi = 0; fi < functions.len; fi++) {
+            const HirGeneratedName* s = other.generated_names.head;
+            const HirGeneratedName* d = generated_names.head;
+            while (s != nullptr && d != nullptr) {
+                if (functions[fi].name.ptr == s->text) {
+                    functions[fi].name = Str{d->text, d->len};
+                    break;
+                }
+                s = s->next;
+                d = d->next;
+            }
+        }
+    }
 
     void rebase_type_alias_storage_ptrs(const HirModule& other) {
         for (u32 i = 0; i < type_aliases.len; i++) {
