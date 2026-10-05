@@ -1834,6 +1834,8 @@ static bool docker_remove(const std::string& name) {
     return command_ok({"docker", "rm", "-f", name});
 }
 
+static bool forked_control_group_has_live_member(pid_t group);
+
 // Reap the complete process group owned by a forked differential control. The
 // control child calls setpgid(0, 0), so its pid is also its process-group id and
 // a negative kill targets the whole owned tree (frontends, CLI wrappers, worker
@@ -1848,6 +1850,13 @@ static bool reap_forked_control_tree(Child& child, const std::string& container_
             (void)kill(child.pid, SIGKILL);
             if (!wait_child(child, 2000)) ok = false;
         }
+        // SIGKILL delivery to the group is asynchronous: wait until every
+        // non-zombie member has exited so the whole owned tree is gone before
+        // this bounded cleanup reports success, not just the direct child.
+        for (int waited = 0; waited < 2000 && forked_control_group_has_live_member(group);
+             waited += 20)
+            poll(nullptr, 0, 20);
+        if (forked_control_group_has_live_member(group)) ok = false;
         child.pid = -1;
     }
     if (!container_name.empty() && !docker_remove(container_name)) ok = false;
@@ -3637,7 +3646,9 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
     (void)docker_remove(container);
 
     int ready_pipe[2] = {-1, -1};
-    if (pipe(ready_pipe) != 0) {
+    // O_CLOEXEC keeps the write end out of the sentinel/docker descendants so the
+    // control's own exit (or death) produces EOF even if they outlive it.
+    if (pipe2(ready_pipe, O_CLOEXEC) != 0) {
         error = "could not create readiness pipe";
         return false;
     }
@@ -3664,8 +3675,6 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
             _exit(44);
         const int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) _exit(45);
-        int one = 1;
-        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -3687,7 +3696,14 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
     close(ready_pipe[1]);
     unsigned char ready[3] = {};
     ssize_t received = 0;
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (received < static_cast<ssize_t>(sizeof(ready))) {
+        const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      ready_deadline - std::chrono::steady_clock::now())
+                                      .count();
+        if (remaining_ms <= 0) break;
+        pollfd ready_poll{ready_pipe[0], POLLIN, 0};
+        if (poll(&ready_poll, 1, static_cast<int>(remaining_ms)) <= 0) break;
         const ssize_t n = read(ready_pipe[0], ready + received, sizeof(ready) - received);
         if (n <= 0) break;
         received += n;
@@ -3708,9 +3724,6 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
         error = "abnormal forked-control cleanup reported failure";
         ok = false;
     }
-    for (int waited = 0; waited < 2000 && forked_control_group_has_live_member(control);
-         waited += 20)
-        poll(nullptr, 0, 20);
     if (forked_control_group_has_live_member(control)) {
         error = "owned process group still has live members after cleanup";
         ok = false;
@@ -3725,8 +3738,8 @@ static bool run_forked_control_cleanup_self_check(std::string& error) {
             error = "could not open rebind socket";
             ok = false;
         } else {
-            int one = 1;
-            (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            // No SO_REUSEADDR: only a bind after the control's socket is truly
+            // closed can succeed, so this proves the held port was released.
             sockaddr_in addr{};
             addr.sin_family = AF_INET;
             addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -74293,15 +74306,16 @@ static bool run_converter_default_buffering_206_range_incomplete_clean_eof_diffe
                                         WIFEXITED(withheld_child.status) &&
                                         WEXITSTATUS(withheld_child.status) == kExpectedWithheldExit;
     const std::string withheld_status = child_status_description(withheld_child);
-    withheld_child.pid = -1;
     if (!exact_expected_failure) {
         // The direct child exited, but forked descendants or its container may
-        // still be alive; drop both before reporting the failure.
+        // still be alive; drop both before reporting the failure. Keep the pid
+        // set so the helper can still target the control's process group.
         (void)reap_forked_control_tree(withheld_child, withheld_container);
         error = "#546 real withheld-authorization control returned " + withheld_status +
                 " instead of exact expected nonzero exit " + std::to_string(kExpectedWithheldExit);
         return false;
     }
+    withheld_child.pid = -1;
     std::cerr << "PASS control: #546 real RUT-side EOF authorization remained withheld through "
                  "its bounded action deadline, exited nonzero, and released all isolated "
                  "resources\n";
