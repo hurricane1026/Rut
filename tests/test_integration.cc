@@ -72,6 +72,9 @@ void observe_iouring_tls_low_water_resume_for_test() {
 
 }  // namespace rut
 
+rut::u32 settlement_event_token_conn_id(const rut::IoEvent& event);
+rut::u64 settlement_event_reconstructed_token(const rut::IoEvent& event);
+
 // Helper: Connection with local buffer storage (for tests that use raw backends).
 static constexpr u32 kTestBufSize = 4096;
 
@@ -4834,6 +4837,10 @@ TEST(uring, wait_emits_timeout_tick) {
     CHECK_GE(events[0].result, 1);
     CHECK_EQ(events[0].has_buf, 0u);
     CHECK_EQ(events[0].buf_id, 0u);
+    CHECK_EQ(events[0].conn_id, 0u);
+    CHECK_EQ(settlement_event_token_conn_id(events[0]), kIoUserDataMaxConnId - 1u);
+    CHECK_EQ(settlement_event_reconstructed_token(events[0]),
+             encode_non_upstream_user_data({kIoUserDataMaxConnId - 1u, IoEventType::Timeout, 0}));
 
     backend.shutdown();
     close(lfd);
@@ -14738,18 +14745,448 @@ struct KeepAliveCountingUpstream {
 // loop: harvest those remaining completions so slot and slice accounting
 // reflects the settled state. io_uring only (epoll closes synchronously);
 // the armed 1 s timer read bounds each wait.
+struct SettlementTrace {
+    static constexpr u32 kMaxBatches = 16;
+    static constexpr u32 kMaxEvents = 32;
+    static constexpr u32 kMaxOwnersPerBatch = 4;
+
+    struct Event {
+        u32 conn_id = UINT32_MAX;
+        i32 result = 0;
+        u32 generation_episode_or_aux = 0;
+        u64 reconstructed_token = kInvalidIoUserData;
+        u16 buf_id = 0;
+        u8 type = 0;
+        u8 aux = 0;
+        u8 more = 0;
+        u8 has_buf = 0;
+    } events[kMaxEvents]{};
+    struct Owner {
+        u32 conn_id = UINT32_MAX;
+        i32 fd = -1;
+        i32 upstream_fd = -1;
+        u32 pending_ops = 0;
+        u32 current_episode = 0;
+        u32 retiring_episode = 0;
+        u32 close_episode = 0;
+        u32 armed_mask = 0;
+        u32 cancel_mask = 0;
+        i32 downstream_send_fd = -1;
+        u32 downstream_send_remaining = 0;
+        u32 downstream_send_generation = 0;
+        i32 upstream_send_fd = -1;
+        u32 upstream_send_remaining = 0;
+        u32 upstream_send_generation = 0;
+        u32 upstream_send_episode = 0;
+        u8 downstream_send_type = 0;
+        u8 upstream_send_type = 0;
+        u8 state = 0;
+        u8 retirement_target_owned = 0;
+        u8 retirement_cancel_owned = 0;
+        u8 retirement_cancel_retry = 0;
+        u8 close_target_owned = 0;
+        u8 close_cancel_owned = 0;
+        u8 close_pause_cancel_owned = 0;
+    };
+    struct Batch {
+        u32 sq_head_before = 0;
+        u32 sq_tail_before = 0;
+        u32 cq_head_before = 0;
+        u32 cq_tail_before = 0;
+        u32 sq_head_after = 0;
+        u32 sq_tail_after = 0;
+        u32 cq_head_after = 0;
+        u32 cq_tail_after = 0;
+        u32 backend_pending = 0;
+        u32 active = 0;
+        u32 pending_free = 0;
+        u32 pool_in_use = 0;
+        u32 owner_count = 0;
+        bool owners_truncated = false;
+        Owner owners[kMaxOwnersPerBatch]{};
+    } batches[kMaxBatches]{};
+    u32 batch_count = 0;
+    u32 event_count = 0;
+    u32 event_next = 0;
+};
+
+inline u32 settlement_event_generation_or_episode(const IoEvent& event) {
+    if (io_event_uses_upstream_episode(event.type)) return event.upstream_episode;
+    switch (event.type) {
+        case IoEventType::Recv:
+            return event.aux;
+        case IoEventType::HandlerTimer:
+            return static_cast<u32>(event.result);
+        case IoEventType::Send:
+        case IoEventType::ResponseReadTimer:
+            return event.non_upstream_generation;
+        case IoEventType::Accept:
+        case IoEventType::Timeout:
+        case IoEventType::UpstreamConnect:
+        case IoEventType::UpstreamRecv:
+        case IoEventType::UpstreamSend:
+        case IoEventType::RelayRead:
+        case IoEventType::RelayWrite:
+        case IoEventType::Count:
+            return 0;
+    }
+    return 0;
+}
+
+inline u32 settlement_event_token_conn_id(const IoEvent& event) {
+    return event.type == IoEventType::Timeout ? kIoUserDataMaxConnId - 1u : event.conn_id;
+}
+
+inline u64 settlement_event_reconstructed_token(const IoEvent& event) {
+    if (io_event_uses_upstream_episode(event.type))
+        return encode_upstream_event_token(
+            {settlement_event_token_conn_id(event), event.type, event.upstream_episode, event.aux});
+    const u32 generation = settlement_event_generation_or_episode(event);
+    return encode_non_upstream_user_data(
+        {settlement_event_token_conn_id(event), event.type, generation});
+}
+
+template <typename LoopT, typename Fn>
+void for_each_initialized_settlement_slot(const LoopT& loop, Fn&& fn) {
+    for (u32 id = 0; id < loop.slots_initialized; id++) fn(id, loop.conns[id]);
+}
+
 template <typename ShardT>
-void settle_stopped_iouring_shard(ShardT& shard) {
+void settle_stopped_iouring_shard(ShardT& shard, SettlementTrace* trace = nullptr) {
     auto* loop = shard.loop;
     if constexpr (requires { loop->backend.sq_tail; }) {
         IoEvent events[64];
         for (u32 it = 0; it < 16u && (loop->active_count() > 0u || loop->pending_free_count > 0u ||
                                       loop->pool.in_use() > 0u);
              it++) {
+            SettlementTrace::Batch* batch = nullptr;
+            if (trace != nullptr && trace->batch_count < SettlementTrace::kMaxBatches) {
+                batch = &trace->batches[trace->batch_count++];
+                batch->sq_head_before = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+                batch->sq_tail_before = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                batch->cq_head_before = __atomic_load_n(loop->backend.cq_head, __ATOMIC_ACQUIRE);
+                batch->cq_tail_before = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+            }
             const u32 n = loop->backend.wait(events, 64, loop->conns, loop->connection_capacity);
+            if (trace != nullptr) {
+                for (u32 i = 0; i < n; i++) {
+                    auto& captured = trace->events[trace->event_next];
+                    captured.conn_id = events[i].conn_id;
+                    captured.result = events[i].result;
+                    captured.type = static_cast<u8>(events[i].type);
+                    captured.aux = events[i].aux;
+                    captured.more = events[i].more;
+                    captured.has_buf = events[i].has_buf;
+                    captured.buf_id = events[i].buf_id;
+                    captured.generation_episode_or_aux =
+                        settlement_event_generation_or_episode(events[i]);
+                    captured.reconstructed_token = settlement_event_reconstructed_token(events[i]);
+                    trace->event_next = (trace->event_next + 1u) % SettlementTrace::kMaxEvents;
+                    if (trace->event_count < SettlementTrace::kMaxEvents) trace->event_count++;
+                }
+            }
             for (u32 i = 0; i < n; i++) loop->dispatch(events[i]);
+            if (batch != nullptr) {
+                batch->sq_head_after = __atomic_load_n(loop->backend.sq_head, __ATOMIC_ACQUIRE);
+                batch->sq_tail_after = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+                batch->cq_head_after = __atomic_load_n(loop->backend.cq_head, __ATOMIC_ACQUIRE);
+                batch->cq_tail_after = __atomic_load_n(loop->backend.cq_tail, __ATOMIC_ACQUIRE);
+                batch->backend_pending = loop->backend.pending;
+                batch->active = loop->active_count();
+                batch->pending_free = loop->pending_free_count;
+                batch->pool_in_use = loop->pool.in_use();
+                for_each_initialized_settlement_slot(*loop, [&](u32 id, const auto& conn) {
+                    const auto& downstream = loop->backend.send_state[id];
+                    const auto& upstream = loop->backend.upstream_send_state[id];
+                    const bool owns_work = conn.pending_ops != 0 || conn.recv_armed ||
+                                           conn.send_armed || conn.upstream_connect_armed ||
+                                           conn.upstream_recv_armed || conn.upstream_send_armed ||
+                                           conn.recv_pause_cancel_pending ||
+                                           conn.upstream_recv_pause_cancel_pending ||
+                                           conn.upstream_retirement_active ||
+                                           conn.upstream_retirement_target_owned != 0 ||
+                                           conn.upstream_retirement_cancel_owned != 0 ||
+                                           conn.upstream_close_target_owned != 0 ||
+                                           conn.upstream_close_cancel_owned != 0 ||
+                                           downstream.remaining != 0 || upstream.remaining != 0;
+                    if (!owns_work) return;
+                    if (batch->owner_count == SettlementTrace::kMaxOwnersPerBatch) {
+                        batch->owners_truncated = true;
+                        return;
+                    }
+                    auto& owner = batch->owners[batch->owner_count++];
+                    owner.conn_id = id;
+                    owner.fd = conn.fd;
+                    owner.upstream_fd = conn.upstream_fd;
+                    owner.pending_ops = conn.pending_ops;
+                    owner.current_episode = conn.upstream_episode;
+                    owner.retiring_episode = conn.upstream_retiring_episode;
+                    owner.close_episode = conn.upstream_close_episode;
+                    owner.state = static_cast<u8>(conn.state);
+                    owner.retirement_target_owned = conn.upstream_retirement_target_owned;
+                    owner.retirement_cancel_owned = conn.upstream_retirement_cancel_owned;
+                    owner.retirement_cancel_retry = conn.upstream_retirement_cancel_retry;
+                    owner.close_target_owned = conn.upstream_close_target_owned;
+                    owner.close_cancel_owned = conn.upstream_close_cancel_owned;
+                    owner.close_pause_cancel_owned =
+                        conn.upstream_close_pause_cancel_owned ? 1u : 0u;
+                    owner.armed_mask = (conn.recv_armed ? 1u : 0u) | (conn.send_armed ? 2u : 0u) |
+                                       (conn.upstream_connect_armed ? 4u : 0u) |
+                                       (conn.upstream_recv_armed ? 8u : 0u) |
+                                       (conn.upstream_send_armed ? 16u : 0u);
+                    owner.cancel_mask = (conn.recv_pause_cancel_pending ? 1u : 0u) |
+                                        (conn.upstream_recv_pause_cancel_pending ? 2u : 0u) |
+                                        (conn.upstream_close_cancel_owned != 0 ? 4u : 0u);
+                    owner.downstream_send_fd = downstream.fd;
+                    owner.downstream_send_remaining = downstream.remaining;
+                    owner.downstream_send_generation = downstream.generation;
+                    owner.downstream_send_type = static_cast<u8>(downstream.type);
+                    owner.upstream_send_fd = upstream.fd;
+                    owner.upstream_send_remaining = upstream.remaining;
+                    owner.upstream_send_generation = upstream.generation;
+                    owner.upstream_send_episode = upstream.upstream_episode;
+                    owner.upstream_send_type = static_cast<u8>(upstream.type);
+                });
+            }
         }
     }
+}
+
+void emit_settlement_trace_if_nonzero(FILE* output,
+                                      u32 active,
+                                      u32 pending_free,
+                                      u32 pool_in_use,
+                                      u64 pending_ops,
+                                      const SettlementTrace& trace) {
+    if (active == 0 && pending_free == 0 && pool_in_use == 0 && pending_ops == 0) return;
+
+    fprintf(output,
+            "\n[settlement-trace] nonzero ownership active=%u pending_free=%u pool_in_use=%u "
+            "pending_ops=%llu batches=%u\n",
+            active,
+            pending_free,
+            pool_in_use,
+            static_cast<unsigned long long>(pending_ops),
+            trace.batch_count);
+    for (u32 i = 0; i < trace.batch_count; i++) {
+        const auto& b = trace.batches[i];
+        fprintf(output,
+                "[settlement-trace] batch=%u sq=%u/%u->%u/%u cq=%u/%u->%u/%u "
+                "backend_pending=%u active=%u pending_free=%u pool_in_use=%u "
+                "owner_count=%u owners_truncated=%u\n",
+                i,
+                b.sq_head_before,
+                b.sq_tail_before,
+                b.sq_head_after,
+                b.sq_tail_after,
+                b.cq_head_before,
+                b.cq_tail_before,
+                b.cq_head_after,
+                b.cq_tail_after,
+                b.backend_pending,
+                b.active,
+                b.pending_free,
+                b.pool_in_use,
+                b.owner_count,
+                b.owners_truncated ? 1u : 0u);
+        for (u32 j = 0; j < b.owner_count; j++) {
+            const auto& o = b.owners[j];
+            fprintf(output,
+                    "[settlement-trace] owner id=%u fd=%d upstream_fd=%d state=%u "
+                    "pending_ops=%u armed=0x%x cancel=0x%x episode=%u retiring=%u "
+                    "close_episode=%u retirement_target=%u retirement_cancel=%u "
+                    "retirement_retry=%u close_target=%u close_cancel=%u close_pause_cancel=%u "
+                    "ds_send(type=%u,fd=%d,remaining=%u,generation=%u) "
+                    "us_send(type=%u,fd=%d,remaining=%u,generation=%u,episode=%u)\n",
+                    o.conn_id,
+                    o.fd,
+                    o.upstream_fd,
+                    static_cast<u32>(o.state),
+                    o.pending_ops,
+                    o.armed_mask,
+                    o.cancel_mask,
+                    o.current_episode,
+                    o.retiring_episode,
+                    o.close_episode,
+                    static_cast<u32>(o.retirement_target_owned),
+                    static_cast<u32>(o.retirement_cancel_owned),
+                    static_cast<u32>(o.retirement_cancel_retry),
+                    static_cast<u32>(o.close_target_owned),
+                    static_cast<u32>(o.close_cancel_owned),
+                    static_cast<u32>(o.close_pause_cancel_owned),
+                    static_cast<u32>(o.downstream_send_type),
+                    o.downstream_send_fd,
+                    o.downstream_send_remaining,
+                    o.downstream_send_generation,
+                    static_cast<u32>(o.upstream_send_type),
+                    o.upstream_send_fd,
+                    o.upstream_send_remaining,
+                    o.upstream_send_generation,
+                    o.upstream_send_episode);
+        }
+    }
+    const u32 first = (trace.event_next + SettlementTrace::kMaxEvents - trace.event_count) %
+                      SettlementTrace::kMaxEvents;
+    for (u32 i = 0; i < trace.event_count; i++) {
+        const auto& e = trace.events[(first + i) % SettlementTrace::kMaxEvents];
+        fprintf(output,
+                "[settlement-trace] cqe id=%u type=%u result=%d aux=%u more=%u "
+                "generation_episode_or_aux=%u reconstructed_token=0x%llx has_buf=%u buf_id=%u\n",
+                e.conn_id,
+                static_cast<u32>(e.type),
+                e.result,
+                static_cast<u32>(e.aux),
+                static_cast<u32>(e.more),
+                e.generation_episode_or_aux,
+                static_cast<unsigned long long>(e.reconstructed_token),
+                static_cast<u32>(e.has_buf),
+                static_cast<u32>(e.buf_id));
+    }
+    fflush(output);
+}
+
+template <typename ShardT>
+void print_settlement_trace_if_nonzero(const ShardT& shard,
+                                       const SettlementTrace& trace,
+                                       FILE* output = stderr) {
+    const auto* loop = shard.loop;
+    u64 pending_ops = 0;
+    for_each_initialized_settlement_slot(
+        *loop, [&](u32, const auto& conn) { pending_ops += conn.pending_ops; });
+    emit_settlement_trace_if_nonzero(output,
+                                     loop->active_count(),
+                                     loop->pending_free_count,
+                                     loop->pool.in_use(),
+                                     pending_ops,
+                                     trace);
+}
+
+TEST(route, settlement_trace_formatter_uses_fixed_sink_and_ring_order) {
+    SettlementTrace trace{};
+    auto& batch = trace.batches[0];
+    trace.batch_count = 1;
+    batch.active = 1;
+    batch.pending_free = 2;
+    batch.pool_in_use = 3;
+    batch.backend_pending = 4;
+    batch.owner_count = SettlementTrace::kMaxOwnersPerBatch;
+    batch.owners_truncated = true;
+    batch.owners[0].conn_id = 17;
+    batch.owners[0].fd = 21;
+    batch.owners[0].pending_ops = 2;
+
+    // Simulate three most-recent entries spanning the circular buffer wrap.
+    trace.event_count = 3;
+    trace.event_next = 2;
+    trace.events[31].conn_id = 11;
+    trace.events[31].type = static_cast<u8>(IoEventType::Recv);
+    trace.events[31].aux = kPauseCancelAux;
+    trace.events[31].reconstructed_token = settlement_event_reconstructed_token(
+        IoEvent{11, 0, 0, 0, IoEventType::Recv, 0, kPauseCancelAux});
+    trace.events[0].conn_id = 12;
+    trace.events[0].type = static_cast<u8>(IoEventType::UpstreamConnect);
+    trace.events[0].generation_episode_or_aux = 2;
+    trace.events[0].reconstructed_token =
+        encode_upstream_event_token({12, IoEventType::UpstreamConnect, 2, 0});
+    trace.events[1].conn_id = 13;
+    trace.events[1].type = static_cast<u8>(IoEventType::Recv);
+    trace.events[1].aux = kDownstreamCloseCancelAux;
+    trace.events[1].reconstructed_token = settlement_event_reconstructed_token(
+        IoEvent{13, 0, 0, 0, IoEventType::Recv, 0, kDownstreamCloseCancelAux});
+
+    char output[8192]{};
+    FILE* sink = fmemopen(output, sizeof(output), "w");
+    REQUIRE(sink != nullptr);
+    emit_settlement_trace_if_nonzero(sink, 1, 2, 3, 4, trace);
+    REQUIRE_EQ(fclose(sink), 0);
+
+    CHECK(strstr(output, "active=1 pending_free=2 pool_in_use=3 pending_ops=4") != nullptr);
+    CHECK(strstr(output, "owner_count=4 owners_truncated=1") != nullptr);
+    CHECK(strstr(output, "reconstructed_token=0x") != nullptr);
+    const char* first = strstr(output, "cqe id=11");
+    const char* second = strstr(output, "cqe id=12");
+    const char* third = strstr(output, "cqe id=13");
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    REQUIRE(third != nullptr);
+    CHECK_LT(first, second);
+    CHECK_LT(second, third);
+}
+
+TEST(route, settlement_trace_tokens_preserve_aux_and_scan_initialized_prefix) {
+    struct EventCase {
+        IoEventType type;
+        u8 aux;
+        i32 result;
+        u32 generation;
+        u32 episode;
+        u32 expected_high;
+        bool uses_episode;
+    };
+    const EventCase cases[] = {
+        {IoEventType::Accept, 0, 0, 0, 0, 0, false},
+        {IoEventType::Recv, 0, 0, 0, 0, 0, false},
+        {IoEventType::Recv, kDownstreamCloseCancelAux, 0, 0, 0, kDownstreamCloseCancelAux, false},
+        {IoEventType::Send, 0, 0, 0x1234u, 0, 0x1234u, false},
+        {IoEventType::UpstreamConnect, kUpstreamRetirementCancelAux, 0, 0, 0x5678u, 0x5678u, true},
+        {IoEventType::UpstreamRecv, kUpstreamCloseCancelAux, 0, 0, 0x5679u, 0x5679u, true},
+        {IoEventType::UpstreamSend, kPauseCancelAux, 0, 0, 0x567Au, 0x567Au, true},
+        {IoEventType::RelayRead, 2, 0, 0, 0x567Bu, 0x567Bu, true},
+        {IoEventType::RelayWrite, 3, 0, 0, 0x567Cu, 0x567Cu, true},
+        {IoEventType::Timeout, 0, 0, 0, 0, 0, false},
+        {IoEventType::HandlerTimer, 0, 0x2345, 0, 0, 0x2345u, false},
+        {IoEventType::ResponseReadTimer, 0, 0, 0x3456u, 0, 0x3456u, false},
+    };
+    for (u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const auto& test = cases[i];
+        IoEvent event{};
+        event.conn_id =
+            test.type == IoEventType::Accept || test.type == IoEventType::Timeout ? 0u : 7u + i;
+        event.type = test.type;
+        event.aux = test.aux;
+        event.result = test.result;
+        event.non_upstream_generation = test.generation;
+        event.upstream_episode = test.episode;
+        CHECK_EQ(settlement_event_generation_or_episode(event), test.expected_high);
+        const u32 expected_conn_id =
+            test.type == IoEventType::Timeout ? kIoUserDataMaxConnId - 1u : event.conn_id;
+        const u64 expected =
+            test.uses_episode
+                ? encode_upstream_event_token({expected_conn_id, test.type, test.episode, test.aux})
+                : encode_non_upstream_user_data({expected_conn_id, test.type, test.expected_high});
+        CHECK_EQ(settlement_event_reconstructed_token(event), expected);
+    }
+
+    struct LazySlots {
+        struct Item {
+            u32 value;
+        };
+        struct View {
+            Item items[16]{};
+            mutable u32 read_count = 0;
+            mutable u32 out_of_prefix_reads = 0;
+
+            const Item& operator[](u32 id) const {
+                if (id >= 3u) {
+                    out_of_prefix_reads++;
+                    return items[0];
+                }
+                read_count++;
+                return items[id];
+            }
+        } conns{};
+        u32 connection_capacity = 16;
+        u32 slots_initialized = 3;
+    } lazy{};
+    u32 visited = 0;
+    for_each_initialized_settlement_slot(lazy, [&](u32 id, const auto&) {
+        CHECK_LT(id, lazy.slots_initialized);
+        visited++;
+    });
+    CHECK_EQ(lazy.connection_capacity, 16u);
+    CHECK_EQ(visited, 3u);
+    CHECK_EQ(lazy.conns.read_count, 3u);
+    CHECK_EQ(lazy.conns.out_of_prefix_reads, 0u);
 }
 
 template <typename ShardT>
@@ -38935,7 +39372,9 @@ TEST(route, ordinary_source_validated_failure_late_strict_successor_iouring) {
     client.fd = -1;
     shard.stop();
     runner.join();
-    settle_stopped_iouring_shard(shard);
+    SettlementTrace settlement_trace{};
+    settle_stopped_iouring_shard(shard, &settlement_trace);
+    print_settlement_trace_if_nonzero(shard, settlement_trace);
     REQUIRE(runner.exited.load(std::memory_order_acquire));
 
     CHECK_EQ(shard.backend_failure_code(), 0);
