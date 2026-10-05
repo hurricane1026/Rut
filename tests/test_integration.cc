@@ -27156,7 +27156,9 @@ route GET "/compiled-sentinel" { return 204 }
 
     shard.stop();
     shard.join();
-    settle_stopped_iouring_shard(shard);
+    SettlementTrace settlement_trace{};
+    settle_stopped_iouring_shard(shard, &settlement_trace);
+    print_settlement_trace_if_nonzero(shard, settlement_trace);
     shard_guard.spawned = false;
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
