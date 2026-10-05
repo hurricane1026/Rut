@@ -33909,6 +33909,7 @@ TEST(metadata, format_static_response_wire_format) {
         {200, "OK", 2, true},
         {201, "Created", 7, false},
         {204, "No Content", 0, true},
+        {205, "Reset Content", 0, true},
         {301, "Moved Permanently", 17, false},
         {302, "Found", 5, true},
         {304, "Not Modified", 0, false},
@@ -34000,6 +34001,62 @@ TEST(metadata, format_static_response_wire_format) {
         }
 
         conn.send_buf.bind(nullptr, 0);
+    }
+}
+
+TEST(metadata, ordinary_205_response_suppresses_representation_body) {
+    const auto wire = [](Connection& conn) {
+        return std::string(reinterpret_cast<const char*>(conn.send_buf.data()),
+                           conn.send_buf.len());
+    };
+
+    // Status-only 205 via the static/reason-phrase formatter.
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_static_response(conn, 205, /*keep_alive=*/true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    // A configured 205 body must be dropped by the ordinary body formatter.
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_response_with_body(conn, 205, "ignored-body", 12, /*keep_alive=*/true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    // Same via the custom-header formatter, which must also skip the default
+    // Content-Type for a bodyless 205.
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        ResponseHeaderKV headers[] = {{"X-Test", 6, "yes", 3}};
+        format_response_with_body_and_headers(
+            conn, 205, "ignored-body", 12, headers, 1, /*keep_alive=*/true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\nX-Test: yes\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    // Neighboring bodies stay intact: 200 keeps its representation body.
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_response_with_body(conn, 200, "ok", 2, /*keep_alive=*/true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                 "Content-Type: text/plain; charset=utf-8\r\n"
+                 "Connection: keep-alive\r\n\r\nok");
     }
 }
 

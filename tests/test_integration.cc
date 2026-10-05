@@ -20356,6 +20356,84 @@ TEST(route, dsl_response_body_real_socket) {
     rir.destroy();
 }
 
+// End-to-end: an ordinary configured-body 205 must emit the zero-content
+// framing (no representation bytes) even though the source supplies a body.
+TEST(route, dsl_response_205_body_real_socket) {
+    using namespace rut;
+
+    const char* src = "route GET \"/reset\" { return response(205, body: \"ignored-body\") }\n";
+    auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
+    REQUIRE(lexed);
+    auto ast = parse_file(lexed.value());
+    REQUIRE(ast);
+    std::unique_ptr<AstFile> ast_owned(ast.value());
+    auto hir = analyze_file(*ast_owned);
+    REQUIRE(hir);
+    std::unique_ptr<HirModule> hir_owned(hir.value());
+    auto mir = build_mir(*hir_owned);
+    REQUIRE(mir);
+    std::unique_ptr<MirModule> mir_owned(mir.value());
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(*mir_owned, rir);
+    REQUIRE(lowered);
+    auto cg = jit::codegen(rir.module);
+    REQUIRE(cg.ok);
+    jit::JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler_fn != nullptr);
+
+    RouteConfig cfg{};
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        const auto& body = rir.module.response_bodies[i];
+        const u16 idx = cfg.add_response_body(body.ptr, body.len);
+        REQUIRE_EQ(idx, static_cast<u16>(i + 1));
+    }
+    REQUIRE(cfg.add_jit_handler("/reset", 'G', handler_fn));
+    const RouteConfig* active = &cfg;
+
+    RealLoop* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    auto lfd_result = create_listen_socket(0);
+    REQUIRE(lfd_result.has_value());
+    i32 lfd = lfd_result.value();
+    u16 port = get_port(lfd);
+    REQUIRE(loop->init(0, lfd).has_value());
+    loop->config_ptr = &active;
+    LoopThread lt = {loop, {}, 100};
+    lt.start();
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    const char kReq[] = "GET /reset HTTP/1.1\r\nHost: x\r\n\r\n";
+    send_all(c, kReq, sizeof(kReq) - 1);
+    char buf[2048];
+    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
+    CHECK_GT(n, 0);
+    const Str response{buf, static_cast<u32>(n)};
+    auto has = [&](const char* needle, u32 nlen) {
+        return buf_contains(
+            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
+    };
+    CHECK(has("205 Reset Content", 17));
+    CHECK(has("Content-Length: 0\r\n", 19));
+    CHECK_FALSE(has("Content-Type:", 13));
+    CHECK_FALSE(has("ignored-body", 12));
+    // The response ends exactly at the header terminator: no representation
+    // body or trailing bytes follow.
+    REQUIRE_GE(response.len, 4u);
+    CHECK_EQ(memcmp(response.ptr + response.len - 4, "\r\n\r\n", 4), 0);
+
+    close(c);
+    lt.stop();
+    loop->shutdown();
+    close(lfd);
+    destroy_real_loop(loop);
+    engine.shutdown();
+    rir.destroy();
+}
+
 // End-to-end: compile a route with custom headers (user-supplied
 // Content-Type must suppress the default text/plain) and assert the
 // real-socket response contains exactly what we expect. Reserved

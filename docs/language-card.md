@@ -244,6 +244,12 @@ storage; `LoadedProgram` keeps that storage alive through teardown and reload
 retirement. This documents the configured local/static response path and does
 not make dynamic `resp.body` mutation available.
 
+Statuses that cannot carry a representation body — `1xx`, `204`, `205`, and
+`304` — are serialized with `Content-Length: 0` and no body bytes. A configured
+body for one of those statuses is dropped on the wire (it is not a commit
+failure), matching the ordinary local-response framing for the other no-body
+statuses.
+
 ## State types (top-level, per-shard, bounded)
 
 ```swift
