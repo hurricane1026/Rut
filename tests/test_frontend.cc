@@ -4816,6 +4816,34 @@ route GET "/x" { let code = require(req.http11) if code == 7 { return 200 } else
     rir.destroy();
 }
 
+TEST(frontend, copied_hir_keeps_byte_body_after_original_destroyed) {
+    // Body bytes live in a refcounted HIR-owned store shared across copies, so
+    // a copy remains valid after the original module is destroyed.
+    const char* src = "route GET \"/x\" { return response(200, body: b\"a\\x00b\") }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto copy = std::make_unique<HirModule>(hir.value());
+    hir.reset();
+    auto mir = build_mir_heap(*copy);
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    REQUIRE(lowered);
+    static const unsigned char kExpected[] = {'a', 0x00, 'b'};
+    bool found = false;
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        if (rir.module.response_bodies[i].len == sizeof(kExpected) &&
+            memcmp(rir.module.response_bodies[i].ptr, kExpected, sizeof(kExpected)) == 0)
+            found = true;
+    }
+    CHECK(found);
+    rir.destroy();
+}
+
 TEST(frontend, identical_byte_bodies_share_pool_storage) {
     const char* src =
         "route GET \"/a\" { return response(200, body: b\"same\") }\n"

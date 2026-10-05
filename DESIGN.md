@@ -631,8 +631,9 @@ The `body: b"..."` byte-string form is the exact-byte alternative: it decodes
 `\n`, `\r`, `\t`, `\\`, `\"`, and `\xNN` to exact bytes and is limited to 4096
 decoded bytes (the same bound as the failure/strict exact-byte bodies), while
 `body: "..."` keeps the raw source spelling of backslash sequences. Invalid or
-truncated escapes reject at parse time. `respond(status, b"...")` accepts the
-same form for guard-failure terminators.
+truncated escapes reject at parse time. The guard-failure terminator accepts the
+same byte body after its status, e.g.
+`guard ok else { respond 401, b"a\x00b" }`.
 
 #### 3.3.5.1 Local Response and Forward Failure Policies (Envoy H1)
 

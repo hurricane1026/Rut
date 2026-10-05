@@ -23,21 +23,40 @@ namespace rut {
 static u32 g_import_analysis_counter = 0;
 static std::deque<std::string> g_stable_generated_names;
 
-// Root owned-strings store for the current (possibly nested) analyze call.
-// Exact-byte response bodies are copied here so their bytes outlive an imported
-// file's temporary AstFile. Analysis is single-threaded per shard.
-static std::deque<std::string>* g_analyze_owned_strings = nullptr;
-
 namespace {
 
-struct ScopedAnalyzeOwnedStrings {
-    std::deque<std::string>* previous;
-    explicit ScopedAnalyzeOwnedStrings(std::deque<std::string>* current)
-        : previous(g_analyze_owned_strings) {
-        g_analyze_owned_strings = current;
-    }
-    ~ScopedAnalyzeOwnedStrings() { g_analyze_owned_strings = previous; }
+// Root refcounted HIR buffer store for the current (possibly nested) analyze
+// call. Exact-byte response bodies are copied here so their bytes outlive an
+// imported file's temporary AstFile and any HirModule copy. The store is
+// shared across copies, so the non-owning Str views stay valid. Analysis is
+// single-threaded per shard.
+static HirGeneratedNames** g_analyze_owned_buffers = nullptr;
+
+struct GeneratedNameSegment {
+    const char* ptr;
+    u32 len;
 };
+
+static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
+                                                const GeneratedNameSegment* segments,
+                                                u32 segment_count);
+
+struct ScopedAnalyzeOwnedBuffers {
+    HirGeneratedNames** previous;
+    explicit ScopedAnalyzeOwnedBuffers(HirGeneratedNames** current)
+        : previous(g_analyze_owned_buffers) {
+        g_analyze_owned_buffers = current;
+    }
+    ~ScopedAnalyzeOwnedBuffers() { g_analyze_owned_buffers = previous; }
+};
+
+// Copy an AST-backed response body into the shared HIR buffer store so it
+// outlives the source AstFile and any HirModule copy.
+static FrontendResult<Str> intern_owned_response_body(Str body) {
+    if (g_analyze_owned_buffers == nullptr || body.ptr == nullptr) return body;
+    const GeneratedNameSegment segment{body.ptr, body.len};
+    return store_generated_name(*g_analyze_owned_buffers, &segment, 1);
+}
 
 static Str intern_generated_name(const std::string& value) {
     g_stable_generated_names.push_back(value);
@@ -150,13 +169,6 @@ static Str stash_owned_string(std::deque<std::string>& store, const std::string&
     store.push_back(value);
     const auto& kept = store.back();
     return {kept.c_str(), static_cast<u32>(kept.size())};
-}
-
-// Copy an AST-backed response body into the root owned-strings store so it
-// outlives the source AstFile (notably an imported file's temporary AST).
-static Str intern_owned_response_body(Str body) {
-    if (g_analyze_owned_strings == nullptr || body.ptr == nullptr) return body;
-    return stash_owned_string(*g_analyze_owned_strings, std::string(body.ptr, body.len));
 }
 
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
@@ -1724,11 +1736,6 @@ static const HirImplMethod* find_impl_method(const HirImpl& impl, Str name) {
     }
     return nullptr;
 }
-
-struct GeneratedNameSegment {
-    const char* ptr;
-    u32 len;
-};
 
 // Concatenate segments into one HIR-owned, nothrow-allocated name. Allocation
 // failure returns FrontendError::OutOfMemory so the -fno-exceptions build never
@@ -6246,9 +6253,11 @@ static FrontendResult<HirExpr> analyze_function_body_stmt(const AstStatement& st
                         guard.fail_term.source_kind = HirTerminatorSourceKind::Literal;
                         guard.fail_term.status_code = static_cast<i32>(respond.status_code);
                         guard.fail_term.span = respond.span;
-                        if (respond.has_response_body)
-                            guard.fail_term.response_body =
-                                intern_owned_response_body(respond.response_body);
+                        if (respond.has_response_body) {
+                            auto body = intern_owned_response_body(respond.response_body);
+                            if (!body) return core::make_unexpected(body.error());
+                            guard.fail_term.response_body = body.value();
+                        }
                         for (u32 hi = 0; hi < respond.response_headers.len; hi++) {
                             const auto& hdr = respond.response_headers[hi];
                             if (!guard.fail_term.response_headers.push({hdr.key, hdr.value}))
@@ -9748,8 +9757,11 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         // user wrote `body: ""`; lower_rir de-dupes on content. Copy the
         // bytes into the root owned-strings store so a byte-literal body in an
         // imported file does not outlive that file's temporary AstFile pool.
-        if (stmt.has_response_body)
-            term.response_body = intern_owned_response_body(stmt.response_body);
+        if (stmt.has_response_body) {
+            auto body = intern_owned_response_body(stmt.response_body);
+            if (!body) return core::make_unexpected(body.error());
+            term.response_body = body.value();
+        }
         // Carry response headers verbatim (parser already rejected
         // explicit empty dicts and duplicate keys).
         for (u32 i = 0; i < stmt.response_headers.len; i++) {
@@ -14828,7 +14840,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         shared_generated_names != nullptr ? *shared_generated_names : mod.generated_names;
     auto* owned_strings =
         shared_owned_strings != nullptr ? shared_owned_strings : &mod.owned_strings;
-    ScopedAnalyzeOwnedStrings owned_strings_scope(owned_strings);
+    ScopedAnalyzeOwnedBuffers owned_buffers_scope(&name_store);
     mod.has_package_decl = file.has_package_decl;
     mod.package_span = file.package_span;
     mod.package_name = file.package_name;

@@ -129,7 +129,8 @@ exceptions, no try/catch. `!` is logical not only.
   `return 200, body`, `return resp`, `return forward(x)`.
 - **Middleware/helper func**: `return` only produces the function's normal
   value (or passes through); to end the whole request immediately use
-  **`respond`**: `respond 401` / `respond 401, "expired"` / `respond resp`.
+  **`respond`**: `respond 401` / `respond 401, "expired"` / `respond 401, b"\x00"` /
+  `respond resp`.
   A helper-local Response may carry ordered literal `set`/`add`/`remove`
   mutations. A `chain after` helper may receive the runtime `Response` and add
   ordered header effects to a successful handler response.
