@@ -1712,7 +1712,7 @@ struct GeneratedNameSegment {
 // Concatenate segments into one HIR-owned, nothrow-allocated name. Allocation
 // failure returns FrontendError::OutOfMemory so the -fno-exceptions build never
 // terminates. The buffer is freed with the owning HirModule::generated_names.
-static FrontendResult<Str> store_generated_name(HirGeneratedNames& store,
+static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
                                                 const GeneratedNameSegment* segments,
                                                 u32 segment_count) {
     u32 len = 0;
@@ -1720,6 +1720,10 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames& store,
         if (segments[i].len > 0xffffffffu - len)
             return frontend_error(FrontendError::OutOfMemory, {});
         len += segments[i].len;
+    }
+    if (store == nullptr) {
+        store = new (std::nothrow) HirGeneratedNames;
+        if (store == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
     }
     auto* buf = new (std::nothrow) char[len];
     if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
@@ -1734,12 +1738,12 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames& store,
     }
     node->text = buf;
     node->len = len;
-    node->next = store.head;
-    store.head = node;
+    node->next = store->head;
+    store->head = node;
     return Str{buf, len};
 }
 
-static FrontendResult<Str> make_protocol_default_function_name(HirGeneratedNames& store,
+static FrontendResult<Str> make_protocol_default_function_name(HirGeneratedNames*& store,
                                                                Str protocol_name,
                                                                Str method_name) {
     static constexpr char kPrefix[] = "__proto_";
@@ -1775,7 +1779,7 @@ static bool impl_matches_exact_target(const HirImpl& impl,
            impl.is_generic_template == is_generic_template;
 }
 
-static FrontendResult<Str> make_impl_function_name(HirGeneratedNames& store,
+static FrontendResult<Str> make_impl_function_name(HirGeneratedNames*& store,
                                                    Str protocol_name,
                                                    Str type_name,
                                                    Str method_name) {
@@ -11800,7 +11804,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
     Str source_path,
     std::vector<std::string>& import_stack,
     std::deque<std::string>* shared_owned_strings,
-    HirGeneratedNames* shared_generated_names,
+    HirGeneratedNames** shared_generated_names,
     const std::vector<Str>& external_decorator_names,
     SourceBudget* source_budget,
     bool internal_strict_local_response_propagation);
@@ -12038,7 +12042,11 @@ static FrontendResult<void> merge_imported_functions(
             const auto& fn = imported.module->functions[fi];
             if (is_hidden_import_runtime_function(fn.name)) {
                 if (find_function_index(*mod, fn.name) != mod->functions.len)
-                    return frontend_error(FrontendError::UnsupportedSyntax, imported.span, fn.name);
+                    // fn.name is a generated name owned by the analysis store,
+                    // which is freed on this error path; use a stable literal.
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          imported.span,
+                                          lit_str("duplicate imported generated function"));
                 if (!mod->functions.push(fn))
                     return frontend_error(FrontendError::TooManyItems, imported.span);
                 continue;
@@ -12857,7 +12865,7 @@ static FrontendResult<void> load_imported_modules(
     const AstFile& file,
     Str source_path,
     std::deque<std::string>& owned_strings,
-    HirGeneratedNames& name_store,
+    HirGeneratedNames*& name_store,
     std::vector<std::string>& import_stack,
     std::vector<std::unique_ptr<HirModule>>& imported_storage,
     const std::vector<Str>& route_decorator_names,
@@ -14785,14 +14793,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
     Str source_path,
     std::vector<std::string>& import_stack,
     std::deque<std::string>* shared_owned_strings,
-    HirGeneratedNames* shared_generated_names,
+    HirGeneratedNames** shared_generated_names,
     const std::vector<Str>& external_decorator_names,
     SourceBudget* source_budget,
     bool internal_strict_local_response_propagation) {
     auto mod_ptr = std::make_unique<HirModule>();
     HirModule& mod = *mod_ptr;
-    HirGeneratedNames* name_store =
-        shared_generated_names != nullptr ? shared_generated_names : &mod.generated_names;
+    HirGeneratedNames*& name_store =
+        shared_generated_names != nullptr ? *shared_generated_names : mod.generated_names;
     mod.has_package_decl = file.has_package_decl;
     mod.package_span = file.package_span;
     mod.package_name = file.package_name;
@@ -15253,7 +15261,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                 file,
                                                 source_path,
                                                 *owned_strings,
-                                                *name_store,
+                                                name_store,
                                                 import_stack,
                                                 imported_storage,
                                                 route_decorator_names,
@@ -17392,7 +17400,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 return frontend_error(
                     FrontendError::UnsupportedSyntax, item.protocol.span, method_ast.name);
             auto mangled = make_protocol_default_function_name(
-                *name_store, item.protocol.name, method_ast.name);
+                name_store, item.protocol.name, method_ast.name);
             if (!mangled) return core::make_unexpected(mangled.error());
             if (find_function_index(mod, mangled.value()) != mod.functions.len)
                 return frontend_error(
@@ -17941,7 +17949,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             }
             auto type_name = make_impl_target_name(item.impl_decl.target);
             if (!type_name) return core::make_unexpected(type_name.error());
-            auto mangled = make_impl_function_name(*name_store,
+            auto mangled = make_impl_function_name(name_store,
                                                    mod.protocols[impl.protocol_index].name,
                                                    type_name.value(),
                                                    method_ast.name);
