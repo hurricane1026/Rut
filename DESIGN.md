@@ -627,6 +627,13 @@ teardown, and reload retirement. This form does not imply a general mutable
 runtime response-body buffer: dynamic `resp.body` mutation remains a separate,
 resumable runtime feature.
 
+The `body: b"..."` byte-string form is the exact-byte alternative: it decodes
+`\n`, `\r`, `\t`, `\\`, `\"`, and `\xNN` to exact bytes and is limited to 4096
+decoded bytes (the same bound as the failure/strict exact-byte bodies), while
+`body: "..."` keeps the raw source spelling of backslash sequences. Invalid or
+truncated escapes reject at parse time. `respond(status, b"...")` accepts the
+same form for guard-failure terminators.
+
 #### 3.3.5.1 Local Response and Forward Failure Policies (Envoy H1)
 
 `local_response({...})` is a compiler-validated builtin for a strict, fully

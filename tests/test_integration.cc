@@ -20410,17 +20410,22 @@ TEST(route, dsl_response_byte_body_real_socket) {
     const char kReq[] = "GET /x HTTP/1.1\r\nHost: x\r\n\r\n";
     send_all(c, kReq, sizeof(kReq) - 1);
     char buf[2048];
-    i32 n = recv_timeout(c, buf, sizeof(buf), 1000);
-    CHECK_GT(n, 0);
-    const Str response{buf, static_cast<u32>(n)};
-    auto has = [&](const char* needle, u32 nlen) {
-        return buf_contains(
-            reinterpret_cast<const char*>(response.ptr), response.len, needle, nlen);
-    };
+    u32 n = 0;
+    // Accumulate through the header terminator and the 5-byte body; a single
+    // recv may return only part of the response.
+    while (n < sizeof(buf)) {
+        const i32 r = recv_timeout(c, buf + n, static_cast<i32>(sizeof(buf) - n), 1000);
+        if (r <= 0) break;
+        n += static_cast<u32>(r);
+        if (buf_contains(buf, n, "\r\n\r\na\nb\\c", sizeof("\r\n\r\na\nb\\c") - 1)) break;
+    }
+    REQUIRE_GT(n, 0u);
+    auto has = [&](const char* needle, u32 nlen) { return buf_contains(buf, n, needle, nlen); };
     CHECK(has("200 OK", 6));
     CHECK(has("Content-Length: 5\r\n", 19));
     // Decoded body is exactly `a\nb\\c`.
     CHECK(has("\r\n\r\na\nb\\c", sizeof("\r\n\r\na\nb\\c") - 1));
+    REQUIRE_GE(n, 5u);
     CHECK_EQ(memcmp(buf + n - 5, "a\nb\\c", 5), 0);
 
     close(c);
