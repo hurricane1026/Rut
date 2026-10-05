@@ -1674,6 +1674,18 @@ if(RUT_ENABLE_JIT)
         TIMEOUT 30
     )
     add_test(
+        NAME test_nginx_issue551_forked_control_cleanup_self_check
+        COMMAND test_nginx_differential --forked-control-cleanup-self-check
+    )
+    set_tests_properties(test_nginx_issue551_forked_control_cleanup_self_check PROPERTIES
+        LABELS "nginx;docker"
+        RUN_SERIAL TRUE
+        RESOURCE_LOCK nginx-differential
+        # Above the sum of the self-check's internal bounded waits (initial
+        # docker rm, readiness poll, tree reap, inspect probe, final rm).
+        TIMEOUT 150
+    )
+    add_test(
         NAME test_nginx_issue270_converter_explicit_timeout_head_source_self_check
         COMMAND test_nginx_differential --converter-explicit-timeout-head-source-self-check
     )

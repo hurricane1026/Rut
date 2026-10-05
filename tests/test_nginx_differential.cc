@@ -1834,6 +1834,35 @@ static bool docker_remove(const std::string& name) {
     return command_ok({"docker", "rm", "-f", name});
 }
 
+static bool forked_control_group_has_live_member(pid_t group);
+
+// Reap the complete process group owned by a forked differential control. The
+// control child calls setpgid(0, 0), so its pid is also its process-group id and
+// a negative kill targets the whole owned tree (frontends, CLI wrappers, worker
+// helpers) without touching unrelated processes. A uniquely named container is
+// owned by the daemon rather than the process tree, so it is removed separately.
+static bool reap_forked_control_tree(Child& child, const std::string& container_name) {
+    bool ok = true;
+    if (child.pid >= 0) {
+        const pid_t group = child.pid;
+        if (kill(-group, SIGKILL) != 0 && errno != ESRCH) ok = false;
+        if (!wait_child(child, 3000)) {
+            (void)kill(child.pid, SIGKILL);
+            if (!wait_child(child, 2000)) ok = false;
+        }
+        // SIGKILL delivery to the group is asynchronous: wait until every
+        // non-zombie member has exited so the whole owned tree is gone before
+        // this bounded cleanup reports success, not just the direct child.
+        for (int waited = 0; waited < 2000 && forked_control_group_has_live_member(group);
+             waited += 20)
+            poll(nullptr, 0, 20);
+        if (forked_control_group_has_live_member(group)) ok = false;
+        child.pid = -1;
+    }
+    if (!container_name.empty() && !docker_remove(container_name)) ok = false;
+    return ok;
+}
+
 struct DockerGuard {
     explicit DockerGuard(const std::string& name) : name(name) {}
     std::string name;
@@ -3537,6 +3566,206 @@ static bool child_exit_readiness_diagnostic_self_check() {
     if (ok)
         std::cerr
             << "PASS: child exit readiness diagnostics preserve status and bounded log evidence\n";
+    return ok;
+}
+
+// True if any non-zombie process still belongs to the given process group.
+// Zombies are ignored: they are already dead and only await reaping by their
+// parent (typically init once the killed control tree is reparented).
+static bool forked_control_group_has_live_member(pid_t group) {
+    DIR* dir = opendir("/proc");
+    if (dir == nullptr) return true;
+    bool found = false;
+    while (struct dirent* entry = readdir(dir)) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        bool numeric = true;
+        for (const char* p = entry->d_name; *p != '\0'; p++) {
+            if (*p < '0' || *p > '9') {
+                numeric = false;
+                break;
+            }
+        }
+        if (!numeric) continue;
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%s/stat", entry->d_name);
+        FILE* file = fopen(path, "r");
+        if (file == nullptr) continue;
+        char line[1024];
+        const bool read = fgets(line, sizeof(line), file) != nullptr;
+        fclose(file);
+        if (!read) continue;
+        char* close_paren = strrchr(line, ')');
+        if (close_paren == nullptr) continue;
+        char state = '\0';
+        long ppid = 0;
+        long pgrp = 0;
+        if (sscanf(close_paren + 2, "%c %ld %ld", &state, &ppid, &pgrp) != 3) continue;
+        if (state == 'Z' || state == 'X') continue;
+        if (pgrp == static_cast<long>(group)) {
+            found = true;
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+static bool forked_control_container_exists(const std::string& name) {
+    Child probe;
+    if (!spawn_child({"docker", "container", "inspect", name}, "/dev/null", probe)) return true;
+    if (!wait_child(probe, 5000)) {
+        (void)stop_child(probe);
+        return true;
+    }
+    const bool exists =
+        probe.status_valid && WIFEXITED(probe.status) && WEXITSTATUS(probe.status) == 0;
+    probe.pid = -1;
+    return exists;
+}
+
+// #551 self-check: prove an abnormally stalling forked differential control is
+// rejected and its complete owned subtree, container, and held port released.
+// The control stalls while holding a sentinel grandchild, a uniquely named
+// container, and a bound loopback port.
+static bool run_forked_control_cleanup_self_check(std::string& error) {
+    char dir_template[256] = {};
+    if (!make_temp_directory_template(getenv("TMPDIR"),
+                                      "rut-forked-control-cleanup-XXXXXX",
+                                      dir_template,
+                                      sizeof(dir_template))) {
+        error = "could not create self-check temp directory";
+        return false;
+    }
+    char* created = mkdtemp(dir_template);
+    if (created == nullptr) {
+        error = "could not materialize self-check temp directory";
+        return false;
+    }
+    const std::string temp_dir(created);
+    const std::string container = "rut-issue551-selfcheck-" + std::to_string(getpid());
+    (void)docker_remove(container);
+
+    int ready_pipe[2] = {-1, -1};
+    // O_CLOEXEC keeps the write end out of the sentinel/docker descendants so the
+    // control's own exit (or death) produces EOF even if they outlive it.
+    if (pipe2(ready_pipe, O_CLOEXEC) != 0) {
+        error = "could not create readiness pipe";
+        return false;
+    }
+    const pid_t control = fork();
+    if (control < 0) {
+        error = "could not fork the stalling control";
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return false;
+    }
+    if (control == 0) {
+        close(ready_pipe[0]);
+        if (setpgid(0, 0) != 0) _exit(40);
+        // In-process sentinel: no external CLI dependency, and it closes the
+        // readiness write end so the control's death still produces EOF.
+        const pid_t sentinel = fork();
+        if (sentinel < 0) _exit(41);
+        if (sentinel == 0) {
+            close(ready_pipe[1]);
+            for (;;) pause();
+        }
+        Child docker_launch;
+        if (!spawn_child({"docker", "create", "--name", container, kNginxImage, "true"},
+                         temp_dir + "/docker.log",
+                         docker_launch))
+            _exit(42);
+        if (!wait_child(docker_launch, 30'000)) _exit(43);
+        if (!docker_launch.status_valid || !WIFEXITED(docker_launch.status) ||
+            WEXITSTATUS(docker_launch.status) != 0)
+            _exit(44);
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) _exit(45);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) _exit(46);
+        socklen_t addr_len = sizeof(addr);
+        if (getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &addr_len) != 0) _exit(47);
+        const u16 port = ntohs(addr.sin_port);
+        // Prove a live owned descendant exists before declaring readiness, so
+        // the cleanup always has a whole tree to reap.
+        if (kill(sentinel, 0) != 0) _exit(49);
+        const unsigned char payload[3] = {
+            1, static_cast<unsigned char>(port >> 8), static_cast<unsigned char>(port & 0xff)};
+        ssize_t written = 0;
+        while (written < static_cast<ssize_t>(sizeof(payload))) {
+            const ssize_t n = write(ready_pipe[1], payload + written, sizeof(payload) - written);
+            if (n <= 0) _exit(48);
+            written += n;
+        }
+        for (;;) pause();
+    }
+    close(ready_pipe[1]);
+    unsigned char ready[3] = {};
+    ssize_t received = 0;
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (received < static_cast<ssize_t>(sizeof(ready))) {
+        const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      ready_deadline - std::chrono::steady_clock::now())
+                                      .count();
+        if (remaining_ms <= 0) break;
+        pollfd ready_poll{ready_pipe[0], POLLIN, 0};
+        if (poll(&ready_poll, 1, static_cast<int>(remaining_ms)) <= 0) break;
+        const ssize_t n = read(ready_pipe[0], ready + received, sizeof(ready) - received);
+        if (n <= 0) break;
+        received += n;
+    }
+    close(ready_pipe[0]);
+
+    Child child;
+    child.pid = control;
+    bool ok = true;
+    if (received != static_cast<ssize_t>(sizeof(ready)) || ready[0] != 1) {
+        error = "stalling control did not reach readiness";
+        ok = false;
+    }
+    const u16 port = static_cast<u16>((static_cast<u16>(ready[1]) << 8) | ready[2]);
+    // The control never exits on its own: the parent must treat it as an
+    // abnormal stall and reap the whole owned tree plus its container.
+    if (!reap_forked_control_tree(child, container)) {
+        error = "abnormal forked-control cleanup reported failure";
+        ok = false;
+    }
+    if (forked_control_group_has_live_member(control)) {
+        error = "owned process group still has live members after cleanup";
+        ok = false;
+    }
+    if (forked_control_container_exists(container)) {
+        error = "owned container still exists after cleanup";
+        ok = false;
+    }
+    if (port != 0) {
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            error = "could not open rebind socket";
+            ok = false;
+        } else {
+            // No SO_REUSEADDR: only a bind after the control's socket is truly
+            // closed can succeed, so this proves the held port was released.
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            addr.sin_port = htons(port);
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+                error = "held port was not released for rebind";
+                ok = false;
+            }
+            close(fd);
+        }
+    }
+    unlink((temp_dir + "/docker.log").c_str());
+    rmdir(temp_dir.c_str());
+    (void)docker_remove(container);
+    if (ok)
+        std::cerr << "PASS: #551 forked differential control abnormal cleanup reaped the owned "
+                     "process tree, removed its container, and released its held port\n";
     return ok;
 }
 
@@ -74055,6 +74284,10 @@ static bool run_converter_default_buffering_206_range_incomplete_clean_eof_diffe
         return false;
     }
     if (withheld_pid == 0) {
+        // Own a private process group so an abnormal parent-side exit can reap the
+        // whole control subtree (frontends, CLI wrappers, workers), not only the
+        // direct child. Every descendant inherits this group.
+        (void)setpgid(0, 0);
         std::string withheld_error;
         const bool accepted =
             run_converter_default_buffering_206_range_incomplete_clean_eof_differential_impl(
@@ -74066,14 +74299,14 @@ static bool run_converter_default_buffering_206_range_incomplete_clean_eof_diffe
                   << "\n";
         _exit(accepted ? 0 : kUnexpectedWithheldFailureExit);
     }
+    // Close the setpgid race: whichever side wins, the control and its
+    // descendants form the withheld_pid process group.
+    (void)setpgid(withheld_pid, withheld_pid);
 
     Child withheld_child;
     withheld_child.pid = withheld_pid;
     if (!wait_child(withheld_child, 30'000)) {
-        (void)kill(withheld_child.pid, SIGKILL);
-        (void)wait_child(withheld_child, 2000);
-        withheld_child.pid = -1;
-        (void)docker_remove(withheld_container);
+        (void)reap_forked_control_tree(withheld_child, withheld_container);
         error = "#546 real withheld-authorization control exceeded its bounded process deadline";
         return false;
     }
@@ -74081,12 +74314,16 @@ static bool run_converter_default_buffering_206_range_incomplete_clean_eof_diffe
                                         WIFEXITED(withheld_child.status) &&
                                         WEXITSTATUS(withheld_child.status) == kExpectedWithheldExit;
     const std::string withheld_status = child_status_description(withheld_child);
-    withheld_child.pid = -1;
     if (!exact_expected_failure) {
+        // The direct child exited, but forked descendants or its container may
+        // still be alive; drop both before reporting the failure. Keep the pid
+        // set so the helper can still target the control's process group.
+        (void)reap_forked_control_tree(withheld_child, withheld_container);
         error = "#546 real withheld-authorization control returned " + withheld_status +
                 " instead of exact expected nonzero exit " + std::to_string(kExpectedWithheldExit);
         return false;
     }
+    withheld_child.pid = -1;
     std::cerr << "PASS control: #546 real RUT-side EOF authorization remained withheld through "
                  "its bounded action deadline, exited nonzero, and released all isolated "
                  "resources\n";
@@ -82398,6 +82635,8 @@ int main(int argc, char** argv) {
         argc == 2 && strcmp(argv[1], "--converter-proxy-hide-header-source-self-check") == 0;
     const bool child_exit_readiness_self_check =
         argc == 2 && strcmp(argv[1], "--child-exit-readiness-diagnostic-self-check") == 0;
+    const bool forked_control_cleanup_self_check =
+        argc == 2 && strcmp(argv[1], "--forked-control-cleanup-self-check") == 0;
     const bool explicit_timeout_head_source_self_check =
         argc == 2 && strcmp(argv[1], "--converter-explicit-timeout-head-source-self-check") == 0;
     const bool explicit_timeout_head_generated_episode =
@@ -82796,9 +83035,10 @@ int main(int argc, char** argv) {
          !zero_suffix_static_query_proxy_uri_oracle && !empty_query_proxy_uri_oracle &&
          !root_empty_query_proxy_uri_oracle && !proxy_hide_header_oracle &&
          !proxy_hide_header_name_oracle && !proxy_hide_header_source_self_check &&
-         !child_exit_readiness_self_check && !proxy_hide_header_generated_side_self_check &&
-         !explicit_timeout_head_source_self_check && !explicit_timeout_head_generated_episode &&
-         !explicit_timeout_head_phase_differential && !keepalive_timeout_head_differential &&
+         !child_exit_readiness_self_check && !forked_control_cleanup_self_check &&
+         !proxy_hide_header_generated_side_self_check && !explicit_timeout_head_source_self_check &&
+         !explicit_timeout_head_generated_episode && !explicit_timeout_head_phase_differential &&
+         !keepalive_timeout_head_differential &&
          !keepalive_timeout_get_initial_deadline_differential &&
          !fixed_upload_head_success_differential &&
          !fixed_upload_head_zero_response_timeout_differential &&
@@ -83497,6 +83737,14 @@ int main(int argc, char** argv) {
         }
         std::cerr << "PASS: zero-response origin stall accepted one complete request, emitted "
                      "no bytes, observed one peer close, and retained then retired its listener\n";
+        return 0;
+    }
+    if (forked_control_cleanup_self_check) {
+        std::string cleanup_error;
+        if (!run_forked_control_cleanup_self_check(cleanup_error)) {
+            std::cerr << "FAIL [#551 forked-control cleanup self-check]: " << cleanup_error << "\n";
+            return 1;
+        }
         return 0;
     }
     if (gated_fragment_peer_probe_self_check) {
