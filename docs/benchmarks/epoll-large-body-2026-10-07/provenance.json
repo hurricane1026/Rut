@@ -1,0 +1,25 @@
+{
+  "prototype_binary": "/tmp/rut-window-study/build/src/rut",
+  "prototype_sha256": "53090ca1e692b779d687731b0320d3430be7a9addedf77b39260439852d20d30",
+  "workspace_binary": "/home/hurricane/private/code/Rut/build/src/rut",
+  "workspace_sha256": "7c0420dda13d875a4fc9513ef2e1e51e19f2a459e3e000aae1a7e81e7ee25bfa",
+  "acceptance_runs": [
+    "epoll-bulk-fixed-cache-20261007-c128",
+    "epoll-bulk-accept-20261007-c1"
+  ],
+  "comparison_runs": [
+    "epoll-nginx-workspace-verified-20261007-c128",
+    "nginx-native-bulk256-20261007-c128",
+    "nginx-native-bulk256-long-retry-20261007-c128"
+  ],
+  "acceptance_switch": "Same prototype binary; RUT_STUDY_EPOLL_BULK presence only enables candidate. Main workspace has no experimental gate; enabled by default.",
+  "cache": "c128 fixed16MiB with adaptive flag absent; c1 initial experimental flag present but peakborrow1 cannot trigger burst, so identical16MiB cache bound.",
+  "nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "compiler_observations": {
+    "epoll-bulk-fixed-cache-20261007": 0,
+    "epoll-bulk-accept-20261007": 0,
+    "epoll-nginx-workspace-verified-20261007": 0,
+    "nginx-native-bulk256-20261007": 0,
+    "nginx-native-bulk256-long-retry-20261007": 0
+  }
+}

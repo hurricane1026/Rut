@@ -1,0 +1,73 @@
+[
+  {
+    "connection": "close",
+    "concurrency": 128,
+    "engines": {
+      "rut": {
+        "valid_runs": 2,
+        "invalid_runs": 0,
+        "rps_valid_mean": 2720.144065186398,
+        "p99_ms_valid_runs": [
+          48.294,
+          48.564
+        ],
+        "stable_two_valid_runs": true
+      },
+      "nginx16": {
+        "valid_runs": 2,
+        "invalid_runs": 0,
+        "rps_valid_mean": 1598.1204283073753,
+        "p99_ms_valid_runs": [
+          80.83,
+          81.722
+        ],
+        "stable_two_valid_runs": true
+      },
+      "nginx256": {
+        "valid_runs": 2,
+        "invalid_runs": 0,
+        "rps_valid_mean": 3081.191042400681,
+        "p99_ms_valid_runs": [
+          41.711,
+          46.345
+        ],
+        "stable_two_valid_runs": true
+      }
+    }
+  },
+  {
+    "connection": "keepalive",
+    "concurrency": 128,
+    "engines": {
+      "rut": {
+        "valid_runs": 2,
+        "invalid_runs": 0,
+        "rps_valid_mean": 3003.1913301068535,
+        "p99_ms_valid_runs": [
+          43.746,
+          43.794
+        ],
+        "stable_two_valid_runs": true
+      },
+      "nginx16": {
+        "valid_runs": 2,
+        "invalid_runs": 0,
+        "rps_valid_mean": 1561.0856370890426,
+        "p99_ms_valid_runs": [
+          111.973,
+          111.025
+        ],
+        "stable_two_valid_runs": true
+      },
+      "nginx256": {
+        "valid_runs": 1,
+        "invalid_runs": 3,
+        "rps_valid_mean": 3539.8913221657617,
+        "p99_ms_valid_runs": [
+          149.604
+        ],
+        "stable_two_valid_runs": false
+      }
+    }
+  }
+]

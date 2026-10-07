@@ -150,6 +150,10 @@ inline constexpr u8 kUpstreamCloseCancelAux = 4;
 // target remains aux 0; keeping the cancel completion distinct prevents its
 // positive cancellation count from being mistaken for selected-buffer data.
 inline constexpr u8 kDownstreamCloseCancelAux = 5;
+// Epoll-only progress notification for a partial send. It refreshes the
+// connection timer without being presented to the send callback, whose
+// contract remains one event per fully drained buffer.
+inline constexpr u8 kEpollSendProgressAux = 6;
 
 inline constexpr u8 kUpstreamOpConnect = 1u << 0;
 inline constexpr u8 kUpstreamOpRecv = 1u << 1;

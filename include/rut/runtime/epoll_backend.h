@@ -80,6 +80,9 @@ struct EpollBackend {
     static constexpr u32 kPendingBurstQuota = 8;
     IoEvent pending_completions[kPendingCap];
     u32 pending_count = 0;
+    // Event-loop owners opt in so direct backend users retain one completion
+    // per fully drained send.
+    bool emit_send_progress = false;
     // Consecutive synthetic completions returned by wait(); once the quota is
     // reached, wait() takes one kernel readiness record (harvested earlier or
     // by a nonblocking probe) before popping.

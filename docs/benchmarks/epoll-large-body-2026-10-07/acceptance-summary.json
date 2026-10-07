@@ -1,0 +1,102 @@
+[
+  {
+    "concurrency": 128,
+    "connection": "close",
+    "engines": {
+      "baseline": {
+        "rps": 1538.7641822246533,
+        "p99_ms_mean_of_runs": 84.625,
+        "p99_ms_per_run": [
+          83.959,
+          85.291
+        ],
+        "end_rss_mib": 74.818359375
+      },
+      "candidate": {
+        "rps": 2706.5401717040772,
+        "p99_ms_mean_of_runs": 48.4155,
+        "p99_ms_per_run": [
+          48.246,
+          48.585
+        ],
+        "end_rss_mib": 89.705078125
+      }
+    },
+    "rps_delta_pct": 75.8905102529176
+  },
+  {
+    "concurrency": 128,
+    "connection": "keepalive",
+    "engines": {
+      "baseline": {
+        "rps": 1474.459141806089,
+        "p99_ms_mean_of_runs": 89.323,
+        "p99_ms_per_run": [
+          89.777,
+          88.869
+        ],
+        "end_rss_mib": 75.37109375
+      },
+      "candidate": {
+        "rps": 2993.1967349713855,
+        "p99_ms_mean_of_runs": 44.262,
+        "p99_ms_per_run": [
+          44.457,
+          44.067
+        ],
+        "end_rss_mib": 100.533203125
+      }
+    },
+    "rps_delta_pct": 103.00303006734862
+  },
+  {
+    "concurrency": 1,
+    "connection": "close",
+    "engines": {
+      "baseline": {
+        "rps": 1435.706908035113,
+        "p99_ms_mean_of_runs": 0.734,
+        "p99_ms_per_run": [
+          0.729,
+          0.739
+        ],
+        "end_rss_mib": 69.328125
+      },
+      "candidate": {
+        "rps": 2530.6272334041737,
+        "p99_ms_mean_of_runs": 0.4195,
+        "p99_ms_per_run": [
+          0.418,
+          0.421
+        ],
+        "end_rss_mib": 69.736328125
+      }
+    },
+    "rps_delta_pct": 76.26349913350717
+  },
+  {
+    "concurrency": 1,
+    "connection": "keepalive",
+    "engines": {
+      "baseline": {
+        "rps": 1643.6210155678523,
+        "p99_ms_mean_of_runs": 0.6875,
+        "p99_ms_per_run": [
+          0.685,
+          0.69
+        ],
+        "end_rss_mib": 69.294921875
+      },
+      "candidate": {
+        "rps": 3002.7249708900617,
+        "p99_ms_mean_of_runs": 0.3835,
+        "p99_ms_per_run": [
+          0.379,
+          0.388
+        ],
+        "end_rss_mib": 69.70703125
+      }
+    },
+    "rps_delta_pct": 82.68961898449896
+  }
+]

@@ -1275,6 +1275,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
 
             i32 result = 0;
             bool pending_retry = false;
+            bool made_progress = false;
 
             if (ss.tls) {
                 auto& conn = conns[conn_id];
@@ -1321,6 +1322,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     if (nw > 0) {
                         ss.offset += static_cast<u32>(nw);
                         ss.remaining -= static_cast<u32>(nw);
+                        made_progress = true;
                     } else if (nw < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         pending_retry = true;
                         break;
@@ -1331,6 +1333,17 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     }
                 }
                 if (!pending_retry && result == 0) result = static_cast<i32>(ss.offset);
+            }
+
+            if (emit_send_progress && made_progress && pending_retry &&
+                ss.type == IoEventType::Send && out < max_events) {
+                events[out] = {};
+                events[out].conn_id = conn_id;
+                events[out].type = ss.type;
+                events[out].result = 0;
+                events[out].aux = kEpollSendProgressAux;
+                events[out].upstream_episode = upstream_episode;
+                out++;
             }
 
             if (pending_retry) continue;

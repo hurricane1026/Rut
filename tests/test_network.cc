@@ -30834,6 +30834,7 @@ TEST(epoll_send, more_follows_is_kept_for_partial_write_continuation) {
 
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
+    backend.emit_send_progress = true;
     // Far more than the shrunken socket buffers can absorb: the write is partial.
     constexpr u32 kLen = 8u << 20;
     void* big = mmap(nullptr, kLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -30842,6 +30843,12 @@ TEST(epoll_send, more_follows_is_kept_for_partial_write_continuation) {
     CHECK_EQ(backend.pending_count, 0u);  // parked on EPOLLOUT, no completion yet
     CHECK_GT(backend.send_state[3].remaining, 0u);
     CHECK_EQ(backend.send_state[3].msg_flags, static_cast<u32>(MSG_MORE));
+    IoEvent progress[2]{};
+    REQUIRE_EQ(backend.wait(progress, 2, nullptr, 0), 1u);
+    CHECK_EQ(progress[0].type, IoEventType::Send);
+    CHECK_EQ(progress[0].aux, kEpollSendProgressAux);
+    CHECK_EQ(progress[0].result, 0);
+    CHECK_GT(backend.send_state[3].remaining, 0u);
     backend.clear_send_state(3);
     backend.shutdown();
     munmap(big, kLen);
@@ -85114,6 +85121,109 @@ TEST(iouring_accept_rearm, closed_listener_is_never_rearmed) {
     CHECK_FALSE(g.loop->accept_rearm_pending);
 }
 #endif  // __linux__
+
+#ifdef __linux__
+TEST(epoll_bulk_body, preserves_bytes_and_releases_idle_bulk) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->upstream_recv_slice = loop->pool.alloc();
+    REQUIRE(c->upstream_recv_slice != nullptr);
+    c->upstream_recv_buf.bind(c->upstream_recv_slice, SlicePool::kSliceSize);
+    for (u32 i = 0; i < 127; ++i) c->upstream_recv_buf.write_ptr()[i] = static_cast<u8>(i);
+    c->upstream_recv_buf.commit(127);
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 1024 * 1024;
+    const u32 available = loop->pool.bulk_available();
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    REQUIRE(loop->pool.is_bulk(c->upstream_recv_slice));
+    CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kBulkSliceSize);
+    CHECK_EQ(c->upstream_recv_buf.len(), 127u);
+    for (u32 i = 0; i < 127; ++i) CHECK_EQ(c->upstream_recv_buf.data()[i], static_cast<u8>(i));
+    CHECK_EQ(loop->pool.bulk_available(), available - 1);
+    u8* const bulk = c->upstream_recv_slice;
+    loop->release_upstream_relay_slice(*c);
+    CHECK_EQ(c->upstream_recv_slice, bulk);  // unread bytes prohibit release
+    c->upstream_recv_buf.reset();
+    loop->backend.send_state[c->id].src = bulk;
+    loop->backend.send_state[c->id].remaining = 64;
+    loop->release_upstream_relay_slice(*c);
+    CHECK_EQ(c->upstream_recv_slice, bulk);  // partial send retains its source
+    loop->backend.clear_send_state(c->id);
+    loop->release_upstream_relay_slice(*c);
+    CHECK_FALSE(loop->pool.is_bulk(c->upstream_recv_slice));
+    CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kSliceSize);
+    CHECK_EQ(loop->pool.bulk_available(), available);
+    loop->close_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_send, partial_progress_refreshes_timer_without_callback) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->state = ConnState::Sending;
+    c->set_slots(nullptr, &on_response_body_sent<EpollEventLoop>, nullptr, nullptr);
+    loop->timer.add(c, 1);
+    const u32 expected_slot =
+        (loop->timer.cursor + loop->keepalive_timeout) & (TimerWheel::kSlots - 1u);
+
+    loop->dispatch({c->id, 0, 0, 0, IoEventType::Send, 0, kEpollSendProgressAux});
+
+    CHECK_EQ(c->timer_node.prev, &loop->timer.slots[expected_slot]);
+    CHECK_EQ(c->on_send, &on_response_body_sent<EpollEventLoop>);
+    loop->free_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_bulk_body, refuses_ineligible_and_pinned_buffers_and_falls_back) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->upstream_recv_slice = loop->pool.alloc();
+    REQUIRE(c->upstream_recv_slice != nullptr);
+    c->upstream_recv_buf.bind(c->upstream_recv_slice, SlicePool::kSliceSize);
+    u8* const ordinary = c->upstream_recv_slice;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = EpollEventLoop::kBulkRelayMinRemaining - 1;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    c->resp_body_remaining = 1024 * 1024;
+    c->resp_body_mode = BodyMode::Chunked;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->tls_active = true;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    c->tls_active = false;
+    loop->backend.send_state[c->id].src = ordinary;
+    loop->backend.send_state[c->id].remaining = 64;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    loop->backend.clear_send_state(c->id);
+    loop->pool.bulk_map_failed = true;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kSliceSize);
+    loop->pool.bulk_map_failed = false;
+    const u32 available = loop->pool.bulk_available();
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    REQUIRE(loop->pool.is_bulk(c->upstream_recv_slice));
+    loop->close_conn(*c);  // aborting a large response returns the bulk slot
+    CHECK_EQ(loop->pool.bulk_available(), available);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+#endif
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
