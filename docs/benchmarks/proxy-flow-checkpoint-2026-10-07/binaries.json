@@ -1,0 +1,18 @@
+[
+  {
+    "path": "/home/hurricane/private/code/rut-performance-checkpoints/proxy-flow-20261007/old-iouring/rut",
+    "sha256": "0e8b7a2aac39bb80cdb44b8d5840a1ef62cc47b5be53bb977a7d105b4a061e7d"
+  },
+  {
+    "path": "/home/hurricane/private/code/rut-performance-checkpoints/proxy-flow-20261007/old-iouring/rut-compile",
+    "sha256": "b5928a036433ec70a094a302d758b4fccb0f51e195aecf34931b49fecb86debd"
+  },
+  {
+    "path": "/home/hurricane/private/code/rut-performance-checkpoints/proxy-flow-20261007/new-epoll/rut.real",
+    "sha256": "7c0420dda13d875a4fc9513ef2e1e51e19f2a459e3e000aae1a7e81e7ee25bfa"
+  },
+  {
+    "path": "/home/hurricane/private/code/rut-performance-checkpoints/proxy-flow-20261007/new-epoll/rut-compile",
+    "sha256": "3c0f05830617f2455bc40d982a1f85de4aa27d9f48dd141b6ea3f5a8dc29bfd9"
+  }
+]

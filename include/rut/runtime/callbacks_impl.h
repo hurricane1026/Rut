@@ -32,7 +32,6 @@
 #include <unistd.h>
 
 namespace rut {
-
 // --- Upstream backend selection + passive health (circuit breaking) ---
 //
 // Shards are share-nothing — one OS thread each — so per-shard state lives in
@@ -8943,7 +8942,23 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         return;
     }
     const u32 remaining = publish_body - completed;
-    const u32 front = conn.buffered_response_front_size();
+    u32 front = conn.buffered_response_front_size();
+    // Study: combine complete already-published nodes up to a byte budget.
+    // Never wait for a node or clip the next one just to fill a vector.
+    static const bool study_gather = [] {
+        if constexpr (requires { Loop::supports_buffered_send_vector(); })
+            return ::getenv("RUT_STUDY_SELECTIVE_VECTOR") != nullptr;
+        return false;
+    }();
+    if (study_gather && !conn.tls_active && conn.response_body_tail.head &&
+        conn.response_body_tail.head->next && conn.upstream_recv_buf.len() == 0) {
+        const auto* next = conn.response_body_tail.head->next;
+        const u32 next_len = next->len - next->offset;
+        if (next_len >= 32 * 1024) {
+            const u32 combined = conn.buffered_response_send_span_size();
+            if (combined <= remaining && combined <= 512 * 1024) front = combined;
+        }
+    }
     const u32 available = remaining < front ? remaining : front;
     if (available == 0) {
         if (conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
@@ -9525,18 +9540,39 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             conn.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::BodySend ||
             !response_read_deadline_post_commit_is_stable(conn) ||
-            conn.upstream_send_len != inflight || conn.buffered_response_front_size() < inflight ||
+            conn.upstream_send_len != inflight ||
+            !conn.buffered_response_send_range_is_valid(inflight) ||
             conn.response_read_deadline_post_commit_downstream_completed > 0xFFFFFFFFu - inflight) {
             loop->close_conn(conn);
             return;
         }
         conn.clear_response_read_deadline_send_owner();
         conn.response_read_deadline_post_commit_downstream_completed += inflight;
+        if constexpr (requires { loop->study_completed_responses; }) {
+            ++loop->study_body_sends;
+            if (conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                conn.response_read_deadline_post_commit_declared_body ==
+                    ResponseBodyChain::kMaxBody &&
+                conn.response_read_deadline_post_commit_downstream_completed ==
+                    ResponseBodyChain::kMaxBody)
+                ++loop->study_completed_responses;
+        }
         conn.response_read_deadline_post_commit_inflight_body = 0;
         if (conn.upstream_recv_buf.len() != 0) {
             (void)consume_upstream_sent(conn);
         } else {
-            conn.response_body_tail.consume(inflight, conn.chain_direct_recv_owner.active);
+            constexpr bool kHasDirectBodyRecv = requires(Loop* candidate, Connection& c) {
+                candidate->arm_response_read_direct_body_recv(c);
+            };
+            const bool recycle_bulk =
+                kHasDirectBodyRecv && !conn.tls_active &&
+                conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                conn.response_read_deadline_post_commit_declared_body > SlicePool::kBulkSliceSize &&
+                conn.response_read_deadline_post_commit_origin_received <
+                    conn.response_read_deadline_post_commit_declared_body;
+            conn.response_body_tail.consume(
+                inflight, conn.chain_direct_recv_owner.active, recycle_bulk);
+            if (!recycle_bulk) conn.response_body_tail.release_recycled();
             conn.upstream_send_len = 0;
         }
         conn.response_read_deadline_post_commit_phase =

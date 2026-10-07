@@ -1,0 +1,78 @@
+[
+  {
+    "concurrency": 128,
+    "connection": "close",
+    "control": {
+      "rps": 2509.147253455551,
+      "p99_us": 57101.0,
+      "server_rss_bytes": 107096064,
+      "minor_faults_per_response": 32.98698538220405
+    },
+    "candidate": {
+      "rps": 2663.073979484598,
+      "p99_us": 54680.0,
+      "server_rss_bytes": 109629440,
+      "minor_faults_per_response": 0.286334022081289
+    },
+    "rps_change_pct": 6.134623060366917,
+    "p99_change_pct": -4.239855694296068,
+    "control_rps_drift_pct": 0.9617603518788043
+  },
+  {
+    "concurrency": 128,
+    "connection": "keepalive",
+    "control": {
+      "rps": 2735.8862384436397,
+      "p99_us": 50623.5,
+      "server_rss_bytes": 95815680,
+      "minor_faults_per_response": 4.268681047162351
+    },
+    "candidate": {
+      "rps": 2751.7244524812722,
+      "p99_us": 47644.5,
+      "server_rss_bytes": 101681152,
+      "minor_faults_per_response": 0.12614686096911992
+    },
+    "rps_change_pct": 0.5789061626569003,
+    "p99_change_pct": -5.8846188035201035,
+    "control_rps_drift_pct": -0.24431999711097552
+  },
+  {
+    "concurrency": 1,
+    "connection": "close",
+    "control": {
+      "rps": 2442.0454833452877,
+      "p99_us": 447.0,
+      "server_rss_bytes": 37957632,
+      "minor_faults_per_response": 0.0033862513321356955
+    },
+    "candidate": {
+      "rps": 2487.2381210672875,
+      "p99_us": 436.0,
+      "server_rss_bytes": 37920768,
+      "minor_faults_per_response": 0.003285362976791387
+    },
+    "rps_change_pct": 1.8506058969913974,
+    "p99_change_pct": -2.460850111856827,
+    "control_rps_drift_pct": 0.7025341501766924
+  },
+  {
+    "concurrency": 1,
+    "connection": "keepalive",
+    "control": {
+      "rps": 2762.674072175121,
+      "p99_us": 434.5,
+      "server_rss_bytes": 37433344,
+      "minor_faults_per_response": 0.0
+    },
+    "candidate": {
+      "rps": 2766.6820966533273,
+      "p99_us": 429.5,
+      "server_rss_bytes": 37396480,
+      "minor_faults_per_response": 0.0
+    },
+    "rps_change_pct": 0.14507771722238605,
+    "p99_change_pct": -1.1507479861910253,
+    "control_rps_drift_pct": 1.1241660069720272
+  }
+]

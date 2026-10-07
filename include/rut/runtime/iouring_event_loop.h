@@ -123,6 +123,11 @@ struct SyncSendCompletionGuard {
 // have been harvested. Includes armed flag management, cancel SQE tracking,
 // deferred accepts, and reclaim_pending/reclaim_slot machinery.
 struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
+    u64 study_direct_body_attempts = 0;
+    u64 study_direct_body_progress = 0;
+    u64 study_direct_body_full = 0;
+    u64 study_completed_responses = 0;
+    u64 study_body_sends = 0;
     IoUringBackend backend;
     TimerWheel timer;
     u32 shard_id = 0;
@@ -365,6 +370,12 @@ public:
     };
     ResponseReadBatchOwner response_read_batch_owners[kMaxEventsPerWait];
     u16 response_read_batch_event_owner[kMaxEventsPerWait];
+    // Batch-local owner index: at most 256 owners in 512 slots. No Connection
+    // state or allocation is retained across dispatch/reclamation boundaries.
+    static constexpr u32 kResponseReadOwnerIndexSize = 2u * kMaxEventsPerWait;
+    static_assert((kResponseReadOwnerIndexSize & (kResponseReadOwnerIndexSize - 1u)) == 0);
+    u16 response_read_batch_owner_index[kResponseReadOwnerIndexSize]{};
+    bool response_read_batch_owner_index_active = false;
     // Counters default to empty so a loop whose slots are used before init()
     // (e.g. storage-only setup) never scans indeterminate batch state.
     u32 response_read_batch_owner_count = 0;
@@ -544,6 +555,7 @@ public:
         response_read_deadline_expiry_pending = false;
         response_read_deadline_body_pump_pending = false;
         response_read_batch_owner_count = 0;
+        response_read_batch_owner_index_active = false;
         response_read_batch_event_count = 0;
         response_read_batch_event_index = 0;
         response_read_batch_events = nullptr;
@@ -732,6 +744,23 @@ public:
         // forever when the kernel never returned a cancelled Send.
         for (u32 i = 0; i < pending_free_count; i++) release_deferred_epoch(conns[pending_free[i]]);
         h2_pool.destroy();
+        if (::getenv("RUT_STUDY_BODY_POOL_LOG"))
+            ::fprintf(
+                stderr,
+                "RUT_DIRECT_BODY_STUDY completed=%llu attempts=%llu progress=%llu full=%llu\n",
+                static_cast<unsigned long long>(study_completed_responses),
+                static_cast<unsigned long long>(study_direct_body_attempts),
+                static_cast<unsigned long long>(study_direct_body_progress),
+                static_cast<unsigned long long>(study_direct_body_full));
+        if (::getenv("RUT_STUDY_BODY_POOL_LOG"))
+            ::fprintf(stderr,
+                      "RUT_BULK_CACHE_STUDY enabled=%u peak_borrowed=%u peak_cached=%u borrowed=%u "
+                      "cached=%u\n",
+                      pool.study_adaptive_cache,
+                      pool.study_bulk_peak_borrowed,
+                      pool.study_bulk_peak_cached,
+                      pool.study_bulk_borrowed,
+                      pool.bulk_cached_count);
         pool.destroy();
         if (capture_region_) {
             munmap(capture_region_, static_cast<u64>(connection_capacity) * kCaptureSliceSize);
@@ -3524,7 +3553,55 @@ public:
                 return false;
             }
         }
-        if (backend.add_send(c.fd, c.id, buf, len, generation, c.plaintext_send_has_follow_up())) {
+        BufferedSendVector* vector = nullptr;
+        if (!c.tls_active &&
+            c.response_read_deadline_post_commit_phase ==
+                ResponseReadDeadlinePostCommitPhase::BodySend &&
+            len > c.buffered_response_front_size()) {
+            if (buf != c.buffered_response_data() || c.upstream_recv_buf.len() != 0 ||
+                len > c.buffered_response_send_span_size() || !c.response_body_tail.head ||
+                !c.response_body_tail.head->next) {
+                if (deadline_send) c.clear_response_read_deadline_send_owner();
+                return false;
+            }
+            const auto* next = c.response_body_tail.head->next;
+            const u32 first = c.buffered_response_front_size();
+            c.response_send_vector.bind(
+                buf, first, ResponseBodyChain::payload(next) + next->offset, len - first);
+            vector = &c.response_send_vector;
+        }
+        static const bool study_direct_body = ::getenv("RUT_STUDY_DIRECT_BODY_SEND") != nullptr;
+        if (study_direct_body && c.response_read_deadline_upload.downstream_close &&
+            c.req_client_connection_close_exact && !c.req_client_keep_alive && deadline_send &&
+            !c.tls_active &&
+            c.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Body &&
+            len >= 32 * 1024 && backend.nop_inject_result && backend.sq_has_room()) {
+            const u32 extra_flags = c.plaintext_send_has_follow_up(len) ? MSG_MORE : 0;
+            ++study_direct_body_attempts;
+            const ssize_t n =
+                vector
+                    ? ::sendmsg(c.fd, &vector->message, MSG_DONTWAIT | MSG_NOSIGNAL | extra_flags)
+                    : ::send(c.fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL | extra_flags);
+            if (n > 0) {
+                ++study_direct_body_progress;
+                if (static_cast<u32>(n) == len) ++study_direct_body_full;
+                if (backend.add_send_after_direct_write(c.fd,
+                                                        c.id,
+                                                        buf,
+                                                        len,
+                                                        static_cast<u32>(n),
+                                                        generation,
+                                                        vector,
+                                                        extra_flags)) {
+                    c.pending_ops++;
+                    c.send_armed = true;
+                    return true;
+                }
+                return false;
+            }
+        }
+        if (backend.add_send(
+                c.fd, c.id, buf, len, generation, c.plaintext_send_has_follow_up(len), vector)) {
             c.pending_ops++;
             c.send_armed = true;
             return true;
@@ -3580,6 +3657,8 @@ public:
                  c.local_body_send_len == 0) ||
                 (buf == c.local_body_cursor && len == c.local_body_send_len));
     }
+
+    static constexpr bool supports_buffered_send_vector() { return true; }
 
     bool submit_send_impl(Connection& c, const u8* buf, u32 len) {
         if (c.tls_active) {
@@ -3883,8 +3962,10 @@ public:
         if (c.relay_owner.pipe_read < 0 || c.relay_owner.pipe_write < 0) {
             int fds[2] = {-1, -1};
             if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
-            if (::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024) < 64 * 1024 ||
-                ::fcntl(fds[1], F_GETPIPE_SZ) < 64 * 1024) {
+            // F_SETPIPE_SZ returns the actual capacity. The pipe is still
+            // private here, so a second F_GETPIPE_SZ only adds a syscall to
+            // every new relay connection.
+            if (::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024) < 64 * 1024) {
                 ::close(fds[0]);
                 ::close(fds[1]);
                 return false;
@@ -4681,10 +4762,36 @@ public:
                !c.h2_proxy_synth_quarantined;
     }
 
-    u16 find_or_add_response_read_batch_owner(u32 cid) {
-        for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
-            if (response_read_batch_owners[i].conn_id == cid) return static_cast<u16>(i + 1);
+    u16 find_response_read_batch_owner(u32 cid) const {
+        if (!response_read_batch_owner_index_active) {
+            for (u32 i = 0; i < response_read_batch_owner_count; ++i)
+                if (response_read_batch_owners[i].conn_id == cid) return static_cast<u16>(i + 1);
+            return 0;
         }
+        u32 slot = (cid * 2654435761u) & (kResponseReadOwnerIndexSize - 1u);
+        for (u32 probes = 0; probes < kResponseReadOwnerIndexSize; ++probes) {
+            const u16 index = response_read_batch_owner_index[slot];
+            if (index == 0) return 0;
+            if (response_read_batch_owners[index - 1u].conn_id == cid) return index;
+            slot = (slot + 1u) & (kResponseReadOwnerIndexSize - 1u);
+        }
+        return 0;
+    }
+
+    u16 publish_response_read_batch_owner() {
+        const u16 index = static_cast<u16>(++response_read_batch_owner_count);
+        if (response_read_batch_owner_index_active) {
+            const u32 cid = response_read_batch_owners[index - 1u].conn_id;
+            u32 slot = (cid * 2654435761u) & (kResponseReadOwnerIndexSize - 1u);
+            while (response_read_batch_owner_index[slot] != 0)
+                slot = (slot + 1u) & (kResponseReadOwnerIndexSize - 1u);
+            response_read_batch_owner_index[slot] = index;
+        }
+        return index;
+    }
+
+    u16 find_or_add_response_read_batch_owner(u32 cid) {
+        if (const u16 index = find_response_read_batch_owner(cid)) return index;
         if (cid >= slots_initialized || response_read_batch_owner_count >= kMaxEventsPerWait)
             return 0;
         const Connection& c = conns[cid];
@@ -4704,26 +4811,24 @@ public:
         owner.body_complete_at_start =
             c.response_read_deadline_state == ResponseReadDeadlineState::BodyComplete;
         owner.valid = response_read_deadline_identity_is_stable(c) && c.upstream_recv_armed;
-        return static_cast<u16>(++response_read_batch_owner_count);
+        return publish_response_read_batch_owner();
     }
 
     u16 find_or_add_precise_timer_batch_owner(u32 cid) {
-        for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
-            if (response_read_batch_owners[i].conn_id == cid) {
-                auto& owner = response_read_batch_owners[i];
-                const Connection& c = conns[cid];
-                if (!c.response_read_timer_owner_is_valid()) {
-                    owner.valid = false;
-                    return static_cast<u16>(i + 1);
-                }
-                owner.precise_timer_valid = true;
-                owner.saw_precise_timer = true;
-                owner.precise_timer_generation = c.response_read_timer_owner_generation;
-                owner.precise_timer_semantic =
-                    c.response_read_deadline_state != ResponseReadDeadlineState::None &&
-                    c.response_read_timer_phase == ResponseReadTimerPhase::Armed;
-                return static_cast<u16>(i + 1);
+        if (const u16 index = find_response_read_batch_owner(cid)) {
+            auto& owner = response_read_batch_owners[index - 1u];
+            const Connection& c = conns[cid];
+            if (!c.response_read_timer_owner_is_valid()) {
+                owner.valid = false;
+                return index;
             }
+            owner.precise_timer_valid = true;
+            owner.saw_precise_timer = true;
+            owner.precise_timer_generation = c.response_read_timer_owner_generation;
+            owner.precise_timer_semantic =
+                c.response_read_deadline_state != ResponseReadDeadlineState::None &&
+                c.response_read_timer_phase == ResponseReadTimerPhase::Armed;
+            return index;
         }
         if (cid >= slots_initialized || response_read_batch_owner_count >= kMaxEventsPerWait)
             return 0;
@@ -4747,41 +4852,37 @@ public:
         owner.precise_timer_semantic =
             c.response_read_deadline_state != ResponseReadDeadlineState::None &&
             c.response_read_timer_phase == ResponseReadTimerPhase::Armed;
-        return static_cast<u16>(++response_read_batch_owner_count);
+        return publish_response_read_batch_owner();
     }
 
     u16 find_or_add_bounded_terminal_custody_owner(u32 cid) {
         if (cid >= slots_initialized) return 0;
-        for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
-            if (response_read_batch_owners[i].conn_id == cid) {
-                auto& owner = response_read_batch_owners[i];
-                if (!owner.bounded_terminal_custody) {
-                    const Connection& c = conns[cid];
-                    owner.bounded_terminal_custody = true;
-                    const u32 received = c.response_read_deadline_post_commit_origin_received;
-                    const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
-                    const u32 header =
-                        c.response_read_deadline_post_commit_phase ==
-                                    ResponseReadDeadlinePostCommitPhase::HeaderSend ||
-                                c.response_read_deadline_post_commit_phase ==
-                                    ResponseReadDeadlinePostCommitPhase::Buffering
-                            ? c.response_read_deadline_post_commit_raw_header_end
-                            : 0;
-                    owner.bounded_terminal_buffer_begin =
-                        received >= completed && header <= 0xffffffffu - (received - completed)
-                            ? header + received - completed
-                            : 0xffffffffu;
-                    owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
-                    owner.post_commit_at_start = true;
-                    owner.valid =
-                        c.fd >= 0 && c.response_read_deadline_post_commit_terminal_pending &&
-                        c.response_read_deadline_buffering ==
-                            ForwardResponseBufferingMode::Bounded &&
-                        c.response_read_deadline_generation == owner.deadline_generation &&
-                        c.upstream_episode == owner.upstream_episode;
-                }
-                return static_cast<u16>(i + 1);
+        if (const u16 index = find_response_read_batch_owner(cid)) {
+            auto& owner = response_read_batch_owners[index - 1u];
+            if (!owner.bounded_terminal_custody) {
+                const Connection& c = conns[cid];
+                owner.bounded_terminal_custody = true;
+                const u32 received = c.response_read_deadline_post_commit_origin_received;
+                const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
+                const u32 header = c.response_read_deadline_post_commit_phase ==
+                                               ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                                           c.response_read_deadline_post_commit_phase ==
+                                               ResponseReadDeadlinePostCommitPhase::Buffering
+                                       ? c.response_read_deadline_post_commit_raw_header_end
+                                       : 0;
+                owner.bounded_terminal_buffer_begin =
+                    received >= completed && header <= 0xffffffffu - (received - completed)
+                        ? header + received - completed
+                        : 0xffffffffu;
+                owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
+                owner.post_commit_at_start = true;
+                owner.valid =
+                    c.fd >= 0 && c.response_read_deadline_post_commit_terminal_pending &&
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    c.response_read_deadline_generation == owner.deadline_generation &&
+                    c.upstream_episode == owner.upstream_episode;
             }
+            return index;
         }
         if (response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
         const Connection& c = conns[cid];
@@ -4819,7 +4920,7 @@ public:
                 c.response_read_deadline_generation &&
             c.response_read_deadline_post_commit_episode == c.upstream_episode &&
             valid_upstream_episode(c.upstream_episode);
-        return static_cast<u16>(++response_read_batch_owner_count);
+        return publish_response_read_batch_owner();
     }
 
     void prepare_bounded_terminal_timer_eof_pairs(const IoEvent* events, u32 count) {
@@ -4899,7 +5000,7 @@ public:
                 c.response_read_deadline_post_commit_episode == c.upstream_episode &&
                 valid_upstream_episode(c.upstream_episode) &&
                 owner.bounded_terminal_buffer_begin == c.buffered_response_len();
-            const u16 owner_index = static_cast<u16>(++response_read_batch_owner_count);
+            const u16 owner_index = publish_response_read_batch_owner();
             response_read_batch_event_owner[recv_index] = owner_index;
             response_read_batch_event_owner[timer_index] = owner_index;
         }
@@ -4908,6 +5009,10 @@ public:
     void prepare_response_read_deadline_batch(const IoEvent* events, u32 count) {
         response_read_batch_events = events;
         response_read_batch_owner_count = 0;
+        response_read_batch_owner_index_active = false;
+        __builtin_memset(
+            response_read_batch_owner_index, 0, sizeof(response_read_batch_owner_index));
+        response_read_batch_owner_index_active = true;
         response_read_batch_event_count = count;
         response_read_batch_event_index = 0;
         response_read_batch_pin_count = 0;
@@ -4946,13 +5051,7 @@ public:
             const IoEvent& ev = events[i];
             if (ev.conn_id >= slots_initialized) continue;
             if (response_read_batch_event_owner[i] == 0xffffu) continue;
-            u16 owner_index = 0;
-            for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
-                if (response_read_batch_owners[oi].conn_id == ev.conn_id) {
-                    owner_index = static_cast<u16>(oi + 1);
-                    break;
-                }
-            }
+            const u16 owner_index = find_response_read_batch_owner(ev.conn_id);
             if (owner_index == 0) continue;
             auto& owner = response_read_batch_owners[owner_index - 1];
             if (owner.bounded_terminal_prospective) continue;
@@ -6831,8 +6930,10 @@ public:
         flush_deferred_relay_reads();
         response_read_batch_pin_count = 0;
         response_read_batch_owner_count = 0;
+        response_read_batch_owner_index_active = false;
         response_read_batch_event_count = 0;
         response_read_batch_events = nullptr;
+        response_read_batch_owner_index_active = false;
         reclaim_pending();
     }
 
@@ -7836,6 +7937,7 @@ public:
                     }
                 } else {
                     sweep_idle_trim();
+                    pool.study_trim_bulk_idle_cache();
                 }
                 break;
             }

@@ -754,26 +754,33 @@ bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32
                                upstream_episode);
 }
 
-bool IoUringBackend::add_send(
-    i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation, bool more_follows) {
+bool IoUringBackend::add_send(i32 fd,
+                              u32 conn_id,
+                              const u8* buf,
+                              u32 len,
+                              u32 generation,
+                              bool more_follows,
+                              BufferedSendVector* vector) {
     if (conn_id >= connection_capacity || connection_capacity == 0) return false;
     io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;  // no SQE even after a flush: don't record send_state for it
+    if (vector && !vector->matches(buf, len)) return false;
     const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
 
     // Record send state only after acquiring SQE — if kernel returns partial,
     // wait() re-submits the remainder.
     if (conn_id < connection_capacity) {
         send_state[conn_id] = {buf, fd, 0, len, IoEventType::Send, 0, generation, extra_flags};
+        send_state[conn_id].vector = vector;
     }
 
     memset(sqe, 0, sizeof(*sqe));
-    sqe->opcode = IORING_OP_SEND;
+    sqe->opcode = vector ? IORING_OP_SENDMSG : IORING_OP_SEND;
     // MSG_NOSIGNAL explicit; current kernels also force it for io_uring.
     sqe->msg_flags = MSG_NOSIGNAL | extra_flags;
     sqe->fd = fd;
-    sqe->addr = reinterpret_cast<u64>(buf);
-    sqe->len = len;
+    sqe->addr = vector ? reinterpret_cast<u64>(&vector->message) : reinterpret_cast<u64>(buf);
+    sqe->len = vector ? 1u : len;
     sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
 
     sqe_advance_tail(sq_tail);
@@ -879,8 +886,15 @@ void IoUringBackend::probe_nop_inject_result() {
     __atomic_store_n(cq_head, head + 1, __ATOMIC_RELEASE);
 }
 
-bool IoUringBackend::add_send_after_direct_write(
-    i32 fd, u32 conn_id, const u8* buf, u32 len, u32 written, u32 generation) {
+bool IoUringBackend::add_send_after_direct_write(i32 fd,
+                                                 u32 conn_id,
+                                                 const u8* buf,
+                                                 u32 len,
+                                                 u32 written,
+                                                 u32 generation,
+                                                 BufferedSendVector* vector,
+                                                 u32 extra_flags) {
+    if (vector && !vector->matches(buf, len)) return false;
     if (conn_id >= connection_capacity || connection_capacity == 0 || written > len ||
         (written == len && !nop_inject_result))
         return false;
@@ -888,7 +902,9 @@ bool IoUringBackend::add_send_after_direct_write(
     if (!sqe) return false;
     // Same send state as add_send, advanced past the bytes the caller already
     // wrote directly; the Send completion still reports the whole length.
-    send_state[conn_id] = {buf, fd, written, len - written, IoEventType::Send, 0, generation};
+    send_state[conn_id] = {
+        buf, fd, written, len - written, IoEventType::Send, 0, generation, extra_flags};
+    send_state[conn_id].vector = vector;
     memset(sqe, 0, sizeof(*sqe));
     if (written == len) {
         sqe->opcode = IORING_OP_NOP;
@@ -897,11 +913,13 @@ bool IoUringBackend::add_send_after_direct_write(
         send_state[conn_id].offset = 0;
         send_state[conn_id].remaining = len;
     } else {
-        sqe->opcode = IORING_OP_SEND;
-        sqe->msg_flags = MSG_NOSIGNAL;  // explicit; current kernels also force it for io_uring
+        if (vector) vector->advance(written);
+        sqe->opcode = vector ? IORING_OP_SENDMSG : IORING_OP_SEND;
+        sqe->msg_flags = MSG_NOSIGNAL | extra_flags;
         sqe->fd = fd;
-        sqe->addr = reinterpret_cast<u64>(buf + written);
-        sqe->len = len - written;
+        sqe->addr =
+            vector ? reinterpret_cast<u64>(&vector->message) : reinterpret_cast<u64>(buf + written);
+        sqe->len = vector ? 1u : len - written;
     }
     sqe->user_data = encode_user_data(conn_id, IoEventType::Send, generation);
     sqe_advance_tail(sq_tail);
@@ -2104,6 +2122,7 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     count++;
                     continue;
                 }
+                if (ss.vector) ss.vector->advance(nw);
                 ss.offset += nw;
                 ss.remaining -= nw;
                 if (ss.remaining > 0) {
@@ -2111,11 +2130,12 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     io_uring_sqe* sqe = get_sqe_flushing();
                     if (sqe) {
                         memset(sqe, 0, sizeof(*sqe));
-                        sqe->opcode = IORING_OP_SEND;
+                        sqe->opcode = ss.vector ? IORING_OP_SENDMSG : IORING_OP_SEND;
                         sqe->msg_flags = MSG_NOSIGNAL | ss.msg_flags;
                         sqe->fd = ss.fd;
-                        sqe->addr = reinterpret_cast<u64>(ss.src + ss.offset);
-                        sqe->len = ss.remaining;
+                        sqe->addr = ss.vector ? reinterpret_cast<u64>(&ss.vector->message)
+                                              : reinterpret_cast<u64>(ss.src + ss.offset);
+                        sqe->len = ss.vector ? 1u : ss.remaining;
                         sqe->user_data =
                             type == IoEventType::UpstreamSend
                                 ? encode_upstream_user_data(conn_id, type, ss.upstream_episode)

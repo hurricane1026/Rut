@@ -1,9 +1,0 @@
-{
-  "base_commit": "88eb423d5f4a4e45f85b6835f29c497ce54029d8",
-  "build": "Clang Release O2, JIT ON, IPO OFF, fresh main build -j2",
-  "sha256": {
-    "rut": "9e4f707b2f4db829d3271ee7f849600b7b34b6d900c76e6e52360c5594059e88",
-    "rut-compile": "6abc58e3571b21bdd087f6a6b2f594d6c6910bf640b9587bff599a85bcc7a552",
-    "rut-nginx-convert": "19ce3b2228186966fe14194d995169eab9fd8e5afcc09b74c0a813ec8ec5d6ab"
-  }
-}

@@ -9,6 +9,7 @@
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/http_parser.h"
 #include "rut/runtime/io_event.h"
@@ -951,7 +952,50 @@ struct ConnectionBase {
     // receive window below one MSS with the rest queued, and the stream then
     // waits for a delayed ACK or the persist timer. Anything that waits on
     // upstream I/O must push.
-    [[nodiscard]] bool plaintext_send_has_follow_up() const { return local_body_remaining != 0; }
+    [[nodiscard]] bool plaintext_send_has_follow_up(u32 len = 0) const {
+        if (local_body_remaining != 0) return true;
+        if (response_read_deadline_post_commit_phase ==
+            ResponseReadDeadlinePostCommitPhase::HeaderSend) {
+            // The rewritten header has an exact send owner, and the body
+            // pump can submit this published prefix after its completion.
+            return !tls_active && len != 0 &&
+                   response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                   !response_read_deadline_post_commit_terminal_pending &&
+                   response_read_deadline_send_owner_active &&
+                   response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Header &&
+                   response_read_deadline_send_src == response_header_buf.data() &&
+                   response_read_deadline_send_len == len && response_header_buf.len() == len &&
+                   response_read_deadline_send_fd == fd && fd >= 0 &&
+                   response_read_deadline_post_commit_inflight_body == 0 &&
+                   response_read_deadline_post_commit_downstream_submitted == 0 &&
+                   response_read_deadline_post_commit_downstream_completed == 0 &&
+                   response_read_deadline_post_commit_release_target != 0 &&
+                   response_read_deadline_post_commit_release_target <=
+                       response_read_deadline_post_commit_origin_received;
+        }
+        // A bounded proxy may cork only bytes already received behind this
+        // exact body send. Future origin arrivals must never hold a push.
+        if (tls_active || len == 0 ||
+            response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::BodySend ||
+            response_read_deadline_post_commit_terminal_pending ||
+            response_read_deadline_post_commit_inflight_body != len ||
+            response_read_deadline_post_commit_downstream_submitted <
+                response_read_deadline_post_commit_downstream_completed ||
+            response_read_deadline_post_commit_downstream_submitted -
+                    response_read_deadline_post_commit_downstream_completed !=
+                len ||
+            response_read_deadline_post_commit_origin_received <=
+                response_read_deadline_post_commit_downstream_completed)
+            return false;
+        // Received bytes below the publication boundary still await origin
+        // progress. Cork only a follow-up the body pump can send immediately.
+        return response_read_deadline_post_commit_release_target <=
+                   response_read_deadline_post_commit_origin_received &&
+               response_read_deadline_post_commit_release_target >
+                   response_read_deadline_post_commit_downstream_submitted;
+    }
 
     // TLS variant for a raw ciphertext send of `len` bytes from tls_out_buf:
     // only ciphertext already queued behind it counts. Plaintext still to be
@@ -1772,6 +1816,30 @@ struct ConnectionBase {
             return 0;
         return tls_active ? ResponseBodyChain::kBulkAfterTls
                           : ResponseBodyChain::kBulkAfterPlaintext;
+    }
+    BufferedSendVector response_send_vector{};
+    // Only chain-owned committed bytes may cross a node boundary in one send.
+    u32 buffered_response_send_span_size() const {
+        const u32 first = buffered_response_front_size();
+        if (tls_active || upstream_recv_buf.len() != 0 ||
+            response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            response_body_tail.head == nullptr || response_body_tail.head->next == nullptr)
+            return first;
+        const auto* next = response_body_tail.head->next;
+        const u32 second = next->len - next->offset;
+        return first + second;
+    }
+    bool buffered_response_send_range_is_valid(u32 len) const {
+        const u32 first = buffered_response_front_size();
+        if (len <= first) return true;
+        if (len > buffered_response_send_span_size() || response_body_tail.head == nullptr ||
+            response_body_tail.head->next == nullptr || upstream_recv_buf.len() != 0)
+            return false;
+        const auto* next = response_body_tail.head->next;
+        return response_send_vector.first_source == buffered_response_data() &&
+               response_send_vector.second_source ==
+                   ResponseBodyChain::payload(next) + next->offset &&
+               response_send_vector.first_size == first && response_send_vector.total_size == len;
     }
     u32 buffered_response_len() const { return upstream_recv_buf.len() + response_body_tail.size; }
     const u8* buffered_response_data() const {

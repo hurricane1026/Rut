@@ -128,13 +128,34 @@ class ToolsTest(unittest.TestCase):
         single = SimpleNamespace(**(baseline | {"concurrency": [32]}))
         validate_proxy_profile(parser, single)
         self.assertEqual(single.body_size, 256 * 1024)
-        for key, value in (("scenarios", ["proxy-close"]),
+        large = SimpleNamespace(**(baseline | {"body_size": 1048576,
+                                "scenarios": ["proxy-close", "proxy-keepalive"],
+                                "concurrency": [1, 128]}))
+        validate_proxy_profile(parser, large)
+        self.assertEqual(large.body_size, 1048576)
+        for key, value in (("scenarios", ["static-close"]),
                            ("concurrency", [8]),
                            ("concurrency", []),
-                           ("body_size", 65536),
+                           ("body_size", 1048577),
                            ("keepalive_header", "explicit")):
             with self.subTest(key=key), self.assertRaises(SystemExit):
                 validate_proxy_profile(parser, SimpleNamespace(**(baseline | {key: value})))
+
+    def test_large_native_close_checks_tail_content_and_transport_eof(self):
+        wanted = expected_body("proxy", 1048576, native_streaming=True)
+        head = (b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n"
+                b"Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
+        raw, closed = response(FakeSocket([head, wanted]), "proxy", True,
+                               body_size=1048576, native_streaming=True)
+        self.assertTrue(closed)
+        self.assertTrue(raw.endswith(wanted))
+        damaged = wanted[:900000] + bytes([wanted[900000] ^ 1]) + wanted[900001:]
+        with self.assertRaisesRegex(ValueError, "unexpected body"):
+            response(FakeSocket([head, damaged]), "proxy", True,
+                     body_size=1048576, native_streaming=True)
+        with self.assertRaisesRegex(ValueError, "expected EOF"):
+            response(FakeSocket([head, wanted, b"surplus"]), "proxy", True,
+                     body_size=1048576, native_streaming=True)
 
     def test_default_proxy_profile_leaves_arguments_unchanged(self):
         args = SimpleNamespace(proxy_profile="converter-strict", body_size=None,

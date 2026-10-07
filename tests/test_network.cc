@@ -12971,6 +12971,42 @@ TEST(iouring_send, pipelined_burst_sync_completion_accounts_once_and_serves_next
     close(listener);
 }
 
+TEST(iouring_send, study_direct_vector_keeps_total_bytes_and_flags_after_prefix) {
+    for (u32 written : {20u, 64u}) {
+        ScopedTlsRawSendLoop guard;
+        REQUIRE(guard.init());
+        auto& backend = guard.loop->backend;
+        backend.nop_inject_result = true;
+        static const u8 first[16] = {};
+        static const u8 second[48] = {};
+        BufferedSendVector vector;
+        vector.bind(first, sizeof(first), second, sizeof(second));
+        REQUIRE(
+            backend.add_send_after_direct_write(9, 0, first, 64, written, 5, &vector, MSG_MORE));
+        CHECK_EQ(guard.sq_tail, 1u);
+        if (written < 64) {
+            CHECK_EQ(guard.sq_entries[0].opcode, IORING_OP_SENDMSG);
+            CHECK_EQ(guard.sq_entries[0].msg_flags, static_cast<u32>(MSG_NOSIGNAL | MSG_MORE));
+            CHECK_EQ(vector.message.msg_iovlen, 1u);
+            CHECK_EQ(vector.message.msg_iov[0].iov_base, const_cast<u8*>(second + 4));
+            CHECK_EQ(vector.message.msg_iov[0].iov_len, 44u);
+        } else {
+            CHECK_EQ(guard.sq_entries[0].opcode, IORING_OP_NOP);
+            CHECK_EQ(guard.sq_entries[0].len, 64u);
+            CHECK_EQ(vector.message.msg_iovlen, 2u);
+        }
+        guard.sq_head = guard.sq_tail;
+        backend.pending = 0;
+        REQUIRE(guard.push_send_cqe(5, written == 64 ? 64 : 44));
+        IoEvent event{};
+        REQUIRE_EQ(backend.wait(&event, 1, guard.loop->conns, 1), 1u);
+        CHECK_EQ(event.result, 64);
+        CHECK_EQ(event.non_upstream_generation, 5u);
+        CHECK_EQ(backend.send_state[0].offset, 64u);
+        CHECK_EQ(backend.send_state[0].remaining, 0u);
+    }
+}
+
 TEST(iouring_send, more_follows_sets_msg_more_across_partial_resubmission) {
     ScopedTlsRawSendLoop guard;
     REQUIRE(guard.init());
@@ -83066,6 +83102,100 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
     }
 }
 
+TEST(send_follow_up, bounded_body_corks_only_committed_following_bytes) {
+    Connection conn{};
+    conn.reset();
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
+    conn.response_read_deadline_post_commit_inflight_body = 100;
+    conn.response_read_deadline_post_commit_downstream_completed = 200;
+    conn.response_read_deadline_post_commit_downstream_submitted = 300;
+    conn.response_read_deadline_post_commit_origin_received = 400;
+    conn.response_read_deadline_post_commit_release_target = 400;
+    CHECK(conn.plaintext_send_has_follow_up(100));
+    // Withheld bytes require another origin completion and cannot justify corking.
+    conn.response_read_deadline_post_commit_release_target = 300;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_post_commit_release_target = 299;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_post_commit_release_target = 401;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_post_commit_release_target = 301;
+    CHECK(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_post_commit_release_target = 400;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up());
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(99));
+    // The final buffered byte must push even if more origin bytes are declared.
+    conn.response_read_deadline_post_commit_declared_body = 1000;
+    conn.response_read_deadline_post_commit_origin_received = 300;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_post_commit_origin_received = 400;
+    conn.response_read_deadline_post_commit_terminal_pending = true;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_post_commit_terminal_pending = false;
+    conn.tls_active = true;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.tls_active = false;
+    conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::HeaderSend;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_post_commit_downstream_submitted = 100;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+    conn.response_read_deadline_post_commit_downstream_submitted = 300;
+    conn.response_read_deadline_post_commit_origin_received = 100;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(100));
+}
+
+TEST(send_follow_up, bounded_header_corks_only_an_owned_header_with_published_body) {
+    Connection conn{};
+    conn.reset();
+    u8 header[128]{};
+    conn.response_header_buf.bind(header, sizeof(header));
+    conn.response_header_buf.commit(sizeof(header));
+    conn.fd = 17;
+    conn.response_read_deadline_buffering = ForwardResponseBufferingMode::Bounded;
+    conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::HeaderSend;
+    conn.response_read_deadline_send_owner_active = true;
+    conn.response_read_deadline_send_kind = ResponseReadDeadlineSendKind::Header;
+    conn.response_read_deadline_send_src = header;
+    conn.response_read_deadline_send_len = sizeof(header);
+    conn.response_read_deadline_send_fd = conn.fd;
+    conn.response_read_deadline_post_commit_origin_received = 8192;
+    conn.response_read_deadline_post_commit_release_target = 4096;
+    CHECK(conn.plaintext_send_has_follow_up(sizeof(header)));
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header) - 1));
+    conn.response_read_deadline_post_commit_release_target = 0;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.response_read_deadline_post_commit_release_target = 8193;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.response_read_deadline_post_commit_release_target = 4096;
+    conn.response_read_deadline_send_owner_active = false;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.response_read_deadline_send_owner_active = true;
+    conn.response_read_deadline_send_src = header + 1;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.response_read_deadline_send_src = header;
+    conn.response_read_deadline_send_fd = 18;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.response_read_deadline_send_fd = conn.fd;
+    conn.response_read_deadline_send_kind = ResponseReadDeadlineSendKind::Body;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.response_read_deadline_send_kind = ResponseReadDeadlineSendKind::Header;
+    conn.response_read_deadline_post_commit_terminal_pending = true;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.response_read_deadline_post_commit_terminal_pending = false;
+    conn.response_read_deadline_post_commit_downstream_submitted = 1;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.response_read_deadline_post_commit_downstream_submitted = 0;
+    conn.tls_active = true;
+    CHECK_FALSE(conn.plaintext_send_has_follow_up(sizeof(header)));
+    conn.tls_active = false;
+    CHECK(conn.plaintext_send_has_follow_up(sizeof(header)));
+}
+
 TEST(send_follow_up, tls_ciphertext_send_follows_only_queued_ciphertext) {
     Connection conn{};
     conn.reset();
@@ -85566,6 +85696,35 @@ void check_body_pump_visits(rut::test::TestCase* _tc,
     for (size_t i = 0; i < common; ++i) CHECK_EQ(actual[i], expected[i]);
 }
 }  // namespace
+
+TEST(iouring_response_read_owner_index, collisions_capacity_and_batch_reset) {
+    IoUringEventLoop loop;
+    loop.response_read_batch_owner_index_active = true;
+    for (u32 i = 0; i < kMaxEventsPerWait; ++i) {
+        // All IDs collide in the first slot, including valid connection ID 0.
+        loop.response_read_batch_owners[i] = {};
+        loop.response_read_batch_owners[i].conn_id = i * loop.kResponseReadOwnerIndexSize;
+        CHECK_EQ(loop.publish_response_read_batch_owner(), i + 1);
+    }
+    for (u32 i = 0; i < kMaxEventsPerWait; ++i)
+        CHECK_EQ(loop.find_response_read_batch_owner(i * loop.kResponseReadOwnerIndexSize), i + 1);
+    CHECK_EQ(
+        loop.find_response_read_batch_owner(kMaxEventsPerWait * loop.kResponseReadOwnerIndexSize),
+        0u);
+    CHECK_EQ(loop.find_response_read_batch_owner(1), 0u);
+
+    // A new wait batch must not retain any prior connection/generation owner.
+    loop.prepare_response_read_deadline_batch(nullptr, 0);
+    CHECK_EQ(loop.response_read_batch_owner_count, 0u);
+    CHECK_EQ(loop.find_response_read_batch_owner(0), 0u);
+    loop.response_read_batch_owners[0] = {};
+    loop.response_read_batch_owners[0].conn_id = 7;
+    CHECK_EQ(loop.publish_response_read_batch_owner(), 1u);
+    CHECK_EQ(loop.find_response_read_batch_owner(7), 1u);
+    CHECK_EQ(loop.find_response_read_batch_owner(0), 0u);
+    loop.response_read_batch_owner_index_active = false;
+    CHECK_EQ(loop.find_response_read_batch_owner(7), 1u);
+}
 
 TEST(iouring_body_pump_ready_set, bounded_capacity_edges_coalesce_and_empty_drain) {
     for (const u32 capacity : {1u, 3u, 63u, 64u, 65u, 32768u}) {

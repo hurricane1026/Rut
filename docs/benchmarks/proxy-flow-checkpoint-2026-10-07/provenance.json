@@ -1,0 +1,14 @@
+[
+  {
+    "binary": "/tmp/rut-window-study/bin-direct-body-send/rut",
+    "sha256": "32f523d0506e398559c0977b5db9ad7dd6ea39dfb72aff65c3323dda4ec92a75"
+  },
+  {
+    "binary": "/tmp/rut-window-study/bin-direct-close-alignment/rut",
+    "sha256": "fef67d7883cb61006fd42217f8895c3c5d702e833fa32b879f6888f0c131d99e"
+  },
+  {
+    "binary": "/tmp/rut-window-study/bin-adaptive-cache-close/rut",
+    "sha256": "0e8b7a2aac39bb80cdb44b8d5840a1ef62cc47b5be53bb977a7d105b4a061e7d"
+  }
+]
