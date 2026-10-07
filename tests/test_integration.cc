@@ -24698,6 +24698,9 @@ struct RecordingUpstream {
     // arrive while the origin peer remains open.  This is only wire evidence;
     // exact io_uring ownership is covered by the focused network tests.
     bool wait_first_response_for_peer_close = false;
+    // Opt-in fixture mode for a persistent origin: the next request on the
+    // first accepted socket receives response_after_first.
+    bool reuse_first_response_connection = false;
     // Separate timeout fixture mode: request 1 receives no origin response
     // bytes at all.  The origin keeps the socket open until RUT retires the
     // timed-out Recv, then remains available to accept request 2.
@@ -24985,6 +24988,7 @@ struct RecordingUpstream {
                     s->first_response_sent_open.store(true, std::memory_order_release);
                 char unexpected[64];
                 bool observed = false;
+                bool client_closed = false;
                 for (u32 waited = 0; waited < 60; waited++) {
                     if (!s->running.load(std::memory_order_acquire)) {
                         s->first_peer_observation_aborted.store(true, std::memory_order_release);
@@ -25002,6 +25006,77 @@ struct RecordingUpstream {
                             s->first_peer_closed_ns.store(timestamp, std::memory_order_release);
                         }
                         s->first_peer_closed.store(true, std::memory_order_release);
+                    } else if (peer_result > 0 && s->reuse_first_response_connection &&
+                               s->response_after_first != nullptr) {
+                        const u32 second_slot = s->request_count.load(std::memory_order_relaxed);
+                        u32 second_len = static_cast<u32>(peer_result);
+                        memcpy(s->request, unexpected, second_len);
+                        u32 second_header_len = 0;
+                        u32 second_want = 0;
+                        for (u32 received = 0; received < 60; received++) {
+                            if (buf_contains(s->request, second_len, "\r\n\r\n", 4)) {
+                                for (u32 k = 0; k + 3 < second_len; k++) {
+                                    if (s->request[k] == '\r' && s->request[k + 1] == '\n' &&
+                                        s->request[k + 2] == '\r' && s->request[k + 3] == '\n') {
+                                        second_header_len = k + 4;
+                                        second_want = second_header_len;
+                                        break;
+                                    }
+                                }
+                                for (u32 k = 0; k + 15 < second_header_len; k++) {
+                                    static constexpr char kCl[] = "content-length:";
+                                    bool match = true;
+                                    for (u32 j = 0; j < 15; j++) {
+                                        char c = s->request[k + j];
+                                        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+                                        if (c != kCl[j]) {
+                                            match = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!match) continue;
+                                    u32 p = k + 15;
+                                    while (p < second_header_len &&
+                                           (s->request[p] == ' ' || s->request[p] == '\t'))
+                                        p++;
+                                    u32 body_len = 0;
+                                    while (p < second_header_len && s->request[p] >= '0' &&
+                                           s->request[p] <= '9')
+                                        body_len = body_len * 10u +
+                                                   static_cast<u32>(s->request[p++] - '0');
+                                    second_want += body_len;
+                                    break;
+                                }
+                            }
+                            if (second_header_len != 0 && second_len >= second_want) break;
+                            if (second_len == sizeof(s->request)) break;
+                            const i32 more = recv_timeout(client,
+                                                          s->request + second_len,
+                                                          sizeof(s->request) - second_len,
+                                                          100);
+                            if (more == -EAGAIN) continue;
+                            if (more <= 0) break;
+                            second_len += static_cast<u32>(more);
+                        }
+                        if (second_header_len == 0 || second_len < second_want) {
+                            s->first_peer_observation_aborted.store(true,
+                                                                    std::memory_order_release);
+                        } else {
+                            if (second_slot < kMaxRecordedRequests) {
+                                memcpy(s->request_history[second_slot], s->request, second_len);
+                                s->request_history_len[second_slot] = second_len;
+                                s->request_history_header_len[second_slot] = second_header_len;
+                            }
+                            s->request_count.fetch_add(1, std::memory_order_release);
+                            const bool second_sent = send_all(
+                                client, s->response_after_first, s->response_after_first_len);
+                            if (!second_sent)
+                                s->first_peer_observation_aborted.store(true,
+                                                                        std::memory_order_release);
+                        }
+                        observed = true;
+                        close(client);
+                        client_closed = true;
                     } else if (peer_result > 0) {
                         s->first_peer_unexpected_data.store(true, std::memory_order_release);
                     } else {
@@ -25013,7 +25088,7 @@ struct RecordingUpstream {
                 if (!observed) {
                     s->first_peer_close_timed_out.store(true, std::memory_order_release);
                 }
-                close(client);
+                if (!client_closed) close(client);
             } else if (s->keep_open && s->held_fd_count < kMaxHeldFds) {
                 // Keep the backend connection open and deliberately unread after
                 // one response. The accept loop remains free to service a second
@@ -37445,6 +37520,7 @@ TEST(route, public_ordinary_source_bounded_buffering_fragmented_success_reuses_d
     backend.gate_first_response_fragments = true;
     backend.allowed_first_response_fragments.store(1, std::memory_order_release);
     backend.wait_first_response_for_peer_close = true;
+    backend.reuse_first_response_connection = true;
     REQUIRE(backend.setup());
 
     PublicGetCompleteContentLengthBufferingSourceResources resources;
@@ -37562,7 +37638,7 @@ TEST(route, public_ordinary_source_bounded_buffering_fragmented_success_reuses_d
     for (u32 waited = 0; waited < 1200 && backend.request_count.load(std::memory_order_acquire) < 2;
          waited++)
         usleep(5000);
-    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 2u);
+    REQUIRE_EQ(backend.accepted_count.load(std::memory_order_acquire), 1u);
     REQUIRE_EQ(backend.request_count.load(std::memory_order_acquire), 2u);
     REQUIRE_EQ(backend.request_history_len[1], sizeof(kRequestTwo) - 1u);
     CHECK_EQ(memcmp(backend.request_history[1], kRequestTwo, sizeof(kRequestTwo) - 1u), 0);
