@@ -30842,6 +30842,12 @@ TEST(epoll_send, more_follows_is_kept_for_partial_write_continuation) {
     CHECK_EQ(backend.pending_count, 0u);  // parked on EPOLLOUT, no completion yet
     CHECK_GT(backend.send_state[3].remaining, 0u);
     CHECK_EQ(backend.send_state[3].msg_flags, static_cast<u32>(MSG_MORE));
+    IoEvent progress[2]{};
+    REQUIRE_EQ(backend.wait(progress, 2, nullptr, 0), 1u);
+    CHECK_EQ(progress[0].type, IoEventType::Send);
+    CHECK_EQ(progress[0].aux, kEpollSendProgressAux);
+    CHECK_EQ(progress[0].result, 0);
+    CHECK_GT(backend.send_state[3].remaining, 0u);
     backend.clear_send_state(3);
     backend.shutdown();
     munmap(big, kLen);
@@ -85150,6 +85156,27 @@ TEST(epoll_bulk_body, preserves_bytes_and_releases_idle_bulk) {
     CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kSliceSize);
     CHECK_EQ(loop->pool.bulk_available(), available);
     loop->close_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_send, partial_progress_refreshes_timer_without_callback) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->state = ConnState::Sending;
+    c->set_slots(nullptr, &on_response_body_sent<EpollEventLoop>, nullptr, nullptr);
+    loop->timer.add(c, 1);
+    const u32 expected_slot =
+        (loop->timer.cursor + loop->keepalive_timeout) & (TimerWheel::kSlots - 1u);
+
+    loop->dispatch({c->id, 0, 0, 0, IoEventType::Send, 0, kEpollSendProgressAux});
+
+    CHECK_EQ(c->timer_node.prev, &loop->timer.slots[expected_slot]);
+    CHECK_EQ(c->on_send, &on_response_body_sent<EpollEventLoop>);
+    loop->free_conn(*c);
     loop->shutdown();
     destroy_real_loop(loop);
 }

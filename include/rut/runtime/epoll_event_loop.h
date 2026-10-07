@@ -1092,6 +1092,13 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < connection_capacity) {
                     auto& conn = conns[ev.conn_id];
+                    if (ev.aux == kEpollSendProgressAux && ev.type == IoEventType::Send) {
+                        if (!conn.throttle_paused)
+                            timer.refresh(&conn,
+                                          conn.state == ConnState::Proxying ? upstream_timeout
+                                                                            : keepalive_timeout);
+                        break;
+                    }
                     if (conn.on_recv || conn.on_send || conn.on_upstream_recv ||
                         conn.on_upstream_send) {
                         // A @throttle-paused connection's timer is owned by the
