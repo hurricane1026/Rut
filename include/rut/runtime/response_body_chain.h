@@ -109,14 +109,17 @@ struct ResponseBodyChain {
         return true;
     }
 
-    // The caller has completed all asynchronous users of the consumed bytes.
-    void consume(u32 len) {
-        while (len != 0) {
+    // Completed sends may consume the committed prefix while a direct recv
+    // still owns the tail's reserved capacity. Retain that node until the
+    // receive target settles; consume(0) then removes any empty retained head.
+    void consume(u32 len, bool tail_pinned = false) {
+        while (head && (len != 0 || head->offset == head->len)) {
             const u32 n = len < front_size() ? len : front_size();
             head->offset += n;
             size -= n;
             len -= n;
             if (head->offset == head->len) {
+                if (head == tail && tail_pinned) break;
                 Node* old = head;
                 head = head->next;
                 release_node(old);

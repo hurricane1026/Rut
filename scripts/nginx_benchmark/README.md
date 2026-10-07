@@ -61,20 +61,29 @@ shape, which is recorded in `environment.json`. Close cases always send
 `Connection: close`. Passing the implicit profile does **not** establish support
 for explicit keep-alive, nor erase the original failed results.
 
-`--proxy-profile native-streaming` selects the public native Rut DSL for the
-bounded 256 KiB `GET /proxy` keepalive workload. It requires exactly
-`--keepalive-header implicit --scenarios proxy-keepalive`; choose a nonempty
-subset of `--concurrency 1 32` (other levels are rejected);
-HTTP is the default, and the same run can use the existing `--tls-cert` /
-`--tls-key` TLS listener. This profile has no converter strict-response or
-request-deadline policy, so its measurements are recorded separately from the
-default `converter-strict` profile. Both frontends use a 60-second origin idle
-timeout and origin connection reuse; nginx has a 4096-entry idle upstream pool
-and streams responses with buffering disabled. Nginx's 16 KiB response header
-buffer is paired with a 16 KiB busy-buffer limit to satisfy its buffer
-configuration constraints; response buffering remains off and cannot spill to
-temporary files. Rut uses the native
-`upstream` / `forward` DSL and its per-shard 4096-connection idle pool.
+`--proxy-profile native-streaming` selects the public native Rut DSL for
+`GET /proxy`, with `--keepalive-header implicit`. It supports proxy-close and
+proxy-keepalive, body sizes from 1 byte through 1 MiB (default 256 KiB), and a
+subset of concurrency 1, 32, and 128. HTTP is the default; the same run can use
+the existing `--tls-cert` / `--tls-key` TLS listener. This profile has no
+converter strict-response or request-deadline policy, so its measurements are
+recorded separately from the default `converter-strict` profile.
+
+Native origin reuse defaults to `--native-origin-reuse on`: both frontends use
+a 60-second origin idle timeout and 4096-entry idle pools. Select `off` to
+compare fresh origin connections; marked preflight requests verify the selected
+reuse behavior. Nginx defaults to `--native-nginx-buffering off`; `on` uses eight
+16 KiB response buffers and a separate 16 KiB header buffer. Close preflight
+checks the entire deterministic body and EOF. Keepalive preflight checks 100
+sequential responses and a slow reader followed by another request.
+
+`--proxy-profile converter-bounded` explicitly replaces only
+`response_buffering: .completeContentLength` in the converted benchmark DSL
+with `.bounded`. The original output is retained as `proxy.converted.rut`.
+The converter default and nginx configuration are unchanged. This profile
+measures incremental response publication with strict header/framing checks;
+measurements must remain separate from complete buffering because an origin
+failure after publication closes an already-started response.
 
 For the 1 MiB `converter-strict` proxy comparison, nginx keeps response
 buffering enabled with eight 16 KiB proxy buffers and a 16 KiB header buffer.

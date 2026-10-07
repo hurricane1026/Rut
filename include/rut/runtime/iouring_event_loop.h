@@ -355,6 +355,13 @@ public:
         bool precise_timer_target_seen = false;
         bool precise_timer_cancel_seen = false;
         bool precise_timer_semantic = false;
+        bool bounded_terminal_custody = false;
+        bool bounded_terminal_prospective = false;
+        bool bounded_terminal_timer_seen = false;
+        u32 bounded_terminal_buffer_begin = 0;
+        bool bounded_terminal_recv_seen = false;
+        bool bounded_terminal_cancel_seen = false;
+        bool bounded_terminal_custody_invalid = false;
     };
     ResponseReadBatchOwner response_read_batch_owners[kMaxEventsPerWait];
     u16 response_read_batch_event_owner[kMaxEventsPerWait];
@@ -1629,7 +1636,13 @@ public:
     // Use the existing separate receive ring so a large buffered origin
     // cannot consume all buffers needed by downstream TLS requests.
     bool add_response_read_recv(Connection& c, bool direct_buffered_body = false) {
-        if (direct_buffered_body) return arm_response_read_direct_body_recv(c);
+        const auto phase = c.response_read_deadline_post_commit_phase;
+        const bool bounded_stream =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            (phase == ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+             phase == ResponseReadDeadlinePostCommitPhase::BodySend ||
+             phase == ResponseReadDeadlinePostCommitPhase::WaitingBody);
+        if (direct_buffered_body || bounded_stream) return arm_response_read_direct_body_recv(c);
         const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
             c.response_read_deadline_buffering);
         // Keep the header/first-body target on the dedicated provided ring.
@@ -1655,23 +1668,39 @@ public:
     // would expire the response although no single gap reached
     // response_read_timeout.
     [[nodiscard]] bool arm_response_read_direct_body_recv(Connection& c) {
-        if (c.response_read_deadline_post_commit_phase !=
-            ResponseReadDeadlinePostCommitPhase::Buffering)
+        const auto phase = c.response_read_deadline_post_commit_phase;
+        const bool buffering = phase == ResponseReadDeadlinePostCommitPhase::Buffering;
+        const bool bounded_stream =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            (phase == ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+             phase == ResponseReadDeadlinePostCommitPhase::BodySend ||
+             phase == ResponseReadDeadlinePostCommitPhase::WaitingBody);
+        if ((!buffering && !bounded_stream) ||
+            c.response_read_deadline_post_commit_terminal_pending ||
+            c.response_read_deadline_post_commit_close_after_drain)
             return false;
         const u32 declared = c.response_read_deadline_post_commit_declared_body;
         const u32 received = c.response_read_deadline_post_commit_origin_received;
         const u32 raw_header_end = c.response_read_deadline_post_commit_raw_header_end;
-        if (received >= declared || raw_header_end == 0 ||
-            raw_header_end > 0xFFFFFFFFu - received ||
-            c.buffered_response_len() != raw_header_end + received ||
+        const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
+        const u32 header = buffering || phase == ResponseReadDeadlinePostCommitPhase::HeaderSend
+                               ? raw_header_end
+                               : 0;
+        if (received >= declared || raw_header_end == 0 || completed > received ||
+            header > 0xFFFFFFFFu - (received - completed) ||
+            c.buffered_response_len() != header + received - completed ||
             !response_read_deadline_identity_is_stable(c) || c.chain_direct_recv_owner.active ||
             c.upstream_recv_armed || c.upstream_recv_pause_cancel_pending ||
             c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
             c.upstream_recv_terminal_stale || c.upstream_fd < 0 ||
             !valid_upstream_episode(c.upstream_episode))
             return false;
-        const u32 bulk_after = c.tls_active ? ResponseBodyChain::kBulkAfterTls
-                                            : ResponseBodyChain::kBulkAfterPlaintext;
+        const u32 bulk_after =
+            !c.tls_active &&
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    declared > SlicePool::kBulkSliceSize
+                ? 0
+                : c.buffered_response_bulk_after();
         if (!c.response_body_tail.reserve_tail(pool, bulk_after)) return false;
         const u32 avail = c.response_body_tail.write_avail(pool);
         const u32 body_room = ResponseBodyChain::kMaxBody - received + 1u;
@@ -4269,7 +4298,8 @@ public:
             !c.tls_active || (response_read_deadline_tls_output_is_settled(c) &&
                               c.on_recv == &tls_recv<Self> && c.tls_pending_on_recv == nullptr);
         if (c.state != ConnState::Proxying || c.protocol != ConnProtocol::Http11 ||
-            !tls_arm_owner || c.upstream_fd < 0 || c.upstream_reused || c.upstream_attempts != 1 ||
+            !tls_arm_owner || c.upstream_fd < 0 ||
+            !response_read_deadline_upstream_reuse_is_stable(c) || c.upstream_attempts != 1 ||
             !valid_upstream_episode(c.upstream_episode) || c.upstream_episode_quarantined ||
             !c.request_upload_complete || c.upstream_request_incomplete ||
             c.buffered_response_len() != 0 || c.on_upstream_recv != &on_upstream_response<Self> ||
@@ -4318,8 +4348,9 @@ public:
             c.protocol != ConnProtocol::Http11 ||
             (c.tls_active && !response_read_deadline_tls_http11_engine_is_stable(c)) ||
             (c.tls_active && (c.on_recv != &tls_recv<Self> || c.tls_pending_on_recv != nullptr)) ||
-            c.h2 != nullptr || c.upstream_reused || c.upstream_attempts != 1 || c.upstream_fd < 0 ||
-            c.response_mutations_snapshotted || !valid_upstream_episode(c.upstream_episode) ||
+            c.h2 != nullptr || !response_read_deadline_upstream_reuse_is_stable(c) ||
+            c.upstream_attempts != 1 || c.upstream_fd < 0 || c.response_mutations_snapshotted ||
+            !valid_upstream_episode(c.upstream_episode) ||
             c.response_read_deadline_upstream_episode != c.upstream_episode)
             return false;
         const RouteConfig* cfg = c.request_config;
@@ -4479,12 +4510,14 @@ public:
     // Semantic ownership is independent of timer transport custody: consuming a
     // target CQE must not make an otherwise valid stream ineligible for rearm.
     [[nodiscard]] bool streaming_response_read_timer_is_stable(const Connection& c) const {
+        const bool bounded_release =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::Buffering;
         if (c.id >= connection_capacity || c.state != ConnState::Sending || c.req_start_us == 0 ||
-            c.epoch_held ||
-            c.response_read_deadline_buffering != ForwardResponseBufferingMode::None ||
-            c.response_read_deadline_profile !=
-                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero ||
-            c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
+            c.epoch_held || !post_commit_incremental_release_active(c) ||
+            (bounded_release ? !response_read_deadline_non_head_method_admitted(c.req_method)
+                             : c.req_method != static_cast<u8>(LogHttpMethod::Get)) ||
             !response_read_deadline_identity_is_stable(c) ||
             !response_read_deadline_post_commit_is_stable(c))
             return false;
@@ -4500,7 +4533,7 @@ public:
         const bool header = phase == ResponseReadDeadlinePostCommitPhase::HeaderSend;
         if (!header && phase != ResponseReadDeadlinePostCommitPhase::BodySend) return false;
         const u32 length = header ? c.response_header_buf.len() : inflight;
-        const auto* source = header ? c.response_header_buf.data() : c.upstream_recv_buf.data();
+        const auto* source = header ? c.response_header_buf.data() : c.buffered_response_data();
         const auto& send = backend.send_state[c.id];
         return length != 0 && c.send_armed && c.pending_ops != 0 &&
                c.response_read_deadline_send_owner_active &&
@@ -4628,8 +4661,8 @@ public:
         return (post_commit ? exact_post_commit_progress || selecting_post_commit
                             : no_progress || exact_progress) &&
                response_read_deadline_profile_is_stable(c, *cfg, bundle_id) &&
-               c.upstream_attempts == 1 && !c.upstream_reused && c.request_upload_complete &&
-               !c.upstream_request_incomplete &&
+               c.upstream_attempts == 1 && response_read_deadline_upstream_reuse_is_stable(c) &&
+               c.request_upload_complete && !c.upstream_request_incomplete &&
                (c.on_upstream_recv == &on_upstream_response<Self> ||
                 (post_commit && c.on_upstream_recv == nullptr)) &&
                (pipeline_generation_stable || header_only_head_explicit_close) &&
@@ -4717,6 +4750,161 @@ public:
         return static_cast<u16>(++response_read_batch_owner_count);
     }
 
+    u16 find_or_add_bounded_terminal_custody_owner(u32 cid) {
+        if (cid >= slots_initialized) return 0;
+        for (u32 i = 0; i < response_read_batch_owner_count; ++i) {
+            if (response_read_batch_owners[i].conn_id == cid) {
+                auto& owner = response_read_batch_owners[i];
+                if (!owner.bounded_terminal_custody) {
+                    const Connection& c = conns[cid];
+                    owner.bounded_terminal_custody = true;
+                    const u32 received = c.response_read_deadline_post_commit_origin_received;
+                    const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
+                    const u32 header =
+                        c.response_read_deadline_post_commit_phase ==
+                                    ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                                c.response_read_deadline_post_commit_phase ==
+                                    ResponseReadDeadlinePostCommitPhase::Buffering
+                            ? c.response_read_deadline_post_commit_raw_header_end
+                            : 0;
+                    owner.bounded_terminal_buffer_begin =
+                        received >= completed && header <= 0xffffffffu - (received - completed)
+                            ? header + received - completed
+                            : 0xffffffffu;
+                    owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
+                    owner.post_commit_at_start = true;
+                    owner.valid =
+                        c.fd >= 0 && c.response_read_deadline_post_commit_terminal_pending &&
+                        c.response_read_deadline_buffering ==
+                            ForwardResponseBufferingMode::Bounded &&
+                        c.response_read_deadline_generation == owner.deadline_generation &&
+                        c.upstream_episode == owner.upstream_episode;
+                }
+                return static_cast<u16>(i + 1);
+            }
+        }
+        if (response_read_batch_owner_count >= kMaxEventsPerWait) return 0;
+        const Connection& c = conns[cid];
+        auto& owner = response_read_batch_owners[response_read_batch_owner_count];
+        owner = {};
+        owner.conn_id = cid;
+        owner.deadline_generation = c.response_read_deadline_generation;
+        owner.upstream_episode = c.upstream_episode;
+        owner.profile = c.response_read_deadline_profile;
+        owner.method = c.response_read_deadline_method;
+        owner.post_commit_at_start = true;
+        owner.bounded_terminal_custody = true;
+        const u32 received = c.response_read_deadline_post_commit_origin_received;
+        const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
+        const u32 header = c.response_read_deadline_post_commit_phase ==
+                                       ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                                   c.response_read_deadline_post_commit_phase ==
+                                       ResponseReadDeadlinePostCommitPhase::Buffering
+                               ? c.response_read_deadline_post_commit_raw_header_end
+                               : 0;
+        owner.bounded_terminal_buffer_begin =
+            received >= completed && header <= 0xffffffffu - (received - completed)
+                ? header + received - completed
+                : 0xffffffffu;
+        owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
+        owner.valid =
+            c.fd >= 0 && c.response_read_deadline_post_commit_terminal_pending &&
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::None &&
+            c.response_read_deadline_generation != 0 &&
+            c.response_read_deadline_owner_generation == c.response_read_deadline_generation &&
+            c.response_read_deadline_upstream_episode == c.upstream_episode &&
+            c.response_read_deadline_post_commit_generation ==
+                c.response_read_deadline_generation &&
+            c.response_read_deadline_post_commit_episode == c.upstream_episode &&
+            valid_upstream_episode(c.upstream_episode);
+        return static_cast<u16>(++response_read_batch_owner_count);
+    }
+
+    void prepare_bounded_terminal_timer_eof_pairs(const IoEvent* events, u32 count) {
+        for (u32 recv_index = 0; recv_index < count; ++recv_index) {
+            const IoEvent& recv = events[recv_index];
+            if (recv.type != IoEventType::UpstreamRecv || recv.result != 0 || recv.more ||
+                recv.aux != 0 || recv.copy_witness != IoEventCopyWitness::None ||
+                recv.conn_id >= slots_initialized)
+                continue;
+            const Connection& c = conns[recv.conn_id];
+            if (c.fd < 0 ||
+                c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+                c.response_read_deadline_post_commit_phase ==
+                    ResponseReadDeadlinePostCommitPhase::None ||
+                c.response_read_deadline_post_commit_phase ==
+                    ResponseReadDeadlinePostCommitPhase::Buffering ||
+                c.response_read_deadline_state != ResponseReadDeadlineState::Armed ||
+                recv.upstream_episode != c.upstream_episode || !c.upstream_recv_armed ||
+                !c.response_read_timer_owner_is_valid() ||
+                c.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
+                !response_read_deadline_uses_precise_timer(c) ||
+                !post_commit_incremental_release_active(c) ||
+                !response_read_deadline_post_commit_is_stable(c) ||
+                !streaming_response_read_timer_is_stable(c))
+                continue;
+            const u32 received = c.response_read_deadline_post_commit_origin_received;
+            const u32 completed = c.response_read_deadline_post_commit_downstream_completed;
+            const u32 header = c.response_read_deadline_post_commit_raw_header_end;
+            if (completed > received || header > 0xffffffffu - (received - completed)) continue;
+            const u32 buffer_begin = header + received - completed;
+            if (buffer_begin != c.buffered_response_len()) continue;
+
+            u32 timer_index = count;
+            bool duplicate = false;
+            for (u32 i = 0; i < count; ++i) {
+                if (events[i].conn_id != recv.conn_id) continue;
+                if (i != recv_index && events[i].type == IoEventType::UpstreamRecv &&
+                    events[i].upstream_episode == recv.upstream_episode && events[i].result <= 0)
+                    duplicate = true;
+                if (events[i].type == IoEventType::ResponseReadTimer) {
+                    if (timer_index != count) duplicate = true;
+                    timer_index = i;
+                }
+            }
+            if (duplicate || timer_index == count) continue;
+            const IoEvent& timer_ev = events[timer_index];
+            if (!valid_response_read_timer_transport_event(timer_ev) ||
+                (timer_ev.non_upstream_generation & kResponseReadTimerCancelBit) != 0 ||
+                (timer_ev.non_upstream_generation & kResponseReadTimerGenerationMask) !=
+                    c.response_read_timer_owner_generation ||
+                timer_ev.result != -ETIME || response_read_batch_owner_count >= kMaxEventsPerWait)
+                continue;
+
+            auto& owner = response_read_batch_owners[response_read_batch_owner_count];
+            owner = {};
+            owner.conn_id = recv.conn_id;
+            owner.deadline_generation = c.response_read_deadline_generation;
+            owner.upstream_episode = c.upstream_episode;
+            owner.profile = c.response_read_deadline_profile;
+            owner.method = c.response_read_deadline_method;
+            owner.post_commit_at_start = true;
+            owner.bounded_terminal_custody = true;
+            owner.bounded_terminal_prospective = true;
+            owner.bounded_terminal_buffer_begin = buffer_begin;
+            owner.expected_copy_end = owner.bounded_terminal_buffer_begin;
+            owner.bounded_terminal_recv_seen = false;
+            owner.saw_precise_timer = true;
+            owner.precise_timer_valid = true;
+            owner.precise_timer_semantic = true;
+            owner.precise_timer_generation = c.response_read_timer_owner_generation;
+            owner.valid =
+                c.response_read_deadline_generation != 0 &&
+                c.response_read_deadline_owner_generation == c.response_read_deadline_generation &&
+                c.response_read_deadline_upstream_episode == c.upstream_episode &&
+                c.response_read_deadline_post_commit_generation ==
+                    c.response_read_deadline_generation &&
+                c.response_read_deadline_post_commit_episode == c.upstream_episode &&
+                valid_upstream_episode(c.upstream_episode) &&
+                owner.bounded_terminal_buffer_begin == c.buffered_response_len();
+            const u16 owner_index = static_cast<u16>(++response_read_batch_owner_count);
+            response_read_batch_event_owner[recv_index] = owner_index;
+            response_read_batch_event_owner[timer_index] = owner_index;
+        }
+    }
+
     void prepare_response_read_deadline_batch(const IoEvent* events, u32 count) {
         response_read_batch_events = events;
         response_read_batch_owner_count = 0;
@@ -4724,17 +4912,30 @@ public:
         response_read_batch_event_index = 0;
         response_read_batch_pin_count = 0;
         for (u32 i = 0; i < count; ++i) response_read_batch_event_owner[i] = 0;
+        prepare_bounded_terminal_timer_eof_pairs(events, count);
 
         // Discover only owners touched by this bounded wait batch.  A timer-only
         // owner remains on the ordinary expiry path; a response or downstream
         // terminal creates an entry without retaining a Connection pointer.
         for (u32 i = 0; i < count; ++i) {
+            if (response_read_batch_event_owner[i] != 0) continue;
             const IoEvent& ev = events[i];
             if (ev.conn_id >= slots_initialized) continue;
             const Connection& c = conns[ev.conn_id];
             const bool current_upstream =
                 ev.type == IoEventType::UpstreamRecv && ev.upstream_episode == c.upstream_episode;
             const bool downstream_terminal = ev.type == IoEventType::Recv && ev.result <= 0;
+            const bool bounded_terminal_pending =
+                c.response_read_deadline_post_commit_terminal_pending &&
+                c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded;
+            const bool bounded_terminal_custody =
+                bounded_terminal_pending &&
+                (ev.type == IoEventType::UpstreamRecv || ev.aux == kPauseCancelAux);
+            if (bounded_terminal_custody) {
+                response_read_batch_event_owner[i] =
+                    find_or_add_bounded_terminal_custody_owner(ev.conn_id);
+                continue;
+            }
             if (current_upstream || downstream_terminal)
                 (void)find_or_add_response_read_batch_owner(ev.conn_id);
             if (ev.type == IoEventType::ResponseReadTimer)
@@ -4744,6 +4945,7 @@ public:
         for (u32 i = 0; i < count; ++i) {
             const IoEvent& ev = events[i];
             if (ev.conn_id >= slots_initialized) continue;
+            if (response_read_batch_event_owner[i] == 0xffffu) continue;
             u16 owner_index = 0;
             for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
                 if (response_read_batch_owners[oi].conn_id == ev.conn_id) {
@@ -4753,6 +4955,61 @@ public:
             }
             if (owner_index == 0) continue;
             auto& owner = response_read_batch_owners[owner_index - 1];
+            if (owner.bounded_terminal_prospective) continue;
+            if (owner.bounded_terminal_custody && ev.type != IoEventType::ResponseReadTimer) {
+                response_read_batch_event_owner[i] = owner_index;
+                const Connection& c = conns[ev.conn_id];
+                if (!owner.valid || !c.response_read_deadline_post_commit_terminal_pending ||
+                    ev.upstream_episode != owner.upstream_episode ||
+                    owner.deadline_generation != c.response_read_deadline_generation ||
+                    owner.profile != c.response_read_deadline_profile ||
+                    owner.method != c.response_read_deadline_method) {
+                    owner.bounded_terminal_custody_invalid = true;
+                    continue;
+                }
+                if (ev.aux == kPauseCancelAux) {
+                    if (!c.response_read_deadline_post_commit_terminal_pending ||
+                        !c.upstream_recv_pause_cancel_pending ||
+                        owner.bounded_terminal_cancel_seen || ev.more ||
+                        ev.copy_witness != IoEventCopyWitness::None ||
+                        (ev.result != 0 && ev.result != -ENOENT)) {
+                        owner.bounded_terminal_custody_invalid = true;
+                    } else {
+                        owner.bounded_terminal_cancel_seen = true;
+                    }
+                    continue;
+                }
+                if (ev.aux != 0 || ev.copy_witness == IoEventCopyWitness::Invalid) {
+                    owner.bounded_terminal_custody_invalid = true;
+                    continue;
+                }
+                if (ev.result > 0) {
+                    if (!c.upstream_recv_cancel_inflight || !c.upstream_recv_terminal_stale ||
+                        ev.copy_witness != IoEventCopyWitness::Full || ev.more == false ||
+                        ev.copy_deadline_generation != owner.deadline_generation ||
+                        ev.copy_deadline_profile != static_cast<u8>(owner.profile) ||
+                        ev.copy_deadline_method != owner.method || ev.copy_end < ev.copy_begin ||
+                        ev.copy_end - ev.copy_begin != static_cast<u32>(ev.result) ||
+                        ev.copy_begin != owner.expected_copy_end ||
+                        owner.expected_copy_end > 0xffffffffu - static_cast<u32>(ev.result)) {
+                        owner.bounded_terminal_custody_invalid = true;
+                    } else {
+                        if (!owner.saw_positive) owner.first_copy_begin = ev.copy_begin;
+                        owner.expected_copy_end = ev.copy_end;
+                        owner.positive_bytes += static_cast<u32>(ev.result);
+                        owner.saw_positive = true;
+                    }
+                    continue;
+                }
+                if (ev.more || ev.copy_witness != IoEventCopyWitness::None || owner.saw_terminal ||
+                    (ev.result != -ECANCELED && ev.result != 0) ||
+                    !c.upstream_recv_cancel_inflight || !c.upstream_recv_terminal_stale) {
+                    owner.bounded_terminal_custody_invalid = true;
+                } else {
+                    owner.bounded_terminal_recv_seen = true;
+                }
+                continue;
+            }
             if (ev.type == IoEventType::ResponseReadTimer) {
                 const bool transport_valid = valid_response_read_timer_transport_event(ev);
                 const bool identity_valid =
@@ -4831,6 +5088,31 @@ public:
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
             auto& owner = response_read_batch_owners[oi];
             const Connection& c = conns[owner.conn_id];
+            if (owner.bounded_terminal_custody) {
+                if (owner.bounded_terminal_prospective) {
+                    continue;
+                }
+                const bool exact_copy_end =
+                    owner.saw_positive
+                        ? owner.first_copy_begin == owner.bounded_terminal_buffer_begin &&
+                              owner.expected_copy_end == c.buffered_response_len()
+                        : c.buffered_response_len() == owner.bounded_terminal_buffer_begin;
+                owner.valid =
+                    owner.valid && !owner.bounded_terminal_custody_invalid &&
+                    c.response_read_deadline_post_commit_terminal_pending &&
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    c.response_read_deadline_generation == owner.deadline_generation &&
+                    c.upstream_episode == owner.upstream_episode &&
+                    valid_upstream_episode(owner.upstream_episode) && exact_copy_end &&
+                    (owner.bounded_terminal_recv_seen || owner.bounded_terminal_cancel_seen ||
+                     owner.saw_positive);
+                if (owner.saw_positive &&
+                    (owner.bounded_terminal_buffer_begin > 0xffffffffu - owner.positive_bytes ||
+                     owner.bounded_terminal_buffer_begin + owner.positive_bytes !=
+                         c.buffered_response_len()))
+                    owner.valid = false;
+                continue;
+            }
             if (!owner.post_commit_at_start && owner.clean_eof && owner.saw_positive &&
                 forward_response_buffering_uses_content_length_machinery(
                     c.response_read_deadline_buffering))
@@ -4844,6 +5126,7 @@ public:
         for (u32 oi = 0; oi < response_read_batch_owner_count; ++oi) {
             auto& owner = response_read_batch_owners[oi];
             const Connection& c = conns[owner.conn_id];
+            if (owner.bounded_terminal_custody) continue;
             if (!owner.saw_relevant && !owner.saw_precise_timer) owner.valid = false;
             const u32 pre_batch_bytes =
                 owner.saw_positive ? owner.first_copy_begin : c.buffered_response_len();
@@ -4886,6 +5169,10 @@ public:
             auto& owner = response_read_batch_owners[oi];
             pin_response_read_batch_slot(owner.conn_id);
             Connection& c = conns[owner.conn_id];
+            if (owner.bounded_terminal_custody) {
+                if (!owner.valid && c.fd >= 0) close_conn(c);
+                continue;
+            }
             // A timer can outlive the logical deadline owner after a successful
             // disarm (for example while the exact 504 Send is in flight). Its
             // CQE is custody-only: keep the slot pinned, but do not force the
@@ -4983,8 +5270,12 @@ public:
         bool member = false;
         for (u32 i = 0; i < response_read_batch_owner_count; ++i)
             member = member || &owner == &response_read_batch_owners[i];
+        const bool bounded_clean_eof =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            owner.clean_eof;
         if (!member || response_read_batch_events == nullptr || !owner.valid ||
-            !owner.post_commit_at_start || !owner.saw_positive || owner.conn_id != c.id ||
+            !owner.post_commit_at_start || (!owner.saw_positive && !bounded_clean_eof) ||
+            owner.conn_id != c.id ||
             owner.deadline_generation != c.response_read_deadline_generation ||
             owner.upstream_episode != c.upstream_episode ||
             (c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
@@ -5000,9 +5291,13 @@ public:
                                : 0;
         if (completed > received || received > declared ||
             owner.positive_bytes > declared - received ||
-            (owner.terminal_fault && owner.positive_bytes != declared - received) ||
-            owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
-            owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end ||
+            (owner.terminal_fault && !bounded_clean_eof &&
+             owner.positive_bytes != declared - received) ||
+            (owner.saw_positive &&
+             (owner.first_copy_begin > 0xFFFFFFFFu - owner.positive_bytes ||
+              owner.first_copy_begin + owner.positive_bytes != owner.expected_copy_end)) ||
+            (!owner.saw_positive && (owner.positive_bytes != 0 || owner.first_copy_begin != 0 ||
+                                     owner.expected_copy_end != 0)) ||
             header > 0xFFFFFFFFu - (received - completed) ||
             header + received - completed > 0xFFFFFFFFu - owner.positive_bytes ||
             c.buffered_response_len() != header + received - completed + owner.positive_bytes ||
@@ -5143,6 +5438,7 @@ public:
         c.response_read_deadline_post_commit_downstream_submitted = 0;
         c.response_read_deadline_post_commit_downstream_completed = 0;
         c.response_read_deadline_post_commit_inflight_body = 0;
+        c.response_read_deadline_post_commit_release_target = 0;
         c.response_read_deadline_post_commit_send_body = 0;
         c.response_read_deadline_post_commit_close_after_drain = false;
         c.response_read_deadline_post_commit_pump_pending = false;
@@ -5336,6 +5632,152 @@ public:
         return saw_due_target;
     }
 
+    // Start the first bounded downstream commit without retiring the origin.
+    // The one-shot upstream recv owner remains independent and may complete
+    // while the header/body sends drain; the post-commit batch ledger accounts
+    // those bytes against release_target.
+    [[nodiscard]] bool start_bounded_content_length_release(Connection& c, u32 target) {
+        if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::Buffering ||
+            c.response_read_deadline_state != ResponseReadDeadlineState::Armed || target == 0 ||
+            target > c.response_read_deadline_post_commit_origin_received ||
+            target > c.response_read_deadline_post_commit_declared_body ||
+            !response_read_deadline_post_commit_is_stable(c) || c.send_armed ||
+            c.response_read_deadline_send_owner_active || c.response_header_buf.len() == 0 ||
+            c.upstream_send_len != 0)
+            return false;
+        c.response_read_deadline_post_commit_release_target = target;
+        c.response_read_deadline_post_commit_send_body = target;
+        // Buffering records cumulative bytes from the raw response prefix.
+        // Once the body is selected, the post-commit owner ledger is body
+        // relative, so rebase its exact progress witness here.
+        c.response_read_deadline_progress_generation = c.response_read_deadline_generation;
+        c.response_read_deadline_progress_episode = c.upstream_episode;
+        c.response_read_deadline_progress_bytes =
+            c.response_read_deadline_post_commit_origin_received;
+        c.response_read_deadline_post_commit_close_after_drain = false;
+        c.resp_body_mode = BodyMode::ContentLength;
+        c.resp_body_remaining = c.response_read_deadline_post_commit_declared_body;
+        c.resp_body_sent = c.response_header_buf.len();
+        c.upstream_send_len = c.response_read_deadline_post_commit_raw_header_end;
+        c.proxy_resp_started = true;
+        c.response_read_deadline_post_commit_phase =
+            ResponseReadDeadlinePostCommitPhase::HeaderSend;
+        c.transition_to_sending(&on_response_header_sent<Self>);
+        return submit_send(c, c.response_header_buf.data(), c.response_header_buf.len());
+    }
+
+    [[nodiscard]] bool start_bounded_release_if_ready(Connection& c) {
+        if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            c.response_read_deadline_post_commit_phase !=
+                ResponseReadDeadlinePostCommitPhase::Buffering)
+            return true;
+        const u32 target =
+            bounded_response_release_target(c.response_read_deadline_post_commit_raw_header_end,
+                                            c.response_read_deadline_post_commit_origin_received,
+                                            c.response_read_deadline_post_commit_declared_body,
+                                            /*terminal=*/false);
+        return target == 0 || start_bounded_content_length_release(c, target);
+    }
+
+    // Capture eligibility BEFORE retiring the exact response episode. An armed
+    // multishot recv or cancel still owns the socket, so that path closes rather
+    // than publishing a live descriptor to another request/shard-local borrower.
+    [[nodiscard]] bool bounded_origin_can_return_idle(const Connection& c,
+                                                      u32 selected,
+                                                      bool close_after_drain) const {
+        return bounded_get_upstream_reuse_is_admitted(c) && !close_after_drain &&
+               selected == c.response_read_deadline_post_commit_declared_body &&
+               c.response_read_deadline_post_commit_origin_received == selected &&
+               c.upstream_keep_alive && !c.upstream_abandoned && c.request_upload_complete &&
+               !c.upstream_request_incomplete && c.upstream_fd >= 0 && !c.upstream_connect_armed &&
+               !c.upstream_send_armed && !c.upstream_recv_armed && !c.upstream_recv_direct_armed &&
+               !c.upstream_recv_cancel_inflight && !c.upstream_recv_pause_cancel_pending &&
+               !c.upstream_recv_pause_rearm_pending && !c.upstream_retirement_active &&
+               !c.upstream_episode_quarantined && c.idle_return_fd < 0 && upstream && config_ptr &&
+               *config_ptr == c.request_config && !is_draining();
+    }
+
+    void release_retired_bounded_origin(Connection& c, bool reusable) {
+        const i32 fd = c.upstream_fd;
+        c.upstream_fd = -1;
+        c.upstream_reused = false;
+        // Framing is already proven. Reject any queued surplus or FIN before
+        // parking; take_idle repeats this probe to handle an origin closing later.
+        u8 byte;
+        const i32 pending = reusable ? ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) : 0;
+        if (!reusable || pending >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK) ||
+            !upstream->put_idle(fd, c.upstream_idx, c.upstream_backend_idx, monotonic_secs()))
+            ::close(fd);
+    }
+
+    [[nodiscard]] bool finish_bounded_content_length_release(Connection& c,
+                                                             u32 target,
+                                                             bool close_after_drain,
+                                                             bool schedule_body_pump = true) {
+        if (c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+            c.response_read_deadline_post_commit_phase ==
+                ResponseReadDeadlinePostCommitPhase::None ||
+            c.response_read_deadline_post_commit_phase ==
+                ResponseReadDeadlinePostCommitPhase::Buffering ||
+            target < c.response_read_deadline_post_commit_downstream_submitted ||
+            target > c.response_read_deadline_post_commit_origin_received ||
+            target > c.response_read_deadline_post_commit_declared_body ||
+            !response_read_deadline_post_commit_is_stable(c))
+            return false;
+        if (c.response_read_deadline_post_commit_terminal_pending) {
+            if (target != c.response_read_deadline_post_commit_release_target ||
+                close_after_drain != c.response_read_deadline_post_commit_close_after_drain ||
+                !c.response_read_timer_owner_is_neutral())
+                return false;
+        } else {
+            if (c.response_read_timer_phase != ResponseReadTimerPhase::None &&
+                (c.response_read_timer_phase != ResponseReadTimerPhase::Armed ||
+                 !streaming_response_read_timer_is_stable(c) ||
+                 !backend.cancel_response_read_timer(c.id, c)))
+                return false;
+            timer.remove(&c);
+            c.response_read_deadline_post_commit_release_target = target;
+            c.response_read_deadline_post_commit_send_body = target;
+            c.response_read_deadline_post_commit_close_after_drain = close_after_drain;
+        }
+        // A terminal read can race a downstream HeaderSend/BodySend. Freeze
+        // the admitted prefix now, but let that exact send owner drain before
+        // asking strict upstream retirement to take custody.
+        if (c.send_armed) {
+            if (c.upstream_recv_armed) {
+                if (!pause_upstream_recv_impl(c)) return false;
+                // Reuse the exact pause-cancel CQE ledger to discard any
+                // already-harvested post-terminal positive recv records.
+                c.upstream_recv_terminal_stale = true;
+            }
+            c.response_read_deadline_post_commit_terminal_pending = true;
+            return true;
+        }
+        const bool reusable_origin = bounded_origin_can_return_idle(c, target, close_after_drain);
+        const bool recv_owned = c.upstream_recv_armed;
+        if (!begin_strict_upstream_retirement(c)) return false;
+        if (recv_owned) c.upstream_recv_armed = false;
+        c.on_upstream_recv = nullptr;
+        c.upstream_abandoned = true;
+        c.upstream_keep_alive = false;
+        c.upstream_start_us = 0;
+        release_retired_bounded_origin(c, reusable_origin);
+        if (c.upstream_slot_held) {
+            upstream_release(c.upstream_slot_uid);
+            c.upstream_slot_held = false;
+        }
+        c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
+        c.response_read_deadline_post_commit_terminal_pending = false;
+        // A caller already pumping this response must not queue a second pump
+        // behind the BodySend it is about to submit.
+        if (schedule_body_pump && c.response_read_deadline_post_commit_phase ==
+                                      ResponseReadDeadlinePostCommitPhase::WaitingBody)
+            defer_response_read_deadline_body_pump(c);
+        return true;
+    }
+
     [[nodiscard]] bool start_complete_content_length_send(
         Connection& c,
         CompleteContentLengthTerminalDisposition disposition,
@@ -5367,7 +5809,10 @@ public:
                          CompleteContentLengthResponseClass::CoherentSingleRange206) ||
                     !complete_content_length_clean_eof_owner_is_valid(c, *terminal_owner))
                     return false;
-                body_to_send = received;
+                body_to_send =
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded
+                        ? c.response_read_deadline_post_commit_release_target
+                        : received;
                 break;
             case CompleteContentLengthTerminalDisposition::InactivityExpiry:
                 if (received >= declared) return false;
@@ -5457,6 +5902,8 @@ public:
                 return false;
         }
         timer.remove(&c);
+        const bool reusable_origin =
+            bounded_origin_can_return_idle(c, body_to_send, close_after_drain);
         const bool recv_owned = c.upstream_recv_armed;
         if (!begin_strict_upstream_retirement(c)) return false;
         // No buffered response byte may become visible while its origin Recv
@@ -5467,8 +5914,7 @@ public:
         c.upstream_abandoned = true;
         c.upstream_keep_alive = false;
         c.upstream_start_us = 0;
-        ::close(c.upstream_fd);
-        c.upstream_fd = -1;
+        release_retired_bounded_origin(c, reusable_origin);
         if (c.upstream_slot_held) {
             upstream_release(c.upstream_slot_uid);
             c.upstream_slot_held = false;
@@ -5478,6 +5924,8 @@ public:
         // body from an authenticated clean-EOF prefix during asynchronous Send.
         c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
         c.response_read_deadline_post_commit_send_body = body_to_send;
+        if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded)
+            c.response_read_deadline_post_commit_release_target = body_to_send;
         c.response_read_deadline_post_commit_close_after_drain = close_after_drain;
         c.resp_body_mode = BodyMode::ContentLength;
         c.upstream_keep_alive = false;
@@ -5506,7 +5954,10 @@ public:
 
         c.response_read_deadline_post_commit_phase =
             ResponseReadDeadlinePostCommitPhase::HeaderSend;
-        c.resp_body_remaining = body_to_send;
+        c.resp_body_remaining =
+            c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded
+                ? c.response_read_deadline_post_commit_declared_body
+                : body_to_send;
         c.resp_body_sent = c.response_header_buf.len();
         c.upstream_send_len = c.response_read_deadline_post_commit_raw_header_end;
         c.transition_to_sending(&on_response_header_sent<Self>);
@@ -5658,6 +6109,7 @@ public:
             if (!rearm_precise_response_read_timer(c, now_ns)) return false;
         }
         c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+        if (!start_bounded_release_if_ready(c)) return false;
         return true;
     }
 
@@ -5666,6 +6118,19 @@ public:
             auto& owner = response_read_batch_owners[oi];
             if (owner.conn_id >= slots_initialized) continue;
             Connection& c = conns[owner.conn_id];
+            if (owner.bounded_terminal_prospective) {
+                if (!owner.valid || c.fd < 0 || !owner.bounded_terminal_timer_seen ||
+                    !owner.bounded_terminal_recv_seen || c.upstream_recv_armed ||
+                    !c.response_read_timer_owner_is_neutral() ||
+                    c.response_read_deadline_state != ResponseReadDeadlineState::Armed ||
+                    !finish_bounded_content_length_release(
+                        c,
+                        c.response_read_deadline_post_commit_release_target,
+                        /*close_after_drain=*/true))
+                    close_conn(c);
+                continue;
+            }
+            if (owner.bounded_terminal_custody) continue;
             const bool precise_complete_content_length =
                 c.response_read_deadline_post_commit_phase ==
                     ResponseReadDeadlinePostCommitPhase::Buffering &&
@@ -5738,7 +6203,13 @@ public:
                     if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
                     continue;
                 }
-                if (!owner.valid || (owner.saw_terminal && !owner.saw_positive)) {
+                const bool bounded_post_commit_clean_eof =
+                    owner.valid && owner.clean_eof && owner.post_commit_at_start &&
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    post_commit_incremental_release_active(c) &&
+                    streaming_response_read_timer_is_stable(c);
+                if (!owner.valid ||
+                    (owner.saw_terminal && !owner.saw_positive && !bounded_post_commit_clean_eof)) {
                     if (owner.precise_timer_semantic && c.fd >= 0) close_conn(c);
                     continue;
                 }
@@ -5776,21 +6247,59 @@ public:
                         close_conn(c);
                     continue;
                 }
-                const bool streaming_progress =
-                    c.response_read_deadline_profile ==
-                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
-                    c.response_read_deadline_post_commit_phase !=
-                        ResponseReadDeadlinePostCommitPhase::None;
-                if (owner.saw_positive &&
+                const bool streaming_progress = post_commit_incremental_release_active(c);
+                const bool bounded_clean_eof =
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    owner.clean_eof;
+                if ((owner.saw_positive || bounded_clean_eof) &&
                     !(streaming_progress
                           ? commit_response_read_deadline_streaming_progress(c, owner)
                           : commit_response_read_deadline_incomplete_progress(c, owner))) {
                     if (c.fd >= 0) close_conn(c);
                     continue;
                 }
+                if (streaming_progress &&
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    owner.saw_positive &&
+                    c.response_read_deadline_post_commit_origin_received <
+                        c.response_read_deadline_post_commit_declared_body) {
+                    const u32 target = bounded_response_release_target(
+                        c.response_read_deadline_post_commit_raw_header_end,
+                        c.response_read_deadline_post_commit_origin_received,
+                        c.response_read_deadline_post_commit_declared_body,
+                        /*terminal=*/false);
+                    if (target > c.response_read_deadline_post_commit_release_target) {
+                        c.response_read_deadline_post_commit_release_target = target;
+                        c.response_read_deadline_post_commit_send_body = target;
+                    }
+                }
+                if (streaming_progress &&
+                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    owner.clean_eof &&
+                    c.response_read_deadline_post_commit_origin_received <
+                        c.response_read_deadline_post_commit_declared_body) {
+                    const u32 admitted = c.response_read_deadline_post_commit_release_target;
+                    if (!finish_bounded_content_length_release(c,
+                                                               admitted,
+                                                               /*close_after_drain=*/true)) {
+                        close_conn(c);
+                        continue;
+                    }
+                    continue;
+                }
                 if (streaming_progress && c.response_read_deadline_post_commit_origin_received ==
                                               c.response_read_deadline_post_commit_declared_body) {
+                    if (c.response_read_deadline_buffering ==
+                        ForwardResponseBufferingMode::Bounded) {
+                        if (!finish_bounded_content_length_release(
+                                c,
+                                c.response_read_deadline_post_commit_declared_body,
+                                /*close_after_drain=*/false)) {
+                            close_conn(c);
+                            continue;
+                        }
+                        continue;
+                    }
                     c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
                     if (c.response_read_timer_phase == ResponseReadTimerPhase::Armed &&
                         !backend.cancel_response_read_timer(c.id, c)) {
@@ -5804,7 +6313,8 @@ public:
                     continue;
                 }
                 if (streaming_progress && owner.saw_terminal && !c.upstream_recv_armed) {
-                    if (owner.terminal_fault || c.upstream_recv_pause_cancel_pending ||
+                    if ((owner.terminal_fault && !owner.clean_eof) ||
+                        c.upstream_recv_pause_cancel_pending ||
                         c.upstream_recv_pause_rearm_pending || c.upstream_recv_cancel_inflight ||
                         !add_response_read_recv(c)) {
                         close_conn(c);
@@ -5830,10 +6340,30 @@ public:
                 if (streaming_progress && c.fd >= 0 &&
                     c.response_read_deadline_state == ResponseReadDeadlineState::Armed &&
                     c.response_read_deadline_post_commit_phase ==
-                        ResponseReadDeadlinePostCommitPhase::WaitingBody)
-                    defer_response_read_deadline_body_pump(c);
+                        ResponseReadDeadlinePostCommitPhase::WaitingBody) {
+                    if (c.response_read_deadline_buffering ==
+                        ForwardResponseBufferingMode::Bounded) {
+                        const u32 target = bounded_response_release_target(
+                            c.response_read_deadline_post_commit_raw_header_end,
+                            c.response_read_deadline_post_commit_origin_received,
+                            c.response_read_deadline_post_commit_declared_body,
+                            /*terminal=*/false);
+                        if (target > c.response_read_deadline_post_commit_release_target) {
+                            c.response_read_deadline_post_commit_release_target = target;
+                            c.response_read_deadline_post_commit_send_body = target;
+                            defer_response_read_deadline_body_pump(c);
+                        }
+                    } else {
+                        defer_response_read_deadline_body_pump(c);
+                    }
+                }
                 continue;
             }
+            if (owner.valid && c.id == owner.conn_id &&
+                c.response_read_deadline_post_commit_terminal_pending &&
+                c.response_read_deadline_generation == owner.deadline_generation &&
+                c.upstream_episode == owner.upstream_episode)
+                continue;
             if (!owner.valid) continue;
             const bool key_stable =
                 c.id == owner.conn_id &&
@@ -5841,6 +6371,7 @@ public:
                 c.upstream_episode == owner.upstream_episode &&
                 c.response_read_deadline_profile == owner.profile &&
                 c.response_read_deadline_method == owner.method;
+            if (key_stable && c.response_read_deadline_post_commit_terminal_pending) continue;
             const bool initial_buffered_clean_eof =
                 c.response_read_deadline_post_commit_phase ==
                     ResponseReadDeadlinePostCommitPhase::Buffering &&
@@ -5930,12 +6461,7 @@ public:
                     c.pending_ops++;
                     c.upstream_recv_armed = true;
                 }
-                const bool streaming_timer =
-                    c.response_read_deadline_profile ==
-                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
-                    c.response_read_deadline_post_commit_phase !=
-                        ResponseReadDeadlinePostCommitPhase::None;
+                const bool streaming_timer = post_commit_incremental_release_active(c);
                 if (streaming_timer) {
                     if (!promote_streaming_response_read_timer(c)) {
                         close_conn(c);
@@ -5945,6 +6471,7 @@ public:
                     timer.refresh(&c, c.response_read_deadline_seconds);
                 }
                 c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+                if (c.fd >= 0 && !start_bounded_release_if_ready(c)) close_conn(c);
             } else if (key_stable && owner.post_commit_at_start &&
                        c.response_read_deadline_post_commit_phase !=
                            ResponseReadDeadlinePostCommitPhase::None &&
@@ -5966,8 +6493,60 @@ public:
                 if (owner.positive_bytes != 0 &&
                     c.response_read_deadline_profile ==
                         ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::None)
+                    (c.response_read_deadline_buffering == ForwardResponseBufferingMode::None ||
+                     c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded))
                     c.response_read_timer_last_progress_ns = monotonic_ns();
+                if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded) {
+                    if (owner.terminal_error) {
+                        close_conn(c);
+                        continue;
+                    }
+                    if (c.response_read_deadline_post_commit_origin_received == declared) {
+                        if (!finish_bounded_content_length_release(
+                                c, declared, /*close_after_drain=*/false))
+                            close_conn(c);
+                        continue;
+                    }
+                    if (owner.clean_eof) {
+                        const u32 admitted = c.response_read_deadline_post_commit_release_target;
+                        if (!finish_bounded_content_length_release(
+                                c, admitted, /*close_after_drain=*/true))
+                            close_conn(c);
+                        continue;
+                    }
+                    const u32 target = bounded_response_release_target(
+                        c.response_read_deadline_post_commit_raw_header_end,
+                        c.response_read_deadline_post_commit_origin_received,
+                        declared,
+                        /*terminal=*/false);
+                    const bool release_ready =
+                        target > c.response_read_deadline_post_commit_release_target;
+                    if (release_ready) {
+                        c.response_read_deadline_post_commit_release_target = target;
+                        c.response_read_deadline_post_commit_send_body = target;
+                    }
+                    if (owner.terminal_fault) {
+                        close_conn(c);
+                        continue;
+                    }
+                    if (owner.saw_terminal && !c.upstream_recv_armed) {
+                        if (c.upstream_recv_pause_cancel_pending ||
+                            c.upstream_recv_pause_rearm_pending ||
+                            c.upstream_recv_cancel_inflight || !add_response_read_recv(c)) {
+                            close_conn(c);
+                            continue;
+                        }
+                        c.pending_ops++;
+                        c.upstream_recv_armed = true;
+                    }
+                    if (!response_read_deadline_uses_precise_timer(c))
+                        timer.refresh(&c, c.response_read_deadline_seconds);
+                    c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+                    if (release_ready && c.response_read_deadline_post_commit_phase ==
+                                             ResponseReadDeadlinePostCommitPhase::WaitingBody)
+                        defer_response_read_deadline_body_pump(c);
+                    continue;
+                }
                 if (c.response_read_deadline_post_commit_origin_received == declared) {
                     c.response_read_deadline_state = ResponseReadDeadlineState::BodyComplete;
                     if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
@@ -5991,12 +6570,7 @@ public:
                         c.pending_ops++;
                         c.upstream_recv_armed = true;
                     }
-                    const bool streaming_timer =
-                        c.response_read_deadline_profile ==
-                            ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                        c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
-                        c.response_read_deadline_post_commit_phase !=
-                            ResponseReadDeadlinePostCommitPhase::None;
+                    const bool streaming_timer = post_commit_incremental_release_active(c);
                     if (streaming_timer) {
                         if (!promote_streaming_response_read_timer(c)) {
                             close_conn(c);
@@ -6035,12 +6609,7 @@ public:
                             ResponseReadDeadlinePostCommitPhase::None
                         ? c.buffered_response_len()
                         : c.response_read_deadline_post_commit_origin_received;
-                const bool streaming_timer =
-                    c.response_read_deadline_profile ==
-                        ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
-                    c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
-                    c.response_read_deadline_post_commit_phase !=
-                        ResponseReadDeadlinePostCommitPhase::None;
+                const bool streaming_timer = post_commit_incremental_release_active(c);
                 if (streaming_timer) {
                     if (!promote_streaming_response_read_timer(c)) {
                         close_conn(c);
@@ -6050,6 +6619,13 @@ public:
                     timer.refresh(&c, c.response_read_deadline_seconds);
                 }
                 c.response_read_deadline_state = ResponseReadDeadlineState::Armed;
+                if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                    c.response_read_deadline_post_commit_phase ==
+                        ResponseReadDeadlinePostCommitPhase::Buffering &&
+                    !start_bounded_release_if_ready(c)) {
+                    close_conn(c);
+                    continue;
+                }
             } else if (key_stable &&
                        (c.response_read_deadline_state == ResponseReadDeadlineState::BatchPending ||
                         c.response_read_deadline_state ==
@@ -6124,6 +6700,22 @@ public:
                     close_conn(c);
                 continue;
             }
+            if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                c.response_read_deadline_post_commit_phase !=
+                    ResponseReadDeadlinePostCommitPhase::None) {
+                // A bounded terminal already froze its release target and is
+                // waiting for an owned send/recv/cancel CQE. Re-running the
+                // expiry selector would revalidate the now-paused origin as
+                // an ordinary live stream and close it before that custody
+                // drains; the terminal finalizer owns this state instead.
+                if (c.response_read_deadline_post_commit_terminal_pending) continue;
+                const u32 admitted = c.response_read_deadline_post_commit_release_target;
+                if (!finish_bounded_content_length_release(c,
+                                                           admitted,
+                                                           /*close_after_drain=*/true))
+                    close_conn(c);
+                continue;
+            }
             if (c.response_read_deadline_post_commit_phase ==
                     ResponseReadDeadlinePostCommitPhase::WaitingBody &&
                 finalize_streaming_inactivity(c))
@@ -6187,10 +6779,50 @@ public:
         prepare_response_read_deadline_batch(events, count);
         for (u32 i = 0; i < count; i++) {
             response_read_batch_event_index = i;
+            const u16 owner_index = response_read_batch_event_owner[i];
+            if (owner_index != 0 && owner_index <= response_read_batch_owner_count &&
+                response_read_batch_owners[owner_index - 1u].bounded_terminal_prospective) {
+                auto& owner = response_read_batch_owners[owner_index - 1u];
+                Connection& c = conns[owner.conn_id];
+                const IoEvent& ev = events[i];
+                if (ev.type == IoEventType::ResponseReadTimer) {
+                    if (!owner.valid || !valid_response_read_timer_transport_event(ev) ||
+                        ev.result != -ETIME ||
+                        !c.consume_response_read_timer_completion(ev.non_upstream_generation))
+                        owner.valid = false;
+                    else
+                        owner.bounded_terminal_timer_seen = true;
+                } else if (ev.type == IoEventType::UpstreamRecv) {
+                    if (!owner.valid || ev.result != 0 || ev.more || ev.aux != 0 ||
+                        ev.copy_witness != IoEventCopyWitness::None ||
+                        ev.upstream_episode != owner.upstream_episode || !c.upstream_recv_armed ||
+                        c.pending_ops == 0) {
+                        owner.valid = false;
+                    } else {
+                        c.upstream_recv_armed = false;
+                        c.pending_ops--;
+                        c.on_upstream_recv = nullptr;
+                        owner.bounded_terminal_recv_seen = true;
+                    }
+                } else {
+                    owner.valid = false;
+                }
+                continue;
+            }
             dispatch(events[i]);
         }
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
+        for (u32 id = 0; id < slots_initialized; ++id) {
+            Connection& c = conns[id];
+            if (c.response_read_deadline_post_commit_terminal_pending && !c.send_armed &&
+                c.response_read_deadline_post_commit_phase ==
+                    ResponseReadDeadlinePostCommitPhase::WaitingBody &&
+                !c.upstream_recv_armed && !c.upstream_recv_pause_cancel_pending &&
+                !c.upstream_recv_cancel_inflight && !c.upstream_recv_pause_rearm_pending &&
+                !c.upstream_recv_paused_for_send && c.response_read_timer_owner_is_neutral())
+                defer_response_read_deadline_body_pump(c);
+        }
         pump_response_read_deadline_bodies();
         // Retirement/header rendezvous owners publish only readiness during
         // dispatch. Admit parked HTTP/1 request boundaries after every CQE in
@@ -7399,7 +8031,26 @@ public:
                                 this->reclaim_slot(conn.id);
                             break;
                         }
+                        if (conn.response_read_deadline_post_commit_terminal_pending &&
+                            conn.response_read_deadline_buffering ==
+                                ForwardResponseBufferingMode::Bounded) {
+                            if (!conn.upstream_recv_armed &&
+                                !conn.upstream_recv_pause_cancel_pending &&
+                                !conn.upstream_recv_cancel_inflight && !conn.send_armed &&
+                                conn.response_read_timer_owner_is_neutral() &&
+                                conn.response_read_deadline_post_commit_phase ==
+                                    ResponseReadDeadlinePostCommitPhase::WaitingBody)
+                                defer_response_read_deadline_body_pump(conn);
+                            break;
+                        }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                        if (conn.fd >= 0 &&
+                            conn.response_read_deadline_post_commit_terminal_pending &&
+                            !conn.upstream_recv_armed && !conn.upstream_recv_pause_cancel_pending &&
+                            !conn.upstream_recv_cancel_inflight && !conn.send_armed &&
+                            conn.response_read_deadline_post_commit_phase ==
+                                ResponseReadDeadlinePostCommitPhase::WaitingBody)
+                            defer_response_read_deadline_body_pump(conn);
                         break;
                     }
                     if (ev.type == IoEventType::UpstreamRecv && ev.result == -ECANCELED) {
@@ -7422,9 +8073,11 @@ public:
                             conn.upstream_recv_buf.reset();
                         }
                         if (conn.pending_ops > 0) conn.pending_ops--;
-                        if (conn.response_read_deadline_state == ResponseReadDeadlineState::Armed ||
-                            conn.response_read_deadline_state ==
-                                ResponseReadDeadlineState::ExpiryPending) {
+                        if (!conn.response_read_deadline_post_commit_terminal_pending &&
+                            (conn.response_read_deadline_state ==
+                                 ResponseReadDeadlineState::Armed ||
+                             conn.response_read_deadline_state ==
+                                 ResponseReadDeadlineState::ExpiryPending)) {
                             disarm_response_read_deadline(conn);
                             if (conn.fd >= 0) this->close_conn(conn);
                             break;
@@ -7441,7 +8094,26 @@ public:
                                 this->reclaim_slot(conn.id);
                             break;
                         }
+                        if (conn.response_read_deadline_post_commit_terminal_pending &&
+                            conn.response_read_deadline_buffering ==
+                                ForwardResponseBufferingMode::Bounded) {
+                            if (!conn.upstream_recv_armed &&
+                                !conn.upstream_recv_pause_cancel_pending &&
+                                !conn.upstream_recv_cancel_inflight && !conn.send_armed &&
+                                conn.response_read_timer_owner_is_neutral() &&
+                                conn.response_read_deadline_post_commit_phase ==
+                                    ResponseReadDeadlinePostCommitPhase::WaitingBody)
+                                defer_response_read_deadline_body_pump(conn);
+                            break;
+                        }
                         if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                        if (conn.fd >= 0 &&
+                            conn.response_read_deadline_post_commit_terminal_pending &&
+                            !conn.upstream_recv_armed && !conn.upstream_recv_pause_cancel_pending &&
+                            !conn.upstream_recv_cancel_inflight && !conn.send_armed &&
+                            conn.response_read_deadline_post_commit_phase ==
+                                ResponseReadDeadlinePostCommitPhase::WaitingBody)
+                            defer_response_read_deadline_body_pump(conn);
                         break;
                     }
                     // Stale post-body recv data/terminal. A body-done pause cancelled this
@@ -7455,12 +8127,24 @@ public:
                     // THIS recv drains.) Only the final CQE accounts/drains the recv.
                     if (ev.type == IoEventType::UpstreamRecv &&
                         conn.upstream_recv_cancel_inflight && conn.upstream_recv_terminal_stale) {
+                        const u16 custody_owner_index =
+                            response_read_batch_event_index < response_read_batch_event_count
+                                ? response_read_batch_event_owner[response_read_batch_event_index]
+                                : 0;
+                        const bool valid_bounded_terminal_custody =
+                            custody_owner_index != 0 &&
+                            custody_owner_index <= response_read_batch_owner_count &&
+                            response_read_batch_owners[custody_owner_index - 1u]
+                                .bounded_terminal_custody &&
+                            response_read_batch_owners[custody_owner_index - 1u].valid &&
+                            ev.result > 0 && ev.copy_witness == IoEventCopyWitness::Full;
                         const bool deadline_surplus =
                             ev.result > 0 &&
                             conn.response_read_deadline_state ==
                                 ResponseReadDeadlineState::BodyComplete &&
                             conn.response_read_deadline_post_commit_phase !=
-                                ResponseReadDeadlinePostCommitPhase::None;
+                                ResponseReadDeadlinePostCommitPhase::None &&
+                            !valid_bounded_terminal_custody;
                         if (ev.result > 0) {
                             if (conn.idle_return_fd >= 0)
                                 conn.upstream_recv_idle_stale_bytes = true;
@@ -7494,7 +8178,25 @@ public:
                                     this->reclaim_slot(conn.id);
                                 break;
                             }
+                            if (conn.response_read_deadline_post_commit_terminal_pending &&
+                                conn.response_read_deadline_buffering ==
+                                    ForwardResponseBufferingMode::Bounded) {
+                                if (!conn.upstream_recv_armed &&
+                                    !conn.upstream_recv_pause_cancel_pending &&
+                                    !conn.upstream_recv_cancel_inflight && !conn.send_armed &&
+                                    conn.response_read_timer_owner_is_neutral() &&
+                                    conn.response_read_deadline_post_commit_phase ==
+                                        ResponseReadDeadlinePostCommitPhase::WaitingBody)
+                                    defer_response_read_deadline_body_pump(conn);
+                                break;
+                            }
                             if (!this->try_deferred_upstream_rearm(conn)) this->close_conn(conn);
+                            if (conn.fd >= 0 &&
+                                conn.response_read_deadline_post_commit_terminal_pending &&
+                                !conn.upstream_recv_pause_cancel_pending && !conn.send_armed &&
+                                conn.response_read_deadline_post_commit_phase ==
+                                    ResponseReadDeadlinePostCommitPhase::WaitingBody)
+                                defer_response_read_deadline_body_pump(conn);
                         }
                         break;
                     }
@@ -7585,6 +8287,7 @@ public:
                             response_read_batch_event_owner[response_read_batch_event_index];
                         if (owner_index != 0 && owner_index <= response_read_batch_owner_count) {
                             const auto& owner = response_read_batch_owners[owner_index - 1];
+                            if (owner.bounded_terminal_custody) break;
                             if (!owner.valid) break;
                             const bool retained_initial_clean_eof =
                                 owner.clean_eof && !owner.post_commit_at_start &&

@@ -1,0 +1,9 @@
+{
+  "base": "8c4b715fdadfa8512b2db086cdfc3b6587207f19",
+  "patch_sha256": "376b3aac111eca3c508b02b97bc9fc4695053d726c204f80f7a00042b2d3547d",
+  "binaries": {
+    "rut": "0378f239b0d49303b7abac8f09e35a2f165d35abec33a15cccb7a6e743953fcd",
+    "rut-compile": "8b39fa3604bb55537959026b29fa4313992d896c7b73a21e36500282a2dbf530",
+    "rut-nginx-convert": "19ce3b2228186966fe14194d995169eab9fd8e5afcc09b74c0a813ec8ec5d6ab"
+  }
+}

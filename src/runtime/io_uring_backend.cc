@@ -1631,12 +1631,10 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                     const u32 overflow = nbytes - prefix_copy;
                     deadline_copy_eligible =
                         overflow == 0 ||
-                        conn.response_body_tail.append(
-                            *response_pool,
-                            src + prefix_copy,
-                            overflow,
-                            conn.tls_active ? ResponseBodyChain::kBulkAfterTls
-                                            : ResponseBodyChain::kBulkAfterPlaintext);
+                        conn.response_body_tail.append(*response_pool,
+                                                       src + prefix_copy,
+                                                       overflow,
+                                                       conn.buffered_response_bulk_after());
                     if (deadline_copy_eligible && prefix_copy != 0) {
                         __builtin_memcpy(target_buf.write_ptr(), src, prefix_copy);
                         target_buf.commit(prefix_copy);
@@ -1745,11 +1743,22 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 }
             }
 
+            const bool bounded_live_post_commit =
+                conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                (conn.response_read_deadline_post_commit_phase ==
+                     ResponseReadDeadlinePostCommitPhase::HeaderSend ||
+                 conn.response_read_deadline_post_commit_phase ==
+                     ResponseReadDeadlinePostCommitPhase::BodySend ||
+                 conn.response_read_deadline_post_commit_phase ==
+                     ResponseReadDeadlinePostCommitPhase::WaitingBody) &&
+                !conn.response_read_deadline_post_commit_terminal_pending &&
+                !conn.response_read_deadline_post_commit_close_after_drain;
             const bool stale_target =
                 conn.fd < 0 || conn.upstream_fd < 0 || !conn.upstream_recv_armed ||
                 target.episode != conn.upstream_episode ||
-                conn.response_read_deadline_post_commit_phase !=
-                    ResponseReadDeadlinePostCommitPhase::Buffering ||
+                (conn.response_read_deadline_post_commit_phase !=
+                     ResponseReadDeadlinePostCommitPhase::Buffering &&
+                 !bounded_live_post_commit) ||
                 conn.response_read_deadline_post_commit_episode != target.episode;
             const u32 declared = conn.response_read_deadline_post_commit_declared_body;
             const u32 received = conn.response_read_deadline_post_commit_origin_received;
@@ -1795,6 +1804,14 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
                 events[count].copy_deadline_method = conn.response_read_deadline_method;
             }
 
+            // A canceled bounded target can complete with bytes already written
+            // into reserved capacity. They are custody-only after the terminal
+            // release was frozen, just like a natural canceled receive target.
+            if (cqe->res > 0 && conn.response_read_deadline_post_commit_terminal_pending &&
+                conn.upstream_recv_cancel_inflight && conn.upstream_recv_terminal_stale) {
+                direct_result = -ECANCELED;
+                events[count].copy_witness = IoEventCopyWitness::None;
+            }
             conn.chain_direct_recv_owner = {};
             conn.upstream_recv_direct_armed = false;
             events[count].conn_id = conn_id;

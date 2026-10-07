@@ -225,6 +225,10 @@ class Harness:
         first_engine = getattr(a, "first_engine", "nginx")
         body_size = getattr(a, "body_size", None)
         native_streaming = getattr(a, "proxy_profile", "converter-strict") == "native-streaming"
+        origin_reuse = (native_streaming and getattr(a, "native_origin_reuse", "on") == "on") or (
+            getattr(a, "proxy_profile", "converter-strict") == "converter-bounded"
+            and getattr(a, "bounded_origin_reuse", "off") == "on"
+        )
         if native_streaming:
             body_size = NATIVE_BODY_SIZE
         if (getattr(a, "static_profile", "converter-return") == "converter-return"
@@ -262,8 +266,9 @@ class Harness:
             "proxy_profile": {
                 "name": getattr(a, "proxy_profile", "converter-strict"),
                 "body_size": body_size,
-                "origin_keepalive": "enabled; 60s idle timeout" if native_streaming else "disabled",
-                "native_origin_reuse_observation": "conditional access log for marked preflight requests only" if native_streaming else None,
+                "origin_keepalive": "enabled; 60s idle timeout" if origin_reuse else "disabled",
+                "nginx_response_buffering": getattr(a, "native_nginx_buffering", "off") if native_streaming else "on",
+                "native_origin_reuse_observation": "conditional access log for marked preflight requests only" if native_streaming or origin_reuse else None,
                 "nginx_keepalive_requests": ({
                     "origin": 1000000000,
                     "upstream_idle_connection": 1000000000,
@@ -319,12 +324,16 @@ class Harness:
                                'etag off; max_ranges 0; add_header Last-Modified ""; }')
             origin_observation = ""
             origin_log = ""
-        if not native_streaming:
-            origin_observation = ""
-        origin_keepalive = "keepalive_timeout 60;" if native_streaming else "keepalive_timeout 0;"
+        if origin_reuse and not native_streaming:
+            origin_observation = ('map $http_x_rut_benchmark_preflight $benchmark_preflight { '
+                                  'default 0; ~.+ 1; }\n'
+                                  'log_format rut_preflight "marker=$http_x_rut_benchmark_preflight '
+                                  'connection=$connection requests=$connection_requests";\n')
+            origin_log = 'access_log /dev/stdout rut_preflight if=$benchmark_preflight;'
+        origin_keepalive = "keepalive_timeout 60;" if origin_reuse else "keepalive_timeout 0;"
         (self.out / "origin.conf").write_text(self.nginx_config(
             f"server {{ listen 127.0.0.1:{a.origin_port}; {origin_keepalive} "
-            f"{'keepalive_requests 1000000000;' if native_streaming else ''} {origin_log} {origin_location} }}",
+            f"{'keepalive_requests 1000000000;' if native_streaming or origin_reuse else ''} {origin_log} {origin_location} }}",
             extra_http=origin_observation, workers=1,
         ))
         works = sorted({scenario.split("-")[0] for scenario in a.scenarios})
@@ -403,6 +412,15 @@ class Harness:
                     "proxy_buffer_size 16k; proxy_buffers 8 16k; "
                     "proxy_busy_buffers_size 32k;",
                 )
+            nginx_http = ""
+            if origin_reuse and work == "proxy":
+                nginx_http = (f"upstream benchmark_bounded_backend {{ server 127.0.0.1:{a.origin_port}; "
+                              "keepalive 4096; keepalive_timeout 60s; keepalive_requests 1000000000; }\n")
+                nginx_fragment = nginx_fragment.replace(
+                    f"proxy_pass http://127.0.0.1:{a.origin_port};",
+                    'proxy_pass http://benchmark_bounded_backend; '
+                    'proxy_http_version 1.1; proxy_set_header Connection "";',
+                )
             if self.tls_context:
                 nginx_fragment = nginx_fragment.replace(
                     f"listen 127.0.0.1:{a.front_port};",
@@ -411,9 +429,15 @@ class Harness:
                     "ssl_protocols TLSv1.3; ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
                     "ssl_ecdh_curve X25519; ssl_session_cache off;",
                 )
-            (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(nginx_fragment, workers=self.args.workers))
+            (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(nginx_fragment, extra_http=nginx_http, workers=self.args.workers))
             converted = self.command([a.converter, "--format", "server", source])
             program = converted.stdout
+            if getattr(a, "proxy_profile", "converter-strict") == "converter-bounded":
+                (self.out / (work + ".converted.rut")).write_text(program)
+                marker = "response_buffering: .completeContentLength"
+                if marker not in program:
+                    raise ValueError("converter-bounded requires an explicit completeContentLength policy")
+                program = program.replace(marker, "response_buffering: .bounded")
             if self.tls_context:
                 # Source listeners currently describe cleartext only. Preserve
                 # converter stdout, then select the existing CLI TLS listener.
@@ -570,7 +594,11 @@ class Harness:
             "requests_per_connection_mode": requests, "full_body_comparison": True,
             "connection_modes": ["close", "keepalive"] if keepalive else ["close"],
         })
+        bounded_reuse = (getattr(self.args, "proxy_profile", "converter-strict") == "converter-bounded"
+                         and getattr(self.args, "bounded_origin_reuse", "off") == "on" and work == "proxy")
         for close in [True, False] if keepalive else [True]:
+            markers = [f"{self.active_label}-{'close' if close else 'keepalive'}-{i}"
+                       for i in range(requests)] if bounded_reuse else []
             sock = None
             try:
                 for _ in range(requests):
@@ -590,7 +618,7 @@ class Harness:
                         sock, work, close, self.args.keepalive_header,
                         getattr(self.args, "body_size", None),
                         False,
-                        None,
+                        markers[_] if bounded_reuse else None,
                     )
                     comparison = canonical_native_static_response(raw) if (
                         work == "static" and getattr(self.args, "static_profile", "converter-return") == "native-body"
@@ -613,6 +641,10 @@ class Harness:
             finally:
                 if sock is not None:
                     sock.close()
+            if bounded_reuse:
+                # Unlike the native profile, bounded completion can pool across
+                # fresh downstream sockets too. Require origin-side proof for both.
+                self.verify_origin_reuse(markers)
 
     def validate_native_keepalive(self, work):
         sock = None
@@ -752,7 +784,21 @@ class Harness:
         marker_prefix = expected_markers[0].rsplit("-", 1)[0]
         (self.out / f"{marker_prefix}-origin-reuse.log").write_text(logs)
         records = origin_reuse_records(logs, expected_markers)
-        if not valid_origin_reuse(records, expected_markers):
+        reuse = (getattr(self.args, "native_origin_reuse", "on") == "on"
+                 if getattr(self.args, "proxy_profile", "converter-strict") == "native-streaming"
+                 else getattr(self.args, "bounded_origin_reuse", "off") == "on")
+        if not reuse:
+            valid = (len(records) == len(expected_markers)
+                     and [row[0] for row in records] == expected_markers
+                     and len({row[1] for row in records}) == len(records)
+                     and all(row[1] > 0 and row[2] == 1 for row in records))
+        elif fresh_downstream:
+            # A native Rut downstream close also closes its origin; nginx may
+            # pool that origin. Only the persistent stage promises reuse.
+            valid = len(records) == len(expected_markers) and [row[0] for row in records] == expected_markers
+        else:
+            valid = valid_origin_reuse(records, expected_markers)
+        if not valid:
             raise ValueError(f"origin reuse preflight failed for markers {expected_markers!r}: got {records!r}")
 
     def wrk(self, work, close, concurrency, duration, label):
@@ -1004,6 +1050,11 @@ def valid_origin_reuse(records, expected_markers):
 
 
 def validate_proxy_profile(parser, args):
+    if getattr(args, "bounded_origin_reuse", "off") == "on":
+        if (args.proxy_profile != "converter-bounded" or getattr(args, "tls_cert", None)
+                or not args.scenarios
+                or any(value not in ("proxy-close", "proxy-keepalive") for value in args.scenarios)):
+            parser.error("bounded origin reuse requires converter-bounded plaintext proxy scenarios")
     if args.proxy_profile != "native-streaming":
         return
     if args.body_size not in (None, NATIVE_BODY_SIZE):
@@ -1121,8 +1172,14 @@ def arguments():
     parser.add_argument("--body-size", type=positive, help="exact response body bytes (max 1 MiB); omitted preserves legacy bodies")
     parser.add_argument("--static-profile", choices=("converter-return", "native-body"),
                         default="converter-return", help="native-body compares a pinned Rut body with an nginx static file; separate from converter acceptance")
-    parser.add_argument("--proxy-profile", choices=("converter-strict", "native-streaming"),
+    parser.add_argument("--proxy-profile", choices=("converter-strict", "converter-bounded", "native-streaming"),
                         default="converter-strict", help="proxy implementation profile; default preserves converter behavior")
+    parser.add_argument("--native-origin-reuse", choices=("on", "off"), default="on",
+                        help="native-streaming origin reuse; off isolates response forwarding from connection pooling")
+    parser.add_argument("--bounded-origin-reuse", choices=("on", "off"), default="off",
+                        help="converter-bounded origin reuse; requires origin connection-ID preflight proof")
+    parser.add_argument("--native-nginx-buffering", choices=("on", "off"), default="off",
+                        help="native-streaming nginx response buffering; on uses eight 16 KiB buffers")
     parser.add_argument("--tls-cert", type=Path, help="PEM certificate with localhost SAN; enables HTTPS")
     parser.add_argument("--tls-key", type=Path)
     parser.add_argument("--front-port", type=int, default=8087)

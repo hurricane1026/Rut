@@ -10,6 +10,26 @@
 
 namespace rut {
 
+// Reuse is admitted only for the bodyless plaintext GET buffering profile.
+// The existing generation/upload/transport predicates still prove this request;
+// a pooled fd is not evidence for any earlier upload or pipelined successor.
+inline bool bounded_get_upstream_reuse_is_admitted(const Connection& c) {
+    return c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+           c.response_read_deadline_profile ==
+               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+           c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+           c.response_read_deadline_method == c.req_method &&
+           c.response_read_deadline_route_method == kRouteMethodGet &&
+           c.protocol == ConnProtocol::Http11 && !c.tls_active && c.h2 == nullptr &&
+           c.req_body_mode == BodyMode::None && !c.req_client_has_content_length &&
+           !c.req_client_has_transfer_encoding && !c.req_wants_upgrade && c.pipeline_depth == 0 &&
+           c.http1_pipeline_request_generation == 0;
+}
+
+inline bool response_read_deadline_upstream_reuse_is_stable(const Connection& c) {
+    return !c.upstream_reused || bounded_get_upstream_reuse_is_admitted(c);
+}
+
 // Pure millisecond rounding used when a precise timeout CQE arrives before
 // its logical deadline. A zero result means the deadline is due now.
 inline u32 response_read_timer_remaining_ms(u64 last_progress_ns, u64 timeout_ns, u64 now_ns) {
@@ -1290,7 +1310,7 @@ inline bool response_read_deadline_coalesced_get_phase1_proof_is_stable(
            c.req_header_override_count == 0 && !c.req_header_override_overflow &&
            c.resp_header_mutation_count == 0 && c.resp_header_mutation_pending_count == 0 &&
            !c.resp_header_mutation_pending_overflow && !c.resp_header_mutation_overflow &&
-           !c.upstream_reused && c.upstream_attempts == 1;
+           response_read_deadline_upstream_reuse_is_stable(c) && c.upstream_attempts == 1;
 }
 
 inline bool response_read_deadline_coalesced_get_phase1_prebuilt_stash_is_stable(
@@ -1943,15 +1963,33 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
                 c.response_read_deadline_route_method) ||
             c.response_read_deadline_post_commit_send_body >
                 c.response_read_deadline_post_commit_origin_received ||
-            (collecting && (c.response_read_deadline_post_commit_send_body != 0 ||
-                            c.response_read_deadline_post_commit_close_after_drain ||
-                            c.response_read_deadline_post_commit_downstream_submitted != 0 ||
-                            c.response_read_deadline_post_commit_downstream_completed != 0)) ||
+            (collecting &&
+             (c.response_read_deadline_post_commit_send_body != 0 ||
+              c.response_read_deadline_post_commit_close_after_drain ||
+              c.response_read_deadline_post_commit_downstream_submitted != 0 ||
+              c.response_read_deadline_post_commit_downstream_completed != 0 ||
+              (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+               c.response_read_deadline_post_commit_release_target != 0))) ||
             (!collecting && !c.response_read_deadline_post_commit_close_after_drain &&
+             c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded &&
              (c.response_read_deadline_post_commit_send_body !=
                   c.response_read_deadline_post_commit_declared_body ||
               c.response_read_deadline_post_commit_origin_received !=
                   c.response_read_deadline_post_commit_declared_body)))
+            return false;
+        if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            (c.response_read_deadline_post_commit_release_target !=
+                 c.response_read_deadline_post_commit_send_body ||
+             c.response_read_deadline_post_commit_downstream_completed >
+                 c.response_read_deadline_post_commit_downstream_submitted ||
+             c.response_read_deadline_post_commit_downstream_submitted >
+                 c.response_read_deadline_post_commit_release_target ||
+             c.response_read_deadline_post_commit_release_target >
+                 c.response_read_deadline_post_commit_origin_received))
+            return false;
+        if (c.response_read_deadline_buffering ==
+                ForwardResponseBufferingMode::CompleteContentLength &&
+            c.response_read_deadline_post_commit_release_target != 0)
             return false;
     } else if (c.response_read_deadline_post_commit_send_body != 0 ||
                c.response_read_deadline_post_commit_close_after_drain) {
@@ -1959,7 +1997,8 @@ inline bool response_read_deadline_owner_is_stable(const Connection& c,
     }
     if (c.upstream_idx >= cfg->upstream_count || cfg->upstreams[c.upstream_idx].addr_count != 1 ||
         cfg->upstreams[c.upstream_idx].addrs[0].sin_family != AF_INET || c.upstream_attempts != 1 ||
-        c.upstream_reused || !c.request_upload_complete || c.upstream_request_incomplete ||
+        !response_read_deadline_upstream_reuse_is_stable(c) || !c.request_upload_complete ||
+        c.upstream_request_incomplete ||
         (!post_commit && c.on_upstream_recv != expected_upstream_recv) ||
         (post_commit && c.on_upstream_recv != nullptr &&
          c.on_upstream_recv != expected_upstream_recv) ||
@@ -2243,8 +2282,11 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
         c.response_read_deadline_buffering);
     const bool retired_buffered_send =
-        complete_buffering && c.response_read_deadline_post_commit_phase !=
-                                  ResponseReadDeadlinePostCommitPhase::Buffering;
+        complete_buffering &&
+        c.response_read_deadline_post_commit_phase !=
+            ResponseReadDeadlinePostCommitPhase::Buffering &&
+        (c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+         c.upstream_abandoned);
     const bool pipeline_generation_stable =
         http1_pipeline_request_generation_upload_active_is_stable(
             c,
@@ -2316,8 +2358,8 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
         c.req_header_override_count != 0 || c.req_header_override_overflow ||
         c.resp_header_mutation_count != 0 || c.resp_header_mutation_pending_count != 0 ||
         c.resp_header_mutation_pending_overflow || c.resp_header_mutation_overflow ||
-        c.upstream_reused || c.upstream_attempts != 1 || !c.request_upload_complete ||
-        c.upstream_request_incomplete)
+        !response_read_deadline_upstream_reuse_is_stable(c) || c.upstream_attempts != 1 ||
+        !c.request_upload_complete || c.upstream_request_incomplete)
         return false;
     const bool exact_get = response_read_deadline_exact_get_layout_is_stable(c);
     const bool id3 =
@@ -2358,7 +2400,8 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
                                                                  c.response_read_deadline_buffering,
                                                                  c.response_read_deadline_profile);
     const bool incomplete_coherent_range_selection =
-        complete_buffering && !collecting &&
+        c.response_read_deadline_buffering == ForwardResponseBufferingMode::CompleteContentLength &&
+        !collecting &&
         c.response_read_deadline_post_commit_response_class ==
             CompleteContentLengthResponseClass::CoherentSingleRange206 &&
         c.response_read_deadline_post_commit_origin_received <
@@ -2372,12 +2415,28 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             (collecting && (c.response_read_deadline_post_commit_send_body != 0 ||
                             c.response_read_deadline_post_commit_close_after_drain ||
                             c.response_read_deadline_post_commit_downstream_submitted != 0 ||
-                            c.response_read_deadline_post_commit_downstream_completed != 0)) ||
+                            c.response_read_deadline_post_commit_downstream_completed != 0 ||
+                            c.response_read_deadline_post_commit_release_target != 0)) ||
             (!collecting && !c.response_read_deadline_post_commit_close_after_drain &&
+             c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded &&
              (c.response_read_deadline_post_commit_send_body !=
                   c.response_read_deadline_post_commit_declared_body ||
               c.response_read_deadline_post_commit_origin_received !=
                   c.response_read_deadline_post_commit_declared_body)))
+            return false;
+        if (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            (c.response_read_deadline_post_commit_release_target !=
+                 c.response_read_deadline_post_commit_send_body ||
+             c.response_read_deadline_post_commit_downstream_completed >
+                 c.response_read_deadline_post_commit_downstream_submitted ||
+             c.response_read_deadline_post_commit_downstream_submitted >
+                 c.response_read_deadline_post_commit_release_target ||
+             c.response_read_deadline_post_commit_release_target >
+                 c.response_read_deadline_post_commit_origin_received))
+            return false;
+        if (c.response_read_deadline_buffering ==
+                ForwardResponseBufferingMode::CompleteContentLength &&
+            c.response_read_deadline_post_commit_release_target != 0)
             return false;
         if (incomplete_coherent_range_selection &&
             (!c.response_read_deadline_post_commit_close_after_drain ||
@@ -2416,9 +2475,13 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
             selected > c.response_read_deadline_post_commit_origin_received ||
             c.resp_body_mode != BodyMode::ContentLength || c.resp_body_sent < header_len ||
             c.resp_body_sent - header_len != submitted ||
-            c.resp_body_remaining != selected - submitted)
+            c.resp_body_remaining !=
+                (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded
+                     ? c.response_read_deadline_post_commit_declared_body - submitted
+                     : selected - submitted))
             return false;
-        if (selected == 0) {
+        if (selected == 0 &&
+            c.response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded) {
             if (submitted != 0 || completed != 0 || inflight != 0 ||
                 c.resp_body_sent != header_len || c.resp_body_remaining != 0)
                 return false;
@@ -2448,6 +2511,17 @@ inline bool response_read_deadline_post_commit_is_stable(const Connection& c) {
     return stable && (c.response_read_deadline_post_commit_phase !=
                           ResponseReadDeadlinePostCommitPhase::CombinedSend ||
                       response_read_deadline_combined_send_frame_is_stable(c));
+}
+
+inline bool post_commit_incremental_release_active(const Connection& c) {
+    return c.response_read_deadline_profile ==
+               ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero &&
+           c.response_read_deadline_post_commit_phase !=
+               ResponseReadDeadlinePostCommitPhase::None &&
+           (c.response_read_deadline_buffering == ForwardResponseBufferingMode::None ||
+            (c.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+             c.response_read_deadline_post_commit_phase !=
+                 ResponseReadDeadlinePostCommitPhase::Buffering));
 }
 
 // The currently admitted default-buffered GET keeps the same precise

@@ -36,6 +36,21 @@ enum class ForwardResponseBufferingMode : u8 {
 
 static constexpr u32 kBoundedResponseBufferBytes = 4096;
 
+// Body prefix eligible for downstream publication under the raw-upstream
+// buffer release rule. A terminal response flushes its received prefix; an
+// incomplete response releases only complete 4 KiB raw-header/body units.
+inline u32 bounded_response_release_target(u32 raw_header_bytes,
+                                           u32 body_received,
+                                           u32 declared_body,
+                                           bool terminal) {
+    if (body_received > declared_body) return 0;
+    if (terminal) return body_received;
+    if (raw_header_bytes > 0xFFFFFFFFu - body_received) return 0;
+    const u32 raw_total = raw_header_bytes + body_received;
+    const u32 released_raw = raw_total - raw_total % kBoundedResponseBufferBytes;
+    return released_raw > raw_header_bytes ? released_raw - raw_header_bytes : 0;
+}
+
 inline bool forward_response_buffering_mode_valid(ForwardResponseBufferingMode mode) {
     return mode == ForwardResponseBufferingMode::None ||
            mode == ForwardResponseBufferingMode::CompleteContentLength ||

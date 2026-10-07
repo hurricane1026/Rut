@@ -758,11 +758,15 @@ struct ConnectionBase {
     u32 response_read_deadline_post_commit_downstream_submitted;
     u32 response_read_deadline_post_commit_downstream_completed;
     u32 response_read_deadline_post_commit_inflight_body;
+    // Monotonic body prefix permitted downstream by bounded raw-upstream
+    // buffer releases. CompleteContentLength leaves this zero.
+    u32 response_read_deadline_post_commit_release_target;
     // For the complete-Content-Length barrier this is the exact body prefix
     // selected for publication.  It equals declared_body on success, zero on
     // inactivity, and origin_received on a clean premature EOF.
     u32 response_read_deadline_post_commit_send_body;
     bool response_read_deadline_post_commit_close_after_drain;
+    bool response_read_deadline_post_commit_terminal_pending;
     bool response_read_deadline_post_commit_pump_pending;
     // Exact downstream Send CQE ownership for the post-commit stream.  The
     // monotonically increasing token is encoded in io_uring user_data; the
@@ -1007,8 +1011,10 @@ struct ConnectionBase {
         visit(c.response_read_deadline_post_commit_downstream_submitted, u32{0});
         visit(c.response_read_deadline_post_commit_downstream_completed, u32{0});
         visit(c.response_read_deadline_post_commit_inflight_body, u32{0});
+        visit(c.response_read_deadline_post_commit_release_target, u32{0});
         visit(c.response_read_deadline_post_commit_send_body, u32{0});
         visit(c.response_read_deadline_post_commit_close_after_drain, false);
+        visit(c.response_read_deadline_post_commit_terminal_pending, false);
         visit(c.response_read_deadline_post_commit_pump_pending, false);
         visit(c.response_read_deadline_first_batch, false);
         visit(c.response_read_deadline_first_batch_profile, ResponseReadDeadlineProfile::None);
@@ -1072,8 +1078,10 @@ struct ConnectionBase {
         check(response_read_deadline_post_commit_downstream_submitted, u32{0});
         check(response_read_deadline_post_commit_downstream_completed, u32{0});
         check(response_read_deadline_post_commit_inflight_body, u32{0});
+        check(response_read_deadline_post_commit_release_target, u32{0});
         check(response_read_deadline_post_commit_send_body, u32{0});
         check(response_read_deadline_post_commit_close_after_drain, false);
+        check(response_read_deadline_post_commit_terminal_pending, false);
         check(response_read_deadline_post_commit_pump_pending, false);
         check(response_read_deadline_first_batch, false);
         check(response_read_deadline_first_batch_profile, ResponseReadDeadlineProfile::None);
@@ -1753,6 +1761,18 @@ struct ConnectionBase {
     // exact memory. epoll never sets this.
     bool upstream_recv_direct_armed = false;
 
+    // A validated large plaintext Content-Length body can start its overflow
+    // chain with a bulk node. Unknown/small responses and TLS retain the
+    // measured ordinary-slice threshold, and allocation still falls back.
+    u32 buffered_response_bulk_after() const {
+        if (!tls_active &&
+            response_read_deadline_post_commit_phase ==
+                ResponseReadDeadlinePostCommitPhase::Buffering &&
+            response_read_deadline_post_commit_declared_body > SlicePool::kBulkSliceSize)
+            return 0;
+        return tls_active ? ResponseBodyChain::kBulkAfterTls
+                          : ResponseBodyChain::kBulkAfterPlaintext;
+    }
     u32 buffered_response_len() const { return upstream_recv_buf.len() + response_body_tail.size; }
     const u8* buffered_response_data() const {
         return upstream_recv_buf.len() ? upstream_recv_buf.data() : response_body_tail.data();

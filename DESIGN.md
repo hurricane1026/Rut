@@ -2274,22 +2274,39 @@ response framed by exactly one `Content-Length`:
 - `"complete_content_length"`: the whole response (header and body) is
   buffered before any downstream byte is sent.
 - `"bounded"`: nginx's `proxy_buffering on` (nginx's default) release rule.
-  ⏳ pending: the mode is accepted, but the runtime still serves it exactly as
-  `"complete_content_length"`. With raw
-  upstream header length `H`, after `n` body bytes have arrived the released
-  body is `n` once the response is complete, and otherwise
-  `max(0, floor((H + n) / 4096) * 4096 - H)`. That is, whole 4 KiB buffers of
-  raw upstream bytes. Nothing, not even the header, is sent before the first
-  release, so below one buffer this is identical to
-  `"complete_content_length"`.
+  With raw upstream header length `H` and `n` received body bytes, an
+  incomplete response releases
+  `max(0, floor((H + n) / 4096) * 4096 - H)` body bytes; completion releases
+  the declared body length, including its final partial unit. The rewritten
+  response header is sent once, with the first positive release. Before that
+  point the downstream remains quiet.
+  This is a publication boundary, not a 4 KiB memory cap. The existing
+  response-size admission limit still applies; a slow downstream may retain
+  the admitted response in the slice chain. Incremental bounded body reads
+  target the chain tail directly after the provided-ring prefix. The tail
+  remains allocated while its receive target is pending, even when downstream
+  sends have consumed its committed bytes; receive settlement releases an
+  empty retained node. Complete buffering keeps its direct-tail receive path.
+  The io_uring depth-0 bodyless plaintext GET profile can borrow a settled
+  idle origin socket. After receiving the complete declared body, it parks
+  a persistent origin only if no receive/cancel owner remains, the current
+  config still matches, the shard is not draining, and a nonblocking peek
+  finds neither surplus bytes nor EOF. The exact response episode retires
+  before the fd enters the pool; downstream send and timer retirement keep
+  their existing generation barriers. Client connection closure does not
+  require closing this independent origin connection. Other profiles and
+  unsettled/failed origins retain the close path; strict borrowed requests
+  are not replayed after an ambiguous send/receive failure.
 
-Terminal dispositions (both modes). If the read timeout expires before any
+Terminal dispositions. For either mode, if the read timeout expires before any
 body release, the client gets the rewritten header only and the connection
 closes. If no upstream header had arrived, the `timeout_failure_policy`
-response (e.g. 504) is sent instead. If the read timeout expires after a
-release, the unreleased partial buffer is dropped and the connection closes.
-A clean origin EOF before the declared length flushes everything received,
-then closes.
+response (e.g. 504) is sent instead. Complete Content Length flushes every
+received byte on a clean premature EOF, then closes. Bounded mode drains only
+the already admitted whole-unit release target after a premature EOF or a
+timeout following release; bytes in the incomplete raw unit are dropped and
+the connection closes. A complete declared body flushes its final partial
+unit and may reuse the downstream connection only after normal owner retirement.
 
 #### 3.4.6 Response Caching
 
