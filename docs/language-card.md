@@ -462,10 +462,17 @@ return forward(users, request_policy: {
 // response_read_timeout: <1..63s> plus response_buffering: .completeContentLength
 // commits the entire upstream response before any downstream byte is sent.
 // response_buffering: .bounded (nginx proxy_buffering-on semantics) releases
-// the Content-Length body downstream in whole 4 KiB units of raw upstream
-// bytes; below one unit it behaves exactly like "complete_content_length".
-// ⏳ pending: `.bounded` is accepted everywhere `.completeContentLength` is,
-// but the runtime still serves it exactly as "complete_content_length".
+// body bytes when the cumulative raw upstream response reaches whole 4 KiB
+// units; the rewritten header accompanies the first positive release, and a
+// complete Content-Length response flushes its final partial unit. A timeout
+// or short EOF after release drops the unreleased partial unit and closes.
+// The 4 KiB unit controls publication, not retained-memory capacity; slow
+// readers still use the existing response-size bound.
+// On io_uring, a depth-0 bodyless plaintext GET with .bounded may borrow an
+// idle origin connection. A complete, persistent response may return it to
+// the pool after its receive ownership settles, even if the client closes.
+// Live receive/cancel owners, surplus bytes, EOF, truncation and timeout
+// prevent pooling. Fixed uploads and pipelined successors still connect fresh.
 
 return forward(users, response_policy: {
     version: .http11, framing: .contentLength, connection: .request,

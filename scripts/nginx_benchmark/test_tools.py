@@ -108,6 +108,15 @@ class ToolsTest(unittest.TestCase):
         missing = "\n".join(complete.splitlines()[:-1])
         self.assertFalse(valid_origin_reuse(origin_reuse_records(missing, markers), markers))
 
+    def test_bounded_origin_reuse_rejects_unsupported_profiles_and_transport(self):
+        baseline = dict(proxy_profile="converter-bounded", bounded_origin_reuse="on",
+                        tls_cert=None, scenarios=["proxy-close", "proxy-keepalive"])
+        validate_proxy_profile(argparse.ArgumentParser(), SimpleNamespace(**baseline))
+        for change in ({"proxy_profile": "converter-strict"}, {"tls_cert": Path("cert.pem")},
+                       {"scenarios": ["static-close"]}):
+            with self.assertRaises(SystemExit):
+                validate_proxy_profile(argparse.ArgumentParser(), SimpleNamespace(**(baseline | change)))
+
     def test_native_streaming_profile_rejects_unsupported_matrix_shapes(self):
         parser = argparse.ArgumentParser()
         baseline = dict(proxy_profile="native-streaming", body_size=None,
@@ -119,13 +128,34 @@ class ToolsTest(unittest.TestCase):
         single = SimpleNamespace(**(baseline | {"concurrency": [32]}))
         validate_proxy_profile(parser, single)
         self.assertEqual(single.body_size, 256 * 1024)
-        for key, value in (("scenarios", ["proxy-close"]),
+        large = SimpleNamespace(**(baseline | {"body_size": 1048576,
+                                "scenarios": ["proxy-close", "proxy-keepalive"],
+                                "concurrency": [1, 128]}))
+        validate_proxy_profile(parser, large)
+        self.assertEqual(large.body_size, 1048576)
+        for key, value in (("scenarios", ["static-close"]),
                            ("concurrency", [8]),
                            ("concurrency", []),
-                           ("body_size", 65536),
+                           ("body_size", 1048577),
                            ("keepalive_header", "explicit")):
             with self.subTest(key=key), self.assertRaises(SystemExit):
                 validate_proxy_profile(parser, SimpleNamespace(**(baseline | {key: value})))
+
+    def test_large_native_close_checks_tail_content_and_transport_eof(self):
+        wanted = expected_body("proxy", 1048576, native_streaming=True)
+        head = (b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n"
+                b"Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n")
+        raw, closed = response(FakeSocket([head, wanted]), "proxy", True,
+                               body_size=1048576, native_streaming=True)
+        self.assertTrue(closed)
+        self.assertTrue(raw.endswith(wanted))
+        damaged = wanted[:900000] + bytes([wanted[900000] ^ 1]) + wanted[900001:]
+        with self.assertRaisesRegex(ValueError, "unexpected body"):
+            response(FakeSocket([head, damaged]), "proxy", True,
+                     body_size=1048576, native_streaming=True)
+        with self.assertRaisesRegex(ValueError, "expected EOF"):
+            response(FakeSocket([head, wanted, b"surplus"]), "proxy", True,
+                     body_size=1048576, native_streaming=True)
 
     def test_default_proxy_profile_leaves_arguments_unchanged(self):
         args = SimpleNamespace(proxy_profile="converter-strict", body_size=None,
@@ -289,6 +319,8 @@ class ToolsTest(unittest.TestCase):
 
     def test_prepare_applies_frontend_workers_in_all_profiles_and_origin_stays_single(self):
         cases = (("converter", "converter-return", "converter-strict", ["proxy-close"], "proxy"),
+                 ("bounded", "converter-return", "converter-bounded", ["proxy-close"], "proxy"),
+                 ("bounded-reuse", "converter-return", "converter-bounded", ["proxy-close"], "proxy"),
                  ("native-body", "native-body", "converter-strict", ["static-close"], "static"),
                  ("native-streaming", "converter-return", "native-streaming",
                   ["proxy-keepalive"], "proxy"))
@@ -309,6 +341,7 @@ class ToolsTest(unittest.TestCase):
                     front_port=8087, origin_port=9087, scenarios=scenarios, repeats=1,
                     first_engine="nginx", static_profile=static_profile,
                     proxy_profile=proxy_profile,
+                    bounded_origin_reuse="on" if name == "bounded-reuse" else "off",
                 )
                 harness = Harness(args)
 
@@ -325,7 +358,7 @@ class ToolsTest(unittest.TestCase):
                     elif command == ["lscpu"]:
                         stdout = "mock topology"
                     elif command[0] == str(binaries["converter"]):
-                        stdout = f"listen 127.0.0.1:{args.front_port}\nmock config\n"
+                        stdout = f"listen 127.0.0.1:{args.front_port}\nresponse_buffering: .completeContentLength\n"
                     else:
                         raise AssertionError(f"unexpected command {argv!r}")
                     return subprocess.CompletedProcess(argv, 0, stdout, "")
@@ -335,6 +368,14 @@ class ToolsTest(unittest.TestCase):
                 frontend = out / f"{work}-nginx.conf"
                 self.assertIn("worker_processes 2;", frontend.read_text())
                 self.assertIn("worker_processes 1;", (out / "origin.conf").read_text())
+                if name == "bounded-reuse":
+                    self.assertIn("keepalive_timeout 60;", (out / "origin.conf").read_text())
+                    self.assertIn("rut_preflight", (out / "origin.conf").read_text())
+                    self.assertIn('proxy_set_header Connection "";', frontend.read_text())
+                if proxy_profile == "converter-bounded":
+                    self.assertIn("response_buffering: .bounded", (out / "proxy.rut").read_text())
+                    self.assertIn("response_buffering: .completeContentLength",
+                                  (out / "proxy.converted.rut").read_text())
 
 
     def test_matrix_profiles_forward_budget_without_dropping_coordinates(self):
@@ -770,7 +811,7 @@ class ToolsTest(unittest.TestCase):
                     elif argv == ["lscpu"]:
                         stdout = "mock cpu topology"
                     elif str(argv[0]) == str(tools["converter"]):
-                        stdout = f"listen 127.0.0.1:{args.front_port}\nmock config\n"
+                        stdout = f"listen 127.0.0.1:{args.front_port}\nresponse_buffering: .completeContentLength\n"
                     else:
                         raise AssertionError(f"unexpected external command: {argv!r}")
                     return subprocess.CompletedProcess(argv, 0, stdout, "")

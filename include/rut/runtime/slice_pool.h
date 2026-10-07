@@ -4,6 +4,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
+#include <stdlib.h>
 #include <sys/mman.h>
 
 namespace rut {
@@ -36,13 +37,25 @@ namespace rut {
 //   pool.destroy();
 
 struct SlicePool {
+    u32 study_bulk_cache_limit = [] {
+        const char* value = ::getenv("RUT_STUDY_BULK_CACHE_MIB");
+        const u32 mib = value ? static_cast<u32>(::atoi(value)) : 16u;
+        return (mib == 32u || mib == 64u) ? mib * 4u : 64u;
+    }();
+    bool study_adaptive_cache = ::getenv("RUT_STUDY_ADAPTIVE_CACHE") != nullptr;
+    bool study_bulk_burst = false;
+    u32 study_bulk_borrowed = 0;
+    u32 study_bulk_peak_borrowed = 0;
+    u32 study_bulk_peak_cached = 0;
+    bool study_body_pool_reuse = ::getenv("RUT_STUDY_BODY_POOL_REUSE") != nullptr;
+    u64 study_body_bulk_clear_bytes = 0;
     static constexpr u32 kSliceSize = 16384;      // 16KB per slice
     static constexpr u32 kMaxCachedSlices = 256;  // At most 4 MiB idle retention per pool.
     // A buffered response keeps its header/prefix slice separately and stores
     // the remaining bounded body in whole SlicePool nodes. Keep this reserve
     // with the pool sizing contract so every backend accounts for it equally.
     static constexpr u32 kMaxBufferedResponseBody = 1u << 20;
-    static constexpr u32 kResponseBodyPayload = kSliceSize - sizeof(void*) - 2 * sizeof(u32);
+    static constexpr u32 kResponseBodyPayload = kSliceSize - sizeof(void*) - 3 * sizeof(u32);
     static constexpr u32 kMaxBufferedResponseSlices =
         (kMaxBufferedResponseBody + kResponseBodyPayload - 1) / kResponseBodyPayload;
     static constexpr u32 kOrdinarySlicesPerConnection = 6;
@@ -108,7 +121,8 @@ struct SlicePool {
     u64* bulk_in_use = nullptr;  // mmap'd bitmap: bit i set while bulk buffer i is borrowed
     u32 bulk_free_top = 0;
     // Like cached_count: the top bulk_cached_count entries of bulk_free are
-    // resident, zeroed buffers; discarded/untouched indices sit below them.
+    // resident buffers; ordinary loans scrub any deferred body bytes.
+    // Discarded/untouched indices sit below them.
     u32 bulk_cached_count = 0;
     u32 bulk_max_count = 0;    // bulk buffers reserved for this pool (set at init)
     u64 bulk_base_size = 0;    // size of mmap'd bulk_base region
@@ -139,6 +153,8 @@ struct SlicePool {
         count = 0;
         free_top = 0;
         bulk_max_count = bulk_capacity > kMaxBulkSlices ? kMaxBulkSlices : bulk_capacity;
+        study_bulk_burst = false;
+        study_bulk_borrowed = study_bulk_peak_borrowed = study_bulk_peak_cached = 0;
 
         // Reserve VA for slice data — PROT_NONE, no physical pages
         base_size = static_cast<u64>(n) * kSliceSize;
@@ -248,15 +264,7 @@ struct SlicePool {
 
     // Borrow one bulk relay buffer, or null when none is available (including
     // when this pool was init'd with bulk_capacity == 0).
-    u8* alloc_bulk() {
-        if (bulk_max_count == 0) return nullptr;
-        if (bulk_base == nullptr && !map_bulk()) return nullptr;
-        if (bulk_free_top == 0) return nullptr;
-        const u32 idx = bulk_free[--bulk_free_top];
-        if (bulk_cached_count != 0) --bulk_cached_count;
-        bulk_in_use[idx >> 6] |= u64{1} << (idx & 63u);
-        return bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
-    }
+    u8* alloc_bulk() { return alloc_bulk_impl(nullptr); }
 
     [[nodiscard]] bool is_bulk(const u8* ptr) const {
         return bulk_base != nullptr && ptr >= bulk_base &&
@@ -396,7 +404,82 @@ struct SlicePool {
         max_count = 0;
     }
 
+    // Study-only bounded idle maintenance: only free cached slots are touched,
+    // and an active bulk loan prevents shrink. Eight slots = 2 MiB per tick.
+    void study_trim_bulk_idle_cache() {
+        if (!study_adaptive_cache || study_bulk_borrowed != 0) return;
+        for (u32 n = 0; n != 8 && bulk_cached_count > study_bulk_cache_limit; ++n) {
+            const u32 position = bulk_free_top - bulk_cached_count;
+            const u32 idx = bulk_free[position] & ~kDeferredBodyClear;
+            u8* ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+#ifdef __linux__
+            if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0)
+                clear_bulk_bytes(ptr, kBulkSliceSize);
+#else
+            clear_bulk_bytes(ptr, kBulkSliceSize);
+#endif
+            bulk_free[position] = idx;
+            --bulk_cached_count;
+        }
+        if (bulk_cached_count <= study_bulk_cache_limit) study_bulk_burst = false;
+    }
+
 private:
+    friend struct ResponseBodyChain;
+    // A cached body slot may retain bytes outside its next logical prefix.
+    // This tag is private to the chain; ordinary bulk loans scrub it first.
+    static constexpr u32 kDeferredBodyClear = u32{1} << 31;
+    static_assert(kMaxBulkSlices < kDeferredBodyClear);
+
+    void clear_bulk_bytes(u8* ptr, u32 dirty) {
+        study_body_bulk_clear_bytes += dirty;
+        __builtin_memset(ptr, 0, dirty);
+    }
+
+    u8* alloc_bulk_impl(u32* previous_dirty) {
+        if (bulk_max_count == 0) return nullptr;
+        if (bulk_base == nullptr && !map_bulk()) return nullptr;
+        if (bulk_free_top == 0) return nullptr;
+        const u32 entry = bulk_free[--bulk_free_top];
+        const u32 idx = entry & ~kDeferredBodyClear;
+        if (bulk_cached_count != 0) --bulk_cached_count;
+        bulk_in_use[idx >> 6] |= u64{1} << (idx & 63u);
+        ++study_bulk_borrowed;
+        if (study_bulk_borrowed > study_bulk_peak_borrowed)
+            study_bulk_peak_borrowed = study_bulk_borrowed;
+        if (study_adaptive_cache && study_bulk_borrowed >= 128) study_bulk_burst = true;
+        u8* const ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+        if ((entry & kDeferredBodyClear) != 0) {
+            u32 dirty = 0;
+            __builtin_memcpy(&dirty, ptr, sizeof(dirty));
+            // A malformed cache marker falls back to a full scrub.
+            if (dirty < sizeof(u32) || dirty > kBulkSliceSize) dirty = kBulkSliceSize;
+            if (previous_dirty)
+                *previous_dirty = dirty;
+            else
+                clear_bulk_bytes(ptr, dirty);
+        }
+        return ptr;
+    }
+
+    u8* alloc_response_body_bulk(u32& previous_dirty) {
+        previous_dirty = 0;
+        if (!study_body_pool_reuse) return alloc_bulk();
+        return alloc_bulk_impl(&previous_dirty);
+    }
+
+    void free_response_body_written(u8* ptr, u32 written) {
+        if (!study_body_pool_reuse) {
+            free_written(ptr, written);
+            return;
+        }
+        if (is_bulk(ptr)) {
+            free_bulk(ptr, written < kBulkSliceSize ? written : kBulkSliceSize, true);
+            return;
+        }
+        free_written(ptr, written);
+    }
+
     bool map_bulk() {
         if (bulk_map_failed || base == nullptr || bulk_max_count == 0) return false;
         // MAP_NORESERVE: reserve VA for the full per-pool bulk capacity (up to
@@ -422,7 +505,7 @@ private:
         return true;
     }
 
-    void free_bulk(u8* ptr, u32 dirty) {
+    void free_bulk(u8* ptr, u32 dirty, bool defer_body_clear = false) {
         const u64 offset = static_cast<u64>(ptr - bulk_base);
         if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
@@ -431,21 +514,34 @@ private:
         const u64 bit = u64{1} << (idx & 63u);
         if ((word & bit) == 0) return;  // double-free detection
         word &= ~bit;
+        --study_bulk_borrowed;
         // Like slices, a returned buffer must not expose its owner's bytes.
-        if (bulk_cached_count < kMaxCachedBulk) {
+        const u32 cache_limit_now =
+            study_bulk_burst && study_bulk_cache_limit < 128 ? 128 : study_bulk_cache_limit;
+        if (bulk_cached_count < cache_limit_now) {
             // Hot: zero in place, since MADV_DONTNEED would make every reuse
             // fault its pages back in. Bytes past `dirty` are still zero from
             // the previous return (or the fresh mapping).
-            __builtin_memset(ptr, 0, dirty);
-            bulk_free[bulk_free_top++] = idx;
+            if (defer_body_clear) {
+                if (dirty < sizeof(u32)) dirty = sizeof(u32);
+                // Every chain borrower starts with len=offset=0 and preserves
+                // this high-water mark until a scrubbed loan or discard.
+                __builtin_memcpy(ptr, &dirty, sizeof(dirty));
+                bulk_free[bulk_free_top++] = idx | kDeferredBodyClear;
+            } else {
+                clear_bulk_bytes(ptr, dirty);
+                bulk_free[bulk_free_top++] = idx;
+            }
             ++bulk_cached_count;
+            if (bulk_cached_count > study_bulk_peak_cached)
+                study_bulk_peak_cached = bulk_cached_count;
             return;
         }
 #ifdef __linux__
         // Private anonymous pages read back zero-filled after MADV_DONTNEED.
-        if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0) __builtin_memset(ptr, 0, dirty);
+        if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0) clear_bulk_bytes(ptr, dirty);
 #else
-        __builtin_memset(ptr, 0, dirty);
+        clear_bulk_bytes(ptr, dirty);
 #endif
         // Below the cached suffix, as free() does for slices, so reuse keeps
         // preferring the resident buffers.

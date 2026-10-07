@@ -1,0 +1,44 @@
+{
+  "source_checkpoint_commit": "b4d350aa",
+  "branch": "experiment/proxy-flow-checkpoint-20261007",
+  "source_worktree": "/home/hurricane/private/code/Rut-proxy-flow-checkpoint",
+  "source_restore": "f1678e9a plus archived validated prototype.patch; source was not rebuilt as a newly verified binary",
+  "comparison_binary": "original frozen old-iouring/rut plus matching rut-compile; new-epoll/rut.real frozen from workspace with matching helper",
+  "binaries": [
+    {
+      "path": "/home/hurricane/private/code/rut-performance-checkpoints/proxy-flow-20261007/old-iouring/rut",
+      "sha256": "0e8b7a2aac39bb80cdb44b8d5840a1ef62cc47b5be53bb977a7d105b4a061e7d"
+    },
+    {
+      "path": "/home/hurricane/private/code/rut-performance-checkpoints/proxy-flow-20261007/old-iouring/rut-compile",
+      "sha256": "b5928a036433ec70a094a302d758b4fccb0f51e195aecf34931b49fecb86debd"
+    },
+    {
+      "path": "/home/hurricane/private/code/rut-performance-checkpoints/proxy-flow-20261007/new-epoll/rut.real",
+      "sha256": "7c0420dda13d875a4fc9513ef2e1e51e19f2a459e3e000aae1a7e81e7ee25bfa"
+    },
+    {
+      "path": "/home/hurricane/private/code/rut-performance-checkpoints/proxy-flow-20261007/new-epoll/rut-compile",
+      "sha256": "3c0f05830617f2455bc40d982a1f85de4aa27d9f48dd141b6ea3f5a8dc29bfd9"
+    }
+  ],
+  "old_env": {
+    "RUT_STUDY_BODY_POOL_REUSE": "1",
+    "RUT_STUDY_SELECTIVE_VECTOR": "1",
+    "RUT_STUDY_DIRECT_BODY_SEND": "1",
+    "RUT_STUDY_DIRECT_CLOSE_ONLY": "1",
+    "RUT_STUDY_ADAPTIVE_CACHE": "1",
+    "RUT_STUDY_BODY_POOL_LOG": "1",
+    "RUT_STUDY_BULK_CACHE_MIB": "16"
+  },
+  "runs": [
+    "checkpoint-vs-epoll-20261007-c128",
+    "checkpoint-vs-epoll-c1-20261007-c1",
+    "checkpoint-vs-epoll-long-retry-20261007-c128"
+  ],
+  "compiler_observations": {
+    "checkpoint-vs-epoll-20261007": 0,
+    "checkpoint-vs-epoll-c1-20261007": 0,
+    "checkpoint-vs-epoll-long-retry-20261007": 0
+  }
+}

@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/types.h"
+#include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/error.h"
 #include "rut/runtime/io_backend.h"
@@ -132,6 +133,7 @@ struct IoUringBackend {
         i32 file_fd = -1;
         u32 file_base = 0;
         bool shutdown_when_done = false;  // end the stream once every byte is out
+        BufferedSendVector* vector = nullptr;
     };
     MappedArray<SendState> send_state;
     MappedArray<SendState> upstream_send_state;
@@ -297,8 +299,13 @@ struct IoUringBackend {
     // any partial-send resubmission): the caller submits more of the same
     // stream from this send's completion.
     // Returns false if SQ is full (no SQE submitted).
-    bool add_send(
-        i32 fd, u32 conn_id, const u8* buf, u32 len, u32 generation = 0, bool more_follows = false);
+    bool add_send(i32 fd,
+                  u32 conn_id,
+                  const u8* buf,
+                  u32 len,
+                  u32 generation = 0,
+                  bool more_follows = false,
+                  BufferedSendVector* vector = nullptr);
 
     // Send `len` bytes of `file_fd` starting at `file_off` with sendfile(2):
     // page-cache pages go to the socket without a user-space copy. Writes
@@ -363,8 +370,14 @@ struct IoUringBackend {
     // Complete a downstream send the caller already started with a direct
     // write of `written` bytes: a NOP injecting `len` when all bytes were
     // written, else a Send of the remainder whose completion reports `len`.
-    bool add_send_after_direct_write(
-        i32 fd, u32 conn_id, const u8* buf, u32 len, u32 written, u32 generation);
+    bool add_send_after_direct_write(i32 fd,
+                                     u32 conn_id,
+                                     const u8* buf,
+                                     u32 len,
+                                     u32 written,
+                                     u32 generation,
+                                     BufferedSendVector* vector = nullptr,
+                                     u32 extra_flags = 0);
     bool add_send_upstream(i32 fd, u32 conn_id, const u8* buf, u32 len, u32 upstream_episode = 1);
 
     // Submit a connect to upstream.

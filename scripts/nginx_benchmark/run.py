@@ -52,7 +52,7 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def response_head(head, max_body=2048, native_streaming=False):
+def response_head(head, max_body=2048, native_streaming=False, close=False):
     if not head.startswith(b"HTTP/1.1 200 OK\r\n"):
         raise ValueError(f"unexpected status: {head[:100]!r}")
     headers = {}
@@ -71,7 +71,7 @@ def response_head(head, max_body=2048, native_streaming=False):
         if headers.get(b"content-type") != b"application/octet-stream":
             raise ValueError("native-streaming requires one application/octet-stream Content-Type")
         connection = headers.get(b"connection", b"").lower()
-        if connection not in (b"", b"keep-alive"):
+        if connection not in ((b"", b"keep-alive", b"close") if close else (b"", b"keep-alive")):
             raise ValueError("native-streaming response must preserve keepalive semantics")
     return int(length), headers.get(b"connection", b"").lower() == b"close"
 
@@ -92,10 +92,11 @@ def expected_body(work, body_size=None, native_streaming=False):
         # Distinct deterministic 4 KiB blocks expose truncation, duplication,
         # and reordering while remaining identical at nginx and Rut.
         blocks = []
-        for block in range(NATIVE_BODY_SIZE // 4096):
+        size = NATIVE_BODY_SIZE if body_size is None else body_size
+        for block in range((size + 4095) // 4096):
             prefix = block.to_bytes(4, "big")
             blocks.append(prefix + bytes(((block * 17 + i * 29) & 255) for i in range(4092)))
-        return b"".join(blocks)
+        return b"".join(blocks)[:size]
     if body_size is not None:
         return b"x" * body_size
     return b"hello from nginx" if work == "static" else b"x" * 1024
@@ -138,7 +139,7 @@ def response(sock, work, close, keepalive_header="explicit", body_size=None,
             raise ValueError("oversized response")
     head, body = data.split(b"\r\n\r\n", 1)
     wanted = expected_body(work, body_size, native_streaming)
-    length, server_close = response_head(head, len(wanted), native_streaming)
+    length, server_close = response_head(head, len(wanted), native_streaming, close)
     chunks = [body]
     received = len(body)
     while received < length:
@@ -225,8 +226,12 @@ class Harness:
         first_engine = getattr(a, "first_engine", "nginx")
         body_size = getattr(a, "body_size", None)
         native_streaming = getattr(a, "proxy_profile", "converter-strict") == "native-streaming"
+        origin_reuse = (native_streaming and getattr(a, "native_origin_reuse", "on") == "on") or (
+            getattr(a, "proxy_profile", "converter-strict") == "converter-bounded"
+            and getattr(a, "bounded_origin_reuse", "off") == "on"
+        )
         if native_streaming:
-            body_size = NATIVE_BODY_SIZE
+            body_size = NATIVE_BODY_SIZE if body_size is None else body_size
         if (getattr(a, "static_profile", "converter-return") == "converter-return"
                 and body_size is not None and body_size > STATIC_BODY_LIMIT
                 and any(scenario.startswith("static-") for scenario in a.scenarios)):
@@ -262,8 +267,9 @@ class Harness:
             "proxy_profile": {
                 "name": getattr(a, "proxy_profile", "converter-strict"),
                 "body_size": body_size,
-                "origin_keepalive": "enabled; 60s idle timeout" if native_streaming else "disabled",
-                "native_origin_reuse_observation": "conditional access log for marked preflight requests only" if native_streaming else None,
+                "origin_keepalive": "enabled; 60s idle timeout" if origin_reuse else "disabled",
+                "nginx_response_buffering": getattr(a, "native_nginx_buffering", "off") if native_streaming else "on",
+                "native_origin_reuse_observation": "conditional access log for marked preflight requests only" if native_streaming or origin_reuse else None,
                 "nginx_keepalive_requests": ({
                     "origin": 1000000000,
                     "upstream_idle_connection": 1000000000,
@@ -301,7 +307,7 @@ class Harness:
         if native_streaming:
             payloads = self.out / "payloads"
             payloads.mkdir()
-            (payloads / "proxy").write_bytes(expected_body("proxy", native_streaming=True))
+            (payloads / "proxy").write_bytes(expected_body("proxy", body_size, native_streaming=True))
             origin_location = ('location / { root /benchmark-payloads; default_type application/octet-stream; '
                                'etag off; max_ranges 0; add_header Last-Modified ""; }')
             origin_observation = ('map $http_x_rut_benchmark_preflight $benchmark_preflight { '
@@ -319,12 +325,16 @@ class Harness:
                                'etag off; max_ranges 0; add_header Last-Modified ""; }')
             origin_observation = ""
             origin_log = ""
-        if not native_streaming:
-            origin_observation = ""
-        origin_keepalive = "keepalive_timeout 60;" if native_streaming else "keepalive_timeout 0;"
+        if origin_reuse and not native_streaming:
+            origin_observation = ('map $http_x_rut_benchmark_preflight $benchmark_preflight { '
+                                  'default 0; ~.+ 1; }\n'
+                                  'log_format rut_preflight "marker=$http_x_rut_benchmark_preflight '
+                                  'connection=$connection requests=$connection_requests";\n')
+            origin_log = 'access_log /dev/stdout rut_preflight if=$benchmark_preflight;'
+        origin_keepalive = "keepalive_timeout 60;" if origin_reuse else "keepalive_timeout 0;"
         (self.out / "origin.conf").write_text(self.nginx_config(
             f"server {{ listen 127.0.0.1:{a.origin_port}; {origin_keepalive} "
-            f"{'keepalive_requests 1000000000;' if native_streaming else ''} {origin_log} {origin_location} }}",
+            f"{'keepalive_requests 1000000000;' if native_streaming or origin_reuse else ''} {origin_log} {origin_location} }}",
             extra_http=origin_observation, workers=1,
         ))
         works = sorted({scenario.split("-")[0] for scenario in a.scenarios})
@@ -367,13 +377,19 @@ class Harness:
                 # Rut's native frontend is streamed; nginx must use matching
                 # response streaming and origin idle reuse semantics.
                 upstream_name = "benchmark_origin"
+                buffering = getattr(a, "native_nginx_buffering", "off")
+                buffers = ('proxy_buffering on; proxy_buffer_size 16k; '
+                           'proxy_buffers 8 16k; proxy_busy_buffers_size 32k; '
+                           if buffering == "on" else
+                           'proxy_buffering off; proxy_buffer_size 16k; proxy_busy_buffers_size 16k; ')
                 nginx_server = (f'server {{ listen 127.0.0.1:{a.front_port}; keepalive_requests 1000000000; '
                                 f'location = /proxy {{ proxy_pass http://{upstream_name}; '
-                                'proxy_http_version 1.1; proxy_buffering off; proxy_buffer_size 16k; '
-                                'proxy_busy_buffers_size 16k; '
+                                'proxy_http_version 1.1; ' + buffers +
                                 'proxy_set_header Host $http_host; proxy_set_header Connection ""; } }')
+                pool = ('keepalive 4096; keepalive_timeout 60s; keepalive_requests 1000000000; '
+                        if origin_reuse else 'keepalive 0; ')
                 nginx_http = (f'upstream {upstream_name} {{ server 127.0.0.1:{a.origin_port}; '
-                              'keepalive 4096; keepalive_timeout 60s; keepalive_requests 1000000000; }\n')
+                              + pool + '}\n')
                 if self.tls_context:
                     nginx_server = nginx_server.replace(
                         f"listen 127.0.0.1:{a.front_port};",
@@ -403,6 +419,15 @@ class Harness:
                     "proxy_buffer_size 16k; proxy_buffers 8 16k; "
                     "proxy_busy_buffers_size 32k;",
                 )
+            nginx_http = ""
+            if origin_reuse and work == "proxy":
+                nginx_http = (f"upstream benchmark_bounded_backend {{ server 127.0.0.1:{a.origin_port}; "
+                              "keepalive 4096; keepalive_timeout 60s; keepalive_requests 1000000000; }\n")
+                nginx_fragment = nginx_fragment.replace(
+                    f"proxy_pass http://127.0.0.1:{a.origin_port};",
+                    'proxy_pass http://benchmark_bounded_backend; '
+                    'proxy_http_version 1.1; proxy_set_header Connection "";',
+                )
             if self.tls_context:
                 nginx_fragment = nginx_fragment.replace(
                     f"listen 127.0.0.1:{a.front_port};",
@@ -411,9 +436,15 @@ class Harness:
                     "ssl_protocols TLSv1.3; ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; "
                     "ssl_ecdh_curve X25519; ssl_session_cache off;",
                 )
-            (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(nginx_fragment, workers=self.args.workers))
+            (self.out / (work + "-nginx.conf")).write_text(self.nginx_config(nginx_fragment, extra_http=nginx_http, workers=self.args.workers))
             converted = self.command([a.converter, "--format", "server", source])
             program = converted.stdout
+            if getattr(a, "proxy_profile", "converter-strict") == "converter-bounded":
+                (self.out / (work + ".converted.rut")).write_text(program)
+                marker = "response_buffering: .completeContentLength"
+                if marker not in program:
+                    raise ValueError("converter-bounded requires an explicit completeContentLength policy")
+                program = program.replace(marker, "response_buffering: .bounded")
             if self.tls_context:
                 # Source listeners currently describe cleartext only. Preserve
                 # converter stdout, then select the existing CLI TLS listener.
@@ -563,14 +594,20 @@ class Harness:
     def validate(self, work, keepalive):
         native_streaming = getattr(self.args, "proxy_profile", "converter-strict") == "native-streaming"
         if native_streaming:
-            self.validate_native_keepalive(work)
+            self.validate_native_close(work)
+            if keepalive:
+                self.validate_native_keepalive(work)
             return
         requests = preflight_request_count(len(expected_body(work, getattr(self.args, "body_size", None))))
         save_json(self.out / f"{self.active_label}-preflight.json", {
             "requests_per_connection_mode": requests, "full_body_comparison": True,
             "connection_modes": ["close", "keepalive"] if keepalive else ["close"],
         })
+        bounded_reuse = (getattr(self.args, "proxy_profile", "converter-strict") == "converter-bounded"
+                         and getattr(self.args, "bounded_origin_reuse", "off") == "on" and work == "proxy")
         for close in [True, False] if keepalive else [True]:
+            markers = [f"{self.active_label}-{'close' if close else 'keepalive'}-{i}"
+                       for i in range(requests)] if bounded_reuse else []
             sock = None
             try:
                 for _ in range(requests):
@@ -590,7 +627,7 @@ class Harness:
                         sock, work, close, self.args.keepalive_header,
                         getattr(self.args, "body_size", None),
                         False,
-                        None,
+                        markers[_] if bounded_reuse else None,
                     )
                     comparison = canonical_native_static_response(raw) if (
                         work == "static" and getattr(self.args, "static_profile", "converter-return") == "native-body"
@@ -613,6 +650,18 @@ class Harness:
             finally:
                 if sock is not None:
                     sock.close()
+            if bounded_reuse:
+                # Unlike the native profile, bounded completion can pool across
+                # fresh downstream sockets too. Require origin-side proof for both.
+                self.verify_origin_reuse(markers)
+
+    def validate_native_close(self, work):
+        markers = [f"{self.active_label}-close-{i}" for i in range(3)]
+        for index, marker in enumerate(markers):
+            with self.open_preflight_socket() as sock:
+                raw, _ = response(sock, work, True, "implicit", self.args.body_size, True, marker)
+                self.save_native_response(f"close-{index}", raw)
+        self.verify_origin_reuse(markers, fresh_downstream=True)
 
     def validate_native_keepalive(self, work):
         sock = None
@@ -621,7 +670,7 @@ class Harness:
             slow_markers = [f"{self.active_label}-slow-{i}" for i in range(2)]
             self.slow_read_response(sock, work, slow_markers[0])
             raw, server_close = response(
-                sock, work, False, "implicit", NATIVE_BODY_SIZE, True, slow_markers[1]
+                sock, work, False, "implicit", self.args.body_size, True, slow_markers[1]
             )
             if server_close:
                 raise ValueError("native slow-read preflight closed before successor response")
@@ -632,7 +681,7 @@ class Harness:
             request_evidence = []
             for index, marker in enumerate(markers):
                 raw, server_close = response(
-                    sock, work, False, "implicit", NATIVE_BODY_SIZE, True, marker
+                    sock, work, False, "implicit", self.args.body_size, True, marker
                 )
                 if server_close:
                     raise ValueError("native keepalive preflight closed before 100 responses")
@@ -691,10 +740,10 @@ class Harness:
             head, body = data.split(b"\r\n\r\n", 1)
             if body:
                 events.append({"phase": "body-prefetch", "bytes": len(body), "elapsed_seconds": time.monotonic() - started})
-            wanted = expected_body(work, native_streaming=True)
+            wanted = expected_body(work, self.args.body_size, native_streaming=True)
             length, server_close = response_head(head, len(wanted), native_streaming=True)
             declared_body_bytes = length
-            if length != NATIVE_BODY_SIZE or server_close:
+            if length != len(wanted) or server_close:
                 raise ValueError("slow-read response has invalid length or closes keepalive")
             time.sleep(0.2)
             while len(body) < length:
@@ -734,7 +783,7 @@ class Harness:
                 "exception_category": type(error).__name__,
                 "exception": repr(error),
                 "elapsed_seconds": time.monotonic() - started,
-                "expected_body_bytes": NATIVE_BODY_SIZE,
+                "expected_body_bytes": self.args.body_size,
                 "declared_response_body_bytes": declared_body_bytes,
                 "received_body_bytes": len(body),
                 "received_wire_bytes": len(received),
@@ -747,12 +796,26 @@ class Harness:
             # Preserve the original preflight failure if evidence storage fails.
             pass
 
-    def verify_origin_reuse(self, expected_markers):
+    def verify_origin_reuse(self, expected_markers, fresh_downstream=False):
         logs = self.command(["docker", "logs", getattr(self, "origin_container_id", "")]).stdout
         marker_prefix = expected_markers[0].rsplit("-", 1)[0]
         (self.out / f"{marker_prefix}-origin-reuse.log").write_text(logs)
         records = origin_reuse_records(logs, expected_markers)
-        if not valid_origin_reuse(records, expected_markers):
+        reuse = (getattr(self.args, "native_origin_reuse", "on") == "on"
+                 if getattr(self.args, "proxy_profile", "converter-strict") == "native-streaming"
+                 else getattr(self.args, "bounded_origin_reuse", "off") == "on")
+        if not reuse:
+            valid = (len(records) == len(expected_markers)
+                     and [row[0] for row in records] == expected_markers
+                     and len({row[1] for row in records}) == len(records)
+                     and all(row[1] > 0 and row[2] == 1 for row in records))
+        elif fresh_downstream:
+            # A native Rut downstream close also closes its origin; nginx may
+            # pool that origin. Only the persistent stage promises reuse.
+            valid = len(records) == len(expected_markers) and [row[0] for row in records] == expected_markers
+        else:
+            valid = valid_origin_reuse(records, expected_markers)
+        if not valid:
             raise ValueError(f"origin reuse preflight failed for markers {expected_markers!r}: got {records!r}")
 
     def wrk(self, work, close, concurrency, duration, label):
@@ -1004,17 +1067,23 @@ def valid_origin_reuse(records, expected_markers):
 
 
 def validate_proxy_profile(parser, args):
+    if getattr(args, "bounded_origin_reuse", "off") == "on":
+        if (args.proxy_profile != "converter-bounded" or getattr(args, "tls_cert", None)
+                or not args.scenarios
+                or any(value not in ("proxy-close", "proxy-keepalive") for value in args.scenarios)):
+            parser.error("bounded origin reuse requires converter-bounded plaintext proxy scenarios")
     if args.proxy_profile != "native-streaming":
         return
-    if args.body_size not in (None, NATIVE_BODY_SIZE):
-        parser.error("native-streaming requires a 256 KiB response")
-    if args.scenarios != ["proxy-keepalive"]:
-        parser.error("native-streaming supports only proxy-keepalive")
-    if not args.concurrency or any(value not in (1, 32) for value in args.concurrency):
-        parser.error("native-streaming supports only concurrency values 1 and 32")
+    if args.body_size is not None and not 1 <= args.body_size <= 1048576:
+        parser.error("native-streaming requires a body between 1 byte and 1 MiB")
+    if not args.scenarios or any(value not in ("proxy-close", "proxy-keepalive") for value in args.scenarios):
+        parser.error("native-streaming supports only proxy-close and proxy-keepalive")
+    if not args.concurrency or any(value not in (1, 32, 128) for value in args.concurrency):
+        parser.error("native-streaming supports only concurrency values 1, 32 and 128")
     if args.keepalive_header != "implicit":
         parser.error("native-streaming requires --keepalive-header implicit")
-    args.body_size = NATIVE_BODY_SIZE
+    if args.body_size is None:
+        args.body_size = NATIVE_BODY_SIZE
 
 
 def add_measurement_arguments(parser, full_duration):
@@ -1121,8 +1190,14 @@ def arguments():
     parser.add_argument("--body-size", type=positive, help="exact response body bytes (max 1 MiB); omitted preserves legacy bodies")
     parser.add_argument("--static-profile", choices=("converter-return", "native-body"),
                         default="converter-return", help="native-body compares a pinned Rut body with an nginx static file; separate from converter acceptance")
-    parser.add_argument("--proxy-profile", choices=("converter-strict", "native-streaming"),
+    parser.add_argument("--proxy-profile", choices=("converter-strict", "converter-bounded", "native-streaming"),
                         default="converter-strict", help="proxy implementation profile; default preserves converter behavior")
+    parser.add_argument("--native-origin-reuse", choices=("on", "off"), default="on",
+                        help="native-streaming origin reuse; off isolates response forwarding from connection pooling")
+    parser.add_argument("--bounded-origin-reuse", choices=("on", "off"), default="off",
+                        help="converter-bounded origin reuse; requires origin connection-ID preflight proof")
+    parser.add_argument("--native-nginx-buffering", choices=("on", "off"), default="off",
+                        help="native-streaming nginx response buffering; on uses eight 16 KiB buffers")
     parser.add_argument("--tls-cert", type=Path, help="PEM certificate with localhost SAN; enables HTTPS")
     parser.add_argument("--tls-key", type=Path)
     parser.add_argument("--front-port", type=int, default=8087)

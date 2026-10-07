@@ -1,0 +1,146 @@
+[
+  {
+    "concurrency": 128,
+    "sample": "control-a",
+    "log": "proxy-keepalive-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=67818 attempts=0 progress=0 full=0",
+      "RUT_BULK_CACHE_STUDY enabled=0 peak_borrowed=242 peak_cached=64 borrowed=0 cached=64"
+    ]
+  },
+  {
+    "concurrency": 128,
+    "sample": "control-a",
+    "log": "proxy-close-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=62518 attempts=0 progress=0 full=0",
+      "RUT_BULK_CACHE_STUDY enabled=0 peak_borrowed=293 peak_cached=64 borrowed=0 cached=64"
+    ]
+  },
+  {
+    "concurrency": 128,
+    "sample": "both-a",
+    "log": "proxy-keepalive-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=68954 attempts=26 progress=26 full=26",
+      "RUT_BULK_CACHE_STUDY enabled=1 peak_borrowed=228 peak_cached=128 borrowed=0 cached=128"
+    ]
+  },
+  {
+    "concurrency": 128,
+    "sample": "both-a",
+    "log": "proxy-close-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=61283 attempts=202559 progress=202522 full=202522",
+      "RUT_BULK_CACHE_STUDY enabled=1 peak_borrowed=278 peak_cached=128 borrowed=0 cached=128"
+    ]
+  },
+  {
+    "concurrency": 128,
+    "sample": "both-b",
+    "log": "proxy-keepalive-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=68609 attempts=18 progress=18 full=18",
+      "RUT_BULK_CACHE_STUDY enabled=1 peak_borrowed=246 peak_cached=128 borrowed=0 cached=128"
+    ]
+  },
+  {
+    "concurrency": 128,
+    "sample": "both-b",
+    "log": "proxy-close-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=60272 attempts=199077 progress=199013 full=199013",
+      "RUT_BULK_CACHE_STUDY enabled=1 peak_borrowed=259 peak_cached=128 borrowed=0 cached=128"
+    ]
+  },
+  {
+    "concurrency": 128,
+    "sample": "control-b",
+    "log": "proxy-keepalive-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=68003 attempts=0 progress=0 full=0",
+      "RUT_BULK_CACHE_STUDY enabled=0 peak_borrowed=255 peak_cached=64 borrowed=0 cached=64"
+    ]
+  },
+  {
+    "concurrency": 128,
+    "sample": "control-b",
+    "log": "proxy-close-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=62964 attempts=0 progress=0 full=0",
+      "RUT_BULK_CACHE_STUDY enabled=0 peak_borrowed=327 peak_cached=64 borrowed=0 cached=64"
+    ]
+  },
+  {
+    "concurrency": 1,
+    "sample": "control-a",
+    "log": "proxy-keepalive-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=41809 attempts=0 progress=0 full=0",
+      "RUT_BULK_CACHE_STUDY enabled=0 peak_borrowed=3 peak_cached=3 borrowed=0 cached=3"
+    ]
+  },
+  {
+    "concurrency": 1,
+    "sample": "control-a",
+    "log": "proxy-close-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=36934 attempts=0 progress=0 full=0",
+      "RUT_BULK_CACHE_STUDY enabled=0 peak_borrowed=3 peak_cached=3 borrowed=0 cached=3"
+    ]
+  },
+  {
+    "concurrency": 1,
+    "sample": "both-a",
+    "log": "proxy-keepalive-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=42084 attempts=19 progress=19 full=19",
+      "RUT_BULK_CACHE_STUDY enabled=1 peak_borrowed=3 peak_cached=3 borrowed=0 cached=3"
+    ]
+  },
+  {
+    "concurrency": 1,
+    "sample": "both-a",
+    "log": "proxy-close-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=37999 attempts=325715 progress=325715 full=325715",
+      "RUT_BULK_CACHE_STUDY enabled=1 peak_borrowed=3 peak_cached=3 borrowed=0 cached=3"
+    ]
+  },
+  {
+    "concurrency": 1,
+    "sample": "both-b",
+    "log": "proxy-keepalive-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=42097 attempts=16 progress=16 full=16",
+      "RUT_BULK_CACHE_STUDY enabled=1 peak_borrowed=3 peak_cached=3 borrowed=0 cached=3"
+    ]
+  },
+  {
+    "concurrency": 1,
+    "sample": "both-b",
+    "log": "proxy-close-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=37612 attempts=324062 progress=324062 full=324062",
+      "RUT_BULK_CACHE_STUDY enabled=1 peak_borrowed=3 peak_cached=3 borrowed=0 cached=3"
+    ]
+  },
+  {
+    "concurrency": 1,
+    "sample": "control-b",
+    "log": "proxy-keepalive-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=42123 attempts=0 progress=0 full=0",
+      "RUT_BULK_CACHE_STUDY enabled=0 peak_borrowed=3 peak_cached=3 borrowed=0 cached=3"
+    ]
+  },
+  {
+    "concurrency": 1,
+    "sample": "control-b",
+    "log": "proxy-close-rut-r1-server.log",
+    "lines": [
+      "RUT_DIRECT_BODY_STUDY completed=37224 attempts=0 progress=0 full=0",
+      "RUT_BULK_CACHE_STUDY enabled=0 peak_borrowed=3 peak_cached=3 borrowed=0 cached=3"
+    ]
+  }
+]

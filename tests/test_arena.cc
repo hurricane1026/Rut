@@ -870,6 +870,239 @@ TEST(slice_arena, multiple_arenas_same_pool) {
     pc.destroy();
 }
 
+TEST(slice_pool, study_adaptive_bulk_cache_shrinks_only_unborrowed_idle_slots) {
+    SlicePool pool;
+    REQUIRE(pool.init(8, 0, 0, 128).has_value());
+    pool.study_adaptive_cache = true;
+    u8* loans[128];
+    for (u32 i = 0; i != 128; ++i) {
+        loans[i] = pool.alloc_bulk();
+        REQUIRE(loans[i] != nullptr);
+        __builtin_memset(loans[i], 0x6D, 4096);
+    }
+    CHECK_EQ(pool.study_bulk_borrowed, 128u);
+    CHECK(pool.study_bulk_burst);
+    for (u32 i = 0; i != 128; ++i) pool.free_written(loans[i], 4096);
+    CHECK_EQ(pool.bulk_cached_count, 128u);
+    u8* held = pool.alloc_bulk();
+    REQUIRE(held != nullptr);
+    pool.study_trim_bulk_idle_cache();
+    CHECK_EQ(pool.bulk_cached_count, 127u);
+    pool.free_written(held, 0);
+    for (u32 i = 0; i != 8; ++i) {
+        pool.study_trim_bulk_idle_cache();
+        CHECK_EQ(pool.bulk_cached_count, 128u - 8u * (i + 1));
+    }
+    CHECK(!pool.study_bulk_burst);
+    CHECK_EQ(pool.study_bulk_borrowed, 0u);
+    for (u32 i = 0; i != 128; ++i) {
+        loans[i] = pool.alloc_bulk();
+        REQUIRE(loans[i] != nullptr);
+        for (u32 j = 0; j != 4096; ++j) CHECK_EQ(loans[i][j], 0u);
+        for (u32 j = 0; j != i; ++j) CHECK(loans[i] != loans[j]);
+    }
+    for (u32 i = 0; i != 128; ++i) pool.free_written(loans[i], 0);
+    for (u32 i = 0; i != 8; ++i) pool.study_trim_bulk_idle_cache();
+    CHECK_EQ(pool.bulk_cached_count, 64u);
+    pool.destroy();
+}
+
+TEST(response_body_chain, private_dirty_prefix_preserves_public_zero) {
+    SlicePool pool;
+    pool.study_body_pool_reuse = true;
+    REQUIRE(pool.init(8, 0, 0, 2).has_value());
+    ResponseBodyChain chain;
+    REQUIRE(chain.reserve_tail(pool, 0));
+    const u32 capacity = ResponseBodyChain::payload_capacity(pool, chain.tail);
+    CHECK_EQ(capacity + ResponseBodyChain::header_size(), SlicePool::kBulkSliceSize);
+    __builtin_memset(chain.write_ptr(pool), 0x6D, capacity);
+    chain.commit(capacity);
+    CHECK_EQ(chain.front_size(), capacity);
+    chain.release();
+    REQUIRE(chain.reserve_tail(pool, 0));
+    __builtin_memset(chain.write_ptr(pool), 0x31, 1024);
+    chain.commit(1024);
+    CHECK_EQ(chain.front_size(), 1024u);
+    CHECK(chain.tail->dirty_end >= capacity);
+    chain.release();
+    u8* ordinary = pool.alloc_bulk();
+    REQUIRE(ordinary != nullptr);
+    for (u32 i = 0; i != SlicePool::kBulkSliceSize; ++i) CHECK_EQ(ordinary[i], 0u);
+    pool.free(ordinary);
+    pool.destroy();
+}
+
+TEST(response_body_chain, response_owned_bulk_reuse_preserves_dirty_high_water) {
+    SlicePool pool;
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, 1).has_value());
+    ResponseBodyChain chain;
+    REQUIRE(chain.reserve_tail(pool, 0));
+    u8* const raw = reinterpret_cast<u8*>(chain.tail);
+    u8* const bytes = chain.write_ptr(pool);
+    constexpr u32 kOld = 200 * 1024;
+    __builtin_memset(bytes, 0x5a, kOld);
+    chain.commit(kOld);
+    chain.consume(kOld, false, true);
+    CHECK_EQ(chain.size, 0u);
+    CHECK_EQ(chain.head, nullptr);
+    CHECK_EQ(reinterpret_cast<u8*>(chain.recycled), raw);
+    CHECK_EQ(pool.bulk_available(), 0u);
+    REQUIRE(chain.reserve_tail(pool, 0));
+    CHECK_EQ(reinterpret_cast<u8*>(chain.tail), raw);
+    CHECK_EQ(chain.front_size(), 0u);
+    CHECK_EQ(chain.recycled, nullptr);
+    __builtin_memset(chain.write_ptr(pool), 0x3c, 4096);
+    REQUIRE(chain.record_direct_write(chain.tail, chain.write_ptr(pool), 4096, pool));
+    chain.commit(128);
+    chain.release();
+    CHECK_EQ(pool.bulk_available(), 1u);
+    u8* reused = pool.alloc_bulk();
+    REQUIRE_EQ(reused, raw);
+    bool zero = true;
+    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) zero &= reused[i] == 0;
+    CHECK(zero);
+    pool.free(reused);
+    pool.destroy();
+}
+
+TEST(response_body_chain, pinned_tail_is_not_recycled_before_recv_settles) {
+    SlicePool pool;
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, 1).has_value());
+    ResponseBodyChain chain;
+    REQUIRE(chain.reserve_tail(pool, 0));
+    __builtin_memset(chain.write_ptr(pool), 0x5a, 128);
+    chain.commit(128);
+    auto* const node = chain.tail;
+    chain.consume(128, true, true);
+    CHECK_EQ(chain.head, node);
+    CHECK_EQ(chain.recycled, nullptr);
+    CHECK_EQ(chain.front_size(), 0u);
+    __builtin_memset(chain.write_ptr(pool), 0x3c, 16);
+    REQUIRE(chain.record_direct_write(node, chain.write_ptr(pool), 16, pool));
+    chain.commit(16);
+    chain.consume(16, false, true);
+    CHECK_EQ(chain.recycled, node);
+    CHECK_EQ(chain.head, nullptr);
+    CHECK_EQ(pool.bulk_available(), 0u);
+    chain.release_recycled();
+    CHECK_EQ(pool.bulk_available(), 1u);
+    CHECK_EQ(chain.owner, nullptr);
+    chain.release();
+    pool.destroy();
+}
+
+TEST(response_body_chain, body_cache_reuse_exposes_only_the_new_prefix) {
+    SlicePool pool;
+    pool.study_body_pool_reuse = true;
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, 1).has_value());
+    ResponseBodyChain first;
+    REQUIRE(first.reserve_tail(pool, 0));
+    u8* const raw = reinterpret_cast<u8*>(first.tail);
+    constexpr u32 old_bytes = 128 * 1024;
+    __builtin_memset(first.write_ptr(pool), 0xa5, old_bytes);
+    first.commit(old_bytes);
+    first.release();
+    CHECK_EQ(pool.bulk_cached_count, 1u);
+
+    ResponseBodyChain next;
+    REQUIRE(next.reserve_tail(pool, 0));
+    CHECK_EQ(reinterpret_cast<u8*>(next.tail), raw);
+    CHECK_EQ(next.size, 0u);
+    CHECK_EQ(next.front_size(), 0u);
+    CHECK_EQ(next.tail->dirty_end, old_bytes);
+    // Writable, uncommitted bytes may still contain the previous response.
+    CHECK_EQ(next.write_ptr(pool)[old_bytes - 1], 0xa5);
+    __builtin_memset(next.write_ptr(pool), 0x3c, 7);
+    next.commit(7);
+    CHECK_EQ(next.front_size(), 7u);
+    for (u32 i = 0; i < next.front_size(); ++i) CHECK_EQ(next.data()[i], 0x3c);
+    __builtin_memset(next.write_ptr(pool), 0x19, 11);
+    REQUIRE(next.record_direct_write(next.tail, next.write_ptr(pool), 11, pool));
+    next.release();
+
+    u8* const ordinary = pool.alloc_bulk();
+    REQUIRE_EQ(ordinary, raw);
+    bool zero = true;
+    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) zero &= ordinary[i] == 0;
+    CHECK(zero);
+    pool.free(ordinary);
+    pool.destroy();
+}
+
+TEST(response_body_chain, dirty_body_append_rollback_preserves_the_full_old_high_water) {
+    SlicePool pool;
+    pool.study_body_pool_reuse = true;
+    REQUIRE(pool.init(1, 0, SlicePool::kMaxCachedSlices, 1).has_value());
+    ResponseBodyChain previous;
+    REQUIRE(previous.reserve_tail(pool, 0));
+    __builtin_memset(previous.write_ptr(pool), 0x5a, 200 * 1024);
+    previous.commit(200 * 1024);
+    previous.release();
+    static u8 oversized[512 * 1024]{};
+    ResponseBodyChain failed;
+    CHECK_FALSE(failed.append(pool, oversized, sizeof(oversized), 0));
+    CHECK_EQ(failed.head, nullptr);
+    CHECK_EQ(failed.size, 0u);
+    CHECK_EQ(pool.bulk_available(), 1u);
+    u8* const ordinary = pool.alloc_bulk();
+    REQUIRE(ordinary != nullptr);
+    bool zero = true;
+    for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) zero &= ordinary[i] == 0;
+    CHECK(zero);
+    pool.free(ordinary);
+    pool.destroy();
+}
+
+TEST(response_body_chain, body_cache_keeps_the_existing_idle_budget_and_index_bitmap) {
+    constexpr u32 count = SlicePool::kMaxCachedBulk + 1;
+    SlicePool pool;
+    pool.study_body_pool_reuse = true;
+    REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, count).has_value());
+    ResponseBodyChain chains[count];
+    for (u32 i = 0; i < count; ++i) {
+        REQUIRE(chains[i].reserve_tail(pool, 0));
+        __builtin_memset(chains[i].write_ptr(pool), 0xa5, 37);
+        chains[i].commit(37);
+    }
+    for (auto& chain : chains) chain.release();
+    CHECK_EQ(pool.bulk_available(), count);
+    CHECK_EQ(pool.bulk_cached_count, SlicePool::kMaxCachedBulk);
+    u8* borrowed[count];
+    for (u32 i = 0; i < count; ++i) {
+        borrowed[i] = pool.alloc_bulk();
+        REQUIRE(borrowed[i] != nullptr);
+        for (u32 j = 0; j < 128; ++j) CHECK_EQ(borrowed[i][j], 0u);
+    }
+    CHECK_EQ(pool.bulk_available(), 0u);
+    CHECK_EQ(pool.bulk_cached_count, 0u);
+    for (auto* block : borrowed) pool.free(block);
+    CHECK_EQ(pool.bulk_cached_count, SlicePool::kMaxCachedBulk);
+    pool.destroy();
+}
+
+TEST(response_body_chain, malformed_body_cache_marker_scrubs_the_entire_ordinary_loan) {
+    constexpr u32 markers[] = {0u, SlicePool::kBulkSliceSize + 1u};
+    for (const u32 marker : markers) {
+        SlicePool pool;
+        pool.study_body_pool_reuse = true;
+        REQUIRE(pool.init(4, 0, SlicePool::kMaxCachedSlices, 1).has_value());
+        ResponseBodyChain chain;
+        REQUIRE(chain.reserve_tail(pool, 0));
+        u8* const raw = reinterpret_cast<u8*>(chain.tail);
+        __builtin_memset(chain.write_ptr(pool), 0x5a, chain.write_avail(pool));
+        chain.commit(chain.write_avail(pool));
+        chain.release();
+        __builtin_memcpy(raw, &marker, sizeof(marker));
+        u8* const ordinary = pool.alloc_bulk();
+        REQUIRE_EQ(ordinary, raw);
+        bool zero = true;
+        for (u32 i = 0; i < SlicePool::kBulkSliceSize; ++i) zero &= ordinary[i] == 0;
+        CHECK(zero);
+        pool.free(ordinary);
+        pool.destroy();
+    }
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

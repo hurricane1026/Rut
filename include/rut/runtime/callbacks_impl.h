@@ -32,7 +32,6 @@
 #include <unistd.h>
 
 namespace rut {
-
 // --- Upstream backend selection + passive health (circuit breaking) ---
 //
 // Shards are share-nothing — one OS thread each — so per-shard state lives in
@@ -1997,7 +1996,8 @@ bool retry_reused_upstream(Loop* loop, Connection& conn) {
     if (!conn.upstream_reused) return false;
     // Paired strict HEAD failures are a one-shot connect-establishment
     // contract; never replay a request from a pooled socket under that policy.
-    if (conn.failure_policy_suppress_body) {
+    if (conn.failure_policy_suppress_body ||
+        conn.response_read_deadline_state != ResponseReadDeadlineState::None) {
         conn.upstream_reused = false;
         return false;
     }
@@ -4723,24 +4723,24 @@ void handle_jit_outcome(Loop* loop,
             // path, JIT forward(...) completions would deposit idle fds the pool never
             // hands back. On a miss, connect fresh.
             //
-            // A strict-response-policy body upload (`request_policy_body_response_domain`)
-            // is never eligible for a pooled/reused socket: `strict_response_upload_ready`
-            // requires `!conn.upstream_reused` before it will publish the strict response,
-            // since a reused socket's prior traffic is not ownership evidence for this
-            // upload. Establishing that safely for a reused socket is a separate change;
-            // until then, always pay the fresh-connect cost for this combination rather
-            // than admit a request that can never produce a response.
+            // Strict uploads still require a fresh origin episode. The bounded,
+            // bodyless plaintext GET exception retains the exact request write
+            // and deadline ownership proofs while borrowing a settled idle fd.
             if constexpr (requires {
                               loop->reuse_idle_upstream(conn,
                                                         static_cast<u16>(outcome.upstream_id),
                                                         static_cast<u8>(kBackend));
                           }) {
-                if (conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
+                if ((conn.response_read_deadline_state == ResponseReadDeadlineState::None ||
+                     (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated &&
+                      bounded_get_upstream_reuse_is_admitted(conn))) &&
                     !conn.failure_policy_suppress_body &&
-                    !(conn.response_policy_id != 0 && request_policy_body_response_domain(conn)) &&
+                    !(conn.response_policy_id != 0 && request_policy_body_response_domain(conn) &&
+                      !bounded_get_upstream_reuse_is_admitted(conn)) &&
                     loop->reuse_idle_upstream(
                         conn, static_cast<u16>(outcome.upstream_id), static_cast<u8>(kBackend))) {
                     conn.upstream_reused = true;
+                    conn.set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
                     if constexpr (requires {
                                       loop->timer.refresh(&conn, loop->upstream_timeout);
                                   }) {
@@ -5092,8 +5092,9 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         if (conn.state != ConnState::Proxying || conn.req_start_us == 0 || conn.epoch_held ||
             loop->is_draining() || conn.is_health_probe || conn.pending_handler_fn != nullptr ||
             conn.yield_armed || conn.yield_timeout_armed || conn.throttle_paused ||
-            conn.upstream_abandoned || conn.upstream_reused || !conn.request_upload_complete ||
-            conn.upstream_request_incomplete || conn.proxy_resp_started || conn.resp_status != 0 ||
+            conn.upstream_abandoned || !response_read_deadline_upstream_reuse_is_stable(conn) ||
+            !conn.request_upload_complete || conn.upstream_request_incomplete ||
+            conn.proxy_resp_started || conn.resp_status != 0 ||
             conn.resp_body_mode != BodyMode::None || conn.resp_body_remaining != 0 ||
             conn.resp_body_sent != 0 || conn.upstream_send_len != 0 || conn.send_progress != 0 ||
             conn.send_armed || conn.on_send != nullptr || !recv_slot_stable ||
@@ -5213,6 +5214,10 @@ inline bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn) {
         // and retained proof before entering the existing D1/D2 path.
         if (explicit_deadline_expiry) {
             if (retained_positive_progress) conn.upstream_recv_buf.reset();
+            // Reuse was admitted under the live bounded GET proof. The timeout
+            // consumes that proof and closes the origin through D1/D2; no retry
+            // or pool return may survive into the prebuilt response owner.
+            if (bounded_get_upstream_reuse_is_admitted(conn)) conn.upstream_reused = false;
             loop->disarm_response_read_deadline(conn);
         }
 
@@ -7767,7 +7772,7 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                conn.response_read_deadline_upload.raw_total_length != 0) {
         auto& proof = conn.response_read_deadline_upload;
         proof.upload_episode = conn.upstream_episode;
-        if (conn.upstream_reused || conn.upstream_attempts != 1 ||
+        if (!response_read_deadline_upstream_reuse_is_stable(conn) || conn.upstream_attempts != 1 ||
             conn.upstream_recv_buf.len() != 0 || conn.upstream_recv_armed ||
             conn.request_upload_complete || req_src != conn.recv_buf.data() ||
             req_send_len != proof.expected_upload_length ||
@@ -8138,7 +8143,9 @@ void on_upstream_request_sent(void* lp, Connection& conn, IoEvent ev) {
         // Guarded on upstream_reused so a fresh non-reused connect doesn't re-copy.
         if (response_mutation_snapshot) {
             reserve_response_mutation_snapshot(conn);
-        } else if (conn.upstream_reused && request_resendable_from_recv_buf(conn) &&
+        } else if (conn.upstream_reused &&
+                   conn.response_read_deadline_state == ResponseReadDeadlineState::None &&
+                   request_resendable_from_recv_buf(conn) &&
                    conn.recv_buf.len() <= conn.send_buf.capacity()) {
             conn.send_buf.reset();
             conn.send_buf.write(conn.recv_buf.data(), conn.req_initial_send_len);
@@ -8895,6 +8902,28 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
         loop->close_conn(conn);
         return;
     }
+    conn.response_body_tail.consume(0, conn.chain_direct_recv_owner.active);
+    if (conn.response_read_deadline_post_commit_terminal_pending) {
+        if (conn.upstream_recv_armed || conn.upstream_recv_pause_cancel_pending ||
+            conn.upstream_recv_cancel_inflight || conn.upstream_recv_pause_rearm_pending ||
+            conn.upstream_recv_paused_for_send || !conn.response_read_timer_owner_is_neutral())
+            return;
+        if constexpr (requires(Loop* candidate, Connection& c, u32 target) {
+                          candidate->finish_bounded_content_length_release(c, target, true, false);
+                      }) {
+            if (!loop->finish_bounded_content_length_release(
+                    conn,
+                    conn.response_read_deadline_post_commit_release_target,
+                    conn.response_read_deadline_post_commit_close_after_drain,
+                    /*schedule_body_pump=*/false)) {
+                loop->close_conn(conn);
+                return;
+            }
+        } else {
+            loop->close_conn(conn);
+            return;
+        }
+    }
     const u32 received = conn.response_read_deadline_post_commit_origin_received;
     const u32 completed = conn.response_read_deadline_post_commit_downstream_completed;
     if (completed > received || conn.buffered_response_len() != received - completed) {
@@ -8904,15 +8933,38 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     const bool complete_buffering = forward_response_buffering_uses_content_length_machinery(
         conn.response_read_deadline_buffering);
     const u32 publish_body =
-        complete_buffering ? conn.response_read_deadline_post_commit_send_body : received;
+        conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded
+            ? conn.response_read_deadline_post_commit_release_target
+        : complete_buffering ? conn.response_read_deadline_post_commit_send_body
+                             : received;
     if (publish_body > received || completed > publish_body) {
         loop->close_conn(conn);
         return;
     }
     const u32 remaining = publish_body - completed;
-    const u32 front = conn.buffered_response_front_size();
+    u32 front = conn.buffered_response_front_size();
+    // Study: combine complete already-published nodes up to a byte budget.
+    // Never wait for a node or clip the next one just to fill a vector.
+    static const bool study_gather = [] {
+        if constexpr (requires { Loop::supports_buffered_send_vector(); })
+            return ::getenv("RUT_STUDY_SELECTIVE_VECTOR") != nullptr;
+        return false;
+    }();
+    if (study_gather && !conn.tls_active && conn.response_body_tail.head &&
+        conn.response_body_tail.head->next && conn.upstream_recv_buf.len() == 0) {
+        const auto* next = conn.response_body_tail.head->next;
+        const u32 next_len = next->len - next->offset;
+        if (next_len >= 32 * 1024) {
+            const u32 combined = conn.buffered_response_send_span_size();
+            if (combined <= remaining && combined <= 512 * 1024) front = combined;
+        }
+    }
     const u32 available = remaining < front ? remaining : front;
     if (available == 0) {
+        if (conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+            !conn.response_read_deadline_post_commit_close_after_drain &&
+            received < conn.response_read_deadline_post_commit_declared_body)
+            return;
         const bool combined_send_marker =
             conn.response_read_deadline_send_kind == ResponseReadDeadlineSendKind::Combined ||
             conn.on_send == &on_complete_response_sent<Loop>;
@@ -8962,7 +9014,10 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
                 conn.response_read_deadline_post_commit_downstream_completed == publish_body &&
                 conn.response_read_deadline_post_commit_inflight_body == 0 && !conn.send_armed &&
                 !conn.response_read_deadline_send_owner_active && conn.send_progress == 0 &&
-                conn.resp_body_remaining == 0 &&
+                (conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded
+                     ? conn.resp_body_remaining ==
+                           conn.response_read_deadline_post_commit_declared_body - publish_body
+                     : conn.resp_body_remaining == 0) &&
                 conn.resp_body_sent == conn.response_header_buf.len() + publish_body;
             const bool combined_completion_valid = combined_terminal_valid;
             const bool completion_callback_valid =
@@ -9485,18 +9540,39 @@ void on_response_body_sent(void* lp, Connection& conn, IoEvent ev) {
             conn.response_read_deadline_post_commit_phase !=
                 ResponseReadDeadlinePostCommitPhase::BodySend ||
             !response_read_deadline_post_commit_is_stable(conn) ||
-            conn.upstream_send_len != inflight || conn.buffered_response_front_size() < inflight ||
+            conn.upstream_send_len != inflight ||
+            !conn.buffered_response_send_range_is_valid(inflight) ||
             conn.response_read_deadline_post_commit_downstream_completed > 0xFFFFFFFFu - inflight) {
             loop->close_conn(conn);
             return;
         }
         conn.clear_response_read_deadline_send_owner();
         conn.response_read_deadline_post_commit_downstream_completed += inflight;
+        if constexpr (requires { loop->study_completed_responses; }) {
+            ++loop->study_body_sends;
+            if (conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                conn.response_read_deadline_post_commit_declared_body ==
+                    ResponseBodyChain::kMaxBody &&
+                conn.response_read_deadline_post_commit_downstream_completed ==
+                    ResponseBodyChain::kMaxBody)
+                ++loop->study_completed_responses;
+        }
         conn.response_read_deadline_post_commit_inflight_body = 0;
         if (conn.upstream_recv_buf.len() != 0) {
             (void)consume_upstream_sent(conn);
         } else {
-            conn.response_body_tail.consume(inflight);
+            constexpr bool kHasDirectBodyRecv = requires(Loop* candidate, Connection& c) {
+                candidate->arm_response_read_direct_body_recv(c);
+            };
+            const bool recycle_bulk =
+                kHasDirectBodyRecv && !conn.tls_active &&
+                conn.response_read_deadline_buffering == ForwardResponseBufferingMode::Bounded &&
+                conn.response_read_deadline_post_commit_declared_body > SlicePool::kBulkSliceSize &&
+                conn.response_read_deadline_post_commit_origin_received <
+                    conn.response_read_deadline_post_commit_declared_body;
+            conn.response_body_tail.consume(
+                inflight, conn.chain_direct_recv_owner.active, recycle_bulk);
+            if (!recycle_bulk) conn.response_body_tail.release_recycled();
             conn.upstream_send_len = 0;
         }
         conn.response_read_deadline_post_commit_phase =
@@ -10687,7 +10763,8 @@ inline bool strict_response_upload_ready(const Connection& conn) {
             conn.req_body_mode == BodyMode::ContentLength) &&
            conn.request_upload_complete && !conn.upstream_request_incomplete &&
            !conn.req_body_streamed && conn.pipeline_stash_len == 0 &&
-           conn.retry_req_send_len == 0 && conn.recv_buf.len() == 0 && !conn.upstream_reused;
+           conn.retry_req_send_len == 0 && conn.recv_buf.len() == 0 &&
+           response_read_deadline_upstream_reuse_is_stable(conn);
 }
 
 // SuppressBody is supported only in the bounded cleartext H1 HEAD/explicit-
@@ -13835,7 +13912,8 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             explicit_route_method == kRouteMethodGet && resp.content_length > 0 &&
             raw_header_end == raw_total && conn.pipeline_depth == 0 &&
             conn.http1_pipeline_request_generation == 0 && conn.pipeline_stash_len == 0 &&
-            conn.retry_req_send_len == 0 && !conn.upstream_reused && conn.upstream_attempts == 1 &&
+            conn.retry_req_send_len == 0 && response_read_deadline_upstream_reuse_is_stable(conn) &&
+            conn.upstream_attempts == 1 &&
             bodyless_get_keep_alive_precise_arm_is_stable(
                 conn,
                 explicit_upload,
@@ -13921,6 +13999,10 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
 
         if (strict_positive_complete_buffering || strict_positive_streaming_get) {
+            // Origin persistence is independent of downstream Connection: close.
+            // Only a fully framed bounded GET can later park this socket.
+            conn.upstream_keep_alive = bounded_get_upstream_reuse_is_admitted(conn) &&
+                                       resp.keep_alive && !resp.connection_close;
             record_reused_response_health();
             if (strict_positive_complete_buffering) {
                 if constexpr (requires(Loop* candidate,
