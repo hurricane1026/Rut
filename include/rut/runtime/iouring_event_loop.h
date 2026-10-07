@@ -5805,7 +5805,8 @@ public:
         // Framing is already proven. Reject any queued surplus or FIN before
         // parking; take_idle repeats this probe to handle an origin closing later.
         u8 byte;
-        const i32 pending = reusable ? ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) : 0;
+        const i32 pending =
+            reusable ? static_cast<i32>(::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)) : 0;
         if (!reusable || pending >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK) ||
             !upstream->put_idle(fd, c.upstream_idx, c.upstream_backend_idx, monotonic_secs()))
             ::close(fd);

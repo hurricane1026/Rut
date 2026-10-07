@@ -1103,10 +1103,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     r.loop->timer.remove(c);
     r.loop->timer.add(c, r.loop->keepalive_timeout);  // a bare add
     CHECK(!c->idle_trim_examined);
-    // RelayOwner adds 48 bytes to the connection slot. Keep the slot-size
-    // assertion explicit so future owner fields cannot grow the hot layout
-    // unnoticed.
-    CHECK_EQ(sizeof(Connection), 3696u);
+    // RelayOwner and BufferedSendVector are part of the hot connection slot.
+    // Keep the slot-size assertion explicit so future owner fields cannot grow
+    // the layout unnoticed.
+    CHECK_EQ(sizeof(Connection), 3824u);
 }
 
 TEST(iouring_idle_trim,
