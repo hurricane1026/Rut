@@ -814,6 +814,9 @@ int main(int argc, char** argv) {
     bool serve_metrics = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
     bool cli_access_log_level_present = false;
+    enum class BackendSelection { Auto, Epoll, IoUring };
+    BackendSelection backend_selection = BackendSelection::Auto;
+    bool backend_specified = false;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [program.rut | --compile PATH]
@@ -827,6 +830,35 @@ int main(int argc, char** argv) {
     //   /metrics?…) is served by the built-in endpoint ahead of route matching,
     //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
+        if (str_eq(argv[i], "--backend")) {
+            if (backend_specified) {
+                write_str("--backend specified twice\n");
+                return 1;
+            }
+            if (i + 1 >= argc || !argv[i + 1][0] || starts_with_dash_dash(argv[i + 1])) {
+                write_str("--backend requires auto, epoll or io_uring\n");
+                return 1;
+            }
+            const char* value = argv[++i];
+            if (str_eq(value, "auto"))
+                backend_selection = BackendSelection::Auto;
+            else if (str_eq(value, "epoll"))
+                backend_selection = BackendSelection::Epoll;
+            else if (str_eq(value, "io_uring"))
+                backend_selection = BackendSelection::IoUring;
+            else {
+                write_str("--backend must be auto, epoll or io_uring\n");
+                return 1;
+            }
+#ifndef __linux__
+            if (backend_selection != BackendSelection::Auto) {
+                write_str("--backend epoll and io_uring require Linux\n");
+                return 1;
+            }
+#endif
+            backend_specified = true;
+            continue;
+        }
         if (is_all_digits(argv[i])) {
             if (!parse_cli_port(argv[i], cli_port)) {
                 write_str("CLI listen port must be between 0 and 65535\n");
@@ -1234,7 +1266,16 @@ int main(int argc, char** argv) {
 #else
     // io_uring now terminates TLS too (event-loop TlsEngine), so it is preferred
     // whenever available — TLS no longer forces the epoll fallback.
-    if (detect_io_uring()) {
+    const bool use_io_uring = backend_selection != BackendSelection::Epoll && detect_io_uring();
+    if (backend_selection == BackendSelection::IoUring && !use_io_uring) {
+        write_str("--backend io_uring requested, but io_uring is unavailable\n");
+        destroy_tls_server_context(tls_server);
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        return 1;
+    }
+    if (use_io_uring) {
         write_str(tls_server ? "Backend: io_uring (TLS)\n" : "Backend: io_uring\n");
         outcome = run_shards<IoUringEventLoop>(listener,
                                                shard_count,
@@ -1250,7 +1291,8 @@ int main(int argc, char** argv) {
                                                route_config,
                                                serve_metrics,
                                                relay_stats_enabled);
-        if (outcome.kind == RunShardsOutcomeKind::IoUringStartupFailure && tls_server) {
+        if (outcome.kind == RunShardsOutcomeKind::IoUringStartupFailure && tls_server &&
+            backend_selection == BackendSelection::Auto) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
             outcome = run_shards<EpollEventLoop>(listener,
                                                  shard_count,
