@@ -368,8 +368,10 @@ public:
         timer.init();
         // Reserve six ordinary slices and one complete bounded response chain
         // per admitted connection. Storage is lazy and VA-reserved.
-        auto pooled =
-            pool.init(SlicePool::capacity_for_connections(connection_capacity), pool_prealloc);
+        auto pooled = pool.init(SlicePool::capacity_for_connections(connection_capacity),
+                                pool_prealloc,
+                                SlicePool::kMaxCachedSlices,
+                                SlicePool::bulk_capacity_for_connections(connection_capacity));
         if (!pooled) {
             backend.shutdown();
             destroy_slot_storage();
@@ -699,6 +701,42 @@ public:
         backend.quarantine_upstream_episode_on_slot_release(cid);
         c.reset();
         free_stack[free_top++] = cid;
+    }
+
+    // Promote only a large self-framed plaintext body, between sends. Epoll
+    // recv resolves the current buffer at dispatch time; no kernel receive
+    // operation retains the old address. A partial downstream send does.
+    static constexpr u32 kBulkRelayMinRemaining = 128 * 1024;
+
+    void upgrade_upstream_recv_to_bulk(Connection& c) {
+        u8* current = c.upstream_recv_slice;
+        if (current == nullptr || pool.is_bulk(current) || c.tls_active ||
+            c.resp_body_mode != BodyMode::ContentLength ||
+            c.resp_body_remaining < kBulkRelayMinRemaining || c.id >= connection_capacity ||
+            backend.send_state[c.id].remaining != 0)
+            return;
+        u8* bulk = pool.alloc_bulk();
+        if (bulk == nullptr) return;
+        const u32 buffered = c.upstream_recv_buf.len();
+        if (buffered != 0) __builtin_memcpy(bulk, c.upstream_recv_buf.data(), buffered);
+        c.upstream_recv_slice = bulk;
+        c.upstream_recv_buf.bind(bulk, SlicePool::kBulkSliceSize);
+        c.upstream_recv_buf.commit(buffered);
+        pool.free(current);
+    }
+
+    // Do not retain a bulk buffer on an idle keep-alive connection. Ordinary
+    // pool exhaustion is harmless: close or a later response boundary retries.
+    void release_upstream_relay_slice(Connection& c) {
+        u8* bulk = c.upstream_recv_slice;
+        if (!pool.is_bulk(bulk) || c.upstream_recv_buf.len() != 0 || c.id >= connection_capacity ||
+            backend.send_state[c.id].remaining != 0)
+            return;
+        u8* ordinary = pool.alloc();
+        if (ordinary == nullptr) return;
+        c.upstream_recv_slice = ordinary;
+        c.upstream_recv_buf.bind(ordinary, SlicePool::kSliceSize);
+        pool.free(bulk);
     }
 
     bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
