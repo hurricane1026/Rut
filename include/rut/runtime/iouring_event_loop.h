@@ -3854,8 +3854,10 @@ public:
         if (c.relay_owner.pipe_read < 0 || c.relay_owner.pipe_write < 0) {
             int fds[2] = {-1, -1};
             if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
-            if (::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024) < 64 * 1024 ||
-                ::fcntl(fds[1], F_GETPIPE_SZ) < 64 * 1024) {
+            // F_SETPIPE_SZ returns the actual capacity. The pipe is still
+            // private here, so a second F_GETPIPE_SZ only adds a syscall to
+            // every new relay connection.
+            if (::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024) < 64 * 1024) {
                 ::close(fds[0]);
                 ::close(fds[1]);
                 return false;
