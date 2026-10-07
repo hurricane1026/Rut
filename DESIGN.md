@@ -4491,8 +4491,8 @@ Startup detection:
      - Fail (ENOSYS) or old kernel → fall back to epoll
 
   2. Can be overridden via command line:
-     --io-backend=io_uring    # force io_uring (fail if unavailable)
-     --io-backend=epoll       # force epoll
+     --backend io_uring       # force io_uring (fail if unavailable)
+     --backend epoll          # force epoll
 
   3. Selected once at startup, all shards use the same backend
      (binary contains both implementations, compiled via templates)
