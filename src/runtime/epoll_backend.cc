@@ -1335,8 +1335,8 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 if (!pending_retry && result == 0) result = static_cast<i32>(ss.offset);
             }
 
-            if (made_progress && pending_retry && ss.type == IoEventType::Send &&
-                out < max_events) {
+            if (emit_send_progress && made_progress && pending_retry &&
+                ss.type == IoEventType::Send && out < max_events) {
                 events[out] = {};
                 events[out].conn_id = conn_id;
                 events[out].type = ss.type;

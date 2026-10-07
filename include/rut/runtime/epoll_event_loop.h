@@ -391,6 +391,7 @@ public:
             destroy_slot_storage();
             return core::make_unexpected(be.error());
         }
+        backend.emit_send_progress = true;
         return {};
     }
 

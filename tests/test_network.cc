@@ -30834,6 +30834,7 @@ TEST(epoll_send, more_follows_is_kept_for_partial_write_continuation) {
 
     EpollBackend backend{};
     REQUIRE(backend.init(0, -1).has_value());
+    backend.emit_send_progress = true;
     // Far more than the shrunken socket buffers can absorb: the write is partial.
     constexpr u32 kLen = 8u << 20;
     void* big = mmap(nullptr, kLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
