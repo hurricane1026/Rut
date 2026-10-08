@@ -147,7 +147,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u32 relay_budget_calls = 8;
     u32 relay_budget_bytes = 512 * 1024;
     u32 relay_cancel_retry_count = 0;
-    static constexpr u32 kDeferredRelayReadLimit = 8;
+    static constexpr u32 kDeferredRelayReadLimit = kMaxEventsPerWait;
     u32 deferred_relay_read_count = 0;
     u32 deferred_relay_read_ids[kDeferredRelayReadLimit]{};
     u32 deferred_relay_read_episodes[kDeferredRelayReadLimit]{};
@@ -608,7 +608,11 @@ public:
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
             retry_response_splice_cancels();
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, slots_initialized);
+            const u32 kEventCount = backend.wait(events,
+                                                 kMaxEventsPerWait,
+                                                 conns,
+                                                 slots_initialized,
+                                                 deferred_relay_read_count == 0);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -618,7 +622,7 @@ public:
             }
             relay_budget_calls = 8;
             relay_budget_bytes = 512 * 1024;
-            dispatch_batch(events, n);
+            dispatch_batch(events, kEventCount);
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
             poll_command();
@@ -3854,12 +3858,19 @@ public:
         c.relay_owner.initial_declined = false;
     }
 
-    // Defer the next read until the complete wait batch has settled.  A relay
-    // that just finished a segment has already yielded one write operation;
-    // keeping its read out of the SQ until the batch tail lets other ready
-    // owners make progress before this connection re-enters the poll queue.
-    // The episode is captured with the slot id so a close/reuse cannot turn a
-    // parked read into an operation for a later connection.
+    // Ready relay reads remain runnable on the shard. Queue them behind their
+    // peers instead of manufacturing another readiness CQE after each segment.
+    // Slot/episode authentication protects close and reuse; queue overflow uses
+    // the existing kernel poll path. EAGAIN still registers a real read poll.
+    void handle_response_splice_poll_failure(Connection& c) {
+        if (c.relay_owner.body_bytes == 0) {
+            close_response_splice_pipe(c);
+            c.relay_owner.initial_declined = true;
+        } else {
+            close_conn(c);
+        }
+    }
+
     void defer_response_splice_read(Connection& c) {
         RelayOwner& r = c.relay_owner;
         r.phase = RelayPhase::Reading;
@@ -3876,22 +3887,29 @@ public:
         }
         // Queue saturation is only a fairness guard.  Preserve progress by
         // using the existing poll admission for the overflow owner.
-        if (!arm_response_splice_read(c)) close_conn(c);
+        if (!arm_response_splice_read(c)) handle_response_splice_poll_failure(c);
     }
 
     void flush_deferred_relay_reads() {
-        const u32 count = deferred_relay_read_count;
-        deferred_relay_read_count = 0;
-        for (u32 i = 0; i < count; i++) {
-            const u32 id = deferred_relay_read_ids[i];
-            const u32 episode = deferred_relay_read_episodes[i];
-            if (id >= slots_initialized) continue;
-            Connection& c = conns[id];
+        const u32 kCount = deferred_relay_read_count;
+        for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
+            // Reserve a read and write. Unprocessed entries retain FIFO order
+            // into the next turn; a completed segment rejoins at the tail.
+            if (relay_budget_calls < 2 || relay_budget_bytes < 2 * 64 * 1024) break;
+            const u32 kId = deferred_relay_read_ids[0];
+            const u32 kEpisode = deferred_relay_read_episodes[0];
+            --deferred_relay_read_count;
+            for (u32 j = 0; j < deferred_relay_read_count; ++j) {
+                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
+                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
+            }
+            if (kId >= slots_initialized) continue;
+            Connection& c = conns[kId];
             RelayOwner& r = c.relay_owner;
             if (!r.active()) continue;
-            // A reused slot, or a slot whose episode was replaced, is an old
+            // A reused slot, or a slot whose kEpisode was replaced, is an old
             // queue entry and is discarded without touching the new owner.
-            if (r.upstream_episode != episode || c.upstream_episode != episode) continue;
+            if (r.upstream_episode != kEpisode || c.upstream_episode != kEpisode) continue;
             if (r.close_pending) {
                 if (!r.read_armed && !r.write_armed && !r.read_cancel_owned &&
                     !r.write_cancel_owned && !r.read_cancel_retry && !r.write_cancel_retry &&
@@ -3899,7 +3917,7 @@ public:
                     close_response_splice_pipe(c);
                 continue;
             }
-            // Same-episode state corruption must not be allowed to become a
+            // Same-kEpisode state corruption must not be allowed to become a
             // second poll or a write/read owner.  The queue entry itself is
             // already consumed, so fail closed through the normal ledger.
             if (c.fd < 0 || c.upstream_fd < 0 || r.phase != RelayPhase::Reading ||
@@ -3910,7 +3928,17 @@ public:
                 close_conn(c);
                 continue;
             }
-            if (!arm_response_splice_read(c)) close_conn(c);
+            const IoEvent kReady{c.id, POLLIN, 0, 0, IoEventType::RelayRead, 0, 0, kEpisode};
+            on_response_splice_event(c, kReady);
+            if (c.relay_owner.initial_declined && c.fd >= 0 && c.upstream_fd >= 0) {
+                // An initial SQE failure no longer has the synchronous caller
+                // that normally resumes the copy pump. No body bytes entered
+                // the pipe, so restore the existing ordinary receive path.
+                c.relay_owner.initial_declined = false;
+                upgrade_upstream_recv_to_bulk(c);
+                c.set_slots(nullptr, nullptr, &on_response_body_recvd<IoUringEventLoop>, nullptr);
+                if (!submit_recv_upstream(c)) close_conn(c);
+            }
         }
     }
 
@@ -4027,13 +4055,7 @@ public:
         if (ev.type == IoEventType::RelayRead) {
             r.read_armed = false;
             if (relay_budget_calls == 0 || relay_budget_bytes == 0) {
-                if (!arm_response_splice_read(c)) {
-                    if (r.body_bytes == 0) {
-                        close_response_splice_pipe(c);
-                        c.relay_owner.initial_declined = true;
-                    } else
-                        close_conn(c);
-                }
+                defer_response_splice_read(c);
                 return;
             }
             --relay_budget_calls;
@@ -4055,11 +4077,7 @@ public:
                     // admission failure is a clean decline to the ordinary
                     // copy path.  Once bytes entered the pipe, losing the
                     // poll owner would strand data and must fail closed.
-                    if (r.body_bytes == 0) {
-                        close_response_splice_pipe(c);
-                        c.relay_owner.initial_declined = true;
-                    } else
-                        close_conn(c);
+                    handle_response_splice_poll_failure(c);
                 }
                 return;
             }

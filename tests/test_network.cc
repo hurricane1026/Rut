@@ -38983,7 +38983,18 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     conn->req_start_us = 1;
     conn->keep_alive = false;
     conn->upstream_keep_alive = false;
+    // Exhaustion retains runnable ownership without a new kernel poll. A
+    // nonblocking CQ harvest followed by an empty batch must still drain it.
+    loop->relay_budget_calls = 0;
     REQUIRE(loop->test_start_response_splice(*conn));
+    CHECK_EQ(loop->deferred_relay_read_count, 1u);
+    CHECK_EQ(conn->pending_ops, 0u);
+    loop->relay_budget_calls = 8;
+    loop->relay_budget_bytes = 512 * 1024;
+    IoEvent ready_events[8]{};
+    const u32 ready_count =
+        loop->backend.wait(ready_events, 8, loop->conns, IoUringEventLoop::kMaxConns, false);
+    loop->dispatch_batch(ready_events, ready_count);
 
     REQUIRE(pump_relay_downstream(loop, downstream[1], received_body, sizeof(expected)));
     CHECK_EQ(memcmp(expected, received_body, sizeof(expected)), 0);
@@ -39017,7 +39028,11 @@ TEST(iouring_relay, close_without_relay_cqe_releases_pipe_and_owner) {
     conn->relay_owner.source_fd = conn->upstream_fd;
     conn->relay_owner.destination_fd = conn->fd;
     conn->relay_owner.upstream_episode = conn->upstream_episode;
+    loop->defer_response_splice_read(*conn);
+    REQUIRE_EQ(loop->deferred_relay_read_count, 1u);
     loop->close_conn(*conn);
+    CHECK_EQ(loop->deferred_relay_read_count, 0u);
+    loop->flush_deferred_relay_reads();
     CHECK_EQ(conn->relay_owner.pipe_read, -1);
     CHECK_EQ(conn->relay_owner.pipe_write, -1);
     CHECK_FALSE(conn->relay_owner.active());
@@ -39066,6 +39081,22 @@ TEST(iouring_relay, initial_poll_admission_failure_leaves_connection_open_for_co
     conn->response_read_deadline_buffering = ForwardResponseBufferingMode::CompleteContentLength;
     REQUIRE_FALSE(loop->test_start_response_splice(*conn));
     conn->response_read_deadline_buffering = ForwardResponseBufferingMode::None;
+    // The same failure after a budget-deferred initial attempt must resume
+    // copy I/O itself: there is no longer a synchronous admission caller.
+    loop->relay_budget_calls = 0;
+    REQUIRE(loop->test_start_response_splice(*conn));
+    REQUIRE_EQ(loop->deferred_relay_read_count, 1u);
+    loop->test_fail_next_relay_poll = true;
+    loop->relay_budget_calls = 8;
+    loop->relay_budget_bytes = 512 * 1024;
+    IoEvent no_events[1]{};
+    loop->dispatch_batch(no_events, 0);
+    CHECK_FALSE(conn->relay_owner.active());
+    CHECK_FALSE(conn->relay_owner.initial_declined);
+    CHECK_GE(conn->fd, 0);
+    CHECK_GE(conn->upstream_fd, 0);
+    CHECK(conn->upstream_recv_armed);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<IoUringEventLoop>);
     loop->close_conn(*conn);
     close(upstream[1]);
     close(downstream[1]);
