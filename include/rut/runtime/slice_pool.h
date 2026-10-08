@@ -266,6 +266,23 @@ struct SlicePool {
     // when this pool was init'd with bulk_capacity == 0).
     u8* alloc_bulk() { return alloc_bulk_impl(nullptr); }
 
+    [[nodiscard]] u32 bulk_buffer_size() const { return kBulkSliceSize; }
+
+    // Receive borrowers expose only bytes committed by recv. A normal bulk
+    // borrower still clears all deferred bytes before exposing this storage.
+    u8* alloc_bulk_for_overwrite() {
+        u32 previous_dirty = 0;
+        return alloc_bulk_impl(&previous_dirty);
+    }
+
+    // All send/recv owners must retire before returning this buffer.
+    void free_bulk_after_overwrite(u8* ptr) {
+        if (is_bulk(ptr))
+            free_bulk(ptr, kBulkSliceSize, true);
+        else
+            free(ptr);
+    }
+
     [[nodiscard]] bool is_bulk(const u8* ptr) const {
         return bulk_base != nullptr && ptr >= bulk_base &&
                ptr < bulk_base + static_cast<u64>(bulk_max_count) * kBulkSliceSize;

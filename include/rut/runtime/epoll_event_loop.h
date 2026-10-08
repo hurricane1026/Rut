@@ -27,6 +27,7 @@
 #include "rut/runtime/upstream_pool.h"
 #include <atomic>
 
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
@@ -227,6 +228,7 @@ public:
     // health-check probes from EventLoopCRTP::sweep_health_probes. io_uring sets
     // this false — its sweep only re-arms deadlines (probing is a follow-up).
     static constexpr bool kSupportsHealthProbe = true;
+    static constexpr u32 kLargeRelayBufferSize = SlicePool::kBulkSliceSize;
     SlicePool pool;
     // Per-shard HTTP/2 engine pool — lazily handed out when a connection
     // upgrades to h2. Bounded; over-cap upgrades fall back to closing the conn.
@@ -478,6 +480,7 @@ public:
     }
 
     void shutdown() {
+        for (u32 i = 0; i < connection_capacity; ++i) close_response_splice_pipe(conns[i]);
         backend.shutdown();
         h2_pool.destroy();
         pool.destroy();
@@ -620,8 +623,16 @@ public:
         if (c.fd >= 0) backend.quiesce_recv(c.id, /*upstream=*/false, 0);
     }
 
+    bool proxy_header_size_allowed(const Connection& c, ParseStatus status, u32 header_end) const {
+        if (!pool.is_bulk(c.upstream_recv_slice)) return true;
+        if (status == ParseStatus::Complete) return header_end <= SlicePool::kSliceSize;
+        if (status == ParseStatus::Incomplete)
+            return c.upstream_recv_buf.len() <= SlicePool::kSliceSize;
+        return true;
+    }
+
     bool alloc_upstream_buf(ConnectionBase& c) {
-        if (c.upstream_recv_slice) return true;  // already allocated
+        if (c.upstream_recv_slice) return true;
         u8* s = pool.alloc();
         if (!s) return false;
         c.upstream_recv_slice = s;
@@ -689,12 +700,16 @@ public:
     }
 
     void free_conn_impl(Connection& c) {
+        close_response_splice_pipe(c);
         u32 cid = c.id;
         timer.remove(&c);
         // Sync backend: kernel is done with buffers. Free immediately.
         if (c.recv_slice) pool.free(c.recv_slice);
         if (c.send_slice) pool.free(c.send_slice);
-        if (c.upstream_recv_slice) pool.free(c.upstream_recv_slice);
+        if (pool.is_bulk(c.upstream_recv_slice))
+            pool.free_bulk_after_overwrite(c.upstream_recv_slice);
+        else if (c.upstream_recv_slice)
+            pool.free(c.upstream_recv_slice);
         if (c.response_header_slice) pool.free(c.response_header_slice);
         if (c.ws_c2u_msg) pool.free(c.ws_c2u_msg);
         if (c.ws_u2c_msg) pool.free(c.ws_u2c_msg);
@@ -702,6 +717,174 @@ public:
         backend.quarantine_upstream_episode_on_slot_release(cid);
         c.reset();
         free_stack[free_top++] = cid;
+    }
+
+    static constexpr u32 kResponseSpliceChunkSize = 64u * 1024u;
+
+    // Admit only the current, fully framed plaintext GET response. No history,
+    // route-size inference or body-inspection policy is bypassed.
+    bool response_splice_eligible(const Connection& c) const {
+        return c.id < connection_capacity && c.fd >= 0 && c.upstream_fd >= 0 &&
+               c.fd != c.upstream_fd && valid_upstream_episode(c.upstream_episode) &&
+               backend.active_upstream_episode[c.id] == c.upstream_episode &&
+               backend.upstream_fd_map[c.id] == c.upstream_fd &&
+               backend.downstream_fd_map[c.id] == c.fd && !c.tls_active &&
+               c.protocol == ConnProtocol::Http11 && c.response_policy_id == 0 &&
+               c.resp_body_mode == BodyMode::ContentLength &&
+               c.response_read_deadline_buffering == ForwardResponseBufferingMode::None &&
+               c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+               c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
+               !c.request_body_fully_buffered && !c.req_body_streamed &&
+               c.request_upload_complete && c.throttle_down_bps == 0 && !c.is_ws_terminate_route &&
+               c.resp_body_remaining >= 64 * 1024 && c.upstream_recv_buf.len() == 0 &&
+               !c.upstream_recv_armed && !c.upstream_recv_direct_armed && !c.upstream_send_armed &&
+               !c.send_armed && c.upstream_relay_send_len == 0 && !c.relay_owner.active() &&
+               c.relay_owner.segment_len == 0 && c.relay_owner.segment_sent == 0 &&
+               !c.relay_owner.read_armed && !c.relay_owner.write_armed &&
+               !c.relay_owner.read_cancel_owned && !c.relay_owner.write_cancel_owned &&
+               !c.relay_owner.read_cancel_retry && !c.relay_owner.write_cancel_retry &&
+               !c.relay_owner.close_pending && backend.send_state[c.id].remaining == 0 &&
+               backend.upstream_send_state[c.id].remaining == 0 &&
+               c.response_read_deadline_owner_is_neutral() && !c.is_ws_tunnel && !c.is_ws_terminate;
+    }
+
+    bool arm_response_splice_after_prefix(Connection& c, u32 send_len) {
+        if (send_len == 0 || c.upstream_recv_buf.len() != send_len) return false;
+        // Eligibility is checked again after the ordinary prefix send retires.
+        if (c.tls_active || c.response_policy_id != 0 ||
+            c.resp_body_mode != BodyMode::ContentLength || c.resp_body_remaining < 64 * 1024 ||
+            c.throttle_down_bps != 0 || !c.response_read_deadline_owner_is_neutral())
+            return false;
+        return true;
+    }
+
+    void close_response_splice_pipe(Connection& c) {
+        if (c.relay_owner.pipe_read >= 0) ::close(c.relay_owner.pipe_read);
+        if (c.relay_owner.pipe_write >= 0) ::close(c.relay_owner.pipe_write);
+        c.relay_owner = {};
+    }
+
+    bool arm_epoll_splice(Connection& c, bool write) {
+        auto& r = c.relay_owner;
+        if (write && !backend.quiesce_recv(c.id, true, r.upstream_episode)) return false;
+        if (!write &&
+            !backend.add_relay_poll(c.fd, c.id, IoEventType::RelayWrite, r.upstream_episode, true))
+            return false;
+        if (!backend.add_relay_poll(write ? c.fd : c.upstream_fd,
+                                    c.id,
+                                    write ? IoEventType::RelayWrite : IoEventType::RelayRead,
+                                    r.upstream_episode))
+            return false;
+        r.phase = write ? RelayPhase::Writing : RelayPhase::Reading;
+        r.write_armed = write;
+        r.read_armed = !write;
+        return true;
+    }
+
+    bool start_response_splice(Connection& c) {
+        if (!response_splice_eligible(c)) return false;
+        auto& r = c.relay_owner;
+        if (r.pipe_read < 0 || r.pipe_write < 0) {
+            int fds[2];
+            if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
+            if (::fcntl(fds[1], F_SETPIPE_SZ, kResponseSpliceChunkSize) <
+                static_cast<i32>(kResponseSpliceChunkSize)) {
+                ::close(fds[0]);
+                ::close(fds[1]);
+                return false;
+            }
+            r.pipe_read = fds[0];
+            r.pipe_write = fds[1];
+        }
+        r.phase = RelayPhase::Reading;
+        r.source_fd = c.upstream_fd;
+        r.destination_fd = c.fd;
+        r.upstream_episode = c.upstream_episode;
+        if (!backend.add_relay_poll(
+                c.fd, c.id, IoEventType::RelayWrite, r.upstream_episode, true)) {
+            close_response_splice_pipe(c);
+            this->close_conn(c);
+            return true;
+        }
+        r.read_armed = true;
+        on_response_splice_event(c,
+                                 {c.id, 1, 0, 0, IoEventType::RelayRead, 0, 0, c.upstream_episode});
+        return true;
+    }
+
+    void on_response_splice_event(Connection& c, const IoEvent& ev) {
+        auto& r = c.relay_owner;
+        if (!r.active() || ev.upstream_episode != r.upstream_episode ||
+            c.upstream_episode != r.upstream_episode || c.upstream_fd != r.source_fd ||
+            c.fd != r.destination_fd)
+            return;
+        if (ev.result < 0) {
+            this->close_conn(c);
+            return;
+        }
+        const bool write = ev.type == IoEventType::RelayWrite;
+        if ((write && (r.phase != RelayPhase::Writing || !r.write_armed)) ||
+            (!write && (ev.type != IoEventType::RelayRead || r.phase != RelayPhase::Reading ||
+                        !r.read_armed)))
+            return;
+        r.read_armed = r.write_armed = false;
+        // Bound each owner turn to two pipe segments (four syscalls). Other
+        // ready connections can run before this owner gets another turn.
+        for (u32 calls = 0; calls < 4; ++calls) {
+            const bool writing = r.segment_len != 0;
+            const u32 want = writing ? r.segment_len - r.segment_sent
+                                     : (c.resp_body_remaining < kResponseSpliceChunkSize
+                                            ? c.resp_body_remaining
+                                            : kResponseSpliceChunkSize);
+            ssize_t n;
+            do {
+                n = writing ? ::splice(r.pipe_read,
+                                       nullptr,
+                                       c.fd,
+                                       nullptr,
+                                       want,
+                                       SPLICE_F_MOVE | SPLICE_F_NONBLOCK)
+                            : ::splice(c.upstream_fd,
+                                       nullptr,
+                                       r.pipe_write,
+                                       nullptr,
+                                       want,
+                                       SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            } while (n < 0 && errno == EINTR);
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (!arm_epoll_splice(c, writing)) this->close_conn(c);
+                return;
+            }
+            if (n <= 0 || static_cast<u32>(n) > want) {
+                this->close_conn(c);
+                return;
+            }
+            if (writing) {
+                r.segment_sent += static_cast<u32>(n);
+                c.resp_body_sent += static_cast<u32>(n);
+                if (r.segment_sent == r.segment_len) r.segment_len = r.segment_sent = 0;
+                if (r.segment_len == 0 && c.resp_body_remaining == 0) {
+                    const i32 pipe_read = r.pipe_read, pipe_write = r.pipe_write;
+                    r = {};
+                    r.pipe_read = pipe_read;
+                    r.pipe_write = pipe_write;
+                    if (!backend.add_recv(c.fd, c.id)) {
+                        this->close_conn(c);
+                        return;
+                    }
+                    proxy_stream_complete<EpollEventLoop>(this, c);
+                    return;
+                }
+            } else {
+                r.segment_len = static_cast<u32>(n);
+                r.segment_sent = 0;
+                r.body_bytes += r.segment_len;
+                c.resp_body_remaining -= r.segment_len;
+            }
+            timer.refresh(&c,
+                          c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
+        }
+        if (!arm_epoll_splice(c, r.segment_len != 0)) this->close_conn(c);
     }
 
     // Promote only a large self-framed plaintext body, between sends. Epoll
@@ -716,12 +899,12 @@ public:
             c.resp_body_remaining < kBulkRelayMinRemaining || c.id >= connection_capacity ||
             backend.send_state[c.id].remaining != 0)
             return;
-        u8* bulk = pool.alloc_bulk();
+        u8* bulk = pool.alloc_bulk_for_overwrite();
         if (bulk == nullptr) return;
         const u32 buffered = c.upstream_recv_buf.len();
         if (buffered != 0) __builtin_memcpy(bulk, c.upstream_recv_buf.data(), buffered);
         c.upstream_recv_slice = bulk;
-        c.upstream_recv_buf.bind(bulk, SlicePool::kBulkSliceSize);
+        c.upstream_recv_buf.bind(bulk, pool.bulk_buffer_size());
         c.upstream_recv_buf.commit(buffered);
         pool.free(current);
     }
@@ -737,8 +920,10 @@ public:
         if (ordinary == nullptr) return;
         c.upstream_recv_slice = ordinary;
         c.upstream_recv_buf.bind(ordinary, SlicePool::kSliceSize);
-        pool.free(bulk);
+        pool.free_bulk_after_overwrite(bulk);
     }
+
+    void release_completed_proxy_receive_buffer(Connection& c) { release_upstream_relay_slice(c); }
 
     bool submit_recv_impl(Connection& c) { return backend.add_recv(c.fd, c.id); }
 
@@ -1093,6 +1278,31 @@ public:
             case IoEventType::UpstreamSend:
                 if (ev.conn_id < connection_capacity) {
                     auto& conn = conns[ev.conn_id];
+                    // A plaintext proxy send still owns a full receive buffer.
+                    // No bytes were consumed by this ENOBUFS: suspend the upstream
+                    // until the send callback retires its prefix and resumes reads.
+                    // Stale tokens and submission failures retain fail-closed handling.
+                    if (ev.type == IoEventType::UpstreamRecv && ev.result == -ENOBUFS &&
+                        ev.aux == 0 && ev.upstream_episode != 0 &&
+                        ev.upstream_episode == conn.upstream_episode &&
+                        backend.active_upstream_episode[conn.id] == conn.upstream_episode &&
+                        !conn.tls_active && conn.response_policy_id == 0 &&
+                        conn.response_read_deadline_owner_is_neutral() &&
+                        conn.on_upstream_recv == nullptr &&
+                        (conn.on_send == &on_response_header_sent<EpollEventLoop> ||
+                         conn.on_send == &on_response_body_sent<EpollEventLoop> ||
+                         conn.on_send == &on_proxy_response_sent<EpollEventLoop>) &&
+                        conn.upstream_recv_buf.capacity() != 0 &&
+                        conn.upstream_recv_buf.write_avail() == 0 && conn.upstream_fd >= 0 &&
+                        conn.upstream_fd != conn.fd &&
+                        backend.upstream_fd_map[conn.id] == conn.upstream_fd &&
+                        backend.upstream_send_state[conn.id].remaining == 0 &&
+                        backend.send_state[conn.id].remaining != 0 &&
+                        backend.send_state[conn.id].fd == conn.fd) {
+                        if (!backend.quiesce_recv(conn.id, true, conn.upstream_episode))
+                            this->close_conn(conn);
+                        break;
+                    }
                     if (ev.aux == kEpollSendProgressAux && ev.type == IoEventType::Send) {
                         if (!conn.throttle_paused)
                             timer.refresh(&conn,
@@ -1144,6 +1354,12 @@ public:
                 break;
             case IoEventType::RelayRead:
             case IoEventType::RelayWrite:
+                if (ev.conn_id < connection_capacity && ev.aux == 0 && !ev.has_buf && !ev.more &&
+                    valid_upstream_episode(ev.upstream_episode) &&
+                    backend.active_upstream_episode[ev.conn_id] == ev.upstream_episode) {
+                    on_response_splice_event(conns[ev.conn_id], ev);
+                }
+                break;
             case IoEventType::ResponseReadTimer:
             case IoEventType::Count:
                 // io_uring owns relay poll events; epoll stays on the copy

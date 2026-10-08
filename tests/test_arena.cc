@@ -870,6 +870,56 @@ TEST(slice_arena, multiple_arenas_same_pool) {
     pc.destroy();
 }
 
+TEST(slice_pool, overwrite_loans_preserve_zeroed_normal_borrowers) {
+    SlicePool pool;
+    constexpr u32 kLarge = SlicePool::kBulkSliceSize;
+    REQUIRE(pool.init(8, 0, SlicePool::kMaxCachedSlices, 4).has_value());
+    CHECK_EQ(pool.bulk_buffer_size(), kLarge);
+    CHECK_EQ(pool.bulk_max_count, 4u);
+    CHECK_EQ(pool.study_bulk_cache_limit * pool.bulk_buffer_size(), 16u * 1024u * 1024u);
+    u8* old = pool.alloc_bulk();
+    REQUIRE(old != nullptr);
+    __builtin_memset(old, 0xA5, kLarge);
+    pool.free_bulk_after_overwrite(old);
+    u8* relay = pool.alloc_bulk_for_overwrite();
+    REQUIRE_EQ(relay, old);
+    CHECK_EQ(relay[kLarge - 1], 0xA5u);
+    __builtin_memset(relay, 0x3C, 64);
+    pool.free_bulk_after_overwrite(relay);
+    u8* ordinary_loan = pool.alloc_bulk();
+    REQUIRE_EQ(ordinary_loan, old);
+    bool all_zero = true;
+    for (u32 i = 0; i < kLarge; ++i) all_zero &= ordinary_loan[i] == 0;
+    CHECK(all_zero);
+    pool.free(ordinary_loan);
+    CHECK_EQ(pool.study_bulk_borrowed, 0u);
+    pool.destroy();
+    REQUIRE(pool.init(8, 0, SlicePool::kMaxCachedSlices, 4).has_value());
+    CHECK_EQ(pool.bulk_buffer_size(), SlicePool::kBulkSliceSize);
+    CHECK_EQ(pool.study_bulk_cache_limit, SlicePool::kMaxCachedBulk);
+    pool.destroy();
+}
+
+TEST(response_body_chain, bulk_overwrite_keeps_committed_payload_exact) {
+    SlicePool pool;
+    REQUIRE(pool.init(8, 0, SlicePool::kMaxCachedSlices, 4).has_value());
+    ResponseBodyChain chain;
+    REQUIRE(chain.reserve_tail(pool, 0));
+    CHECK_EQ(chain.write_avail(pool), pool.bulk_buffer_size() - ResponseBodyChain::header_size());
+    u8* bytes = chain.write_ptr(pool);
+    __builtin_memset(bytes, 0x5A, 200u * 1024u);
+    REQUIRE(chain.record_direct_write(chain.tail, bytes, 200u * 1024u, pool));
+    chain.commit(4096);
+    CHECK_EQ(chain.front_size(), 4096u);
+    chain.release();
+    u8* clean = pool.alloc_bulk();
+    REQUIRE(clean != nullptr);
+    CHECK_EQ(clean[4096], 0u);
+    CHECK_EQ(clean[200u * 1024u], 0u);
+    pool.free(clean);
+    pool.destroy();
+}
+
 TEST(slice_pool, study_adaptive_bulk_cache_shrinks_only_unborrowed_idle_slots) {
     SlicePool pool;
     REQUIRE(pool.init(8, 0, 0, 128).has_value());

@@ -60,7 +60,8 @@ struct EpollBackend {
     };
     MappedArray<FdInterest> fd_interest;  // 2 * capacity entries
     static u32 fd_interest_slot(u32 conn_id, IoEventType type) {
-        return 2 * conn_id + (io_event_is_upstream(type) ? 1u : 0u);
+        return 2 * conn_id +
+               ((io_event_is_upstream(type) || type == IoEventType::RelayRead) ? 1u : 0u);
     }
     static void reset_fd_interest(FdInterest& r) { r = {-1, 0, 0, r.gen + 1}; }
 
@@ -186,7 +187,10 @@ struct EpollBackend {
     // pending the fd is removed from the epoll set entirely. Used by the
     // nginx-style drain-then-close path. upstream selects the upstream fd /
     // upstream_send_state; otherwise the downstream fd / send_state.
-    void quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode);
+    // Report registration failures so owners that must stop reads can fail closed.
+    bool quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode);
+    bool add_relay_poll(
+        i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode, bool parked = false);
 
     // Drop any partial-send bookkeeping for conn_id. MUST be called on close so
     // a leftover send_state entry (a partial send that was still in flight when

@@ -12,6 +12,9 @@ enum class HttpMethod : u8;
 struct EpollEventLoop;
 struct IoUringEventLoop;
 
+template <typename Loop>
+void proxy_stream_complete(Loop* loop, Connection& conn);
+
 // Verify capture slice size constants match the authoritative CaptureEntry::kMaxHeaderLen.
 // These are defined separately in each EventLoop type to avoid circular includes.
 static_assert(CaptureEntry::kMaxHeaderLen == 8192,

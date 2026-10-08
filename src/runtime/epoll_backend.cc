@@ -110,7 +110,7 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
                            IoEventType type,
                            u32 events,
                            u32 upstream_episode) {
-    if (io_event_is_upstream(type)) {
+    if (io_event_uses_upstream_episode(type)) {
         if (!valid_upstream_episode(upstream_episode)) {
             errno = EINVAL;
             return -EINVAL;
@@ -121,7 +121,7 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
     }
     struct epoll_event ev;
     ev.events = events;
-    ev.data.u64 = io_event_is_upstream(type)
+    ev.data.u64 = io_event_uses_upstream_episode(type)
                       ? encode_upstream_event_token({conn_id, type, upstream_episode, 0})
                       : encode_non_upstream_user_data({conn_id, type, 0});
     if (ev.data.u64 == kInvalidIoUserData) {
@@ -182,7 +182,7 @@ static void rearm_recv_interest(EpollBackend::FdInterest* interest,
 }
 
 u64 EpollBackend::encode_data(u32 conn_id, IoEventType type, u32 upstream_episode) {
-    if (io_event_is_upstream(type))
+    if (io_event_uses_upstream_episode(type))
         return encode_upstream_event_token({conn_id, type, upstream_episode, 0});
     return encode_non_upstream_user_data({conn_id, type, 0});
 }
@@ -190,7 +190,7 @@ u64 EpollBackend::encode_data(u32 conn_id, IoEventType type, u32 upstream_episod
 bool EpollBackend::decode_data(u64 data, u32& conn_id, IoEventType& type, u32& upstream_episode) {
     type = static_cast<IoEventType>(data & 0xFF);
     upstream_episode = 0;
-    if (io_event_is_upstream(type)) {
+    if (io_event_uses_upstream_episode(type)) {
         UpstreamEventToken token;
         if (!decode_upstream_event_token(data, &token)) return false;
         conn_id = token.conn_id;
@@ -382,11 +382,29 @@ bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
     return true;
 }
 
-void EpollBackend::quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode) {
-    if (upstream && !valid_upstream_episode(upstream_episode)) return;
-    if (conn_id >= connection_capacity) return;
+bool EpollBackend::add_relay_poll(i32 fd, u32 conn_id, IoEventType type, u32 episode, bool parked) {
+    if ((parked && type != IoEventType::RelayWrite) || conn_id >= connection_capacity ||
+        !valid_upstream_episode(episode) || active_upstream_episode[conn_id] != episode ||
+        (type != IoEventType::RelayRead && type != IoEventType::RelayWrite))
+        return false;
+    const i32 expected =
+        type == IoEventType::RelayRead ? upstream_fd_map[conn_id] : downstream_fd_map[conn_id];
+    if (fd < 0 || fd != expected) return false;
+    return set_fd_interest(fd_interest.data(),
+                           connection_capacity,
+                           epoll_fd,
+                           fd,
+                           conn_id,
+                           type,
+                           parked ? 0u : (type == IoEventType::RelayRead ? EPOLLIN : EPOLLOUT),
+                           episode) >= 0;
+}
+
+bool EpollBackend::quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode) {
+    if (upstream && !valid_upstream_episode(upstream_episode)) return false;
+    if (conn_id >= connection_capacity) return false;
     i32 fd = upstream ? upstream_fd_map[conn_id] : downstream_fd_map[conn_id];
-    if (fd < 0) return;
+    if (fd < 0) return false;
     const auto& ss = upstream ? upstream_send_state[conn_id] : send_state[conn_id];
     if (ss.remaining > 0 && ss.fd == fd && (!upstream || ss.upstream_episode == upstream_episode)) {
         // Keep flushing the in-flight send. Downstream registers type=Send so the
@@ -395,18 +413,18 @@ void EpollBackend::quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode
         // EPOLLIN/EPOLLRDHUP, so the half-close can't re-fire.
         IoEventType type = upstream ? IoEventType::UpstreamRecv : ss.type;
         u32 events = (ss.tls && ss.tls_wait_events == EPOLLIN) ? EPOLLIN : EPOLLOUT;
-        set_fd_interest(fd_interest.data(),
-                        connection_capacity,
-                        epoll_fd,
-                        fd,
-                        conn_id,
-                        type,
-                        events,
-                        upstream ? upstream_episode : 0);
+        return set_fd_interest(fd_interest.data(),
+                               connection_capacity,
+                               epoll_fd,
+                               fd,
+                               conn_id,
+                               type,
+                               events,
+                               upstream ? upstream_episode : 0) >= 0;
     } else {
         // Nothing to flush — remove the fd so EPOLLHUP/ERR can't spin the loop.
         invalidate_fd_interest(conn_id, fd);
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+        return epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr) == 0 || errno == ENOENT;
     }
 }
 
@@ -953,12 +971,33 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         // Upstream epoll records are self-contained episode tokens. Validate
         // them before touching maps, socket state, connection buffers, or the
         // partial-send state; a malformed/stale record is simply consumed.
-        if (io_event_is_upstream(type) &&
+        if (io_event_uses_upstream_episode(type) &&
             (conns == nullptr || conn_id >= max_conns || conn_id >= connection_capacity ||
              !valid_upstream_episode(upstream_episode) ||
              conns[conn_id].upstream_episode != upstream_episode ||
              active_upstream_episode[conn_id] != upstream_episode))
             continue;
+        if (type == IoEventType::RelayRead || type == IoEventType::RelayWrite) {
+            const auto& relay = conns[conn_id].relay_owner;
+            const bool owner = relay.active() && relay.upstream_episode == upstream_episode &&
+                               relay.source_fd == conns[conn_id].upstream_fd &&
+                               relay.destination_fd == conns[conn_id].fd;
+            const bool client_closed = type == IoEventType::RelayWrite &&
+                                       (ep_events[i].events & (EPOLLHUP | EPOLLERR)) != 0;
+            const bool runnable = (type == IoEventType::RelayRead &&
+                                   relay.phase == RelayPhase::Reading && relay.read_armed) ||
+                                  (type == IoEventType::RelayWrite &&
+                                   relay.phase == RelayPhase::Writing && relay.write_armed);
+            if (!owner || (!client_closed && !runnable)) continue;
+            events[out] = {};
+            events[out].conn_id = conn_id;
+            events[out].type = type;
+            events[out].upstream_episode = upstream_episode;
+            events[out].result =
+                client_closed ? -ECONNRESET : static_cast<i32>(ep_events[i].events);
+            ++out;
+            continue;
+        }
         // EPOLLHUP/EPOLLERR always fire regardless of the interest mask
         // (per epoll_ctl(2)), so pause_recv(events=0) can't prevent them.
         // Fold them into has_read so peer-close / hard-error routes
