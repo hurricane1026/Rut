@@ -13664,6 +13664,12 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     resp_parser.reset();
     ParseStatus ps =
         resp_parser.parse(conn.upstream_recv_buf.data(), conn.upstream_recv_buf.len(), &resp);
+    if constexpr (requires { loop->proxy_header_size_allowed(conn, ps, resp_parser.header_end); }) {
+        if (!loop->proxy_header_size_allowed(conn, ps, resp_parser.header_end)) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
     if (ps == ParseStatus::Incomplete) {
         if (ev.result <= 0)
             ps = ParseStatus::Error;
@@ -14687,6 +14693,8 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
     if (conn.upstream_recv_buf.len() > conn.upstream_send_len && !conn.tls_proxy_stream)
         conn.upstream_keep_alive = false;
     conn.upstream_recv_buf.reset();
+    if constexpr (requires { loop->release_completed_proxy_receive_buffer(conn); })
+        loop->release_completed_proxy_receive_buffer(conn);
 
     release_upstream_conn(loop, conn);  // pool for reuse if keep-alive, else close
 

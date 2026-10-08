@@ -86205,6 +86205,169 @@ TEST(iouring_accept_rearm, closed_listener_is_never_rearmed) {
 #endif  // __linux__
 
 #ifdef __linux__
+TEST(epoll_response_sized_relay, only_current_response_promotes_and_send_pins_are_respected) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    u8* ordinary = c->upstream_recv_slice;
+    c->resp_body_remaining = 1024u * 1024u;
+    c->resp_body_mode = BodyMode::Chunked;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->tls_active = true;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    c->tls_active = false;
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>("pending"), 7);
+    loop->backend.send_state[c->id].src = ordinary;
+    loop->backend.send_state[c->id].remaining = 7;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    loop->backend.clear_send_state(c->id);
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    REQUIRE(loop->pool.is_bulk(c->upstream_recv_slice));
+    CHECK_EQ(c->upstream_recv_buf.capacity(), EpollEventLoop::kLargeRelayBufferSize);
+    CHECK_EQ(c->upstream_recv_buf.len(), 7u);
+    CHECK_EQ(memcmp(c->upstream_recv_buf.data(), "pending", 7), 0);
+    c->upstream_recv_buf.reset();
+    loop->release_upstream_relay_slice(*c);
+    // Repeated large responses cannot influence the next response's allocation.
+    for (u32 i = 0; i < 24; ++i) {
+        REQUIRE(loop->alloc_upstream_buf(*c));
+        CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kSliceSize);
+        c->resp_body_mode = BodyMode::ContentLength;
+        c->resp_body_remaining = 1024u * 1024u;
+        loop->upgrade_upstream_recv_to_bulk(*c);
+        REQUIRE(loop->pool.is_bulk(c->upstream_recv_slice));
+        loop->release_upstream_relay_slice(*c);
+    }
+    c->resp_body_remaining = 4096;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kSliceSize);
+    auto* next = loop->alloc_conn();
+    REQUIRE(next != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*next));
+    CHECK_EQ(next->upstream_recv_buf.capacity(), SlicePool::kSliceSize);
+    loop->close_conn(*next);
+    loop->close_conn(*c);
+    CHECK_EQ(loop->pool.study_bulk_borrowed, 0u);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_response_sized_relay, allocation_failure_preserves_existing_receive_storage) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 1024u * 1024u;
+    u8* ordinary = c->upstream_recv_slice;
+    loop->pool.bulk_map_failed = true;
+    loop->upgrade_upstream_recv_to_bulk(*c);
+    CHECK_EQ(c->upstream_recv_slice, ordinary);
+    CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kSliceSize);
+    loop->pool.bulk_map_failed = false;
+    loop->close_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_response_sized_relay, large_receive_preserves_the_original_header_bound) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds), 0);
+    c->fd = fds[0];
+    REQUIRE(loop->backend.add_recv(c->fd, c->id));
+    c->upstream_recv_slice = loop->pool.alloc_bulk_for_overwrite();
+    REQUIRE(c->upstream_recv_slice != nullptr);
+    c->upstream_recv_buf.bind(c->upstream_recv_slice, loop->pool.bulk_buffer_size());
+    constexpr char prefix[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Large: ";
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(prefix), sizeof(prefix) - 1);
+    __builtin_memset(c->upstream_recv_buf.write_ptr(), 'a', SlicePool::kSliceSize);
+    c->upstream_recv_buf.commit(SlicePool::kSliceSize);
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>("\r\n\r\n"), 4);
+    HttpResponseParser parser;
+    ParsedResponse response;
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(c->upstream_recv_buf.data(), c->upstream_recv_buf.len(), &response),
+               ParseStatus::Complete);
+    REQUIRE(parser.header_end > SlicePool::kSliceSize);
+    on_upstream_response<EpollEventLoop>(
+        loop,
+        *c,
+        {c->id, static_cast<i32>(c->upstream_recv_buf.len()), 0, 0, IoEventType::UpstreamRecv});
+    CHECK_EQ(c->fd, -1);
+    u8 byte;
+    CHECK_EQ(recv(fds[1], &byte, 1, 0), 0);
+    CHECK_EQ(loop->pool.study_bulk_borrowed, 0u);
+    close(fds[1]);
+
+    c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->upstream_recv_slice = loop->pool.alloc_bulk_for_overwrite();
+    REQUIRE(c->upstream_recv_slice != nullptr);
+    c->upstream_recv_buf.bind(c->upstream_recv_slice, loop->pool.bulk_buffer_size());
+    constexpr char head[] = "HTTP/1.1 200 OK\r\nContent-Length: 32768\r\n\r\n";
+    c->upstream_recv_buf.write(reinterpret_cast<const u8*>(head), sizeof(head) - 1);
+    __builtin_memset(c->upstream_recv_buf.write_ptr(), 'x', 20u * 1024u);
+    c->upstream_recv_buf.commit(20u * 1024u);
+    parser.reset();
+    response.reset();
+    REQUIRE_EQ(parser.parse(c->upstream_recv_buf.data(), c->upstream_recv_buf.len(), &response),
+               ParseStatus::Complete);
+    CHECK(loop->proxy_header_size_allowed(*c, ParseStatus::Complete, parser.header_end));
+    CHECK_FALSE(loop->proxy_header_size_allowed(*c, ParseStatus::Incomplete, 0));
+    loop->close_conn(*c);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
+TEST(epoll_response_sized_relay, one_shot_completion_releases_bulk_before_keepalive) {
+    auto* loop = create_real_loop();
+    REQUIRE(loop != nullptr);
+    REQUIRE(loop->init(0, -1, 0).has_value());
+    auto* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds), 0);
+    c->fd = fds[0];
+    REQUIRE(loop->backend.add_recv(c->fd, c->id));
+    const u32 available = loop->pool.bulk_available();
+    c->upstream_recv_slice = loop->pool.alloc_bulk_for_overwrite();
+    REQUIRE(c->upstream_recv_slice != nullptr);
+    c->upstream_recv_buf.bind(c->upstream_recv_slice, loop->pool.bulk_buffer_size());
+    __builtin_memset(c->upstream_recv_buf.write_ptr(), 'x', 4096);
+    c->upstream_recv_buf.commit(4096);
+    c->upstream_send_len = 4096;
+    c->resp_body_sent = 4096;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_status = 200;
+    c->keep_alive = c->req_keep_alive = c->req_client_keep_alive = true;
+    c->req_start_us = monotonic_us();
+    c->transition_to_sending(&on_proxy_response_sent<EpollEventLoop>);
+    on_proxy_response_sent<EpollEventLoop>(loop, *c, {c->id, 4096, 0, 0, IoEventType::Send});
+    CHECK_EQ(c->fd, fds[0]);
+    CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kSliceSize);
+    CHECK_EQ(loop->pool.bulk_available(), available);
+    CHECK_EQ(loop->pool.study_bulk_borrowed, 0u);
+    loop->close_conn(*c);
+    close(fds[1]);
+    loop->shutdown();
+    destroy_real_loop(loop);
+}
+
 TEST(epoll_bulk_body, preserves_bytes_and_releases_idle_bulk) {
     auto* loop = create_real_loop();
     REQUIRE(loop != nullptr);
@@ -86221,7 +86384,7 @@ TEST(epoll_bulk_body, preserves_bytes_and_releases_idle_bulk) {
     const u32 available = loop->pool.bulk_available();
     loop->upgrade_upstream_recv_to_bulk(*c);
     REQUIRE(loop->pool.is_bulk(c->upstream_recv_slice));
-    CHECK_EQ(c->upstream_recv_buf.capacity(), SlicePool::kBulkSliceSize);
+    CHECK_EQ(c->upstream_recv_buf.capacity(), loop->pool.bulk_buffer_size());
     CHECK_EQ(c->upstream_recv_buf.len(), 127u);
     for (u32 i = 0; i < 127; ++i) CHECK_EQ(c->upstream_recv_buf.data()[i], static_cast<u8>(i));
     CHECK_EQ(loop->pool.bulk_available(), available - 1);
@@ -86310,3 +86473,333 @@ TEST(epoll_bulk_body, refuses_ineligible_and_pinned_buffers_and_falls_back) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+#ifdef __linux__
+TEST(epoll_backpressure, full_proxy_buffer_survives_partial_client_send) {
+    RealEpollEpisodeGuard guard;
+    REQUIRE(guard.create());
+    REQUIRE(guard.init());
+    auto* loop = guard.loop;
+    auto* c = guard.alloc_conn();
+    REQUIRE(c != nullptr);
+    const u32 cid = c->id;
+    i32 client[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, client), 0);
+    c->fd = client[0];
+    guard.peer_fds[0] = client[1];
+    i32 upstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, upstream), 0);
+    c->upstream_fd = upstream[0];
+    guard.peer_fds[1] = upstream[1];
+    const i32 small = 4096;
+    REQUIRE_EQ(setsockopt(c->fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+    REQUIRE(loop->begin_upstream_episode(*c));
+    REQUIRE(loop->backend.add_recv(c->fd, cid));
+    REQUIRE(loop->backend.add_recv_upstream(c->upstream_fd, cid, c->upstream_episode));
+    REQUIRE(loop->alloc_upstream_buf(*c));
+    constexpr u32 first = SlicePool::kSliceSize;
+    constexpr u32 tail = 8192;
+    __builtin_memset(c->upstream_recv_buf.write_ptr(), 'x', first);
+    c->upstream_recv_buf.commit(first);
+    u8 suffix[tail];
+    __builtin_memset(suffix, 'y', tail);
+    REQUIRE_EQ(send(upstream[1], suffix, tail, MSG_NOSIGNAL), static_cast<ssize_t>(tail));
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = tail;
+    c->resp_body_sent = first;
+    c->upstream_send_len = first;
+    c->resp_status = 200;
+    c->req_start_us = monotonic_us();
+    c->transition_to_sending(&on_response_body_sent<EpollEventLoop>);
+    REQUIRE(loop->backend.add_send(c->fd, cid, c->upstream_recv_buf.data(), first));
+    REQUIRE_GT(loop->backend.send_state[cid].remaining, 0u);
+    IoEvent event{};
+    REQUIRE_EQ(loop->backend.wait(&event, 1, loop->conns, loop->connection_capacity), 1u);
+    REQUIRE_EQ(event.type, IoEventType::UpstreamRecv);
+    REQUIRE_EQ(event.result, -ENOBUFS);
+    loop->dispatch(event);
+    if (c->fd < 0) guard.release_conn(*c, cid);
+    REQUIRE_EQ(c->fd, client[0]);
+    CHECK_EQ(c->upstream_recv_buf.len(), first);
+    u8 peek[8];
+    REQUIRE_EQ(recv(c->upstream_fd, peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT),
+               static_cast<ssize_t>(sizeof(peek)));
+    CHECK_EQ(__builtin_memcmp(peek, suffix, sizeof(peek)), 0);
+
+    u32 received = 0;
+    u8 bytes[8192];
+    for (u32 step = 0; step < 1024 && received < first + tail; ++step) {
+        const ssize_t n = recv(client[1], bytes, sizeof(bytes), MSG_DONTWAIT);
+        if (n > 0) {
+            bool exact = true;
+            for (u32 i = 0; i < static_cast<u32>(n); ++i)
+                if (bytes[i] != (received + i < first ? 'x' : 'y')) exact = false;
+            CHECK(exact);
+            received += static_cast<u32>(n);
+        }
+        if (c->fd >= 0) {
+            pollfd ready{loop->backend.epoll_fd, POLLIN, 0};
+            if (loop->backend.pending_count != 0 || poll(&ready, 1, 0) > 0) {
+                const u32 count =
+                    loop->backend.wait(&event, 1, loop->conns, loop->connection_capacity);
+                if (count != 0) loop->dispatch(event);
+                if (c->fd < 0) guard.release_conn(*c, cid);
+            }
+        }
+    }
+    CHECK_EQ(received, first + tail);
+}
+#endif
+#ifdef __linux__
+TEST(epoll_backpressure, stale_and_failed_full_recv_never_mask_transport_errors) {
+    for (u32 scenario = 0; scenario < 3; ++scenario) {
+        RealEpollEpisodeGuard guard;
+        REQUIRE(guard.create());
+        REQUIRE(guard.init());
+        auto* loop = guard.loop;
+        auto* c = guard.alloc_conn();
+        REQUIRE(c != nullptr);
+        const u32 cid = c->id;
+        i32 client[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, client), 0);
+        c->fd = client[0];
+        guard.peer_fds[0] = client[1];
+        i32 upstream[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, upstream), 0);
+        c->upstream_fd = upstream[0];
+        guard.peer_fds[1] = upstream[1];
+        REQUIRE(loop->begin_upstream_episode(*c));
+        REQUIRE(loop->backend.add_recv_upstream(c->upstream_fd, cid, c->upstream_episode));
+        REQUIRE(loop->alloc_upstream_buf(*c));
+        c->upstream_recv_buf.commit(c->upstream_recv_buf.capacity());
+        c->transition_to_sending(&on_response_body_sent<EpollEventLoop>);
+        loop->backend.send_state[cid] = {c->upstream_recv_buf.data(),
+                                         c->fd,
+                                         0,
+                                         c->upstream_recv_buf.len(),
+                                         IoEventType::Send,
+                                         false,
+                                         0,
+                                         0};
+        const u32 interest_slot = EpollBackend::fd_interest_slot(cid, IoEventType::UpstreamRecv);
+        const u32 generation = loop->backend.fd_interest[interest_slot].gen;
+        IoEvent event{};
+        event.conn_id = cid;
+        event.type = IoEventType::UpstreamRecv;
+        event.result = -ENOBUFS;
+        event.upstream_episode = c->upstream_episode + (scenario == 0 ? 1u : 0u);
+        event.aux = scenario == 1 ? kLocalSubmitFailureAux : 0;
+        if (scenario == 2) {
+            SyscallFaultConfig config;
+            config.epoll_ctl_errno = EIO;
+            config.epoll_ctl_failures = 1;
+            ScopedSyscallFault fault(config);
+            loop->dispatch(event);
+        } else {
+            loop->dispatch(event);
+        }
+        if (scenario == 0) {
+            CHECK_EQ(c->fd, client[0]);
+            CHECK_EQ(loop->backend.fd_interest[interest_slot].gen, generation);
+            CHECK_EQ(loop->backend.fd_interest[interest_slot].fd, upstream[0]);
+        } else {
+            guard.release_conn(*c, cid);
+            CHECK_EQ(c->fd, -1);
+            CHECK_EQ(loop->backend.send_state[cid].remaining, 0u);
+            CHECK_EQ(loop->backend.active_upstream_episode[cid], 0u);
+        }
+    }
+}
+TEST(epoll_splice, current_response_only_and_stale_readiness_cannot_advance_pipe) {
+    constexpr u32 kChunk = EpollEventLoop::kResponseSpliceChunkSize;
+    RealEpollEpisodeGuard g;
+    REQUIRE(g.create());
+    REQUIRE(g.init());
+    Connection* c = g.alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2], upstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, downstream), 0);
+    g.peer_fds[0] = downstream[1];
+    c->fd = downstream[0];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, upstream), 0);
+    g.peer_fds[1] = upstream[1];
+    c->upstream_fd = upstream[0];
+    c->upstream_episode = 1;
+    REQUIRE(g.loop->backend.begin_upstream_episode(c->id, 1));
+    REQUIRE(g.loop->backend.add_recv(c->fd, c->id));
+    REQUIRE(g.loop->backend.add_recv_upstream(c->upstream_fd, c->id, 1));
+    c->state = ConnState::Proxying;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->request_upload_complete = true;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 4 * kChunk;
+    CHECK(g.loop->response_splice_eligible(*c));
+    g.loop->backend.active_upstream_episode[c->id] = 2;
+    CHECK_FALSE(g.loop->response_splice_eligible(*c));
+    g.loop->backend.active_upstream_episode[c->id] = 1;
+    g.loop->backend.upstream_fd_map[c->id] = -1;
+    CHECK_FALSE(g.loop->response_splice_eligible(*c));
+    g.loop->backend.upstream_fd_map[c->id] = c->upstream_fd;
+    c->relay_owner.read_cancel_owned = true;
+    CHECK_FALSE(g.loop->response_splice_eligible(*c));
+    c->relay_owner.read_cancel_owned = false;
+    c->tls_active = true;
+    CHECK_FALSE(g.loop->response_splice_eligible(*c));
+    c->tls_active = false;
+    c->resp_body_mode = BodyMode::Chunked;
+    CHECK_FALSE(g.loop->response_splice_eligible(*c));
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->response_policy_id = 1;
+    CHECK_FALSE(g.loop->response_splice_eligible(*c));
+    c->response_policy_id = 0;
+    c->throttle_down_bps = 1;
+    CHECK_FALSE(g.loop->response_splice_eligible(*c));
+    c->throttle_down_bps = 0;
+    g.loop->backend.send_state[c->id].remaining = 1;
+    CHECK_FALSE(g.loop->response_splice_eligible(*c));
+    g.loop->backend.clear_send_state(c->id);
+    u8 payload[kChunk];
+    for (u32 i = 0; i < sizeof(payload); ++i) payload[i] = static_cast<u8>(i);
+    REQUIRE_EQ(send(upstream[1], payload, sizeof(payload), MSG_NOSIGNAL),
+               static_cast<ssize_t>(sizeof(payload)));
+    REQUIRE(g.loop->start_response_splice(*c));
+    REQUIRE(c->relay_owner.active());
+    CHECK_EQ(c->resp_body_remaining, 3u * kChunk);
+    CHECK_EQ(c->resp_body_sent, kChunk);
+    CHECK_EQ(c->upstream_recv_buf.len(), 0u);
+    u8 received[sizeof(payload)];
+    REQUIRE_EQ(recv(downstream[1], received, sizeof(received), 0),
+               static_cast<ssize_t>(sizeof(received)));
+    CHECK_EQ(memcmp(payload, received, sizeof(payload)), 0);
+    g.loop->dispatch({c->id, 1, 0, 0, IoEventType::RelayRead, 0, 0, 2});
+    CHECK_EQ(c->resp_body_remaining, 3u * kChunk);
+    CHECK(c->relay_owner.read_armed);
+    REQUIRE_EQ(send(upstream[1], payload, sizeof(payload), MSG_NOSIGNAL),
+               static_cast<ssize_t>(sizeof(payload)));
+    IoEvent ready[1]{};
+    REQUIRE_EQ(g.loop->backend.wait(ready, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    REQUIRE_EQ(ready[0].type, IoEventType::RelayRead);
+    CHECK_EQ(ready[0].upstream_episode, 1u);
+    CHECK_EQ(c->upstream_recv_buf.len(), 0u);
+    g.loop->dispatch(ready[0]);
+    CHECK_EQ(c->resp_body_remaining, 2u * kChunk);
+    REQUIRE_EQ(recv(downstream[1], received, sizeof(received), 0),
+               static_cast<ssize_t>(sizeof(received)));
+    CHECK_EQ(memcmp(payload, received, sizeof(payload)), 0);
+    const i32 pipe_read = c->relay_owner.pipe_read, pipe_write = c->relay_owner.pipe_write;
+    const u32 cid = c->id;
+    close(g.peer_fds[0]);
+    g.peer_fds[0] = -1;
+    REQUIRE_EQ(g.loop->backend.wait(ready, 1, g.loop->conns, g.loop->connection_capacity), 1u);
+    REQUIRE_EQ(ready[0].type, IoEventType::RelayWrite);
+    REQUIRE_EQ(ready[0].result, -ECONNRESET);
+    g.loop->dispatch(ready[0]);
+    g.release_conn(*c, cid);
+    CHECK_EQ(c->fd, -1);
+    CHECK_EQ(fcntl(pipe_read, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_EQ(fcntl(pipe_write, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+}
+
+TEST(epoll_splice, downstream_backpressure_retains_pipe_and_does_not_read_ahead) {
+    constexpr u32 kChunk = EpollEventLoop::kResponseSpliceChunkSize;
+    RealEpollEpisodeGuard g;
+    REQUIRE(g.create());
+    REQUIRE(g.init());
+    Connection* c = g.alloc_conn();
+    REQUIRE(c != nullptr);
+    i32 downstream[2], upstream[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, downstream), 0);
+    g.peer_fds[0] = downstream[1];
+    c->fd = downstream[0];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, upstream), 0);
+    g.peer_fds[1] = upstream[1];
+    c->upstream_fd = upstream[0];
+    const i32 send_bytes = 4096;
+    REQUIRE_EQ(setsockopt(c->fd, SOL_SOCKET, SO_SNDBUF, &send_bytes, sizeof(send_bytes)), 0);
+    u8 filler[4096];
+    __builtin_memset(filler, 0xa5, sizeof(filler));
+    u32 prefix_remaining = 0;
+    ssize_t filled;
+    while ((filled = send(c->fd, filler, sizeof(filler), MSG_NOSIGNAL)) > 0)
+        prefix_remaining += static_cast<u32>(filled);
+    REQUIRE(prefix_remaining != 0);
+    REQUIRE(errno == EAGAIN || errno == EWOULDBLOCK);
+    c->upstream_episode = 1;
+    REQUIRE(g.loop->backend.begin_upstream_episode(c->id, 1));
+    REQUIRE(g.loop->backend.add_recv(c->fd, c->id));
+    REQUIRE(g.loop->backend.add_recv_upstream(c->upstream_fd, c->id, 1));
+    c->state = ConnState::Proxying;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->request_upload_complete = true;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 4 * kChunk;
+    u8 payload[kChunk];
+    for (u32 i = 0; i < sizeof(payload); ++i) payload[i] = static_cast<u8>(i);
+    REQUIRE_EQ(send(upstream[1], payload, sizeof(payload), MSG_NOSIGNAL),
+               static_cast<ssize_t>(sizeof(payload)));
+    REQUIRE(g.loop->start_response_splice(*c));
+    REQUIRE(c->relay_owner.active());
+    REQUIRE_EQ(c->relay_owner.phase, RelayPhase::Writing);
+    REQUIRE(c->relay_owner.write_armed);
+    CHECK(c->relay_owner.segment_sent < c->relay_owner.segment_len);
+    CHECK_EQ(c->resp_body_remaining, 3u * kChunk);
+    REQUIRE_EQ(send(upstream[1], payload, sizeof(payload), MSG_NOSIGNAL),
+               static_cast<ssize_t>(sizeof(payload)));
+    u8 peek;
+    REQUIRE_EQ(recv(c->upstream_fd, &peek, 1, MSG_PEEK), 1);
+    CHECK_EQ(peek, payload[0]);
+    // A forged read wakeup cannot consume more upstream bytes while a pipe
+    // segment is still owned by the slow downstream writer.
+    g.loop->dispatch({c->id, 1, 0, 0, IoEventType::RelayRead, 0, 0, 1});
+    CHECK_EQ(c->resp_body_remaining, 3u * kChunk);
+    u32 received = 0;
+    for (u32 turn = 0; turn < 128 && received < 2u * kChunk; ++turn) {
+        u8 bytes[8192];
+        ssize_t n;
+        while ((n = recv(downstream[1], bytes, sizeof(bytes), 0)) > 0) {
+            for (u32 i = 0; i < static_cast<u32>(n); ++i) {
+                if (prefix_remaining != 0) {
+                    REQUIRE_EQ(bytes[i], 0xa5);
+                    --prefix_remaining;
+                } else {
+                    REQUIRE_EQ(bytes[i], static_cast<u8>(received));
+                    ++received;
+                }
+            }
+        }
+        if (c->relay_owner.write_armed)
+            g.loop->dispatch({c->id, 1, 0, 0, IoEventType::RelayWrite, 0, 0, 1});
+        else if (c->relay_owner.read_armed)
+            g.loop->dispatch({c->id, 1, 0, 0, IoEventType::RelayRead, 0, 0, 1});
+    }
+    CHECK_EQ(received, 2u * kChunk);
+    CHECK_EQ(c->resp_body_remaining, 2u * kChunk);
+    CHECK_EQ(c->relay_owner.segment_len, 0u);
+    REQUIRE_EQ(c->relay_owner.phase, RelayPhase::Reading);
+    struct epoll_event idle[1];
+    CHECK_EQ(epoll_wait(g.loop->backend.epoll_fd, idle, 1, 0), 0);
+    const i32 pipe_read = c->relay_owner.pipe_read, pipe_write = c->relay_owner.pipe_write;
+    g.close_conn(*c);
+    CHECK_EQ(fcntl(pipe_read, F_GETFD), -1);
+    CHECK_EQ(fcntl(pipe_write, F_GETFD), -1);
+}
+
+TEST(epoll_splice, relay_read_and_write_tokens_keep_episode_and_independent_fd_slots) {
+    const u32 cid = 7, episode = 23;
+    for (IoEventType type : {IoEventType::RelayRead, IoEventType::RelayWrite}) {
+        UpstreamEventToken decoded{};
+        REQUIRE(decode_upstream_event_token(encode_upstream_event_token({cid, type, episode, 0}),
+                                            &decoded));
+        CHECK_EQ(decoded.conn_id, cid);
+        CHECK_EQ(decoded.episode, episode);
+        CHECK_EQ(decoded.type, type);
+        CHECK_EQ(encode_upstream_event_token({cid, type, 0, 0}), kInvalidIoUserData);
+    }
+    CHECK_EQ(EpollBackend::fd_interest_slot(cid, IoEventType::RelayRead),
+             EpollBackend::fd_interest_slot(cid, IoEventType::UpstreamRecv));
+    CHECK_EQ(EpollBackend::fd_interest_slot(cid, IoEventType::RelayWrite),
+             EpollBackend::fd_interest_slot(cid, IoEventType::Send));
+}
+
+#endif
