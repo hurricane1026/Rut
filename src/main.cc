@@ -124,6 +124,48 @@ static void write_error(const char* prefix, const rut::Error& err) {
 }
 
 #ifdef __linux__
+static const char* io_uring_init_failure_detail_name(IoUringInitFailureDetail detail) {
+    switch (detail) {
+        case IoUringInitFailureDetail::None:
+            return "None";
+        case IoUringInitFailureDetail::InvalidLifecycle:
+            return "InvalidLifecycle";
+        case IoUringInitFailureDetail::SendStateStorage:
+            return "SendStateStorage";
+        case IoUringInitFailureDetail::QueueSetup:
+            return "QueueSetup";
+        case IoUringInitFailureDetail::QueueSetupFeatureFlagsUnsupported:
+            return "QueueSetupFeatureFlagsUnsupported";
+        case IoUringInitFailureDetail::SqRingMapping:
+            return "SqRingMapping";
+        case IoUringInitFailureDetail::SqeMapping:
+            return "SqeMapping";
+        case IoUringInitFailureDetail::CqRingMapping:
+            return "CqRingMapping";
+        case IoUringInitFailureDetail::RingSizeInvariant:
+            return "RingSizeInvariant";
+        case IoUringInitFailureDetail::TerminalWindowMapping:
+            return "TerminalWindowMapping";
+        case IoUringInitFailureDetail::TerminalSlotMapping:
+            return "TerminalSlotMapping";
+        case IoUringInitFailureDetail::ProvidedBufferMapping:
+            return "ProvidedBufferMapping";
+        case IoUringInitFailureDetail::ProvidedBufferRingMapping:
+            return "ProvidedBufferRingMapping";
+        case IoUringInitFailureDetail::ProvidedBufferRingRegistration:
+            return "ProvidedBufferRingRegistration";
+        case IoUringInitFailureDetail::ProvidedBufferRingUnsupported:
+            return "ProvidedBufferRingUnsupported";
+        case IoUringInitFailureDetail::TimerfdCreate:
+            return "TimerfdCreate";
+        case IoUringInitFailureDetail::TimerfdSettime:
+            return "TimerfdSettime";
+    }
+    return "Unknown";
+}
+#endif
+
+#ifdef __linux__
 static void write_memlock_limit(rlim_t v) {
     if (v == RLIM_INFINITY) {
         write_str("unlimited");
@@ -354,6 +396,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                    u32 pool_prealloc,
                                    u32 connection_capacity,
                                    TlsServerContext* tls_server,
+                                   bool allow_io_uring_fallback,
                                    const char* access_log_path,
                                    bool access_log_compress,
                                    i32 access_log_level,
@@ -411,8 +454,14 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             write_u32(i);
             write_error("", rc.error());
 #ifdef __linux__
+            if (rc.error().source == Error::Source::IoUring) {
+                write_str("io_uring startup initialization failed (detail=");
+                write_str(io_uring_init_failure_detail_name(shards[i].init_failure_detail()));
+                write_str(")\n");
+            }
             if (rc.error().source == Error::Source::IoUring && rc.error().code == ENOMEM)
-                report_io_uring_enomem(i, shard_count, connection_capacity, tls_server != nullptr);
+                report_io_uring_enomem(
+                    i, shard_count, connection_capacity, allow_io_uring_fallback);
 #endif
             close(lfd);
             for (u32 j = 0; j < i; j++) {
@@ -814,6 +863,9 @@ int main(int argc, char** argv) {
     bool serve_metrics = false;
     i32 access_log_level = AccessLogFlusher::kDefaultLevel;
     bool cli_access_log_level_present = false;
+    enum class BackendSelection : u8 { Auto, Epoll, IoUring };
+    BackendSelection backend_selection = BackendSelection::Auto;
+    bool backend_specified = false;
     u32 opt_level = 2;  // JIT IR optimization level (0=low/fast-start .. 3=high)
 
     // Simple arg parsing: [port] [program.rut | --compile PATH]
@@ -827,6 +879,35 @@ int main(int argc, char** argv) {
     //   /metrics?…) is served by the built-in endpoint ahead of route matching,
     //   shadowing any user route on that path. Non-GET methods are unaffected.
     for (int i = 1; i < argc; i++) {
+        if (str_eq(argv[i], "--backend")) {
+            if (backend_specified) {
+                write_str("--backend specified twice\n");
+                return 1;
+            }
+            if (i + 1 >= argc || !argv[i + 1][0] || starts_with_dash_dash(argv[i + 1])) {
+                write_str("--backend requires auto, epoll or io_uring\n");
+                return 1;
+            }
+            const char* value = argv[++i];
+            if (str_eq(value, "auto"))
+                backend_selection = BackendSelection::Auto;
+            else if (str_eq(value, "epoll"))
+                backend_selection = BackendSelection::Epoll;
+            else if (str_eq(value, "io_uring"))
+                backend_selection = BackendSelection::IoUring;
+            else {
+                write_str("--backend must be auto, epoll or io_uring\n");
+                return 1;
+            }
+#ifndef __linux__
+            if (backend_selection != BackendSelection::Auto) {
+                write_str("--backend epoll and io_uring require Linux\n");
+                return 1;
+            }
+#endif
+            backend_specified = true;
+            continue;
+        }
         if (is_all_digits(argv[i])) {
             if (!parse_cli_port(argv[i], cli_port)) {
                 write_str("CLI listen port must be between 0 and 65535\n");
@@ -1224,6 +1305,7 @@ int main(int argc, char** argv) {
                                           pool_prealloc,
                                           connection_capacity,
                                           tls_server,
+                                          false,
                                           access_log_path,
                                           access_log_compress,
                                           access_log_level,
@@ -1234,23 +1316,35 @@ int main(int argc, char** argv) {
 #else
     // io_uring now terminates TLS too (event-loop TlsEngine), so it is preferred
     // whenever available — TLS no longer forces the epoll fallback.
-    if (detect_io_uring()) {
+    const bool use_io_uring = backend_selection != BackendSelection::Epoll && detect_io_uring();
+    if (backend_selection == BackendSelection::IoUring && !use_io_uring) {
+        write_str("--backend io_uring requested, but io_uring is unavailable\n");
+        destroy_tls_server_context(tls_server);
+#ifdef RUT_ENABLE_JIT
+        program.destroy();
+#endif
+        return 1;
+    }
+    if (use_io_uring) {
         write_str(tls_server ? "Backend: io_uring (TLS)\n" : "Backend: io_uring\n");
-        outcome = run_shards<IoUringEventLoop>(listener,
-                                               shard_count,
-                                               pin_cpus,
-                                               drain_secs,
-                                               pool_prealloc,
-                                               connection_capacity,
-                                               tls_server,
-                                               access_log_path,
-                                               access_log_compress,
-                                               access_log_level,
-                                               source_live_fd_ptr,
-                                               route_config,
-                                               serve_metrics,
-                                               relay_stats_enabled);
-        if (outcome.kind == RunShardsOutcomeKind::IoUringStartupFailure && tls_server) {
+        outcome = run_shards<IoUringEventLoop>(
+            listener,
+            shard_count,
+            pin_cpus,
+            drain_secs,
+            pool_prealloc,
+            connection_capacity,
+            tls_server,
+            tls_server != nullptr && backend_selection == BackendSelection::Auto,
+            access_log_path,
+            access_log_compress,
+            access_log_level,
+            source_live_fd_ptr,
+            route_config,
+            serve_metrics,
+            relay_stats_enabled);
+        if (outcome.kind == RunShardsOutcomeKind::IoUringStartupFailure && tls_server &&
+            backend_selection == BackendSelection::Auto) {
             write_str("Backend: io_uring TLS startup failed; falling back to epoll (TLS)\n");
             outcome = run_shards<EpollEventLoop>(listener,
                                                  shard_count,
@@ -1259,6 +1353,7 @@ int main(int argc, char** argv) {
                                                  pool_prealloc,
                                                  connection_capacity,
                                                  tls_server,
+                                                 false,
                                                  access_log_path,
                                                  access_log_compress,
                                                  access_log_level,
@@ -1276,6 +1371,7 @@ int main(int argc, char** argv) {
                                              pool_prealloc,
                                              connection_capacity,
                                              tls_server,
+                                             false,
                                              access_log_path,
                                              access_log_compress,
                                              access_log_level,

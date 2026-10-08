@@ -3729,3 +3729,9 @@ else()
         COMMENT "Running non-JIT tests..."
     )
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+add_test(NAME test_cli_backend
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_backend.py $<TARGET_FILE:rut>)
+set_tests_properties(test_cli_backend PROPERTIES LABELS "cli" RUN_SERIAL TRUE TIMEOUT 45)
+endif()
