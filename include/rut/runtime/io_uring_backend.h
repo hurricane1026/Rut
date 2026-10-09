@@ -425,10 +425,15 @@ struct IoUringBackend {
     void cancel_accept();
 
     // Wait for completions. Returns number of events filled.
-    // Calls io_uring_enter to submit pending SQEs and wait for CQEs.
+    // Submit pending SQEs and harvest CQEs. With wait_for_event=false,
+    // service kernel work without blocking while the shard has runnable work.
     // conns: connection table — recv completions using provided buffers are
     // copied into conns[conn_id].recv_buf. max_conns: table size for bounds checking.
-    u32 wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns);
+    u32 wait(IoEvent* events,
+             u32 max_events,
+             Connection* conns,
+             u32 max_conns,
+             bool wait_for_event = true);
 
     i32 failure_code() const { return fatal_error.load(std::memory_order_acquire); }
 

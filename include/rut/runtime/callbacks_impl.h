@@ -8829,6 +8829,11 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
                          conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->start_response_splice_after_header(c);
+                      }) {
+            if (loop->start_response_splice_after_header(conn)) return;
+        }
         if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }
@@ -9389,6 +9394,8 @@ void proxy_stream_complete(Loop* loop, Connection& conn) {
         return;
     }
     if (!prepare_clean_strict_upstream_retirement(loop, conn)) return;
+    if constexpr (requires { loop->study_note_proxy_complete(conn); })
+        loop->study_note_proxy_complete(conn);
     conn.tls_proxy_stream = false;
     conn.resp_fully_buffered = false;
     conn.tls_recv_paused_hw = false;  // per-response; must not leak into the next request
@@ -13620,8 +13627,13 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
     }
 
     if (conn.upstream_start_us != 0) {
-        conn.upstream_us = static_cast<u32>(monotonic_us() - conn.upstream_start_us);
+        const u64 first_response_us = monotonic_us();
+        conn.upstream_us = static_cast<u32>(first_response_us - conn.upstream_start_us);
         conn.upstream_start_us = 0;
+        if constexpr (requires { loop->study_note_first_response(conn, first_response_us); }) {
+            if (ev.result > 0 || conn.upstream_recv_buf.len() != 0)
+                loop->study_note_first_response(conn, first_response_us);
+        }
     }
 
     if (ev.result <= 0 && conn.upstream_recv_buf.len() == 0) {
@@ -14524,6 +14536,11 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
         }
     }
 
+    if constexpr (requires { loop->study_note_response_size(conn, resp.content_length); }) {
+        if (conn.resp_body_mode == BodyMode::ContentLength)
+            loop->study_note_response_size(conn, resp.content_length);
+    }
+
     bool body_complete = false;
     if (conn.resp_body_mode == BodyMode::None) {
         body_complete = true;
@@ -14666,6 +14683,8 @@ void on_proxy_response_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     if (!prepare_clean_strict_upstream_retirement(loop, conn)) return;
+    if constexpr (requires { loop->study_note_proxy_complete(conn); })
+        loop->study_note_proxy_complete(conn);
 
     // One-shot proxy response complete (header-only / small Content-Length that
     // finished in the first read). Release the backend concurrency slot promptly

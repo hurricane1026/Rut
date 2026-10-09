@@ -4,6 +4,7 @@
 #include "rut/runtime/callbacks.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/error.h"
+#include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/response_read_deadline.h"
 
@@ -1241,7 +1242,8 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
 
 // --- Wait (submit + harvest) ---
 
-u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 max_conns) {
+u32 IoUringBackend::wait(
+    IoEvent* events, u32 max_events, Connection* conns, u32 max_conns, bool wait_for_event) {
     if (failure_code() != 0) return 0;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
@@ -1255,12 +1257,12 @@ u32 IoUringBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32
     const bool kernel_work = (kernel_flags & (IORING_SQ_CQ_OVERFLOW | IORING_SQ_TASKRUN)) != 0;
     u32 flags = IORING_ENTER_GETEVENTS;
     i32 ret;
-    while (pending != 0 || !ready || kernel_work) {
+    while (pending != 0 || (wait_for_event && !ready) || kernel_work) {
         if (pending > 0) {
-            ret = io_uring_enter(ring_fd, pending, 1, flags);
+            ret = io_uring_enter(ring_fd, pending, wait_for_event ? 1u : 0u, flags);
             if (ret >= 0) pending -= static_cast<u32>(ret);
         } else {
-            ret = io_uring_enter(ring_fd, 0, 1, flags);
+            ret = io_uring_enter(ring_fd, 0, wait_for_event ? 1u : 0u, flags);
         }
         if (ret >= 0) break;
         if (ret == -EINTR) continue;
