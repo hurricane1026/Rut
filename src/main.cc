@@ -679,6 +679,29 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 write_str("\n");
             }
         }
+        if (relay_stats_enabled) {
+            if constexpr (requires { shards[0].loop->study_relay_turns; }) {
+                for (u32 i = 0; i < shard_count; ++i) {
+                    const auto& loop = *shards[i].loop;
+                    write_str("RUT_SCHED_STATS turns=");
+                    write_u64(loop.study_relay_turns);
+                    write_str(" yields=");
+                    write_u64(loop.study_relay_yields);
+                    write_str(" calls=");
+                    write_u64(loop.study_relay_calls);
+                    write_str(" probes=");
+                    write_u64(loop.study_cq_probes);
+                    write_str(" inspected=");
+                    write_u64(loop.study_cq_entries);
+                    write_str(" types=");
+                    for (u32 j = 0; j <= static_cast<u32>(IoEventType::Count); ++j) {
+                        write_u64(loop.study_yield_types[j]);
+                        write_str(",");
+                    }
+                    write_str("\n");
+                }
+            }
+        }
         for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
         return success;
     };

@@ -128,6 +128,13 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_direct_body_full = 0;
     u64 study_completed_responses = 0;
     u64 study_body_sends = 0;
+    bool study_yield_enabled = true;
+    u64 study_relay_turns = 0;
+    u64 study_relay_yields = 0;
+    u64 study_relay_calls = 0;
+    u64 study_cq_probes = 0;
+    u64 study_cq_entries = 0;
+    u64 study_yield_types[static_cast<u32>(IoEventType::Count) + 1]{};
     IoUringBackend backend;
     TimerWheel timer;
     u32 shard_id = 0;
@@ -3895,7 +3902,8 @@ public:
         if (!arm_response_splice_read(c)) handle_response_splice_poll_failure(c);
     }
 
-    bool has_ordinary_cq_work() const {
+    bool has_ordinary_cq_work() {
+        ++study_cq_probes;
         if (!backend.cq_head || !backend.cq_tail) return false;
         const u32 head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
         const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
@@ -3907,11 +3915,16 @@ public:
         const u32 count = std::min<u32>(tail - head, 32);
         for (u32 i = 0; i < count; ++i) {
             const auto& cqe = backend.cq_entries[(head + i) & *backend.cq_ring_mask];
+            ++study_cq_entries;
+            const u32 tag = static_cast<u32>(cqe.user_data & 0xFFu);
+            const u32 type = std::min<u32>(tag, static_cast<u32>(IoEventType::Count));
             UpstreamEventToken token{};
             if (!decode_upstream_event_token(cqe.user_data, &token) ||
                 (token.type != IoEventType::RelayRead && token.type != IoEventType::RelayWrite) ||
-                token.aux != 0 || cqe.res < 0 || token.conn_id >= slots_initialized)
+                token.aux != 0 || cqe.res < 0 || token.conn_id >= slots_initialized) {
+                ++study_yield_types[type];
                 return true;
+            }
             const Connection& c = conns[token.conn_id];
             const RelayOwner& r = c.relay_owner;
             if (!r.active() || r.close_pending || token.episode != c.upstream_episode ||
@@ -3924,6 +3937,8 @@ public:
     }
 
     void flush_deferred_relay_reads() {
+        ++study_relay_turns;
+        const u32 start_calls = relay_budget_calls;
         const u32 kCount = deferred_relay_read_count;
         for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
             // Reserve a read and write. Unprocessed entries retain FIFO order
@@ -3932,7 +3947,10 @@ public:
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
-            if (relay_budget_calls <= 8 && has_ordinary_cq_work()) break;
+            if (relay_budget_calls <= 8 && has_ordinary_cq_work() && study_yield_enabled) {
+                ++study_relay_yields;
+                break;
+            }
             const u32 kId = deferred_relay_read_ids[0];
             const u32 kEpisode = deferred_relay_read_episodes[0];
             --deferred_relay_read_count;
@@ -3977,6 +3995,7 @@ public:
                 if (!submit_recv_upstream(c)) close_conn(c);
             }
         }
+        study_relay_calls += start_calls - relay_budget_calls;
     }
 
     void clear_deferred_relay_read(u32 id) {
