@@ -129,6 +129,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_completed_responses = 0;
     u64 study_body_sends = 0;
     bool study_yield_enabled = true;
+    u64 ordinary_cq_wait_limit_ns = 80 * 1000;
     u64 study_relay_turns = 0;
     u64 study_relay_yields = 0;
     u64 study_relay_calls = 0;
@@ -3940,6 +3941,10 @@ public:
         ++study_relay_turns;
         const u32 start_calls = relay_budget_calls;
         const u32 kCount = deferred_relay_read_count;
+        // CQEs have no completion timestamp. Measure only how long ordinary
+        // work has been observed pending during this relay flush, not its
+        // true kernel age. Reset the observation whenever the CQ is quiet.
+        u64 ordinary_since_ns = has_ordinary_cq_work() ? monotonic_ns() : 0;
         for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
             // Reserve a read and write. Unprocessed entries retain FIFO order
             // into the next turn; a completed segment rejoins at the tail.
@@ -3947,9 +3952,17 @@ public:
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
-            if (relay_budget_calls <= 8 && has_ordinary_cq_work() && study_yield_enabled) {
-                ++study_relay_yields;
-                break;
+            if (relay_budget_calls <= 8 && study_yield_enabled) {
+                if (has_ordinary_cq_work()) {
+                    const u64 now = monotonic_ns();
+                    if (ordinary_since_ns == 0) ordinary_since_ns = now;
+                    if (now - ordinary_since_ns >= ordinary_cq_wait_limit_ns) {
+                        ++study_relay_yields;
+                        break;
+                    }
+                } else {
+                    ordinary_since_ns = 0;
+                }
             }
             const u32 kId = deferred_relay_read_ids[0];
             const u32 kEpisode = deferred_relay_read_episodes[0];

@@ -39007,6 +39007,10 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     auto* saved_tail = loop->backend.cq_tail;
     loop->backend.cq_head = &fake_head;
     loop->backend.cq_tail = &fake_tail;
+    // Zero threshold exercises immediate expiry deterministically; runtime
+    // uses a bounded observation interval rather than CQ presence alone.
+    const u64 saved_wait_limit = loop->ordinary_cq_wait_limit_ns;
+    loop->ordinary_cq_wait_limit_ns = 0;
     CHECK_TRUE(loop->has_ordinary_cq_work());
     fake_cqe.user_data =
         encode_upstream_event_token({conn->id, IoEventType::RelayRead, conn->upstream_episode, 0});
@@ -39022,6 +39026,13 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     CHECK_EQ(loop->deferred_relay_read_count, 1u);
     CHECK_EQ(loop->relay_pulled_bytes, 0u);
     CHECK_EQ(loop->relay_budget_calls, 8u);
+    // Pending ordinary work that has not reached the observation limit must
+    // not prevent a runnable body from using its remaining turn budget.
+    loop->ordinary_cq_wait_limit_ns = ~static_cast<u64>(0);
+    loop->flush_deferred_relay_reads();
+    CHECK_EQ(loop->deferred_relay_read_count, 0u);
+    CHECK_EQ(loop->relay_pulled_bytes, sizeof(expected));
+    loop->ordinary_cq_wait_limit_ns = saved_wait_limit;
     loop->backend.cq_entries = saved_entries;
     loop->backend.cq_ring_mask = saved_mask;
     loop->backend.cq_head = saved_head;
