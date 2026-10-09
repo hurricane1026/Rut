@@ -145,7 +145,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
 
     void study_note_first_response(const Connection& c, u64 now_us) {
         if (c.req_start_us == 0 || now_us < c.req_start_us ||
-            now_us - c.req_start_us > 60 * 1000000u)
+            now_us - c.req_start_us > 60ull * 1000000u)
             return;
         u32 rng = study_phase_rng;
         rng ^= rng << 13;
@@ -242,7 +242,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     }
 
     bool study_yield_enabled = true;
-    u64 ordinary_cq_wait_limit_ns = 80 * 1000;
+    u64 ordinary_cq_wait_limit_ns = 80ull * 1000;
     u64 study_relay_turns = 0;
     u64 study_relay_yields = 0;
     u64 study_relay_calls = 0;
@@ -265,8 +265,10 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // again before that nested call returns.
     SyncSendCompletionGuard in_sync_send_completion{};
     // Shared fairness budget for synchronous relay progress within one wait turn.
-    u32 relay_budget_calls = 16;
-    u32 relay_budget_bytes = 1024 * 1024;
+    static constexpr u32 kRelayTurnMaxCalls = 16;
+    static constexpr u32 kRelayTurnMaxBytes = 1024 * 1024;
+    u32 relay_budget_calls = kRelayTurnMaxCalls;
+    u32 relay_budget_bytes = kRelayTurnMaxBytes;
     u32 relay_cancel_retry_count = 0;
     static constexpr u32 kDeferredRelayReadLimit = kMaxEventsPerWait;
     u32 deferred_relay_read_count = 0;
@@ -741,8 +743,8 @@ public:
                 running_.store(false, std::memory_order_release);
                 break;
             }
-            relay_budget_calls = 16;
-            relay_budget_bytes = 1024 * 1024;
+            relay_budget_calls = kRelayTurnMaxCalls;
+            relay_budget_bytes = kRelayTurnMaxBytes;
             dispatch_batch(events, kEventCount);
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();

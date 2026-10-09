@@ -105,12 +105,13 @@ bool read_exact(i32 fd, u8* data, u32 len) {
 
 bool pump_once(IoUringEventLoop& loop) {
     IoEvent events[kMaxEventsPerWait]{};
-    const u32 count =
-        loop.backend.wait(events, kMaxEventsPerWait, loop.conns, IoUringEventLoop::kMaxConns);
-    if (count == 0) return false;
+    const bool runnable = loop.deferred_relay_read_count != 0;
+    const u32 count = loop.backend.wait(
+        events, kMaxEventsPerWait, loop.conns, IoUringEventLoop::kMaxConns, !runnable);
+    if (loop.backend.failure_code() != 0 || (count == 0 && !runnable)) return false;
     // Match the production run loop's fresh per-wait shared splice budget.
-    loop.relay_budget_calls = 8;
-    loop.relay_budget_bytes = 512 * 1024;
+    loop.relay_budget_calls = IoUringEventLoop::kRelayTurnMaxCalls;
+    loop.relay_budget_bytes = IoUringEventLoop::kRelayTurnMaxBytes;
     loop.dispatch_batch(events, count);
     return true;
 }
@@ -168,8 +169,8 @@ TEST(iouring_splice, shared_budget_yields_and_finishes_exact_body) {
     REQUIRE(loop.test_start_response_splice(*conns[1]));
     CHECK_EQ(loop.relay_pulled_bytes, 128u * 1024u);
     CHECK_EQ(loop.relay_written_bytes, 128u * 1024u);
-    CHECK_EQ(loop.relay_budget_calls, 4u);
-    CHECK_EQ(loop.relay_budget_bytes, 256u * 1024u);
+    CHECK_EQ(loop.relay_budget_calls, IoUringEventLoop::kRelayTurnMaxCalls - 4u);
+    CHECK_EQ(loop.relay_budget_bytes, IoUringEventLoop::kRelayTurnMaxBytes - 256u * 1024u);
     CHECK_EQ(loop.deferred_relay_read_count, 2u);
     for (Connection* c : conns) {
         CHECK_FALSE(c->relay_owner.read_armed);
@@ -366,7 +367,8 @@ TEST(iouring_splice, large_owner_set_shares_budget_before_batch_flush) {
     ScopedIoUringLoop guard;
     if (!guard.init()) SKIP("io_uring unavailable");
     auto& loop = *guard.loop;
-    constexpr u32 kOwnerCount = 5;
+    constexpr u32 kOwnersPerTurn = IoUringEventLoop::kRelayTurnMaxCalls / 2;
+    constexpr u32 kOwnerCount = kOwnersPerTurn + 1;
     constexpr u32 kFirstTurn = 64 * 1024;
     constexpr u32 kBody = 128 * 1024;
     static u8 expected[kOwnerCount][kBody];
@@ -391,11 +393,11 @@ TEST(iouring_splice, large_owner_set_shares_budget_before_batch_flush) {
 
     for (Connection* c : conns) REQUIRE(loop.test_start_response_splice(*c));
 
-    CHECK_EQ(loop.relay_pulled_bytes, 4u * kFirstTurn);
-    CHECK_EQ(loop.relay_written_bytes, 4u * kFirstTurn);
+    CHECK_EQ(loop.relay_pulled_bytes, kOwnersPerTurn * kFirstTurn);
+    CHECK_EQ(loop.relay_written_bytes, kOwnersPerTurn * kFirstTurn);
     CHECK_EQ(loop.relay_budget_calls, 0u);
     CHECK_EQ(loop.relay_budget_bytes, 0u);
-    CHECK_EQ(loop.deferred_relay_read_count, 4u);
+    CHECK_EQ(loop.deferred_relay_read_count, kOwnerCount);
     for (u32 i = 0; i < kOwnerCount - 1; ++i) {
         CHECK(conns[i]->relay_owner.active());
         CHECK_FALSE(conns[i]->relay_owner.read_armed);
@@ -403,16 +405,17 @@ TEST(iouring_splice, large_owner_set_shares_budget_before_batch_flush) {
         CHECK_EQ(conns[i]->relay_owner.body_bytes, kFirstTurn);
         CHECK_EQ(conns[i]->pending_ops, 0u);
     }
-    CHECK(conns[kOwnerCount - 1]->relay_owner.read_armed);
-    CHECK_EQ(conns[kOwnerCount - 1]->pending_ops, 1u);
+    CHECK_FALSE(conns[kOwnerCount - 1]->relay_owner.read_armed);
+    CHECK_EQ(conns[kOwnerCount - 1]->relay_owner.body_bytes, 0u);
+    CHECK_EQ(conns[kOwnerCount - 1]->pending_ops, 0u);
 
-    // The first four owners were parked until the batch boundary.  Flushing
-    // admits their real read polls; all later progress comes from kernel CQEs.
+    // An exhausted turn keeps all owners runnable, including the owner that
+    // has not moved a byte yet. It must not manufacture readiness polls.
     loop.flush_deferred_relay_reads();
-    CHECK_EQ(loop.deferred_relay_read_count, 0u);
+    CHECK_EQ(loop.deferred_relay_read_count, kOwnerCount);
     for (Connection* c : conns) {
-        CHECK(c->relay_owner.read_armed);
-        CHECK_EQ(c->pending_ops, 1u);
+        CHECK_FALSE(c->relay_owner.read_armed);
+        CHECK_EQ(c->pending_ops, 0u);
     }
     for (u32 i = 0; i < kOwnerCount; ++i)
         REQUIRE(send_all(upstream[i][1], expected[i] + kFirstTurn, kBody - kFirstTurn));

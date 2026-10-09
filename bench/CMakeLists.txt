@@ -53,7 +53,7 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/testing
         ${LLVM_INCLUDE_DIRS}
     )
-    target_compile_definitions(bench_art_jit_spike PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(bench_art_jit_spike PRIVATE ${RUT_LLVM_DEFINITIONS})
     target_compile_options(bench_art_jit_spike PRIVATE -O3 -DNDEBUG)
 endif()
 
@@ -94,7 +94,7 @@ if(RUT_ENABLE_JIT)
         ${LLVM_INCLUDE_DIRS}
     )
     target_compile_definitions(bench_dispatch_compare PRIVATE
-        ${LLVM_DEFINITIONS}
+        ${RUT_LLVM_DEFINITIONS}
         BENCH_SIMD_BACKEND="${SIMD_ARCH}"
     )
     target_compile_options(bench_dispatch_compare PRIVATE -O3 -DNDEBUG ${SIMD_FLAGS})
