@@ -38989,6 +38989,9 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     REQUIRE(loop->test_start_response_splice(*conn));
     CHECK_EQ(loop->deferred_relay_read_count, 1u);
     CHECK_EQ(conn->pending_ops, 0u);
+    // A smaller existing pipe must still make exact progress when the read
+    // chunk limit is larger than its capacity (also covers resize fallback).
+    REQUIRE_EQ(fcntl(conn->relay_owner.pipe_write, F_SETPIPE_SZ, 64 * 1024), 64 * 1024);
     loop->relay_budget_calls = 8;
     loop->relay_budget_bytes = 512 * 1024;
     // A completion arriving after the first half of the larger quantum must

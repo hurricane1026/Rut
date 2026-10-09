@@ -128,6 +128,9 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_direct_body_full = 0;
     u64 study_completed_responses = 0;
     u64 study_body_sends = 0;
+    static constexpr u32 kResponseSpliceChunkSize = 128 * 1024;
+    u64 study_large_pipes = 0;
+    u64 study_small_pipes = 0;
     u64 study_splice_calls[2]{};
     u64 study_splice_eagain[2]{};
     u64 study_splice_short[2]{};
@@ -4099,11 +4102,18 @@ public:
             // F_SETPIPE_SZ returns the actual capacity. The pipe is still
             // private here, so a second F_GETPIPE_SZ only adds a syscall to
             // every new relay connection.
-            if (::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024) < 64 * 1024) {
+            int capacity = ::fcntl(fds[1], F_SETPIPE_SZ, kResponseSpliceChunkSize);
+            if (capacity < 64 * 1024 && kResponseSpliceChunkSize > 64 * 1024)
+                capacity = ::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024);
+            if (capacity < 64 * 1024) {
                 ::close(fds[0]);
                 ::close(fds[1]);
                 return false;
             }
+            if (capacity >= 128 * 1024)
+                ++study_large_pipes;
+            else
+                ++study_small_pipes;
             c.relay_owner.pipe_read = fds[0];
             c.relay_owner.pipe_write = fds[1];
         }
@@ -4163,13 +4173,14 @@ public:
         }
         if (ev.type == IoEventType::RelayRead) {
             r.read_armed = false;
-            if (relay_budget_calls == 0 || relay_budget_bytes == 0) {
+            if (relay_budget_calls < 2 || relay_budget_bytes < 2) {
                 defer_response_splice_read(c);
                 return;
             }
             --relay_budget_calls;
             const u32 want =
-                std::min<u32>(std::min<u32>(c.resp_body_remaining, 64 * 1024), relay_budget_bytes);
+                std::min<u32>(std::min<u32>(c.resp_body_remaining, kResponseSpliceChunkSize),
+                              relay_budget_bytes / 2);
             const bool sampled = (++study_splice_calls[0] & 63u) == 0;
             const u64 syscall_start = sampled ? monotonic_ns() : 0;
             const ssize_t n = ::splice(c.upstream_fd,
