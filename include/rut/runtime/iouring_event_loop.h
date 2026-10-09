@@ -3895,6 +3895,34 @@ public:
         if (!arm_response_splice_read(c)) handle_response_splice_poll_failure(c);
     }
 
+    bool has_ordinary_cq_work() const {
+        if (!backend.cq_head || !backend.cq_tail) return false;
+        const u32 head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
+        const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        if (head == tail) return false;
+        if (!backend.cq_entries || !backend.cq_ring_mask || tail - head > backend.cq_ring_entries)
+            return true;
+        // Peek only; wait() retains sole ownership of CQ consumption and all
+        // cancellation/proactor accounting. Bound the scheduler hint's cost.
+        const u32 count = std::min<u32>(tail - head, 32);
+        for (u32 i = 0; i < count; ++i) {
+            const auto& cqe = backend.cq_entries[(head + i) & *backend.cq_ring_mask];
+            UpstreamEventToken token{};
+            if (!decode_upstream_event_token(cqe.user_data, &token) ||
+                (token.type != IoEventType::RelayRead && token.type != IoEventType::RelayWrite) ||
+                token.aux != 0 || cqe.res < 0 || token.conn_id >= slots_initialized)
+                return true;
+            const Connection& c = conns[token.conn_id];
+            const RelayOwner& r = c.relay_owner;
+            if (!r.active() || r.close_pending || token.episode != c.upstream_episode ||
+                token.episode != r.upstream_episode ||
+                (token.type == IoEventType::RelayRead ? !r.read_armed : !r.write_armed))
+                return true;
+        }
+        // Uninspected work is conservatively serviced before the extra quantum.
+        return tail - head > count;
+    }
+
     void flush_deferred_relay_reads() {
         const u32 kCount = deferred_relay_read_count;
         for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
@@ -3904,7 +3932,7 @@ public:
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
-            if (relay_budget_calls <= 8 && backend.cq_unharvested() != 0) break;
+            if (relay_budget_calls <= 8 && has_ordinary_cq_work()) break;
             const u32 kId = deferred_relay_read_ids[0];
             const u32 kEpisode = deferred_relay_read_episodes[0];
             --deferred_relay_read_count;

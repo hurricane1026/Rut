@@ -38996,14 +38996,34 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     // pointers before wait() so the synthetic CQ never reaches the kernel.
     u32 fake_head = 0;
     u32 fake_tail = 1;
+    io_uring_cqe fake_cqe{};
+    fake_cqe.user_data = encode_non_upstream_user_data({conn->id, IoEventType::Send, 1});
+    u32 fake_mask = 0;
+    auto* saved_entries = loop->backend.cq_entries;
+    auto* saved_mask = loop->backend.cq_ring_mask;
+    loop->backend.cq_entries = &fake_cqe;
+    loop->backend.cq_ring_mask = &fake_mask;
     auto* saved_head = loop->backend.cq_head;
     auto* saved_tail = loop->backend.cq_tail;
     loop->backend.cq_head = &fake_head;
     loop->backend.cq_tail = &fake_tail;
+    CHECK_TRUE(loop->has_ordinary_cq_work());
+    fake_cqe.user_data =
+        encode_upstream_event_token({conn->id, IoEventType::RelayRead, conn->upstream_episode, 0});
+    conn->relay_owner.read_armed = true;
+    CHECK_FALSE(loop->has_ordinary_cq_work());
+    fake_cqe.res = -ECANCELED;
+    CHECK_TRUE(loop->has_ordinary_cq_work());
+    fake_cqe.res = 0;
+    conn->relay_owner.read_armed = false;
+    CHECK_TRUE(loop->has_ordinary_cq_work());
+    fake_cqe.user_data = encode_non_upstream_user_data({conn->id, IoEventType::Send, 1});
     loop->flush_deferred_relay_reads();
     CHECK_EQ(loop->deferred_relay_read_count, 1u);
     CHECK_EQ(loop->relay_pulled_bytes, 0u);
     CHECK_EQ(loop->relay_budget_calls, 8u);
+    loop->backend.cq_entries = saved_entries;
+    loop->backend.cq_ring_mask = saved_mask;
     loop->backend.cq_head = saved_head;
     loop->backend.cq_tail = saved_tail;
     IoEvent ready_events[8]{};
