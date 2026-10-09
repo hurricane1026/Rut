@@ -390,14 +390,18 @@ static void report_source_live_start_error(const SourceLiveAccessLogStartError& 
 
 template <typename Loop>
 static void configure_study_policy(Loop* loop) {
-    if constexpr (requires { loop->study_event_batch_limit; loop->study_relay_chunk_size; }) {
+    if constexpr (requires {
+                      loop->study_event_batch_limit;
+                      loop->study_relay_chunk_size;
+                  }) {
         extern char** environ;
         const char* profile = "current";
         bool nodelay = false;
         for (char** item = environ; *item != nullptr; ++item)
             if (str_eq(*item, "RUT_STUDY_HTTP_NODELAY=on")) nodelay = true;
         UpstreamPool::study_tcp_nodelay.store(nodelay, std::memory_order_relaxed);
-        write_str(nodelay ? "RUT_STUDY_HTTP_NODELAY mode=on\n" : "RUT_STUDY_HTTP_NODELAY mode=off\n");
+        write_str(nodelay ? "RUT_STUDY_HTTP_NODELAY mode=on\n"
+                          : "RUT_STUDY_HTTP_NODELAY mode=off\n");
         for (char** item = environ; *item != nullptr; ++item) {
             if (str_eq(*item, "RUT_STUDY_POLICY=latency")) profile = "latency";
             if (str_eq(*item, "RUT_STUDY_POLICY=balanced")) profile = "balanced";
@@ -406,16 +410,34 @@ static void configure_study_policy(Loop* loop) {
         }
         if constexpr (requires { loop->backend.enable_ws_recv_cache(); }) {
             for (char** item = environ; *item != nullptr; ++item) {
-                if (str_eq(*item, "RUT_STUDY_WS_RECV=cache") && !loop->backend.enable_ws_recv_cache())
+                if (str_eq(*item, "RUT_STUDY_WS_RECV=cache") &&
+                    !loop->backend.enable_ws_recv_cache())
                     loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
             }
-            write_str(loop->backend.ws_recv_cache_enabled ? "RUT_STUDY_WS_RECV mode=cache\n" : "RUT_STUDY_WS_RECV mode=once\n");
+            write_str(loop->backend.ws_recv_cache_enabled ? "RUT_STUDY_WS_RECV mode=cache\n"
+                                                          : "RUT_STUDY_WS_RECV mode=once\n");
         }
         if constexpr (requires { loop->ws_splice.enable(loop->connection_capacity); }) {
             for (char** item = environ; *item != nullptr; ++item)
-                if (str_eq(*item, "RUT_STUDY_WS_SPLICE=on") && !loop->ws_splice.enable(loop->connection_capacity))
+                if (str_eq(*item, "RUT_STUDY_WS_SPLICE=on") &&
+                    !loop->ws_splice.enable(loop->connection_capacity))
                     loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
-            write_str(loop->ws_splice.enabled ? "RUT_STUDY_WS_SPLICE mode=on\n" : "RUT_STUDY_WS_SPLICE mode=off\n");
+            for (char** item = environ; *item != nullptr; ++item) {
+                if (str_eq(*item, "RUT_STUDY_WS_COPY=on")) loop->ws_splice.copy_first = true;
+                if (str_eq(*item, "RUT_STUDY_WS_SEGMENT=16k")) loop->ws_splice.chunk_size = 16384;
+                if (str_eq(*item, "RUT_STUDY_WS_SEGMENT=128k")) loop->ws_splice.chunk_size = 131072;
+                if (str_eq(*item, "RUT_STUDY_WS_CALLS=2")) loop->ws_splice.call_budget = 2;
+                if (str_eq(*item, "RUT_STUDY_WS_CALLS=16")) loop->ws_splice.call_budget = 16;
+            }
+            write_str(loop->ws_splice.copy_first ? "RUT_STUDY_WS_COPY mode=on\n"
+                                                 : "RUT_STUDY_WS_COPY mode=off\n");
+            write_str("RUT_STUDY_WS_PARAMETERS chunk=");
+            write_u32(loop->ws_splice.chunk_size);
+            write_str(" calls=");
+            write_u32(loop->ws_splice.call_budget);
+            write_str("\n");
+            write_str(loop->ws_splice.enabled ? "RUT_STUDY_WS_SPLICE mode=on\n"
+                                              : "RUT_STUDY_WS_SPLICE mode=off\n");
         }
         const bool latency = str_eq(profile, "latency");
         const bool balanced = str_eq(profile, "balanced");
@@ -424,16 +446,20 @@ static void configure_study_policy(Loop* loop) {
         if constexpr (requires { loop->study_relay_turn_call_limit; }) {
             loop->study_relay_chunk_size = (latency || balanced) ? 64u * 1024u : 128u * 1024u;
             loop->study_relay_turn_call_limit = latency ? 8u : (throughput ? 32u : 16u);
-            loop->study_relay_turn_byte_limit = latency ? 512u * 1024u : (throughput ? 2u * 1024u * 1024u : 1024u * 1024u);
+            loop->study_relay_turn_byte_limit =
+                latency ? 512u * 1024u : (throughput ? 2u * 1024u * 1024u : 1024u * 1024u);
             loop->ordinary_cq_wait_limit_ns = latency ? 20ull * 1000u : 80ull * 1000u;
             loop->study_yield_enabled = !throughput;
         } else if constexpr (requires { loop->study_relay_owner_call_limit; }) {
             loop->study_relay_chunk_size = throughput ? 128u * 1024u : 64u * 1024u;
             loop->study_relay_owner_call_limit = latency ? 2u : (throughput ? 8u : 4u);
         }
-        write_str("RUT_STUDY_POLICY profile="); write_str(profile);
-        write_str(" batch="); write_u32(loop->study_event_batch_limit);
-        write_str(" chunk="); write_u32(loop->study_relay_chunk_size);
+        write_str("RUT_STUDY_POLICY profile=");
+        write_str(profile);
+        write_str(" batch=");
+        write_u32(loop->study_event_batch_limit);
+        write_str(" chunk=");
+        write_u32(loop->study_relay_chunk_size);
         write_str("\n");
     }
 }

@@ -16,6 +16,7 @@ struct WsSpliceExperiment {
         i32 read_fd = -1, write_fd = -1;
         u32 buffered = 0;
         bool eof = false, armed = false, writing = false, cancel_owned = false;
+        bool copying = false, probe_copy = true;
     };
     struct Owner {
         Direction direction[2];
@@ -25,8 +26,11 @@ struct WsSpliceExperiment {
     MappedArray<Owner> owners;
     MappedArray<u32> queued;
     u32 queued_count = 0;
-    bool enabled = false;
+    bool enabled = false, copy_first = false;
     u64 admissions = 0, transferred[2]{}, calls = 0;
+    u32 chunk_size = 65536, call_budget = 8;
+    u64 polls = 0, eagain[2]{}, pipe_grow_failures = 0;
+    u32 minimum_pipe_capacity = 0xffffffffu;
     bool enable(u32 capacity) {
         if (!owners.init(capacity) || !queued.init(capacity)) return false;
         enabled = true;
@@ -96,6 +100,7 @@ struct WsSpliceExperiment {
                                          o.episode,
                                          static_cast<u8>(32 + index)))
             return false;
+        ++polls;
         d.armed = true;
         d.writing = writing;
         ++c.pending_ops;
@@ -108,25 +113,46 @@ struct WsSpliceExperiment {
         if (!o.active || o.closing || d.armed || d.eof) return;
         const i32 kSource = index == 0 ? c.fd : c.upstream_fd;
         const i32 kDestination = index == 0 ? c.upstream_fd : c.fd;
-        for (u32 budget = 0; budget < 8; ++budget) {
+        // A full copied prefix can leave immediately available bytes behind it.
+        // Permit one additional read/write pair before yielding, bounded to
+        // two extra syscalls per turn; never extend from a guessed frame size.
+        u32 turn_limit = call_budget;
+        bool extended = false;
+        for (u32 budget = 0; budget < turn_limit; ++budget) {
             const bool kWriting = d.buffered != 0;
+            auto& buffer = index == 0 ? c.recv_buf : c.upstream_recv_buf;
+            const bool kCopy = kWriting ? d.copying : (copy_first && d.probe_copy);
+            const u32 kCopyLength = buffer.write_avail() < 4096u ? buffer.write_avail() : 4096u;
+            if (!kWriting && kCopy && kCopyLength == 0) {
+                loop.close_conn(c);
+                return;
+            }
             ssize_t n;
             do {
                 ++calls;
-                n = kWriting ? ::splice(d.read_fd,
-                                        nullptr,
-                                        kDestination,
-                                        nullptr,
-                                        d.buffered,
-                                        SPLICE_F_NONBLOCK | SPLICE_F_MOVE)
-                             : ::splice(kSource,
-                                        nullptr,
-                                        d.write_fd,
-                                        nullptr,
-                                        65536,
-                                        SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
+                if (kCopy) {
+                    n = kWriting ? ::send(kDestination,
+                                          buffer.data(),
+                                          d.buffered,
+                                          MSG_DONTWAIT | MSG_NOSIGNAL)
+                                 : ::recv(kSource, buffer.write_ptr(), kCopyLength, MSG_DONTWAIT);
+                } else
+                    n = kWriting ? ::splice(d.read_fd,
+                                            nullptr,
+                                            kDestination,
+                                            nullptr,
+                                            d.buffered,
+                                            SPLICE_F_NONBLOCK | SPLICE_F_MOVE)
+                                 : ::splice(kSource,
+                                            nullptr,
+                                            d.write_fd,
+                                            nullptr,
+                                            chunk_size,
+                                            SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
             } while (n < 0 && errno == EINTR);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                ++eagain[kWriting ? 1 : 0];
+                if (!kWriting) d.probe_copy = true;
                 if (!arm(loop, c, index, kWriting)) loop.close_conn(c);
                 return;
             }
@@ -142,9 +168,22 @@ struct WsSpliceExperiment {
             }
             if (kWriting) {
                 d.buffered -= static_cast<u32>(n);
+                if (kCopy) buffer.consume(static_cast<u32>(n));
                 transferred[index] += static_cast<u32>(n);
-            } else
+            } else {
+                d.copying = kCopy;
                 d.buffered = static_cast<u32>(n);
+                if (kCopy) {
+                    buffer.commit(static_cast<u32>(n));
+                    if (static_cast<u32>(n) == kCopyLength) {
+                        d.probe_copy = false;
+                        if (!extended) {
+                            turn_limit += 2;
+                            extended = true;
+                        }
+                    }
+                }
+            }
         }
         if (!arm(loop, c, index, d.buffered != 0)) loop.close_conn(c);
     }
@@ -250,7 +289,12 @@ struct WsSpliceExperiment {
                     }
                     d.read_fd = fds[0];
                     d.write_fd = fds[1];
-                    (void)::fcntl(d.write_fd, F_SETPIPE_SZ, 65536);
+                    if (::fcntl(d.write_fd, F_SETPIPE_SZ, chunk_size) <
+                        static_cast<int>(chunk_size))
+                        ++pipe_grow_failures;
+                    const int kCapacity = ::fcntl(d.write_fd, F_GETPIPE_SZ);
+                    if (kCapacity > 0 && static_cast<u32>(kCapacity) < minimum_pipe_capacity)
+                        minimum_pipe_capacity = static_cast<u32>(kCapacity);
                 }
                 if (!ok) {
                     close_pipes(o);

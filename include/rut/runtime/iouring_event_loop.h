@@ -871,11 +871,16 @@ public:
         if (ws_splice.enabled)
             ::fprintf(
                 stderr,
-                "RUT_WS_SPLICE admissions=%llu client_bytes=%llu upstream_bytes=%llu calls=%llu\n",
+                "RUT_WS_SPLICE admissions=%llu client_bytes=%llu upstream_bytes=%llu calls=%llu polls=%llu read_eagain=%llu write_eagain=%llu pipe_grow_failures=%llu min_pipe_capacity=%u\n",
                 static_cast<unsigned long long>(ws_splice.admissions),
                 static_cast<unsigned long long>(ws_splice.transferred[0]),
                 static_cast<unsigned long long>(ws_splice.transferred[1]),
-                static_cast<unsigned long long>(ws_splice.calls));
+                static_cast<unsigned long long>(ws_splice.calls),
+                      static_cast<unsigned long long>(ws_splice.polls),
+                      static_cast<unsigned long long>(ws_splice.eagain[0]),
+                      static_cast<unsigned long long>(ws_splice.eagain[1]),
+                      static_cast<unsigned long long>(ws_splice.pipe_grow_failures),
+                      ws_splice.minimum_pipe_capacity);
         ws_splice.shutdown();
         // No further CQE can retire relay polls after the backend has stopped.
         // Close every connection-owned pipe explicitly before destroying the

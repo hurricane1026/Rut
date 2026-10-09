@@ -80,12 +80,21 @@ static void full_duplex_burst(test::TestCase* _tc,
                               bool splice = false,
                               bool half_close = false,
                               u32 prefix = 0,
-                              bool pipe_failure = false) {
+                              bool pipe_failure = false,
+                              u32 segment = 65536,
+                              u32 budget = 8,
+                              bool copy_first = false,
+                              u32 payload_bytes = 64 * 1024 + 73) {
     LoopStorage storage;
     if (!storage.init()) return;
     auto& loop = *storage.loop;
     if (cache) REQUIRE(loop.backend.enable_ws_recv_cache());
-    if (splice) REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    if (splice) {
+        REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+        loop.ws_splice.chunk_size = segment;
+        loop.ws_splice.call_budget = budget;
+        loop.ws_splice.copy_first = copy_first;
+    }
     int downstream[2], upstream[2];
     REQUIRE_EQ(test::stream_socketpair(downstream), 0);
     REQUIRE_EQ(test::stream_socketpair(upstream), 0);
@@ -112,8 +121,11 @@ static void full_duplex_burst(test::TestCase* _tc,
                     &on_ws_upstream_to_client_sent<IoUringEventLoop>,
                     &on_ws_upstream_recv<IoUringEventLoop>,
                     &on_ws_client_to_upstream_sent<IoUringEventLoop>);
-    constexpr u32 kBytes = 64 * 1024 + 73;
-    u8 sent_client[kBytes], sent_origin[kBytes], received_client[kBytes], received_origin[kBytes];
+    constexpr u32 kMaxBytes = 64 * 1024 + 73;
+    const u32 kBytes = payload_bytes;
+    REQUIRE(kBytes <= kMaxBytes);
+    u8 sent_client[kMaxBytes], sent_origin[kMaxBytes], received_client[kMaxBytes],
+        received_origin[kMaxBytes];
     for (u32 i = 0; i < kBytes; ++i) {
         sent_client[i] = static_cast<u8>(i * 29u + 3u);
         sent_origin[i] = static_cast<u8>(i * 37u + 11u);
@@ -273,6 +285,26 @@ TEST(websocket, iouring_splice_buffered_prefix_handoff) {
 }
 TEST(websocket, iouring_splice_pipe_creation_failure_fallback) {
     full_duplex_burst(_tc, false, false, false, true, false, 0, true);
+}
+
+TEST(websocket, iouring_splice_large_pipe_short_turn_half_close) {
+    full_duplex_burst(_tc, false, false, true, true, true, 0, false, 131072, 2);
+}
+TEST(websocket, iouring_splice_large_pipe_long_turn) {
+    full_duplex_burst(_tc, false, false, true, true, false, 37, false, 131072, 16);
+}
+
+TEST(websocket, iouring_splice_copy_first_small_and_threshold) {
+    full_duplex_burst(_tc, false, false, false, true, true, 0, false, 65536, 2, true, 64);
+    full_duplex_burst(_tc, false, false, true, true, false, 0, false, 65536, 2, true, 4096);
+    full_duplex_burst(_tc, false, false, true, true, false, 0, false, 65536, 2, true, 4097);
+}
+
+TEST(websocket, iouring_splice_copy_first_slow_half_close) {
+    full_duplex_burst(_tc, false, false, true, true, true, 0, false, 65536, 2, true);
+}
+TEST(websocket, iouring_splice_copy_first_prefix_and_close) {
+    full_duplex_burst(_tc, false, true, true, true, false, 37, false, 65536, 8, true);
 }
 
 TEST(websocket, iouring_splice_excludes_tls_inspection_and_throttle) {
