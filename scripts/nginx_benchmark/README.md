@@ -293,3 +293,12 @@ matrix remains incomplete. This is a local goal check, not a performance CI gate
 [The 2026-09-23 full acceptance run](../../docs/benchmarks/nginx-acceptance-2026-09-23/README.md)
 uses a fresh main build and evaluates all 96 coordinates: 38 passed, 10 below
 target, 48 invalid. The overall verdict is FAIL; full evidence is retained.
+# Relay scheduling comparisons and buffer scans
+
+`relay_compare.py` extends the existing harness with explicit runtime backend
+selection, rotating serial frontend order, optional alternative Rut binaries,
+four-worker origins, and plaintext mixed-size traffic. `nginx_buffer_scan.py`
+screens 11 buffer configurations, then rechecks two candidates against Rut.
+See [the relay checkpoint](../../docs/benchmarks/iouring-relay-2026-10-10/README.md)
+for commands, measured results and limitations. Both reuse the harness's existing
+dependencies and preflight/error validation.
