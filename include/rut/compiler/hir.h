@@ -1405,6 +1405,7 @@ struct HirGeneratedName {
 // share it, so every merged or copied function keeps a valid name view. The
 // store is reference-counted and freed when the last owner is destroyed.
 struct HirGeneratedNames {
+    u32 workload_bytes = 0;
     u32 refs = 1;
     HirGeneratedName* head = nullptr;
 
