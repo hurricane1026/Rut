@@ -3901,6 +3901,10 @@ public:
             // Reserve a read and write. Unprocessed entries retain FIFO order
             // into the next turn; a completed segment rejoins at the tail.
             if (relay_budget_calls < 2 || relay_budget_bytes < 2 * 64 * 1024) break;
+            // Keep the first half of the turn for bounded relay progress, but
+            // do not spend the larger quantum behind newly posted completions.
+            // An idle CQ can still use all eight FIFO segments.
+            if (relay_budget_calls <= 8 && backend.cq_unharvested() != 0) break;
             const u32 kId = deferred_relay_read_ids[0];
             const u32 kEpisode = deferred_relay_read_episodes[0];
             --deferred_relay_read_count;

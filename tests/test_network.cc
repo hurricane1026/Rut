@@ -38991,6 +38991,21 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     CHECK_EQ(conn->pending_ops, 0u);
     loop->relay_budget_calls = 8;
     loop->relay_budget_bytes = 512 * 1024;
+    // A completion arriving after the first half of the larger quantum must
+    // retain FIFO ownership until the CQ is harvested. Restore real ring
+    // pointers before wait() so the synthetic CQ never reaches the kernel.
+    u32 fake_head = 0;
+    u32 fake_tail = 1;
+    auto* saved_head = loop->backend.cq_head;
+    auto* saved_tail = loop->backend.cq_tail;
+    loop->backend.cq_head = &fake_head;
+    loop->backend.cq_tail = &fake_tail;
+    loop->flush_deferred_relay_reads();
+    CHECK_EQ(loop->deferred_relay_read_count, 1u);
+    CHECK_EQ(loop->relay_pulled_bytes, 0u);
+    CHECK_EQ(loop->relay_budget_calls, 8u);
+    loop->backend.cq_head = saved_head;
+    loop->backend.cq_tail = saved_tail;
     IoEvent ready_events[8]{};
     const u32 ready_count =
         loop->backend.wait(ready_events, 8, loop->conns, IoUringEventLoop::kMaxConns, false);
