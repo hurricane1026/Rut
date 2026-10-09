@@ -5,12 +5,17 @@
   source tree. Pre-existing test compilation warnings remain.
 - `ctest -R '^test_network$' --output-on-failure`: passed after the final changes.
 - clang-format dry-run with warnings as errors: all six changed C++ files passed.
-- clang-tidy 22 on the changed lines in main/backend and included headers: passed
-  with bugprone/performance warnings treated as errors. The unfiltered check
-  encounters existing `alloc_h2_impl` derived-method shadowing in both event
-  loops and unchecked `atoi` in slice_pool. The two new widening diagnostics
-  were corrected. CI uses clang-tidy 20; the entire unfiltered local check is
-  not reported as passing.
+- Full CI-scope clang-tidy 22: all 60 source/helper translation units passed
+  with bugprone/performance warnings treated as errors, without line filters.
+  Fixed the HTTP/2 CRTP fallback shadowing, checked the study-cache environment
+  conversion, and split LLVM definition arguments consistently across source,
+  test and benchmark targets. CI lint now pins clang/clang-tidy/LLVM to 22.
+- CI repair validation: test_network, test_splice, test_arena, test_jit,
+  test_serve_loader and test_harness all passed after the final rebuild.
+  The standalone splice driver now matches nonblocking runnable-work pumping,
+  and the owner-count test still exceeds one shared turn rather than weakening
+  its budget/fairness checks. The checked numeric conversion has a regression
+  covering malformed/overflow input and errno preservation.
 - Python byte-compilation and both entry-point help commands: passed.
 - Repository scanner end-to-end smoke: all 11 buffer configurations plus two
   selected nginx candidates and Rut completed, 14 valid measurement rows and

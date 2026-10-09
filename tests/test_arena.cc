@@ -870,6 +870,21 @@ TEST(slice_arena, multiple_arenas_same_pool) {
     pc.destroy();
 }
 
+TEST(slice_pool, study_bulk_cache_setting_validates_complete_number_and_preserves_errno) {
+    const int saved_errno = errno;
+    errno = EBUSY;
+    CHECK_EQ(SlicePool::parse_study_bulk_cache_limit(nullptr), 64u);
+    CHECK_EQ(SlicePool::parse_study_bulk_cache_limit("32"), 128u);
+    CHECK_EQ(SlicePool::parse_study_bulk_cache_limit("64"), 256u);
+    CHECK_EQ(SlicePool::parse_study_bulk_cache_limit("16"), 64u);
+    CHECK_EQ(SlicePool::parse_study_bulk_cache_limit(""), 64u);
+    CHECK_EQ(SlicePool::parse_study_bulk_cache_limit("32junk"), 64u);
+    CHECK_EQ(SlicePool::parse_study_bulk_cache_limit("-32"), 64u);
+    CHECK_EQ(SlicePool::parse_study_bulk_cache_limit("999999999999999999999999999999"), 64u);
+    CHECK_EQ(errno, EBUSY);
+    errno = saved_errno;
+}
+
 TEST(slice_pool, overwrite_loans_preserve_zeroed_normal_borrowers) {
     SlicePool pool;
     constexpr u32 kLarge = SlicePool::kBulkSliceSize;

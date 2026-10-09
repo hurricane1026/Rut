@@ -395,7 +395,7 @@ if(RUT_ENABLE_JIT)
     target_include_directories(test_fixture_privileged_listener_loader PRIVATE
         ${LLVM_INCLUDE_DIRS})
     target_compile_definitions(test_fixture_privileged_listener_loader PRIVATE
-        ${LLVM_DEFINITIONS} RUT_ENABLE_JIT=1)
+        ${RUT_LLVM_DEFINITIONS} RUT_ENABLE_JIT=1)
     add_test(NAME test_fixture_privileged_listener_loader
         COMMAND test_fixture_privileged_listener_loader)
     set_tests_properties(test_fixture_privileged_listener_loader PROPERTIES
@@ -3524,7 +3524,7 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/testing
         ${LLVM_INCLUDE_DIRS}
     )
-    target_compile_definitions(test_jit PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(test_jit PRIVATE ${RUT_LLVM_DEFINITIONS})
     add_test(NAME test_jit COMMAND test_jit)
     set_tests_properties(test_jit PROPERTIES LABELS "unit;jit")
 
@@ -3555,7 +3555,7 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/testing
         ${LLVM_INCLUDE_DIRS}
     )
-    target_compile_definitions(test_serve_loader PRIVATE ${LLVM_DEFINITIONS} RUT_ENABLE_JIT=1)
+    target_compile_definitions(test_serve_loader PRIVATE ${RUT_LLVM_DEFINITIONS} RUT_ENABLE_JIT=1)
     add_test(NAME test_serve_loader COMMAND test_serve_loader)
     set_tests_properties(test_serve_loader PROPERTIES LABELS "unit;jit")
 endif()
@@ -3610,7 +3610,7 @@ if(RUT_ENABLE_JIT)
     target_include_directories(test_harness PRIVATE ${LLVM_INCLUDE_DIRS})
     target_compile_definitions(test_harness PRIVATE
         RUT_ENABLE_JIT_TESTS=1
-        ${LLVM_DEFINITIONS}
+        ${RUT_LLVM_DEFINITIONS}
     )
 else()
     target_compile_definitions(test_harness PRIVATE RUT_ENABLE_JIT_TESTS=0)
@@ -3625,7 +3625,7 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/testing
         ${LLVM_INCLUDE_DIRS}
     )
-    target_compile_definitions(test_simulate_engine PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(test_simulate_engine PRIVATE ${RUT_LLVM_DEFINITIONS})
     target_compile_definitions(test_simulate_engine PRIVATE
         RUT_SIMULATE_BIN_PATH="$<TARGET_FILE:rut-simulate>"
     )

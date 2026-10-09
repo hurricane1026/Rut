@@ -72,12 +72,11 @@ public:
 
     // Lazily attach a pooled HTTP/2 engine to a connection (idempotent).
     // Returns false if the per-shard h2 pool is exhausted.
-    bool alloc_h2(Connection& c) { return self().alloc_h2_impl(c); }
-
-    // Default: HTTP/2 unsupported (no pool). Concrete loops that serve h2
-    // (EpollEventLoop, IoUringEventLoop) hide this with a real implementation;
-    // test/mocks and the legacy loop inherit the refusal and fall back to close.
-    bool alloc_h2_impl(Connection& /*c*/) { return false; }
+    bool alloc_h2(Connection& c) {
+        if constexpr (requires { self().alloc_h2_impl(c); }) return self().alloc_h2_impl(c);
+        // Test/mocks and the legacy loop have no HTTP/2 pool.
+        return false;
+    }
 
     // Upstream I/O: send/recv on upstream_fd instead of fd.
     bool submit_send_upstream(Connection& c, const u8* buf, u32 len) {

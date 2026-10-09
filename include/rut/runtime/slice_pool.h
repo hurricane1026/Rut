@@ -4,6 +4,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 
@@ -37,11 +38,17 @@ namespace rut {
 //   pool.destroy();
 
 struct SlicePool {
-    u32 study_bulk_cache_limit = [] {
-        const char* value = ::getenv("RUT_STUDY_BULK_CACHE_MIB");
-        const u32 mib = value ? static_cast<u32>(::atoi(value)) : 16u;
-        return (mib == 32u || mib == 64u) ? mib * 4u : 64u;
-    }();
+    static u32 parse_study_bulk_cache_limit(const char* value) {
+        if (value == nullptr) return 64u;
+        const int saved_errno = errno;
+        errno = 0;
+        char* end = nullptr;
+        const long mib = ::strtol(value, &end, 10);
+        const bool valid = errno == 0 && end != value && *end == '\0' && (mib == 32 || mib == 64);
+        errno = saved_errno;
+        return valid ? static_cast<u32>(mib) * 4u : 64u;
+    }
+    u32 study_bulk_cache_limit = parse_study_bulk_cache_limit(::getenv("RUT_STUDY_BULK_CACHE_MIB"));
     bool study_adaptive_cache = ::getenv("RUT_STUDY_ADAPTIVE_CACHE") != nullptr;
     bool study_bulk_burst = false;
     u32 study_bulk_borrowed = 0;
