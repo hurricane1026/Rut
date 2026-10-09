@@ -683,6 +683,45 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             if constexpr (requires { shards[0].loop->study_relay_turns; }) {
                 for (u32 i = 0; i < shard_count; ++i) {
                     const auto& loop = *shards[i].loop;
+                    write_str("RUT_SPLICE_STATS read_calls=");
+                    write_u64(loop.study_splice_calls[0]);
+                    write_str(" write_calls=");
+                    write_u64(loop.study_splice_calls[1]);
+                    write_str(" read_eagain=");
+                    write_u64(loop.study_splice_eagain[0]);
+                    write_str(" write_eagain=");
+                    write_u64(loop.study_splice_eagain[1]);
+                    write_str(" read_short=");
+                    write_u64(loop.study_splice_short[0]);
+                    write_str(" write_short=");
+                    write_u64(loop.study_splice_short[1]);
+                    write_str(" budget_write_polls=");
+                    write_u64(loop.study_write_budget_polls);
+                    write_str("\n");
+                    for (u32 kind = 0; kind < 3; ++kind) {
+                        write_str("RUT_WAIT_STATS kind=");
+                        write_u32(kind);
+                        write_str(" sum_ns=");
+                        write_u64(loop.study_wait_sum_ns[kind]);
+                        write_str(" max_ns=");
+                        write_u64(loop.study_wait_max_ns[kind]);
+                        write_str(" hist=");
+                        for (u32 bin = 0; bin < 32; ++bin) {
+                            write_u64(loop.study_wait_hist[kind][bin]);
+                            write_str(",");
+                        }
+                        write_str("\n");
+                    }
+                    for (u32 kind = 0; kind < 2; ++kind) {
+                        write_str("RUT_SYSCALL_STATS kind=");
+                        write_u32(kind);
+                        write_str(" hist=");
+                        for (u32 bin = 0; bin < 32; ++bin) {
+                            write_u64(loop.study_syscall_hist[kind][bin]);
+                            write_str(",");
+                        }
+                        write_str("\n");
+                    }
                     write_str("RUT_SCHED_STATS turns=");
                     write_u64(loop.study_relay_turns);
                     write_str(" yields=");

@@ -128,6 +128,37 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_direct_body_full = 0;
     u64 study_completed_responses = 0;
     u64 study_body_sends = 0;
+    u64 study_splice_calls[2]{};
+    u64 study_splice_eagain[2]{};
+    u64 study_splice_short[2]{};
+    u64 study_write_budget_polls = 0;
+    u64 study_poll_started[2][kDefaultConnectionCapacity]{};
+    u64 study_queue_started[kDefaultConnectionCapacity]{};
+    u64 study_wait_hist[3][32]{};
+    u64 study_wait_sum_ns[3]{};
+    u64 study_wait_max_ns[3]{};
+    u64 study_syscall_hist[2][32]{};
+    void study_record_wait(u32 kind, u64 ns) {
+        u64 us = ns / 1000;
+        u32 bin = 0;
+        while (us > 1 && bin < 31) {
+            us >>= 1;
+            ++bin;
+        }
+        ++study_wait_hist[kind][bin];
+        study_wait_sum_ns[kind] += ns;
+        if (ns > study_wait_max_ns[kind]) study_wait_max_ns[kind] = ns;
+    }
+    void study_record_syscall(u32 kind, u64 ns) {
+        u64 us = ns / 1000;
+        u32 bin = 0;
+        while (us > 1 && bin < 31) {
+            us >>= 1;
+            ++bin;
+        }
+        ++study_syscall_hist[kind][bin];
+    }
+
     bool study_yield_enabled = true;
     u64 ordinary_cq_wait_limit_ns = 80 * 1000;
     u64 study_relay_turns = 0;
@@ -3893,6 +3924,7 @@ public:
                 return;
         }
         if (deferred_relay_read_count < kDeferredRelayReadLimit) {
+            study_queue_started[c.id] = monotonic_ns();
             deferred_relay_read_ids[deferred_relay_read_count] = c.id;
             deferred_relay_read_episodes[deferred_relay_read_count] = r.upstream_episode;
             deferred_relay_read_count++;
@@ -3996,6 +4028,10 @@ public:
                 close_conn(c);
                 continue;
             }
+            if (study_queue_started[c.id] != 0) {
+                study_record_wait(2, monotonic_ns() - study_queue_started[c.id]);
+                study_queue_started[c.id] = 0;
+            }
             const IoEvent kReady{c.id, POLLIN, 0, 0, IoEventType::RelayRead, 0, 0, kEpisode};
             on_response_splice_event(c, kReady);
             if (c.relay_owner.initial_declined && c.fd >= 0 && c.upstream_fd >= 0) {
@@ -4038,6 +4074,7 @@ public:
         if (!backend.add_relay_poll(
                 c.upstream_fd, c.id, IoEventType::RelayRead, c.relay_owner.upstream_episode))
             return false;
+        study_poll_started[0][c.id] = monotonic_ns();
         c.pending_ops++;
         c.relay_owner.read_armed = true;
         c.relay_owner.phase = RelayPhase::Reading;
@@ -4070,6 +4107,8 @@ public:
             c.relay_owner.pipe_read = fds[0];
             c.relay_owner.pipe_write = fds[1];
         }
+        study_poll_started[0][c.id] = study_poll_started[1][c.id] = 0;
+        study_queue_started[c.id] = 0;
         c.relay_owner.phase = RelayPhase::Reading;
         c.relay_owner.upstream_episode = c.upstream_episode;
         c.relay_owner.source_fd = c.upstream_fd;
@@ -4104,6 +4143,7 @@ public:
         if (!backend.add_relay_poll(
                 c.fd, c.id, IoEventType::RelayWrite, c.relay_owner.upstream_episode))
             return false;
+        study_poll_started[1][c.id] = monotonic_ns();
         c.pending_ops++;
         c.relay_owner.write_armed = true;
         c.relay_owner.phase = RelayPhase::Writing;
@@ -4130,17 +4170,24 @@ public:
             --relay_budget_calls;
             const u32 want =
                 std::min<u32>(std::min<u32>(c.resp_body_remaining, 64 * 1024), relay_budget_bytes);
+            const bool sampled = (++study_splice_calls[0] & 63u) == 0;
+            const u64 syscall_start = sampled ? monotonic_ns() : 0;
             const ssize_t n = ::splice(c.upstream_fd,
                                        nullptr,
                                        r.pipe_write,
                                        nullptr,
                                        want,
                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            const int splice_errno = errno;
+            if (sampled) study_record_syscall(0, monotonic_ns() - syscall_start);
+            errno = splice_errno;
+            if (n > 0 && static_cast<u32>(n) < want) ++study_splice_short[0];
             if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                 close_conn(c);
                 return;
             }
             if (n < 0) {
+                ++study_splice_eagain[0];
                 if (!arm_response_splice_read(c)) {
                     // Before the first byte is pulled, a readiness-SQE
                     // admission failure is a clean decline to the ordinary
@@ -4165,14 +4212,22 @@ public:
         }
         r.write_armed = false;
         if (relay_budget_calls == 0 || relay_budget_bytes == 0) {
+            ++study_write_budget_polls;
             if (!arm_response_splice_write(c)) close_conn(c);
             return;
         }
         --relay_budget_calls;
         const u32 write_want = std::min<u32>(r.segment_len - r.segment_sent, relay_budget_bytes);
+        const bool sampled = (++study_splice_calls[1] & 63u) == 0;
+        const u64 syscall_start = sampled ? monotonic_ns() : 0;
         const ssize_t n = ::splice(
             r.pipe_read, nullptr, c.fd, nullptr, write_want, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        const int splice_errno = errno;
+        if (sampled) study_record_syscall(1, monotonic_ns() - syscall_start);
+        errno = splice_errno;
+        if (n > 0 && static_cast<u32>(n) < write_want) ++study_splice_short[1];
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            ++study_splice_eagain[1];
             if (!arm_response_splice_write(c)) close_conn(c);
             return;
         }
@@ -8657,6 +8712,11 @@ public:
                         running_.store(false, std::memory_order_release);
                         break;
                     }
+                    const u32 wait_kind = ev.type == IoEventType::RelayRead ? 0 : 1;
+                    const u64 started = study_poll_started[wait_kind][conn.id];
+                    study_poll_started[wait_kind][conn.id] = 0;
+                    if (!cancel && started != 0)
+                        study_record_wait(wait_kind, monotonic_ns() - started);
                     --conn.pending_ops;
                     if (ev.type == IoEventType::RelayRead) {
                         if (cancel)
