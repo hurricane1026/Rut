@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import copy
 import importlib.util
+import http.client
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 
 
@@ -28,11 +30,16 @@ def main():
     parser.add_argument("--mixed-client-cpus", default="7,5")
     parser.add_argument("--nginx-buffering", choices=("on", "off"), default="off")
     parser.add_argument("--nginx-buffer-kib", type=int, default=1024)
+    parser.add_argument("--mixed-nginx-small-buffer-kib", type=int, default=16)
+    parser.add_argument("--origin-mode", choices=("static", "api"), default="static")
+    parser.add_argument("--api-delay-ms", type=float, default=0)
+    parser.add_argument("--api-fragment-bytes", type=int, default=0)
+    parser.add_argument("--api-fragment-delay-ms", type=float, default=0)
     options, remaining = parser.parse_known_args()
     if not any(arg == "--origin-cpu" or arg.startswith("--origin-cpu=") for arg in remaining):
         remaining += ["--origin-cpu", options.origin_cpus.split(",")[0]]
     engines = options.engines.split(",")
-    if not engines or any(e not in ("uring", "baseline-uring", "epoll", "nginx") for e in engines):
+    if not engines or any(e not in ("uring", "baseline-uring", "epoll", "nginx", "direct-origin") for e in engines):
         parser.error("--engines must contain uring, baseline-uring, epoll or nginx")
     if "baseline-uring" in engines and options.baseline_rut is None:
         parser.error("baseline-uring requires --baseline-rut and its matching rut-compile")
@@ -57,7 +64,9 @@ def main():
         if options.mixed_small_bytes and "-s" in argv:
             lua = Path(argv[argv.index("-s") + 1])
             if lua.name.endswith("-small.lua"):
-                lua.write_text('wrk.headers["X-Payload"]="small"\n' + lua.read_text())
+                lua.write_text(lua.read_text().replace('wrk.path="/proxy"', 'wrk.path="/api4k"'))
+        if len(argv)>2 and argv[:2]==["docker","logs"] and argv[2]==getattr(self,"api_origin_id",None):
+            return subprocess.CompletedProcess(argv,0,self.api_log.read_text(),"")
         return command(self, argv, *args, **kwargs)
 
     module.Harness.command = labelled
@@ -76,16 +85,36 @@ def main():
             text = text.replace("worker_connections 8192;", f"worker_connections 8192; multi_accept {options.origin_multi_accept};")
             if options.mixed_small_bytes:
                 (self.out / "payloads" / "small").write_bytes(b"Z" * options.mixed_small_bytes)
-                text = text.replace("server {", "map $http_x_payload $payload_file { default /benchmark-payloads/proxy; small /benchmark-payloads/small; }\nserver {", 1)
-                text = text.replace("location / {", "location = /proxy { alias $payload_file; default_type application/octet-stream; etag off; max_ranges 0; } location / {", 1)
+                text = text.replace("location / {", "location = /api4k { alias /benchmark-payloads/small; default_type application/octet-stream; etag off; max_ranges 0; } location / {", 1)
             path.write_text(text)
             metadata = self.out / "environment.json"
             data = json.loads(metadata.read_text())
             data["relay_compare"] = vars(options) | {"baseline_rut": str(options.baseline_rut) if options.baseline_rut else None}
             data["origin_cpu"] = cpu
             data["origin_workers"] = options.origin_workers
+            if options.mixed_small_bytes:
+                data["mixed_request_paths"] = {"large": "/proxy", "small": "/api4k"}
             metadata.write_text(json.dumps(data, indent=2) + "\n")
+        if name=="origin" and options.origin_mode=="api":
+            self.api_origin_id=self.prefix+"-api";self.origin_container_id=self.api_origin_id;self.api_log=self.out/"api-origin.log"
+            argv=[sys.executable,str(Path(__file__).with_name("api_origin.py")),"--port",str(port),"--cpus",options.origin_cpus,"--payload",str(self.out/"payloads"/"proxy"),"--delay-ms",str(options.api_delay_ms),"--fragment-bytes",str(options.api_fragment_bytes),"--fragment-delay-ms",str(options.api_fragment_delay_ms)]
+            with self.api_log.open("w") as log:
+                process=subprocess.Popen(argv,stdout=log,stderr=subprocess.STDOUT)
+                try:
+                    deadline=time.monotonic()+15
+                    while self.api_log.read_text().count("API_READY ")<options.origin_workers:
+                        if process.poll() is not None or time.monotonic()>deadline:raise RuntimeError("API origin did not become ready")
+                        time.sleep(.05)
+                    self.ready(port,process.pid)
+                    self.experiment_origin_pid=process.pid
+                    yield process.pid
+                finally:
+                    process.terminate()
+                    try:process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:process.kill();process.wait()
+            return
         with nginx(self, name, config, cpu, port) as pid:
+            if name=="origin":self.experiment_origin_pid=pid
             yield pid
 
     module.Harness.nginx = origin
@@ -106,9 +135,42 @@ def main():
 
     subprocess.Popen = selected
 
+    def validate_mixed_urls(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.args.front_port, timeout=5)
+        try:
+            connection.connect()
+            retained = connection.sock
+            # Cross-route successor requests must not inherit a previous large
+            # response's relay owner or body state on the persistent connection.
+            for index in range(8):
+                small = index % 2 == 1
+                connection.request("GET", "/api4k" if small else "/proxy",
+                                   headers={"Host": "client.example"})
+                reply = connection.getresponse()
+                wanted = b"Z" * options.mixed_small_bytes if small else module.expected_body(
+                    "proxy", self.args.body_size, native_streaming=True)
+                if reply.status != 200 or reply.read() != wanted or connection.sock is not retained:
+                    raise RuntimeError("mixed URL persistent response preflight failed")
+        finally:
+            connection.close()
+
     @contextlib.contextmanager
     def chosen_frontend(self, engine, work, label):
         nonlocal active_backend, active_output, active_rut, frontend_live
+        if engine=="direct-origin":
+            self.active_label=label
+            saved_port=self.args.front_port
+            self.args.front_port=self.args.origin_port
+            if options.mixed_small_bytes:
+                request = urllib.request.Request(f"http://127.0.0.1:{self.args.front_port}/api4k")
+                with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=3) as response:
+                    if response.read() != b"Z" * options.mixed_small_bytes:
+                        raise RuntimeError("direct-origin small URL preflight failed")
+            if options.mixed_small_bytes:
+                validate_mixed_urls(self)
+            try:yield self.experiment_origin_pid
+            finally:self.args.front_port=saved_port
+            return
         if frontend_live:
             raise RuntimeError("frontends must run serially")
         frontend_live = True
@@ -117,6 +179,11 @@ def main():
         saved_rut = self.args.rut
         config = self.out / (work + "-nginx.conf")
         saved = config.read_text()
+        if options.mixed_small_bytes:
+            program = self.out / (work + ".rut")
+            original_program = program.read_text()
+            if 'route GET "/api4k"' not in original_program:
+                program.write_text(original_program + 'route GET "/api4k" { return forward(backend) }\n')
         try:
             if engine == "baseline-uring":
                 self.args.rut = options.baseline_rut.resolve()
@@ -132,6 +199,19 @@ def main():
                 )
                 if replacements != 1:
                     raise ValueError("expected exactly one native proxy buffer configuration")
+                if options.mixed_small_bytes:
+                    match = re.search(r"location = /proxy\s*\{([^{}]*)\}", text)
+                    if not match:
+                        raise ValueError("expected one proxy location for mixed URL configuration")
+                    small_body = match.group(1)
+                    if options.mixed_nginx_small_buffer_kib:
+                        small_size = options.mixed_nginx_small_buffer_kib
+                        small_body = re.sub(
+                            r"proxy_buffering\s+(?:on|off);\s*proxy_buffer_size\s+\S+;\s*(?:proxy_buffers\s+\d+\s+\S+;\s*)?proxy_busy_buffers_size\s+\S+;",
+                            f"proxy_buffering off; proxy_buffer_size {small_size}k; proxy_buffers 8 {small_size}k; proxy_busy_buffers_size {2 * small_size}k;",
+                            small_body,
+                        )
+                    text = text[:match.end()] + " location = /api4k {" + small_body + "}" + text[match.end():]
                 config.write_text(text)
                 (self.out / (label + "-effective-nginx.conf")).write_text(text)
             with frontend(self, engine, work, label) as pid:
@@ -139,10 +219,11 @@ def main():
                     if "Backend: " + active_backend not in (self.out / (label + "-server.log")).read_text():
                         raise RuntimeError("runtime selected an unexpected backend")
                 if options.mixed_small_bytes:
-                    request = urllib.request.Request(f"http://127.0.0.1:{self.args.front_port}/proxy", headers={"Host": "client.example", "X-Payload": "small"})
+                    request = urllib.request.Request(f"http://127.0.0.1:{self.args.front_port}/api4k", headers={"Host": "client.example"})
                     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=3) as response:
                         if response.read() != b"Z" * options.mixed_small_bytes:
                             raise RuntimeError("small payload preflight failed")
+                    validate_mixed_urls(self)
                 yield pid
         finally:
             self.args.rut = saved_rut

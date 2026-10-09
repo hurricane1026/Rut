@@ -3436,6 +3436,20 @@ public:
         }
     }
 
+    // Receive only into the available fixed buffer while its paired send
+    // owns the previous block. This uses actual tunnel state, not frame size.
+    bool use_one_shot_websocket_recv(const Connection& c) const {
+        if (backend.ws_recv_cache_enabled) return false;
+        return c.is_ws_tunnel && !c.tls_active && c.protocol == ConnProtocol::Http11 && c.fd >= 0 &&
+               c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode);
+    }
+
+    bool ws_recv_cache_active(const Connection& c) const {
+        return backend.ws_recv_cache_enabled && c.is_ws_tunnel && !c.is_ws_terminate &&
+               !c.tls_active;
+    }
+    bool ws_has_cached_input(const Connection& c) const { return backend.has_ws_recv_cache(c.id); }
+
     bool submit_recv_impl(Connection& c) {
         const bool tls_send_needs_recv =
             c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>;
@@ -3452,7 +3466,16 @@ public:
             if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
             return true;
         }
-        if (backend.add_recv(c.fd, c.id)) {
+        bool submitted = false;
+        if (use_one_shot_websocket_recv(c)) {
+            const u32 available = c.recv_buf.write_avail();
+            const u32 maximum = kProvidedBufSize;
+            submitted =
+                backend.add_recv_once(c.fd, c.id, available < maximum ? available : maximum);
+        } else {
+            submitted = backend.add_recv(c.fd, c.id);
+        }
+        if (submitted) {
             c.pending_ops++;
             c.recv_armed = true;
             c.recv_pause_rearm_pending = false;
@@ -4500,7 +4523,7 @@ public:
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
-        const bool one_shot = use_one_shot_upstream_recv(c);
+        const bool one_shot = use_one_shot_websocket_recv(c) || use_one_shot_upstream_recv(c);
         bool submitted = false;
         bool direct = false;
         if (one_shot) {
@@ -8593,9 +8616,9 @@ public:
                             // deliver a terminal the response pumps treat as fatal
                             // (header) or as already re-armed (body). This batch's
                             // buffers were returned before dispatch.
-                            const bool one_shot_ring_empty = ev.provided_ring_empty &&
-                                                             ev.result == -ENOBUFS &&
-                                                             use_one_shot_upstream_recv(conn);
+                            const bool one_shot_ring_empty =
+                                ev.provided_ring_empty && ev.result == -ENOBUFS &&
+                                (use_one_shot_upstream_recv(conn) || ws_recv_cache_active(conn));
                             // A torn-down h2-proxy episode's recv terminal has now drained;
                             // discard any stale positive bytes it left so the next stream
                             // can't parse them as its response. Gated on the flag so the

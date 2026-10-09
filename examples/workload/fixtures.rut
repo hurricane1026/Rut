@@ -1,9 +1,13 @@
-// Synthetic benchmark origin: distinct URLs share one server.
+// Deterministic workload handlers. These sizes describe the fixture itself;
+// production proxy response admission still depends on the actual response.
 listen 127.0.0.1:8704
-route GET "/static4k" { return workload(bytes: 4096) }
+route GET "/tiny512" { return workload(bytes: 512) }
+route GET "/api4k" { return workload(bytes: 4096) }
+route GET "/medium64k" { return workload(bytes: 65536) }
 route GET "/static256k" { return workload(bytes: 262144) }
 route GET "/static1m" { return workload(bytes: 1048576) }
-route GET "/api4k" {
+route GET "/apiDelayed4k" {
     wait(1ms)
     return workload(bytes: 4096)
 }
+// Request /api4k and /static1m concurrently to exercise mixed-size fairness.

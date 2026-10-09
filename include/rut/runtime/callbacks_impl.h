@@ -27,6 +27,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 #include <openssl/rand.h>  // RAND_bytes — fresh outbound mask-key seed (terminate mode)
 #include <sys/socket.h>
 #include <unistd.h>
@@ -10051,6 +10052,9 @@ bool ws_arm_terminate(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 bool ws_pause_client_recv(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->ws_recv_cache_active(conn); }) {
+        if (loop->ws_recv_cache_active(conn)) return true;
+    }
     // Prefer the loop-level pause_recv(Connection&): the io_uring loop needs it
     // to set recv_paused_for_send / recv_pause_cancel_pending and cancel the
     // multishot recv on the correct fd. It must be checked BEFORE the backend
@@ -10080,6 +10084,9 @@ bool ws_pause_client_recv(Loop* loop, Connection& conn) {
 
 template <typename Loop>
 [[nodiscard]] bool ws_pause_upstream_recv(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->ws_recv_cache_active(conn); }) {
+        if (loop->ws_recv_cache_active(conn)) return true;
+    }
     if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv_for_send(c); }) {
         return loop->pause_upstream_recv_for_send(conn);
     } else if constexpr (requires(Loop* lp, Connection& c) { lp->pause_upstream_recv(c); }) {
@@ -10338,6 +10345,9 @@ inline bool ws_draining(const Connection& conn) {
 
 template <typename Loop>
 void ws_close_if_drained(Loop* loop, Connection& conn) {
+    if constexpr (requires { loop->ws_has_cached_input(conn); }) {
+        if (loop->ws_has_cached_input(conn)) return;
+    }
     if (!conn.ws_client_send_pending && !conn.ws_upstream_send_pending &&
         conn.recv_buf.len() == 0 && conn.upstream_recv_buf.len() == 0) {
         close_conn_if_live(loop, conn);
@@ -10605,6 +10615,15 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         close_conn_if_live(loop, conn);
         return;
     }
+    // Byte tunnels publish small blocks independently. Disable Nagle on
+    // both TCP legs so a partial final block does not wait for a delayed ACK.
+    // The option is performance-only (AF_UNIX test transports do not support
+    // it); preserve errno for callers that use synthetic events.
+    const int saved_errno = errno;
+    const int no_delay = 1;
+    (void)::setsockopt(conn.fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+    (void)::setsockopt(conn.upstream_fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+    errno = saved_errno;
     conn.is_ws_tunnel = true;
     conn.ws_client_send_pending = false;
     conn.ws_upstream_send_pending = false;

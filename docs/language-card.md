@@ -26,7 +26,7 @@ listen :8080                      // one cleartext IPv4 wildcard listener
 tls "api.example.com", cert: env("CERT"), key: env("KEY")
 defaults { clientMaxBodySize: 10mb }
 
-let users = upstream { "10.0.0.1:8080" }            // upstreams
+let users = upstream { "10.0.0.1:8080" }            // ⏳ builder form; current: upstream users at "10.0.0.1:8080"
 let buckets = Cache<IP, i64>(capacity: 100000)     // lossy per-key state
 
 struct Ctx { userId: str }        // types
@@ -607,7 +607,7 @@ return redirect({
     content_type: "text/html", target_path: "/api/", body: b"<p>moved</p>"
 })
 let resp = forward(users, buffered: true)      // buffered Response, then return resp
-return forward(users, streaming: true)         // large bodies, no buffering
+return forward(users, streaming: true)         // ⏳ explicit flag; current transparent forward(users) streams
 
 // Static files / pipes
 return read(root: "/var/www")                  // zero-copy (uses *catch-all capture)
@@ -747,7 +747,7 @@ admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats(
 
 ```swift
 listen :80                         // one cleartext IPv4 wildcard listener
-let users = upstream { "10.0.0.1:8080" }
+let users = upstream { "10.0.0.1:8080" }          // ⏳ current: upstream users at "10.0.0.1:8080"
 // A standalone Cache/GCRA implementation lives in examples/ratelimit.rut.
 // ⚠ Unmatched methods/paths currently use Rut's default 200 OK handler; there
 // is no shipped top-level catch-all syntax yet. Configure the surrounding

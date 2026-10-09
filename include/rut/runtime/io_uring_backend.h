@@ -232,6 +232,31 @@ struct IoUringBackend {
     // No user buffer needed — kernel picks from provided ring.
     // Returns false if SQ is full (no SQE submitted).
     bool add_recv(i32 fd, u32 conn_id);
+    // Experimental bounded provided-buffer cache for transparent byte tunnels.
+    struct WsRecvCacheNode {
+        IoEvent event{};
+        u32 next = 0xffffffffu;
+        bool queued = false;
+    };
+    struct WsRecvCacheOwner {
+        u32 queued = 0;
+        u32 scan_generation = 0;
+    };
+    MappedArray<WsRecvCacheNode> ws_recv_cache_nodes;
+    MappedArray<WsRecvCacheOwner> ws_recv_cache_owners;
+    bool ws_recv_cache_enabled = false;
+    u32 ws_recv_cache_head = 0xffffffffu;
+    u32 ws_recv_cache_tail = 0xffffffffu;
+    u32 ws_recv_cache_generation = 0;
+    u64 ws_recv_cache_deferred = 0;
+    u64 ws_recv_cache_peak = 0;
+    u32 ws_recv_cache_count = 0;
+    bool enable_ws_recv_cache();
+    bool has_ws_recv_cache(u32 conn_id) const;
+    bool cache_ws_recv(Connection& conn, u16 buffer_id, const IoEvent& event);
+    u32 drain_ws_recv_cache(IoEvent* events, u32 maximum, Connection* conns, u32 max_conns);
+    // Bounded one-shot selected-buffer receive for backpressured byte tunnels.
+    bool add_recv_once(i32 fd, u32 conn_id, u32 max_len);
 
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.
