@@ -62,13 +62,11 @@ jobs:
             sudo tee /etc/apt/sources.list.d/llvm.list
           sudo apt-get update
           sudo apt-get install -y clang-22 clang-tidy-22 llvm-22-dev cmake ninja-build libboost-dev ragel
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-22 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-22 100
-          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-22 100
-          clang-tidy --version
+          clang-22 --version
+          clang-tidy-22 --version
 
       - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm
+        run: cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm
 
       - name: Lint
         run: |
@@ -81,7 +79,7 @@ jobs:
             ! -path '*/simd/avx512.cc' \
             ! -path '*/simd/neon.cc' \
             ! -path '*/simd/sve.cc' | \
-            xargs clang-tidy -p build --warnings-as-errors='bugprone-*,performance-*'
+            xargs clang-tidy-22 -p build --warnings-as-errors='bugprone-*,performance-*'
 
   runtime-state-model:
     name: Runtime state model
