@@ -128,6 +128,12 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_direct_body_full = 0;
     u64 study_completed_responses = 0;
     u64 study_body_sends = 0;
+    bool study_inside_cq = false;
+    u64 study_turn_started_ns = 0;
+    u64 study_cq_splice_calls = 0;
+    u64 study_cq_splice_bytes = 0;
+    u64 study_cq_phase_ns = 0;
+    u64 study_flush_phase_ns = 0;
     static constexpr u32 kResponseSpliceChunkSize = 128 * 1024;
     u64 study_large_pipes = 0;
     u64 study_small_pipes = 0;
@@ -3974,12 +3980,15 @@ public:
 
     void flush_deferred_relay_reads() {
         ++study_relay_turns;
+        const u64 phase_started = monotonic_ns();
         const u32 start_calls = relay_budget_calls;
         const u32 kCount = deferred_relay_read_count;
         // CQEs have no completion timestamp. Measure only how long ordinary
         // work has been observed pending during this relay flush, not its
         // true kernel age. Reset the observation whenever the CQ is quiet.
         u64 ordinary_since_ns = has_ordinary_cq_work() ? monotonic_ns() : 0;
+        const u64 turn_started =
+            study_turn_started_ns != 0 ? study_turn_started_ns : monotonic_ns();
         for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
             // Reserve a read and write. Unprocessed entries retain FIFO order
             // into the next turn; a completed segment rejoins at the tail.
@@ -3987,11 +3996,15 @@ public:
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
-            if (relay_budget_calls <= 8 && study_yield_enabled) {
+            // Preserve the original 256 KiB body minimum even when a segment
+            // grows. Bound elapsed work from CQ dispatch, including body
+            // progress made by header/readiness callbacks before this queue.
+            if ((relay_budget_bytes <= 512 * 1024 || relay_budget_calls <= 8) &&
+                study_yield_enabled) {
                 if (has_ordinary_cq_work()) {
                     const u64 now = monotonic_ns();
                     if (ordinary_since_ns == 0) ordinary_since_ns = now;
-                    if (now - ordinary_since_ns >= ordinary_cq_wait_limit_ns) {
+                    if (now - turn_started >= ordinary_cq_wait_limit_ns) {
                         ++study_relay_yields;
                         break;
                     }
@@ -4048,6 +4061,7 @@ public:
             }
         }
         study_relay_calls += start_calls - relay_budget_calls;
+        study_flush_phase_ns += monotonic_ns() - phase_started;
     }
 
     void clear_deferred_relay_read(u32 id) {
@@ -4181,6 +4195,7 @@ public:
             const u32 want =
                 std::min<u32>(std::min<u32>(c.resp_body_remaining, kResponseSpliceChunkSize),
                               relay_budget_bytes / 2);
+            if (study_inside_cq) ++study_cq_splice_calls;
             const bool sampled = (++study_splice_calls[0] & 63u) == 0;
             const u64 syscall_start = sampled ? monotonic_ns() : 0;
             const ssize_t n = ::splice(c.upstream_fd,
@@ -4229,6 +4244,7 @@ public:
         }
         --relay_budget_calls;
         const u32 write_want = std::min<u32>(r.segment_len - r.segment_sent, relay_budget_bytes);
+        if (study_inside_cq) ++study_cq_splice_calls;
         const bool sampled = (++study_splice_calls[1] & 63u) == 0;
         const u64 syscall_start = sampled ? monotonic_ns() : 0;
         const ssize_t n = ::splice(
@@ -4249,6 +4265,7 @@ public:
         r.segment_sent += static_cast<u32>(n);
         relay_budget_bytes -= static_cast<u32>(n);
         relay_written_bytes += static_cast<u32>(n);
+        if (study_inside_cq) study_cq_splice_bytes += static_cast<u32>(n);
         c.resp_body_sent += static_cast<u32>(n);
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
@@ -7028,6 +7045,8 @@ public:
     // Public deterministic seam used by the production run loop and focused
     // same-batch arbitration tests.
     void dispatch_batch(const IoEvent* events, u32 count) {
+        study_turn_started_ns = monotonic_ns();
+        study_inside_cq = true;
         if (count > kMaxEventsPerWait) count = kMaxEventsPerWait;
         prepare_response_read_deadline_batch(events, count);
         for (u32 i = 0; i < count; i++) {
@@ -7064,6 +7083,8 @@ public:
             }
             dispatch(events[i]);
         }
+        study_inside_cq = false;
+        study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
         for (u32 id = 0; id < slots_initialized; ++id) {

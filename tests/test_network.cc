@@ -38992,7 +38992,10 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     // A smaller existing pipe must still make exact progress when the read
     // chunk limit is larger than its capacity (also covers resize fallback).
     REQUIRE_EQ(fcntl(conn->relay_owner.pipe_write, F_SETPIPE_SZ, 64 * 1024), 64 * 1024);
-    loop->relay_budget_calls = 8;
+    // Model two full 128 KiB segments already serviced elsewhere this turn:
+    // byte minimum met, but twelve calls still remain. Ordinary work must
+    // cause an expired window to yield without waiting for eight calls left.
+    loop->relay_budget_calls = 12;
     loop->relay_budget_bytes = 512 * 1024;
     // A completion arriving after the first half of the larger quantum must
     // retain FIFO ownership until the CQ is harvested. Restore real ring
@@ -39028,7 +39031,7 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     loop->flush_deferred_relay_reads();
     CHECK_EQ(loop->deferred_relay_read_count, 1u);
     CHECK_EQ(loop->relay_pulled_bytes, 0u);
-    CHECK_EQ(loop->relay_budget_calls, 8u);
+    CHECK_EQ(loop->relay_budget_calls, 12u);
     // Pending ordinary work that has not reached the observation limit must
     // not prevent a runnable body from using its remaining turn budget.
     loop->ordinary_cq_wait_limit_ns = ~static_cast<u64>(0);
