@@ -8829,6 +8829,11 @@ void on_response_header_sent(void* lp, Connection& conn, IoEvent ev) {
                          conn.upstream_episode};
         on_response_body_recvd<Loop>(lp, conn, synth);
     } else {
+        if constexpr (requires(Loop* candidate, Connection& c) {
+                          candidate->start_response_splice_after_header(c);
+                      }) {
+            if (loop->start_response_splice_after_header(conn)) return;
+        }
         if (!loop->submit_recv_upstream(conn)) loop->close_conn(conn);
     }
 }

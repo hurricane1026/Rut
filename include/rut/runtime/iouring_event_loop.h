@@ -3807,6 +3807,11 @@ public:
                c.response_read_deadline_owner_is_neutral() && !c.is_ws_tunnel && !c.is_ws_terminate;
     }
 
+    // The initial header send already includes any body bytes received with
+    // the header. Once it drains, admission can use the same neutral-owner
+    // checks without reading and sending a second serialized prefix first.
+    bool start_response_splice_after_header(Connection& c) { return start_response_splice(c); }
+
     bool arm_response_splice_after_prefix(Connection& c, u32 send_len) {
         if (send_len == 0 || c.upstream_recv_buf.len() != send_len || c.fd < 0 ||
             c.upstream_fd < 0 || c.tls_active || c.protocol != ConnProtocol::Http11 ||

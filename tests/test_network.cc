@@ -39201,6 +39201,197 @@ TEST(iouring_relay, body_callback_admits_relay_after_prefix_send) {
     if (conn->fd >= 0 || conn->upstream_fd >= 0) loop->close_conn(*conn);
 }
 
+TEST(iouring_relay, header_completion_admits_relay_without_second_prefix) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    i32 upstream[2] = {-1, -1};
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    int buffer_size = 256 * 1024;
+    REQUIRE_EQ(setsockopt(upstream[1], SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)),
+               0);
+    REQUIRE_EQ(setsockopt(downstream[0], SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)),
+               0);
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    conn->fd = downstream[0];
+    downstream[0] = -1;
+    conn->upstream_fd = upstream[0];
+    upstream[0] = -1;
+    REQUIRE_EQ(fcntl(conn->upstream_fd, F_SETFL, fcntl(conn->upstream_fd, F_GETFL) | O_NONBLOCK),
+               0);
+    REQUIRE_EQ(fcntl(conn->fd, F_SETFL, fcntl(conn->fd, F_GETFL) | O_NONBLOCK), 0);
+    conn->protocol = ConnProtocol::Http11;
+    conn->state = ConnState::Proxying;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Get);
+    conn->req_body_mode = BodyMode::None;
+    conn->request_upload_complete = true;
+    conn->resp_body_mode = BodyMode::ContentLength;
+    conn->response_read_deadline_buffering = ForwardResponseBufferingMode::None;
+    constexpr u32 kBody = 128 * 1024;
+    conn->resp_body_remaining = kBody;
+    conn->resp_status = 200;
+    conn->req_start_us = 1;
+    conn->keep_alive = false;
+    conn->upstream_keep_alive = false;
+    conn->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    const u32 first = conn->upstream_recv_buf.write_avail();
+    REQUIRE_GT(first, 0u);
+    REQUIRE_LT(first, kBody - 64 * 1024);
+    static u8 expected[kBody];
+    static u8 received[kBody];
+    for (u32 i = 0; i < kBody; ++i) expected[i] = static_cast<u8>(i * 17u + 3u);
+    REQUIRE_EQ(conn->upstream_recv_buf.write(expected, first), first);
+    u32 queued = 0;
+    while (queued != kBody - first) {
+        const ssize_t n =
+            ::send(upstream[1], expected + first + queued, kBody - first - queued, MSG_NOSIGNAL);
+        REQUIRE_GT(n, 0);
+        queued += static_cast<u32>(n);
+    }
+    conn->resp_body_remaining = kBody - first;
+    conn->resp_body_sent = first;
+    conn->upstream_send_len = first;
+    conn->transition_to_sending(&on_response_header_sent<IoUringEventLoop>);
+    REQUIRE(loop->submit_send(*conn, conn->upstream_recv_buf.data(), first));
+    REQUIRE(conn->send_armed);
+    const u32 send_len = conn->upstream_send_len;
+    REQUIRE_EQ(send_len, first);
+    IoEvent send_events[8]{};
+    const u32 send_event_count =
+        loop->backend.wait(send_events, 8, loop->conns, IoUringEventLoop::kMaxConns);
+    REQUIRE_GE(send_event_count, 1u);
+    bool saw_send = false;
+    for (u32 i = 0; i < send_event_count; ++i) {
+        if (send_events[i].conn_id == conn->id && send_events[i].type == IoEventType::Send) {
+            saw_send = true;
+            REQUIRE_EQ(send_events[i].result, static_cast<i32>(send_len));
+        }
+        loop->dispatch(send_events[i]);
+    }
+    REQUIRE(saw_send);
+    // The first body send is now retired and the real callback has admitted
+    // the relay for the remaining body; no direct test seam is involved.
+    CHECK_EQ(loop->relay_admissions, 1u);
+    CHECK_GT(loop->relay_pulled_bytes, 0u);
+    CHECK_GT(loop->relay_written_bytes, 0u);
+    REQUIRE(pump_relay_downstream(loop, downstream[1], received, kBody));
+    CHECK_EQ(memcmp(expected, received, kBody), 0);
+    CHECK_EQ(loop->relay_pulled_bytes, kBody - first);
+    CHECK_EQ(loop->relay_written_bytes, kBody - first);
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_FALSE(conn->relay_owner.active());
+    CHECK_EQ(conn->relay_owner.pipe_read, -1);
+    CHECK_EQ(conn->relay_owner.pipe_write, -1);
+    CHECK_EQ(conn->fd, -1);
+    CHECK_EQ(conn->upstream_fd, -1);
+    close(upstream[1]);
+    close(downstream[1]);
+    if (conn->fd >= 0 || conn->upstream_fd >= 0) loop->close_conn(*conn);
+}
+
+TEST(iouring_relay, header_poll_failure_rearms_copy_receive_and_preserves_body) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    i32 upstream[2] = {-1, -1};
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    int buffer_size = 256 * 1024;
+    REQUIRE_EQ(setsockopt(upstream[1], SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)),
+               0);
+    REQUIRE_EQ(setsockopt(downstream[0], SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)),
+               0);
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop->alloc_upstream_buf(*conn));
+    conn->fd = downstream[0];
+    downstream[0] = -1;
+    conn->upstream_fd = upstream[0];
+    upstream[0] = -1;
+    REQUIRE_EQ(fcntl(conn->upstream_fd, F_SETFL, fcntl(conn->upstream_fd, F_GETFL) | O_NONBLOCK),
+               0);
+    REQUIRE_EQ(fcntl(conn->fd, F_SETFL, fcntl(conn->fd, F_GETFL) | O_NONBLOCK), 0);
+    conn->protocol = ConnProtocol::Http11;
+    conn->state = ConnState::Proxying;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Get);
+    conn->req_body_mode = BodyMode::None;
+    conn->request_upload_complete = true;
+    conn->resp_body_mode = BodyMode::ContentLength;
+    conn->response_read_deadline_buffering = ForwardResponseBufferingMode::None;
+    constexpr u32 kBody = 128 * 1024;
+    conn->resp_body_remaining = kBody;
+    conn->resp_status = 200;
+    conn->req_start_us = 1;
+    conn->keep_alive = false;
+    conn->upstream_keep_alive = false;
+    RouteConfig config{};
+    config.upstream_count = 1;
+    conn->request_config = &config;
+    conn->upstream_attempts = 1;
+    conn->on_upstream_recv = &on_response_body_recvd<IoUringEventLoop>;
+    REQUIRE(loop->use_one_shot_upstream_recv(*conn));
+    const u32 first = conn->upstream_recv_buf.write_avail();
+    REQUIRE_GT(first, 0u);
+    REQUIRE_LT(first, kBody - 64 * 1024);
+    static u8 expected[kBody];
+    static u8 received[kBody];
+    for (u32 i = 0; i < kBody; ++i) expected[i] = static_cast<u8>(i * 17u + 3u);
+    REQUIRE_EQ(conn->upstream_recv_buf.write(expected, first), first);
+    conn->resp_body_remaining = kBody - first;
+    conn->resp_body_sent = first;
+    conn->upstream_send_len = first;
+    conn->transition_to_sending(&on_response_header_sent<IoUringEventLoop>);
+    loop->test_fail_next_relay_poll = true;
+    REQUIRE(loop->submit_send(*conn, conn->upstream_recv_buf.data(), first));
+    REQUIRE(conn->send_armed);
+    const u32 send_len = conn->upstream_send_len;
+    REQUIRE_EQ(send_len, first);
+    IoEvent send_events[8]{};
+    const u32 send_event_count =
+        loop->backend.wait(send_events, 8, loop->conns, IoUringEventLoop::kMaxConns);
+    REQUIRE_GE(send_event_count, 1u);
+    bool saw_send = false;
+    for (u32 i = 0; i < send_event_count; ++i) {
+        if (send_events[i].conn_id == conn->id && send_events[i].type == IoEventType::Send) {
+            saw_send = true;
+            REQUIRE_EQ(send_events[i].result, static_cast<i32>(send_len));
+        }
+        loop->dispatch(send_events[i]);
+    }
+    REQUIRE(saw_send);
+    CHECK_EQ(loop->relay_admissions, 0u);
+    CHECK_FALSE(conn->relay_owner.active());
+    CHECK_EQ(conn->relay_owner.pipe_read, -1);
+    CHECK_EQ(conn->relay_owner.pipe_write, -1);
+    CHECK_GE(conn->fd, 0);
+    CHECK_GE(conn->upstream_fd, 0);
+    CHECK_TRUE(conn->upstream_recv_armed);
+    CHECK_EQ(conn->on_upstream_recv, &on_response_body_recvd<IoUringEventLoop>);
+    u32 queued = 0;
+    while (queued != kBody - first) {
+        const ssize_t n =
+            ::send(upstream[1], expected + first + queued, kBody - first - queued, MSG_NOSIGNAL);
+        REQUIRE_GT(n, 0);
+        queued += static_cast<u32>(n);
+    }
+    REQUIRE(pump_relay_downstream(loop, downstream[1], received, kBody));
+    CHECK_EQ(memcmp(expected, received, kBody), 0);
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_FALSE(conn->relay_owner.active());
+    CHECK_EQ(conn->relay_owner.pipe_read, -1);
+    CHECK_EQ(conn->relay_owner.pipe_write, -1);
+    CHECK_EQ(conn->fd, -1);
+    CHECK_EQ(conn->upstream_fd, -1);
+    close(upstream[1]);
+    close(downstream[1]);
+    if (conn->fd >= 0 || conn->upstream_fd >= 0) loop->close_conn(*conn);
+}
+
 // With the smaller rings a full SQ is reachable, and several submit_recv callers
 // (accept, pipeline and TLS continuations) cannot act on a false return: the
 // connection would sit with no recv armed until the keep-alive timeout. The
