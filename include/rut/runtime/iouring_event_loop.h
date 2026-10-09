@@ -27,6 +27,7 @@
 #include "rut/runtime/tls_iouring.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
+#include "rut/runtime/ws_splice_experiment.h"
 #include <atomic>
 
 #include <errno.h>
@@ -279,6 +280,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u32 deferred_relay_read_ids[kDeferredRelayReadLimit]{};
     u32 deferred_relay_read_episodes[kDeferredRelayReadLimit]{};
     // Read-only diagnostics for focused validation and post-run evidence.
+    WsSpliceExperiment ws_splice;
     u64 relay_admissions = 0;
     u64 relay_pulled_bytes = 0;
     u64 relay_written_bytes = 0;
@@ -735,6 +737,7 @@ public:
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
             retry_response_splice_cancels();
+            ws_splice.progress(*this);
             const u32 kEventCount = backend.wait(events,
                                                  study_event_batch_limit,
                                                  conns,
@@ -865,6 +868,15 @@ public:
             idle_trim_pidfd = -1;
         }
         backend.shutdown();
+        if (ws_splice.enabled)
+            ::fprintf(
+                stderr,
+                "RUT_WS_SPLICE admissions=%llu client_bytes=%llu upstream_bytes=%llu calls=%llu\n",
+                static_cast<unsigned long long>(ws_splice.admissions),
+                static_cast<unsigned long long>(ws_splice.transferred[0]),
+                static_cast<unsigned long long>(ws_splice.transferred[1]),
+                static_cast<unsigned long long>(ws_splice.calls));
+        ws_splice.shutdown();
         // No further CQE can retire relay polls after the backend has stopped.
         // Close every connection-owned pipe explicitly before destroying the
         // mmap-backed slots; integer pipe descriptors are not owned by reset().
@@ -3440,7 +3452,23 @@ public:
         }
     }
 
+    // Tunnel callbacks consume one contiguous block while its paired send
+    // owns that memory. A terminal bounded recv prevents a multishot burst
+    // from filling the same buffer before dispatch can apply backpressure.
+    bool use_one_shot_websocket_recv(const Connection& c) const {
+        if (backend.ws_recv_cache_enabled) return false;
+        return c.is_ws_tunnel && !c.tls_active && c.protocol == ConnProtocol::Http11 && c.fd >= 0 &&
+               c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode);
+    }
+
+    bool ws_recv_cache_active(const Connection& c) const {
+        return backend.ws_recv_cache_enabled && c.is_ws_tunnel && !c.is_ws_terminate &&
+               !c.tls_active;
+    }
+    bool ws_has_cached_input(const Connection& c) const { return backend.has_ws_recv_cache(c.id); }
+
     bool submit_recv_impl(Connection& c) {
+        if (ws_splice.intercept_recv(*this, c)) return true;
         const bool tls_send_needs_recv =
             c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>;
         if (tls_send_needs_recv) c.recv_paused_for_send = false;
@@ -3456,7 +3484,16 @@ public:
             if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
             return true;
         }
-        if (backend.add_recv(c.fd, c.id)) {
+        bool submitted = false;
+        if (use_one_shot_websocket_recv(c)) {
+            const u32 available = c.recv_buf.write_avail();
+            const u32 maximum = kProvidedBufSize;
+            submitted =
+                backend.add_recv_once(c.fd, c.id, available < maximum ? available : maximum);
+        } else {
+            submitted = backend.add_recv(c.fd, c.id);
+        }
+        if (submitted) {
             c.pending_ops++;
             c.recv_armed = true;
             c.recv_pause_rearm_pending = false;
@@ -4479,6 +4516,7 @@ public:
     }
 
     bool submit_recv_upstream_impl(Connection& c) {
+        if (ws_splice.intercept_recv(*this, c)) return true;
         if (c.upstream_recv_paused_for_send) {
             c.upstream_recv_pause_rearm_pending = true;
             return true;
@@ -4504,7 +4542,7 @@ public:
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
-        const bool one_shot = use_one_shot_upstream_recv(c);
+        const bool one_shot = use_one_shot_websocket_recv(c) || use_one_shot_upstream_recv(c);
         bool submitted = false;
         bool direct = false;
         if (one_shot) {
@@ -7154,8 +7192,9 @@ public:
                 }
                 continue;
             }
-            dispatch(events[i]);
+            if (!ws_splice.dispatch(*this, events[i])) dispatch(events[i]);
         }
+        ws_splice.progress(*this);
         study_inside_cq = false;
         study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
         settle_response_read_deadline_batch();
@@ -7342,6 +7381,7 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
+        ws_splice.close(*this, c);
         if (c.tls_out_inflight) {
             // TLS close custody belongs to the actual ciphertext SQE, not the
             // logical plaintext continuation. The common ledger survives
@@ -8597,9 +8637,9 @@ public:
                             // deliver a terminal the response pumps treat as fatal
                             // (header) or as already re-armed (body). This batch's
                             // buffers were returned before dispatch.
-                            const bool one_shot_ring_empty = ev.provided_ring_empty &&
-                                                             ev.result == -ENOBUFS &&
-                                                             use_one_shot_upstream_recv(conn);
+                            const bool one_shot_ring_empty =
+                                ev.provided_ring_empty && ev.result == -ENOBUFS &&
+                                (use_one_shot_upstream_recv(conn) || ws_recv_cache_active(conn));
                             // A torn-down h2-proxy episode's recv terminal has now drained;
                             // discard any stale positive bytes it left so the next stream
                             // can't parse them as its response. Gated on the flag so the

@@ -393,11 +393,29 @@ static void configure_study_policy(Loop* loop) {
     if constexpr (requires { loop->study_event_batch_limit; loop->study_relay_chunk_size; }) {
         extern char** environ;
         const char* profile = "current";
+        bool nodelay = false;
+        for (char** item = environ; *item != nullptr; ++item)
+            if (str_eq(*item, "RUT_STUDY_HTTP_NODELAY=on")) nodelay = true;
+        UpstreamPool::study_tcp_nodelay.store(nodelay, std::memory_order_relaxed);
+        write_str(nodelay ? "RUT_STUDY_HTTP_NODELAY mode=on\n" : "RUT_STUDY_HTTP_NODELAY mode=off\n");
         for (char** item = environ; *item != nullptr; ++item) {
             if (str_eq(*item, "RUT_STUDY_POLICY=latency")) profile = "latency";
             if (str_eq(*item, "RUT_STUDY_POLICY=balanced")) profile = "balanced";
             if (str_eq(*item, "RUT_STUDY_POLICY=current")) profile = "current";
             if (str_eq(*item, "RUT_STUDY_POLICY=throughput")) profile = "throughput";
+        }
+        if constexpr (requires { loop->backend.enable_ws_recv_cache(); }) {
+            for (char** item = environ; *item != nullptr; ++item) {
+                if (str_eq(*item, "RUT_STUDY_WS_RECV=cache") && !loop->backend.enable_ws_recv_cache())
+                    loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
+            }
+            write_str(loop->backend.ws_recv_cache_enabled ? "RUT_STUDY_WS_RECV mode=cache\n" : "RUT_STUDY_WS_RECV mode=once\n");
+        }
+        if constexpr (requires { loop->ws_splice.enable(loop->connection_capacity); }) {
+            for (char** item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_WS_SPLICE=on") && !loop->ws_splice.enable(loop->connection_capacity))
+                    loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
+            write_str(loop->ws_splice.enabled ? "RUT_STUDY_WS_SPLICE mode=on\n" : "RUT_STUDY_WS_SPLICE mode=off\n");
         }
         const bool latency = str_eq(profile, "latency");
         const bool balanced = str_eq(profile, "balanced");
