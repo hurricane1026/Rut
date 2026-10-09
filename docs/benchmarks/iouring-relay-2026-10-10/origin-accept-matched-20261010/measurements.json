@@ -1,0 +1,434 @@
+[
+  {
+    "requests": 325277,
+    "seconds": 15.071592,
+    "rps": 21660.864143796673,
+    "p50_us": 8923.0,
+    "p95_us": 21050.0,
+    "p99_us": 26359.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 15.14,
+    "large_client": {
+      "requests": 75646,
+      "seconds": 15.071592,
+      "rps": 5019.1114515308,
+      "p50_us": 8923.0,
+      "p95_us": 21050.0,
+      "p99_us": 26359.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 13.42
+    },
+    "small_client": {
+      "requests": 249631,
+      "seconds": 15.000283,
+      "rps": 16641.752692265873,
+      "p50_us": 2179.0,
+      "p95_us": 4078.0,
+      "p99_us": 5086.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 1.72
+    },
+    "workload": "proxy",
+    "proxy_profile": "native-streaming",
+    "static_profile": "converter-return",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workers": 1,
+    "server_cpus": "2",
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 62.03724198478833,
+    "origin_cpu_pct": 137.5435322293756,
+    "server_rss_bytes": 42553344,
+    "valid": true,
+    "origin_multi_accept": "on",
+    "outer_repeat": 1
+  },
+  {
+    "requests": 360790,
+    "seconds": 15.015961,
+    "rps": 24046.975822841705,
+    "p50_us": 20620.0,
+    "p95_us": 25066.0,
+    "p99_us": 28302.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 14.429999999999998,
+    "large_client": {
+      "requests": 69075,
+      "seconds": 15.015961,
+      "rps": 4600.105181413297,
+      "p50_us": 20620.0,
+      "p95_us": 25066.0,
+      "p99_us": 28302.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 12.649999999999999
+    },
+    "small_client": {
+      "requests": 291715,
+      "seconds": 15.000614,
+      "rps": 19446.87064142841,
+      "p50_us": 1737.0,
+      "p95_us": 3185.0,
+      "p99_us": 3636.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 1.78
+    },
+    "workload": "proxy",
+    "proxy_profile": "native-streaming",
+    "static_profile": "converter-return",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workers": 1,
+    "server_cpus": "2",
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 61.0017567307214,
+    "origin_cpu_pct": 132.39245893086695,
+    "server_rss_bytes": 41046016,
+    "valid": true,
+    "origin_multi_accept": "on",
+    "outer_repeat": 2
+  },
+  {
+    "requests": 436715,
+    "seconds": 15.008061,
+    "rps": 29111.162102208116,
+    "p50_us": 22730.0,
+    "p95_us": 27212.0,
+    "p99_us": 29912.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 13.879999999999999,
+    "large_client": {
+      "requests": 62308,
+      "seconds": 15.008061,
+      "rps": 4151.635577707207,
+      "p50_us": 22730.0,
+      "p95_us": 27212.0,
+      "p99_us": 29912.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 11.68
+    },
+    "small_client": {
+      "requests": 374407,
+      "seconds": 15.000565,
+      "rps": 24959.52652450091,
+      "p50_us": 1308.0,
+      "p95_us": 2378.0,
+      "p99_us": 2779.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 2.1999999999999997
+    },
+    "workload": "proxy",
+    "proxy_profile": "native-streaming",
+    "static_profile": "converter-return",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workers": 1,
+    "server_cpus": "2",
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 60.96723620726221,
+    "origin_cpu_pct": 130.1300681014023,
+    "server_rss_bytes": 41017344,
+    "valid": true,
+    "origin_multi_accept": "on",
+    "outer_repeat": 3
+  },
+  {
+    "requests": 744269,
+    "seconds": 15.084006,
+    "rps": 49590.444722215805,
+    "p50_us": 12306.0,
+    "p95_us": 22249.0,
+    "p99_us": 23970.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 15.540000000000003,
+    "large_client": {
+      "requests": 59648,
+      "seconds": 15.084006,
+      "rps": 3954.3871833516905,
+      "p50_us": 12306.0,
+      "p95_us": 22249.0,
+      "p99_us": 23970.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 11.760000000000002
+    },
+    "small_client": {
+      "requests": 684621,
+      "seconds": 15.001756,
+      "rps": 45636.057538864115,
+      "p50_us": 470.0,
+      "p95_us": 2506.0,
+      "p99_us": 3538.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 3.7800000000000002
+    },
+    "workload": "proxy",
+    "proxy_profile": "native-streaming",
+    "static_profile": "converter-return",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workers": 1,
+    "server_cpus": "2",
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 65.83131828507625,
+    "origin_cpu_pct": 151.15348005032612,
+    "server_rss_bytes": 41082880,
+    "valid": true,
+    "origin_multi_accept": "off",
+    "outer_repeat": 1
+  },
+  {
+    "requests": 712684,
+    "seconds": 15.016449,
+    "rps": 47506.153456203276,
+    "p50_us": 29059.0,
+    "p95_us": 30140.0,
+    "p99_us": 31582.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 12.530000000000001,
+    "large_client": {
+      "requests": 49444,
+      "seconds": 15.016449,
+      "rps": 3292.655940162684,
+      "p50_us": 29059.0,
+      "p95_us": 30140.0,
+      "p99_us": 31582.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 9.200000000000001
+    },
+    "small_client": {
+      "requests": 663240,
+      "seconds": 15.000849,
+      "rps": 44213.49751604059,
+      "p50_us": 663.0,
+      "p95_us": 1026.0,
+      "p99_us": 1209.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 3.33
+    },
+    "workload": "proxy",
+    "proxy_profile": "native-streaming",
+    "static_profile": "converter-return",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workers": 1,
+    "server_cpus": "2",
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 62.59802167609666,
+    "origin_cpu_pct": 131.25606459956012,
+    "server_rss_bytes": 41119744,
+    "valid": true,
+    "origin_multi_accept": "off",
+    "outer_repeat": 2
+  },
+  {
+    "requests": 699647,
+    "seconds": 15.015869,
+    "rps": 46638.167215515765,
+    "p50_us": 29528.0,
+    "p95_us": 31552.0,
+    "p99_us": 32279.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 12.5,
+    "large_client": {
+      "requests": 48385,
+      "seconds": 15.015869,
+      "rps": 3222.2577328025436,
+      "p50_us": 29528.0,
+      "p95_us": 31552.0,
+      "p99_us": 32279.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 9.2
+    },
+    "small_client": {
+      "requests": 651262,
+      "seconds": 15.000538,
+      "rps": 43415.90948271322,
+      "p50_us": 677.0,
+      "p95_us": 1043.0,
+      "p99_us": 1229.0,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "client_cpu_seconds": 3.3
+    },
+    "workload": "proxy",
+    "proxy_profile": "native-streaming",
+    "static_profile": "converter-return",
+    "transport": "http",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workers": 1,
+    "server_cpus": "2",
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 62.33405472570385,
+    "origin_cpu_pct": 130.46197992270714,
+    "server_rss_bytes": 41140224,
+    "valid": true,
+    "origin_multi_accept": "off",
+    "outer_repeat": 3
+  }
+]

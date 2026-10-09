@@ -679,6 +679,101 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                 write_str("\n");
             }
         }
+        if (relay_stats_enabled) {
+            if constexpr (requires { shards[0].loop->study_relay_turns; }) {
+                for (u32 i = 0; i < shard_count; ++i) {
+                    const auto& loop = *shards[i].loop;
+                    write_str("RUT_SMALL_PHASE_SAMPLES count=");
+                    write_u64(loop.study_small_phase_samples);
+                    write_str(" drops=");
+                    write_u64(loop.study_small_phase_drops);
+                    write_str("\n");
+                    for (u32 kind = 0; kind < 4; ++kind) {
+                        write_str("RUT_SMALL_PHASE kind=");
+                        write_u32(kind);
+                        write_str(" sum_us=");
+                        write_u64(loop.study_small_phase_sum_us[kind]);
+                        write_str(" max_us=");
+                        write_u64(loop.study_small_phase_max_us[kind]);
+                        write_str(" hist=");
+                        for (u32 bin = 0; bin < 32; ++bin) {
+                            write_u64(loop.study_small_phase_hist[kind][bin]);
+                            write_str(",");
+                        }
+                        write_str("\n");
+                    }
+                    write_str("RUT_PHASE_STATS cq_calls=");
+                    write_u64(loop.study_cq_splice_calls);
+                    write_str(" cq_bytes=");
+                    write_u64(loop.study_cq_splice_bytes);
+                    write_str(" cq_ns=");
+                    write_u64(loop.study_cq_phase_ns);
+                    write_str(" flush_ns=");
+                    write_u64(loop.study_flush_phase_ns);
+                    write_str("\n");
+                    write_str("RUT_PIPE_STATS large=");
+                    write_u64(loop.study_large_pipes);
+                    write_str(" small=");
+                    write_u64(loop.study_small_pipes);
+                    write_str("\n");
+                    write_str("RUT_SPLICE_STATS read_calls=");
+                    write_u64(loop.study_splice_calls[0]);
+                    write_str(" write_calls=");
+                    write_u64(loop.study_splice_calls[1]);
+                    write_str(" read_eagain=");
+                    write_u64(loop.study_splice_eagain[0]);
+                    write_str(" write_eagain=");
+                    write_u64(loop.study_splice_eagain[1]);
+                    write_str(" read_short=");
+                    write_u64(loop.study_splice_short[0]);
+                    write_str(" write_short=");
+                    write_u64(loop.study_splice_short[1]);
+                    write_str(" budget_write_polls=");
+                    write_u64(loop.study_write_budget_polls);
+                    write_str("\n");
+                    for (u32 kind = 0; kind < 3; ++kind) {
+                        write_str("RUT_WAIT_STATS kind=");
+                        write_u32(kind);
+                        write_str(" sum_ns=");
+                        write_u64(loop.study_wait_sum_ns[kind]);
+                        write_str(" max_ns=");
+                        write_u64(loop.study_wait_max_ns[kind]);
+                        write_str(" hist=");
+                        for (u32 bin = 0; bin < 32; ++bin) {
+                            write_u64(loop.study_wait_hist[kind][bin]);
+                            write_str(",");
+                        }
+                        write_str("\n");
+                    }
+                    for (u32 kind = 0; kind < 2; ++kind) {
+                        write_str("RUT_SYSCALL_STATS kind=");
+                        write_u32(kind);
+                        write_str(" hist=");
+                        for (u32 bin = 0; bin < 32; ++bin) {
+                            write_u64(loop.study_syscall_hist[kind][bin]);
+                            write_str(",");
+                        }
+                        write_str("\n");
+                    }
+                    write_str("RUT_SCHED_STATS turns=");
+                    write_u64(loop.study_relay_turns);
+                    write_str(" yields=");
+                    write_u64(loop.study_relay_yields);
+                    write_str(" calls=");
+                    write_u64(loop.study_relay_calls);
+                    write_str(" probes=");
+                    write_u64(loop.study_cq_probes);
+                    write_str(" inspected=");
+                    write_u64(loop.study_cq_entries);
+                    write_str(" types=");
+                    for (u32 j = 0; j <= static_cast<u32>(IoEventType::Count); ++j) {
+                        write_u64(loop.study_yield_types[j]);
+                        write_str(",");
+                    }
+                    write_str("\n");
+                }
+            }
+        }
         for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();
         return success;
     };

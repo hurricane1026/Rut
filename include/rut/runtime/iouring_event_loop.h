@@ -128,6 +128,127 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_direct_body_full = 0;
     u64 study_completed_responses = 0;
     u64 study_body_sends = 0;
+    struct StudyRequestPhaseSlot {
+        u32 conn_id = 0;
+        u64 req_us = 0;
+        u64 first_us = 0;
+        u32 upstream_us = 0;
+        u32 payload_len = 0;
+    };
+    StudyRequestPhaseSlot study_request_slots[128]{};
+    u32 study_phase_rng = 0x6d2b79f5u;
+    u64 study_small_phase_samples = 0;
+    u64 study_small_phase_drops = 0;
+    u64 study_small_phase_hist[4][32]{};
+    u64 study_small_phase_sum_us[4]{};
+    u64 study_small_phase_max_us[4]{};
+
+    void study_note_first_response(const Connection& c, u64 now_us) {
+        if (c.req_start_us == 0 || now_us < c.req_start_us ||
+            now_us - c.req_start_us > 60ull * 1000000u)
+            return;
+        u32 rng = study_phase_rng;
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        study_phase_rng = rng;
+        if ((rng & 63u) != 0) return;
+        auto& slot = study_request_slots[c.id & 127u];
+        if (slot.req_us != 0 && slot.conn_id != c.id && now_us >= slot.req_us &&
+            now_us - slot.req_us < 1000000u) {
+            ++study_small_phase_drops;
+            return;
+        }
+        slot.conn_id = c.id;
+        slot.req_us = c.req_start_us;
+        slot.first_us = now_us;
+        slot.upstream_us = c.upstream_us;
+        slot.payload_len = 0;
+    }
+
+    void study_note_response_size(const Connection& c, u32 payload_len) {
+        auto& slot = study_request_slots[c.id & 127u];
+        if (slot.req_us != 0 && slot.conn_id == c.id && slot.req_us == c.req_start_us)
+            slot.payload_len = payload_len;
+    }
+
+    void study_note_proxy_complete(const Connection& c) {
+        auto& slot = study_request_slots[c.id & 127u];
+        if (slot.req_us == 0 || slot.conn_id != c.id || slot.req_us != c.req_start_us) return;
+        const StudyRequestPhaseSlot snapshot = slot;
+        slot.req_us = 0;
+        // Filter by actual completed payload, never by a predicted URL size.
+        if (snapshot.payload_len != 4096 || c.resp_body_mode != BodyMode::ContentLength) return;
+        const u64 now = monotonic_us();
+        if (now < snapshot.first_us || snapshot.first_us < snapshot.req_us ||
+            snapshot.first_us - snapshot.req_us < snapshot.upstream_us)
+            return;
+        const u64 phases[4] = {now - snapshot.req_us,
+                               snapshot.first_us - snapshot.req_us - snapshot.upstream_us,
+                               snapshot.upstream_us,
+                               now - snapshot.first_us};
+        ++study_small_phase_samples;
+        for (u32 k = 0; k < 4; ++k) {
+            u64 value = phases[k];
+            u32 bin = 0;
+            while (value > 1 && bin < 31) {
+                value >>= 1;
+                ++bin;
+            }
+            ++study_small_phase_hist[k][bin];
+            study_small_phase_sum_us[k] += phases[k];
+            if (phases[k] > study_small_phase_max_us[k]) study_small_phase_max_us[k] = phases[k];
+        }
+    }
+
+    bool study_inside_cq = false;
+    u64 study_turn_started_ns = 0;
+    u64 study_cq_splice_calls = 0;
+    u64 study_cq_splice_bytes = 0;
+    u64 study_cq_phase_ns = 0;
+    u64 study_flush_phase_ns = 0;
+    static constexpr u32 kResponseSpliceChunkSize = 128 * 1024;
+    u64 study_large_pipes = 0;
+    u64 study_small_pipes = 0;
+    u64 study_splice_calls[2]{};
+    u64 study_splice_eagain[2]{};
+    u64 study_splice_short[2]{};
+    u64 study_write_budget_polls = 0;
+    u64 study_poll_started[2][kDefaultConnectionCapacity]{};
+    u64 study_queue_started[kDefaultConnectionCapacity]{};
+    u64 study_wait_hist[3][32]{};
+    u64 study_wait_sum_ns[3]{};
+    u64 study_wait_max_ns[3]{};
+    u64 study_syscall_hist[2][32]{};
+    void study_record_wait(u32 kind, u64 ns) {
+        u64 us = ns / 1000;
+        u32 bin = 0;
+        while (us > 1 && bin < 31) {
+            us >>= 1;
+            ++bin;
+        }
+        ++study_wait_hist[kind][bin];
+        study_wait_sum_ns[kind] += ns;
+        if (ns > study_wait_max_ns[kind]) study_wait_max_ns[kind] = ns;
+    }
+    void study_record_syscall(u32 kind, u64 ns) {
+        u64 us = ns / 1000;
+        u32 bin = 0;
+        while (us > 1 && bin < 31) {
+            us >>= 1;
+            ++bin;
+        }
+        ++study_syscall_hist[kind][bin];
+    }
+
+    bool study_yield_enabled = true;
+    u64 ordinary_cq_wait_limit_ns = 80ull * 1000;
+    u64 study_relay_turns = 0;
+    u64 study_relay_yields = 0;
+    u64 study_relay_calls = 0;
+    u64 study_cq_probes = 0;
+    u64 study_cq_entries = 0;
+    u64 study_yield_types[static_cast<u32>(IoEventType::Count) + 1]{};
     IoUringBackend backend;
     TimerWheel timer;
     u32 shard_id = 0;
@@ -144,10 +265,12 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // again before that nested call returns.
     SyncSendCompletionGuard in_sync_send_completion{};
     // Shared fairness budget for synchronous relay progress within one wait turn.
-    u32 relay_budget_calls = 8;
-    u32 relay_budget_bytes = 512 * 1024;
+    static constexpr u32 kRelayTurnMaxCalls = 16;
+    static constexpr u32 kRelayTurnMaxBytes = 1024 * 1024;
+    u32 relay_budget_calls = kRelayTurnMaxCalls;
+    u32 relay_budget_bytes = kRelayTurnMaxBytes;
     u32 relay_cancel_retry_count = 0;
-    static constexpr u32 kDeferredRelayReadLimit = 8;
+    static constexpr u32 kDeferredRelayReadLimit = kMaxEventsPerWait;
     u32 deferred_relay_read_count = 0;
     u32 deferred_relay_read_ids[kDeferredRelayReadLimit]{};
     u32 deferred_relay_read_episodes[kDeferredRelayReadLimit]{};
@@ -608,7 +731,11 @@ public:
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
             retry_response_splice_cancels();
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, slots_initialized);
+            const u32 kEventCount = backend.wait(events,
+                                                 kMaxEventsPerWait,
+                                                 conns,
+                                                 slots_initialized,
+                                                 deferred_relay_read_count == 0);
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -616,9 +743,9 @@ public:
                 running_.store(false, std::memory_order_release);
                 break;
             }
-            relay_budget_calls = 8;
-            relay_budget_bytes = 512 * 1024;
-            dispatch_batch(events, n);
+            relay_budget_calls = kRelayTurnMaxCalls;
+            relay_budget_bytes = kRelayTurnMaxBytes;
+            dispatch_batch(events, kEventCount);
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
             poll_command();
@@ -3803,6 +3930,11 @@ public:
                c.response_read_deadline_owner_is_neutral() && !c.is_ws_tunnel && !c.is_ws_terminate;
     }
 
+    // The initial header send already includes any body bytes received with
+    // the header. Once it drains, admission can use the same neutral-owner
+    // checks without reading and sending a second serialized prefix first.
+    bool start_response_splice_after_header(Connection& c) { return start_response_splice(c); }
+
     bool arm_response_splice_after_prefix(Connection& c, u32 send_len) {
         if (send_len == 0 || c.upstream_recv_buf.len() != send_len || c.fd < 0 ||
             c.upstream_fd < 0 || c.tls_active || c.protocol != ConnProtocol::Http11 ||
@@ -3854,12 +3986,19 @@ public:
         c.relay_owner.initial_declined = false;
     }
 
-    // Defer the next read until the complete wait batch has settled.  A relay
-    // that just finished a segment has already yielded one write operation;
-    // keeping its read out of the SQ until the batch tail lets other ready
-    // owners make progress before this connection re-enters the poll queue.
-    // The episode is captured with the slot id so a close/reuse cannot turn a
-    // parked read into an operation for a later connection.
+    // Ready relay reads remain runnable on the shard. Queue them behind their
+    // peers instead of manufacturing another readiness CQE after each segment.
+    // Slot/episode authentication protects close and reuse; queue overflow uses
+    // the existing kernel poll path. EAGAIN still registers a real read poll.
+    void handle_response_splice_poll_failure(Connection& c) {
+        if (c.relay_owner.body_bytes == 0) {
+            close_response_splice_pipe(c);
+            c.relay_owner.initial_declined = true;
+        } else {
+            close_conn(c);
+        }
+    }
+
     void defer_response_splice_read(Connection& c) {
         RelayOwner& r = c.relay_owner;
         r.phase = RelayPhase::Reading;
@@ -3869,6 +4008,7 @@ public:
                 return;
         }
         if (deferred_relay_read_count < kDeferredRelayReadLimit) {
+            study_queue_started[c.id] = monotonic_ns();
             deferred_relay_read_ids[deferred_relay_read_count] = c.id;
             deferred_relay_read_episodes[deferred_relay_read_count] = r.upstream_episode;
             deferred_relay_read_count++;
@@ -3876,22 +4016,85 @@ public:
         }
         // Queue saturation is only a fairness guard.  Preserve progress by
         // using the existing poll admission for the overflow owner.
-        if (!arm_response_splice_read(c)) close_conn(c);
+        if (!arm_response_splice_read(c)) handle_response_splice_poll_failure(c);
+    }
+
+    bool has_ordinary_cq_work() {
+        ++study_cq_probes;
+        if (!backend.cq_head || !backend.cq_tail) return false;
+        const u32 head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
+        const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        if (head == tail) return false;
+        if (!backend.cq_entries || !backend.cq_ring_mask || tail - head > backend.cq_ring_entries)
+            return true;
+        // Peek only; wait() retains sole ownership of CQ consumption and all
+        // cancellation/proactor accounting. Bound the scheduler hint's cost.
+        const u32 count = std::min<u32>(tail - head, 32);
+        for (u32 i = 0; i < count; ++i) {
+            const auto& cqe = backend.cq_entries[(head + i) & *backend.cq_ring_mask];
+            ++study_cq_entries;
+            const u32 tag = static_cast<u32>(cqe.user_data & 0xFFu);
+            const u32 type = std::min<u32>(tag, static_cast<u32>(IoEventType::Count));
+            UpstreamEventToken token{};
+            if (!decode_upstream_event_token(cqe.user_data, &token) ||
+                (token.type != IoEventType::RelayRead && token.type != IoEventType::RelayWrite) ||
+                token.aux != 0 || cqe.res < 0 || token.conn_id >= slots_initialized) {
+                ++study_yield_types[type];
+                return true;
+            }
+            const Connection& c = conns[token.conn_id];
+            const RelayOwner& r = c.relay_owner;
+            if (!r.active() || r.close_pending || token.episode != c.upstream_episode ||
+                token.episode != r.upstream_episode ||
+                (token.type == IoEventType::RelayRead ? !r.read_armed : !r.write_armed))
+                return true;
+        }
+        // Uninspected work is conservatively serviced before the extra quantum.
+        return tail - head > count;
     }
 
     void flush_deferred_relay_reads() {
-        const u32 count = deferred_relay_read_count;
-        deferred_relay_read_count = 0;
-        for (u32 i = 0; i < count; i++) {
-            const u32 id = deferred_relay_read_ids[i];
-            const u32 episode = deferred_relay_read_episodes[i];
-            if (id >= slots_initialized) continue;
-            Connection& c = conns[id];
+        ++study_relay_turns;
+        const u64 phase_started = monotonic_ns();
+        const u32 start_calls = relay_budget_calls;
+        const u32 kCount = deferred_relay_read_count;
+        // CQEs have no completion timestamp. Measure only how long ordinary
+        // work has been observed pending during this relay flush, not its
+        // true kernel age. Reset the observation whenever the CQ is quiet.
+        u64 ordinary_since_ns = has_ordinary_cq_work() ? monotonic_ns() : 0;
+        for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
+            // Reserve a read and write. Unprocessed entries retain FIFO order
+            // into the next turn; a completed segment rejoins at the tail.
+            if (relay_budget_calls < 2 || relay_budget_bytes < 2 * 64 * 1024) break;
+            // Keep the first half of the turn for bounded relay progress, but
+            // do not spend the larger quantum behind newly posted completions.
+            // An idle CQ can still use all eight FIFO segments.
+            if (relay_budget_calls <= 8 && study_yield_enabled) {
+                if (has_ordinary_cq_work()) {
+                    const u64 now = monotonic_ns();
+                    if (ordinary_since_ns == 0) ordinary_since_ns = now;
+                    if (now - ordinary_since_ns >= ordinary_cq_wait_limit_ns) {
+                        ++study_relay_yields;
+                        break;
+                    }
+                } else {
+                    ordinary_since_ns = 0;
+                }
+            }
+            const u32 kId = deferred_relay_read_ids[0];
+            const u32 kEpisode = deferred_relay_read_episodes[0];
+            --deferred_relay_read_count;
+            for (u32 j = 0; j < deferred_relay_read_count; ++j) {
+                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
+                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
+            }
+            if (kId >= slots_initialized) continue;
+            Connection& c = conns[kId];
             RelayOwner& r = c.relay_owner;
             if (!r.active()) continue;
-            // A reused slot, or a slot whose episode was replaced, is an old
+            // A reused slot, or a slot whose kEpisode was replaced, is an old
             // queue entry and is discarded without touching the new owner.
-            if (r.upstream_episode != episode || c.upstream_episode != episode) continue;
+            if (r.upstream_episode != kEpisode || c.upstream_episode != kEpisode) continue;
             if (r.close_pending) {
                 if (!r.read_armed && !r.write_armed && !r.read_cancel_owned &&
                     !r.write_cancel_owned && !r.read_cancel_retry && !r.write_cancel_retry &&
@@ -3899,7 +4102,7 @@ public:
                     close_response_splice_pipe(c);
                 continue;
             }
-            // Same-episode state corruption must not be allowed to become a
+            // Same-kEpisode state corruption must not be allowed to become a
             // second poll or a write/read owner.  The queue entry itself is
             // already consumed, so fail closed through the normal ledger.
             if (c.fd < 0 || c.upstream_fd < 0 || r.phase != RelayPhase::Reading ||
@@ -3910,8 +4113,24 @@ public:
                 close_conn(c);
                 continue;
             }
-            if (!arm_response_splice_read(c)) close_conn(c);
+            if (study_queue_started[c.id] != 0) {
+                study_record_wait(2, monotonic_ns() - study_queue_started[c.id]);
+                study_queue_started[c.id] = 0;
+            }
+            const IoEvent kReady{c.id, POLLIN, 0, 0, IoEventType::RelayRead, 0, 0, kEpisode};
+            on_response_splice_event(c, kReady);
+            if (c.relay_owner.initial_declined && c.fd >= 0 && c.upstream_fd >= 0) {
+                // An initial SQE failure no longer has the synchronous caller
+                // that normally resumes the copy pump. No body bytes entered
+                // the pipe, so restore the existing ordinary receive path.
+                c.relay_owner.initial_declined = false;
+                upgrade_upstream_recv_to_bulk(c);
+                c.set_slots(nullptr, nullptr, &on_response_body_recvd<IoUringEventLoop>, nullptr);
+                if (!submit_recv_upstream(c)) close_conn(c);
+            }
         }
+        study_relay_calls += start_calls - relay_budget_calls;
+        study_flush_phase_ns += monotonic_ns() - phase_started;
     }
 
     void clear_deferred_relay_read(u32 id) {
@@ -3941,6 +4160,7 @@ public:
         if (!backend.add_relay_poll(
                 c.upstream_fd, c.id, IoEventType::RelayRead, c.relay_owner.upstream_episode))
             return false;
+        study_poll_started[0][c.id] = monotonic_ns();
         c.pending_ops++;
         c.relay_owner.read_armed = true;
         c.relay_owner.phase = RelayPhase::Reading;
@@ -3965,14 +4185,23 @@ public:
             // F_SETPIPE_SZ returns the actual capacity. The pipe is still
             // private here, so a second F_GETPIPE_SZ only adds a syscall to
             // every new relay connection.
-            if (::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024) < 64 * 1024) {
+            int capacity = ::fcntl(fds[1], F_SETPIPE_SZ, kResponseSpliceChunkSize);
+            if (capacity < 64 * 1024 && kResponseSpliceChunkSize > 64 * 1024)
+                capacity = ::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024);
+            if (capacity < 64 * 1024) {
                 ::close(fds[0]);
                 ::close(fds[1]);
                 return false;
             }
+            if (capacity >= 128 * 1024)
+                ++study_large_pipes;
+            else
+                ++study_small_pipes;
             c.relay_owner.pipe_read = fds[0];
             c.relay_owner.pipe_write = fds[1];
         }
+        study_poll_started[0][c.id] = study_poll_started[1][c.id] = 0;
+        study_queue_started[c.id] = 0;
         c.relay_owner.phase = RelayPhase::Reading;
         c.relay_owner.upstream_episode = c.upstream_episode;
         c.relay_owner.source_fd = c.upstream_fd;
@@ -4007,6 +4236,7 @@ public:
         if (!backend.add_relay_poll(
                 c.fd, c.id, IoEventType::RelayWrite, c.relay_owner.upstream_episode))
             return false;
+        study_poll_started[1][c.id] = monotonic_ns();
         c.pending_ops++;
         c.relay_owner.write_armed = true;
         c.relay_owner.phase = RelayPhase::Writing;
@@ -4026,40 +4256,39 @@ public:
         }
         if (ev.type == IoEventType::RelayRead) {
             r.read_armed = false;
-            if (relay_budget_calls == 0 || relay_budget_bytes == 0) {
-                if (!arm_response_splice_read(c)) {
-                    if (r.body_bytes == 0) {
-                        close_response_splice_pipe(c);
-                        c.relay_owner.initial_declined = true;
-                    } else
-                        close_conn(c);
-                }
+            if (relay_budget_calls < 2 || relay_budget_bytes < 2) {
+                defer_response_splice_read(c);
                 return;
             }
             --relay_budget_calls;
             const u32 want =
-                std::min<u32>(std::min<u32>(c.resp_body_remaining, 64 * 1024), relay_budget_bytes);
+                std::min<u32>(std::min<u32>(c.resp_body_remaining, kResponseSpliceChunkSize),
+                              relay_budget_bytes / 2);
+            if (study_inside_cq) ++study_cq_splice_calls;
+            const bool sampled = (++study_splice_calls[0] & 63u) == 0;
+            const u64 syscall_start = sampled ? monotonic_ns() : 0;
             const ssize_t n = ::splice(c.upstream_fd,
                                        nullptr,
                                        r.pipe_write,
                                        nullptr,
                                        want,
                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            const int splice_errno = errno;
+            if (sampled) study_record_syscall(0, monotonic_ns() - syscall_start);
+            errno = splice_errno;
+            if (n > 0 && static_cast<u32>(n) < want) ++study_splice_short[0];
             if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                 close_conn(c);
                 return;
             }
             if (n < 0) {
+                ++study_splice_eagain[0];
                 if (!arm_response_splice_read(c)) {
                     // Before the first byte is pulled, a readiness-SQE
                     // admission failure is a clean decline to the ordinary
                     // copy path.  Once bytes entered the pipe, losing the
                     // poll owner would strand data and must fail closed.
-                    if (r.body_bytes == 0) {
-                        close_response_splice_pipe(c);
-                        c.relay_owner.initial_declined = true;
-                    } else
-                        close_conn(c);
+                    handle_response_splice_poll_failure(c);
                 }
                 return;
             }
@@ -4078,14 +4307,23 @@ public:
         }
         r.write_armed = false;
         if (relay_budget_calls == 0 || relay_budget_bytes == 0) {
+            ++study_write_budget_polls;
             if (!arm_response_splice_write(c)) close_conn(c);
             return;
         }
         --relay_budget_calls;
         const u32 write_want = std::min<u32>(r.segment_len - r.segment_sent, relay_budget_bytes);
+        if (study_inside_cq) ++study_cq_splice_calls;
+        const bool sampled = (++study_splice_calls[1] & 63u) == 0;
+        const u64 syscall_start = sampled ? monotonic_ns() : 0;
         const ssize_t n = ::splice(
             r.pipe_read, nullptr, c.fd, nullptr, write_want, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        const int splice_errno = errno;
+        if (sampled) study_record_syscall(1, monotonic_ns() - syscall_start);
+        errno = splice_errno;
+        if (n > 0 && static_cast<u32>(n) < write_want) ++study_splice_short[1];
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            ++study_splice_eagain[1];
             if (!arm_response_splice_write(c)) close_conn(c);
             return;
         }
@@ -4096,6 +4334,7 @@ public:
         r.segment_sent += static_cast<u32>(n);
         relay_budget_bytes -= static_cast<u32>(n);
         relay_written_bytes += static_cast<u32>(n);
+        if (study_inside_cq) study_cq_splice_bytes += static_cast<u32>(n);
         c.resp_body_sent += static_cast<u32>(n);
         refresh_relay_progress_timer(c);
         if (r.segment_sent != r.segment_len) {
@@ -6875,6 +7114,8 @@ public:
     // Public deterministic seam used by the production run loop and focused
     // same-batch arbitration tests.
     void dispatch_batch(const IoEvent* events, u32 count) {
+        study_turn_started_ns = monotonic_ns();
+        study_inside_cq = true;
         if (count > kMaxEventsPerWait) count = kMaxEventsPerWait;
         prepare_response_read_deadline_batch(events, count);
         for (u32 i = 0; i < count; i++) {
@@ -6911,6 +7152,8 @@ public:
             }
             dispatch(events[i]);
         }
+        study_inside_cq = false;
+        study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
         for (u32 id = 0; id < slots_initialized; ++id) {
@@ -8570,6 +8813,11 @@ public:
                         running_.store(false, std::memory_order_release);
                         break;
                     }
+                    const u32 wait_kind = ev.type == IoEventType::RelayRead ? 0 : 1;
+                    const u64 started = study_poll_started[wait_kind][conn.id];
+                    study_poll_started[wait_kind][conn.id] = 0;
+                    if (!cancel && started != 0)
+                        study_record_wait(wait_kind, monotonic_ns() - started);
                     --conn.pending_ops;
                     if (ev.type == IoEventType::RelayRead) {
                         if (cancel)

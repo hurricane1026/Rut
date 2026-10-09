@@ -1,0 +1,12 @@
+[
+  {
+    "name": "off-1024k",
+    "buffering": "off",
+    "size_kib": 1024
+  },
+  {
+    "name": "off-512k",
+    "buffering": "off",
+    "size_kib": 512
+  }
+]

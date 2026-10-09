@@ -71,6 +71,14 @@ endif()
 # Minimum LLVM 18: stable C API, ORC components (orcshared/orctargetprocess) split finalized.
 if(RUT_ENABLE_JIT)
     find_package(LLVM REQUIRED CONFIG)
+    # LLVM packages may export one shell-style definition string or a CMake
+    # list. Split each item before passing it to target_compile_definitions;
+    # otherwise multiple -D flags can become one macro's replacement text.
+    set(RUT_LLVM_DEFINITIONS)
+    foreach(_RUT_LLVM_DEFINITION IN LISTS LLVM_DEFINITIONS)
+        separate_arguments(_RUT_LLVM_DEFINITION_ARGS NATIVE_COMMAND "${_RUT_LLVM_DEFINITION}")
+        list(APPEND RUT_LLVM_DEFINITIONS ${_RUT_LLVM_DEFINITION_ARGS})
+    endforeach()
     if(LLVM_PACKAGE_VERSION VERSION_LESS "18")
         message(FATAL_ERROR "LLVM >= 18 required, found ${LLVM_PACKAGE_VERSION}")
     endif()

@@ -420,7 +420,7 @@ if(RUT_ENABLE_JIT)
     # The LLVM C API is pure C so no RTTI issues, but LLVM's cmake may add
     # -fno-rtti to definitions. Add LLVM definitions selectively.
     get_filename_component(RUT_NATIVE_LINKER_DIR "${CMAKE_LINKER}" DIRECTORY)
-    target_compile_definitions(rut_jit PRIVATE ${LLVM_DEFINITIONS}
+    target_compile_definitions(rut_jit PRIVATE ${RUT_LLVM_DEFINITIONS}
         RUT_NATIVE_LINKER="${CMAKE_C_COMPILER}"
         RUT_NATIVE_LINKER_DIR="${RUT_NATIVE_LINKER_DIR}/")
     target_include_directories(rut_jit PRIVATE ${PROJECT_BINARY_DIR}/generated)
@@ -445,7 +445,7 @@ if(RUT_ENABLE_JIT)
         ${LLVM_INCLUDE_DIRS}
     )
     target_compile_definitions(rut_loader PUBLIC RUT_ENABLE_JIT=1)
-    target_compile_definitions(rut_loader PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(rut_loader PRIVATE ${RUT_LLVM_DEFINITIONS})
     target_link_libraries(rut_loader
         rut_runtime
         rut_compiler
@@ -472,7 +472,7 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/include
         ${LLVM_INCLUDE_DIRS}
     )
-    target_compile_definitions(rut_harness_runtime PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(rut_harness_runtime PRIVATE ${RUT_LLVM_DEFINITIONS})
     target_link_libraries(rut_harness_runtime
         rut_harness_core
         rut_loader
@@ -486,7 +486,7 @@ if(RUT_ENABLE_JIT)
         ${PROJECT_SOURCE_DIR}/include
         ${LLVM_INCLUDE_DIRS}
     )
-    target_compile_definitions(rut_simulate PRIVATE ${LLVM_DEFINITIONS})
+    target_compile_definitions(rut_simulate PRIVATE ${RUT_LLVM_DEFINITIONS})
     target_link_libraries(rut_simulate
         rut_runtime
         rut_compiler
