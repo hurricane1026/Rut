@@ -132,6 +132,7 @@ def main():
     parser.add_argument('--duration', type=int, default=8)
     parser.add_argument('--cases', nargs='+', choices=[case['name'] for case in CASES])
     parser.add_argument('--smoke', action='store_true')
+    parser.add_argument('--policies', nargs='+', choices=['latency', 'balanced', 'current'])
     parser.add_argument('--engines', nargs='+', choices=['direct-origin', 'uring', 'epoll', 'nginx'])
     args = parser.parse_args()
     out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
@@ -143,7 +144,8 @@ def main():
                     rut_sha256=hashlib.sha256(args.rut.read_bytes()).hexdigest(), nginx_image=image,
                     fixture_sha256=hashlib.sha256(args.fixture.read_bytes()).hexdigest(),
                     ws_recv_mode=os.environ.get('RUT_STUDY_WS_RECV', 'once'),
-                    nginx_keepalive_requests=1000000)
+                    nginx_keepalive_requests=1000000,
+                    ws_splice_mode=os.environ.get('RUT_STUDY_WS_SPLICE', 'off'))
     prior = out / 'study.json'
     if prior.exists() and json.loads(prior.read_text()) != manifest:
         raise RuntimeError('manifest changed; use another output directory')
@@ -169,6 +171,9 @@ def main():
             configurations = [(engine, policy) for engine, policy in configurations if engine in args.engines]
             if 'direct-origin' in args.engines and not any(engine == 'direct-origin' for engine, _ in configurations):
                 configurations.insert(0, ('direct-origin', 'current'))
+        if args.policies:
+            configurations = [(engine, policy) for engine, policy in configurations
+                              if engine not in ['uring', 'epoll'] or policy in args.policies]
         repeats = 1 if args.smoke else 3
         for repeat in range(1, repeats + 1):
             offset = (repeat - 1) % len(configurations)
@@ -240,11 +245,19 @@ def main():
                             frontend = stack.enter_context(process(command, frontend_log,
                                                                    dict(env, RUT_STUDY_POLICY=policy)))
                             ready(front_port, frontend, frontend_log)
+                            startup_deadline = time.monotonic() + 30
                             log = frontend_log.read_text()
+                            while 'Listening on port' not in log:
+                                if frontend.poll() is not None or time.monotonic() >= startup_deadline:
+                                    raise RuntimeError('runtime initialization did not finish: ' + log)
+                                time.sleep(.05)
+                                log = frontend_log.read_text()
                             if f'Backend: {backend}' not in log or f'RUT_STUDY_POLICY profile={policy} ' not in log:
                                 raise RuntimeError('backend or policy did not activate')
                             if engine == 'uring' and f"RUT_STUDY_WS_RECV mode={manifest['ws_recv_mode']}" not in log:
                                 raise RuntimeError('WebSocket receive mode did not activate')
+                            if engine == 'uring' and manifest['ws_splice_mode'] == 'on' and 'RUT_STUDY_WS_SPLICE mode=on' not in log:
+                                raise RuntimeError('WebSocket splice mode did not activate')
                             port = front_port; frontend_pid = frontend.pid
                         if case['kind'] == 'websocket':
                             subprocess.run(fixture + ['preflight', '--port', str(port)], check=True, timeout=10, env=env)
@@ -261,6 +274,7 @@ def main():
                         row = json.loads(result_file.read_text())
                         row.update(case=case, engine=engine, policy=policy, repeat=repeat,
                                    ws_recv_mode=manifest['ws_recv_mode'] if engine == 'uring' else None,
+                                   ws_splice_mode=manifest['ws_splice_mode'] if engine == 'uring' else None,
                                    cpu_observation_seconds=usage_seconds,
                                    frontend_cpu_pct=100 * (after - before) / usage_seconds,
                                    origin_cpu_pct=100 * (origin_after - origin_before) / usage_seconds)
