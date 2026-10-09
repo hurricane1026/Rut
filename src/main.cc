@@ -683,6 +683,25 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
             if constexpr (requires { shards[0].loop->study_relay_turns; }) {
                 for (u32 i = 0; i < shard_count; ++i) {
                     const auto& loop = *shards[i].loop;
+                    write_str("RUT_SMALL_PHASE_SAMPLES count=");
+                    write_u64(loop.study_small_phase_samples);
+                    write_str(" drops=");
+                    write_u64(loop.study_small_phase_drops);
+                    write_str("\n");
+                    for (u32 kind = 0; kind < 4; ++kind) {
+                        write_str("RUT_SMALL_PHASE kind=");
+                        write_u32(kind);
+                        write_str(" sum_us=");
+                        write_u64(loop.study_small_phase_sum_us[kind]);
+                        write_str(" max_us=");
+                        write_u64(loop.study_small_phase_max_us[kind]);
+                        write_str(" hist=");
+                        for (u32 bin = 0; bin < 32; ++bin) {
+                            write_u64(loop.study_small_phase_hist[kind][bin]);
+                            write_str(",");
+                        }
+                        write_str("\n");
+                    }
                     write_str("RUT_PHASE_STATS cq_calls=");
                     write_u64(loop.study_cq_splice_calls);
                     write_str(" cq_bytes=");

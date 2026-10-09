@@ -38992,10 +38992,7 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     // A smaller existing pipe must still make exact progress when the read
     // chunk limit is larger than its capacity (also covers resize fallback).
     REQUIRE_EQ(fcntl(conn->relay_owner.pipe_write, F_SETPIPE_SZ, 64 * 1024), 64 * 1024);
-    // Model two full 128 KiB segments already serviced elsewhere this turn:
-    // byte minimum met, but twelve calls still remain. Ordinary work must
-    // cause an expired window to yield without waiting for eight calls left.
-    loop->relay_budget_calls = 12;
+    loop->relay_budget_calls = 8;
     loop->relay_budget_bytes = 512 * 1024;
     // A completion arriving after the first half of the larger quantum must
     // retain FIFO ownership until the CQ is harvested. Restore real ring
@@ -39031,7 +39028,7 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     loop->flush_deferred_relay_reads();
     CHECK_EQ(loop->deferred_relay_read_count, 1u);
     CHECK_EQ(loop->relay_pulled_bytes, 0u);
-    CHECK_EQ(loop->relay_budget_calls, 12u);
+    CHECK_EQ(loop->relay_budget_calls, 8u);
     // Pending ordinary work that has not reached the observation limit must
     // not prevent a runnable body from using its remaining turn budget.
     loop->ordinary_cq_wait_limit_ns = ~static_cast<u64>(0);
@@ -39056,6 +39053,49 @@ TEST(iouring_relay, sync_pipe_moves_exact_content_length_body) {
     close(upstream[1]);
     close(downstream[1]);
     if (conn->fd >= 0 || conn->upstream_fd >= 0) loop->close_conn(*conn);
+}
+
+TEST(iouring_relay, small_phase_sampler_covers_one_shot_and_excludes_header_bytes) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    i32 upstream[2] = {-1, -1};
+    i32 downstream[2] = {-1, -1};
+    REQUIRE_EQ(rut::test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(rut::test::stream_socketpair(downstream), 0);
+    Connection* c = loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = downstream[0];
+    c->upstream_fd = upstream[0];
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::Sending;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    c->request_upload_complete = true;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 0;
+    // The native one-shot path's log count includes header bytes. Sampling
+    // must select the parsed Content-Length, not this transport byte count.
+    c->resp_body_sent = 4096 + 100;
+    c->resp_status = 200;
+    c->keep_alive = false;
+    c->upstream_keep_alive = false;
+    c->req_start_us = monotonic_us() - 1000;
+    c->upstream_us = 200;
+    const u64 first = c->req_start_us + 500;
+    auto& slot = loop->study_request_slots[c->id & 127u];
+    for (u32 i = 0; i < 1024 && slot.req_us == 0; ++i) loop->study_note_first_response(*c, first);
+    REQUIRE_EQ(slot.req_us, c->req_start_us);
+    loop->study_note_response_size(*c, 4096);
+    const IoEvent sent{c->id, 4196, 0, 0, IoEventType::Send};
+    on_proxy_response_sent<IoUringEventLoop>(loop, *c, sent);
+    CHECK_EQ(loop->study_small_phase_samples, 1u);
+    CHECK_EQ(loop->study_small_phase_sum_us[1], 300u);
+    CHECK_EQ(loop->study_small_phase_sum_us[2], 200u);
+    CHECK_EQ(slot.req_us, 0u);
+    close(upstream[1]);
+    close(downstream[1]);
+    if (c->fd >= 0 || c->upstream_fd >= 0) loop->close_conn(*c);
 }
 
 TEST(iouring_relay, close_without_relay_cqe_releases_pipe_and_owner) {

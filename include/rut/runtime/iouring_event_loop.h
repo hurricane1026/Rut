@@ -128,6 +128,79 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 study_direct_body_full = 0;
     u64 study_completed_responses = 0;
     u64 study_body_sends = 0;
+    struct StudyRequestPhaseSlot {
+        u32 conn_id = 0;
+        u64 req_us = 0;
+        u64 first_us = 0;
+        u32 upstream_us = 0;
+        u32 payload_len = 0;
+    };
+    StudyRequestPhaseSlot study_request_slots[128]{};
+    u32 study_phase_rng = 0x6d2b79f5u;
+    u64 study_small_phase_samples = 0;
+    u64 study_small_phase_drops = 0;
+    u64 study_small_phase_hist[4][32]{};
+    u64 study_small_phase_sum_us[4]{};
+    u64 study_small_phase_max_us[4]{};
+
+    void study_note_first_response(const Connection& c, u64 now_us) {
+        if (c.req_start_us == 0 || now_us < c.req_start_us ||
+            now_us - c.req_start_us > 60 * 1000000u)
+            return;
+        u32 rng = study_phase_rng;
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        study_phase_rng = rng;
+        if ((rng & 63u) != 0) return;
+        auto& slot = study_request_slots[c.id & 127u];
+        if (slot.req_us != 0 && slot.conn_id != c.id && now_us >= slot.req_us &&
+            now_us - slot.req_us < 1000000u) {
+            ++study_small_phase_drops;
+            return;
+        }
+        slot.conn_id = c.id;
+        slot.req_us = c.req_start_us;
+        slot.first_us = now_us;
+        slot.upstream_us = c.upstream_us;
+        slot.payload_len = 0;
+    }
+
+    void study_note_response_size(const Connection& c, u32 payload_len) {
+        auto& slot = study_request_slots[c.id & 127u];
+        if (slot.req_us != 0 && slot.conn_id == c.id && slot.req_us == c.req_start_us)
+            slot.payload_len = payload_len;
+    }
+
+    void study_note_proxy_complete(const Connection& c) {
+        auto& slot = study_request_slots[c.id & 127u];
+        if (slot.req_us == 0 || slot.conn_id != c.id || slot.req_us != c.req_start_us) return;
+        const StudyRequestPhaseSlot snapshot = slot;
+        slot.req_us = 0;
+        // Filter by actual completed payload, never by a predicted URL size.
+        if (snapshot.payload_len != 4096 || c.resp_body_mode != BodyMode::ContentLength) return;
+        const u64 now = monotonic_us();
+        if (now < snapshot.first_us || snapshot.first_us < snapshot.req_us ||
+            snapshot.first_us - snapshot.req_us < snapshot.upstream_us)
+            return;
+        const u64 phases[4] = {now - snapshot.req_us,
+                               snapshot.first_us - snapshot.req_us - snapshot.upstream_us,
+                               snapshot.upstream_us,
+                               now - snapshot.first_us};
+        ++study_small_phase_samples;
+        for (u32 k = 0; k < 4; ++k) {
+            u64 value = phases[k];
+            u32 bin = 0;
+            while (value > 1 && bin < 31) {
+                value >>= 1;
+                ++bin;
+            }
+            ++study_small_phase_hist[k][bin];
+            study_small_phase_sum_us[k] += phases[k];
+            if (phases[k] > study_small_phase_max_us[k]) study_small_phase_max_us[k] = phases[k];
+        }
+    }
+
     bool study_inside_cq = false;
     u64 study_turn_started_ns = 0;
     u64 study_cq_splice_calls = 0;
@@ -3987,8 +4060,6 @@ public:
         // work has been observed pending during this relay flush, not its
         // true kernel age. Reset the observation whenever the CQ is quiet.
         u64 ordinary_since_ns = has_ordinary_cq_work() ? monotonic_ns() : 0;
-        const u64 turn_started =
-            study_turn_started_ns != 0 ? study_turn_started_ns : monotonic_ns();
         for (u32 i = 0; i < kCount && deferred_relay_read_count != 0; i++) {
             // Reserve a read and write. Unprocessed entries retain FIFO order
             // into the next turn; a completed segment rejoins at the tail.
@@ -3996,15 +4067,11 @@ public:
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
-            // Preserve the original 256 KiB body minimum even when a segment
-            // grows. Bound elapsed work from CQ dispatch, including body
-            // progress made by header/readiness callbacks before this queue.
-            if ((relay_budget_bytes <= 512 * 1024 || relay_budget_calls <= 8) &&
-                study_yield_enabled) {
+            if (relay_budget_calls <= 8 && study_yield_enabled) {
                 if (has_ordinary_cq_work()) {
                     const u64 now = monotonic_ns();
                     if (ordinary_since_ns == 0) ordinary_since_ns = now;
-                    if (now - turn_started >= ordinary_cq_wait_limit_ns) {
+                    if (now - ordinary_since_ns >= ordinary_cq_wait_limit_ns) {
                         ++study_relay_yields;
                         break;
                     }
