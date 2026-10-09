@@ -267,6 +267,10 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // Shared fairness budget for synchronous relay progress within one wait turn.
     static constexpr u32 kRelayTurnMaxCalls = 16;
     static constexpr u32 kRelayTurnMaxBytes = 1024 * 1024;
+    u32 study_event_batch_limit = kMaxEventsPerWait;
+    u32 study_relay_chunk_size = kResponseSpliceChunkSize;
+    u32 study_relay_turn_call_limit = kRelayTurnMaxCalls;
+    u32 study_relay_turn_byte_limit = kRelayTurnMaxBytes;
     u32 relay_budget_calls = kRelayTurnMaxCalls;
     u32 relay_budget_bytes = kRelayTurnMaxBytes;
     u32 relay_cancel_retry_count = 0;
@@ -732,7 +736,7 @@ public:
             retry_strict_upstream_retirement_cancels();
             retry_response_splice_cancels();
             const u32 kEventCount = backend.wait(events,
-                                                 kMaxEventsPerWait,
+                                                 study_event_batch_limit,
                                                  conns,
                                                  slots_initialized,
                                                  deferred_relay_read_count == 0);
@@ -743,8 +747,8 @@ public:
                 running_.store(false, std::memory_order_release);
                 break;
             }
-            relay_budget_calls = kRelayTurnMaxCalls;
-            relay_budget_bytes = kRelayTurnMaxBytes;
+            relay_budget_calls = study_relay_turn_call_limit;
+            relay_budget_bytes = study_relay_turn_byte_limit;
             dispatch_batch(events, kEventCount);
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
@@ -4069,7 +4073,7 @@ public:
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
-            if (relay_budget_calls <= 8 && study_yield_enabled) {
+            if (relay_budget_calls <= study_relay_turn_call_limit / 2 && study_yield_enabled) {
                 if (has_ordinary_cq_work()) {
                     const u64 now = monotonic_ns();
                     if (ordinary_since_ns == 0) ordinary_since_ns = now;
@@ -4185,8 +4189,8 @@ public:
             // F_SETPIPE_SZ returns the actual capacity. The pipe is still
             // private here, so a second F_GETPIPE_SZ only adds a syscall to
             // every new relay connection.
-            int capacity = ::fcntl(fds[1], F_SETPIPE_SZ, kResponseSpliceChunkSize);
-            if (capacity < 64 * 1024 && kResponseSpliceChunkSize > 64 * 1024)
+            int capacity = ::fcntl(fds[1], F_SETPIPE_SZ, study_relay_chunk_size);
+            if (capacity < 64 * 1024 && study_relay_chunk_size > 64 * 1024)
                 capacity = ::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024);
             if (capacity < 64 * 1024) {
                 ::close(fds[0]);
@@ -4262,7 +4266,7 @@ public:
             }
             --relay_budget_calls;
             const u32 want =
-                std::min<u32>(std::min<u32>(c.resp_body_remaining, kResponseSpliceChunkSize),
+                std::min<u32>(std::min<u32>(c.resp_body_remaining, study_relay_chunk_size),
                               relay_budget_bytes / 2);
             if (study_inside_cq) ++study_cq_splice_calls;
             const bool sampled = (++study_splice_calls[0] & 63u) == 0;

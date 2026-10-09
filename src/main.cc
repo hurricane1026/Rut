@@ -388,6 +388,38 @@ static void report_source_live_start_error(const SourceLiveAccessLogStartError& 
     write_str(")\n");
 }
 
+template <typename Loop>
+static void configure_study_policy(Loop* loop) {
+    if constexpr (requires { loop->study_event_batch_limit; loop->study_relay_chunk_size; }) {
+        extern char** environ;
+        const char* profile = "current";
+        for (char** item = environ; *item != nullptr; ++item) {
+            if (str_eq(*item, "RUT_STUDY_POLICY=latency")) profile = "latency";
+            if (str_eq(*item, "RUT_STUDY_POLICY=balanced")) profile = "balanced";
+            if (str_eq(*item, "RUT_STUDY_POLICY=current")) profile = "current";
+            if (str_eq(*item, "RUT_STUDY_POLICY=throughput")) profile = "throughput";
+        }
+        const bool latency = str_eq(profile, "latency");
+        const bool balanced = str_eq(profile, "balanced");
+        const bool throughput = str_eq(profile, "throughput");
+        loop->study_event_batch_limit = latency ? 32u : (balanced ? 64u : kMaxEventsPerWait);
+        if constexpr (requires { loop->study_relay_turn_call_limit; }) {
+            loop->study_relay_chunk_size = (latency || balanced) ? 64u * 1024u : 128u * 1024u;
+            loop->study_relay_turn_call_limit = latency ? 8u : (throughput ? 32u : 16u);
+            loop->study_relay_turn_byte_limit = latency ? 512u * 1024u : (throughput ? 2u * 1024u * 1024u : 1024u * 1024u);
+            loop->ordinary_cq_wait_limit_ns = latency ? 20ull * 1000u : 80ull * 1000u;
+            loop->study_yield_enabled = !throughput;
+        } else if constexpr (requires { loop->study_relay_owner_call_limit; }) {
+            loop->study_relay_chunk_size = throughput ? 128u * 1024u : 64u * 1024u;
+            loop->study_relay_owner_call_limit = latency ? 2u : (throughput ? 8u : 4u);
+        }
+        write_str("RUT_STUDY_POLICY profile="); write_str(profile);
+        write_str(" batch="); write_u32(loop->study_event_batch_limit);
+        write_str(" chunk="); write_u32(loop->study_relay_chunk_size);
+        write_str("\n");
+    }
+}
+
 template <typename EventLoopType>
 static RunShardsOutcome run_shards(ListenerSpec listener,
                                    u32 shard_count,
@@ -474,6 +506,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                                      : RunShardsOutcomeKind::Failure;
             return {outcome};
         }
+        configure_study_policy(shards[i].loop);
         if constexpr (requires { shards[i].loop->tls_server; }) {
             shards[i].loop->tls_server = tls_server;
         }
