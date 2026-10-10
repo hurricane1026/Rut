@@ -27,6 +27,17 @@ CASES = [
 ]
 
 
+def frontend_cpu_observation(engine, before, after, seconds):
+    if engine == 'direct-origin' or before is None or after is None:
+        return None
+    return 100 * (after - before) / seconds
+
+
+def manifest_script_hashes(args):
+    return dict(protocol_strategy_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                harness_sha256=hashlib.sha256(args.harness.read_bytes()).hexdigest())
+
+
 def selection_manifest(args):
     return {
         'cases_filter': sorted(args.cases) if args.cases else None,
@@ -213,6 +224,7 @@ def main():
                     tcpkali2_sha256=hashlib.sha256(args.tcpkali2.read_bytes()).hexdigest() if args.tcpkali2 else None,
                     rut_sha256=hashlib.sha256(args.rut.read_bytes()).hexdigest(), nginx_image=image,
                     fixture_sha256=hashlib.sha256(args.fixture.read_bytes()).hexdigest(),
+                    **manifest_script_hashes(args),
                     ws_recv_mode=os.environ.get('RUT_STUDY_WS_RECV', 'once'),
                     nginx_keepalive_requests=1000000, nginx_buffer_kib=args.nginx_buffer_kib,
                     ws_splice_mode=os.environ.get('RUT_STUDY_WS_SPLICE', 'off'),
@@ -386,8 +398,8 @@ def main():
                                    ws_segment=manifest['ws_segment'] if engine == 'uring' else None,
                                    ws_calls=manifest['ws_calls'] if engine == 'uring' else None,
                                    cpu_observation_seconds=usage_seconds,
-                                   frontend_cpu_observation_pct=(100 * (after - before) / usage_seconds
-                                                                 if before is not None else None),
+                                   frontend_cpu_observation_pct=frontend_cpu_observation(
+                                       engine, before, after, usage_seconds),
                                    origin_cpu_observation_pct=100 * (origin_after - origin_before) / usage_seconds,
                                    cpu_observation_scope='setup+warmup+measurement+teardown')
                         result_file.write_text(json.dumps(row, indent=2) + '\n')

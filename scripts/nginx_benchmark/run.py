@@ -918,9 +918,8 @@ class Harness:
                                 workers=self.args.workers,
                                 server_cpus=self.args.server_cpus,
                                 warmup_errors=warmup["errors"],
-                                server_cpu_pct=100
-                                * (after - before)
-                                / result["seconds"],
+                                server_cpu_pct=server_cpu_observation(
+                                    engine, before, after, result["seconds"]),
                                 origin_cpu_pct=100
                                 * (origin_after - origin_before)
                                 / result["seconds"],
@@ -1034,6 +1033,12 @@ class Harness:
                     save_json(self.out / "diagnostics.json", self.results)
                     print(label, json.dumps(result), flush=True)
         return all(r["valid"] for r in self.results)
+
+
+def server_cpu_observation(engine, before, after, seconds):
+    if engine == "direct-origin" or before is None or after is None:
+        return None
+    return 100 * (after - before) / seconds
 
 
 def positive(value):

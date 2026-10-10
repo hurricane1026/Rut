@@ -134,6 +134,33 @@ class ToolsTest(unittest.TestCase):
             "engines_filter": ["nginx"], "policies_filter": ["current"], "smoke": True,
         })
 
+    def test_study_environment_clears_all_runtime_knobs(self):
+        clean = workload_strategy.study_environment({
+            "DOCKER_HOST": "tcp://unused", "RUT_STUDY_POLICY": "latency",
+            "RUT_STUDY_DIRECT_BODY_SEND": "on", "RUT_STUDY_SELECTIVE_VECTOR": "on",
+            "PATH": "/bin",
+        })
+        self.assertNotIn("DOCKER_HOST", clean)
+        self.assertFalse(any(key.startswith("RUT_STUDY_") for key in clean))
+        self.assertEqual(clean["PATH"], "/bin")
+
+    def test_protocol_manifest_hashes_strategy_and_harness(self):
+        with tempfile.NamedTemporaryFile() as harness:
+            harness.write(b"harness-v1")
+            harness.flush()
+            hashes = protocol_strategy.manifest_script_hashes(SimpleNamespace(
+                harness=Path(harness.name)))
+        self.assertEqual(hashes["harness_sha256"],
+                         __import__("hashlib").sha256(b"harness-v1").hexdigest())
+        self.assertEqual(hashes["protocol_strategy_sha256"],
+                         __import__("hashlib").sha256(Path(protocol_strategy.__file__).read_bytes()).hexdigest())
+
+    def test_direct_origin_cpu_observation_is_absent(self):
+        self.assertIsNone(protocol_strategy.frontend_cpu_observation("direct-origin", 1, 3, 1))
+        self.assertEqual(protocol_strategy.frontend_cpu_observation("uring", 1, 3, 1), 200)
+        self.assertIsNone(run.server_cpu_observation("direct-origin", 1, 3, 1))
+        self.assertEqual(run.server_cpu_observation("uring", 1, 3, 1), 200)
+
     def test_protocol_summary_labels_full_cpu_observation(self):
         case = protocol_strategy.CASES[0]
         rows = [dict(case=case, engine="nginx", policy="current", messages_per_second=100,

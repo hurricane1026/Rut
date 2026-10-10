@@ -30,6 +30,15 @@ WORKLOADS = [
 POLICIES = ['latency', 'balanced', 'current', 'throughput']
 
 
+def study_environment(source):
+    env = dict(source)
+    env.pop('DOCKER_HOST', None)
+    for key in list(env):
+        if key.startswith('RUT_STUDY_'):
+            env.pop(key)
+    return env
+
+
 def metric(row):
     if 'small_client' in row:
         return row['small_client']['p99_us']
@@ -125,9 +134,7 @@ def main():
               '--client-cpus', '5,7', '--workers', '1', '--front-port', '8604', '--origin-port', '8704',
               '--concurrency', '128', '--keepalive-header', 'implicit', '--proxy-profile', 'native-streaming',
               '--native-nginx-buffering', 'off', '--native-origin-reuse', 'on', '--scenarios', 'proxy-keepalive']
-    env = dict(os.environ)
-    env.pop('DOCKER_HOST', None)
-    env.pop('RUT_STUDY_POLICY', None)
+    env = study_environment(os.environ)
     env['RUT_BENCH_RELAY_STATS'] = '1'
     rows = []
     selected = {}
