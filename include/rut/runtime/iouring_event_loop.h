@@ -467,6 +467,7 @@ public:
     MappedArray<u64> recv_rearm_words;
     u32 recv_rearm_count = 0;
     u32 recv_rearm_cursor = 0;  // word where the next capped pass resumes
+    u32 ws_cache_rearm_budget = 0;
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
         CompleteBody,
@@ -768,6 +769,11 @@ public:
             relay_budget_calls = study_relay_turn_call_limit;
             relay_budget_bytes = study_relay_turn_byte_limit;
             dispatch_batch(events, kEventCount);
+            if (backend.ws_recv_cache_enabled) {
+                const u32 free = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
+                const u32 pinned = backend.cq_unharvested();
+                ws_cache_rearm_budget = free > pinned ? free - pinned : 0;
+            }
             rearm_deferred_ws_cache_recvs();
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
@@ -3478,7 +3484,7 @@ public:
         if (recv_rearm_count == 0) return;
         u32 cache_free = kProvidedBufCount;
         if (backend.ws_recv_cache_enabled) {
-            cache_free = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
+            cache_free = ws_cache_rearm_budget;
             if (cache_free == 0) return;
         }
         const u32 pinned = backend.cq_unharvested();
@@ -3521,6 +3527,7 @@ public:
                         continue;
                     }
                     budget--;
+                    if (backend.ws_recv_cache_enabled) ws_cache_rearm_budget = budget;
                 }
                 clear_deferred_recv(cid);
             }
@@ -3534,7 +3541,7 @@ public:
     // -ENOBUFS CQE and can spin the shard without making progress.
     void rearm_deferred_ws_cache_recvs() {
         if (!backend.ws_recv_cache_enabled) return;
-        u32 budget = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
+        u32 budget = ws_cache_rearm_budget;
         if (budget == 0) return;
         for (u32 id = 0; id < slots_initialized; ++id) {
             Connection& c = conns[id];
@@ -3546,7 +3553,10 @@ public:
                 close_conn(c);
                 return;
             }
-            if (!was_armed && c.upstream_recv_armed && --budget == 0) return;
+            if (!was_armed && c.upstream_recv_armed) {
+                if (--budget == 0) return;
+                ws_cache_rearm_budget = budget;
+            }
         }
     }
 
@@ -7340,8 +7350,14 @@ public:
         drain_response_read_deadline_body_pump_ready(static_cast<Callback&&>(callback));
     }
     void test_close_listen() { close_listen(); }
-    void test_rearm_deferred_ws_cache_recvs() { rearm_deferred_ws_cache_recvs(); }
-    void test_rearm_deferred_recvs() { rearm_deferred_recvs(false); }
+    void test_rearm_deferred_ws_cache_recvs() {
+        ws_cache_rearm_budget = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
+        rearm_deferred_ws_cache_recvs();
+    }
+    void test_rearm_deferred_recvs() {
+        ws_cache_rearm_budget = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
+        rearm_deferred_recvs(false);
+    }
     u32 test_recv_rearm_count() const { return recv_rearm_count; }
 #endif
 
