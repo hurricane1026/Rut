@@ -406,7 +406,7 @@ TEST(epoll_full_edge, stale_readiness_cannot_complete_an_unsubmitted_read) {
     ASSERT_EQ(event.result, 64);
 }
 
-TEST(epoll_full_edge, short_read_waits_for_a_new_edge_and_half_close_still_completes) {
+TEST(epoll_full_edge, short_read_retries_and_half_close_still_completes) {
     for (bool half_close : {false, true}) {
         EdgeEpollFixture f;
         ASSERT_TRUE(f.init());
@@ -418,12 +418,28 @@ TEST(epoll_full_edge, short_read_waits_for_a_new_edge_and_half_close_still_compl
         f.conn.recv_buf.reset();
         ASSERT_TRUE(f.backend.add_recv(f.conn.fd, 0));
         if (!half_close) {
-            ASSERT_EQ(f.backend.edge_count, 0u);
             ASSERT_TRUE(send_all(f.peer, reinterpret_cast<const u8*>("next"), 4));
         }
         ASSERT_EQ(f.backend.wait(&event, 1, &f.conn, 1), 1u);
         ASSERT_EQ(event.result, half_close ? 0 : 4);
     }
+}
+
+TEST(epoll_full_edge, short_positive_read_requeues_until_eagain_without_a_new_write) {
+    EdgeEpollFixture f;
+    ASSERT_TRUE(f.init());
+    f.conn.recv_buf.bind(f.buffer, 5);
+    ASSERT_TRUE(send_all(f.peer, reinterpret_cast<const u8*>("123456789"), 9));
+    IoEvent event{};
+    ASSERT_EQ(f.backend.wait(&event, 1, &f.conn, 1), 1u);
+    ASSERT_EQ(event.result, 5);
+    ASSERT_EQ(memcmp(f.buffer, "12345", 5), 0);
+    f.conn.recv_buf.reset();
+    ASSERT_TRUE(f.backend.add_recv(f.conn.fd, 0));
+    ASSERT_TRUE(f.backend.edge_runnable[0].queued);
+    ASSERT_EQ(f.backend.wait(&event, 1, &f.conn, 1), 1u);
+    ASSERT_EQ(event.result, 4);
+    ASSERT_EQ(memcmp(f.buffer, "6789", 4), 0);
 }
 
 TEST(epoll_stable_edge, disabled_owner_retains_data_and_fin_until_receive_submission) {
@@ -604,6 +620,48 @@ TEST(epoll_stable_relay, same_registration_changes_consumer_without_reading_byte
     REQUIRE(f.backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode));
     CHECK_EQ(f.backend.fd_interest[1].data, kToken);
     CHECK_FALSE(f.backend.stable_upstream[c.upstream_fd].relay_read);
+}
+
+TEST(epoll_stable_relay, valid_relay_read_spends_accept_io_budget) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    f.backend.study_stable_upstream_relay = true;
+    auto& c = f.conns[0];
+    c.fd = f.peer;
+    c.relay_owner.phase = RelayPhase::Reading;
+    c.relay_owner.source_fd = c.upstream_fd;
+    c.relay_owner.destination_fd = c.fd;
+    c.relay_owner.upstream_episode = c.upstream_episode;
+    c.relay_owner.read_armed = true;
+    REQUIRE(
+        f.backend.add_relay_poll(c.upstream_fd, c.id, IoEventType::RelayRead, c.upstream_episode));
+    f.backend.accept_io_budget = 2;
+    REQUIRE_EQ(::send(f.peer, "x", 1, MSG_NOSIGNAL), 1);
+    IoEvent event{};
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(event.type, IoEventType::RelayRead);
+    CHECK_EQ(event.conn_id, c.id);
+    CHECK_EQ(f.backend.accept_io_budget, 1u);
+}
+
+TEST(epoll_stable_relay, valid_relay_write_spends_accept_io_budget) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    auto& c = f.conns[0];
+    c.fd = f.peer;
+    f.backend.downstream_fd_map[c.id] = c.fd;
+    c.relay_owner.phase = RelayPhase::Writing;
+    c.relay_owner.source_fd = c.upstream_fd;
+    c.relay_owner.destination_fd = c.fd;
+    c.relay_owner.upstream_episode = c.upstream_episode;
+    c.relay_owner.write_armed = true;
+    REQUIRE(f.backend.add_relay_poll(c.fd, c.id, IoEventType::RelayWrite, c.upstream_episode));
+    f.backend.accept_io_budget = 2;
+    IoEvent event{};
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(event.type, IoEventType::RelayWrite);
+    CHECK_EQ(event.conn_id, c.id);
+    CHECK_EQ(f.backend.accept_io_budget, 1u);
 }
 
 TEST(epoll_stable, transfer_keeps_kernel_token_and_waits_for_receive_submission) {
