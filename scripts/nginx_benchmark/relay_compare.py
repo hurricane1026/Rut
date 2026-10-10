@@ -17,6 +17,30 @@ import time
 import urllib.request
 
 
+DEFAULT_SCENARIOS = ("static-close", "static-keepalive", "proxy-close", "proxy-keepalive")
+
+
+def distinct_url_scenarios(remaining):
+    """Return the scenarios requested in the delegated run.py arguments."""
+    for index, argument in enumerate(remaining):
+        if argument == "--scenarios":
+            values = []
+            for value in remaining[index + 1:]:
+                if value.startswith("--"):
+                    break
+                values.append(value)
+            return tuple(values) or DEFAULT_SCENARIOS
+        if argument.startswith("--scenarios="):
+            return tuple(argument.split("=", 1)[1].split(","))
+    return DEFAULT_SCENARIOS
+
+
+def validate_distinct_url_scenarios(scenarios, enabled):
+    if enabled and any(scenario.startswith("static-") for scenario in scenarios):
+        raise ValueError("--mixed-distinct-urls requires proxy-only scenarios; "
+                         "pass --scenarios proxy-close proxy-keepalive")
+
+
 def mixed_cpu_masks(value):
     masks = value.split(";") if ";" in value else value.split(",")
     if len(masks) != 2:
@@ -125,6 +149,10 @@ def main():
         parser.error("--mixed-small-rate requires --mixed-small-bytes")
     if options.mixed_distinct_urls and not options.mixed_small_bytes:
         parser.error("--mixed-distinct-urls requires --mixed-small-bytes")
+    try:
+        validate_distinct_url_scenarios(distinct_url_scenarios(remaining), options.mixed_distinct_urls)
+    except ValueError as error:
+        parser.error(str(error))
     source = Path(__file__).with_name("run.py")
     sys.path.insert(0, str(source.parent))
     if "--help" in remaining:

@@ -101,6 +101,22 @@ class ToolsTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 relay_compare.mixed_cpu_masks(invalid)
 
+    def test_distinct_urls_require_proxy_scenarios(self):
+        with self.assertRaisesRegex(ValueError, "requires proxy-only scenarios"):
+            relay_compare.validate_distinct_url_scenarios(relay_compare.DEFAULT_SCENARIOS, True)
+        with self.assertRaisesRegex(ValueError, "requires proxy-only scenarios"):
+            relay_compare.validate_distinct_url_scenarios(("static-close", "proxy-close"), True)
+        relay_compare.validate_distinct_url_scenarios(("proxy-close", "proxy-keepalive"), True)
+        relay_compare.validate_distinct_url_scenarios(relay_compare.DEFAULT_SCENARIOS, False)
+
+    def test_distinct_url_scenario_defaults_and_explicit_lists(self):
+        self.assertEqual(
+            relay_compare.distinct_url_scenarios([]), relay_compare.DEFAULT_SCENARIOS)
+        self.assertEqual(
+            relay_compare.distinct_url_scenarios(
+                ["--scenarios", "proxy-close", "proxy-keepalive", "--repeats", "2"]),
+            ("proxy-close", "proxy-keepalive"))
+
     def test_strategy_requires_repeats_and_guards_tail_latency(self):
         rows = []
         for policy, rate, tail in [('current', 100, 100), ('throughput', 150, 130),
