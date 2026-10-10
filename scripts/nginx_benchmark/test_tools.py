@@ -234,6 +234,31 @@ class ToolsTest(unittest.TestCase):
         relay_compare.validate_distinct_url_scenarios(("proxy-close", "proxy-keepalive"), True)
         relay_compare.validate_distinct_url_scenarios(relay_compare.DEFAULT_SCENARIOS, False)
 
+    def test_distinct_urls_reject_single_payload_api_origin(self):
+        with self.assertRaisesRegex(ValueError, "API origin serves one payload"):
+            relay_compare.validate_distinct_url_origin_mode(True, "api")
+        relay_compare.validate_distinct_url_origin_mode(True, "native")
+        relay_compare.validate_distinct_url_origin_mode(False, "api")
+
+    def test_distinct_url_api_origin_rejected_before_output_or_frontend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "must-not-be-created"
+            argv = [
+                str(Path(relay_compare.__file__)), "--engines", "direct-origin",
+                "--origin-mode", "api", "--mixed-small-bytes", "4096",
+                "--mixed-distinct-urls", "--scenarios", "proxy-keepalive",
+                "--output", str(output),
+            ]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(relay_compare.importlib.util,
+                                      "spec_from_file_location") as load_module, \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as raised:
+                relay_compare.main()
+            self.assertEqual(raised.exception.code, 2)
+            load_module.assert_not_called()
+            self.assertFalse(output.exists())
+
     def test_distinct_url_scenario_defaults_and_explicit_lists(self):
         self.assertEqual(
             relay_compare.distinct_url_scenarios([]), relay_compare.DEFAULT_SCENARIOS)

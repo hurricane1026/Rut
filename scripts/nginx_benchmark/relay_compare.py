@@ -90,6 +90,12 @@ def validate_distinct_url_scenarios(scenarios, enabled):
                          "pass --scenarios proxy-close proxy-keepalive")
 
 
+def validate_distinct_url_origin_mode(enabled, origin_mode):
+    if enabled and origin_mode == "api":
+        raise ValueError("--mixed-distinct-urls is not supported with --origin-mode api; "
+                         "the API origin serves one payload for every path")
+
+
 def validate_mixed_small_rate_scenarios(scenarios, enabled):
     if enabled and any(scenario != "proxy-keepalive" for scenario in scenarios):
         raise ValueError("--mixed-small-rate requires keepalive scenarios and specifically "
@@ -219,6 +225,10 @@ def main():
         parser.error("--mixed-small-rate requires --mixed-small-bytes")
     if options.mixed_distinct_urls and not options.mixed_small_bytes:
         parser.error("--mixed-distinct-urls requires --mixed-small-bytes")
+    try:
+        validate_distinct_url_origin_mode(options.mixed_distinct_urls, options.origin_mode)
+    except ValueError as error:
+        parser.error(str(error))
     try:
         validate_api_origin_workers(options.origin_workers, options.origin_cpus, options.origin_mode)
     except ValueError as error:
