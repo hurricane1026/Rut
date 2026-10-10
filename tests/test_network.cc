@@ -41557,6 +41557,33 @@ TEST(iouring_upstream_recv, empty_ring_terminal_rearms_one_shot_body_recv) {
     }
 }
 
+TEST(iouring_upstream_recv, empty_ring_terminal_rearms_default_websocket_recv) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    conn.is_ws_tunnel = true;
+    conn.state = ConnState::Sending;
+    conn.on_upstream_recv = &on_ws_upstream_recv<IoUringEventLoop>;
+    REQUIRE(loop->use_one_shot_websocket_recv(conn));
+    REQUIRE(loop->submit_recv_upstream(conn));
+    REQUIRE_EQ(conn.pending_ops, 1u);
+    const u32 tail_after_first = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    IoEvent terminal{
+        conn.id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+    terminal.provided_ring_empty = 1;
+    loop->dispatch(terminal);
+
+    CHECK_GE(conn.fd, 0);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_first + 1u);
+    fixture.cleanup();
+}
+
 namespace {
 
 // Stage an ordinary native Content-Length body owner whose upstream slice holds

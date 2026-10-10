@@ -8812,7 +8812,8 @@ public:
                             // buffers were returned before dispatch.
                             const bool kOneShotRingEmpty =
                                 ev.provided_ring_empty && ev.result == -ENOBUFS &&
-                                (use_one_shot_upstream_recv(conn) || ws_recv_cache_active(conn));
+                                (use_one_shot_websocket_recv(conn) ||
+                                 use_one_shot_upstream_recv(conn) || ws_recv_cache_active(conn));
                             // A torn-down h2-proxy episode's recv terminal has now drained;
                             // discard any stale positive bytes it left so the next stream
                             // can't parse them as its response. Gated on the flag so the
