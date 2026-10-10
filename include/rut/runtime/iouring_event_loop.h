@@ -298,6 +298,17 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 relay_written_bytes = 0;
     bool test_fail_next_relay_poll = false;
     bool test_fail_next_ws_splice_cancel = false;
+    u32 test_fail_ws_splice_cancel_count = 0;
+
+    bool test_consume_ws_splice_cancel_failure() {
+        if (test_fail_next_ws_splice_cancel) {
+            test_fail_next_ws_splice_cancel = false;
+            return true;
+        }
+        if (test_fail_ws_splice_cancel_count == 0) return false;
+        --test_fail_ws_splice_cancel_count;
+        return true;
+    }
 #ifdef RUT_TESTING
     bool test_eintr_next_ws_splice_call = false;
 #endif
@@ -3490,6 +3501,11 @@ public:
     // connection is reached. A recv that finds no SQE stays pending.
     void rearm_deferred_recvs(bool force) {
         if (recv_rearm_count == 0) return;
+        // Timer-forced passes run before the end-of-batch budget refresh.
+        // Recompute from current cache occupancy so a stale larger budget
+        // cannot over-arm receives after the ring filled in this batch.
+        if (force && backend.ws_recv_cache_enabled)
+            ws_cache_rearm_budget = cache_rearm_budget(backend.cq_unharvested());
         u32 cache_free = kProvidedBufCount;
         if (backend.ws_recv_cache_enabled) {
             cache_free = ws_cache_rearm_budget;

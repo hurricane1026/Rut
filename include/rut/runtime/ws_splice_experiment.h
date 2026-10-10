@@ -154,8 +154,8 @@ struct WsSpliceExperiment {
                         {c.id, kType, o.episode, static_cast<u8>(32 + index)});
 #ifdef RUT_TESTING
                     const bool kCancelSubmitted =
-                        loop.test_fail_next_ws_splice_cancel
-                            ? (loop.test_fail_next_ws_splice_cancel = false, false)
+                        loop.test_consume_ws_splice_cancel_failure()
+                            ? false
                             : loop.backend.cancel_ws_splice_poll(
                                   kTarget, c.id, kType, static_cast<u8>(96 + index), o.episode);
 #else
@@ -165,6 +165,9 @@ struct WsSpliceExperiment {
                     if (kCancelSubmitted) {
                         d.cancel_owned = true;
                         ++c.pending_ops;
+                    } else {
+                        o.budget_deferred = true;
+                        enqueue(c.id);
                     }
                 }
                 return;
@@ -313,8 +316,8 @@ struct WsSpliceExperiment {
                         {c.id, kType, o.episode, static_cast<u8>(32 + kOther)});
                     const bool kCancelSubmitted =
 #ifdef RUT_TESTING
-                        loop.test_fail_next_ws_splice_cancel
-                            ? (loop.test_fail_next_ws_splice_cancel = false, false)
+                        loop.test_consume_ws_splice_cancel_failure()
+                            ? false
                             : loop.backend.cancel_ws_splice_poll(
                                   kTarget, c.id, kType, static_cast<u8>(96 + kOther), o.episode);
 #else

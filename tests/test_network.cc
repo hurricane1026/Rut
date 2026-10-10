@@ -41706,6 +41706,44 @@ TEST(iouring_cache_rearm, shared_budget_keeps_downstream_pending) {
     fixture.cleanup();
 }
 
+TEST(iouring_cache_rearm, timer_forced_pass_uses_current_ordinary_occupancy) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture first;
+    OneShotRecvFixture second;
+    REQUIRE(first.stage(guard.loop, /*plaintext=*/true));
+    REQUIRE(second.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    first.conn->is_ws_tunnel = second.conn->is_ws_tunnel = true;
+    loop.test_defer_recv_rearm(*first.conn);
+    loop.test_defer_recv_rearm(*second.conn);
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    // This is the larger capacity left by the previous batch. The current
+    // wait has since pinned all but one ordinary buffer before Timeout is
+    // dispatched, so the forced pass must refresh occupancy before arming.
+    loop.ws_cache_rearm_budget = kProvidedBufCount;
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;
+    const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout};
+    loop.dispatch(timeout);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+    CHECK(first.conn->recv_armed);
+    CHECK_FALSE(second.conn->recv_armed);
+
+    // Returning one ordinary block permits the remaining slot on a later
+    // timer pass; the persistent cursor must not strand it.
+    --loop.backend.ws_recv_cache_ordinary_count;
+    loop.dispatch(timeout);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 2u);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    CHECK(second.conn->recv_armed);
+    loop.backend.ws_recv_cache_ordinary_count = 0;
+    first.cleanup();
+    second.cleanup();
+}
+
 TEST(iouring_cache_rearm, upstream_budget_one_round_robins_pending_owners) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

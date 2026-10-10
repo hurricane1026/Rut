@@ -1318,6 +1318,70 @@ TEST(websocket, iouring_splice_eof_retries_failed_read_cancel_without_wait) {
     CHECK_EQ(loop.backend.failure_code(), 0);
 }
 
+TEST(websocket, iouring_splice_repeated_eof_cancel_failures_stay_runnable) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    Peer client{downstream[1]}, origin{upstream[1]};
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 free_before = loop.free_top;
+    conn->fd = downstream[0];
+    conn->upstream_fd = upstream[0];
+    conn->upstream_episode = 1;
+    REQUIRE(set_nonblocking(conn->fd));
+    REQUIRE(set_nonblocking(conn->upstream_fd));
+    auto& owner = loop.ws_splice.owners[conn->id];
+    owner.active = true;
+    owner.eof_closing = true;
+    owner.episode = conn->upstream_episode;
+    owner.direction[0].eof = owner.direction[1].eof = true;
+    ++conn->pending_ops;  // owner pin
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner.direction[direction].read_fd = fds[0];
+        owner.direction[direction].write_fd = fds[1];
+    }
+    REQUIRE(loop.ws_splice.arm(loop, *conn, 1, false));
+    owner.direction[0].armed = true;  // synthetic completed read poll
+    ++conn->pending_ops;
+    CHECK_EQ(loop.ws_splice.queued_count, 0u);
+
+    loop.test_fail_next_ws_splice_cancel = true;
+    loop.test_fail_ws_splice_cancel_count = 16;
+    const IoEvent completed_read{conn->id, 0, 0, 0, IoEventType::RelayRead, 0, 32, owner.episode};
+    loop.dispatch_batch(&completed_read, 1);
+    CHECK(owner.queued);
+    CHECK(owner.budget_deferred);
+    CHECK_FALSE(loop.should_wait_for_event());
+
+    // progress() clears the marker before each retry. Multiple failures in
+    // that pass must restore it, otherwise a quiet shard may block forever.
+    loop.ws_splice.progress(loop);
+    CHECK(owner.queued);
+    CHECK(owner.budget_deferred);
+    CHECK_FALSE(loop.should_wait_for_event());
+
+    loop.test_fail_ws_splice_cancel_count = 0;
+    loop.ws_splice.progress(loop);
+    CHECK(owner.direction[1].cancel_owned);
+    for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_EQ(loop.free_top, free_before + 1u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
+}
+
 TEST(websocket, iouring_splice_recv_cache_partial_configuration_is_reclaimable) {
     LoopStorage storage;
     if (!storage.init()) return;
