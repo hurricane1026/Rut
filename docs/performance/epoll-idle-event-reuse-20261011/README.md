@@ -1,6 +1,6 @@
 # Event-driven idle upstream reuse — 2026-10-11
 
-Branch `perf/epoll-full-et`, isolated worktree `/tmp/rut-ws-pr-20261010`; no commit/push/merge. Enabled only with existing stable-upstream event watches. Unwatched sockets and other backends retain the synchronous borrow probe.
+Branch `perf/epoll-full-et`, isolated worktree `/tmp/rut-ws-pr-20261010`; no commit/push/merge. Stable-upstream watches eagerly reject known-stale idle sockets; every backend still performs the synchronous borrow probe.
 
 ## Policy
 
@@ -24,7 +24,7 @@ All 18 cells valid with zero errors. This is not evidence of a substantial throu
 
 ## Verification and artifacts
 
-Initial release test_splice 37 tests / 99,658 checks pass; ET stable subset 14 tests / 66,006 checks pass. Covers healthy watched borrowing, exact slot ownership, harvested idle data, idle FIN/data handling, consumed FIN on return, receive submission, full-buffer reads, stale owners, descriptor reuse, reload, generation/version exhaustion and partial sends. Unwatched pool probing retains existing tests.
+Historical initial release validation: test_splice 37 tests / 99,658 checks passed; ET stable subset 14 tests / 66,006 checks passed. Those results predate the current borrow-probe repair. The current lifecycle run is recorded in `edge-tests.log` below.
 
 Frozen binary, full diff/hash and raw logs: `/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-idle-event-20261011`. Local scripts depend on existing absolute-path drivers and are provenance, not portable harnesses. Further confirmation/validation follows below.
 
@@ -38,4 +38,4 @@ Additional boundary tests verify that FIN racing an unharvested borrow is reject
 
 Real HTTPS persistent-proxy smoke and byte/frame-checked WebSocket 64-byte / 1 MiB plus streaming 64 KiB smoke pass, all zero errors; frontend logs confirm ET and stable-upstream on. These correctness checker rates are not performance acceptance evidence. Protocol runs occurred after timed throughput/BPF cells ended; compilation overlapped correctness smoke only. Formatting and git diff checks pass.
 
-Final release CTest network/splice/ws_tunnel_iouring/cli_backend: all four passed. Final ET stable lifecycle subset: 16 tests, 66,027 checks passed. Runtime implementation is identical to the frozen measured candidate; final validation adds the explicit FIN-racing-borrow and full-read/EAGAIN handoff tests.
+Release CTest for network/splice/ws_tunnel_iouring/cli_backend passed 4/4 before removal of the unused readiness-probe callback. After that removal, focused CTests for splice, idle trim, and shard control passed; splice was rerun after the final teardown-test adjustment. The current ET stable lifecycle filter passed 23 tests and 66,101 checks (25 skipped), as recorded in `edge-tests.log`. Current code keeps the synchronous probe on every borrow. The throughput and BPF measurements above came from the earlier skip-probe implementation; they do not measure or establish performance for the current implementation. No current-source performance benchmark has been run.
