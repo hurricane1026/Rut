@@ -1412,6 +1412,7 @@ struct HirGeneratedNames {
     u32 workload_bytes = 0;
     u32 refs = 1;
     HirGeneratedName* head = nullptr;
+    bool mapped_owner = false;
 
     HirGeneratedNames() = default;
     HirGeneratedNames(const HirGeneratedNames&) = delete;
@@ -1435,7 +1436,12 @@ struct HirGeneratedNames {
             }
             node = next;
         }
-        delete this;
+        if (mapped_owner) {
+            this->~HirGeneratedNames();
+            munmap(this, sizeof(HirGeneratedNames));
+        } else {
+            delete this;
+        }
     }
 };
 

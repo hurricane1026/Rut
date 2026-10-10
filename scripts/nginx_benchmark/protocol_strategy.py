@@ -38,6 +38,19 @@ def manifest_script_hashes(args):
                 harness_sha256=hashlib.sha256(args.harness.read_bytes()).hexdigest())
 
 
+def protocol_environment(source):
+    selected = {key: value for key, value in source.items()
+                if key in {'RUT_STUDY_WS_RECV', 'RUT_STUDY_WS_SPLICE', 'RUT_STUDY_WS_SEGMENT',
+                           'RUT_STUDY_WS_CALLS', 'RUT_STUDY_WS_NODELAY', 'RUT_STUDY_IO_STATS',
+                           'RUT_STUDY_WS_SYNC_SEND', 'RUT_STUDY_WS_DIRECT_RECV',
+                           'RUT_STUDY_WS_POLL_FIRST', 'RUT_STUDY_WS_COPY', 'RUT_STUDY_WS_COPY_LIMIT',
+                           'RUT_STUDY_WS_AVAILABLE', 'RUT_STUDY_WS_FAST_BATCH', 'RUT_STUDY_WS_FAST_SCAN'}}
+    env = {key: value for key, value in source.items() if not key.startswith('RUT_STUDY_')}
+    env.update(selected)
+    env.pop('DOCKER_HOST', None)
+    return env
+
+
 def selection_manifest(args):
     return {
         'cases_filter': sorted(args.cases) if args.cases else None,
@@ -252,7 +265,7 @@ def main():
     rows = []
     fixture = [sys.executable, str(args.fixture.resolve())]
     origin_port = 8805; front_port = 8804
-    env = dict(os.environ); env.pop('DOCKER_HOST', None)
+    env = protocol_environment(os.environ)
     if args.tcpkali2:
         env['TCPKALI2_BENCH_FULL_LATENCY'] = '1'; env['TCPKALI2_BENCH_VERIFY'] = '1'
     for case in cases:

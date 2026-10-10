@@ -1751,8 +1751,15 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
         len += segments[i].len;
     }
     if (store == nullptr) {
-        store = new (std::nothrow) HirGeneratedNames;
-        if (store == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
+        void* owner_region = mmap(nullptr,
+                                  sizeof(HirGeneratedNames),
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS,
+                                  -1,
+                                  0);
+        if (owner_region == MAP_FAILED) return frontend_error(FrontendError::OutOfMemory, {});
+        store = ::new (owner_region) HirGeneratedNames{};
+        store->mapped_owner = true;
     }
     bool mapped = false;
     char* buf = nullptr;

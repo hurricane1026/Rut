@@ -144,6 +144,14 @@ class ToolsTest(unittest.TestCase):
         self.assertFalse(any(key.startswith("RUT_STUDY_") for key in clean))
         self.assertEqual(clean["PATH"], "/bin")
 
+    def test_protocol_environment_clears_unselected_runtime_knobs(self):
+        env = protocol_strategy.protocol_environment({
+            "RUT_STUDY_WS_RECV": "once", "RUT_STUDY_DIRECT_BODY_SEND": "on",
+            "RUT_STUDY_SELECTIVE_VECTOR": "on", "PATH": "/bin"})
+        self.assertEqual(env["RUT_STUDY_WS_RECV"], "once")
+        self.assertNotIn("RUT_STUDY_DIRECT_BODY_SEND", env)
+        self.assertNotIn("RUT_STUDY_SELECTIVE_VECTOR", env)
+
     def test_protocol_manifest_hashes_strategy_and_harness(self):
         with tempfile.NamedTemporaryFile() as harness:
             harness.write(b"harness-v1")

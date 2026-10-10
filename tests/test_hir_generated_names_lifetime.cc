@@ -8,7 +8,15 @@
 using namespace rut;
 
 TEST(hir_generated_names, releases_small_and_large_mapped_storage) {
-    auto* names = new HirGeneratedNames;
+    auto* names = static_cast<HirGeneratedNames*>(mmap(nullptr,
+                                                       sizeof(HirGeneratedNames),
+                                                       PROT_READ | PROT_WRITE,
+                                                       MAP_PRIVATE | MAP_ANONYMOUS,
+                                                       -1,
+                                                       0));
+    REQUIRE(names != MAP_FAILED);
+    ::new (names) HirGeneratedNames{};
+    names->mapped_owner = true;
     auto* small = static_cast<HirGeneratedName*>(mmap(nullptr,
                                                       sizeof(HirGeneratedName),
                                                       PROT_READ | PROT_WRITE,
@@ -37,6 +45,7 @@ TEST(hir_generated_names, releases_small_and_large_mapped_storage) {
                                                       -1,
                                                       0));
     CHECK_NE(large, MAP_FAILED);
+    ::new (large) HirGeneratedName{};
     large->text = large_text;
     large->len = kLargeLength;
     large->mapped = true;
