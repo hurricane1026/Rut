@@ -188,7 +188,8 @@ def main():
                              '--body-size', str(workload['body']), '--duration', str(duration),
                              '--warmup', '2', '--repeats', '1', '--output', str(destination)]
             if workload.get('small'):
-                argv += ['--mixed-small-bytes', str(workload['small']), '--small-connections', '32']
+                argv += ['--mixed-small-bytes', str(workload['small']),
+                         '--mixed-small-path', '/api4k', '--small-connections', '32']
             if engine == 'nginx':
                 size = 16 if workload['body'] <= 16384 else workload['body'] // 1024
                 argv += ['--nginx-buffer-kib', str(size)]

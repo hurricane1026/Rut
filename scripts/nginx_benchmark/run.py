@@ -925,6 +925,7 @@ class Harness:
                                 / result["seconds"],
                                 server_rss_bytes=rss,
                                 valid=bool(result["requests"])
+                                and result.get("valid", True)
                                 and not any(result["errors"].values())
                                 and bool(warmup["requests"])
                                 and not any(warmup["errors"].values()),

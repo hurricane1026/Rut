@@ -105,9 +105,12 @@ python3 scripts/nginx_benchmark/nginx_buffer_scan.py \
 The comparison supports `--baseline-rut /path/to/rut --engines
 uring,baseline-uring,nginx`, and `--engines epoll,uring,nginx` using one candidate
 binary. For the plaintext mixed case, add `--mixed-small-bytes 4096
---small-connections 32 --mixed-client-cpus 7,5`; 128 total connections then split
-into 96 large and 32 small. Mixed aggregate percentiles are the large client's
-percentiles; use the separate `large_client` / `small_client` rows for latency.
+--mixed-small-path /api4k --small-connections 32 --mixed-client-cpus 7,5`; 128
+total connections then split into 96 large `/proxy` and 32 small `/api4k`
+requests. Both URLs are preflighted against their exact response bodies, and
+both clients must report requests, zero errors and a usable p99 for a sample to
+be valid. Mixed aggregate percentiles are the large client's percentiles; use
+the separate `large_client` / `small_client` rows for latency.
 The scanner fixes eight body buffers for buffering-on configurations and
 disables temporary-file writes, without enabling a proxy cache. It writes each
 effective nginx configuration before startup and validates every result.

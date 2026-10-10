@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import run
+import api_origin
 import matrix
 import workload_strategy
 import protocol_workload
@@ -58,6 +59,11 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(command[command.index("--port") + 1], "8704")
         self.assertEqual(command[command.index("--cpus") + 1], "3,4")
         self.assertEqual(command[command.index("--fragment-bytes") + 1], "16384")
+        mixed = relay_compare.api_origin_command(
+            Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2,
+            Path("small.bin"), "/api4k")
+        self.assertEqual(mixed[mixed.index("--small-payload") + 1], "small.bin")
+        self.assertEqual(mixed[mixed.index("--small-path") + 1], "/api4k")
         class ReadyProcess:
             def poll(self):
                 return None
@@ -365,6 +371,18 @@ class ToolsTest(unittest.TestCase):
     def test_mixed_strategy_guards_small_client_tail(self):
         row = {'p99_us': 50000, 'small_client': {'p99_us': 200}}
         self.assertEqual(workload_strategy.metric(row), 200)
+
+    def test_mixed_measurement_requires_both_clients_with_requests_and_p99(self):
+        valid = dict(requests=100, errors={"connect": 0}, p99_us=20.0)
+        self.assertTrue(relay_compare.mixed_clients_valid(valid, valid))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"requests": 0}))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"p99_us": None}))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"p99_us": float("nan")}))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"errors": {"read": 1}}))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"errors": {}}))
+        self.assertEqual(api_origin.payload_for_path("/proxy", b"large", b"small", "/api4k"), b"large")
+        self.assertEqual(api_origin.payload_for_path("/api4k", b"large", b"small", "/api4k"), b"small")
+        self.assertEqual(api_origin.payload_for_path("/api4k-wrong", b"large", b"small", "/api4k"), b"large")
 
     def test_stream_records_ignore_http_chunk_boundaries(self):
         expected = [b'abcdefgh', b'ijklmnop', b'qrstuvwx']
