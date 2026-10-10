@@ -124,8 +124,7 @@ struct WsSpliceExperiment {
             if (!d.eof || d.buffered != 0) return;
             if (d.armed || d.cancel_owned) {
                 if (d.armed && !d.cancel_owned) {
-                    const auto kType =
-                        d.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
+                    const auto kType = d.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                     const u64 kTarget = encode_upstream_event_token(
                         {c.id, kType, o.episode, static_cast<u8>(32 + index)});
                     if (loop.backend.cancel_ws_splice_poll(

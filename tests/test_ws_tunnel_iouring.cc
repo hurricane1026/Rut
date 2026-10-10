@@ -315,29 +315,29 @@ static void full_duplex_burst(test::TestCase* _tc,
             u8 probe = 0;
             CHECK_EQ(recv(kClient.fd, &probe, sizeof(probe), MSG_DONTWAIT), 0);
         } else {
-        constexpr u32 kReply = 19;
-        u8 reply[kReply];
-        u32 reply_bytes = 0;
-        REQUIRE(write_burst(kOrigin.fd, sent_origin, kReply));
-        for (u32 i = 0; i < 1000 && reply_bytes < kReply; ++i) {
-            IoEvent events[kMaxEventsPerWait]{};
-            const u32 kCount = loop.backend.wait(
-                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
-            loop.dispatch_batch(events, kCount);
-            REQUIRE(read_available(kClient.fd, reply, &reply_bytes, kReply));
-            if (kCount == 0) usleep(1000);
-        }
-        REQUIRE_EQ(reply_bytes, kReply);
-        CHECK(__builtin_memcmp(reply, sent_origin, kReply) == 0);
-        REQUIRE_EQ(shutdown(kOrigin.fd, SHUT_WR), 0);
-        for (u32 i = 0; i < 1000 && conn->fd >= 0; ++i) {
-            IoEvent events[kMaxEventsPerWait]{};
-            const u32 kCount = loop.backend.wait(
-                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
-            loop.dispatch_batch(events, kCount);
-            if (kCount == 0) usleep(1000);
-        }
-        REQUIRE(conn->fd < 0);
+            constexpr u32 kReply = 19;
+            u8 reply[kReply];
+            u32 reply_bytes = 0;
+            REQUIRE(write_burst(kOrigin.fd, sent_origin, kReply));
+            for (u32 i = 0; i < 1000 && reply_bytes < kReply; ++i) {
+                IoEvent events[kMaxEventsPerWait]{};
+                const u32 kCount = loop.backend.wait(
+                    events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+                loop.dispatch_batch(events, kCount);
+                REQUIRE(read_available(kClient.fd, reply, &reply_bytes, kReply));
+                if (kCount == 0) usleep(1000);
+            }
+            REQUIRE_EQ(reply_bytes, kReply);
+            CHECK(__builtin_memcmp(reply, sent_origin, kReply) == 0);
+            REQUIRE_EQ(shutdown(kOrigin.fd, SHUT_WR), 0);
+            for (u32 i = 0; i < 1000 && conn->fd >= 0; ++i) {
+                IoEvent events[kMaxEventsPerWait]{};
+                const u32 kCount = loop.backend.wait(
+                    events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+                loop.dispatch_batch(events, kCount);
+                if (kCount == 0) usleep(1000);
+            }
+            REQUIRE(conn->fd < 0);
         }
     } else
         loop.close_conn(*conn);
@@ -422,8 +422,8 @@ TEST(websocket, iouring_sync_send_reserves_suffix_before_direct_write) {
     __atomic_store_n(loop.backend.sq_tail, head + loop.backend.sq_ring_entries, __ATOMIC_RELEASE);
     loop.backend.disable_full_sq_flush = true;
     i32 sent = 0;
-    CHECK_FALSE(loop.try_ws_sync_send(
-        *conn, true, conn->recv_buf.data(), conn->recv_buf.len(), &sent));
+    CHECK_FALSE(
+        loop.try_ws_sync_send(*conn, true, conn->recv_buf.data(), conn->recv_buf.len(), &sent));
     CHECK_EQ(sent, 0);
     u8 probe = 0;
     errno = 0;
