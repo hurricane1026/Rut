@@ -535,6 +535,7 @@ core::Expected<void, Error> EpollBackend::init_state_storage(u32 capacity) {
 void EpollBackend::destroy_state_storage() {
     if (stable_pool != nullptr && stable_pool->idle_close_ctx == this) {
         stable_pool->before_idle_close = nullptr;
+        stable_pool->idle_reuse_probe_required = nullptr;
         stable_pool->idle_close_ctx = nullptr;
     }
     stable_pool = nullptr;
