@@ -1,0 +1,2220 @@
+3434 warnings generated.
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:44:9: warning: variable 'n' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+   44 |         u32 n = len_ < max ? len_ : max;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:56:15: warning: invalid case style for member 'ptr_' [readability-identifier-naming]
+   13 |         if (!ptr_ || max == 0) return 0;
+      |              ~~~~
+      |              ptr
+   14 |         u32 n = len_ < max ? len_ : max;
+   15 |         if (n > 0) __builtin_memmove(dst, ptr_, n);
+      |                                           ~~~~
+      |                                           ptr
+   16 |         return n;
+   17 |     }
+   18 |
+   19 |     // Read-only data pointer — for kernel send() on a View.
+   20 |     const u8* data() const noexcept { return ptr_; }
+      |                                              ~~~~
+      |                                              ptr
+   21 |
+   22 |     u32 len() const noexcept { return len_; }
+   23 |     bool valid() const noexcept { return ptr_ != nullptr; }
+      |                                          ~~~~
+      |                                          ptr
+   24 |
+   25 | private:
+   26 |     const u8* ptr_;
+      |               ^~~~
+      |               ptr
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:57:9: warning: invalid case style for member 'len_' [readability-identifier-naming]
+   13 |         u32 n = len_ < max ? len_ : max;
+      |                 ~~~~         ~~~~
+      |                 len          len
+   14 |         if (n > 0) __builtin_memmove(dst, ptr_, n);
+   15 |         return n;
+   16 |     }
+   17 |
+   18 |     // Read-only data pointer — for kernel send() on a View.
+   19 |     const u8* data() const noexcept { return ptr_; }
+   20 |
+   21 |     u32 len() const noexcept { return len_; }
+      |                                       ~~~~
+      |                                       len
+   22 |     bool valid() const noexcept { return ptr_ != nullptr; }
+   23 |
+   24 | private:
+   25 |     const u8* ptr_;
+   26 |     u32 len_;
+      |         ^~~~
+      |         len
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:58:13: warning: invalid case style for member 'owner_' [readability-identifier-naming]
+   13 |     Buffer* owner_;
+      |             ^~~~~~
+      |             owner
+   14 |
+   15 |     friend struct Buffer;
+   16 |     View(const u8* ptr, u32 len, Buffer* owner) noexcept : ptr_(ptr), len_(len), owner_(owner) {}
+      |                                                                                  ~~~~~~
+      |                                                                                  owner
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:110:9: warning: variable 'avail' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  110 |         u32 avail = cap_ - len_;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:111:9: warning: variable 'to_write' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  111 |         u32 to_write = n < avail ? n : avail;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:122:9: warning: variable 'n' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  122 |         u32 n = len_ < max ? len_ : max;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:210:9: warning: invalid case style for member 'ptr_' [readability-identifier-naming]
+   69 |         ptr_ = ptr;
+      |         ~~~~
+      |         ptr
+   70 |         len_ = 0;
+   71 |         cap_ = cap;
+   72 |         released_ = false;
+   73 |     }
+   74 |
+   75 |     u32 len() const noexcept { return len_; }
+   76 |     u32 capacity() const noexcept { return cap_; }
+   77 |     bool valid() const noexcept { return ptr_ != nullptr; }
+      |                                          ~~~~
+      |                                          ptr
+   78 |     bool is_released() const noexcept { return released_; }
+   79 |
+   80 | private:
+   81 |     friend struct View;
+   82 |     u8* ptr_;
+      |         ^~~~
+      |         ptr
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:211:9: warning: invalid case style for member 'len_' [readability-identifier-naming]
+   69 |         len_ = 0;
+      |         ~~~~
+      |         len
+   70 |         cap_ = cap;
+   71 |         released_ = false;
+   72 |     }
+   73 |
+   74 |     u32 len() const noexcept { return len_; }
+      |                                       ~~~~
+      |                                       len
+   75 |     u32 capacity() const noexcept { return cap_; }
+   76 |     bool valid() const noexcept { return ptr_ != nullptr; }
+   77 |     bool is_released() const noexcept { return released_; }
+   78 |
+   79 | private:
+   80 |     friend struct View;
+   81 |     u8* ptr_;
+   82 |     u32 len_;
+      |         ^~~~
+      |         len
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:212:9: warning: invalid case style for member 'cap_' [readability-identifier-naming]
+   69 |         cap_ = cap;
+      |         ~~~~
+      |         cap
+   70 |         released_ = false;
+   71 |     }
+   72 |
+   73 |     u32 len() const noexcept { return len_; }
+   74 |     u32 capacity() const noexcept { return cap_; }
+      |                                            ~~~~
+      |                                            cap
+   75 |     bool valid() const noexcept { return ptr_ != nullptr; }
+   76 |     bool is_released() const noexcept { return released_; }
+   77 |
+   78 | private:
+   79 |     friend struct View;
+   80 |     u8* ptr_;
+   81 |     u32 len_;
+   82 |     u32 cap_;
+      |         ^~~~
+      |         cap
+/tmp/rut-ws-pr-20261010/include/rut/common/buffer.h:213:10: warning: invalid case style for member 'released_' [readability-identifier-naming]
+   69 |         released_ = false;
+      |         ~~~~~~~~~
+      |         released
+   70 |     }
+   71 |
+   72 |     u32 len() const noexcept { return len_; }
+   73 |     u32 capacity() const noexcept { return cap_; }
+   74 |     bool valid() const noexcept { return ptr_ != nullptr; }
+   75 |     bool is_released() const noexcept { return released_; }
+      |                                                ~~~~~~~~~
+      |                                                released
+   76 |
+   77 | private:
+   78 |     friend struct View;
+   79 |     u8* ptr_;
+   80 |     u32 len_;
+   81 |     u32 cap_;
+   82 |     bool released_;
+      |          ^~~~~~~~~
+      |          released
+/tmp/rut-ws-pr-20261010/include/rut/common/failure_policy.h:49:15: warning: invalid case style for constant 'raw_total' [readability-identifier-naming]
+   49 |     const u32 raw_total = raw_header_bytes + body_received;
+      |               ^~~~~~~~~
+      |               kRawTotal
+   50 |     const u32 released_raw = raw_total - raw_total % kBoundedResponseBufferBytes;
+      |                              ~~~~~~~~~   ~~~~~~~~~
+      |                              kRawTotal   kRawTotal
+/tmp/rut-ws-pr-20261010/include/rut/common/failure_policy.h:50:15: warning: invalid case style for constant 'released_raw' [readability-identifier-naming]
+   50 |     const u32 released_raw = raw_total - raw_total % kBoundedResponseBufferBytes;
+      |               ^~~~~~~~~~~~
+      |               kReleasedRaw
+   51 |     return released_raw > raw_header_bytes ? released_raw - raw_header_bytes : 0;
+      |            ~~~~~~~~~~~~                      ~~~~~~~~~~~~
+      |            kReleasedRaw                      kReleasedRaw
+/tmp/rut-ws-pr-20261010/include/rut/common/failure_policy.h:103:34: warning: boolean expression can be simplified by DeMorgan's theorem [readability-simplify-boolean-expr]
+  103 |     if ((value.ptr == nullptr && !(allow_empty && value.len == 0)) || value.len > cap ||
+      |                                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      |                                    !           ||           !=
+/tmp/rut-ws-pr-20261010/include/rut/common/failure_policy.h:107:18: warning: invalid case style for constant 'c' [readability-identifier-naming]
+  107 |         const u8 c = static_cast<u8>(value.ptr[i]);
+      |                  ^
+      |                  kC
+  108 |         if (c < 0x20 || c == 0x7f) return false;
+      |             ~           ~
+      |             kC          kC
+/tmp/rut-ws-pr-20261010/include/rut/common/failure_policy.h:133:16: warning: redundant boolean literal in conditional return statement [readability-simplify-boolean-expr]
+  133 |         return false;
+      |                ^
+/tmp/rut-ws-pr-20261010/include/rut/common/failure_policy.h:128:9: note: conditions that can be simplified
+  128 |     if (!forward_failure_policy_spec_scalar_valid(policy) ||
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  129 |         !failure_policy_safe_text(policy.reason, kMaxFailurePolicyReasonLen) ||
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  130 |         !failure_policy_safe_text(policy.content_type, kMaxFailurePolicyContentTypeLen) ||
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  131 |         !failure_policy_safe_text(policy.server, kMaxFailurePolicyServerLen) ||
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  132 |         !failure_policy_safe_body(policy.body))
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/common/failure_policy.h:137:5: note: return statement that can be simplified
+  137 |     return true;
+      |     ^~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/common/forward_target_transform.h:26:18: warning: invalid case style for constant 'c' [readability-identifier-naming]
+   26 |         const u8 c = static_cast<u8>(value.ptr[i]);
+      |                  ^
+      |                  kC
+   27 |         if (c < 0x21 || c == 0x7f || c == '%' || c == '?' || c == '#') return false;
+      |             ~           ~            ~           ~           ~
+      |             kC          kC           kC          kC          kC
+/tmp/rut-ws-pr-20261010/include/rut/common/forward_target_transform.h:33:19: warning: invalid case style for constant 'segment_len' [readability-identifier-naming]
+   33 |         const u32 segment_len = i - segment_start;
+      |                   ^~~~~~~~~~~
+      |                   kSegmentLen
+   34 |         if (segment_len == 1 && value.ptr[segment_start] == '.') return false;
+      |             ~~~~~~~~~~~
+      |             kSegmentLen
+   35 |         if (segment_len == 2 && value.ptr[segment_start] == '.' &&
+      |             ~~~~~~~~~~~
+      |             kSegmentLen
+/tmp/rut-ws-pr-20261010/include/rut/common/forward_target_transform.h:59:18: warning: invalid case style for constant 'c' [readability-identifier-naming]
+   59 |         const u8 c = static_cast<u8>(value.ptr[i]);
+      |                  ^
+      |                  kC
+   60 |         const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+      |                             ~           ~             ~           ~
+      |                             kC          kC            kC          kC
+   61 |         const bool digit = c >= '0' && c <= '9';
+      |                            ~           ~
+      |                            kC          kC
+   62 |         if (!alpha && !digit && c != '.' && c != '_' && c != '~' && c != '-' && c != '=' &&
+      |                                 ~           ~           ~           ~           ~
+      |                                 kC          kC          kC          kC          kC
+   63 |             c != '&')
+      |             ~
+      |             kC
+/tmp/rut-ws-pr-20261010/include/rut/common/forward_target_transform.h:60:20: warning: invalid case style for constant 'alpha' [readability-identifier-naming]
+   60 |         const bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+      |                    ^~~~~
+      |                    kAlpha
+   61 |         const bool digit = c >= '0' && c <= '9';
+   62 |         if (!alpha && !digit && c != '.' && c != '_' && c != '~' && c != '-' && c != '=' &&
+      |              ~~~~~
+      |              kAlpha
+/tmp/rut-ws-pr-20261010/include/rut/common/forward_target_transform.h:61:20: warning: invalid case style for constant 'digit' [readability-identifier-naming]
+   61 |         const bool digit = c >= '0' && c <= '9';
+      |                    ^~~~~
+      |                    kDigit
+   62 |         if (!alpha && !digit && c != '.' && c != '_' && c != '~' && c != '-' && c != '=' &&
+      |                        ~~~~~
+      |                        kDigit
+/tmp/rut-ws-pr-20261010/include/rut/common/http_header_validation.h:84:18: warning: invalid case style for constant 'c' [readability-identifier-naming]
+   84 |         const u8 c = static_cast<u8>(value[i]);
+      |                  ^
+      |                  kC
+   85 |         // Horizontal tab is permitted in values (RFC 7230 field-vchar
+   86 |         // actually allows obs-fold historically, but modern parsers
+   87 |         // treat bare tabs OK; CR/LF/NUL and other C0 controls are
+   88 |         // strict-reject for wire safety).
+   89 |         if (c == '\t') continue;
+      |             ~
+      |             kC
+   90 |         if (c < 0x20 || c == 0x7f) {
+      |             ~           ~
+      |             kC          kC
+/tmp/rut-ws-pr-20261010/include/rut/common/response_policy.h:86:18: warning: invalid case style for constant 'c' [readability-identifier-naming]
+   86 |         const u8 c = static_cast<u8>(value.ptr[i]);
+      |                  ^
+      |                  kC
+   87 |         if (c < 0x20 || c == 0x7f) return false;
+      |             ~           ~
+      |             kC          kC
+/tmp/rut-ws-pr-20261010/include/rut/common/response_policy.h:111:19: warning: invalid case style for constant 'hidden' [readability-identifier-naming]
+  111 |         const Str hidden = policy.hide_headers[i];
+      |                   ^~~~~~
+      |                   kHidden
+  112 |         if (http_header_name_eq_ci(hidden.ptr, hidden.len, name.ptr, name.len)) return true;
+      |                                    ~~~~~~      ~~~~~~
+      |                                    kHidden     kHidden
+/tmp/rut-ws-pr-20261010/include/rut/platform/socket.h:30:15: warning: invalid case style for constant 'flags' [readability-identifier-naming]
+   30 |     const int flags = fcntl(fd, F_GETFL);
+      |               ^~~~~
+      |               kFlags
+   31 |     if (flags < 0 ||
+      |         ~~~~~
+      |         kFlags
+   32 |         fcntl(fd,
+   33 |               F_SETFL,
+   34 |               static_cast<int>(static_cast<unsigned>(flags) | static_cast<unsigned>(O_NONBLOCK))) <
+      |                                                      ~~~~~
+      |                                                      kFlags
+/tmp/rut-ws-pr-20261010/include/rut/platform/socket.h:37:16: warning: redundant boolean literal in conditional return statement [readability-simplify-boolean-expr]
+   37 |         return false;
+      |                ^
+/tmp/rut-ws-pr-20261010/include/rut/platform/socket.h:31:9: note: conditions that can be simplified
+   31 |     if (flags < 0 ||
+      |         ^~~~~~~~~~~~
+   32 |         fcntl(fd,
+      |         ~~~~~~~~~
+   33 |               F_SETFL,
+      |               ~~~~~~~~
+   34 |               static_cast<int>(static_cast<unsigned>(flags) | static_cast<unsigned>(O_NONBLOCK))) <
+      |               ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   35 |             0 ||
+      |             ~~~~
+   36 |         fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
+      |         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/platform/socket.h:42:5: note: return statement that can be simplified
+   42 |     return true;
+      |     ^~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/platform/socket.h:47:15: warning: invalid case style for constant 'error' [readability-identifier-naming]
+   47 |     const int error = errno;
+      |               ^~~~~
+      |               kError
+   48 |     close(fd);
+   49 |     errno = error;
+      |             ~~~~~
+      |             kError
+/tmp/rut-ws-pr-20261010/include/rut/runtime/access_log.h:63:8: warning: invalid case style for member '_pad' [readability-identifier-naming]
+   63 |     u8 _pad;
+      |        ^~~~
+      |        pad
+/tmp/rut-ws-pr-20261010/include/rut/runtime/access_log.h:86:8: warning: invalid case style for member '_pad' [readability-identifier-naming]
+   86 |     u8 _pad[5];
+      |        ^~~~
+      |        pad
+/tmp/rut-ws-pr-20261010/include/rut/runtime/buffered_send_vector.h:34:23: warning: invalid case style for constant 'step' [readability-identifier-naming]
+   34 |             const u32 step = part.iov_len < n ? static_cast<u32>(part.iov_len) : n;
+      |                       ^~~~
+      |                       kStep
+   35 |             part.iov_base = static_cast<u8*>(part.iov_base) + step;
+      |                                                               ~~~~
+      |                                                               kStep
+   36 |             part.iov_len -= step;
+      |                             ~~~~
+      |                             kStep
+   37 |             n -= step;
+      |                  ~~~~
+      |                  kStep
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:307:8: warning: Excessive padding in 'struct rut::ConnectionBase' (145 padding bytes, where 1 is optimal). Optimal fields order: on_recv, on_send, on_upstream_recv, on_upstream_send, idle_return_config, response_header_slice, throttle_tat_ns, ws_handler, ws_c2u_msg, ws_u2c_msg, handler_ctx, pending_handler_fn, response_read_deadline_post_commit_range_first, response_read_deadline_post_commit_range_last, response_read_deadline_post_commit_range_total, response_read_deadline_send_src, response_read_timer_last_progress_ns, request_config, h2, tls, tls_in_slice, tls_out_slice, tls_out_inflight_src, tls_send_src, tls_pending_on_recv, tls_pending_on_send, http1_prebuilt_deadline_config, upstream_start_us, capture_buf, req_start_us, recv_slice, send_slice, local_body_cursor, local_body_base, upstream_recv_slice, upstream_relay_slice, timer_node, idle_node, req_path_override, response_read_timer_timespec, yield_timespec, req_path_canon, response_header_buf, tls_in_buf, tls_out_buf, recv_buf, send_buf, upstream_recv_buf, chain_direct_recv_owner, response_body_tail, tls_engine, ws_c2u, ws_u2c, response_read_deadline_upload, response_read_deadline_first_batch_upload, http1_prebuilt_deadline_upload, response_send_vector, req_header_overrides, handler_ctx_storage, resp_header_mutations, fd, id, upstream_fd, idle_return_fd, throttle_down_bps, throttle_pending_len, ws_client_send_len, ws_upstream_send_len, ws_upgrade_response_len, ws_upgrade_sent_len, ws_max_message_size, ws_c2u_consumed, ws_u2c_consumed, resume_event_result, handler_gen, upstream_episode, response_read_deadline_generation, response_read_deadline_owner_generation, response_read_deadline_upstream_episode, response_read_deadline_first_batch_generation, response_read_deadline_progress_generation, response_read_deadline_progress_episode, response_read_deadline_progress_bytes, response_read_deadline_post_commit_generation, response_read_deadline_post_commit_episode, response_read_deadline_post_commit_raw_header_end, response_read_deadline_post_commit_declared_body, response_read_deadline_post_commit_origin_received, response_read_deadline_post_commit_downstream_submitted, response_read_deadline_post_commit_downstream_completed, response_read_deadline_post_commit_inflight_body, response_read_deadline_post_commit_release_target, response_read_deadline_post_commit_send_body, response_read_deadline_send_generation, response_read_deadline_send_owner_generation, response_read_deadline_send_tombstone_generation, response_read_deadline_send_deadline_generation, response_read_deadline_send_upstream_episode, response_read_deadline_send_len, response_read_deadline_send_fd, response_read_deadline_send_close_generation, tls_send_owner_generation, tls_send_owner_fd, tls_send_owner_handler_generation, response_read_timer_generation, response_read_timer_owner_generation, response_read_timer_deadline_generation, response_read_timer_upstream_episode, yield_timer_gen, downstream_completed_request_count, tls_out_inflight_len, tls_out_inflight_generation, tls_out_inflight_fd, tls_send_len, tls_send_off, http1_pipeline_request_generation, req_header_end, req_content_length, req_initial_send_len, retry_req_send_len, req_metadata_episode, req_raw_target_episode, req_raw_target_offset, req_raw_target_length, req_body_remaining, resp_body_remaining, resp_body_sent, upstream_send_len, upstream_retiring_episode, upstream_close_episode, http1_boundary_successor_episode, http1_prebuilt_request_prefix_len, http1_prebuilt_deadline_generation, http1_prebuilt_header_end, http1_prebuilt_total_len, http1_prebuilt_body_len, downstream_req_size, req_size, peer_addr, upstream_us, pending_ops, recv_slice_capacity, send_progress, local_body_remaining, local_body_send_len, local_body_file_fd, local_response_size, upstream_relay_send_len, tls_recv_overflow_prefix_len, listener_context, req_chunk_parser, resp_chunk_parser, relay_owner, access_log_target_snapshot, flags, timer_slot, upstream_idx, idle_return_uid, target_transform_id, req_header_append_mask, upstream_slot_uid, ws_close_code, ws_echo_close_code, handler_state, response_read_deadline_bundle_id, response_read_deadline_first_batch_bundle_id, pipeline_depth, pipeline_stash_len, request_policy_id, pending_forward_upstream_id, pending_forward_request_policy_id, pending_forward_response_policy_id, pending_forward_failure_policy_id, pending_forward_timeout_failure_policy_id, response_policy_id, failure_policy_id, timeout_failure_policy_id, http1_prebuilt_deadline_bundle_id, http1_prebuilt_status, resp_status, peer_port, capture_header_len, state, shard_id, idle_trim_examined, upstream_attempts, upstream_backend_idx, proxy_resp_started, upstream_abandoned, req_body_overflow_rejected, req_body_lossy_successor, req_body_abandoned, upstream_keep_alive, upstream_reused, upstream_request_incomplete, idle_return_bidx, close_after_idle_return, is_health_probe, h2_proxy_recv_draining, h2_proxy_synth_quarantined, req_path_overridden, target_transform_recorded, req_header_override_count, req_header_override_overflow, resp_header_mutation_pending_count, resp_header_mutation_pending_overflow, resp_header_mutation_count, resp_header_mutation_overflow, upstream_slot_held, throttle_paused, is_ws_tunnel, ws_client_send_pending, ws_upstream_send_pending, ws_pre_tunnel_upstream_closed, ws_client_eof, ws_upstream_eof, is_ws_terminate_route, is_ws_terminate, ws_closing, ws_close_client_need, ws_close_client_inflight, ws_close_upstream_need, ws_close_upstream_inflight, pending_yield_kind, resume_event_kind, upstream_episode_quarantined, response_read_deadline_seconds, response_read_deadline_buffering, response_read_deadline_profile, response_read_deadline_method, response_read_deadline_route_method, response_read_deadline_state, response_read_deadline_first_batch, response_read_deadline_first_batch_profile, response_read_deadline_first_batch_method, response_read_deadline_first_batch_route_method, response_read_deadline_first_batch_buffering, response_read_deadline_post_commit_phase, response_read_deadline_post_commit_response_class, response_read_deadline_post_commit_close_after_drain, response_read_deadline_post_commit_terminal_pending, response_read_deadline_post_commit_pump_pending, response_read_deadline_send_kind, response_read_deadline_send_owner_active, response_read_deadline_send_close_target_owned, response_read_deadline_send_close_cancel_owned, response_read_timer_phase, response_read_timer_target_owned, response_read_timer_cancel_owned, keep_alive, tls_active, tls_handshake_complete, protocol, tls_out_inflight, tls_recv_paused_hw, resp_fully_buffered, tls_proxy_stream, http1_pipeline_boundary_owners_settled, retry_req_snapshot_replayable, response_mutations_snapshotted, req_malformed, request_policy_body_pending, request_body_fully_buffered, request_upload_complete, response_policy_suppress_body, failure_policy_suppress_body, req_http_version, req_strict_h1_complete, req_target_has_fragment, req_target_form_unsupported, req_target_form_reject_before_pre_route, req_keep_alive, req_client_keep_alive, req_client_connection_close, req_client_connection_close_exact, req_client_connection_keep_alive_exact, req_client_has_content_length, req_client_content_length_count, req_client_transfer_encoding, req_client_has_transfer_encoding, req_client_has_te, req_client_has_expect, req_client_has_upgrade_header, req_client_connection_count, req_wants_upgrade, req_upgrade_is_websocket, resp_upgrade_is_websocket, req_body_mode, req_body_streamed, resp_body_mode, recv_armed, send_armed, upstream_connect_armed, upstream_recv_armed, upstream_send_armed, recv_paused_for_send, recv_pause_cancel_pending, recv_pause_target_inflight, recv_pause_rearm_pending, upstream_recv_paused_for_send, upstream_recv_pause_cancel_pending, upstream_recv_pause_rearm_pending, upstream_recv_cancel_inflight, upstream_recv_terminal_stale, upstream_retirement_active, upstream_retirement_target_owned, upstream_retirement_cancel_owned, upstream_retirement_cancel_retry, upstream_close_target_owned, upstream_close_cancel_owned, upstream_close_pause_cancel_owned, http1_boundary_deferred, http1_boundary_ready, http1_prebuilt_wait, http1_prebuilt_disposition, http1_prebuilt_response_layout, http1_prebuilt_response_purpose, http1_prebuilt_deadline_profile, http1_prebuilt_deadline_method, http1_prebuilt_deadline_route_method, upstream_recv_idle_stale_bytes, upstream_recv_close_quarantine, yield_armed, yield_timeout_armed, req_method, epoch_held, epoch_leave_deferred, upstream_recv_direct_armed, direct_write_completion_pending, ws_close_frame_client, ws_close_frame_upstream, upstream_name, req_path, consider reordering the fields or adding explicit padding members [clang-analyzer-optin.performance.Padding]
+  307 | struct ConnectionBase {
+      | ~~~~~~~^~~~~~~~~~~~~~~~
+  308 |     static constexpr u32 kMaxReqPathLen = 64;
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  309 |     static constexpr u32 kMaxUpstreamNameLen = 24;
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  310 |     static constexpr u16 kMaxPipelineDepth = 16;
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  311 |     // Keep persistent wait fields coupled to the shared route wait limit:
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  312 |     // every wait stores kind/result in two i64 slots.
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  313 |     static constexpr u32 kMaxJitHandlerSlots = rut::kMaxJitHandlerSlots;
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  314 |     static_assert(kMaxJitHandlerSlots >= 2u, "JIT wait frame must hold at least one wait result");
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  315 |     // Event callback type — void* loop to avoid circular dependency.
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  316 |     using Callback = void (*)(void* loop, ConnectionBase& conn, IoEvent ev);
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  317 |
+  318 |     // Per-event-type callback slots (Seastar-inspired).
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  319 |     // Each slot receives ONLY its designated event type. The dispatch
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  320 |     // layer routes events to the correct slot and handles null slots
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  321 |     // centrally (drain/ignore/close). No event-type guard code needed
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  322 |     // inside callbacks.
+      |     ~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:307:8: note: Excessive padding in 'struct rut::ConnectionBase' (145 padding bytes, where 1 is optimal). Optimal fields order: on_recv, on_send, on_upstream_recv, on_upstream_send, idle_return_config, response_header_slice, throttle_tat_ns, ws_handler, ws_c2u_msg, ws_u2c_msg, handler_ctx, pending_handler_fn, response_read_deadline_post_commit_range_first, response_read_deadline_post_commit_range_last, response_read_deadline_post_commit_range_total, response_read_deadline_send_src, response_read_timer_last_progress_ns, request_config, h2, tls, tls_in_slice, tls_out_slice, tls_out_inflight_src, tls_send_src, tls_pending_on_recv, tls_pending_on_send, http1_prebuilt_deadline_config, upstream_start_us, capture_buf, req_start_us, recv_slice, send_slice, local_body_cursor, local_body_base, upstream_recv_slice, upstream_relay_slice, timer_node, idle_node, req_path_override, response_read_timer_timespec, yield_timespec, req_path_canon, response_header_buf, tls_in_buf, tls_out_buf, recv_buf, send_buf, upstream_recv_buf, chain_direct_recv_owner, response_body_tail, tls_engine, ws_c2u, ws_u2c, response_read_deadline_upload, response_read_deadline_first_batch_upload, http1_prebuilt_deadline_upload, response_send_vector, req_header_overrides, handler_ctx_storage, resp_header_mutations, fd, id, upstream_fd, idle_return_fd, throttle_down_bps, throttle_pending_len, ws_client_send_len, ws_upstream_send_len, ws_upgrade_response_len, ws_upgrade_sent_len, ws_max_message_size, ws_c2u_consumed, ws_u2c_consumed, resume_event_result, handler_gen, upstream_episode, response_read_deadline_generation, response_read_deadline_owner_generation, response_read_deadline_upstream_episode, response_read_deadline_first_batch_generation, response_read_deadline_progress_generation, response_read_deadline_progress_episode, response_read_deadline_progress_bytes, response_read_deadline_post_commit_generation, response_read_deadline_post_commit_episode, response_read_deadline_post_commit_raw_header_end, response_read_deadline_post_commit_declared_body, response_read_deadline_post_commit_origin_received, response_read_deadline_post_commit_downstream_submitted, response_read_deadline_post_commit_downstream_completed, response_read_deadline_post_commit_inflight_body, response_read_deadline_post_commit_release_target, response_read_deadline_post_commit_send_body, response_read_deadline_send_generation, response_read_deadline_send_owner_generation, response_read_deadline_send_tombstone_generation, response_read_deadline_send_deadline_generation, response_read_deadline_send_upstream_episode, response_read_deadline_send_len, response_read_deadline_send_fd, response_read_deadline_send_close_generation, tls_send_owner_generation, tls_send_owner_fd, tls_send_owner_handler_generation, response_read_timer_generation, response_read_timer_owner_generation, response_read_timer_deadline_generation, response_read_timer_upstream_episode, yield_timer_gen, downstream_completed_request_count, tls_out_inflight_len, tls_out_inflight_generation, tls_out_inflight_fd, tls_send_len, tls_send_off, http1_pipeline_request_generation, req_header_end, req_content_length, req_initial_send_len, retry_req_send_len, req_metadata_episode, req_raw_target_episode, req_raw_target_offset, req_raw_target_length, req_body_remaining, resp_body_remaining, resp_body_sent, upstream_send_len, upstream_retiring_episode, upstream_close_episode, http1_boundary_successor_episode, http1_prebuilt_request_prefix_len, http1_prebuilt_deadline_generation, http1_prebuilt_header_end, http1_prebuilt_total_len, http1_prebuilt_body_len, downstream_req_size, req_size, peer_addr, upstream_us, pending_ops, recv_slice_capacity, send_progress, local_body_remaining, local_body_send_len, local_body_file_fd, local_response_size, upstream_relay_send_len, tls_recv_overflow_prefix_len, listener_context, req_chunk_parser, resp_chunk_parser, relay_owner, access_log_target_snapshot, flags, timer_slot, upstream_idx, idle_return_uid, target_transform_id, req_header_append_mask, upstream_slot_uid, ws_close_code, ws_echo_close_code, handler_state, response_read_deadline_bundle_id, response_read_deadline_first_batch_bundle_id, pipeline_depth, pipeline_stash_len, request_policy_id, pending_forward_upstream_id, pending_forward_request_policy_id, pending_forward_response_policy_id, pending_forward_failure_policy_id, pending_forward_timeout_failure_policy_id, response_policy_id, failure_policy_id, timeout_failure_policy_id, http1_prebuilt_deadline_bundle_id, http1_prebuilt_status, resp_status, peer_port, capture_header_len, state, shard_id, idle_trim_examined, upstream_attempts, upstream_backend_idx, proxy_resp_started, upstream_abandoned, req_body_overflow_rejected, req_body_lossy_successor, req_body_abandoned, upstream_keep_alive, upstream_reused, upstream_request_incomplete, idle_return_bidx, close_after_idle_return, is_health_probe, h2_proxy_recv_draining, h2_proxy_synth_quarantined, req_path_overridden, target_transform_recorded, req_header_override_count, req_header_override_overflow, resp_header_mutation_pending_count, resp_header_mutation_pending_overflow, resp_header_mutation_count, resp_header_mutation_overflow, upstream_slot_held, throttle_paused, is_ws_tunnel, ws_client_send_pending, ws_upstream_send_pending, ws_pre_tunnel_upstream_closed, ws_client_eof, ws_upstream_eof, is_ws_terminate_route, is_ws_terminate, ws_closing, ws_close_client_need, ws_close_client_inflight, ws_close_upstream_need, ws_close_upstream_inflight, pending_yield_kind, resume_event_kind, upstream_episode_quarantined, response_read_deadline_seconds, response_read_deadline_buffering, response_read_deadline_profile, response_read_deadline_method, response_read_deadline_route_method, response_read_deadline_state, response_read_deadline_first_batch, response_read_deadline_first_batch_profile, response_read_deadline_first_batch_method, response_read_deadline_first_batch_route_method, response_read_deadline_first_batch_buffering, response_read_deadline_post_commit_phase, response_read_deadline_post_commit_response_class, response_read_deadline_post_commit_close_after_drain, response_read_deadline_post_commit_terminal_pending, response_read_deadline_post_commit_pump_pending, response_read_deadline_send_kind, response_read_deadline_send_owner_active, response_read_deadline_send_close_target_owned, response_read_deadline_send_close_cancel_owned, response_read_timer_phase, response_read_timer_target_owned, response_read_timer_cancel_owned, keep_alive, tls_active, tls_handshake_complete, protocol, tls_out_inflight, tls_recv_paused_hw, resp_fully_buffered, tls_proxy_stream, http1_pipeline_boundary_owners_settled, retry_req_snapshot_replayable, response_mutations_snapshotted, req_malformed, request_policy_body_pending, request_body_fully_buffered, request_upload_complete, response_policy_suppress_body, failure_policy_suppress_body, req_http_version, req_strict_h1_complete, req_target_has_fragment, req_target_form_unsupported, req_target_form_reject_before_pre_route, req_keep_alive, req_client_keep_alive, req_client_connection_close, req_client_connection_close_exact, req_client_connection_keep_alive_exact, req_client_has_content_length, req_client_content_length_count, req_client_transfer_encoding, req_client_has_transfer_encoding, req_client_has_te, req_client_has_expect, req_client_has_upgrade_header, req_client_connection_count, req_wants_upgrade, req_upgrade_is_websocket, resp_upgrade_is_websocket, req_body_mode, req_body_streamed, resp_body_mode, recv_armed, send_armed, upstream_connect_armed, upstream_recv_armed, upstream_send_armed, recv_paused_for_send, recv_pause_cancel_pending, recv_pause_target_inflight, recv_pause_rearm_pending, upstream_recv_paused_for_send, upstream_recv_pause_cancel_pending, upstream_recv_pause_rearm_pending, upstream_recv_cancel_inflight, upstream_recv_terminal_stale, upstream_retirement_active, upstream_retirement_target_owned, upstream_retirement_cancel_owned, upstream_retirement_cancel_retry, upstream_close_target_owned, upstream_close_cancel_owned, upstream_close_pause_cancel_owned, http1_boundary_deferred, http1_boundary_ready, http1_prebuilt_wait, http1_prebuilt_disposition, http1_prebuilt_response_layout, http1_prebuilt_response_purpose, http1_prebuilt_deadline_profile, http1_prebuilt_deadline_method, http1_prebuilt_deadline_route_method, upstream_recv_idle_stale_bytes, upstream_recv_close_quarantine, yield_armed, yield_timeout_armed, req_method, epoch_held, epoch_leave_deferred, upstream_recv_direct_armed, direct_write_completion_pending, ws_close_frame_client, ws_close_frame_upstream, upstream_name, req_path, consider reordering the fields or adding explicit padding members
+  307 | struct ConnectionBase {
+      | ~~~~~~~^~~~~~~~~~~~~~~~
+  308 |     static constexpr u32 kMaxReqPathLen = 64;
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  309 |     static constexpr u32 kMaxUpstreamNameLen = 24;
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  310 |     static constexpr u16 kMaxPipelineDepth = 16;
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  311 |     // Keep persistent wait fields coupled to the shared route wait limit:
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  312 |     // every wait stores kind/result in two i64 slots.
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  313 |     static constexpr u32 kMaxJitHandlerSlots = rut::kMaxJitHandlerSlots;
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  314 |     static_assert(kMaxJitHandlerSlots >= 2u, "JIT wait frame must hold at least one wait result");
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  315 |     // Event callback type — void* loop to avoid circular dependency.
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  316 |     using Callback = void (*)(void* loop, ConnectionBase& conn, IoEvent ev);
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  317 |
+  318 |     // Per-event-type callback slots (Seastar-inspired).
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  319 |     // Each slot receives ONLY its designated event type. The dispatch
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  320 |     // layer routes events to the correct slot and handles null slots
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  321 |     // centrally (drain/ignore/close). No event-type guard code needed
+      |     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  322 |     // inside callbacks.
+      |     ~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:577:23: warning: invalid case style for constant 'offset' [readability-identifier-naming]
+  577 |             const u32 offset = response_header_buf.len();
+      |                       ^~~~~~
+      |                       kOffset
+  578 |             if (response_header_buf.write(ptr, value.len) != value.len) return false;
+  579 |             value.ptr = reinterpret_cast<const char*>(response_header_buf.data() + offset);
+      |                                                                                    ~~~~~~
+      |                                                                                    kOffset
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:841:20: warning: invalid case style for constant 'keys_valid' [readability-identifier-naming]
+  841 |         const bool keys_valid =
+      |                    ^~~~~~~~~~
+      |                    kEysValid
+  842 |             response_read_timer_owner_generation != 0 &&
+  843 |             response_read_timer_owner_generation <= kResponseReadTimerGenerationMask &&
+  844 |             response_read_timer_owner_generation == response_read_timer_generation &&
+  845 |             response_read_timer_deadline_generation != 0 &&
+  846 |             valid_upstream_episode(response_read_timer_upstream_episode);
+  847 |         const bool timespec_valid =
+  848 |             response_read_timer_timespec.tv_sec >= 0 && response_read_timer_timespec.tv_nsec >= 0 &&
+  849 |             response_read_timer_timespec.tv_nsec < 1'000'000'000LL &&
+  850 |             (response_read_timer_timespec.tv_sec != 0 || response_read_timer_timespec.tv_nsec != 0);
+  851 |         switch (response_read_timer_phase) {
+  852 |             case ResponseReadTimerPhase::None:
+  853 |                 return response_read_timer_owner_is_neutral();
+  854 |             case ResponseReadTimerPhase::Armed:
+  855 |                 return keys_valid && timespec_valid && response_read_timer_target_owned &&
+      |                        ~~~~~~~~~~
+      |                        kEysValid
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:847:20: warning: invalid case style for constant 'timespec_valid' [readability-identifier-naming]
+  847 |         const bool timespec_valid =
+      |                    ^~~~~~~~~~~~~~
+      |                    kTimespecValid
+  848 |             response_read_timer_timespec.tv_sec >= 0 && response_read_timer_timespec.tv_nsec >= 0 &&
+  849 |             response_read_timer_timespec.tv_nsec < 1'000'000'000LL &&
+  850 |             (response_read_timer_timespec.tv_sec != 0 || response_read_timer_timespec.tv_nsec != 0);
+  851 |         switch (response_read_timer_phase) {
+  852 |             case ResponseReadTimerPhase::None:
+  853 |                 return response_read_timer_owner_is_neutral();
+  854 |             case ResponseReadTimerPhase::Armed:
+  855 |                 return keys_valid && timespec_valid && response_read_timer_target_owned &&
+      |                                      ~~~~~~~~~~~~~~
+      |                                      kTimespecValid
+  856 |                        !response_read_timer_cancel_owned;
+  857 |             case ResponseReadTimerPhase::CancelPending:
+  858 |                 return keys_valid && timespec_valid &&
+      |                                      ~~~~~~~~~~~~~~
+      |                                      kTimespecValid
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:887:20: warning: invalid case style for constant 'cancel' [readability-identifier-naming]
+  887 |         const bool cancel = (tagged_generation & kResponseReadTimerCancelBit) != 0;
+      |                    ^~~~~~
+      |                    kCancel
+  888 |         const u32 generation = tagged_generation & kResponseReadTimerGenerationMask;
+  889 |         if (generation == 0 || generation != response_read_timer_owner_generation) return false;
+  890 |         if (response_read_timer_phase == ResponseReadTimerPhase::Armed) {
+  891 |             if (cancel || !response_read_timer_target_owned || response_read_timer_cancel_owned)
+      |                 ~~~~~~
+      |                 kCancel
+  892 |                 return false;
+  893 |             response_read_timer_target_owned = false;
+  894 |         } else if (response_read_timer_phase == ResponseReadTimerPhase::CancelPending) {
+  895 |             bool& owned =
+  896 |                 cancel ? response_read_timer_cancel_owned : response_read_timer_target_owned;
+      |                 ~~~~~~
+      |                 kCancel
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:888:19: warning: invalid case style for constant 'generation' [readability-identifier-naming]
+  888 |         const u32 generation = tagged_generation & kResponseReadTimerGenerationMask;
+      |                   ^~~~~~~~~~
+      |                   kGeneration
+  889 |         if (generation == 0 || generation != response_read_timer_owner_generation) return false;
+      |             ~~~~~~~~~~         ~~~~~~~~~~
+      |             kGeneration        kGeneration
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:903:24: warning: invalid case style for constant 'cleared' [readability-identifier-naming]
+  903 |             const bool cleared = clear_response_read_timer_owner();
+      |                        ^~~~~~~
+      |                        kCleared
+  904 |             if (cleared && response_read_deadline_state == ResponseReadDeadlineState::None)
+      |                 ~~~~~~~
+      |                 kCleared
+  905 |                 response_read_timer_last_progress_ns = 0;
+  906 |             return cleared;
+      |                    ~~~~~~~
+      |                    kCleared
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1097:20: warning: invalid case style for constant 'check' [readability-identifier-naming]
+ 1097 |         const auto check = [&](const auto& value, const auto& reset_value) {
+      |                    ^~~~~
+      |                    kCheck
+ 1098 |             neutral = neutral && value == reset_value;
+ 1099 |         };
+ 1100 |         visit_response_read_deadline_owner_fields(*this, check);
+      |                                                          ~~~~~
+      |                                                          kCheck
+ 1101 |         visit_response_read_deadline_send_owner_fields(*this, check);
+      |                                                               ~~~~~
+      |                                                               kCheck
+ 1102 |         visit_response_read_deadline_send_close_owner_fields(*this, check);
+      |                                                                     ~~~~~
+      |                                                                     kCheck
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1108:20: warning: invalid case style for constant 'check' [readability-identifier-naming]
+ 1108 |         const auto check = [&](const auto& value, const auto& reset_value) {
+      |                    ^~~~~
+      |                    kCheck
+ 1109 |             neutral = neutral && value == reset_value;
+ 1110 |         };
+ 1111 |         check(response_read_deadline_progress_generation, u32{0});
+      |         ~~~~~
+      |         kCheck
+ 1112 |         check(response_read_deadline_progress_episode, u32{0});
+      |         ~~~~~
+      |         kCheck
+ 1113 |         check(response_read_deadline_progress_bytes, u32{0});
+      |         ~~~~~
+      |         kCheck
+ 1114 |         check(response_read_deadline_post_commit_phase, ResponseReadDeadlinePostCommitPhase::None);
+      |         ~~~~~
+      |         kCheck
+ 1115 |         check(response_read_deadline_post_commit_generation, u32{0});
+      |         ~~~~~
+      |         kCheck
+ 1116 |         check(response_read_deadline_post_commit_episode, u32{0});
+      |         ~~~~~
+      |         kCheck
+ 1117 |         check(response_read_deadline_post_commit_raw_header_end, u32{0});
+      |         ~~~~~
+      |         kCheck
+ 1118 |         check(response_read_deadline_post_commit_declared_body, u32{0});
+      |         ~~~~~
+      |         kCheck
+ 1119 |         check(response_read_deadline_post_commit_response_class,
+      |         ~~~~~
+      |         kCheck
+ 1120 |               CompleteContentLengthResponseClass::Unsupported);
+ 1121 |         check(response_read_deadline_post_commit_range_first, u64{0});
+      |         ~~~~~
+      |         kCheck
+ 1122 |         check(response_read_deadline_post_commit_range_last, u64{0});
+      |         ~~~~~
+      |         kCheck
+ 1123 |         check(response_read_deadline_post_commit_range_total, u64{0});
+      |         ~~~~~
+      |         kCheck
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1172:20: warning: invalid case style for constant 'check' [readability-identifier-naming]
+ 1172 |         const auto check = [&](const auto& value, const auto& reset_value) {
+      |                    ^~~~~
+      |                    kCheck
+ 1173 |             neutral = neutral && value == reset_value;
+ 1174 |         };
+ 1175 |         visit_http1_prebuilt_response_proof_fields(*this, check);
+      |                                                           ~~~~~
+      |                                                           kCheck
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1435:45: warning: invalid case style for constant 'neutral' [readability-identifier-naming]
+ 1435 |         const RawRequestTargetWitnessResult neutral{RawRequestTargetWitnessState::Neutral,
+      |                                             ^~~~~~~
+      |                                             kNeutral
+ 1436 |                                                     {nullptr, 0}};
+ 1437 |         const RawRequestTargetWitnessResult invalid{RawRequestTargetWitnessState::Invalid,
+ 1438 |                                                     {nullptr, 0}};
+ 1439 |         if (req_raw_target_episode == 0 && req_raw_target_offset == 0 && req_raw_target_length == 0)
+ 1440 |             return neutral;
+      |                    ~~~~~~~
+      |                    kNeutral
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1437:45: warning: invalid case style for constant 'invalid' [readability-identifier-naming]
+ 1437 |         const RawRequestTargetWitnessResult invalid{RawRequestTargetWitnessState::Invalid,
+      |                                             ^~~~~~~
+      |                                             kInvalid
+ 1438 |                                                     {nullptr, 0}};
+ 1439 |         if (req_raw_target_episode == 0 && req_raw_target_offset == 0 && req_raw_target_length == 0)
+ 1440 |             return neutral;
+ 1441 |         if (req_raw_target_episode == 0 || req_raw_target_offset == 0 ||
+ 1442 |             req_raw_target_length == 0 || req_metadata_episode == 0 ||
+ 1443 |             req_raw_target_episode != req_metadata_episode || !req_strict_h1_complete ||
+ 1444 |             req_malformed || req_header_end == 0 || req_initial_send_len == 0 ||
+ 1445 |             req_header_end > req_initial_send_len || !recv_buf.valid() || recv_buf.is_released())
+ 1446 |             return invalid;
+      |                    ~~~~~~~
+      |                    kInvalid
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1448:19: warning: invalid case style for constant 'capacity' [readability-identifier-naming]
+ 1448 |         const u32 capacity = recv_buf.capacity();
+      |                   ^~~~~~~~
+      |                   kCapacity
+ 1449 |         const u32 count = recv_buf.len();
+ 1450 |         if (recv_slice == nullptr || recv_slice_capacity == 0 || capacity != recv_slice_capacity ||
+      |                                                                  ~~~~~~~~
+      |                                                                  kCapacity
+ 1451 |             count > capacity || req_header_end > count || req_initial_send_len > count ||
+      |                     ~~~~~~~~
+      |                     kCapacity
+ 1452 |             req_raw_target_offset >= req_header_end)
+ 1453 |             return invalid;
+ 1454 |         const u64 target_end64 = static_cast<u64>(req_raw_target_offset) + req_raw_target_length;
+ 1455 |         if (target_end64 >= req_header_end || target_end64 > count || target_end64 > capacity)
+      |                                                                                      ~~~~~~~~
+      |                                                                                      kCapacity
+ 1456 |             return invalid;
+ 1457 |
+ 1458 |         const u8* base = recv_buf.data();
+ 1459 |         const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+ 1460 |         if (base != recv_slice || address < 4096 || capacity > UINTPTR_MAX - address)
+      |                                                     ~~~~~~~~
+      |                                                     kCapacity
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1449:19: warning: invalid case style for constant 'count' [readability-identifier-naming]
+ 1449 |         const u32 count = recv_buf.len();
+      |                   ^~~~~
+      |                   kCount
+ 1450 |         if (recv_slice == nullptr || recv_slice_capacity == 0 || capacity != recv_slice_capacity ||
+ 1451 |             count > capacity || req_header_end > count || req_initial_send_len > count ||
+      |             ~~~~~                                ~~~~~                           ~~~~~
+      |             kCount                               kCount                          kCount
+ 1452 |             req_raw_target_offset >= req_header_end)
+ 1453 |             return invalid;
+ 1454 |         const u64 target_end64 = static_cast<u64>(req_raw_target_offset) + req_raw_target_length;
+ 1455 |         if (target_end64 >= req_header_end || target_end64 > count || target_end64 > capacity)
+      |                                                              ~~~~~
+      |                                                              kCount
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1454:19: warning: invalid case style for constant 'target_end64' [readability-identifier-naming]
+ 1454 |         const u64 target_end64 = static_cast<u64>(req_raw_target_offset) + req_raw_target_length;
+      |                   ^~~~~~~~~~~~
+      |                   kTargetEnd64
+ 1455 |         if (target_end64 >= req_header_end || target_end64 > count || target_end64 > capacity)
+      |             ~~~~~~~~~~~~                      ~~~~~~~~~~~~            ~~~~~~~~~~~~
+      |             kTargetEnd64                      kTargetEnd64            kTargetEnd64
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1459:15: warning: use auto when initializing with a cast to avoid duplicating the type name [modernize-use-auto]
+ 1459 |         const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+      |               ^~~~~~~~~
+      |               auto
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1459:25: warning: invalid case style for constant 'address' [readability-identifier-naming]
+ 1459 |         const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+      |                         ^~~~~~~
+      |                         kAddress
+ 1460 |         if (base != recv_slice || address < 4096 || capacity > UINTPTR_MAX - address)
+      |                                   ~~~~~~~                                    ~~~~~~~
+      |                                   kAddress                                   kAddress
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1512:19: warning: invalid case style for constant 'target_end' [readability-identifier-naming]
+ 1512 |         const u32 target_end = static_cast<u32>(target_end64);
+      |                   ^~~~~~~~~~
+      |                   kTargetEnd
+ 1513 |         // Bind the offsets to the strictly parsed request line, not merely an
+ 1514 |         // arbitrary slash-delimited substring elsewhere in the header block.
+ 1515 |         // Bounds above are proven before these bytes are examined.
+ 1516 |         const bool h10 = req_http_version == static_cast<u8>(HttpVersion::Http10);
+ 1517 |         const bool h11 = req_http_version == static_cast<u8>(HttpVersion::Http11);
+ 1518 |         if ((!h10 && !h11) || base[req_raw_target_offset - 1] != ' ' ||
+ 1519 |             base[req_raw_target_offset] != '/' || base[target_end] != ' ' ||
+      |                                                        ~~~~~~~~~~
+      |                                                        kTargetEnd
+ 1520 |             target_end64 + 11u > req_header_end || base[target_end + 1] != 'H' ||
+      |                                                         ~~~~~~~~~~
+      |                                                         kTargetEnd
+ 1521 |             base[target_end + 2] != 'T' || base[target_end + 3] != 'T' ||
+      |                  ~~~~~~~~~~                     ~~~~~~~~~~
+      |                  kTargetEnd                     kTargetEnd
+ 1522 |             base[target_end + 4] != 'P' || base[target_end + 5] != '/' ||
+      |                  ~~~~~~~~~~                     ~~~~~~~~~~
+      |                  kTargetEnd                     kTargetEnd
+ 1523 |             base[target_end + 6] != '1' || base[target_end + 7] != '.' ||
+      |                  ~~~~~~~~~~                     ~~~~~~~~~~
+      |                  kTargetEnd                     kTargetEnd
+ 1524 |             base[target_end + 8] != static_cast<u8>(h11 ? '1' : '0') ||
+      |                  ~~~~~~~~~~
+      |                  kTargetEnd
+ 1525 |             base[target_end + 9] != '\r' || base[target_end + 10] != '\n')
+      |                  ~~~~~~~~~~                      ~~~~~~~~~~
+      |                  kTargetEnd                      kTargetEnd
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1516:20: warning: invalid case style for constant 'h10' [readability-identifier-naming]
+ 1516 |         const bool h10 = req_http_version == static_cast<u8>(HttpVersion::Http10);
+      |                    ^~~
+      |                    kH10
+ 1517 |         const bool h11 = req_http_version == static_cast<u8>(HttpVersion::Http11);
+ 1518 |         if ((!h10 && !h11) || base[req_raw_target_offset - 1] != ' ' ||
+      |               ~~~
+      |               kH10
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1517:20: warning: invalid case style for constant 'h11' [readability-identifier-naming]
+ 1517 |         const bool h11 = req_http_version == static_cast<u8>(HttpVersion::Http11);
+      |                    ^~~
+      |                    kH11
+ 1518 |         if ((!h10 && !h11) || base[req_raw_target_offset - 1] != ' ' ||
+      |                       ~~~
+      |                       kH11
+ 1519 |             base[req_raw_target_offset] != '/' || base[target_end] != ' ' ||
+ 1520 |             target_end64 + 11u > req_header_end || base[target_end + 1] != 'H' ||
+ 1521 |             base[target_end + 2] != 'T' || base[target_end + 3] != 'T' ||
+ 1522 |             base[target_end + 4] != 'P' || base[target_end + 5] != '/' ||
+ 1523 |             base[target_end + 6] != '1' || base[target_end + 7] != '.' ||
+ 1524 |             base[target_end + 8] != static_cast<u8>(h11 ? '1' : '0') ||
+      |                                                     ~~~
+      |                                                     kH11
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1537:19: warning: invalid case style for constant 'episode' [readability-identifier-naming]
+ 1537 |         const u32 episode = req_metadata_episode;
+      |                   ^~~~~~~
+      |                   kEpisode
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1538:45: warning: invalid case style for constant 'witness' [readability-identifier-naming]
+ 1538 |         const RawRequestTargetWitnessResult witness = checked_raw_request_target();
+      |                                             ^~~~~~~
+      |                                             kWitness
+ 1539 |         if (witness.state == RawRequestTargetWitnessState::Valid) {
+      |             ~~~~~~~
+      |             kWitness
+ 1540 |             if (witness.target.len == 0 ||
+      |                 ~~~~~~~
+      |                 kWitness
+ 1541 |                 witness.target.len > kAccessLogObservedStrictH1TargetMax) {
+      |                 ~~~~~~~
+      |                 kWitness
+ 1542 |                 access_log_target_snapshot.target_state = AccessLogTargetState::Invalid;
+ 1543 |             } else if (witness.target.len > kAccessLogCompleteTargetMax) {
+      |                        ~~~~~~~
+      |                        kWitness
+ 1544 |                 access_log_target_snapshot.target_length = static_cast<u16>(witness.target.len);
+      |                                                                             ~~~~~~~
+      |                                                                             kWitness
+ 1545 |                 access_log_target_snapshot.target_state = AccessLogTargetState::OverLimit;
+ 1546 |             } else {
+ 1547 |                 for (u32 i = 0; i < witness.target.len; i++)
+      |                                     ~~~~~~~
+      |                                     kWitness
+ 1548 |                     access_log_target_snapshot.path[i] = witness.target.ptr[i];
+      |                                                          ~~~~~~~
+      |                                                          kWitness
+ 1549 |                 access_log_target_snapshot.target_length = static_cast<u16>(witness.target.len);
+      |                                                                             ~~~~~~~
+      |                                                                             kWitness
+ 1550 |                 access_log_target_snapshot.target_state = AccessLogTargetState::Complete;
+ 1551 |             }
+ 1552 |         } else if (witness.state == RawRequestTargetWitnessState::Neutral) {
+      |                    ~~~~~~~
+      |                    kWitness
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1826:19: warning: invalid case style for constant 'first' [readability-identifier-naming]
+ 1826 |         const u32 first = buffered_response_front_size();
+      |                   ^~~~~
+      |                   kFirst
+ 1827 |         if (tls_active || upstream_recv_buf.len() != 0 ||
+ 1828 |             response_read_deadline_buffering != ForwardResponseBufferingMode::Bounded ||
+ 1829 |             response_body_tail.head == nullptr || response_body_tail.head->next == nullptr)
+ 1830 |             return first;
+      |                    ~~~~~
+      |                    kFirst
+ 1831 |         const auto* next = response_body_tail.head->next;
+ 1832 |         const u32 second = next->len - next->offset;
+ 1833 |         return first + second;
+      |                ~~~~~
+      |                kFirst
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1832:19: warning: invalid case style for constant 'second' [readability-identifier-naming]
+ 1832 |         const u32 second = next->len - next->offset;
+      |                   ^~~~~~
+      |                   kSecond
+ 1833 |         return first + second;
+      |                        ~~~~~~
+      |                        kSecond
+/tmp/rut-ws-pr-20261010/include/rut/runtime/connection_base.h:1836:19: warning: invalid case style for constant 'first' [readability-identifier-naming]
+ 1836 |         const u32 first = buffered_response_front_size();
+      |                   ^~~~~
+      |                   kFirst
+ 1837 |         if (len <= first) return true;
+      |                    ~~~~~
+      |                    kFirst
+ 1838 |         if (len > buffered_response_send_span_size() || response_body_tail.head == nullptr ||
+ 1839 |             response_body_tail.head->next == nullptr || upstream_recv_buf.len() != 0)
+ 1840 |             return false;
+ 1841 |         const auto* next = response_body_tail.head->next;
+ 1842 |         return response_send_vector.first_source == buffered_response_data() &&
+ 1843 |                response_send_vector.second_source ==
+ 1844 |                    ResponseBodyChain::payload(next) + next->offset &&
+ 1845 |                response_send_vector.first_size == first && response_send_vector.total_size == len;
+      |                                                   ~~~~~
+      |                                                   kFirst
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:52:1: warning: function 'io_event_is_upstream' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+   52 | inline constexpr bool io_event_is_upstream(IoEventType type) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:57:1: warning: function 'io_event_uses_upstream_episode' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+   57 | inline constexpr bool io_event_uses_upstream_episode(IoEventType type) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:80:1: warning: function 'valid_upstream_event_token' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+   80 | inline constexpr bool valid_upstream_event_token(const UpstreamEventToken& token) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:85:1: warning: function 'valid_upstream_episode' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+   85 | inline constexpr bool valid_upstream_episode(u32 episode) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:89:1: warning: function 'encode_upstream_event_token' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+   89 | inline constexpr u64 encode_upstream_event_token(const UpstreamEventToken& token) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:95:1: warning: function 'decode_upstream_event_token' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+   95 | inline constexpr bool decode_upstream_event_token(u64 data, UpstreamEventToken* out) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:107:1: warning: function 'valid_non_upstream_user_data' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+  107 | inline constexpr bool valid_non_upstream_user_data(const NonUpstreamUserData& value) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:117:1: warning: function 'encode_non_upstream_user_data' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+  117 | inline constexpr u64 encode_non_upstream_user_data(const NonUpstreamUserData& value) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:123:1: warning: function 'decode_non_upstream_user_data' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+  123 | inline constexpr bool decode_non_upstream_user_data(u64 data, NonUpstreamUserData* out) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:207:1: warning: function 'valid_response_read_timer_transport_event' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+  207 | inline constexpr bool valid_response_read_timer_transport_event(const IoEvent& event) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:209:16: warning: invalid case style for constant 'cancel' [readability-identifier-naming]
+  209 |     const bool cancel = (event.non_upstream_generation & kResponseReadTimerCancelBit) != 0;
+      |                ^~~~~~
+      |                kCancel
+  210 |     const u32 generation = event.non_upstream_generation & kResponseReadTimerGenerationMask;
+  211 |     const bool result_valid = cancel ? (event.result == 0 || event.result == -ENOENT)
+      |                               ~~~~~~
+      |                               kCancel
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:210:15: warning: invalid case style for constant 'generation' [readability-identifier-naming]
+  210 |     const u32 generation = event.non_upstream_generation & kResponseReadTimerGenerationMask;
+      |               ^~~~~~~~~~
+      |               kGeneration
+  211 |     const bool result_valid = cancel ? (event.result == 0 || event.result == -ENOENT)
+  212 |                                      : (event.result == -ETIME || event.result == -ECANCELED);
+  213 |     return generation != 0 && result_valid && event.buf_id == 0 && event.has_buf == 0 &&
+      |            ~~~~~~~~~~
+      |            kGeneration
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:211:16: warning: invalid case style for constant 'result_valid' [readability-identifier-naming]
+  211 |     const bool result_valid = cancel ? (event.result == 0 || event.result == -ENOENT)
+      |                ^~~~~~~~~~~~
+      |                kResultValid
+  212 |                                      : (event.result == -ETIME || event.result == -ECANCELED);
+  213 |     return generation != 0 && result_valid && event.buf_id == 0 && event.has_buf == 0 &&
+      |                               ~~~~~~~~~~~~
+      |                               kResultValid
+/tmp/rut-ws-pr-20261010/include/rut/runtime/io_event.h:222:1: warning: function 'io_event_is_tagged_stale' has inline specifier but is implicitly inlined [readability-redundant-inline-specifier]
+  222 | inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {
+      | ^~~~~~
+/tmp/rut-ws-pr-20261010/include/rut/runtime/listener.h:52:16: warning: invalid case style for constant 'cli_listener_present' [readability-identifier-naming]
+   52 |     const bool cli_listener_present = cli_present || cli_transport == ListenerTransport::Tls;
+      |                ^~~~~~~~~~~~~~~~~~~~
+      |                kCliListenerPresent
+   53 |     if (!source_present && !cli_listener_present) return ListenerSpec{};
+      |                             ~~~~~~~~~~~~~~~~~~~~
+      |                             kCliListenerPresent
+   54 |     if (!source_present) {
+   55 |         ListenerSpec result{};
+   56 |         result.port = cli_present ? cli_port : ListenerSpec{}.port;
+   57 |         result.transport = cli_transport;
+   58 |         return result;
+   59 |     }
+   60 |     if (cli_listener_present && source.transport != cli_transport)
+      |         ~~~~~~~~~~~~~~~~~~~~
+      |         kCliListenerPresent
+/tmp/rut-ws-pr-20261010/include/rut/runtime/listener_context.h:56:15: warning: invalid case style for constant 'bound_port' [readability-identifier-naming]
+   56 |     const u16 bound_port = ntohs(bound.sin_port);
+      |               ^~~~~~~~~~
+      |               kBoundPort
+   57 |     const u32 bound_ipv4_host = ntohl(bound.sin_addr.s_addr);
+   58 |     if ((requested_port != 0u && bound_port != requested_port) ||
+      |                                  ~~~~~~~~~~
+      |                                  kBoundPort
+   59 |         (declared.port != 0u && bound_port != declared.port))
+      |                                 ~~~~~~~~~~
+      |                                 kBoundPort
+   60 |         return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
+   61 |     if ((declared.address == ListenerAddress::IPv4Wildcard && bound_ipv4_host != 0u) ||
+   62 |         (declared.address == ListenerAddress::IPv4Exact && bound_ipv4_host != declared.ipv4_host))
+   63 |         return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
+   64 |
+   65 |     ListenerContext result{declared.address, declared.transport, bound_port, bound_ipv4_host};
+      |                                                                  ~~~~~~~~~~
+      |                                                                  kBoundPort
+/tmp/rut-ws-pr-20261010/include/rut/runtime/listener_context.h:57:15: warning: invalid case style for constant 'bound_ipv4_host' [readability-identifier-naming]
+   57 |     const u32 bound_ipv4_host = ntohl(bound.sin_addr.s_addr);
+      |               ^~~~~~~~~~~~~~~
+      |               kBoundIpv4Host
+   58 |     if ((requested_port != 0u && bound_port != requested_port) ||
+   59 |         (declared.port != 0u && bound_port != declared.port))
+   60 |         return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
+   61 |     if ((declared.address == ListenerAddress::IPv4Wildcard && bound_ipv4_host != 0u) ||
+      |                                                               ~~~~~~~~~~~~~~~
+      |                                                               kBoundIpv4Host
+   62 |         (declared.address == ListenerAddress::IPv4Exact && bound_ipv4_host != declared.ipv4_host))
+      |                                                            ~~~~~~~~~~~~~~~
+      |                                                            kBoundIpv4Host
+   63 |         return core::make_unexpected(ListenerContextError::InvalidBoundAddress);
+   64 |
+   65 |     ListenerContext result{declared.address, declared.transport, bound_port, bound_ipv4_host};
+      |                                                                              ~~~~~~~~~~~~~~~
+      |                                                                              kBoundIpv4Host
+/tmp/rut-ws-pr-20261010/include/rut/runtime/listener_context.h:97:15: warning: invalid case style for constant 'fd' [readability-identifier-naming]
+   97 |     const i32 fd = fd_result.value();
+      |               ^~
+      |               kFd
+   98 |
+   99 |     auto context = derive_listener_context(fd, declared, requested_port);
+      |                                            ~~
+      |                                            kFd
+  100 |     if (!context) {
+  101 |         close(fd);
+      |               ~~
+      |               kFd
+  102 |         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+  103 |     }
+  104 |     if (expected != nullptr && !context.value().equivalent(*expected)) {
+  105 |         close(fd);
+      |               ~~
+      |               kFd
+  106 |         return core::make_unexpected(Error::make(EADDRINUSE, Error::Source::Socket));
+  107 |     }
+  108 |     *out_context = context.value();
+  109 |     return fd;
+      |            ~~
+      |            kFd
+/tmp/rut-ws-pr-20261010/include/rut/runtime/mapped_array.h:44:22: warning: invalid case style for constant 'bytes' [readability-identifier-naming]
+   44 |         const size_t bytes = static_cast<size_t>(count) * sizeof(T);
+      |                      ^~~~~
+      |                      kBytes
+   45 |         void* region =
+   46 |             mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      |                           ~~~~~
+      |                           kBytes
+/tmp/rut-ws-pr-20261010/include/rut/runtime/mapped_array.h:86:8: warning: invalid case style for member 'ptr_' [readability-identifier-naming]
+   39 |     T* data() { return ptr_; }
+      |                        ~~~~
+      |                        ptr
+   40 |     const T* data() const { return ptr_; }
+      |                                    ~~~~
+      |                                    ptr
+   41 |     u32 size() const { return count_; }
+   42 |     bool initialized() const { return ptr_ != nullptr; }
+      |                                       ~~~~
+      |                                       ptr
+   43 |     T& operator[](u32 i) { return ptr_[i]; }
+      |                                   ~~~~
+      |                                   ptr
+   44 |     const T& operator[](u32 i) const { return ptr_[i]; }
+      |                                               ~~~~
+      |                                               ptr
+   45 |     operator T*() { return ptr_; }
+      |                            ~~~~
+      |                            ptr
+   46 |     operator const T*() const { return ptr_; }
+      |                                        ~~~~
+      |                                        ptr
+   47 |     T* begin() { return ptr_; }
+      |                         ~~~~
+      |                         ptr
+   48 |     T* end() { return ptr_ ? ptr_ + count_ : nullptr; }
+      |                       ~~~~   ~~~~
+      |                       ptr    ptr
+   49 |     const T* begin() const { return ptr_; }
+      |                                     ~~~~
+      |                                     ptr
+   50 |     const T* end() const { return ptr_ ? ptr_ + count_ : nullptr; }
+      |                                   ~~~~   ~~~~
+      |                                   ptr    ptr
+   51 |
+   52 | private:
+   53 |     T* ptr_ = nullptr;
+      |        ^~~~
+      |        ptr
+/tmp/rut-ws-pr-20261010/include/rut/runtime/mapped_array.h:87:9: warning: invalid case style for member 'count_' [readability-identifier-naming]
+   40 |     u32 size() const { return count_; }
+      |                               ~~~~~~
+      |                               count
+   41 |     bool initialized() const { return ptr_ != nullptr; }
+   42 |     T& operator[](u32 i) { return ptr_[i]; }
+   43 |     const T& operator[](u32 i) const { return ptr_[i]; }
+   44 |     operator T*() { return ptr_; }
+   45 |     operator const T*() const { return ptr_; }
+   46 |     T* begin() { return ptr_; }
+   47 |     T* end() { return ptr_ ? ptr_ + count_ : nullptr; }
+      |                                     ~~~~~~
+      |                                     count
+   48 |     const T* begin() const { return ptr_; }
+   49 |     const T* end() const { return ptr_ ? ptr_ + count_ : nullptr; }
+      |                                                 ~~~~~~
+      |                                                 count
+   50 |
+   51 | private:
+   52 |     T* ptr_ = nullptr;
+   53 |     u32 count_ = 0;
+      |         ^~~~~~
+      |         count
+/tmp/rut-ws-pr-20261010/include/rut/runtime/mapped_array.h:88:9: warning: invalid case style for member 'constructed_' [readability-identifier-naming]
+   60 |     u32 constructed_ = 0;
+      |         ^~~~~~~~~~~~
+      |         constructed
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:66:19: warning: invalid case style for constant 'spare' [readability-identifier-naming]
+   66 |         const u32 spare = tail ? payload_capacity(pool, tail) - tail->len : 0;
+      |                   ^~~~~
+      |                   kSpare
+   67 |         u32 missing = len > spare ? len - spare : 0;
+      |                             ~~~~~         ~~~~~
+      |                             kSpare        kSpare
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:97:23: warning: invalid case style for constant 'cap' [readability-identifier-naming]
+   97 |             const u32 cap = payload_capacity(pool, node);
+      |                       ^~~
+      |                       kCap
+   98 |             missing = missing > cap ? missing - cap : 0;
+      |                                 ~~~             ~~~
+      |                                 kCap            kCap
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:112:23: warning: invalid case style for constant 'room' [readability-identifier-naming]
+  112 |             const u32 room = payload_capacity(pool, write) - write->len;
+      |                       ^~~~
+      |                       kRoom
+  113 |             const u32 n = len < room ? len : room;
+      |                                 ~~~~         ~~~~
+      |                                 kRoom        kRoom
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:113:23: warning: invalid case style for constant 'n' [readability-identifier-naming]
+  113 |             const u32 n = len < room ? len : room;
+      |                       ^
+      |                       kN
+  114 |             __builtin_memcpy(payload(write) + write->len, src, n);
+      |                                                                ~
+      |                                                                kN
+  115 |             write->len += n;
+      |                           ~
+      |                           kN
+  116 |             if (write->dirty_end < write->len) write->dirty_end = write->len;
+  117 |             src += n;
+      |                    ~
+      |                    kN
+  118 |             len -= n;
+      |                    ~
+      |                    kN
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:129:23: warning: invalid case style for constant 'n' [readability-identifier-naming]
+  129 |             const u32 n = len < front_size() ? len : front_size();
+      |                       ^
+      |                       kN
+  130 |             head->offset += n;
+      |                             ~
+      |                             kN
+  131 |             size -= n;
+      |                     ~
+      |                     kN
+  132 |             len -= n;
+      |                    ~
+      |                    kN
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:189:20: warning: invalid case style for constant 'reuse' [readability-identifier-naming]
+  189 |         const bool reuse = size >= bulk_after && recycled != nullptr;
+      |                    ^~~~~
+      |                    kReuse
+  190 |         u32 previous_dirty = 0;
+  191 |         u8* raw = reuse                ? reinterpret_cast<u8*>(recycled)
+      |                   ~~~~~
+      |                   kReuse
+  192 |                   : size >= bulk_after ? pool.alloc_response_body_bulk(previous_dirty)
+  193 |                                        : nullptr;
+  194 |         if (!raw) raw = pool.alloc();
+  195 |         auto* node = reinterpret_cast<Node*>(raw);
+  196 |         if (!node) return false;
+  197 |         if (reuse)
+      |             ~~~~~
+      |             kReuse
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:237:19: warning: invalid case style for constant 'begin' [readability-identifier-naming]
+  237 |         const u64 begin = reinterpret_cast<u64>(payload(node));
+      |                   ^~~~~
+      |                   kBegin
+  238 |         const u64 address = reinterpret_cast<u64>(ptr);
+  239 |         const u32 capacity = payload_capacity(pool, node);
+  240 |         if (address < begin || address - begin > capacity ||
+      |                       ~~~~~              ~~~~~
+      |                       kBegin             kBegin
+  241 |             n > capacity - static_cast<u32>(address - begin))
+      |                                                       ~~~~~
+      |                                                       kBegin
+  242 |             return false;
+  243 |         const u32 end = static_cast<u32>(address - begin) + n;
+      |                                                    ~~~~~
+      |                                                    kBegin
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:238:19: warning: invalid case style for constant 'address' [readability-identifier-naming]
+  238 |         const u64 address = reinterpret_cast<u64>(ptr);
+      |                   ^~~~~~~
+      |                   kAddress
+  239 |         const u32 capacity = payload_capacity(pool, node);
+  240 |         if (address < begin || address - begin > capacity ||
+      |             ~~~~~~~            ~~~~~~~
+      |             kAddress           kAddress
+  241 |             n > capacity - static_cast<u32>(address - begin))
+      |                                             ~~~~~~~
+      |                                             kAddress
+  242 |             return false;
+  243 |         const u32 end = static_cast<u32>(address - begin) + n;
+      |                                          ~~~~~~~
+      |                                          kAddress
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:239:19: warning: invalid case style for constant 'capacity' [readability-identifier-naming]
+  239 |         const u32 capacity = payload_capacity(pool, node);
+      |                   ^~~~~~~~
+      |                   kCapacity
+  240 |         if (address < begin || address - begin > capacity ||
+      |                                                  ~~~~~~~~
+      |                                                  kCapacity
+  241 |             n > capacity - static_cast<u32>(address - begin))
+      |                 ~~~~~~~~
+      |                 kCapacity
+/tmp/rut-ws-pr-20261010/include/rut/runtime/response_body_chain.h:243:19: warning: invalid case style for constant 'end' [readability-identifier-naming]
+  243 |         const u32 end = static_cast<u32>(address - begin) + n;
+      |                   ^~~
+      |                   kEnd
+  244 |         if (end > tail_dirty_end) tail_dirty_end = end;
+      |             ~~~                                    ~~~
+      |             kEnd                                   kEnd
+  245 |         if (end > node->dirty_end) node->dirty_end = end;
+      |             ~~~                                      ~~~
+      |             kEnd                                     kEnd
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:43:19: warning: invalid case style for constant 'saved_errno' [readability-identifier-naming]
+   43 |         const int saved_errno = errno;
+      |                   ^~~~~~~~~~~
+      |                   kSavedErrno
+   44 |         errno = 0;
+   45 |         char* end = nullptr;
+   46 |         const long mib = ::strtol(value, &end, 10);
+   47 |         const bool valid = errno == 0 && end != value && *end == '\0' && (mib == 32 || mib == 64);
+   48 |         errno = saved_errno;
+      |                 ~~~~~~~~~~~
+      |                 kSavedErrno
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:46:20: warning: invalid case style for constant 'mib' [readability-identifier-naming]
+   46 |         const long mib = ::strtol(value, &end, 10);
+      |                    ^~~
+      |                    kMib
+   47 |         const bool valid = errno == 0 && end != value && *end == '\0' && (mib == 32 || mib == 64);
+      |                                                                           ~~~          ~~~
+      |                                                                           kMib         kMib
+   48 |         errno = saved_errno;
+   49 |         return valid ? static_cast<u32>(mib) * 4u : 64u;
+      |                                         ~~~
+      |                                         kMib
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:47:20: warning: invalid case style for constant 'valid' [readability-identifier-naming]
+   47 |         const bool valid = errno == 0 && end != value && *end == '\0' && (mib == 32 || mib == 64);
+      |                    ^~~~~
+      |                    kValid
+   48 |         errno = saved_errno;
+   49 |         return valid ? static_cast<u32>(mib) * 4u : 64u;
+      |                ~~~~~
+      |                kValid
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:100:19: warning: invalid case style for constant 'n' [readability-identifier-naming]
+  100 |         const u32 n =
+      |                   ^
+      |                   kN
+  101 |             connections > kMaxU32 / kBulkPerConnection ? kMaxU32 : connections * kBulkPerConnection;
+  102 |         return n > kMaxBulkSlices ? kMaxBulkSlices : n;
+      |                ~                                     ~
+      |                kN                                    kN
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:222:23: warning: invalid case style for constant 'words' [readability-identifier-naming]
+  222 |             const u32 words = (bulk_max_count + 63u) / 64u;
+      |                       ^~~~~
+      |                       kWords
+  223 |             bulk_in_use_size = static_cast<u64>(words) * sizeof(u64);
+      |                                                 ~~~~~
+      |                                                 kWords
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:249:13: warning: variable 'steps' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  249 |             u32 steps = (prealloc + kGrowStep - 1) / kGrowStep;
+      |             ^
+      |                 const
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:265:9: warning: variable 'idx' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  265 |         u32 idx = free_stack[--free_top];
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:318:9: warning: variable 'offset' of type 'u64' (aka 'unsigned long') can be declared 'const' [misc-const-correctness]
+  318 |         u64 offset = static_cast<u64>(ptr - base);
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:321:9: warning: variable 'idx' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  321 |         u32 idx = static_cast<u32>(offset / kSliceSize);
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:342:19: warning: invalid case style for constant 'boundary' [readability-identifier-naming]
+  342 |         const u32 boundary = free_top - cached_count;
+      |                   ^~~~~~~~
+      |                   kBoundary
+  343 |         if (cached_count != 0) free_stack[free_top] = free_stack[boundary];
+      |                                                                  ~~~~~~~~
+      |                                                                  kBoundary
+  344 |         free_stack[boundary] = idx;
+      |                    ~~~~~~~~
+      |                    kBoundary
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:357:19: warning: invalid case style for constant 'offset' [readability-identifier-naming]
+  357 |         const u64 offset = static_cast<u64>(ptr - base);
+      |                   ^~~~~~
+      |                   kOffset
+  358 |         if (offset % kSliceSize != 0) return false;
+      |             ~~~~~~
+      |             kOffset
+  359 |         return in_use_map[offset / kSliceSize];
+      |                           ~~~~~~
+      |                           kOffset
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:436:23: warning: invalid case style for constant 'position' [readability-identifier-naming]
+  436 |             const u32 position = bulk_free_top - bulk_cached_count;
+      |                       ^~~~~~~~
+      |                       kPosition
+  437 |             const u32 idx = bulk_free[position] & ~kDeferredBodyClear;
+      |                                       ~~~~~~~~
+      |                                       kPosition
+  438 |             u8* ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+  439 | #ifdef __linux__
+  440 |             if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0)
+  441 |                 clear_bulk_bytes(ptr, kBulkSliceSize);
+  442 | #else
+  443 |             clear_bulk_bytes(ptr, kBulkSliceSize);
+  444 | #endif
+  445 |             bulk_free[position] = idx;
+      |                       ~~~~~~~~
+      |                       kPosition
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:437:23: warning: invalid case style for constant 'idx' [readability-identifier-naming]
+  437 |             const u32 idx = bulk_free[position] & ~kDeferredBodyClear;
+      |                       ^~~
+      |                       kIdx
+  438 |             u8* ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+      |                                                    ~~~
+      |                                                    kIdx
+  439 | #ifdef __linux__
+  440 |             if (madvise(ptr, kBulkSliceSize, MADV_DONTNEED) != 0)
+  441 |                 clear_bulk_bytes(ptr, kBulkSliceSize);
+  442 | #else
+  443 |             clear_bulk_bytes(ptr, kBulkSliceSize);
+  444 | #endif
+  445 |             bulk_free[position] = idx;
+      |                                   ~~~
+      |                                   kIdx
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:467:19: warning: invalid case style for constant 'entry' [readability-identifier-naming]
+  467 |         const u32 entry = bulk_free[--bulk_free_top];
+      |                   ^~~~~
+      |                   kEntry
+  468 |         const u32 idx = entry & ~kDeferredBodyClear;
+      |                         ~~~~~
+      |                         kEntry
+  469 |         if (bulk_cached_count != 0) --bulk_cached_count;
+  470 |         bulk_in_use[idx >> 6] |= u64{1} << (idx & 63u);
+  471 |         ++study_bulk_borrowed;
+  472 |         if (study_bulk_borrowed > study_bulk_peak_borrowed)
+  473 |             study_bulk_peak_borrowed = study_bulk_borrowed;
+  474 |         if (study_adaptive_cache && study_bulk_borrowed >= 128) study_bulk_burst = true;
+  475 |         u8* const ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+  476 |         if ((entry & kDeferredBodyClear) != 0) {
+      |              ~~~~~
+      |              kEntry
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:468:19: warning: invalid case style for constant 'idx' [readability-identifier-naming]
+  468 |         const u32 idx = entry & ~kDeferredBodyClear;
+      |                   ^~~
+      |                   kIdx
+  469 |         if (bulk_cached_count != 0) --bulk_cached_count;
+  470 |         bulk_in_use[idx >> 6] |= u64{1} << (idx & 63u);
+      |                     ~~~                     ~~~
+      |                     kIdx                    kIdx
+  471 |         ++study_bulk_borrowed;
+  472 |         if (study_bulk_borrowed > study_bulk_peak_borrowed)
+  473 |             study_bulk_peak_borrowed = study_bulk_borrowed;
+  474 |         if (study_adaptive_cache && study_bulk_borrowed >= 128) study_bulk_burst = true;
+  475 |         u8* const ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+      |                                                      ~~~
+      |                                                      kIdx
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:475:19: warning: invalid case style for constant 'ptr' [readability-identifier-naming]
+  475 |         u8* const ptr = bulk_base + static_cast<u64>(idx) * kBulkSliceSize;
+      |                   ^~~
+      |                   kPtr
+  476 |         if ((entry & kDeferredBodyClear) != 0) {
+  477 |             u32 dirty = 0;
+  478 |             __builtin_memcpy(&dirty, ptr, sizeof(dirty));
+      |                                      ~~~
+      |                                      kPtr
+  479 |             // A malformed cache marker falls back to a full scrub.
+  480 |             if (dirty < sizeof(u32) || dirty > kBulkSliceSize) dirty = kBulkSliceSize;
+  481 |             if (previous_dirty)
+  482 |                 *previous_dirty = dirty;
+  483 |             else
+  484 |                 clear_bulk_bytes(ptr, dirty);
+      |                                  ~~~
+      |                                  kPtr
+  485 |         }
+  486 |         return ptr;
+      |                ~~~
+      |                kPtr
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:533:19: warning: invalid case style for constant 'offset' [readability-identifier-naming]
+  533 |         const u64 offset = static_cast<u64>(ptr - bulk_base);
+      |                   ^~~~~~
+      |                   kOffset
+  534 |         if (offset % kBulkSliceSize != 0) return;  // not buffer-aligned
+      |             ~~~~~~
+      |             kOffset
+  535 |         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
+      |                                          ~~~~~~
+      |                                          kOffset
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:535:19: warning: invalid case style for constant 'idx' [readability-identifier-naming]
+  535 |         const u32 idx = static_cast<u32>(offset / kBulkSliceSize);
+      |                   ^~~
+      |                   kIdx
+  536 |         if (idx >= bulk_max_count) return;
+      |             ~~~
+      |             kIdx
+  537 |         u64& word = bulk_in_use[idx >> 6];
+      |                                 ~~~
+      |                                 kIdx
+  538 |         const u64 bit = u64{1} << (idx & 63u);
+      |                                    ~~~
+      |                                    kIdx
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:538:19: warning: invalid case style for constant 'bit' [readability-identifier-naming]
+  538 |         const u64 bit = u64{1} << (idx & 63u);
+      |                   ^~~
+      |                   kBit
+  539 |         if ((word & bit) == 0) return;  // double-free detection
+      |                     ~~~
+      |                     kBit
+  540 |         word &= ~bit;
+      |                  ~~~
+      |                  kBit
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:543:19: warning: invalid case style for constant 'cache_limit_now' [readability-identifier-naming]
+  543 |         const u32 cache_limit_now =
+      |                   ^~~~~~~~~~~~~~~
+      |                   kCacheLimitNow
+  544 |             study_bulk_burst && study_bulk_cache_limit < 128 ? 128 : study_bulk_cache_limit;
+  545 |         if (bulk_cached_count < cache_limit_now) {
+      |                                 ~~~~~~~~~~~~~~~
+      |                                 kCacheLimitNow
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:572:19: warning: invalid case style for constant 'boundary' [readability-identifier-naming]
+  572 |         const u32 boundary = bulk_free_top - bulk_cached_count;
+      |                   ^~~~~~~~
+      |                   kBoundary
+  573 |         if (bulk_cached_count != 0) bulk_free[bulk_free_top] = bulk_free[boundary];
+      |                                                                          ~~~~~~~~
+      |                                                                          kBoundary
+  574 |         bulk_free[boundary] = idx;
+      |                   ~~~~~~~~
+      |                   kBoundary
+/tmp/rut-ws-pr-20261010/include/rut/runtime/slice_pool.h:588:9: warning: variable 'chunk_size' of type 'u64' (aka 'unsigned long') can be declared 'const' [misc-const-correctness]
+  588 |         u64 chunk_size = static_cast<u64>(step) * kSliceSize;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:79:19: warning: invalid case style for constant 'idx' [readability-identifier-naming]
+   79 |         const u32 idx = free_stack[--free_top];
+      |                   ^~~
+      |                   kIdx
+   80 |         conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true, now_sec};
+      |               ~~~
+      |               kIdx
+   81 |         link_idle(idx);
+      |                   ~~~
+      |                   kIdx
+   82 |         idle_count.fetch_add(1, std::memory_order_release);
+   83 |         if (parked_slot != nullptr) *parked_slot = idx;
+      |                                                    ~~~
+      |                                                    kIdx
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:106:23: warning: invalid case style for constant 'next' [readability-identifier-naming]
+  106 |             const u32 next = idle_next[i];
+      |                       ^~~~
+      |                       kNext
+  107 |             UpstreamConn& c = conns[i];
+  108 |             if (now_sec - c.parked_sec >= max_idle_sec) {
+  109 |                 close_idle_fd(c.fd);
+  110 |                 release_slot(i);
+  111 |             }
+  112 |             i = next;
+      |                 ~~~~
+      |                 kNext
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:107:13: warning: variable 'c' of type 'UpstreamConn &' can be declared 'const' [misc-const-correctness]
+  107 |             UpstreamConn& c = conns[i];
+      |             ^
+      |                          const
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:130:23: warning: invalid case style for constant 'next' [readability-identifier-naming]
+  130 |             const u32 next = idle_next[i];
+      |                       ^~~~
+      |                       kNext
+  131 |             const UpstreamConn& c = conns[i];
+  132 |             if (c.upstream_id != upstream_id || c.backend_idx != backend_idx) {
+  133 |                 i = next;
+      |                     ~~~~
+      |                     kNext
+  134 |                 continue;
+  135 |             }
+  136 |             const i32 fd = c.fd;
+  137 |             const bool probe_required = idle_reuse_probe_required == nullptr ||
+  138 |                                         idle_reuse_probe_required(idle_close_ctx, fd, i);
+  139 |             release_slot(i);
+  140 |             if (!probe_required) return fd;
+  141 |             char probe;
+  142 |             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+  143 |             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
+  144 |             close_idle_fd(fd);  // EOF / unexpected data / hard error → not reusable
+  145 |             i = next;
+      |                 ~~~~
+      |                 kNext
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:136:23: warning: invalid case style for constant 'fd' [readability-identifier-naming]
+  136 |             const i32 fd = c.fd;
+      |                       ^~
+      |                       kFd
+  137 |             const bool probe_required = idle_reuse_probe_required == nullptr ||
+  138 |                                         idle_reuse_probe_required(idle_close_ctx, fd, i);
+      |                                                                                   ~~
+      |                                                                                   kFd
+  139 |             release_slot(i);
+  140 |             if (!probe_required) return fd;
+      |                                         ~~
+      |                                         kFd
+  141 |             char probe;
+  142 |             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+      |                                      ~~
+      |                                      kFd
+  143 |             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
+      |                                                                            ~~
+      |                                                                            kFd
+  144 |             close_idle_fd(fd);  // EOF / unexpected data / hard error → not reusable
+      |                           ~~
+      |                           kFd
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:137:24: warning: invalid case style for constant 'probe_required' [readability-identifier-naming]
+  137 |             const bool probe_required = idle_reuse_probe_required == nullptr ||
+      |                        ^~~~~~~~~~~~~~
+      |                        kProbeRequired
+  138 |                                         idle_reuse_probe_required(idle_close_ctx, fd, i);
+  139 |             release_slot(i);
+  140 |             if (!probe_required) return fd;
+      |                  ~~~~~~~~~~~~~~
+      |                  kProbeRequired
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:142:27: warning: invalid case style for constant 'n' [readability-identifier-naming]
+  142 |             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+      |                           ^
+      |                           kN
+  143 |             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
+      |                 ~
+      |                 kN
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:205:19: warning: invalid case style for constant 'prev' [readability-identifier-naming]
+  205 |         const u32 prev = idle_prev[i];
+      |                   ^~~~
+      |                   kPrev
+  206 |         const u32 next = idle_next[i];
+  207 |         if (prev != kNoSlot)
+      |             ~~~~
+      |             kPrev
+  208 |             idle_next[prev] = next;
+      |                       ~~~~
+      |                       kPrev
+  209 |         else
+  210 |             idle_head = next;
+  211 |         if (next != kNoSlot) idle_prev[next] = prev;
+      |                                                ~~~~
+      |                                                kPrev
+/tmp/rut-ws-pr-20261010/include/rut/runtime/upstream_pool.h:206:19: warning: invalid case style for constant 'next' [readability-identifier-naming]
+  206 |         const u32 next = idle_next[i];
+      |                   ^~~~
+      |                   kNext
+  207 |         if (prev != kNoSlot)
+  208 |             idle_next[prev] = next;
+      |                               ~~~~
+      |                               kNext
+  209 |         else
+  210 |             idle_head = next;
+      |                         ~~~~
+      |                         kNext
+  211 |         if (next != kNoSlot) idle_prev[next] = prev;
+      |             ~~~~                       ~~~~
+      |             kNext                      kNext
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:41:1: warning: no header providing "rut::AlpnProtocol" is directly included [misc-include-cleaner]
+    8 | AlpnProtocol default_alpn_negotiated(SSL* ssl) {
+      | ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:42:12: warning: no header providing "rut::tls_negotiated_protocol" is directly included [misc-include-cleaner]
+   42 |     return tls_negotiated_protocol(ssl);
+      |            ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:61:5: warning: variable 'err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+   61 |     i32 err = get_tls_hooks()->ssl_get_error(ssl, rc);
+      |     ^
+      |         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:162:16: warning: invalid case style for constant 'recorded' [readability-identifier-naming]
+  162 |     const bool recorded = last != nullptr && last->fd == fd;
+      |                ^~~~~~~~
+      |                kRecorded
+  163 |     const i32 first = recorded ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+      |                       ~~~~~~~~
+      |                       kRecorded
+  164 |     i32 rc = epoll_ctl(epoll_fd, first, fd, &ev);
+  165 |     if (rc < 0 && errno == (recorded ? ENOENT : EEXIST)) {
+      |                             ~~~~~~~~
+      |                             kRecorded
+  166 |         rc = epoll_ctl(epoll_fd, recorded ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, fd, &ev);
+      |                                  ~~~~~~~~
+      |                                  kRecorded
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:163:15: warning: invalid case style for constant 'first' [readability-identifier-naming]
+  163 |     const i32 first = recorded ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+      |               ^~~~~
+      |               kFirst
+  164 |     i32 rc = epoll_ctl(epoll_fd, first, fd, &ev);
+      |                                  ~~~~~
+      |                                  kFirst
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:169:19: warning: invalid case style for constant 'err' [readability-identifier-naming]
+  169 |         const i32 err = errno;
+      |                   ^~~
+      |                   kErr
+  170 |         if (last != nullptr) EpollBackend::reset_fd_interest(*last);
+  171 |         errno = err;
+      |                 ~~~
+      |                 kErr
+  172 |         return -err;
+      |                 ~~~
+      |                 kErr
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:176:23: warning: invalid case style for constant 'slot' [readability-identifier-naming]
+  176 |             const u32 slot = EpollBackend::fd_interest_slot(conn_id, type);
+      |                       ^~~~
+      |                       kSlot
+  177 |             backend->clear_edge(slot);
+      |                                 ~~~~
+      |                                 kSlot
+  178 |             if (backend->study_edge_trigger && last->fd != fd) {
+  179 |                 backend->edge_runnable[slot].read_ready = false;
+      |                                        ~~~~
+      |                                        kSlot
+  180 |                 backend->edge_runnable[slot].read_eof = false;
+      |                                        ~~~~
+      |                                        kSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:220:19: warning: invalid case style for constant 'slot' [readability-identifier-naming]
+  220 |         const u32 slot = edge_queue[edge_head];
+      |                   ^~~~
+      |                   kSlot
+  221 |         if (++edge_head == connection_capacity * 2) edge_head = 0;
+  222 |         --edge_count;
+  223 |         auto& runnable = edge_runnable[slot];
+      |                                        ~~~~
+      |                                        kSlot
+  224 |         const auto& interest = fd_interest[slot];
+      |                                            ~~~~
+      |                                            kSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:225:19: warning: invalid case style for constant 'mask' [readability-identifier-naming]
+  225 |         const u32 mask = interest.events | ((interest.events & EPOLLIN) ? EPOLLRDHUP : 0u);
+      |                   ^~~~
+      |                   kMask
+  226 |         const u32 events = (runnable.events & mask) | (runnable.events & (EPOLLHUP | EPOLLERR));
+      |                                               ~~~~
+      |                                               kMask
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:226:19: warning: invalid case style for constant 'events' [readability-identifier-naming]
+  226 |         const u32 events = (runnable.events & mask) | (runnable.events & (EPOLLHUP | EPOLLERR));
+      |                   ^~~~~~
+      |                   kEvents
+  227 |         const bool read_submitted = runnable.read_submitted;
+  228 |         const bool read_ready = runnable.read_ready;
+  229 |         const bool read_eof = runnable.read_eof;
+  230 |         runnable = {};
+  231 |         runnable.read_submitted = read_submitted;
+  232 |         runnable.read_ready = read_ready;
+  233 |         runnable.read_eof = read_eof;
+  234 |         if (interest.fd < 0 || events == 0) continue;
+      |                                ~~~~~~
+      |                                kEvents
+  235 |         event = {};
+  236 |         event.events = events | ((read_eof && (events & EPOLLIN)) ? EPOLLRDHUP : 0u);
+      |                        ~~~~~~                  ~~~~~~
+      |                        kEvents                 kEvents
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:227:20: warning: invalid case style for constant 'read_submitted' [readability-identifier-naming]
+  227 |         const bool read_submitted = runnable.read_submitted;
+      |                    ^~~~~~~~~~~~~~
+      |                    kReadSubmitted
+  228 |         const bool read_ready = runnable.read_ready;
+  229 |         const bool read_eof = runnable.read_eof;
+  230 |         runnable = {};
+  231 |         runnable.read_submitted = read_submitted;
+      |                                   ~~~~~~~~~~~~~~
+      |                                   kReadSubmitted
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:228:20: warning: invalid case style for constant 'read_ready' [readability-identifier-naming]
+  228 |         const bool read_ready = runnable.read_ready;
+      |                    ^~~~~~~~~~
+      |                    kReadReady
+  229 |         const bool read_eof = runnable.read_eof;
+  230 |         runnable = {};
+  231 |         runnable.read_submitted = read_submitted;
+  232 |         runnable.read_ready = read_ready;
+      |                               ~~~~~~~~~~
+      |                               kReadReady
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:229:20: warning: invalid case style for constant 'read_eof' [readability-identifier-naming]
+  229 |         const bool read_eof = runnable.read_eof;
+      |                    ^~~~~~~~
+      |                    kReadEof
+  230 |         runnable = {};
+  231 |         runnable.read_submitted = read_submitted;
+  232 |         runnable.read_ready = read_ready;
+  233 |         runnable.read_eof = read_eof;
+      |                             ~~~~~~~~
+      |                             kReadEof
+  234 |         if (interest.fd < 0 || events == 0) continue;
+  235 |         event = {};
+  236 |         event.events = events | ((read_eof && (events & EPOLLIN)) ? EPOLLRDHUP : 0u);
+      |                                   ~~~~~~~~
+      |                                   kReadEof
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:303:15: warning: invalid case style for constant 'previous_version' [readability-identifier-naming]
+  303 |     const u32 previous_version = transport.version;
+      |               ^~~~~~~~~~~~~~~~
+      |               kPreviousVersion
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:312:19: warning: invalid case style for constant 'slot' [readability-identifier-naming]
+  312 |         const u32 slot = fd_interest_slot(conn_id, IoEventType::UpstreamRecv);
+      |                   ^~~~
+      |                   kSlot
+  313 |         clear_edge(slot);
+      |                    ~~~~
+      |                    kSlot
+  314 |         auto& runnable = edge_runnable[slot];
+      |                                        ~~~~
+      |                                        kSlot
+  315 |         runnable.read_submitted = runnable.read_ready = runnable.read_eof = false;
+  316 |         // An idle event harvested before the claim is not re-delivered by ET.
+  317 |         // Carry its readiness into the new owner, but do not read before that
+  318 |         // owner explicitly submits receive after sending its request.
+  319 |         for (u32 i = ready_head; i < ready_count; ++i)
+  320 |             if (ready_slot[i] == (kStableReadySlotBit | static_cast<u32>(fd)) &&
+  321 |                 ready_gen[i] == previous_version) {
+  322 |                 runnable.read_ready = true;
+  323 |                 runnable.read_eof |= (ready[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
+  324 |             }
+  325 |         auto& interest = fd_interest[slot];
+      |                                      ~~~~
+      |                                      kSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:340:27: warning: invalid case style for constant 'result' [readability-identifier-naming]
+  340 |             const ssize_t result = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+      |                           ^~~~~~
+      |                           kResult
+  341 |             transport.idle_probe_pending = false;
+  342 |             if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+      |                 ~~~~~~
+      |                 kResult
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:368:19: warning: invalid case style for constant 'token' [readability-identifier-naming]
+  368 |         const u64 token = stable_upstream_token(fd, transport.generation);
+      |                   ^~~~~
+      |                   kToken
+  369 |         const bool mode_changed = transport.relay_read != relay_read;
+  370 |         const bool same_interest = interest.fd == fd && interest.events == EPOLLIN &&
+  371 |                                    interest.data == token && !mode_changed;
+      |                                                     ~~~~~
+      |                                                     kToken
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:369:20: warning: invalid case style for constant 'mode_changed' [readability-identifier-naming]
+  369 |         const bool mode_changed = transport.relay_read != relay_read;
+      |                    ^~~~~~~~~~~~
+      |                    kModeChanged
+  370 |         const bool same_interest = interest.fd == fd && interest.events == EPOLLIN &&
+  371 |                                    interest.data == token && !mode_changed;
+      |                                                               ~~~~~~~~~~~~
+      |                                                               kModeChanged
+  372 |         if (study_edge_trigger && mode_changed) {
+      |                                   ~~~~~~~~~~~~
+      |                                   kModeChanged
+  373 |             auto& runnable = edge_runnable[fd_interest_slot(conn_id, kType)];
+  374 |             for (u32 i = ready_head; i < ready_count; ++i)
+  375 |                 if (ready_slot[i] == (kStableReadySlotBit | static_cast<u32>(fd)) &&
+  376 |                     ready_gen[i] == transport.version) {
+  377 |                     runnable.read_ready = true;
+  378 |                     runnable.read_eof |=
+  379 |                         (ready[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
+  380 |                 }
+  381 |         }
+  382 |         // Mode changes retire any harvested record for the previous consumer.
+  383 |         if (mode_changed) ++transport.version;
+      |             ~~~~~~~~~~~~
+      |             kModeChanged
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:370:20: warning: invalid case style for constant 'same_interest' [readability-identifier-naming]
+  370 |         const bool same_interest = interest.fd == fd && interest.events == EPOLLIN &&
+      |                    ^~~~~~~~~~~~~
+      |                    kSameInterest
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:389:23: warning: invalid case style for constant 'slot' [readability-identifier-naming]
+  389 |             const u32 slot = fd_interest_slot(conn_id, kType);
+      |                       ^~~~
+      |                       kSlot
+  390 |             clear_edge(slot);
+      |                        ~~~~
+      |                        kSlot
+  391 |             if (edge_runnable[slot].read_ready) queue_edge(slot, EPOLLIN);
+      |                               ~~~~                         ~~~~
+      |                               kSlot                        kSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:418:19: warning: invalid case style for constant 'slot' [readability-identifier-naming]
+  418 |         const u32 slot = fd_interest_slot(conn_id, kType);
+      |                   ^~~~
+      |                   kSlot
+  419 |         clear_edge(slot);
+      |                    ~~~~
+      |                    kSlot
+  420 |         edge_runnable[slot].read_ready = edge_runnable[slot].read_eof = false;
+      |                       ~~~~                             ~~~~
+      |                       kSlot                            kSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:438:9: warning: variable 'fd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  438 |         i32 fd = upstream_fd_map[conn_id];
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:452:5: warning: variable 'fd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  452 |     i32 fd = downstream_fd_map[conn_id];
+      |     ^
+      |         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:482:10: warning: no header providing "rut::validate_connection_capacity" is directly included [misc-include-cleaner]
+    6 |     if (!validate_connection_capacity(capacity))
+      |          ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:572:9: warning: variable 'err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  572 |         i32 err = errno;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:577:31: warning: no header providing "CLOCK_MONOTONIC" is directly included [misc-include-cleaner]
+   10 |     timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+      |                               ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:579:9: warning: variable 'err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  579 |         i32 err = errno;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:584:12: warning: no header providing "itimerspec" is directly included [misc-include-cleaner]
+   10 |     struct itimerspec ts;
+      |            ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:594:9: warning: variable 'err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  594 |         i32 err = errno;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:605:9: warning: variable 'err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  605 |         i32 err = errno;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:613:9: warning: variable 'err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  613 |         i32 err = errno;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:647:15: warning: invalid case style for constant 'accept_limit' [readability-identifier-naming]
+  647 |     const u32 accept_limit = study_accept_batch_limit == 0 ? 1 : study_accept_batch_limit;
+      |               ^~~~~~~~~~~~
+      |               kAcceptLimit
+  648 |     for (u32 accepted = 0; accepted < accept_limit && out < max_events; ++accepted) {
+      |                                       ~~~~~~~~~~~~
+      |                                       kAcceptLimit
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:651:9: warning: variable 'fd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  651 |         i32 fd = accept4(listen_fd,
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:660:80: warning: no header providing "EHOSTDOWN" is directly included [misc-include-cleaner]
+   10 |                          errno == ENETDOWN || errno == ENOPROTOOPT || errno == EHOSTDOWN ||
+      |                                                                                ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:661:35: warning: no header providing "ENONET" is directly included [misc-include-cleaner]
+  661 |                          errno == ENONET || errno == EHOSTUNREACH || errno == EOPNOTSUPP ||
+      |                                   ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:717:15: warning: invalid case style for constant 'slot' [readability-identifier-naming]
+  717 |     const u32 slot = fd_interest_slot(conn_id, type);
+      |               ^~~~
+      |               kSlot
+  718 |     const u32 generation = fd_interest[slot].gen;
+      |                                        ~~~~
+      |                                        kSlot
+  719 |     if (set_fd_interest(
+  720 |             fd_interest.data(), connection_capacity, epoll_fd, fd, conn_id, type, events, 0, this) <
+  721 |         0)
+  722 |         return false;
+  723 |     if (study_edge_trigger) edge_runnable[slot].read_submitted = true;
+      |                                           ~~~~
+      |                                           kSlot
+  724 |     if (study_edge_trigger && fd_interest[slot].gen == generation && edge_runnable[slot].read_ready)
+      |                                           ~~~~                                     ~~~~
+      |                                           kSlot                                    kSlot
+  725 |         queue_edge(slot, EPOLLIN);
+      |                    ~~~~
+      |                    kSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:718:15: warning: invalid case style for constant 'generation' [readability-identifier-naming]
+  718 |     const u32 generation = fd_interest[slot].gen;
+      |               ^~~~~~~~~~
+      |               kGeneration
+  719 |     if (set_fd_interest(
+  720 |             fd_interest.data(), connection_capacity, epoll_fd, fd, conn_id, type, events, 0, this) <
+  721 |         0)
+  722 |         return false;
+  723 |     if (study_edge_trigger) edge_runnable[slot].read_submitted = true;
+  724 |     if (study_edge_trigger && fd_interest[slot].gen == generation && edge_runnable[slot].read_ready)
+      |                                                        ~~~~~~~~~~
+      |                                                        kGeneration
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:734:15: warning: invalid case style for constant 'expected' [readability-identifier-naming]
+  734 |     const i32 expected =
+      |               ^~~~~~~~
+      |               kExpected
+  735 |         type == IoEventType::RelayRead ? upstream_fd_map[conn_id] : downstream_fd_map[conn_id];
+  736 |     if (fd < 0 || fd != expected) return false;
+      |                         ~~~~~~~~
+      |                         kExpected
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:751:5: warning: variable 'fd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  751 |     i32 fd = upstream ? upstream_fd_map[conn_id] : downstream_fd_map[conn_id];
+      |     ^
+      |         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:761:9: warning: variable 'type' of type 'IoEventType' can be declared 'const' [misc-const-correctness]
+  761 |         IoEventType type = upstream ? IoEventType::UpstreamRecv : ss.type;
+      |         ^
+      |                     const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:762:9: warning: variable 'events' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+  762 |         u32 events = (ss.tls && ss.tls_wait_events == EPOLLIN) ? EPOLLIN : EPOLLOUT;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:802:57: warning: no header providing "rut::Connection" is directly included [misc-include-cleaner]
+    6 | bool EpollBackend::retire_upstream_episode_after_detach(Connection& conn, u32 expected_episode) {
+      |                                                         ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:803:15: warning: invalid case style for constant 'conn_id' [readability-identifier-naming]
+  803 |     const u32 conn_id = conn.id;
+      |               ^~~~~~~
+      |               kConnId
+  804 |     if (conn_id >= connection_capacity || !valid_upstream_episode(expected_episode)) return false;
+      |         ~~~~~~~
+      |         kConnId
+  805 |     if (active_upstream_episode[conn_id] != expected_episode ||
+      |                                 ~~~~~~~
+      |                                 kConnId
+  806 |         conn.upstream_episode != expected_episode)
+  807 |         return false;
+  808 |     if (upstream_fd_map[conn_id] != -1 ||
+      |                         ~~~~~~~
+      |                         kConnId
+  809 |         !upstream_send_state_detached(upstream_send_state[conn_id]))
+      |                                                           ~~~~~~~
+      |                                                           kConnId
+  810 |         return false;
+  811 |
+  812 |     // The max token cannot wrap safely: an old kernel readiness record or a
+  813 |     // future synthetic completion is not necessarily visible in this queue.
+  814 |     // Preserve the connection token and quarantine ownership instead.
+  815 |     if (expected_episode == kIoUserDataMaxUpstreamEpisode) {
+  816 |         active_upstream_episode[conn_id] = kUpstreamEpisodeExhausted;
+      |                                 ~~~~~~~
+      |                                 kConnId
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:833:15: warning: invalid case style for constant 'expected_episode' [readability-identifier-naming]
+  833 |     const u32 expected_episode = conn.upstream_episode;
+      |               ^~~~~~~~~~~~~~~~
+      |               kExpectedEpisode
+  834 |     const i32 fd = conn.upstream_fd;
+  835 |     if (detached_fd != nullptr) *detached_fd = -1;
+  836 |
+  837 |     // Legacy owners DEL while the descriptor is still valid. Stable owners
+  838 |     // can retain the socket watch, publishing an idle owner before retirement.
+  839 |     // The remaining operations are
+  840 |     // deliberately unconditional so a registration failure also gets a
+  841 |     // complete map/send-state detach before retirement is attempted. ENOENT
+  842 |     // means the descriptor was already absent, which is a safe detach state;
+  843 |     // every other error must fail closed because the registration may remain.
+  844 |     bool del_ok = true;
+  845 |     StableUpstream* retained = nullptr;
+  846 |     if (detached_fd != nullptr && stable_pool != nullptr && stable_upstream.data() != nullptr &&
+  847 |         fd >= 0 && static_cast<u32>(fd) < kStableFdCapacity && conn.id < connection_capacity &&
+  848 |         active_upstream_episode[conn.id] == expected_episode &&
+      |                                             ~~~~~~~~~~~~~~~~
+      |                                             kExpectedEpisode
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:834:15: warning: invalid case style for constant 'fd' [readability-identifier-naming]
+  834 |     const i32 fd = conn.upstream_fd;
+      |               ^~
+      |               kFd
+  835 |     if (detached_fd != nullptr) *detached_fd = -1;
+  836 |
+  837 |     // Legacy owners DEL while the descriptor is still valid. Stable owners
+  838 |     // can retain the socket watch, publishing an idle owner before retirement.
+  839 |     // The remaining operations are
+  840 |     // deliberately unconditional so a registration failure also gets a
+  841 |     // complete map/send-state detach before retirement is attempted. ENOENT
+  842 |     // means the descriptor was already absent, which is a safe detach state;
+  843 |     // every other error must fail closed because the registration may remain.
+  844 |     bool del_ok = true;
+  845 |     StableUpstream* retained = nullptr;
+  846 |     if (detached_fd != nullptr && stable_pool != nullptr && stable_upstream.data() != nullptr &&
+  847 |         fd >= 0 && static_cast<u32>(fd) < kStableFdCapacity && conn.id < connection_capacity &&
+      |         ~~                          ~~
+      |         kFd                         kFd
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:869:27: warning: invalid case style for constant 'slot' [readability-identifier-naming]
+  869 |                 const u32 slot = 2 * conn.id + side;
+      |                           ^~~~
+      |                           kSlot
+  870 |                 clear_edge(slot);
+      |                            ~~~~
+      |                            kSlot
+  871 |                 if (study_edge_trigger) {
+  872 |                     auto& runnable = edge_runnable[slot];
+      |                                                    ~~~~
+      |                                                    kSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:922:16: warning: invalid case style for constant 'retired' [readability-identifier-naming]
+  922 |     const bool retired =
+      |                ^~~~~~~
+      |                kRetired
+  923 |         !close_failed && retire_upstream_episode_after_detach(conn, expected_episode);
+  924 |     const bool reusable = del_ok && retired;
+      |                                     ~~~~~~~
+      |                                     kRetired
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:924:16: warning: invalid case style for constant 'reusable' [readability-identifier-naming]
+  924 |     const bool reusable = del_ok && retired;
+      |                ^~~~~~~~
+      |                kReusable
+  925 |     if (reusable && detached_fd != nullptr && fd >= 0) {
+      |         ~~~~~~~~
+      |         kReusable
+  926 |         *detached_fd = fd;
+  927 |     } else if (fd >= 0 && !fd_closed) {
+  928 |         if (retained != nullptr) {
+  929 |             (void)epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+  930 |             invalidate_stable_upstream(fd);
+  931 |         }
+  932 |         ::close(fd);
+  933 |     }
+  934 |     return reusable;
+      |            ~~~~~~~~
+      |            kReusable
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:939:15: warning: invalid case style for constant 'owner' [readability-identifier-naming]
+  939 |     const u32 owner = active_upstream_episode[conn_id];
+      |               ^~~~~
+      |               kOwner
+  940 |     if (owner != 0 && owner != kUpstreamEpisodeExhausted)
+      |         ~~~~~         ~~~~~
+      |         kOwner        kOwner
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:946:5: warning: variable 'fd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  946 |     i32 fd = downstream_fd_map[conn_id];
+      |     ^
+      |         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:978:5: warning: variable 'fd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+  978 |     i32 fd = upstream_fd_map[conn_id];
+      |     ^
+      |         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:987:5: warning: variable 'type' of type 'IoEventType' can be declared 'const' [misc-const-correctness]
+  987 |     IoEventType type = IoEventType::UpstreamRecv;
+      |     ^
+      |                 const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1015:5: warning: variable 'nw' of type 'ssize_t' (aka 'long') can be declared 'const' [misc-const-correctness]
+ 1015 |     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL);
+      |     ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1037:5: warning: variable 'sent' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+ 1037 |     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
+      |     ^
+      |         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1061:19: warning: invalid case style for constant 'registration_error' [readability-identifier-naming]
+ 1061 |         const i32 registration_error = -errno;
+      |                   ^~~~~~~~~~~~~~~~~~
+      |                   kRegistrationError
+ 1062 |         if (conn_id < connection_capacity) {
+ 1063 |             upstream_send_state[conn_id] = {
+ 1064 |                 nullptr, -1, 0, 0, IoEventType::UpstreamSend, false, 0, 0};
+ 1065 |         }
+ 1066 |         if (!queue_pending_completion(pending_completions,
+ 1067 |                                       pending_count,
+ 1068 |                                       conn_id,
+ 1069 |                                       IoEventType::UpstreamSend,
+ 1070 |                                       registration_error,
+      |                                       ~~~~~~~~~~~~~~~~~~
+      |                                       kRegistrationError
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1092:5: warning: variable 'type' of type 'IoEventType' can be declared 'const' [misc-const-correctness]
+ 1092 |     IoEventType type = IoEventType::UpstreamRecv;
+      |     ^
+      |                 const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1104:15: warning: invalid case style for constant 'slot' [readability-identifier-naming]
+ 1104 |     const u32 slot = fd_interest_slot(conn_id, type);
+      |               ^~~~
+      |               kSlot
+ 1105 |     const u32 generation = fd_interest[slot].gen;
+      |                                        ~~~~
+      |                                        kSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1105:15: warning: invalid case style for constant 'generation' [readability-identifier-naming]
+ 1105 |     const u32 generation = fd_interest[slot].gen;
+      |               ^~~~~~~~~~
+      |               kGeneration
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1115:19: warning: invalid case style for constant 'err' [readability-identifier-naming]
+ 1115 |         const i32 err = errno;
+      |                   ^~~
+      |                   kErr
+ 1116 |         if (conn_id < connection_capacity) upstream_fd_map[conn_id] = -1;
+ 1117 |         return queue_pending_completion(pending_completions,
+ 1118 |                                         pending_count,
+ 1119 |                                         conn_id,
+ 1120 |                                         IoEventType::UpstreamRecv,
+ 1121 |                                         -err,
+      |                                          ~~~
+      |                                          kErr
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1138:15: warning: invalid case style for constant 'extra_flags' [readability-identifier-naming]
+ 1138 |     const u32 extra_flags = more_follows ? static_cast<u32>(MSG_MORE) : 0u;
+      |               ^~~~~~~~~~~
+      |               kExtraFlags
+ 1139 |     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL | extra_flags);
+      |                                                    ~~~~~~~~~~~
+      |                                                    kExtraFlags
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1139:5: warning: variable 'nw' of type 'ssize_t' (aka 'long') can be declared 'const' [misc-const-correctness]
+ 1139 |     ssize_t nw = send(fd, buf, len, MSG_NOSIGNAL | extra_flags);
+      |     ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1151:5: warning: variable 'sent' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+ 1151 |     u32 sent = (nw > 0) ? static_cast<u32>(nw) : 0;
+      |     ^
+      |         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1175:9: warning: variable 'err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1175 |         i32 err = errno;
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1200:9: warning: variable 'nw' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1200 |         i32 nw = tls_hooks->ssl_write(ssl, buf + sent, static_cast<i32>(len - sent));
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1206:9: warning: variable 'ssl_err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1206 |         i32 ssl_err = tls_hooks->ssl_get_error(ssl, nw);
+      |         ^
+      |             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1216:13: warning: variable 'rc' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1216 |             i32 rc = set_fd_interest(fd_interest.data(),
+      |             ^
+      |                 const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1255:5: warning: variable 'rc' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1255 |     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
+      |     ^
+      |         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1255:14: warning: The 1st argument to 'connect' is < 0 but should be >= 0 [clang-analyzer-unix.StdCLibraryFunctions]
+ 1255 |     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
+      |              ^       ~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1244:9: note: Assuming 'conn_id' is < field 'connection_capacity'
+ 1244 |     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1244:9: note: Left side of '||' is false
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1244:5: note: Taking false branch
+ 1244 |     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
+      |     ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1248:9: note: Assuming 'kPendingCap' is > field 'pending_count'
+ 1248 |     if (pending_count >= kPendingCap) return false;
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1248:5: note: Taking false branch
+ 1248 |     if (pending_count >= kPendingCap) return false;
+      |     ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1250:5: note: Calling 'EpollBackend::invalidate_stable_upstream'
+ 1250 |     invalidate_stable_upstream(fd);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:282:9: note: Assuming the condition is false
+  282 |     if (stable_upstream.data() == nullptr || fd < 0 || static_cast<u32>(fd) >= kStableFdCapacity)
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:282:9: note: Left side of '||' is false
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:282:46: note: Assuming 'fd' is < 0
+  282 |     if (stable_upstream.data() == nullptr || fd < 0 || static_cast<u32>(fd) >= kStableFdCapacity)
+      |                                              ^~~~~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:282:53: note: Left side of '||' is true
+  282 |     if (stable_upstream.data() == nullptr || fd < 0 || static_cast<u32>(fd) >= kStableFdCapacity)
+      |                                                     ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1250:5: note: Returning from 'EpollBackend::invalidate_stable_upstream'
+ 1250 |     invalidate_stable_upstream(fd);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1252:9: note: Assuming 'conn_id' is >= field 'connection_capacity'
+ 1252 |     if (conn_id < connection_capacity) upstream_fd_map[conn_id] = fd;
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1252:5: note: Taking false branch
+ 1252 |     if (conn_id < connection_capacity) upstream_fd_map[conn_id] = fd;
+      |     ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1255:14: note: The 1st argument to 'connect' is < 0 but should be >= 0
+ 1255 |     i32 rc = connect(fd, static_cast<const struct sockaddr*>(addr), addr_len);
+      |              ^       ~~
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1339:13: warning: variable 'candidate' of type 'IoEvent' can be declared 'const' [misc-const-correctness]
+ 1339 |             IoEvent candidate = pending_completions[--pending_count];
+      |             ^
+      |                     const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1378:24: warning: invalid case style for constant 'runnable_accept' [readability-identifier-naming]
+ 1378 |             const bool runnable_accept =
+      |                        ^~~~~~~~~~~~~~~
+      |                        kRunnableAccept
+ 1379 |                 study_accept_edge_trigger && accept_pending && !accept_retry_on_timer;
+ 1380 |             const bool probe_pending = pending_count > 0 || runnable_accept || edge_count > 0;
+      |                                                             ~~~~~~~~~~~~~~~
+      |                                                             kRunnableAccept
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1380:24: warning: invalid case style for constant 'probe_pending' [readability-identifier-naming]
+ 1380 |             const bool probe_pending = pending_count > 0 || runnable_accept || edge_count > 0;
+      |                        ^~~~~~~~~~~~~
+      |                        kProbePending
+ 1381 |             i32 harvested;
+ 1382 |             for (;;) {
+ 1383 |                 harvested = epoll_wait(epoll_fd, ready, kReadyBatch, probe_pending ? 0 : -1);
+      |                                                                      ~~~~~~~~~~~~~
+      |                                                                      kProbePending
+ 1384 |                 if (harvested >= 0) break;
+ 1385 |                 if (errno == EINTR && !probe_pending) continue;
+      |                                        ~~~~~~~~~~~~~
+      |                                        kProbePending
+ 1386 |                 if (probe_pending) {
+      |                     ~~~~~~~~~~~~~
+      |                     kProbePending
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1440:30: warning: invalid case style for constant 'ep_events' [readability-identifier-naming]
+ 1440 |     const struct epoll_event ep_events[1] = {from_edge ? runnable_event : ready[r]};
+      |                              ^~~~~~~~~
+      |                              kEpEvents
+ 1441 |     const i32 n = 1;
+ 1442 |
+ 1443 |     u32 out = 0;
+ 1444 |
+ 1445 |     for (i32 i = 0; i < n && out < max_events; i++) {
+ 1446 |         u32 conn_id;
+ 1447 |         IoEventType type;
+ 1448 |         u32 upstream_episode = 0;
+ 1449 |         bool stable_recv_disabled = false;
+ 1450 |         if (static_cast<u8>(ep_events[i].data.u64) == kStableUpstreamTag) {
+      |                             ~~~~~~~~~
+      |                             kEpEvents
+ 1451 |             const u32 kFd = static_cast<u32>((ep_events[i].data.u64 >> 8) & kIoUserDataMaxConnId);
+      |                                               ~~~~~~~~~
+      |                                               kEpEvents
+ 1452 |             const u32 kGeneration = static_cast<u32>(ep_events[i].data.u64 >> 32);
+      |                                                      ~~~~~~~~~
+      |                                                      kEpEvents
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1441:15: warning: invalid case style for constant 'n' [readability-identifier-naming]
+ 1441 |     const i32 n = 1;
+      |               ^
+      |               kN
+ 1442 |
+ 1443 |     u32 out = 0;
+ 1444 |
+ 1445 |     for (i32 i = 0; i < n && out < max_events; i++) {
+      |                         ~
+      |                         kN
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1497:24: warning: invalid case style for constant 'owner' [readability-identifier-naming]
+ 1497 |             const bool owner = relay.active() && relay.upstream_episode == upstream_episode &&
+      |                        ^~~~~
+      |                        kOwner
+ 1498 |                                relay.source_fd == conns[conn_id].upstream_fd &&
+ 1499 |                                relay.destination_fd == conns[conn_id].fd;
+ 1500 |             const bool client_closed = type == IoEventType::RelayWrite &&
+ 1501 |                                        (ep_events[i].events & (EPOLLHUP | EPOLLERR)) != 0;
+ 1502 |             const bool runnable = (type == IoEventType::RelayRead &&
+ 1503 |                                    relay.phase == RelayPhase::Reading && relay.read_armed) ||
+ 1504 |                                   (type == IoEventType::RelayWrite &&
+ 1505 |                                    relay.phase == RelayPhase::Writing && relay.write_armed);
+ 1506 |             if (!owner || (!client_closed && !runnable)) continue;
+      |                  ~~~~~
+      |                  kOwner
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1500:24: warning: invalid case style for constant 'client_closed' [readability-identifier-naming]
+ 1500 |             const bool client_closed = type == IoEventType::RelayWrite &&
+      |                        ^~~~~~~~~~~~~
+      |                        kClientClosed
+ 1501 |                                        (ep_events[i].events & (EPOLLHUP | EPOLLERR)) != 0;
+ 1502 |             const bool runnable = (type == IoEventType::RelayRead &&
+ 1503 |                                    relay.phase == RelayPhase::Reading && relay.read_armed) ||
+ 1504 |                                   (type == IoEventType::RelayWrite &&
+ 1505 |                                    relay.phase == RelayPhase::Writing && relay.write_armed);
+ 1506 |             if (!owner || (!client_closed && !runnable)) continue;
+      |                             ~~~~~~~~~~~~~
+      |                             kClientClosed
+ 1507 |             events[out] = {};
+ 1508 |             events[out].conn_id = conn_id;
+ 1509 |             events[out].type = type;
+ 1510 |             events[out].upstream_episode = upstream_episode;
+ 1511 |             events[out].result =
+ 1512 |                 client_closed ? -ECONNRESET : static_cast<i32>(ep_events[i].events);
+      |                 ~~~~~~~~~~~~~
+      |                 kClientClosed
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1502:24: warning: invalid case style for constant 'runnable' [readability-identifier-naming]
+ 1502 |             const bool runnable = (type == IoEventType::RelayRead &&
+      |                        ^~~~~~~~
+      |                        kRunnable
+ 1503 |                                    relay.phase == RelayPhase::Reading && relay.read_armed) ||
+ 1504 |                                   (type == IoEventType::RelayWrite &&
+ 1505 |                                    relay.phase == RelayPhase::Writing && relay.write_armed);
+ 1506 |             if (!owner || (!client_closed && !runnable)) continue;
+      |                                               ~~~~~~~~
+      |                                               kRunnable
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1503:51: warning: no header providing "rut::RelayPhase" is directly included [misc-include-cleaner]
+    6 |                                    relay.phase == RelayPhase::Reading && relay.read_armed) ||
+      |                                                   ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1523:9: warning: variable 'has_read' of type 'bool' can be declared 'const' [misc-const-correctness]
+ 1523 |         bool has_read = (ep_events[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR | EPOLLRDHUP)) != 0;
+      |         ^
+      |              const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1524:9: warning: variable 'has_write' of type 'bool' can be declared 'const' [misc-const-correctness]
+ 1524 |         bool has_write = (ep_events[i].events & EPOLLOUT) != 0;
+      |         ^
+      |              const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1556:13: warning: variable 'fd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1556 |             i32 fd = (type == IoEventType::HandlerTimer) ? yield_timer_fd : timer_fd;
+      |             ^
+      |                 const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1558:13: warning: variable 'rr' of type 'ssize_t' (aka 'long') can be declared 'const' [misc-const-correctness]
+ 1558 |             ssize_t rr = read(fd, &ticks, sizeof(ticks));
+      |             ^
+      |                     const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1576:13: warning: variable 'cfd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1576 |             i32 cfd = (conn_id < connection_capacity) ? upstream_fd_map[conn_id] : -1;
+      |             ^
+      |                 const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1577:43: warning: no header providing "SOL_SOCKET" is directly included [misc-include-cleaner]
+   10 |             if (cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+      |                                           ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1577:55: warning: no header providing "SO_ERROR" is directly included [misc-include-cleaner]
+ 1577 |             if (cfd >= 0) getsockopt(cfd, SOL_SOCKET, SO_ERROR, &err, &errlen);
+      |                                                       ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1607:23: warning: invalid case style for constant 'recv_slot' [readability-identifier-naming]
+ 1607 |             const u32 recv_slot = fd_interest_slot(conn_id, recv_type);
+      |                       ^~~~~~~~~
+      |                       kRecvSlot
+ 1608 |             const auto& concurrent_send = recv_type == IoEventType::UpstreamRecv
+ 1609 |                                               ? upstream_send_state[conn_id]
+ 1610 |                                               : send_state[conn_id];
+ 1611 |             if (has_write && concurrent_send.remaining > 0 && concurrent_send.fd == fd &&
+ 1612 |                 (!io_event_is_upstream(recv_type) ||
+ 1613 |                  concurrent_send.upstream_episode == upstream_episode))
+ 1614 |                 queue_edge(recv_slot, EPOLLOUT);
+      |                            ~~~~~~~~~
+      |                            kRecvSlot
+ 1615 |             if (study_edge_trigger && !edge_runnable[recv_slot].read_submitted &&
+      |                                                      ~~~~~~~~~
+      |                                                      kRecvSlot
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1631:25: warning: variable 'rc' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1631 |                         i32 rc = get_tls_hooks()->ssl_accept(ssl);
+      |                         ^
+      |                             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1638:49: warning: no header providing "rut::ConnProtocol" is directly included [misc-include-cleaner]
+ 1638 |                                 conn.protocol = ConnProtocol::Http2;
+      |                                                 ^
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1649:29: warning: variable 'ssl_err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1649 |                             i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, rc);
+      |                             ^
+      |                                 const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1679:21: warning: variable 'avail' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+ 1679 |                     u32 avail = buf.write_avail();
+      |                     ^
+      |                         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1685:25: warning: variable 'nr' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1685 |                         i32 nr = get_tls_hooks()->ssl_read(
+      |                         ^
+      |                             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1714:29: warning: variable 'ssl_err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1714 |                             i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, nr);
+      |                             ^
+      |                                 const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1747:17: warning: variable 'avail' of type 'u32' (aka 'unsigned int') can be declared 'const' [misc-const-correctness]
+ 1747 |                 u32 avail = buf.write_avail();
+      |                 ^
+      |                     const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1820:28: warning: invalid case style for constant 'upstream_state_current' [readability-identifier-naming]
+ 1820 |                 const bool upstream_state_current =
+      |                            ^~~~~~~~~~~~~~~~~~~~~~
+      |                            kUpstreamStateCurrent
+ 1821 |                     !io_event_is_upstream(type) || ss.upstream_episode == upstream_episode;
+ 1822 |                 if (ss.tls && ss.remaining > 0 && ss.tls_wait_events == EPOLLIN &&
+ 1823 |                     upstream_state_current) {
+      |                     ~~~~~~~~~~~~~~~~~~~~~~
+      |                     kUpstreamStateCurrent
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1883:25: warning: variable 'nw' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1883 |                         i32 nw = get_tls_hooks()->ssl_write(
+      |                         ^
+      |                             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1890:25: warning: variable 'ssl_err' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1890 |                         i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, nw);
+      |                         ^
+      |                             const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1947:13: warning: variable 'send_fd' of type 'i32' (aka 'int') can be declared 'const' [misc-const-correctness]
+ 1947 |             i32 send_fd = ss.fd;
+      |             ^
+      |                 const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1948:13: warning: variable 'next_type' of type 'IoEventType' can be declared 'const' [misc-const-correctness]
+ 1948 |             IoEventType next_type = (ss.type == IoEventType::UpstreamSend)
+      |             ^
+      |                         const
+/tmp/rut-ws-pr-20261010/src/runtime/epoll_backend.cc:1951:13: warning: variable 'emit_type' of type 'IoEventType' can be declared 'const' [misc-const-correctness]
+ 1951 |             IoEventType emit_type = ss.type;
+      |             ^
+      |                         const
+Suppressed 3217 warnings (3217 in non-user code).
+Use -header-filter=.* or leave it as default to display errors from all non-system headers. Use -system-headers to display errors from system headers as well.

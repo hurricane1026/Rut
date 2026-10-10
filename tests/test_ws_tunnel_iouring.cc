@@ -995,6 +995,7 @@ static void byte_fairness(test::TestCase* _tc, bool byte_gate) {
     auto* saved_tail = loop.backend.cq_tail;
     auto* saved_entries = loop.backend.cq_entries;
     auto* saved_mask = loop.backend.cq_ring_mask;
+    const u32 kFreeTopBeforeFlush = loop.free_top;
     loop.backend.cq_head = &fake_head;
     loop.backend.cq_tail = &fake_tail;
     loop.backend.cq_entries = &ordinary;
@@ -1010,8 +1011,24 @@ static void byte_fairness(test::TestCase* _tc, bool byte_gate) {
     CHECK_EQ(loop.deferred_relay_read_count, byte_gate ? 1u : 0u);
     CHECK_EQ(second->relay_owner.read_armed, !byte_gate);
     CHECK_EQ(loop.study_relay_yields, byte_gate ? 1u : 0u);
-    loop.close_conn(*first);
-    loop.close_conn(*second);
+    CHECK_EQ(loop.free_top, kFreeTopBeforeFlush + 1u);
+    CHECK_EQ(first->fd, -1);
+    CHECK(second->fd >= 0);
+    // The synchronous relay can complete the first response and return its
+    // slot during flush_deferred_relay_reads(). Only close the still-live
+    // second owner; closing the already-reset first slot would free it twice.
+    if (first->fd >= 0) loop.close_conn(*first);
+    if (second->fd >= 0) loop.close_conn(*second);
+    for (u32 i = 0; i < 1000 && (first->pending_ops != 0 || second->pending_ops != 0); ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 kCount =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, kCount);
+        if (kCount == 0) usleep(1000);
+    }
+    CHECK_EQ(first->pending_ops, 0u);
+    CHECK_EQ(second->pending_ops, 0u);
+    CHECK_EQ(loop.free_top, kFreeTopBeforeFlush + 2u);
 }
 
 TEST(http, byte_budget_completion_observation) {
@@ -1073,6 +1090,8 @@ TEST(http, newly_dispatched_relay_read_preserves_older_runnable_owner) {
     auto* second = loop.alloc_conn();
     REQUIRE(first != nullptr);
     REQUIRE(second != nullptr);
+    const u32 kFirstId = first->id;
+    const u32 kSecondId = second->id;
     first->fd = first_down[0];
     first->upstream_fd = first_up[0];
     second->fd = second_down[0];
@@ -1099,13 +1118,34 @@ TEST(http, newly_dispatched_relay_read_preserves_older_runnable_owner) {
     CHECK_EQ(loop.relay_written_bytes, 0u);
     CHECK_EQ(loop.deferred_relay_read_count, 2u);
     loop.study_inside_cq = false;
+    const u32 kFreeTopBeforeFlush = loop.free_top;
     loop.flush_deferred_relay_reads();
     CHECK_EQ(loop.relay_written_bytes, sizeof(payload));
     CHECK_EQ(second->resp_body_remaining, sizeof(payload));
     CHECK_EQ(loop.deferred_relay_read_count, 1u);
     CHECK_EQ(loop.deferred_relay_read_ids[loop.deferred_relay_read_slot(0)], second->id);
-    loop.close_conn(*first);
-    loop.close_conn(*second);
+    // The first relay completes synchronously in the flush and, with
+    // keep_alive=false, closes and returns its slot before this test's cleanup.
+    CHECK_EQ(loop.free_top, kFreeTopBeforeFlush + 1u);
+    CHECK_EQ(first->fd, -1);
+    CHECK(second->fd >= 0);
+    if (first->fd >= 0) loop.close_conn(*first);
+    if (second->fd >= 0) loop.close_conn(*second);
+    for (u32 i = 0; i < 1000 && (first->pending_ops != 0 || second->pending_ops != 0); ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 kCount =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, kCount);
+        if (kCount == 0) usleep(1000);
+    }
+    CHECK_EQ(first->pending_ops, 0u);
+    CHECK_EQ(second->pending_ops, 0u);
+    CHECK_EQ(loop.free_top, kFreeTopBeforeFlush + 2u);
+    CHECK(kFirstId != kSecondId);
+    CHECK((loop.free_stack[kFreeTopBeforeFlush] == kFirstId &&
+           loop.free_stack[kFreeTopBeforeFlush + 1] == kSecondId) ||
+          (loop.free_stack[kFreeTopBeforeFlush] == kSecondId &&
+           loop.free_stack[kFreeTopBeforeFlush + 1] == kFirstId));
 }
 
 static void early_submit(test::TestCase* _tc, bool enabled, bool failure = false) {
