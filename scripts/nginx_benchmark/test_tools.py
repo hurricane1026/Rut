@@ -51,6 +51,33 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_mixed_result_requires_valid_warmup(self):
+        measured = dict(requests=10, errors={'connect': 0}, valid=True)
+        warmup = dict(requests=10, errors={'connect': 0}, valid=False)
+        self.assertFalse(run.valid_warmup_result(measured, warmup))
+        warmup['valid'] = True
+        self.assertTrue(run.valid_warmup_result(measured, warmup))
+        del warmup['valid']
+        self.assertTrue(run.valid_warmup_result(measured, warmup))
+
+    def test_protocol_workers_share_parent_published_measurement_window(self):
+        context = protocol_workload.multiprocessing.get_context('fork')
+        gate = dict(release=context.Event(), measurement=context.Value('d', 0),
+                    deadline=context.Value('d', 0), failed=context.Value('b', 0))
+
+        async def read_window():
+            waiters = [protocol_workload.await_client_window(gate) for _ in range(2)]
+            pending = protocol_workload.asyncio.ensure_future(
+                protocol_workload.asyncio.gather(*waiters))
+            await protocol_workload.asyncio.sleep(.01)
+            self.assertFalse(pending.done())
+            protocol_workload.publish_client_window(gate, 2, 5, now=100)
+            gate['release'].set()
+            return await pending
+
+        windows = protocol_workload.asyncio.run(read_window())
+        self.assertEqual(windows, [(102, 107), (102, 107)])
+
     def test_api_origin_command_and_readiness_are_forwarded(self):
         command = relay_compare.api_origin_command(
             Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2
@@ -175,6 +202,20 @@ class ToolsTest(unittest.TestCase):
                 output = Path(directory) / 'study'
                 argv = ['protocol_strategy.py', '--output', str(output), '--rut', '/bin/true',
                         '--harness', str(Path(run.__file__)), '--duration', duration]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(protocol_strategy.subprocess, 'Popen') as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        protocol_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
+
+    def test_protocol_cli_rejects_nonpositive_nginx_buffer_before_output(self):
+        for size in ('0', '-1'):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'study'
+                argv = ['protocol_strategy.py', '--output', str(output), '--rut', '/bin/true',
+                        '--harness', str(Path(run.__file__)), '--nginx-buffer-kib', size]
                 with mock.patch.object(sys, 'argv', argv), \
                         mock.patch.object(protocol_strategy.subprocess, 'Popen') as launch:
                     with self.assertRaises(SystemExit) as raised:

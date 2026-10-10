@@ -276,6 +276,8 @@ def main():
         parser.error('--duration must be positive')
     if args.connections_per_client < 1 or args.repeats < 1:
         parser.error('connections and repeats must be positive')
+    if args.nginx_buffer_kib <= 0:
+        parser.error('--nginx-buffer-kib must be positive')
     if not args.smoke and args.repeats < 3:
         parser.error('non-smoke studies require at least three repeats')
     cases = [case for case in CASES if not args.cases or case['name'] in args.cases]

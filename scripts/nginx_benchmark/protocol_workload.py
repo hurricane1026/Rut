@@ -133,6 +133,18 @@ def percentiles(values):
             for name, fraction in [('p50_us', .50), ('p95_us', .95), ('p99_us', .99), ('max_us', 1)]}
 
 
+def publish_client_window(gate, warmup, duration, now=None):
+    gate['measurement'].value = (time.monotonic() if now is None else now) + warmup
+    gate['deadline'].value = gate['measurement'].value + duration
+
+
+async def await_client_window(gate):
+    await asyncio.to_thread(gate['release'].wait)
+    if gate['failed'].value:
+        return None
+    return gate['measurement'].value, gate['deadline'].value
+
+
 def origin_worker(cpu, port, size, delay_ms, chunks):
     # Forked workers must not run the parent's child-management handler.
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -250,7 +262,7 @@ async def ws_preflight(port):
     await writer.wait_closed()
 
 
-def client_worker(cpu, args, output):
+def client_worker(cpu, args, output, shared_gate=None):
     os.sched_setaffinity(0, {cpu})
     cpu_started = time.process_time(); wall_started = time.monotonic()
     fixed = bytes((i * 29) & 255 for i in range(args.size))
@@ -262,7 +274,15 @@ def client_worker(cpu, args, output):
         ready_count = 0
         startup_failed = False
         deadline = measurement = 0
+        announced_ready = False
         sessions = []
+
+        def announce_ready():
+            nonlocal announced_ready
+            if not announced_ready:
+                announced_ready = True
+                if shared_gate is not None:
+                    shared_gate['queue'].put(('ready', cpu))
 
         async def session():
             nonlocal ready_count, startup_failed, deadline, measurement
@@ -273,12 +293,19 @@ def client_worker(cpu, args, output):
                     counts['connections'] += 1
                     ready_count += 1
                     if ready_count == args.connections:
-                        measurement = time.monotonic() + args.warmup
-                        deadline = measurement + args.duration
+                        if shared_gate is None:
+                            measurement = time.monotonic() + args.warmup
+                            deadline = measurement + args.duration
+                        announce_ready()
                         ready.set()
                     await ready.wait()
                     if startup_failed:
                         return
+                    if shared_gate is not None:
+                        window = await await_client_window(shared_gate)
+                        if window is None:
+                            return
+                        measurement, deadline = window
                     sequence = 0
                     while time.monotonic() < deadline:
                         expected = struct.pack('!Q', sequence) + fixed[8:] if len(fixed) >= 8 else fixed
@@ -306,12 +333,19 @@ def client_worker(cpu, args, output):
                     counts['connections'] += 1
                     ready_count += 1
                     if ready_count == args.connections:
-                        measurement = time.monotonic() + args.warmup
-                        deadline = measurement + args.duration
+                        if shared_gate is None:
+                            measurement = time.monotonic() + args.warmup
+                            deadline = measurement + args.duration
+                        announce_ready()
                         ready.set()
                     await ready.wait()
                     if startup_failed:
                         return
+                    if shared_gate is not None:
+                        window = await await_client_window(shared_gate)
+                        if window is None:
+                            return
+                        measurement, deadline = window
                     while time.monotonic() < deadline:
                         began = time.monotonic_ns()
                         writer.write(b'GET /stream HTTP/1.1\r\nHost: fixture.example\r\n\r\n')
@@ -331,6 +365,9 @@ def client_worker(cpu, args, output):
             except Exception as error:
                 if not ready.is_set():
                     startup_failed = True
+                    if shared_gate is not None:
+                        shared_gate['failed'].value = 1
+                        shared_gate['queue'].put(('failed', cpu, repr(error)))
                     ready.set()
                     current = asyncio.current_task()
                     for task in sessions:
@@ -354,7 +391,7 @@ def client_worker(cpu, args, output):
     sample['cpu_seconds'] = time.process_time() - cpu_started
     sample['observation_seconds'] = time.monotonic() - wall_started
     sample['cpu'] = cpu
-    output.put(sample)
+    output.put(sample if shared_gate is None else ('sample', sample))
 
 
 def main():
@@ -398,14 +435,43 @@ def main():
         stop()
     else:
         queue = context.Queue()
-        children = [context.Process(target=client_worker, args=(cpu, args, queue)) for cpu in cpus]
-        for child in children:
-            child.start()
-        samples = [queue.get(timeout=args.duration + args.warmup + 30) for _ in children]
-        for child in children:
-            child.join(5)
-            if child.exitcode != 0:
-                raise RuntimeError('client worker failed')
+        gate = dict(queue=queue, release=context.Event(), measurement=context.Value('d', 0),
+                    deadline=context.Value('d', 0), failed=context.Value('b', 0))
+        children = [context.Process(target=client_worker, args=(cpu, args, queue, gate)) for cpu in cpus]
+        samples = []
+        try:
+            for child in children:
+                child.start()
+            ready = set()
+            timeout = args.duration + args.warmup + 30
+            while len(ready) < len(children) and not gate['failed'].value:
+                message = queue.get(timeout=timeout)
+                if message[0] == 'ready':
+                    ready.add(message[1])
+            if gate['failed'].value:
+                gate['release'].set()
+            else:
+                publish_client_window(gate, args.warmup, args.duration)
+                gate['release'].set()
+            while len(samples) < len(children):
+                message = queue.get(timeout=timeout)
+                if message[0] == 'sample':
+                    samples.append(message[1])
+            for child in children:
+                child.join(5)
+                if child.exitcode != 0:
+                    raise RuntimeError('client worker failed')
+        except BaseException:
+            gate['failed'].value = 1
+            gate['release'].set()
+            for child in children:
+                if child.is_alive():
+                    child.terminate()
+            for child in children:
+                child.join(5)
+            raise
+        if gate['failed'].value:
+            raise RuntimeError('client connection startup failed')
         counts = {key: sum(sample['counts'][key] for sample in samples) for key in samples[0]['counts']}
         result = dict(kind=args.kind, payload_bytes=args.size, concurrent_connections=args.connections * len(cpus),
                       duration_seconds=args.duration, **counts,

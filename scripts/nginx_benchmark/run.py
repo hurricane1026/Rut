@@ -924,11 +924,7 @@ class Harness:
                                 * (origin_after - origin_before)
                                 / result["seconds"],
                                 server_rss_bytes=rss,
-                                valid=bool(result["requests"])
-                                and result.get("valid", True)
-                                and not any(result["errors"].values())
-                                and bool(warmup["requests"])
-                                and not any(warmup["errors"].values()),
+                                valid=valid_warmup_result(result, warmup),
                             )
                             self.results.append(result)
                             save_json(self.out / "results.json", self.results)
@@ -1047,6 +1043,15 @@ def positive(value):
     if number <= 0:
         raise argparse.ArgumentTypeError("must be positive")
     return number
+
+
+def valid_warmup_result(result, warmup):
+    return (bool(result["requests"])
+            and result.get("valid", True)
+            and not any(result["errors"].values())
+            and warmup.get("valid", True)
+            and bool(warmup["requests"])
+            and not any(warmup["errors"].values()))
 
 
 def origin_reuse_records(logs, expected_markers):

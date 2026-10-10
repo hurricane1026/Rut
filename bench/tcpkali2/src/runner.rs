@@ -23,6 +23,10 @@ fn measurement_elapsed(start: time::Instant, end: time::Instant) -> Duration {
     end.duration_since(start)
 }
 
+fn handshake_timeout(connect_timeout: Duration) -> Duration {
+    connect_timeout.saturating_add(Duration::from_secs(1))
+}
+
 /// Asynchronous main function responsible for executing load tests
 ///
 /// # Arguments
@@ -102,7 +106,7 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
     // Do not open the measurement window while handshakes are still joining.
     // Every attempt reaches either success_connections or connection_errors
     // before waiting on load_start.
-    let handshake_deadline = time::Instant::now() + Duration::from_secs(30);
+    let handshake_deadline = time::Instant::now() + handshake_timeout(config.connect_timeout);
     loop {
         let total = stats.total_connections.load(Ordering::Relaxed);
         if handshakes_ready(
@@ -122,10 +126,7 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
     let _ = load_start_tx.send(true);
 
     // Warmup phase
-    warmup_phase(&config, &stats).await;
-
-    let start_time = time::Instant::now();
-    let _ = benchmark_start_tx.send(Some(start_time));
+    let start_time = warmup_phase(&config, &stats, &benchmark_start_tx).await;
 
     // Execute benchmark
     let measurement_end = execute_benchmark(&config, &stats, &mut tasks).await;
@@ -205,11 +206,17 @@ fn spawn_stats_printer(stats: Arc<Stats>) -> JoinHandle<()> {
 }
 
 /// Warmup phase processing
-async fn warmup_phase(config: &Config, stats: &Arc<Stats>) {
+async fn warmup_phase(
+    config: &Config,
+    stats: &Arc<Stats>,
+    benchmark_start_tx: &tokio::sync::watch::Sender<Option<time::Instant>>,
+) -> time::Instant {
     // If warmup duration is 0, skip warmup phase
     if config.warmup_duration.as_secs_f64() == 0.0 {
+        let start_time = time::Instant::now();
+        let _ = benchmark_start_tx.send(Some(start_time));
         stats.end_warmup();
-        return;
+        return start_time;
     }
 
     if !config.quiet {
@@ -220,6 +227,9 @@ async fn warmup_phase(config: &Config, stats: &Arc<Stats>) {
     }
     // Wait for warmup to complete
     time::sleep(config.warmup_duration).await;
+    // Publish the measurement boundary before workers become measurement-eligible.
+    let start_time = time::Instant::now();
+    let _ = benchmark_start_tx.send(Some(start_time));
     // Reset statistics
     stats.end_warmup();
     // Output log
@@ -229,6 +239,7 @@ async fn warmup_phase(config: &Config, stats: &Arc<Stats>) {
             config.duration.as_secs()
         );
     }
+    start_time
 }
 
 /// Execute benchmark
@@ -263,7 +274,7 @@ fn report_task_result(result: Result<Result<(), TcpKaliError>, JoinError>, quiet
 
 #[cfg(test)]
 mod tests {
-    use super::{handshakes_ready, measurement_elapsed};
+    use super::{handshake_timeout, handshakes_ready, measurement_elapsed};
     use tokio::time::{Duration, Instant};
 
     #[test]
@@ -271,6 +282,14 @@ mod tests {
         assert!(!handshakes_ready(2, 0, 3));
         assert!(handshakes_ready(2, 1, 3));
         assert!(handshakes_ready(0, 3, 3));
+    }
+
+    #[test]
+    fn readiness_timeout_tracks_configured_connection_timeout() {
+        assert_eq!(
+            handshake_timeout(Duration::from_secs(45)),
+            Duration::from_secs(46)
+        );
     }
 
     #[tokio::test]
