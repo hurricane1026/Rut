@@ -372,6 +372,9 @@ struct ConnectionBase {
     ConnState state;  // for debugging/metrics only
     u8 shard_id;
     u16 flags;
+    static constexpr u16 kWriteHalfClosed = 1u << 0;
+    [[nodiscard]] bool write_half_closed() const { return (flags & kWriteHalfClosed) != 0; }
+    void mark_write_half_closed() { flags |= kWriteHalfClosed; }
     u16 timer_slot;
     // Idle-buffer trim mark (io_uring sweep only; see IoUringEventLoop::
     // sweep_idle_trim): this connection's timer node has been examined since it

@@ -139,6 +139,350 @@ bool exact_pattern(const u8* buf, u32 len) {
 }  // namespace
 
 #ifdef __linux__
+namespace {
+struct StableEpollFixture {
+    EpollBackend backend{};
+    UpstreamPool pool{};
+    Connection conns[2]{};
+    u8 buffers[2][64]{};
+    i32 peer = -1;
+
+    bool init() {
+        if (!backend.init(0, -1, 4).has_value() || !backend.enable_stable_upstream_events())
+            return false;
+        pool.init();
+        backend.bind_stable_pool(&pool);
+        for (u32 i = 0; i < 2; ++i) {
+            conns[i].reset();
+            conns[i].id = i;
+            conns[i].upstream_recv_buf.bind(buffers[i], sizeof(buffers[i]));
+        }
+        i32 fds[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fds) < 0) return false;
+        peer = fds[1];
+        conns[0].upstream_fd = fds[0];
+        return backend.begin_upstream_episode(0, conns[0].upstream_episode) &&
+               backend.add_recv_upstream(fds[0], 0, conns[0].upstream_episode);
+    }
+
+    bool park(u32 owner) {
+        i32 fd = -1;
+        if (!backend.detach_upstream(conns[owner], &fd)) return false;
+        u32 slot = UpstreamPool::kNoSlot;
+        if (!pool.put_idle(fd, 0, 0, 1, &slot)) {
+            pool.close_idle_fd(fd);
+            return false;
+        }
+        backend.park_stable_upstream(fd, slot);
+        return true;
+    }
+
+    i32 borrow(u32 owner) {
+        const i32 fd = pool.take_idle(0, 0);
+        if (fd < 0) return fd;
+        if (!backend.begin_upstream_episode(owner, conns[owner].upstream_episode)) {
+            pool.close_idle_fd(fd);
+            return -1;
+        }
+        conns[owner].upstream_fd = fd;
+        backend.upstream_fd_map[owner] = fd;
+        backend.claim_stable_upstream(fd, owner, conns[owner].upstream_episode);
+        return fd;
+    }
+
+    ~StableEpollFixture() {
+        for (auto& conn : conns)
+            if (conn.upstream_fd >= 0) backend.detach_upstream(conn);
+        pool.shutdown();
+        backend.shutdown();
+        if (peer >= 0) close(peer);
+    }
+};
+}  // namespace
+
+TEST(epoll_stable_relay, same_registration_changes_consumer_without_reading_bytes) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    f.backend.study_stable_upstream_relay = true;
+    auto& c = f.conns[0];
+    const u64 kToken = f.backend.fd_interest[1].data;
+    const u32 kVersion = f.backend.stable_upstream[c.upstream_fd].version;
+    c.fd = f.peer;
+    c.relay_owner.phase = RelayPhase::Reading;
+    c.relay_owner.source_fd = c.upstream_fd;
+    c.relay_owner.destination_fd = c.fd;
+    c.relay_owner.upstream_episode = c.upstream_episode;
+    c.relay_owner.read_armed = true;
+    // Retire a record harvested for the previous recv consumer.
+    f.backend.ready[0] = {};
+    f.backend.ready[0].events = EPOLLIN;
+    f.backend.ready[0].data.u64 = kToken;
+    f.backend.ready_slot[0] = EpollBackend::kStableReadySlotBit | static_cast<u32>(c.upstream_fd);
+    f.backend.ready_gen[0] = kVersion;
+    f.backend.ready_head = 0;
+    f.backend.ready_count = 1;
+    REQUIRE(
+        f.backend.add_relay_poll(c.upstream_fd, c.id, IoEventType::RelayRead, c.upstream_episode));
+    CHECK_EQ(f.backend.fd_interest[1].data, kToken);
+    CHECK_EQ(f.backend.stable_upstream[c.upstream_fd].version, kVersion + 1);
+    REQUIRE_EQ(::send(f.peer, "body", 4, MSG_NOSIGNAL), 4);
+    IoEvent events[4]{};
+    REQUIRE_EQ(f.backend.wait(events, 4, f.conns, 2), 1u);
+    CHECK_EQ(f.backend.ready_gen[0], kVersion + 1);
+    CHECK_EQ(events[0].type, IoEventType::RelayRead);
+    CHECK_EQ(c.upstream_recv_buf.len(), 0u);
+    u8 bytes[4]{};
+    REQUIRE_EQ(::recv(c.upstream_fd, bytes, sizeof(bytes), MSG_DONTWAIT), 4);
+    CHECK_EQ(__builtin_memcmp(bytes, "body", 4), 0);
+    c.relay_owner = {};
+    REQUIRE(f.backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode));
+    CHECK_EQ(f.backend.fd_interest[1].data, kToken);
+    CHECK_FALSE(f.backend.stable_upstream[c.upstream_fd].relay_read);
+}
+
+TEST(epoll_stable, transfer_keeps_kernel_token_and_waits_for_receive_submission) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    const u64 token =
+        f.backend.fd_interest[EpollBackend::fd_interest_slot(0, IoEventType::UpstreamRecv)].data;
+    const u32 downstream_generation = f.backend.fd_interest[0].gen;
+    REQUIRE(f.park(0));
+    CHECK_EQ(f.backend.fd_interest[0].gen, downstream_generation + 1);
+    REQUIRE_EQ(f.borrow(1), fd);
+    const u8 byte = 'x';
+    REQUIRE_EQ(send(f.peer, &byte, 1, 0), 1);
+    IoEvent event{};
+    CHECK_EQ(f.backend.wait(&event, 1, f.conns, 2), 0u);
+    CHECK_EQ(f.conns[1].upstream_recv_buf.len(), 0u);
+    REQUIRE(f.backend.add_recv_upstream(fd, 1, f.conns[1].upstream_episode));
+    CHECK_EQ(
+        f.backend.fd_interest[EpollBackend::fd_interest_slot(1, IoEventType::UpstreamRecv)].data,
+        token);
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(event.conn_id, 1u);
+    CHECK_EQ(event.upstream_episode, f.conns[1].upstream_episode);
+    CHECK_EQ(event.result, 1);
+    CHECK_EQ(f.conns[1].upstream_recv_buf.data()[0], byte);
+    CHECK_EQ(f.conns[0].upstream_recv_buf.len(), 0u);
+}
+
+TEST(epoll_stable, old_harvested_owner_is_dropped_before_socket_read) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    const u64 token =
+        f.backend.fd_interest[EpollBackend::fd_interest_slot(0, IoEventType::UpstreamRecv)].data;
+    const u32 version = f.backend.stable_upstream[fd].version;
+    REQUIRE(f.park(0));
+    REQUIRE_EQ(f.borrow(1), fd);
+    REQUIRE(f.backend.add_recv_upstream(fd, 1, f.conns[1].upstream_episode));
+    f.backend.ready[0] = {EPOLLIN, {.u64 = token}};
+    f.backend.ready_slot[0] = EpollBackend::kStableReadySlotBit | static_cast<u32>(fd);
+    f.backend.ready_gen[0] = version;
+    f.backend.ready_head = 0;
+    f.backend.ready_count = 1;
+    const u8 byte = 'n';
+    REQUIRE_EQ(send(f.peer, &byte, 1, 0), 1);
+    IoEvent event{};
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(event.conn_id, 1u);
+    CHECK_EQ(f.conns[1].upstream_recv_buf.len(), 1u);
+    CHECK_EQ(f.conns[1].upstream_recv_buf.data()[0], byte);
+}
+
+TEST(epoll_stable, idle_fin_and_unsolicited_bytes_discard_only_the_idle_socket) {
+    for (u32 data = 0; data < 2; ++data) {
+        StableEpollFixture f;
+        REQUIRE(f.init());
+        const i32 fd = f.conns[0].upstream_fd;
+        REQUIRE(f.park(0));
+        if (data) {
+            const u8 byte = 'z';
+            REQUIRE_EQ(send(f.peer, &byte, 1, 0), 1);
+        } else {
+            REQUIRE_EQ(shutdown(f.peer, SHUT_WR), 0);
+        }
+        IoEvent event{};
+        CHECK_EQ(f.backend.wait(&event, 1, f.conns, 2), 0u);
+        CHECK_EQ(f.pool.idle_count.load(), 0u);
+        CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+        CHECK_EQ(f.conns[0].upstream_recv_buf.len(), 0u);
+        CHECK_EQ(f.conns[1].upstream_recv_buf.len(), 0u);
+        CHECK_EQ(fcntl(fd, F_GETFD), -1);
+        CHECK_EQ(errno, EBADF);
+    }
+}
+
+TEST(epoll_stable, borrow_probe_and_reload_still_reject_idle_transport) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE(f.park(0));
+    const u8 byte = 's';
+    REQUIRE_EQ(send(f.peer, &byte, 1, 0), 1);
+    CHECK_EQ(f.pool.take_idle(0, 0), -1);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+    CHECK_EQ(f.pool.idle_count.load(), 0u);
+
+    StableEpollFixture reload;
+    REQUIRE(reload.init());
+    const i32 reload_fd = reload.conns[0].upstream_fd;
+    REQUIRE(reload.park(0));
+    reload.pool.drain();
+    CHECK_FALSE(reload.backend.stable_upstream[reload_fd].registered);
+    CHECK_EQ(reload.pool.idle_count.load(), 0u);
+}
+
+TEST(epoll_stable, generation_rejects_old_token_even_when_owner_version_matches) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    const u64 old_token =
+        f.backend.fd_interest[EpollBackend::fd_interest_slot(0, IoEventType::UpstreamRecv)].data;
+    f.backend.pause_upstream_recv(0, f.conns[0].upstream_episode, false);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+    REQUIRE(f.backend.add_recv_upstream(fd, 0, f.conns[0].upstream_episode));
+    CHECK_NE(f.backend.stable_upstream[fd].generation, static_cast<u32>(old_token >> 32));
+    f.backend.ready[0] = {EPOLLIN, {.u64 = old_token}};
+    f.backend.ready_slot[0] = EpollBackend::kStableReadySlotBit | static_cast<u32>(fd);
+    f.backend.ready_gen[0] = f.backend.stable_upstream[fd].version;
+    f.backend.ready_head = 0;
+    f.backend.ready_count = 1;
+    const u8 byte = 'g';
+    REQUIRE_EQ(send(f.peer, &byte, 1, 0), 1);
+    IoEvent event{};
+    CHECK_EQ(f.backend.wait(&event, 1, f.conns, 2), 0u);
+    CHECK_EQ(f.conns[0].upstream_recv_buf.len(), 0u);
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(f.conns[0].upstream_recv_buf.data()[0], byte);
+}
+
+TEST(epoll_stable, exhausted_owner_version_uses_full_detach_without_wrapping) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    f.backend.stable_upstream[fd].version = 0xffffffffu;
+    REQUIRE(f.park(0));
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+    CHECK_EQ(f.pool.idle_count.load(), 1u);
+    REQUIRE_EQ(f.borrow(1), fd);
+    REQUIRE(f.backend.add_recv_upstream(fd, 1, f.conns[1].upstream_episode));
+    CHECK(f.backend.stable_upstream[fd].registered);
+    CHECK_NE(f.backend.stable_upstream[fd].generation, 1u);
+}
+
+TEST(epoll_stable, failed_registration_reports_local_error_without_consuming_bytes) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    f.backend.invalidate_stable_upstream(fd);
+    const i32 epoll_fd = f.backend.epoll_fd;
+    f.backend.epoll_fd = f.peer;  // valid socket, deliberately not an epoll descriptor
+    const bool submitted = f.backend.add_recv_upstream(fd, 0, f.conns[0].upstream_episode);
+    f.backend.epoll_fd = epoll_fd;
+    REQUIRE(submitted);  // a local-submit failure is delivered as a completion
+    IoEvent event{};
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(event.type, IoEventType::UpstreamRecv);
+    CHECK_EQ(event.aux, kLocalSubmitFailureAux);
+    CHECK_EQ(event.result, -EINVAL);
+    CHECK_EQ(event.upstream_episode, f.conns[0].upstream_episode);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+    CHECK_EQ(f.backend.upstream_fd_map[0], -1);
+    CHECK_EQ(f.conns[0].upstream_recv_buf.len(), 0u);
+}
+
+TEST(epoll_stable, reused_descriptor_cannot_accept_the_previous_socket_token) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    const u64 old_token =
+        f.backend.fd_interest[EpollBackend::fd_interest_slot(0, IoEventType::UpstreamRecv)].data;
+    REQUIRE(f.park(0));
+    f.pool.drain();
+    close(f.peer);
+    f.peer = -1;
+    i32 fresh[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fresh), 0);
+    if (fresh[0] != fd) {
+        if (fresh[1] == fd) {
+            f.peer = fcntl(fresh[1], F_DUPFD_CLOEXEC, 0);
+            REQUIRE(f.peer >= 0);
+            close(fresh[1]);
+        } else {
+            f.peer = fresh[1];
+        }
+        REQUIRE_EQ(dup2(fresh[0], fd), fd);
+        close(fresh[0]);
+    } else {
+        f.peer = fresh[1];
+    }
+    f.conns[1].upstream_fd = fd;
+    REQUIRE(f.backend.begin_upstream_episode(1, f.conns[1].upstream_episode));
+    REQUIRE(f.backend.add_recv_upstream(fd, 1, f.conns[1].upstream_episode));
+    CHECK_NE(f.backend.stable_upstream[fd].generation, static_cast<u32>(old_token >> 32));
+    f.backend.ready[0] = {EPOLLIN, {.u64 = old_token}};
+    f.backend.ready_slot[0] = EpollBackend::kStableReadySlotBit | static_cast<u32>(fd);
+    f.backend.ready_gen[0] = f.backend.stable_upstream[fd].version;
+    f.backend.ready_head = 0;
+    f.backend.ready_count = 1;
+    const u8 byte = 'r';
+    REQUIRE_EQ(send(f.peer, &byte, 1, 0), 1);
+    IoEvent event{};
+    CHECK_EQ(f.backend.wait(&event, 1, f.conns, 2), 0u);
+    CHECK_EQ(f.conns[1].upstream_recv_buf.len(), 0u);
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(event.conn_id, 1u);
+    CHECK_EQ(f.conns[1].upstream_recv_buf.data()[0], byte);
+}
+
+TEST(epoll_stable, partial_send_keeps_write_interest_and_restores_stable_read_owner) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    const i32 send_capacity = 4096;
+    REQUIRE_EQ(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_capacity, sizeof(send_capacity)), 0);
+    u8 payload[64 * 1024];
+    for (auto& byte : payload) byte = 0xa5;
+    REQUIRE(
+        f.backend.add_send_upstream(fd, 0, payload, sizeof(payload), f.conns[0].upstream_episode));
+    REQUIRE(f.backend.upstream_send_state[0].remaining > 0);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+    REQUIRE(f.backend.add_recv_upstream(fd, 0, f.conns[0].upstream_episode));
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+    u32 received = 0;
+    bool completed = false;
+    u8 bytes[2048];
+    for (u32 turn = 0; turn < 128 && !completed; ++turn) {
+        for (;;) {
+            const ssize_t count = recv(f.peer, bytes, sizeof(bytes), 0);
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0 && errno == EAGAIN) break;
+            REQUIRE(count > 0);
+            received += static_cast<u32>(count);
+            for (ssize_t i = 0; i < count; ++i) CHECK_EQ(bytes[i], 0xa5);
+        }
+        IoEvent event{};
+        if (f.backend.wait(&event, 1, f.conns, 2) != 0 && event.type == IoEventType::UpstreamSend) {
+            CHECK_EQ(event.upstream_episode, f.conns[0].upstream_episode);
+            CHECK_EQ(event.result, static_cast<i32>(sizeof(payload)));
+            completed = true;
+        }
+    }
+    REQUIRE(completed);
+    while (received < sizeof(payload)) {
+        const ssize_t count = recv(f.peer, bytes, sizeof(bytes), 0);
+        REQUIRE(count > 0);
+        received += static_cast<u32>(count);
+        for (ssize_t i = 0; i < count; ++i) CHECK_EQ(bytes[i], 0xa5);
+    }
+    CHECK_EQ(received, sizeof(payload));
+    CHECK_EQ(f.backend.upstream_send_state[0].remaining, 0u);
+    CHECK(f.backend.stable_upstream[fd].registered);
+    CHECK(f.backend.stable_upstream[fd].recv_enabled);
+}
+
 TEST(iouring_splice, shared_budget_yields_and_finishes_exact_body) {
     ScopedIoUringLoop guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -758,6 +1102,121 @@ static_assert(HasResponseSpliceSeam<IoUringEventLoop>);
 static_assert(!HasResponseSpliceSeam<EpollEventLoop>);
 
 #endif  // __linux__
+
+TEST(request_policy_parse_witness, exact_wire_and_stale_extent_rejection) {
+    Connection conn{};
+    u8 recv[512]{};
+    u8 send[512]{};
+    static constexpr char kRequest[] =
+        "GET /item?q=1 HTTP/1.1\r\nHost: client\r\nX-Test: yes\r\n\r\n";
+    static constexpr char kExpected[] =
+        "GET /item?q=1 HTTP/1.1\r\nHost: 127.0.0.1:9000\r\nX-Test: yes\r\n\r\n";
+    conn.reset();
+    conn.recv_slice = recv;
+    conn.send_slice = send;
+    conn.bind_request_receive_buffer(recv, sizeof(recv));
+    conn.send_buf.bind(send, sizeof(send));
+    REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1),
+               sizeof(kRequest) - 1);
+    capture_request_metadata(conn);
+    RequestPolicyParseWitness witness;
+    REQUIRE_EQ(inspect_request_policy_body(conn, 1, &witness), RequestPolicyBodyState::Complete);
+    REQUIRE_EQ(witness.source, conn.recv_buf.data());
+    sockaddr_in endpoint{};
+    endpoint.sin_family = AF_INET;
+    endpoint.sin_addr.s_addr = htonl(0x7f000001u);
+    endpoint.sin_port = htons(9000);
+    const u32 kSourceLength = witness.source_len;
+    ++witness.source_len;
+    CHECK_FALSE(materialize_validated_request_policy(conn, endpoint, 1, &witness));
+    CHECK_EQ(conn.recv_buf.len(), sizeof(kRequest) - 1);
+    witness.source_len = kSourceLength;
+    const u8* kSource = witness.source;
+    witness.source = send;
+    CHECK_FALSE(materialize_validated_request_policy(conn, endpoint, 1, &witness));
+    witness.source = kSource;
+    REQUIRE(materialize_validated_request_policy(conn, endpoint, 1, &witness));
+    REQUIRE_EQ(conn.recv_buf.len(), sizeof(kExpected) - 1);
+    CHECK_EQ(__builtin_memcmp(conn.recv_buf.data(), kExpected, sizeof(kExpected) - 1), 0);
+}
+
+TEST(request_policy_parse_witness, waiting_and_invalid_do_not_publish) {
+    Connection conn{};
+    u8 recv[512]{};
+    u8 send[512]{};
+    const char* requests[] = {
+        "GET /item HTTP/1.1\r\nHost: client\r\nContent-Length: 3\r\n\r\na",
+        "GET /item HTTP/1.1\r\nHost: client\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab"};
+    for (u32 i = 0; i < 2; ++i) {
+        conn.reset();
+        conn.recv_slice = recv;
+        conn.send_slice = send;
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_buf.bind(send, sizeof(send));
+        const u32 kLength = static_cast<u32>(__builtin_strlen(requests[i]));
+        REQUIRE_EQ(conn.recv_buf.write(reinterpret_cast<const u8*>(requests[i]), kLength), kLength);
+        capture_request_metadata(conn);
+        RequestPolicyParseWitness witness;
+        CHECK_EQ(inspect_request_policy_body(conn, 1, &witness),
+                 i == 0 ? RequestPolicyBodyState::Waiting : RequestPolicyBodyState::Invalid);
+        CHECK_EQ(witness.source, nullptr);
+    }
+}
+
+TEST(request_metadata_parse_reuse, preserves_framing_routing_and_client_headers) {
+    const char* wires[] = {
+        "GET /item?q=1 HTTP/1.1\r\nHost: client\r\nConnection: close\r\n\r\n",
+        "POST /upload HTTP/1.1\r\nHost: client\r\nContent-Length: 4\r\n\r\nab",
+        "GET /item#fragment HTTP/1.1\r\nHost: client\r\n\r\n",
+        "GET /ws HTTP/1.1\r\nHost: client\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+        "GET /item HTTP/1.1\r\nHost: client\r\nTE: trailers\r\nConnection: close\r\nConnection: "
+        "keep-alive\r\n\r\n",
+        "GET /first HTTP/1.1\r\nHost: client\r\n\r\nGET /second HTTP/1.1\r\nHost: client\r\n\r\n"};
+    for (const char* wire : wires) {
+        Connection legacy{};
+        Connection reused{};
+        u8 legacy_recv[512]{};
+        u8 reused_recv[512]{};
+        legacy.reset();
+        reused.reset();
+        legacy.bind_request_receive_buffer(legacy_recv, sizeof(legacy_recv));
+        reused.bind_request_receive_buffer(reused_recv, sizeof(reused_recv));
+        const u32 kLength = static_cast<u32>(__builtin_strlen(wire));
+        REQUIRE_EQ(legacy.recv_buf.write(reinterpret_cast<const u8*>(wire), kLength), kLength);
+        REQUIRE_EQ(reused.recv_buf.write(reinterpret_cast<const u8*>(wire), kLength), kLength);
+        HttpParser parser;
+        ParsedRequest request;
+        parser.reset();
+        REQUIRE_EQ(parser.parse(reused.recv_buf.data(), kLength, &request), ParseStatus::Complete);
+        capture_request_metadata(legacy);
+        capture_parsed_request_metadata(reused, request, parser.header_end);
+        CHECK_EQ(reused.req_method, legacy.req_method);
+        CHECK_EQ(reused.req_header_end, legacy.req_header_end);
+        CHECK_EQ(reused.req_initial_send_len, legacy.req_initial_send_len);
+        CHECK_EQ(reused.req_http_version, legacy.req_http_version);
+        CHECK_EQ(reused.req_body_mode, legacy.req_body_mode);
+        CHECK_EQ(reused.req_body_remaining, legacy.req_body_remaining);
+        CHECK_EQ(reused.req_content_length, legacy.req_content_length);
+        CHECK_EQ(reused.req_target_has_fragment, legacy.req_target_has_fragment);
+        CHECK_EQ(reused.req_target_form_unsupported, legacy.req_target_form_unsupported);
+        CHECK_EQ(reused.req_malformed, legacy.req_malformed);
+        CHECK_EQ(reused.req_keep_alive, legacy.req_keep_alive);
+        CHECK_EQ(reused.req_client_connection_close, legacy.req_client_connection_close);
+        CHECK_EQ(reused.req_client_connection_count, legacy.req_client_connection_count);
+        CHECK_EQ(reused.req_client_has_te, legacy.req_client_has_te);
+        CHECK_EQ(reused.req_wants_upgrade, legacy.req_wants_upgrade);
+        CHECK_EQ(reused.req_upgrade_is_websocket, legacy.req_upgrade_is_websocket);
+        CHECK_EQ(reused.capture_header_len, legacy.capture_header_len);
+        CHECK_EQ(__builtin_strcmp(reused.req_path, legacy.req_path), 0);
+        REQUIRE_EQ(reused.req_path_canon.len, legacy.req_path_canon.len);
+        CHECK_EQ(
+            __builtin_memcmp(
+                reused.req_path_canon.ptr, legacy.req_path_canon.ptr, reused.req_path_canon.len),
+            0);
+        CHECK_EQ(reused.recv_buf.len(), kLength);
+        CHECK_EQ(__builtin_memcmp(reused.recv_buf.data(), wire, kLength), 0);
+    }
+}
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
