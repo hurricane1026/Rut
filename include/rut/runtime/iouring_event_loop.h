@@ -3476,6 +3476,7 @@ public:
     // connection is reached. A recv that finds no SQE stays pending.
     void rearm_deferred_recvs(bool force) {
         if (recv_rearm_count == 0) return;
+        if (backend.ws_recv_cache_enabled && !backend.ws_recv_cache_has_capacity()) return;
         const u32 pinned = backend.cq_unharvested();
         if (!force && pinned >= kProvidedBufCount / 2) return;
         u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
@@ -7329,6 +7330,8 @@ public:
     }
     void test_close_listen() { close_listen(); }
     void test_rearm_deferred_ws_cache_recvs() { rearm_deferred_ws_cache_recvs(); }
+    void test_rearm_deferred_recvs() { rearm_deferred_recvs(false); }
+    u32 test_recv_rearm_count() const { return recv_rearm_count; }
 #endif
 
 public:
