@@ -4,11 +4,11 @@ Branch `perf/epoll-full-et`, isolated worktree `/tmp/rut-ws-pr-20261010`; no com
 
 ## Policy
 
-Like [nginx 1.29.7 upstream keepalive](https://github.com/nginx/nginx/blob/release-1.29.7/src/http/modules/ngx_http_upstream_keepalive_module.c#L184-L404), keep an idle read watch and check on known readiness instead of probing every healthy borrow. Pool borrowing calls an existing-context function-pointer hook: skip MSG_PEEK only if the exact descriptor/slot has a live stable idle registration, no pending readiness, no harvested idle event, and an unexhausted owner version. All fallback states keep the probe. No heap allocation or Connection fields added; the pool adds one hook pointer per shard.
+Keep an idle read watch and eagerly reject known-stale idle sockets. Readiness callbacks and pool return/cleanup paths use the existing context hook to invalidate the exact descriptor/slot before it can be borrowed. Every borrow still performs the nonblocking `MSG_PEEK` liveness/surplus probe: a readiness event not yet harvested cannot prove that no bytes arrived after parking. The probe can reject data, EOF, and hard errors before reuse; a residual probe-versus-send race remains. No heap allocation or Connection fields are added; the pool adds one hook pointer per shard.
 
 Return-to-pool checks retained ET readiness and harvested active events before retirement of their owner version. Known readiness triggers MSG_PEEK once after the pool owns the descriptor: EAGAIN retains it, data/EOF/hard error discards it. Idle event callbacks retain their existing conditional MSG_PEEK. Borrowed sockets still establish a fresh owner/version and episode, preserving stale-event fences. FD close invalidates the watch before release; reload/sweep continue through the pool close hook.
 
-FIN or data not yet harvested can race a borrow, as in nginx; the implementation does not claim a positive liveness guarantee. Existing transport failure handling remains, with retries restricted by existing request replay rules. Synchronous probing also has a probe-versus-send race. This change intentionally removes unconditional pre-borrow rejection when no readiness is known; it does not remove error/cancellation handling or assert that unsolicited bytes can never race ownership.
+FIN or data not yet harvested can race a borrow, so the borrow-time probe remains as a safety fence. Existing transport failure handling remains, with retries restricted by existing request replay rules. Synchronous probing cannot prevent a later probe-versus-send race.
 
 ## Screening
 
@@ -30,9 +30,9 @@ Frozen binary, full diff/hash and raw logs: `/home/hurricane/private/code/rut-pe
 
 ## Longer persistent confirmation and syscall evidence
 
-Three rotated 12-second 1 KiB keep-alive pairs: median before 73,351 RPS / p99 1.935 ms, after 74,608 / 1.921 ms (+1.71% throughput, -0.72% p99). All six cells valid with zero errors. Initial 6s screening p99 regression was not reproduced; this does not establish a universal latency guarantee or a substantial throughput gain.
+Three rotated 12-second 1 KiB keep-alive pairs from the original skip-probe candidate: median before 73,351 RPS / p99 1.935 ms, after 74,608 / 1.921 ms (+1.71% throughput, -0.72% p99). All six cells valid with zero errors. These measurements describe that earlier implementation, which skipped the borrow probe; they do not measure the current always-probe policy below. Initial 6s screening p99 regression was not reproduced; this does not establish a universal latency guarantee or a substantial throughput gain.
 
-Separate 5s BPF measurements: recvfrom/request 2.0013 (short) and 2.0012 (persistent), down from 3.0022 / 3.0017 in the immediately preceding ET+stable/nginx audit. epoll_ctl/request stays 1.0008 / 0.0004. All trace cells valid, zero errors; these rates are not throughput acceptance evidence. Raw traces: `epoll-et-idle-event-bpf-20261011` external checkpoint. Healthy unconditional peek is removed; conditional idle checks and fallback probes remain.
+Separate 5s BPF measurements from the original skip-probe candidate: recvfrom/request 2.0013 (short) and 2.0012 (persistent), down from 3.0022 / 3.0017 in the immediately preceding ET+stable/nginx audit. epoll_ctl/request stays 1.0008 / 0.0004. All trace cells valid, zero errors; these rates are not throughput acceptance evidence. Raw traces: `epoll-et-idle-event-bpf-20261011` external checkpoint. These syscall counts do not apply to the current always-probe policy.
 
 Additional boundary tests verify FIN racing an unharvested borrow is reported to the new episode, and full-buffer readiness probes EAGAIN on return then permits a healthy borrow. ASan+UBSan no-JIT Debug ET fixtures: 39 tests, 99,678 checks passed (leak detection disabled). clang-tidy 22 backend bugprone/performance checks passed with existing unrelated warnings; full CI/multi-shard/macOS remain unverified.
 
