@@ -250,6 +250,7 @@ mod tests {
             connections: 4,
             connect_rate: 0,
             connect_timeout: Duration::from_secs(1),
+            init_timeout: Duration::from_secs(30),
             channel_lifetime: None,
             first_message: None,
             message: Some(payload.clone()),

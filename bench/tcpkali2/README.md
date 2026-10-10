@@ -49,6 +49,7 @@ Options:
   -c, --connections <N>              Connections to keep open to the destinations [default: 1]
       --connect-rate <R>             Limit number of new connections per second [default: 100]
       --connect-timeout <T>          Limit time spent in a connection attempt [default: 1s]
+      --init-timeout <T>             Limit first-message initialization after connect [default: 30s]
       --channel-lifetime <T>         Shut down each connection after T seconds
   -w, --workers <N>                  Number of Tokio worker threads (default: max(1, logical CPUs / 2))
       --nagle                        Enable Nagle's algorithm (TCP_NODELAY is enabled by default)

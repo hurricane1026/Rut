@@ -38,6 +38,8 @@ pub struct Config {
     pub connect_rate: u64,
     /// Connection timeout
     pub connect_timeout: Duration,
+    /// Timeout for application initialization after the transport connects
+    pub init_timeout: Duration,
     /// Channel lifetime
     pub channel_lifetime: Option<Duration>,
     /// First message
@@ -102,6 +104,7 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
         connections: *matches.get_one::<u64>("connections").unwrap(),
         connect_rate: *matches.get_one::<u64>("connect-rate").unwrap(),
         connect_timeout: *matches.get_one::<Duration>("connect-timeout").unwrap(),
+        init_timeout: *matches.get_one::<Duration>("init-timeout").unwrap(),
         channel_lifetime: matches.get_one::<Duration>("channel-lifetime").cloned(),
         first_message,
         message,
@@ -122,6 +125,11 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
     if config.connect_timeout.as_secs_f64() == 0.0 {
         return Err(TcpKaliError::Config(
             "connect-timeout must be greater than 0".into(),
+        ));
+    }
+    if config.init_timeout.is_zero() {
+        return Err(TcpKaliError::Config(
+            "init-timeout must be greater than 0".into(),
         ));
     }
     if config.duration.as_secs_f64() == 0.0 {
@@ -203,7 +211,7 @@ pub fn new_command() -> clap::ArgMatches {
     command().get_matches()
 }
 
-fn command() -> Command {
+pub(crate) fn command() -> Command {
     Command::new("tcpkali2")
         .version(env!("CARGO_PKG_VERSION"))
         .about("A load testing tool for WebSocket and TCP server")
@@ -244,6 +252,14 @@ fn command() -> Command {
                 .default_value("1s")
                 .value_parser(parse_duration)
                 .help("Limit time spent in a connection attempt"),
+        )
+        .arg(
+            Arg::new("init-timeout")
+                .long("init-timeout")
+                .value_name("T")
+                .default_value("30s")
+                .value_parser(parse_duration)
+                .help("Limit time spent waiting for first-message initialization after connect"),
         )
         .arg(
             Arg::new("channel-lifetime")
@@ -373,6 +389,33 @@ mod tests {
         argv.push("127.0.0.1:1234".to_string());
         let matches = super::command().try_get_matches_from(argv).unwrap();
         super::parse_config(&matches)
+    }
+
+    #[test]
+    fn initialization_timeout_is_configurable_and_must_be_positive() {
+        let defaults = super::command()
+            .try_get_matches_from(["tcpkali2", "127.0.0.1:1234"])
+            .unwrap();
+        assert_eq!(
+            super::parse_config(&defaults).unwrap().init_timeout,
+            std::time::Duration::from_secs(30)
+        );
+
+        let configured = super::command()
+            .try_get_matches_from(["tcpkali2", "--init-timeout", "2s", "127.0.0.1:1234"])
+            .unwrap();
+        assert_eq!(
+            super::parse_config(&configured).unwrap().init_timeout,
+            std::time::Duration::from_secs(2)
+        );
+
+        let zero = super::command()
+            .try_get_matches_from(["tcpkali2", "--init-timeout", "0s", "127.0.0.1:1234"])
+            .unwrap();
+        assert!(matches!(
+            super::parse_config(&zero),
+            Err(TcpKaliError::Config(message)) if message == "init-timeout must be greater than 0"
+        ));
     }
 
     #[test]

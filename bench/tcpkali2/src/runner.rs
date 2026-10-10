@@ -36,7 +36,7 @@ async fn wait_for_readiness(
     stats: &Stats,
     expected: u64,
     transport_stage: bool,
-    deadline: Option<time::Instant>,
+    deadline: Option<(time::Instant, &'static str)>,
     quiet: bool,
 ) -> Result<bool, TcpKaliError> {
     loop {
@@ -55,10 +55,10 @@ async fn wait_for_readiness(
         if ready {
             return Ok(true);
         }
-        if deadline.is_some_and(|deadline| time::Instant::now() >= deadline) {
-            return Err(TcpKaliError::Timeout(
-                "timed out waiting for connection handshakes".into(),
-            ));
+        if let Some((deadline, message)) = deadline
+            && time::Instant::now() >= deadline
+        {
+            return Err(TcpKaliError::Timeout(message.into()));
         }
 
         tokio::select! {
@@ -166,7 +166,10 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
         &stats,
         spawned_connections,
         true,
-        Some(handshake_deadline),
+        Some((
+            handshake_deadline,
+            "timed out waiting for connection handshakes",
+        )),
         config.quiet,
     )
     .await;
@@ -188,14 +191,18 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
         }
     }
 
-    // Optional first-message echoes are application initialization. They can
-    // take longer than connect_timeout, but every attempt must terminate.
+    // Optional first-message echoes have their own timeout after the transport
+    // is ready, so they may outlast connect_timeout without hanging forever.
+    let init_deadline = time::Instant::now() + config.init_timeout;
     let initialization_ready = wait_for_readiness(
         &mut tasks,
         &stats,
         spawned_connections,
         false,
-        None,
+        Some((
+            init_deadline,
+            "timed out waiting for connection initialization",
+        )),
         config.quiet,
     )
     .await;
@@ -409,6 +416,48 @@ mod tests {
         assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
         assert_eq!(stats.initialized_connections.load(Ordering::Relaxed), 1);
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silent_first_message_times_out_and_reaps_connection() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut first = [0; 4];
+            stream.read_exact(&mut first).await.unwrap();
+            let mut extra = [0; 1];
+            assert_eq!(stream.read(&mut extra).await.unwrap(), 0);
+        });
+        let matches = crate::command::command()
+            .try_get_matches_from(vec![
+                "tcpkali2".to_string(),
+                "-q".to_string(),
+                "--connect-timeout".to_string(),
+                "25ms".to_string(),
+                "--init-timeout".to_string(),
+                "50ms".to_string(),
+                "--first-message".to_string(),
+                "init".to_string(),
+                address.to_string(),
+            ])
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), super::async_main(matches))
+            .await
+            .expect("runner did not enforce the initialization deadline");
+        assert!(matches!(
+            result,
+            Err(crate::error::TcpKaliError::Timeout(message))
+                if message == "timed out waiting for connection initialization"
+        ));
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("runner did not close the pending worker")
+            .unwrap();
     }
 
     #[test]

@@ -313,6 +313,7 @@ mod tests {
             connections: 1,
             connect_rate: 0,
             connect_timeout: Duration::from_millis(25),
+            init_timeout: Duration::from_millis(500),
             channel_lifetime: None,
             first_message: Some(Bytes::from_static(b"init")),
             message: Some(Bytes::new()),
@@ -382,6 +383,7 @@ mod tests {
             connections: 1,
             connect_rate: 0,
             connect_timeout: Duration::from_millis(25),
+            init_timeout: Duration::from_millis(50),
             channel_lifetime: None,
             first_message: Some(Bytes::from_static(b"init")),
             message: Some(Bytes::new()),
@@ -395,9 +397,15 @@ mod tests {
         let worker_stats = stats.clone();
         let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(false);
         let worker = tokio::spawn(async move {
-            tcp_worker(&address.to_string(), config, worker_stats, load_start_rx, None)
-                .await
-                .unwrap();
+            tcp_worker(
+                &address.to_string(),
+                config,
+                worker_stats,
+                load_start_rx,
+                None,
+            )
+            .await
+            .unwrap();
         });
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -446,6 +454,7 @@ mod tests {
             connections: 1,
             connect_rate: 0,
             connect_timeout: Duration::from_secs(1),
+            init_timeout: Duration::from_secs(1),
             channel_lifetime: None,
             first_message: None,
             message: Some(payload),
