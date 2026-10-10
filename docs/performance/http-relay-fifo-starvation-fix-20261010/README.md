@@ -22,4 +22,4 @@ Validation: rebuilt Release rut, test_ws_tunnel_iouring, test_network and test_s
 
 Full raw logs/configs/frozen binaries: /home/hurricane/private/code/rut-performance-checkpoints/http-relay-fifo-starvation-fix-20261010. Diagnostic raw records are in the sibling before/after directories named in the archived logs.
 
-Raw performance summary SHA256: `01ed69fc6a69b36608ba551e921b41a0aa47707d0b23f3969d29c664fee9c352`.
+Raw performance summary SHA256: `79a88512b724911b8df5646ee5ee1f6adf3b66cb388588f1437f65dc65061ca0`.
