@@ -292,6 +292,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     bool study_ws_sync_send = false;
     u64 study_ws_sync_attempts = 0, study_ws_sync_full = 0, study_ws_sync_partial = 0;
     u64 study_ws_sync_blocked = 0, study_ws_sync_errors = 0, study_ws_sync_bytes = 0;
+    u64 study_ws_sync_cached = 0;
     u64 relay_admissions = 0;
     u64 relay_pulled_bytes = 0;
     u64 relay_written_bytes = 0;
@@ -889,6 +890,12 @@ public:
             ::close(idle_trim_pidfd);
             idle_trim_pidfd = -1;
         }
+        if (backend.ws_recv_cache_enabled)
+            ::fprintf(stderr,
+                      "RUT_WS_CACHE deferred=%llu peak=%llu live=%u\n",
+                      static_cast<unsigned long long>(backend.ws_recv_cache_deferred),
+                      static_cast<unsigned long long>(backend.ws_recv_cache_peak),
+                      backend.ws_recv_cache_count);
         backend.shutdown();
         if (ws_splice.enabled)
             ::fprintf(stderr,
@@ -916,13 +923,14 @@ public:
         if (study_ws_sync_send)
             ::fprintf(stderr,
                       "RUT_WS_SYNC attempts=%llu full=%llu partial=%llu blocked=%llu "
-                      "errors=%llu bytes=%llu\n",
+                      "errors=%llu bytes=%llu cached=%llu\n",
                       static_cast<unsigned long long>(study_ws_sync_attempts),
                       static_cast<unsigned long long>(study_ws_sync_full),
                       static_cast<unsigned long long>(study_ws_sync_partial),
                       static_cast<unsigned long long>(study_ws_sync_blocked),
                       static_cast<unsigned long long>(study_ws_sync_errors),
-                      static_cast<unsigned long long>(study_ws_sync_bytes));
+                      static_cast<unsigned long long>(study_ws_sync_bytes),
+                      static_cast<unsigned long long>(study_ws_sync_cached));
         if (backend.study_io_stats)
             ::fprintf(stderr,
                       "RUT_IO_WAIT calls=%llu enters=%llu submitted=%llu events=%llu "
@@ -3523,23 +3531,31 @@ public:
                c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode);
     }
 
-    // Only terminal one-shot opaque tunnel reads can lend this buffer to an
-    // immediate send. A positive short write leaves the entire source buffer
-    // intact; the caller submits the unsent suffix through the original send
-    // ledger and consumes the full source only when that suffix completes.
+    // Terminal one-shot reads and bounded-cache multishot reads can lend this
+    // connection buffer to an immediate send. Multishot writes only into
+    // selected kernel buffers; wait() retains later blocks while a send owns
+    // the connection buffer, so an armed cached receive cannot overwrite it.
+    // A positive short write leaves the entire source buffer intact; the caller
+    // submits the unsent suffix through the original send ledger and consumes
+    // the full source only when that suffix completes.
     bool try_ws_sync_send(Connection& c, bool upstream, const u8* source, u32 length, i32* sent) {
-        if (!study_ws_sync_send || ws_splice.enabled || !use_one_shot_websocket_recv(c) ||
-            c.is_ws_terminate || c.is_ws_terminate_route || c.ws_closing || c.ws_client_eof ||
-            c.ws_upstream_eof || c.throttle_down_bps != 0 || c.response_policy_id != 0 ||
+        if (!study_ws_sync_send || ws_splice.enabled) return false;
+        const bool kCached = ws_recv_cache_active(c) && c.protocol == ConnProtocol::Http11 &&
+                             c.fd >= 0 && c.upstream_fd >= 0 &&
+                             valid_upstream_episode(c.upstream_episode);
+        if ((!use_one_shot_websocket_recv(c) && !kCached) || c.is_ws_terminate ||
+            c.is_ws_terminate_route || c.ws_closing || c.ws_client_eof || c.ws_upstream_eof ||
+            c.throttle_down_bps != 0 || c.response_policy_id != 0 ||
             (upstream ? c.upstream_send_armed : c.send_armed) || c.recv_pause_cancel_pending ||
             c.recv_pause_target_inflight || c.upstream_recv_pause_cancel_pending ||
             c.upstream_recv_cancel_inflight || length == 0)
             return false;
         auto& buffer = upstream ? c.recv_buf : c.upstream_recv_buf;
         if (source != buffer.data() || length != buffer.len() ||
-            (upstream ? c.recv_armed : c.upstream_recv_armed))
+            (!kCached && (upstream ? c.recv_armed : c.upstream_recv_armed)))
             return false;
         ++study_ws_sync_attempts;
+        if (kCached) ++study_ws_sync_cached;
         const bool kSampled = backend.study_io_stats && (++study_splice_calls[1] & 63u) == 0;
         const u64 kStarted = kSampled ? monotonic_ns() : 0;
         ssize_t n;

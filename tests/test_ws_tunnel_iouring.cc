@@ -7,6 +7,7 @@
 #include "rut/runtime/io_backend.h"
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/iouring_event_loop.h"
+#include "rut/runtime/slice_pool.h"
 #include "rut/runtime/socket.h"
 #include "test.h"
 #include "test_helpers.h"
@@ -90,7 +91,9 @@ static void full_duplex_burst(test::TestCase* _tc,
                               bool fast_batch = false,
                               bool sync_send = false,
                               u32 direct_recv_limit = 0,
-                              bool poll_first = false) {
+                              bool poll_first = false,
+                              bool queued_fin = false) {
+    REQUIRE(!half_close || splice);
     LoopStorage storage;
     if (!storage.init()) return;
     auto& loop = *storage.loop;
@@ -199,6 +202,18 @@ static void full_duplex_burst(test::TestCase* _tc,
         CHECK_EQ(conn->pending_ops, 0u);
         return;
     }
+    if (queued_fin) {
+        REQUIRE(cache);
+        for (u32 i = 0; i < 100 && loop.backend.ws_recv_cache_count == 0; ++i) {
+            IoEvent events[kMaxEventsPerWait]{};
+            const u32 kCount = loop.backend.wait(
+                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+            loop.dispatch_batch(events, kCount);
+            if (kCount == 0) usleep(1000);
+        }
+        REQUIRE(loop.backend.ws_recv_cache_count > 0);
+        REQUIRE_EQ(shutdown(kClient.fd, SHUT_WR), 0);
+    }
     u32 client_bytes = 0, origin_bytes = 0;
     const u64 kStart = monotonic_ns();
     const u64 kDeadline = kStart + 4ull * 1000 * 1000 * 1000;
@@ -208,7 +223,7 @@ static void full_duplex_burst(test::TestCase* _tc,
             loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
         loop.dispatch_batch(events, kCount);
         REQUIRE_EQ(loop.backend.failure_code(), 0);
-        REQUIRE(conn->fd >= 0);
+        REQUIRE(queued_fin || conn->fd >= 0);
         if (!slow_reader || monotonic_ns() - kStart >= 30ull * 1000 * 1000) {
             REQUIRE(read_available(kClient.fd, received_client, &client_bytes, kBytes));
             REQUIRE(read_available(kOrigin.fd, received_origin, &origin_bytes, kBytes));
@@ -221,6 +236,7 @@ static void full_duplex_burst(test::TestCase* _tc,
     if (poll_first) CHECK(loop.study_ws_poll_first_arms > 0);
     if (sync_send) {
         CHECK(loop.study_ws_sync_attempts > 0);
+        if (cache) CHECK(loop.study_ws_sync_cached > 0);
         if (slow_reader)
             CHECK(loop.study_ws_sync_partial + loop.study_ws_sync_blocked > 0);
         else
@@ -229,7 +245,7 @@ static void full_duplex_burst(test::TestCase* _tc,
     CHECK(__builtin_memcmp(received_client, sent_origin, kBytes) == 0);
     CHECK(__builtin_memcmp(received_origin, sent_client, kBytes) == 0);
     if (cache) {
-        CHECK(loop.backend.ws_recv_cache_deferred > 0);
+        if (kBytes > SlicePool::kSliceSize) CHECK(loop.backend.ws_recv_cache_deferred > 0);
         CHECK_EQ(loop.backend.ws_recv_cache_count, 0u);
     }
     if (splice) {
@@ -237,7 +253,16 @@ static void full_duplex_burst(test::TestCase* _tc,
         CHECK_EQ(loop.ws_splice.transferred[0], pipe_failure ? 0u : kBytes - prefix);
         CHECK_EQ(loop.ws_splice.transferred[1], pipe_failure ? 0u : kBytes - prefix);
     }
-    if (half_close) {
+    if (queued_fin) {
+        for (u32 i = 0; i < 1000 && conn->fd >= 0; ++i) {
+            IoEvent events[kMaxEventsPerWait]{};
+            const u32 kCount = loop.backend.wait(
+                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+            loop.dispatch_batch(events, kCount);
+            if (kCount == 0) usleep(1000);
+        }
+        REQUIRE(conn->fd < 0);
+    } else if (half_close) {
         REQUIRE_EQ(shutdown(kClient.fd, SHUT_WR), 0);
         for (u32 i = 0; i < 1000 && !loop.ws_splice.owners[conn->id].direction[0].eof; ++i) {
             IoEvent events[kMaxEventsPerWait]{};
@@ -526,6 +551,76 @@ TEST(websocket, iouring_poll_first_sync_small_slow_and_close) {
                       false,
                       true,
                       16384,
+                      true);
+}
+
+TEST(websocket, iouring_multishot_sync_small_slow_and_close) {
+    full_duplex_burst(_tc,
+                      true,
+                      false,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64,
+                      4096,
+                      false,
+                      false,
+                      true);
+    full_duplex_burst(_tc,
+                      true,
+                      false,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true);
+    full_duplex_burst(_tc,
+                      true,
+                      true,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true);
+    full_duplex_burst(_tc,
+                      true,
+                      false,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true,
+                      0,
+                      false,
                       true);
 }
 
