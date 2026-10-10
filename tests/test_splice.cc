@@ -528,10 +528,6 @@ TEST(epoll_stable_edge, healthy_watched_idle_socket_preserves_owner) {
     REQUIRE(f.init(true));
     const i32 fd = f.conns[0].upstream_fd;
     REQUIRE(f.park(0));
-    const u32 slot = f.backend.stable_upstream[fd].pool_slot;
-    REQUIRE(f.pool.idle_reuse_probe_required != nullptr);
-    CHECK_FALSE(f.pool.idle_reuse_probe_required(f.pool.idle_close_ctx, fd, slot));
-    CHECK(f.pool.idle_reuse_probe_required(f.pool.idle_close_ctx, fd, slot + 1));
     REQUIRE_EQ(f.borrow(1), fd);
     REQUIRE_EQ(::send(f.peer, "body", 4, MSG_NOSIGNAL), 4);
     REQUIRE(f.backend.add_recv_upstream(fd, 1, f.conns[1].upstream_episode));
@@ -582,7 +578,6 @@ TEST(epoll_stable_edge, exhausted_full_read_is_probed_once_when_parked) {
     const auto& transport = f.backend.stable_upstream[fd];
     CHECK(transport.registered);
     CHECK_FALSE(transport.idle_probe_pending);
-    CHECK_FALSE(f.pool.idle_reuse_probe_required(f.pool.idle_close_ctx, fd, transport.pool_slot));
     REQUIRE_EQ(f.borrow(1), fd);
 }
 
@@ -985,20 +980,21 @@ TEST(epoll_stable, harvested_idle_readiness_and_reload_reject_idle_transport) {
     CHECK_EQ(reload.pool.idle_count.load(), 0u);
 }
 
-TEST(epoll_stable, backend_teardown_restores_pool_probe_fallback) {
+TEST(epoll_stable, backend_teardown_clears_idle_close_hook) {
     StableEpollFixture f;
     REQUIRE(f.init());
     const i32 fd = f.conns[0].upstream_fd;
     REQUIRE(f.park(0));
-    REQUIRE(f.pool.idle_reuse_probe_required != nullptr);
+    REQUIRE(f.pool.before_idle_close != nullptr);
 
     // The pool outlives this backend during a shard/backend rebind.
     f.backend.shutdown();
-    CHECK(f.pool.idle_reuse_probe_required == nullptr);
+    CHECK(f.pool.before_idle_close == nullptr);
     CHECK(f.pool.idle_close_ctx == nullptr);
-    CHECK_EQ(f.pool.take_idle(0, 0), fd);
-    CHECK_EQ(fcntl(fd, F_GETFD) >= 0, 1);
-    close(fd);
+    REQUIRE_EQ(::send(f.peer, "x", 1, MSG_NOSIGNAL), 1);
+    CHECK_EQ(f.pool.take_idle(0, 0), -1);
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
 }
 
 TEST(epoll_stable, generation_rejects_old_token_even_when_owner_version_matches) {
