@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -26,9 +27,12 @@ struct WsSpliceExperiment {
     MappedArray<Owner> owners;
     MappedArray<u32> queued;
     u32 queued_count = 0;
-    bool enabled = false, copy_first = false;
+    bool enabled = false, copy_first = false, check_available = false, fast_batch = false;
+    bool fast_scan = false, last_batch_ws_only = false;
+    u64 deadline_batches_skipped = 0, terminal_scans_skipped = 0;
     u64 admissions = 0, transferred[2]{}, calls = 0;
     u32 chunk_size = 65536, call_budget = 8;
+    u32 copy_limit = 4096;
     u64 polls = 0, eagain[2]{}, pipe_grow_failures = 0;
     u32 minimum_pipe_capacity = 0xffffffffu;
     bool enable(u32 capacity) {
@@ -121,16 +125,25 @@ struct WsSpliceExperiment {
         for (u32 budget = 0; budget < turn_limit; ++budget) {
             const bool kWriting = d.buffered != 0;
             auto& buffer = index == 0 ? c.recv_buf : c.upstream_recv_buf;
-            const bool kCopy = kWriting ? d.copying : (copy_first && d.probe_copy);
-            const u32 kCopyLength = buffer.write_avail() < 4096u ? buffer.write_avail() : 4096u;
-            if (!kWriting && kCopy && kCopyLength == 0) {
+            bool copy = kWriting ? d.copying : (copy_first && d.probe_copy);
+            const u32 kCopyLength =
+                buffer.write_avail() < copy_limit ? buffer.write_avail() : copy_limit;
+            if (!kWriting && copy && check_available) {
+                int available = 0;
+                if (::ioctl(kSource, FIONREAD, &available) == 0 &&
+                    available > static_cast<int>(kCopyLength)) {
+                    copy = false;
+                    d.probe_copy = false;
+                }
+            }
+            if (!kWriting && copy && kCopyLength == 0) {
                 loop.close_conn(c);
                 return;
             }
             ssize_t n;
             do {
                 ++calls;
-                if (kCopy) {
+                if (copy) {
                     n = kWriting ? ::send(kDestination,
                                           buffer.data(),
                                           d.buffered,
@@ -168,12 +181,12 @@ struct WsSpliceExperiment {
             }
             if (kWriting) {
                 d.buffered -= static_cast<u32>(n);
-                if (kCopy) buffer.consume(static_cast<u32>(n));
+                if (copy) buffer.consume(static_cast<u32>(n));
                 transferred[index] += static_cast<u32>(n);
             } else {
-                d.copying = kCopy;
+                d.copying = copy;
                 d.buffered = static_cast<u32>(n);
-                if (kCopy) {
+                if (copy) {
                     buffer.commit(static_cast<u32>(n));
                     if (static_cast<u32>(n) == kCopyLength) {
                         d.probe_copy = false;

@@ -84,7 +84,10 @@ static void full_duplex_burst(test::TestCase* _tc,
                               u32 segment = 65536,
                               u32 budget = 8,
                               bool copy_first = false,
-                              u32 payload_bytes = 64 * 1024 + 73) {
+                              u32 payload_bytes = 64 * 1024 + 73,
+                              u32 copy_limit = 4096,
+                              bool check_available = false,
+                              bool fast_batch = false) {
     LoopStorage storage;
     if (!storage.init()) return;
     auto& loop = *storage.loop;
@@ -94,6 +97,10 @@ static void full_duplex_burst(test::TestCase* _tc,
         loop.ws_splice.chunk_size = segment;
         loop.ws_splice.call_budget = budget;
         loop.ws_splice.copy_first = copy_first;
+        loop.ws_splice.copy_limit = copy_limit;
+        loop.ws_splice.check_available = check_available;
+        loop.ws_splice.fast_batch = fast_batch;
+        loop.ws_splice.fast_scan = fast_batch;
     }
     int downstream[2], upstream[2];
     REQUIRE_EQ(test::stream_socketpair(downstream), 0);
@@ -250,6 +257,12 @@ static void full_duplex_burst(test::TestCase* _tc,
         if (kCount == 0) usleep(1000);
     }
     CHECK_EQ(conn->pending_ops, 0u);
+    if (fast_batch && half_close) {
+        // The initial burst can drain synchronously during handoff. FIN and
+        // the reverse reply force actual readiness completions afterward.
+        CHECK(loop.ws_splice.deadline_batches_skipped > 0);
+        CHECK(loop.ws_splice.terminal_scans_skipped > 0);
+    }
 }
 
 TEST(websocket, iouring_full_duplex_burst_exceeds_receive_slice) {
@@ -298,6 +311,93 @@ TEST(websocket, iouring_splice_copy_first_small_and_threshold) {
     full_duplex_burst(_tc, false, false, false, true, true, 0, false, 65536, 2, true, 64);
     full_duplex_burst(_tc, false, false, true, true, false, 0, false, 65536, 2, true, 4096);
     full_duplex_burst(_tc, false, false, true, true, false, 0, false, 65536, 2, true, 4097);
+}
+
+TEST(websocket, iouring_splice_copy_first_large_prefix_boundaries) {
+    full_duplex_burst(_tc, false, false, true, true, false, 0, false, 65536, 2, true, 16384, 16384);
+    full_duplex_burst(_tc, false, false, true, true, true, 37, false, 65536, 2, true, 16385, 16384);
+    full_duplex_burst(_tc, false, true, true, true, false, 0, false, 65536, 2, true, 65536, 16384);
+}
+
+TEST(websocket, iouring_splice_available_bytes_gate) {
+    full_duplex_burst(
+        _tc, false, false, false, true, true, 0, false, 65536, 2, true, 64, 4096, true);
+    full_duplex_burst(
+        _tc, false, false, true, true, false, 37, false, 65536, 2, true, 65536, 4096, true);
+    full_duplex_burst(
+        _tc, false, true, true, true, false, 0, false, 65536, 2, true, 65536, 4096, true);
+}
+
+TEST(websocket, iouring_splice_fast_batch_preserves_mixed_preparation) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    loop.ws_splice.fast_batch = true;
+    IoEvent events[2]{};
+    events[0].type = IoEventType::RelayRead;
+    events[0].aux = 32;
+    loop.response_read_batch_owner_index[0] = 17;
+    loop.prepare_response_read_deadline_batch(events, 1);
+    CHECK_EQ(loop.ws_splice.deadline_batches_skipped, 1u);
+    CHECK(!loop.response_read_batch_owner_index_active);
+    CHECK_EQ(loop.response_read_batch_owner_count, 0u);
+    CHECK_EQ(loop.response_read_batch_event_owner[0], 0u);
+    // An HTTP/timer completion forces the ordinary preparation and clears
+    // the old inactive index before it can be reused by a future owner.
+    events[1].type = IoEventType::ResponseReadTimer;
+    events[1].conn_id = loop.connection_capacity;
+    loop.prepare_response_read_deadline_batch(events, 2);
+    CHECK_EQ(loop.ws_splice.deadline_batches_skipped, 1u);
+    CHECK(loop.response_read_batch_owner_index_active);
+    CHECK_EQ(loop.response_read_batch_owner_index[0], 0u);
+    events[0].aux = 0;  // Ordinary HTTP relay events must also use normal preparation.
+    loop.prepare_response_read_deadline_batch(events, 1);
+    CHECK_EQ(loop.ws_splice.deadline_batches_skipped, 1u);
+}
+TEST(websocket, iouring_splice_fast_scan_invalidates_on_http_terminal_owner) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    loop.ws_splice.fast_batch = loop.ws_splice.fast_scan = true;
+    int fds[2];
+    REQUIRE_EQ(test::stream_socketpair(fds), 0);
+    const Peer kPeer{fds[1]};
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = fds[0];
+    IoEvent event{};
+    event.type = IoEventType::RelayRead;
+    event.aux = 32;
+    event.conn_id = loop.connection_capacity;  // retired relay identity, no live owner
+    loop.dispatch_batch(&event, 1);
+    CHECK(!loop.response_read_terminal_scan_needed);
+    loop.dispatch_batch(&event, 1);
+    CHECK_EQ(loop.ws_splice.terminal_scans_skipped, 1u);
+    conn->send_armed = true;  // HTTP terminal must wait for its existing send
+    loop.mark_response_read_terminal_pending(*conn);
+    REQUIRE(loop.response_read_terminal_scan_needed);
+    loop.dispatch_batch(&event, 1);
+    CHECK(loop.response_read_terminal_scan_needed);
+    CHECK_EQ(loop.ws_splice.terminal_scans_skipped, 1u);
+    conn->response_read_deadline_post_commit_terminal_pending = false;
+    conn->send_armed = false;
+    loop.dispatch_batch(&event, 1);
+    CHECK(!loop.response_read_terminal_scan_needed);
+    loop.dispatch_batch(&event, 1);
+    CHECK_EQ(loop.ws_splice.terminal_scans_skipped, 2u);
+    event.type = IoEventType::ResponseReadTimer;
+    loop.dispatch_batch(&event, 1);
+    CHECK_EQ(loop.ws_splice.terminal_scans_skipped, 2u);
+    loop.close_conn(*conn);
+}
+
+TEST(websocket, iouring_splice_fast_batch_half_close_and_cancel) {
+    full_duplex_burst(
+        _tc, false, false, true, true, true, 37, false, 65536, 2, true, 65536, 4096, false, true);
+    full_duplex_burst(
+        _tc, false, true, true, true, false, 0, false, 65536, 2, true, 65536, 4096, false, true);
 }
 
 TEST(websocket, iouring_splice_copy_first_slow_half_close) {

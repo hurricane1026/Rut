@@ -281,6 +281,9 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u32 deferred_relay_read_episodes[kDeferredRelayReadLimit]{};
     // Read-only diagnostics for focused validation and post-run evidence.
     WsSpliceExperiment ws_splice;
+    // Conservative negative cache: only the terminal-pending publisher can
+    // introduce an owner. Normal/mixed batches still scan unconditionally.
+    bool response_read_terminal_scan_needed = true;
     u64 relay_admissions = 0;
     u64 relay_pulled_bytes = 0;
     u64 relay_written_bytes = 0;
@@ -869,13 +872,14 @@ public:
         }
         backend.shutdown();
         if (ws_splice.enabled)
-            ::fprintf(
-                stderr,
-                "RUT_WS_SPLICE admissions=%llu client_bytes=%llu upstream_bytes=%llu calls=%llu polls=%llu read_eagain=%llu write_eagain=%llu pipe_grow_failures=%llu min_pipe_capacity=%u\n",
-                static_cast<unsigned long long>(ws_splice.admissions),
-                static_cast<unsigned long long>(ws_splice.transferred[0]),
-                static_cast<unsigned long long>(ws_splice.transferred[1]),
-                static_cast<unsigned long long>(ws_splice.calls),
+            ::fprintf(stderr,
+                      "RUT_WS_SPLICE admissions=%llu client_bytes=%llu upstream_bytes=%llu "
+                      "calls=%llu polls=%llu read_eagain=%llu write_eagain=%llu "
+                      "pipe_grow_failures=%llu min_pipe_capacity=%u\n",
+                      static_cast<unsigned long long>(ws_splice.admissions),
+                      static_cast<unsigned long long>(ws_splice.transferred[0]),
+                      static_cast<unsigned long long>(ws_splice.transferred[1]),
+                      static_cast<unsigned long long>(ws_splice.calls),
                       static_cast<unsigned long long>(ws_splice.polls),
                       static_cast<unsigned long long>(ws_splice.eagain[0]),
                       static_cast<unsigned long long>(ws_splice.eagain[1]),
@@ -5293,9 +5297,29 @@ public:
     }
 
     void prepare_response_read_deadline_batch(const IoEvent* events, u32 count) {
+        ws_splice.last_batch_ws_only = false;
         response_read_batch_events = events;
         response_read_batch_owner_count = 0;
         response_read_batch_owner_index_active = false;
+        // These auxiliary domains belong exclusively to the opaque WebSocket
+        // relay ledger, including its cancel acknowledgements. They cannot
+        // contribute HTTP response-read deadline owners. Keep the common
+        // post-dispatch maintenance, and always prepare mixed batches normally.
+        bool ws_only = ws_splice.enabled && ws_splice.fast_batch && count != 0;
+        for (u32 i = 0; ws_only && i < count; ++i) {
+            const auto& ev = events[i];
+            ws_only = (ev.type == IoEventType::RelayRead || ev.type == IoEventType::RelayWrite) &&
+                      (ev.aux == 32 || ev.aux == 33 || ev.aux == 96 || ev.aux == 97);
+        }
+        if (ws_only) {
+            ws_splice.last_batch_ws_only = true;
+            response_read_batch_event_count = count;
+            response_read_batch_event_index = 0;
+            response_read_batch_pin_count = 0;
+            for (u32 i = 0; i < count; ++i) response_read_batch_event_owner[i] = 0;
+            ++ws_splice.deadline_batches_skipped;
+            return;
+        }
         __builtin_memset(
             response_read_batch_owner_index, 0, sizeof(response_read_batch_owner_index));
         response_read_batch_owner_index_active = true;
@@ -6098,6 +6122,11 @@ public:
             ::close(fd);
     }
 
+    void mark_response_read_terminal_pending(Connection& c) {
+        c.response_read_deadline_post_commit_terminal_pending = true;
+        response_read_terminal_scan_needed = true;
+    }
+
     [[nodiscard]] bool finish_bounded_content_length_release(Connection& c,
                                                              u32 target,
                                                              bool close_after_drain,
@@ -6138,7 +6167,7 @@ public:
                 // already-harvested post-terminal positive recv records.
                 c.upstream_recv_terminal_stale = true;
             }
-            c.response_read_deadline_post_commit_terminal_pending = true;
+            mark_response_read_terminal_pending(c);
             return true;
         }
         const bool reusable_origin = bounded_origin_can_return_idle(c, target, close_after_drain);
@@ -7204,15 +7233,23 @@ public:
         study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
-        for (u32 id = 0; id < slots_initialized; ++id) {
-            Connection& c = conns[id];
-            if (c.response_read_deadline_post_commit_terminal_pending && !c.send_armed &&
-                c.response_read_deadline_post_commit_phase ==
-                    ResponseReadDeadlinePostCommitPhase::WaitingBody &&
-                !c.upstream_recv_armed && !c.upstream_recv_pause_cancel_pending &&
-                !c.upstream_recv_cancel_inflight && !c.upstream_recv_pause_rearm_pending &&
-                !c.upstream_recv_paused_for_send && c.response_read_timer_owner_is_neutral())
-                defer_response_read_deadline_body_pump(c);
+        if (!ws_splice.fast_scan || !ws_splice.last_batch_ws_only ||
+            response_read_terminal_scan_needed) {
+            bool any_pending = false;
+            for (u32 id = 0; id < slots_initialized; ++id) {
+                Connection& c = conns[id];
+                any_pending = any_pending || c.response_read_deadline_post_commit_terminal_pending;
+                if (c.response_read_deadline_post_commit_terminal_pending && !c.send_armed &&
+                    c.response_read_deadline_post_commit_phase ==
+                        ResponseReadDeadlinePostCommitPhase::WaitingBody &&
+                    !c.upstream_recv_armed && !c.upstream_recv_pause_cancel_pending &&
+                    !c.upstream_recv_cancel_inflight && !c.upstream_recv_pause_rearm_pending &&
+                    !c.upstream_recv_paused_for_send && c.response_read_timer_owner_is_neutral())
+                    defer_response_read_deadline_body_pump(c);
+            }
+            response_read_terminal_scan_needed = any_pending;
+        } else {
+            ++ws_splice.terminal_scans_skipped;
         }
         pump_response_read_deadline_bodies();
         // Retirement/header rendezvous owners publish only readiness during

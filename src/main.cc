@@ -424,6 +424,12 @@ static void configure_study_policy(Loop* loop) {
                     loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
             for (char** item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_WS_COPY=on")) loop->ws_splice.copy_first = true;
+                if (str_eq(*item, "RUT_STUDY_WS_FAST_BATCH=on")) loop->ws_splice.fast_batch = true;
+                if (str_eq(*item, "RUT_STUDY_WS_FAST_SCAN=on")) loop->ws_splice.fast_scan = true;
+                if (str_eq(*item, "RUT_STUDY_WS_AVAILABLE=on"))
+                    loop->ws_splice.check_available = true;
+                if (str_eq(*item, "RUT_STUDY_WS_COPY_LIMIT=16k"))
+                    loop->ws_splice.copy_limit = 16384;
                 if (str_eq(*item, "RUT_STUDY_WS_SEGMENT=16k")) loop->ws_splice.chunk_size = 16384;
                 if (str_eq(*item, "RUT_STUDY_WS_SEGMENT=128k")) loop->ws_splice.chunk_size = 131072;
                 if (str_eq(*item, "RUT_STUDY_WS_CALLS=2")) loop->ws_splice.call_budget = 2;
@@ -431,6 +437,15 @@ static void configure_study_policy(Loop* loop) {
             }
             write_str(loop->ws_splice.copy_first ? "RUT_STUDY_WS_COPY mode=on\n"
                                                  : "RUT_STUDY_WS_COPY mode=off\n");
+            write_str(loop->ws_splice.check_available ? "RUT_STUDY_WS_AVAILABLE mode=on\n"
+                                                      : "RUT_STUDY_WS_AVAILABLE mode=off\n");
+            write_str(loop->ws_splice.fast_batch ? "RUT_STUDY_WS_FAST_BATCH mode=on\n"
+                                                 : "RUT_STUDY_WS_FAST_BATCH mode=off\n");
+            write_str(loop->ws_splice.fast_scan ? "RUT_STUDY_WS_FAST_SCAN mode=on\n"
+                                                : "RUT_STUDY_WS_FAST_SCAN mode=off\n");
+            write_str("RUT_STUDY_WS_COPY_LIMIT bytes=");
+            write_u32(loop->ws_splice.copy_limit);
+            write_str("\n");
             write_str("RUT_STUDY_WS_PARAMETERS chunk=");
             write_u32(loop->ws_splice.chunk_size);
             write_str(" calls=");

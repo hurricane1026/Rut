@@ -1,0 +1,902 @@
+[
+  {
+    "profile": "base",
+    "cores": {
+      "cpu0": {
+        "busy": 2.938388625592417,
+        "user": 1.990521327014218,
+        "system": 0.2843601895734597,
+        "softirq": 0.5687203791469194,
+        "idle": 97.06161137440758
+      },
+      "cpu1": {
+        "busy": 0.0946073793755913,
+        "user": 0.0,
+        "system": 0.0946073793755913,
+        "softirq": 0.0,
+        "idle": 99.90539262062441
+      },
+      "cpu2": {
+        "busy": 95.45884578997162,
+        "user": 4.068117313150426,
+        "system": 54.588457899716175,
+        "softirq": 36.51844843897824,
+        "idle": 2.6490066225165565
+      },
+      "cpu3": {
+        "busy": 93.27014218009478,
+        "user": 44.54976303317535,
+        "system": 39.81042654028436,
+        "softirq": 8.530805687203792,
+        "idle": 6.729857819905213
+      },
+      "cpu4": {
+        "busy": 68.6367969494757,
+        "user": 41.84938036224976,
+        "system": 19.065776930409914,
+        "softirq": 7.435653002859866,
+        "idle": 31.36320305052431
+      },
+      "cpu5": {
+        "busy": 42.404473438956195,
+        "user": 16.123019571295433,
+        "system": 18.825722273998135,
+        "softirq": 7.1761416589002796,
+        "idle": 57.595526561043805
+      },
+      "cpu6": {
+        "busy": 41.935483870967744,
+        "user": 15.464895635673624,
+        "system": 18.500948766603415,
+        "softirq": 7.685009487666034,
+        "idle": 58.064516129032256
+      },
+      "cpu7": {
+        "busy": 41.69847328244275,
+        "user": 15.83969465648855,
+        "system": 18.22519083969466,
+        "softirq": 7.347328244274809,
+        "idle": 58.30152671755725
+      },
+      "cpu8": {
+        "busy": 85.1207729468599,
+        "user": 42.028985507246375,
+        "system": 35.169082125603865,
+        "softirq": 7.632850241545894,
+        "idle": 14.879227053140097
+      },
+      "cpu9": {
+        "busy": 94.02843601895735,
+        "user": 45.59241706161137,
+        "system": 39.43127962085308,
+        "softirq": 8.72037914691943,
+        "idle": 5.971563981042654
+      },
+      "cpu10": {
+        "busy": 0.3784295175023652,
+        "user": 0.28382213812677387,
+        "system": 0.0946073793755913,
+        "softirq": 0.0,
+        "idle": 99.62157048249763
+      },
+      "cpu11": {
+        "busy": 4.1548630783758265,
+        "user": 4.0604343720491025,
+        "system": 0.09442870632672333,
+        "softirq": 0.0,
+        "idle": 95.84513692162417
+      },
+      "cpu12": {
+        "busy": 0.3784295175023652,
+        "user": 0.0946073793755913,
+        "system": 0.1892147587511826,
+        "softirq": 0.0,
+        "idle": 99.62157048249763
+      },
+      "cpu13": {
+        "busy": 0.8522727272727273,
+        "user": 0.6628787878787878,
+        "system": 0.1893939393939394,
+        "softirq": 0.0,
+        "idle": 99.14772727272727
+      },
+      "cpu14": {
+        "busy": 1.2287334593572778,
+        "user": 0.945179584120983,
+        "system": 0.1890359168241966,
+        "softirq": 0.0,
+        "idle": 98.77126654064273
+      },
+      "cpu15": {
+        "busy": 1.7061611374407584,
+        "user": 1.5165876777251184,
+        "system": 0.1895734597156398,
+        "softirq": 0.0,
+        "idle": 97.91469194312796
+      }
+    },
+    "measurement": {
+      "kind": "websocket",
+      "payload_bytes": 64,
+      "concurrent_connections": 192,
+      "duration_seconds": 8,
+      "messages": 688386,
+      "bytes": 44056704,
+      "connections": 192,
+      "errors": 0,
+      "valid": true,
+      "messages_per_second": 86011.69,
+      "received_mib_per_second": 5.249977111816406,
+      "rtt_us": {
+        "p50_us": 2215.0,
+        "p95_us": 2527.0,
+        "p99_us": 2589.0,
+        "max_us": 7787.0
+      },
+      "first_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "delivery_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "gap_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "source_gap_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "client_workers": [
+        {
+          "cpu_seconds": 9.926461,
+          "observation_seconds": 10.081155028892681,
+          "cpu_pct": 98.46551284600497,
+          "cpu": "5,6,7"
+        }
+      ],
+      "tcpkali2_csv": {
+        "timestamp": "2026-10-10T00:05:06Z",
+        "target": "ws://127.0.0.1:8804/ws",
+        "connections": "192",
+        "connect_rate": "10000",
+        "connect_timeout_s": "5.00",
+        "channel_lifetime_s": "-1",
+        "duration_s": "8.00",
+        "warmup_s": "2.00",
+        "workers": "3",
+        "nagle": "false",
+        "pipeline": "false",
+        "websocket": "true",
+        "message_size": "64",
+        "message_rate": "-1",
+        "total_connections": "192",
+        "success_rate_pct": "100.0",
+        "total_requests": "688386",
+        "connection_errors": "0",
+        "connection_error_rate_pct": "0.00",
+        "requests_per_sec": "86011.69",
+        "throughput_mb": "88.11",
+        "bandwidth_mb_s": "11.01",
+        "traffic_down_mbps": "44.04",
+        "traffic_up_mbps": "44.04",
+        "latency_avg_us": "2231.4",
+        "latency_min_us": "323",
+        "latency_p50_us": "2215",
+        "latency_p90_us": "2497",
+        "latency_p95_us": "2527",
+        "latency_p99_us": "2589",
+        "latency_max_us": "7787",
+        "latency_samples": "688386",
+        "latency_sample_shift": "0",
+        "verify_payload": "true"
+      },
+      "latency_definition": "send start through full reply; includes frame preparation",
+      "case": {
+        "name": "websocket-interactive-64",
+        "kind": "websocket",
+        "size": 64,
+        "chunks": 16,
+        "delay": 0
+      },
+      "engine": "uring",
+      "policy": "current",
+      "repeat": 1,
+      "ws_recv_mode": "once",
+      "ws_splice_mode": "on",
+      "ws_segment": "64k",
+      "ws_calls": "2",
+      "cpu_observation_seconds": 10.082207878120244,
+      "frontend_cpu_pct": 60.40343616814452,
+      "origin_cpu_pct": 318.0850899691946,
+      "stage": "core-probe",
+      "profile": "base",
+      "outer_repeat": 1
+    }
+  },
+  {
+    "profile": "scan",
+    "cores": {
+      "cpu0": {
+        "busy": 1.8078020932445291,
+        "user": 1.236917221693625,
+        "system": 0.09514747859181731,
+        "softirq": 0.47573739295908657,
+        "idle": 98.19219790675547
+      },
+      "cpu1": {
+        "busy": 2.1821631878557874,
+        "user": 1.8975332068311195,
+        "system": 0.18975332068311196,
+        "softirq": 0.0,
+        "idle": 97.81783681214421
+      },
+      "cpu2": {
+        "busy": 95.44592030360532,
+        "user": 3.984819734345351,
+        "system": 54.93358633776091,
+        "softirq": 36.24288425047438,
+        "idle": 3.0360531309297913
+      },
+      "cpu3": {
+        "busy": 93.72623574144487,
+        "user": 43.72623574144487,
+        "system": 40.96958174904943,
+        "softirq": 8.65019011406844,
+        "idle": 6.273764258555133
+      },
+      "cpu4": {
+        "busy": 93.91634980988593,
+        "user": 45.247148288973385,
+        "system": 39.543726235741445,
+        "softirq": 8.745247148288973,
+        "idle": 6.083650190114068
+      },
+      "cpu5": {
+        "busy": 42.69449715370019,
+        "user": 16.03415559772296,
+        "system": 18.880455407969638,
+        "softirq": 7.590132827324478,
+        "idle": 57.30550284629981
+      },
+      "cpu6": {
+        "busy": 43.33017975402081,
+        "user": 16.272469252601702,
+        "system": 19.01608325449385,
+        "softirq": 7.757805108798486,
+        "idle": 56.66982024597919
+      },
+      "cpu7": {
+        "busy": 42.979127134724855,
+        "user": 16.31878557874763,
+        "system": 18.975332068311197,
+        "softirq": 7.495256166982922,
+        "idle": 57.020872865275145
+      },
+      "cpu8": {
+        "busy": 92.93893129770993,
+        "user": 45.229007633587784,
+        "system": 38.74045801526717,
+        "softirq": 8.587786259541986,
+        "idle": 7.061068702290076
+      },
+      "cpu9": {
+        "busy": 72.9990356798457,
+        "user": 44.455159112825456,
+        "system": 20.25072324011572,
+        "softirq": 7.907425265188042,
+        "idle": 27.000964320154292
+      },
+      "cpu10": {
+        "busy": 0.9478672985781991,
+        "user": 0.6635071090047393,
+        "system": 0.1895734597156398,
+        "softirq": 0.0,
+        "idle": 98.76777251184834
+      },
+      "cpu11": {
+        "busy": 0.0947867298578199,
+        "user": 0.0,
+        "system": 0.0,
+        "softirq": 0.0,
+        "idle": 99.90521327014218
+      },
+      "cpu12": {
+        "busy": 0.3795066413662239,
+        "user": 0.18975332068311196,
+        "system": 0.18975332068311196,
+        "softirq": 0.0,
+        "idle": 99.62049335863378
+      },
+      "cpu13": {
+        "busy": 0.2846299810246679,
+        "user": 0.18975332068311196,
+        "system": 0.0,
+        "softirq": 0.0,
+        "idle": 99.71537001897534
+      },
+      "cpu14": {
+        "busy": 3.1368821292775664,
+        "user": 3.1368821292775664,
+        "system": 0.0,
+        "softirq": 0.0,
+        "idle": 96.86311787072243
+      },
+      "cpu15": {
+        "busy": 1.5151515151515151,
+        "user": 1.231060606060606,
+        "system": 0.1893939393939394,
+        "softirq": 0.0,
+        "idle": 98.48484848484848
+      }
+    },
+    "measurement": {
+      "kind": "websocket",
+      "payload_bytes": 64,
+      "concurrent_connections": 192,
+      "duration_seconds": 8,
+      "messages": 698826,
+      "bytes": 44724864,
+      "connections": 192,
+      "errors": 0,
+      "valid": true,
+      "messages_per_second": 87311.48,
+      "received_mib_per_second": 5.328655242919922,
+      "rtt_us": {
+        "p50_us": 2167.0,
+        "p95_us": 2487.0,
+        "p99_us": 2543.0,
+        "max_us": 3137.0
+      },
+      "first_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "delivery_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "gap_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "source_gap_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "client_workers": [
+        {
+          "cpu_seconds": 10.165217,
+          "observation_seconds": 10.029614981031045,
+          "cpu_pct": 101.35201619628887,
+          "cpu": "5,6,7"
+        }
+      ],
+      "tcpkali2_csv": {
+        "timestamp": "2026-10-10T00:05:16Z",
+        "target": "ws://127.0.0.1:8804/ws",
+        "connections": "192",
+        "connect_rate": "10000",
+        "connect_timeout_s": "5.00",
+        "channel_lifetime_s": "-1",
+        "duration_s": "8.00",
+        "warmup_s": "2.00",
+        "workers": "3",
+        "nagle": "false",
+        "pipeline": "false",
+        "websocket": "true",
+        "message_size": "64",
+        "message_rate": "-1",
+        "total_connections": "192",
+        "success_rate_pct": "100.0",
+        "total_requests": "698826",
+        "connection_errors": "0",
+        "connection_error_rate_pct": "0.00",
+        "requests_per_sec": "87311.48",
+        "throughput_mb": "89.45",
+        "bandwidth_mb_s": "11.18",
+        "traffic_down_mbps": "44.70",
+        "traffic_up_mbps": "44.70",
+        "latency_avg_us": "2198.0",
+        "latency_min_us": "1729",
+        "latency_p50_us": "2167",
+        "latency_p90_us": "2459",
+        "latency_p95_us": "2487",
+        "latency_p99_us": "2543",
+        "latency_max_us": "3137",
+        "latency_samples": "698826",
+        "latency_sample_shift": "0",
+        "verify_payload": "true"
+      },
+      "latency_definition": "send start through full reply; includes frame preparation",
+      "case": {
+        "name": "websocket-interactive-64",
+        "kind": "websocket",
+        "size": 64,
+        "chunks": 16,
+        "delay": 0
+      },
+      "engine": "uring",
+      "policy": "current",
+      "repeat": 1,
+      "ws_recv_mode": "once",
+      "ws_splice_mode": "on",
+      "ws_segment": "64k",
+      "ws_calls": "2",
+      "cpu_observation_seconds": 10.03063561511226,
+      "frontend_cpu_pct": 60.81369350920969,
+      "origin_cpu_pct": 330.08875280162835,
+      "stage": "core-probe",
+      "profile": "scan",
+      "outer_repeat": 1
+    }
+  },
+  {
+    "profile": "nginx",
+    "cores": {
+      "cpu0": {
+        "busy": 2.6365348399246704,
+        "user": 1.60075329566855,
+        "system": 0.2824858757062147,
+        "softirq": 0.6591337099811676,
+        "idle": 97.36346516007534
+      },
+      "cpu1": {
+        "busy": 0.658513640639699,
+        "user": 0.5644402634054563,
+        "system": 0.09407337723424271,
+        "softirq": 0.0,
+        "idle": 99.15333960489181
+      },
+      "cpu2": {
+        "busy": 94.54887218045113,
+        "user": 7.048872180451128,
+        "system": 51.597744360902254,
+        "softirq": 35.6203007518797,
+        "idle": 5.357142857142857
+      },
+      "cpu3": {
+        "busy": 94.07894736842105,
+        "user": 46.99248120300752,
+        "system": 38.25187969924812,
+        "softirq": 8.458646616541353,
+        "idle": 5.921052631578948
+      },
+      "cpu4": {
+        "busy": 93.52720450281426,
+        "user": 46.529080675422136,
+        "system": 38.367729831144466,
+        "softirq": 8.161350844277674,
+        "idle": 6.472795497185741
+      },
+      "cpu5": {
+        "busy": 40.92627599243856,
+        "user": 15.784499054820415,
+        "system": 17.76937618147448,
+        "softirq": 7.088846880907372,
+        "idle": 59.07372400756144
+      },
+      "cpu6": {
+        "busy": 41.95672624647225,
+        "user": 15.710253998118532,
+        "system": 18.438381937911572,
+        "softirq": 7.431796801505174,
+        "idle": 58.04327375352775
+      },
+      "cpu7": {
+        "busy": 41.3760603204524,
+        "user": 16.022620169651272,
+        "system": 17.813383600377,
+        "softirq": 7.163053722902922,
+        "idle": 58.529688972667294
+      },
+      "cpu8": {
+        "busy": 89.85645933014354,
+        "user": 45.26315789473684,
+        "system": 36.45933014354067,
+        "softirq": 7.751196172248804,
+        "idle": 10.14354066985646
+      },
+      "cpu9": {
+        "busy": 71.7948717948718,
+        "user": 43.87464387464387,
+        "system": 20.03798670465337,
+        "softirq": 7.597340930674264,
+        "idle": 28.205128205128204
+      },
+      "cpu10": {
+        "busy": 0.8482563619227145,
+        "user": 0.6597549481621112,
+        "system": 0.1885014137606032,
+        "softirq": 0.0,
+        "idle": 99.15174363807729
+      },
+      "cpu11": {
+        "busy": 1.2229539040451551,
+        "user": 0.940733772342427,
+        "system": 0.28222013170272814,
+        "softirq": 0.0,
+        "idle": 98.77704609595484
+      },
+      "cpu12": {
+        "busy": 0.28222013170272814,
+        "user": 0.09407337723424271,
+        "system": 0.18814675446848542,
+        "softirq": 0.0,
+        "idle": 99.71777986829727
+      },
+      "cpu13": {
+        "busy": 1.3157894736842106,
+        "user": 0.9398496240601504,
+        "system": 0.2819548872180451,
+        "softirq": 0.09398496240601503,
+        "idle": 98.6842105263158
+      },
+      "cpu14": {
+        "busy": 3.9473684210526314,
+        "user": 3.4774436090225564,
+        "system": 0.2819548872180451,
+        "softirq": 0.09398496240601503,
+        "idle": 96.05263157894737
+      },
+      "cpu15": {
+        "busy": 0.847457627118644,
+        "user": 0.5649717514124294,
+        "system": 0.18832391713747645,
+        "softirq": 0.09416195856873823,
+        "idle": 99.15254237288136
+      }
+    },
+    "measurement": {
+      "kind": "websocket",
+      "payload_bytes": 64,
+      "concurrent_connections": 192,
+      "duration_seconds": 8,
+      "messages": 680239,
+      "bytes": 43535296,
+      "connections": 192,
+      "errors": 0,
+      "valid": true,
+      "messages_per_second": 84988.22,
+      "received_mib_per_second": 5.186796188354492,
+      "rtt_us": {
+        "p50_us": 2261.0,
+        "p95_us": 2595.0,
+        "p99_us": 2671.0,
+        "max_us": 2889.0
+      },
+      "first_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "delivery_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "gap_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "source_gap_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "client_workers": [
+        {
+          "cpu_seconds": 9.850457,
+          "observation_seconds": 10.02941049193032,
+          "cpu_pct": 98.21571275725222,
+          "cpu": "5,6,7"
+        }
+      ],
+      "tcpkali2_csv": {
+        "timestamp": "2026-10-10T00:05:27Z",
+        "target": "ws://127.0.0.1:8804/ws",
+        "connections": "192",
+        "connect_rate": "10000",
+        "connect_timeout_s": "5.00",
+        "channel_lifetime_s": "-1",
+        "duration_s": "8.00",
+        "warmup_s": "2.00",
+        "workers": "3",
+        "nagle": "false",
+        "pipeline": "false",
+        "websocket": "true",
+        "message_size": "64",
+        "message_rate": "-1",
+        "total_connections": "192",
+        "success_rate_pct": "100.0",
+        "total_requests": "680239",
+        "connection_errors": "0",
+        "connection_error_rate_pct": "0.00",
+        "requests_per_sec": "84988.22",
+        "throughput_mb": "87.07",
+        "bandwidth_mb_s": "10.88",
+        "traffic_down_mbps": "43.51",
+        "traffic_up_mbps": "43.51",
+        "latency_avg_us": "2258.1",
+        "latency_min_us": "1706",
+        "latency_p50_us": "2261",
+        "latency_p90_us": "2545",
+        "latency_p95_us": "2595",
+        "latency_p99_us": "2671",
+        "latency_max_us": "2889",
+        "latency_samples": "680239",
+        "latency_sample_shift": "0",
+        "verify_payload": "true"
+      },
+      "latency_definition": "send start through full reply; includes frame preparation",
+      "case": {
+        "name": "websocket-interactive-64",
+        "kind": "websocket",
+        "size": 64,
+        "chunks": 16,
+        "delay": 0
+      },
+      "engine": "nginx",
+      "policy": "reference",
+      "repeat": 1,
+      "ws_recv_mode": null,
+      "ws_splice_mode": null,
+      "ws_segment": null,
+      "ws_calls": null,
+      "cpu_observation_seconds": 10.030935529852286,
+      "frontend_cpu_pct": 61.509716433107805,
+      "origin_cpu_pct": 329.0819674970646,
+      "stage": "core-probe",
+      "profile": "nginx",
+      "outer_repeat": 1
+    }
+  },
+  {
+    "profile": "direct-origin",
+    "cores": {
+      "cpu0": {
+        "busy": 6.147934678194044,
+        "user": 4.803073967339097,
+        "system": 0.4803073967339097,
+        "softirq": 0.7684918347742555,
+        "idle": 93.85206532180595
+      },
+      "cpu1": {
+        "busy": 0.28763183125599234,
+        "user": 0.09587727708533078,
+        "system": 0.09587727708533078,
+        "softirq": 0.09587727708533078,
+        "idle": 99.712368168744
+      },
+      "cpu2": {
+        "busy": 3.4582132564841497,
+        "user": 3.362151777137368,
+        "system": 0.09606147934678194,
+        "softirq": 0.0,
+        "idle": 96.54178674351586
+      },
+      "cpu3": {
+        "busy": 96.92898272552783,
+        "user": 45.96928982725528,
+        "system": 40.78694817658349,
+        "softirq": 9.692898272552783,
+        "idle": 3.071017274472169
+      },
+      "cpu4": {
+        "busy": 95.96928982725528,
+        "user": 45.58541266794626,
+        "system": 40.40307101727447,
+        "softirq": 9.596928982725528,
+        "idle": 4.030710172744722
+      },
+      "cpu5": {
+        "busy": 64.44444444444444,
+        "user": 25.70048309178744,
+        "system": 27.43961352657005,
+        "softirq": 10.72463768115942,
+        "idle": 35.55555555555556
+      },
+      "cpu6": {
+        "busy": 64.95643756050339,
+        "user": 25.072604065827687,
+        "system": 27.87996127783156,
+        "softirq": 11.326234269119071,
+        "idle": 35.04356243949661
+      },
+      "cpu7": {
+        "busy": 65.20039100684262,
+        "user": 25.61094819159335,
+        "system": 27.956989247311828,
+        "softirq": 11.045943304007821,
+        "idle": 34.79960899315738
+      },
+      "cpu8": {
+        "busy": 96.06903163950143,
+        "user": 45.63758389261745,
+        "system": 40.172579098753594,
+        "softirq": 9.77948226270374,
+        "idle": 3.9309683604985617
+      },
+      "cpu9": {
+        "busy": 96.06525911708253,
+        "user": 53.742802303262955,
+        "system": 28.21497120921305,
+        "softirq": 13.723608445297504,
+        "idle": 3.9347408829174664
+      },
+      "cpu10": {
+        "busy": 0.09615384615384616,
+        "user": 0.0,
+        "system": 0.09615384615384616,
+        "softirq": 0.0,
+        "idle": 99.90384615384616
+      },
+      "cpu11": {
+        "busy": 0.4803073967339097,
+        "user": 0.2881844380403458,
+        "system": 0.19212295869356388,
+        "softirq": 0.0,
+        "idle": 99.5196926032661
+      },
+      "cpu12": {
+        "busy": 0.09596928982725528,
+        "user": 0.0,
+        "system": 0.09596928982725528,
+        "softirq": 0.0,
+        "idle": 99.90403071017275
+      },
+      "cpu13": {
+        "busy": 0.09606147934678194,
+        "user": 0.0,
+        "system": 0.0,
+        "softirq": 0.0,
+        "idle": 99.90393852065321
+      },
+      "cpu14": {
+        "busy": 2.0172910662824206,
+        "user": 1.7291066282420748,
+        "system": 0.2881844380403458,
+        "softirq": 0.0,
+        "idle": 97.98270893371757
+      },
+      "cpu15": {
+        "busy": 0.4807692307692308,
+        "user": 0.28846153846153844,
+        "system": 0.09615384615384616,
+        "softirq": 0.0,
+        "idle": 99.51923076923077
+      }
+    },
+    "measurement": {
+      "kind": "websocket",
+      "payload_bytes": 64,
+      "concurrent_connections": 192,
+      "duration_seconds": 8,
+      "messages": 1122557,
+      "bytes": 71843648,
+      "connections": 192,
+      "errors": 0,
+      "valid": true,
+      "messages_per_second": 140255.59,
+      "received_mib_per_second": 8.560419082641602,
+      "rtt_us": {
+        "p50_us": 1413.0,
+        "p95_us": 1860.0,
+        "p99_us": 2135.0,
+        "max_us": 3051.0
+      },
+      "first_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "delivery_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "gap_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "source_gap_us": {
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "max_us": null
+      },
+      "client_workers": [
+        {
+          "cpu_seconds": 15.414081999999999,
+          "observation_seconds": 10.081466419855133,
+          "cpu_pct": 152.8952372409082,
+          "cpu": "5,6,7"
+        }
+      ],
+      "tcpkali2_csv": {
+        "timestamp": "2026-10-10T00:05:37Z",
+        "target": "ws://127.0.0.1:8805/ws",
+        "connections": "192",
+        "connect_rate": "10000",
+        "connect_timeout_s": "5.00",
+        "channel_lifetime_s": "-1",
+        "duration_s": "8.00",
+        "warmup_s": "2.00",
+        "workers": "3",
+        "nagle": "false",
+        "pipeline": "false",
+        "websocket": "true",
+        "message_size": "64",
+        "message_rate": "-1",
+        "total_connections": "192",
+        "success_rate_pct": "100.0",
+        "total_requests": "1122557",
+        "connection_errors": "0",
+        "connection_error_rate_pct": "0.00",
+        "requests_per_sec": "140255.59",
+        "throughput_mb": "143.69",
+        "bandwidth_mb_s": "17.95",
+        "traffic_down_mbps": "71.81",
+        "traffic_up_mbps": "71.81",
+        "latency_avg_us": "1367.9",
+        "latency_min_us": "71",
+        "latency_p50_us": "1413",
+        "latency_p90_us": "1790",
+        "latency_p95_us": "1860",
+        "latency_p99_us": "2135",
+        "latency_max_us": "3051",
+        "latency_samples": "1122557",
+        "latency_sample_shift": "0",
+        "verify_payload": "true"
+      },
+      "latency_definition": "send start through full reply; includes frame preparation",
+      "case": {
+        "name": "websocket-interactive-64",
+        "kind": "websocket",
+        "size": 64,
+        "chunks": 16,
+        "delay": 0
+      },
+      "engine": "direct-origin",
+      "policy": "current",
+      "repeat": 1,
+      "ws_recv_mode": null,
+      "ws_splice_mode": null,
+      "ws_segment": null,
+      "ws_calls": null,
+      "cpu_observation_seconds": 10.082621514098719,
+      "frontend_cpu_pct": 349.80981831641003,
+      "origin_cpu_pct": 349.80981831641003,
+      "stage": "core-probe",
+      "profile": "direct-origin",
+      "outer_repeat": 1
+    }
+  }
+]

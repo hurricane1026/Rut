@@ -99,3 +99,8 @@ if(RUT_ENABLE_JIT)
     )
     target_compile_options(bench_dispatch_compare PRIVATE -O3 -DNDEBUG ${SIMD_FLAGS})
 endif()
+
+# Optional benchmark-only accelerator for the Python WebSocket fixture. Keeps
+# payload validation/sequence semantics while removing Python strided copies.
+add_library(bench_ws_mask SHARED EXCLUDE_FROM_ALL bench_ws_mask.cc)
+target_compile_options(bench_ws_mask PRIVATE -O3 -fno-exceptions -fno-rtti)
