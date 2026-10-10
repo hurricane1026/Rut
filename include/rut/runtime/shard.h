@@ -482,12 +482,6 @@ struct Shard {
             log_ring = nullptr;
         }
         free_capture_ring();
-        if (upstream) {
-            upstream->shutdown();
-            upstream->~UpstreamPool();
-            munmap(upstream, sizeof(UpstreamPool));
-            upstream = nullptr;
-        }
         if (loop) {
             // Sync listen_fd: EventLoop may have closed it during drain.
             if (loop->listen_fd < 0) listen_fd = -1;
@@ -498,6 +492,12 @@ struct Shard {
             loop->~EventLoopType();
             munmap(loop, sizeof(EventLoopType));
             loop = nullptr;
+        }
+        if (upstream) {
+            upstream->shutdown();
+            upstream->~UpstreamPool();
+            munmap(upstream, sizeof(UpstreamPool));
+            upstream = nullptr;
         }
         scratch.destroy();
         if (owns_listen_fd && listen_fd >= 0) {
