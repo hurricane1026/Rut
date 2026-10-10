@@ -58,6 +58,19 @@ def throughput_score(row):
     return row['rps']
 
 
+def script_hashes(relay_script):
+    paths = [relay_script, relay_script.with_name('api_origin.py'),
+             relay_script.with_name('run.py'), Path(__file__)]
+    return {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in paths}
+
+
+def require_matching_manifest(prior, manifest):
+    if prior.exists() and json.loads(prior.read_text()) != manifest:
+        raise RuntimeError('study manifest changed; use a new output directory')
+    prior.write_text(json.dumps(manifest, indent=2) + '\n')
+
+
 def summarize(rows, limit):
     groups = {}
     for row in rows:
@@ -142,19 +155,17 @@ def main():
     env['RUT_BENCH_RELAY_STATS'] = '1'
     rows = []
     selected = {}
+    binaries = {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in [args.rut, args.rut.with_name('rut-compile'), args.converter, args.wrk]}
     manifest = dict(workloads=workloads, policies=POLICIES, concurrency=128, frontend_workers=1,
                     frontend_cpu=2, origin_workers=4, origin_cpus=[3, 4, 8, 9], client_cpus=[5, 7],
                     p99_increase_limit=args.p99_increase_limit, practical_rps_gain=.03,
                     screen_seconds=args.screen_seconds, confirm_seconds=args.confirm_seconds,
                     confirm_repeats=3, serial_frontends=True,
                     skip_nginx=args.skip_nginx,
-                    binaries={str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
-                              for path in [args.rut, args.rut.with_name('rut-compile'), args.converter, args.wrk,
-                                           args.relay_script, args.relay_script.with_name('api_origin.py')]})
+                    binaries=binaries | script_hashes(args.relay_script))
     prior = out / 'study.json'
-    if prior.exists() and json.loads(prior.read_text()) != manifest:
-        raise RuntimeError('study manifest changed; use a new output directory')
-    prior.write_text(json.dumps(manifest, indent=2) + '\n')
+    require_matching_manifest(prior, manifest)
 
     def run(stage, workload, engine, policy, repeat, duration):
         label = f'{stage}-{workload["name"]}-{engine}-{policy}-r{repeat}'

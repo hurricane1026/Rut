@@ -213,7 +213,15 @@ def summarize(rows):
             if winner['rate'] < current['rate'] * 1.03 or winner['rate_range'][0] <= current['rate_range'][1]:
                 winner = current
             current['throughput_policy'] = winner['policy']
-            tail = min(candidates, key=lambda item: item['p99_us'])
+            latency_candidates = [item for item in candidates
+                                  if item['p99_us'] <= current['p99_us'] * 1.1
+                                  and (case['kind'] == 'websocket' or
+                                       (current['first_p99_us'] is not None and
+                                        item['first_p99_us'] is not None and
+                                        item['first_p99_us'] <= current['first_p99_us'] * 1.1))]
+            if not latency_candidates:
+                latency_candidates = [current]
+            tail = min(latency_candidates, key=lambda item: item['p99_us'])
             current['experimental_latency_candidate'] = tail['policy']
             if tail['p99_us'] > current['p99_us'] * .95 or tail['p99_range_us'][1] >= current['p99_range_us'][0]:
                 tail = current

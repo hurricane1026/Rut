@@ -269,6 +269,45 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(result['latency_policy'], 'latency')
         self.assertEqual(workload_strategy.summarize(rows[:2], .10)['decisions'], [])
 
+    def test_workload_manifest_rejects_resume_after_imported_harness_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = root / 'relay_compare.py'
+            for name in ('relay_compare.py', 'api_origin.py', 'run.py'):
+                (root / name).write_text(name + '-v1')
+            first = dict(scripts=workload_strategy.script_hashes(relay))
+            prior = root / 'study.json'
+            workload_strategy.require_matching_manifest(prior, first)
+            run_script = root / 'run.py'
+            run_script.write_text('run.py-v2')
+            resumed = dict(scripts=workload_strategy.script_hashes(relay))
+            self.assertNotEqual(first, resumed)
+            with self.assertRaisesRegex(RuntimeError, 'manifest changed'):
+                workload_strategy.require_matching_manifest(prior, resumed)
+
+        hashes = workload_strategy.script_hashes(Path(workload_strategy.__file__).with_name('relay_compare.py'))
+        self.assertIn(str(Path(run.__file__).resolve()), hashes)
+        self.assertIn(str(Path(workload_strategy.__file__).resolve()), hashes)
+
+    def test_streaming_latency_policy_bounds_first_chunk_before_delivery_tail(self):
+        case = next(case for case in protocol_strategy.CASES
+                    if case['name'] == 'streaming-live-256')
+        rows = []
+        for policy, delivery, first in (('current', 100, 100),
+                                        ('latency', 60, 200),
+                                        ('balanced', 80, None)):
+            for _ in range(3):
+                rows.append(dict(case=case, engine='uring', policy=policy,
+                                 messages_per_second=100, received_mib_per_second=1,
+                                 delivery_us=dict(p99_us=delivery),
+                                 first_us=dict(p99_us=first),
+                                 source_gap_us=dict(p99_us=20),
+                                 origin_cpu_observation_pct=10))
+        current = next(row for row in protocol_strategy.summarize(rows)
+                       if row['policy'] == 'current')
+        self.assertEqual(current['experimental_latency_candidate'], 'current')
+        self.assertEqual(current['latency_policy'], 'current')
+
     def test_mixed_throughput_weights_bytes_instead_of_request_count(self):
         current = dict(rps=10100, large_client={'rps': 100}, small_client={'rps': 10000})
         more_small = dict(rps=20040, large_client={'rps': 40}, small_client={'rps': 20000})
