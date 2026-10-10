@@ -5,6 +5,7 @@ RUT_STUDY_POLICY is an experimental runtime knob, not a production CLI contract.
 Never interpret the winner as a global optimum or infer a future response size.
 """
 import argparse
+import math
 import hashlib
 import json
 import os
@@ -156,6 +157,8 @@ def main():
     args = p.parse_args()
     if args.screen_seconds <= 0 or args.confirm_seconds <= 0:
         p.error('--screen-seconds and --confirm-seconds must be positive')
+    if not math.isfinite(args.p99_increase_limit) or args.p99_increase_limit < 0:
+        p.error('--p99-increase-limit must be finite and nonnegative')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     workloads = [w for w in WORKLOADS if not args.workloads or w['name'] in args.workloads]

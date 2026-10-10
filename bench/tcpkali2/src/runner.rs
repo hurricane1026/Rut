@@ -15,7 +15,11 @@ use std::time::Duration;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time;
 
-fn handshakes_ready(success: u64, failures: u64, expected: u64) -> bool {
+fn handshakes_ready(transports: u64, failures: u64, expected: u64) -> bool {
+    transports.saturating_add(failures) >= expected
+}
+
+fn initializations_ready(success: u64, failures: u64, expected: u64) -> bool {
     success.saturating_add(failures) >= expected
 }
 
@@ -103,23 +107,33 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
         }
     }
 
-    // Do not open the measurement window while handshakes are still joining.
-    // Every attempt reaches either success_connections or connection_errors
-    // before waiting on load_start.
+    // Bound only TCP/WebSocket transport establishment with connect_timeout.
     let handshake_deadline = time::Instant::now() + handshake_timeout(config.connect_timeout);
     loop {
-        let total = stats.total_connections.load(Ordering::Relaxed);
         if handshakes_ready(
-            stats.success_connections.load(Ordering::Relaxed),
+            stats.transport_connections.load(Ordering::Relaxed),
             stats.connection_errors.load(Ordering::Relaxed),
             spawned_connections,
-        ) && total == spawned_connections {
+        ) {
             break;
         }
         if time::Instant::now() >= handshake_deadline {
             return Err(TcpKaliError::Timeout(
                 "timed out waiting for connection handshakes".into(),
             ));
+        }
+        time::sleep(Duration::from_millis(1)).await;
+    }
+
+    // Optional first-message echoes are application initialization. Allow them
+    // to finish without imposing connect_timeout on an established transport.
+    loop {
+        if initializations_ready(
+            stats.success_connections.load(Ordering::Relaxed),
+            stats.connection_errors.load(Ordering::Relaxed),
+            spawned_connections,
+        ) {
+            break;
         }
         time::sleep(Duration::from_millis(1)).await;
     }
@@ -274,7 +288,7 @@ fn report_task_result(result: Result<Result<(), TcpKaliError>, JoinError>, quiet
 
 #[cfg(test)]
 mod tests {
-    use super::{handshake_timeout, handshakes_ready, measurement_elapsed};
+    use super::{handshake_timeout, handshakes_ready, initializations_ready, measurement_elapsed};
     use tokio::time::{Duration, Instant};
 
     #[test]
@@ -282,6 +296,14 @@ mod tests {
         assert!(!handshakes_ready(2, 0, 3));
         assert!(handshakes_ready(2, 1, 3));
         assert!(handshakes_ready(0, 3, 3));
+    }
+
+    #[test]
+    fn transport_readiness_is_independent_of_first_message_initialization() {
+        assert!(handshakes_ready(1, 0, 1));
+        assert!(!initializations_ready(0, 0, 1));
+        assert!(initializations_ready(1, 0, 1));
+        assert!(initializations_ready(0, 1, 1));
     }
 
     #[test]

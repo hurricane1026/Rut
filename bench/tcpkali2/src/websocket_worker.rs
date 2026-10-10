@@ -110,6 +110,7 @@ async fn run_websocket_worker(
         }
     };
 
+    stats.transport_connections.fetch_add(1, Ordering::Relaxed);
     let (mut write, mut read) = ws_stream.split();
 
     if let Some(first_message) = &config.first_message {

@@ -256,6 +256,8 @@ pub struct Stats {
     pub total_connections: AtomicU64,
     /// Successful connections
     pub success_connections: AtomicU64,
+    /// Connections that completed the TCP or WebSocket transport handshake
+    pub transport_connections: AtomicU64,
     /// Total requests
     pub total_requests: AtomicU64,
     /// Total bytes sent
@@ -296,6 +298,7 @@ impl Stats {
             verify_payload: std::env::var("TCPKALI2_BENCH_VERIFY").as_deref() == Ok("1"),
             total_connections: AtomicU64::new(0),
             success_connections: AtomicU64::new(0),
+            transport_connections: AtomicU64::new(0),
             total_requests: AtomicU64::new(0),
             total_bytes_sent: AtomicU64::new(0),
             total_bytes_received: AtomicU64::new(0),

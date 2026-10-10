@@ -257,6 +257,38 @@ class ToolsTest(unittest.TestCase):
                     workload_strategy.main()
             launch.assert_not_called()
 
+    def test_workload_cli_rejects_invalid_p99_increase_limit_before_output_or_process(self):
+        for limit in ('-0.1', 'nan', 'inf', '-inf'):
+            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'study'
+                argv = ['workload_strategy.py', '--output', str(output),
+                        '--relay-script', str(Path(relay_compare.__file__)),
+                        '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                        '--p99-increase-limit', limit]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(workload_strategy.subprocess, 'Popen') as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        workload_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
+
+    def test_workload_cli_accepts_zero_p99_increase_limit(self):
+        class ReachedOutputSetup(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            argv = ['workload_strategy.py', '--output', str(Path(directory) / 'study'),
+                    '--relay-script', str(Path(relay_compare.__file__)),
+                    '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                    '--p99-increase-limit', '0']
+            with mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(Path, 'mkdir', side_effect=ReachedOutputSetup), \
+                    mock.patch.object(workload_strategy.subprocess, 'Popen') as launch:
+                with self.assertRaises(ReachedOutputSetup):
+                    workload_strategy.main()
+            launch.assert_not_called()
+
     def test_protocol_manifest_records_selection_filters(self):
         args = SimpleNamespace(cases=["websocket-bulk-64k", "websocket-interactive-64"],
                                engines=["nginx"], policies=["current"], smoke=True)
