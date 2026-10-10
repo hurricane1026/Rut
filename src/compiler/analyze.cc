@@ -1773,9 +1773,7 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
                              MAP_PRIVATE | MAP_ANONYMOUS,
                              -1,
                              0);
-    auto* node = node_region == MAP_FAILED
-                     ? nullptr
-                     : ::new (node_region) HirGeneratedName{};
+    auto* node = node_region == MAP_FAILED ? nullptr : ::new (node_region) HirGeneratedName{};
     if (node == nullptr) {
         if (mapped)
             munmap(buf, len);
