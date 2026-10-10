@@ -17,3 +17,10 @@ WebSocket strategy experiments and offline policy overrides remain opt-in.
 
 Performance tables describe the archived frozen study binaries, not a new
 measurement of this integration head. No default-path performance win is claimed.
+
+Default behavior changes versus main: plaintext HTTP/1 WebSocket reads use
+bounded one-shot receives so their paired asynchronous sends cannot race a
+multishot burst into the same fixed connection buffer. WebSocket Upgrade also
+enables TCP_NODELAY on both TCP legs. The bounded-cache multishot, readiness
+splice/copy-first, immediate-send, direct-receive and POLL_FIRST experiments
+remain opt-in. These are not default performance improvements for all workloads.
