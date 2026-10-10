@@ -3,7 +3,7 @@
 // See RUT.md for per-file changes and upstream provenance.
 use crate::command::{Config, pipeline_in_flight_batches};
 use crate::error::TcpKaliError;
-use crate::stats::{LocalStatsCache, Stats};
+use crate::stats::{ConnectionInitialization, LocalStatsCache, Stats};
 use crate::utils::{RatePacer, wait_for_benchmark_lifetime, wait_for_load_start};
 
 use bytes::Bytes;
@@ -78,6 +78,7 @@ async fn run_websocket_worker(
     load_start: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), TcpKaliError> {
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
+    let mut initialization = ConnectionInitialization::new(stats);
 
     let ws_url = if target.starts_with("ws://") || target.starts_with("wss://") {
         target.to_string()
@@ -100,12 +101,10 @@ async fn run_websocket_worker(
                 ws_url,
                 error
             );
-            stats.record_connection_error();
             return Ok(());
         }
         Err(_) => {
             log_error!(stats, config, "WebSocket connection timeout to {}", ws_url);
-            stats.record_connection_error();
             return Ok(());
         }
     };
@@ -122,7 +121,6 @@ async fn run_websocket_worker(
                 "Failed to send first WebSocket message: {}",
                 error
             );
-            stats.record_connection_error();
             return Ok(());
         }
 
@@ -136,7 +134,6 @@ async fn run_websocket_worker(
             }
             Some(Ok(Message::Binary(_))) => {
                 log_error!(stats, config, "First WebSocket echo payload mismatch");
-                stats.record_connection_error();
                 return Ok(());
             }
             Some(Err(error)) => {
@@ -146,18 +143,16 @@ async fn run_websocket_worker(
                     "Failed to read first message response: {}",
                     error
                 );
-                stats.record_connection_error();
                 return Ok(());
             }
             _ => {
                 log_error!(stats, config, "Unexpected response to first message");
-                stats.record_connection_error();
                 return Ok(());
             }
         }
     }
 
-    stats.success_connections.fetch_add(1, Ordering::Relaxed);
+    initialization.succeed();
     wait_for_load_start(load_start).await;
 
     let message = config.message.as_ref().expect("Message must be provided");

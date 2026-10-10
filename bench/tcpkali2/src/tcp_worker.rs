@@ -1,6 +1,6 @@
 use crate::command::{Config, pipeline_in_flight_batches};
 use crate::error::TcpKaliError;
-use crate::stats::{LocalStatsCache, Stats};
+use crate::stats::{ConnectionInitialization, LocalStatsCache, Stats};
 use crate::utils::{RatePacer, wait_for_benchmark_lifetime, wait_for_load_start};
 
 use std::sync::Arc;
@@ -58,17 +58,16 @@ async fn run_tcp_worker(
     load_start: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), TcpKaliError> {
     stats.total_connections.fetch_add(1, Ordering::Relaxed);
+    let mut initialization = ConnectionInitialization::new(stats);
 
     let stream = match time::timeout(config.connect_timeout, TcpStream::connect(target)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => {
             log_error!(stats, config, "Failed to connect to {}: {}", target, error);
-            stats.record_connection_error();
             return Ok(());
         }
         Err(_) => {
             log_error!(stats, config, "Connection timeout to {}", target);
-            stats.record_connection_error();
             return Ok(());
         }
     };
@@ -81,7 +80,6 @@ async fn run_tcp_worker(
         let sent_at = Instant::now();
         if let Err(error) = writer.write_all(first_message).await {
             log_error!(stats, config, "Failed to send first message: {}", error);
-            stats.record_connection_error();
             return Ok(());
         }
 
@@ -93,7 +91,6 @@ async fn run_tcp_worker(
                 "Failed to read first message response: {}",
                 error
             );
-            stats.record_connection_error();
             return Ok(());
         }
 
@@ -102,7 +99,7 @@ async fn run_tcp_worker(
         stats.record_request(first_message.len(), first_message.len());
     }
 
-    stats.success_connections.fetch_add(1, Ordering::Relaxed);
+    initialization.succeed();
     wait_for_load_start(load_start).await;
 
     let message = config.message.as_ref().expect("Message must be provided");
@@ -291,6 +288,134 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_first_message_echo_follows_transport_readiness() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut first = [0; 4];
+            stream.read_exact(&mut first).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            stream.write_all(&first).await.unwrap();
+            let mut extra = [0; 1];
+            let _ = stream.read(&mut extra).await;
+        });
+
+        let config = Arc::new(Config {
+            duration: Duration::from_secs(1),
+            warmup_duration: Duration::ZERO,
+            message_size: 0,
+            quiet: true,
+            nagle: false,
+            pipeline: false,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_millis(25),
+            channel_lifetime: None,
+            first_message: Some(Bytes::from_static(b"init")),
+            message: Some(Bytes::new()),
+            pipeline_message: None,
+            pipeline_batch_size: 1,
+            message_rate: Some(0),
+            use_websocket: false,
+            output: None,
+        });
+        let stats = Arc::new(Stats::new());
+        let worker_stats = stats.clone();
+        let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(async move {
+            tcp_worker(
+                &address.to_string(),
+                config,
+                worker_stats,
+                load_start_rx,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.transport_connections.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TCP transport did not become ready");
+        assert_eq!(stats.success_connections.load(Ordering::Relaxed), 0);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.success_connections.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow first-message echo did not complete");
+        assert_eq!(stats.transport_connections.load(Ordering::Relaxed), 1);
+
+        worker.abort();
+        let _ = worker.await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceling_silent_first_message_records_one_terminal_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut first = [0; 4];
+            stream.read_exact(&mut first).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let config = Arc::new(Config {
+            duration: Duration::from_secs(1),
+            warmup_duration: Duration::ZERO,
+            message_size: 0,
+            quiet: true,
+            nagle: false,
+            pipeline: false,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_millis(25),
+            channel_lifetime: None,
+            first_message: Some(Bytes::from_static(b"init")),
+            message: Some(Bytes::new()),
+            pipeline_message: None,
+            pipeline_batch_size: 1,
+            message_rate: Some(0),
+            use_websocket: false,
+            output: None,
+        });
+        let stats = Arc::new(Stats::new());
+        let worker_stats = stats.clone();
+        let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(false);
+        let worker = tokio::spawn(async move {
+            tcp_worker(&address.to_string(), config, worker_stats, load_start_rx, None)
+                .await
+                .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.transport_connections.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TCP transport did not become ready");
+        assert_eq!(stats.success_connections.load(Ordering::Relaxed), 0);
+
+        worker.abort();
+        let _ = worker.await;
+        assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.initialized_connections.load(Ordering::Relaxed), 1);
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pipeline_echo_batches_io_and_flushes_stats_on_cancel() {

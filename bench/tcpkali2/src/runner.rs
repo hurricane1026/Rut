@@ -19,8 +19,8 @@ fn handshakes_ready(transports: u64, failures: u64, expected: u64) -> bool {
     transports.saturating_add(failures) >= expected
 }
 
-fn initializations_ready(success: u64, failures: u64, expected: u64) -> bool {
-    success.saturating_add(failures) >= expected
+fn initializations_ready(initialized: u64, expected: u64) -> bool {
+    initialized >= expected
 }
 
 fn measurement_elapsed(start: time::Instant, end: time::Instant) -> Duration {
@@ -29,6 +29,58 @@ fn measurement_elapsed(start: time::Instant, end: time::Instant) -> Duration {
 
 fn handshake_timeout(connect_timeout: Duration) -> Duration {
     connect_timeout.saturating_add(Duration::from_secs(1))
+}
+
+async fn wait_for_readiness(
+    tasks: &mut JoinSet<Result<(), TcpKaliError>>,
+    stats: &Stats,
+    expected: u64,
+    transport_stage: bool,
+    deadline: Option<time::Instant>,
+    quiet: bool,
+) -> Result<bool, TcpKaliError> {
+    loop {
+        let ready = if transport_stage {
+            handshakes_ready(
+                stats.transport_connections.load(Ordering::Relaxed),
+                stats.connection_errors.load(Ordering::Relaxed),
+                expected,
+            )
+        } else {
+            initializations_ready(
+                stats.initialized_connections.load(Ordering::Relaxed),
+                expected,
+            )
+        };
+        if ready {
+            return Ok(true);
+        }
+        if deadline.is_some_and(|deadline| time::Instant::now() >= deadline) {
+            return Err(TcpKaliError::Timeout(
+                "timed out waiting for connection handshakes".into(),
+            ));
+        }
+
+        tokio::select! {
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(result) = result {
+                    report_task_result(result, quiet);
+                }
+            }
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                return Ok(false);
+            }
+            _ = time::sleep(Duration::from_millis(1)) => {}
+        }
+    }
+}
+
+async fn abort_and_reap(tasks: &mut JoinSet<Result<(), TcpKaliError>>) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        report_task_result(result, true);
+    }
 }
 
 /// Asynchronous main function responsible for executing load tests
@@ -109,33 +161,60 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
 
     // Bound only TCP/WebSocket transport establishment with connect_timeout.
     let handshake_deadline = time::Instant::now() + handshake_timeout(config.connect_timeout);
-    loop {
-        if handshakes_ready(
-            stats.transport_connections.load(Ordering::Relaxed),
-            stats.connection_errors.load(Ordering::Relaxed),
-            spawned_connections,
-        ) {
-            break;
+    let transport_ready = wait_for_readiness(
+        &mut tasks,
+        &stats,
+        spawned_connections,
+        true,
+        Some(handshake_deadline),
+        config.quiet,
+    )
+    .await;
+    match transport_ready {
+        Ok(true) => {}
+        Ok(false) => {
+            abort_and_reap(&mut tasks).await;
+            if let Some(stats_printer) = stats_printer {
+                stats_printer.abort();
+            }
+            return Ok(());
         }
-        if time::Instant::now() >= handshake_deadline {
-            return Err(TcpKaliError::Timeout(
-                "timed out waiting for connection handshakes".into(),
-            ));
+        Err(error) => {
+            abort_and_reap(&mut tasks).await;
+            if let Some(stats_printer) = stats_printer {
+                stats_printer.abort();
+            }
+            return Err(error);
         }
-        time::sleep(Duration::from_millis(1)).await;
     }
 
-    // Optional first-message echoes are application initialization. Allow them
-    // to finish without imposing connect_timeout on an established transport.
-    loop {
-        if initializations_ready(
-            stats.success_connections.load(Ordering::Relaxed),
-            stats.connection_errors.load(Ordering::Relaxed),
-            spawned_connections,
-        ) {
-            break;
+    // Optional first-message echoes are application initialization. They can
+    // take longer than connect_timeout, but every attempt must terminate.
+    let initialization_ready = wait_for_readiness(
+        &mut tasks,
+        &stats,
+        spawned_connections,
+        false,
+        None,
+        config.quiet,
+    )
+    .await;
+    match initialization_ready {
+        Ok(true) => {}
+        Ok(false) => {
+            abort_and_reap(&mut tasks).await;
+            if let Some(stats_printer) = stats_printer {
+                stats_printer.abort();
+            }
+            return Ok(());
         }
-        time::sleep(Duration::from_millis(1)).await;
+        Err(error) => {
+            abort_and_reap(&mut tasks).await;
+            if let Some(stats_printer) = stats_printer {
+                stats_printer.abort();
+            }
+            return Err(error);
+        }
     }
     let _ = load_start_tx.send(true);
 
@@ -289,6 +368,10 @@ fn report_task_result(result: Result<Result<(), TcpKaliError>, JoinError>, quiet
 #[cfg(test)]
 mod tests {
     use super::{handshake_timeout, handshakes_ready, initializations_ready, measurement_elapsed};
+    use crate::stats::{ConnectionInitialization, Stats};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use tokio::task::JoinSet;
     use tokio::time::{Duration, Instant};
 
     #[test]
@@ -301,9 +384,31 @@ mod tests {
     #[test]
     fn transport_readiness_is_independent_of_first_message_initialization() {
         assert!(handshakes_ready(1, 0, 1));
-        assert!(!initializations_ready(0, 0, 1));
-        assert!(initializations_ready(1, 0, 1));
-        assert!(initializations_ready(0, 1, 1));
+        assert!(!initializations_ready(0, 1));
+        assert!(initializations_ready(1, 1));
+    }
+
+    #[tokio::test]
+    async fn initialization_gate_terminates_and_counts_worker_panic_once() {
+        let stats = Arc::new(Stats::new());
+        let mut tasks = JoinSet::new();
+        let worker_stats = stats.clone();
+        tasks.spawn(async move {
+            worker_stats
+                .transport_connections
+                .fetch_add(1, Ordering::Relaxed);
+            let _initialization = ConnectionInitialization::new(&worker_stats);
+            panic!("simulated worker task failure");
+        });
+
+        assert!(
+            super::wait_for_readiness(&mut tasks, &stats, 1, false, None, true)
+                .await
+                .unwrap()
+        );
+        assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.initialized_connections.load(Ordering::Relaxed), 1);
+        assert!(tasks.is_empty());
     }
 
     #[test]
