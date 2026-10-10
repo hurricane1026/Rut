@@ -49,6 +49,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 
 namespace rut {
@@ -6955,6 +6956,25 @@ TEST(shard, init_shutdown) {
     CHECK_EQ(shard.listen_fd, lfd);
     shard.shutdown();
     CHECK(shard.loop == nullptr);
+    close(lfd);
+}
+
+// The epoll backend borrows the shard pool only for idle-fd invalidation. It
+// must release that hook before Shard unmaps the pool.
+TEST(shard, stable_pool_hook_released_before_pool_unmap) {
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    REQUIRE(shard.init(0, lfd).has_value());
+    REQUIRE(shard.loop->backend.enable_stable_upstream_events());
+    shard.loop->backend.bind_stable_pool(shard.upstream);
+
+    i32 fds[2] = {-1, -1};
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    REQUIRE(shard.upstream->put_idle(fds[0], 0, 0, 1));
+    close(fds[1]);
+
+    shard.shutdown();
     close(lfd);
 }
 

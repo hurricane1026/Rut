@@ -1,0 +1,4 @@
+{"type": "attached_probes", "count": 6, "data": {"probes": 6}}
+{"type": "printf", "data": "READY\n"}
+{"type": "map", "data": {"@calls": {"uprobe:/tmp/rut-ws-pr-20261010-build/src/rut:_ZN3rut20apply_request_policyERNS_14ConnectionBaseERK11sockaddr_int": 254577, "uprobe:/tmp/rut-ws-pr-20261010-build/src/rut:_ZN3rut27inspect_request_policy_bodyERKNS_14ConnectionBaseEt": 509154, "uprobe:/tmp/rut-ws-pr-20261010-build/src/rut:_ZN3rut10HttpParser5parseEPKhjPNS_13ParsedRequestE": 1272885}}}
+{"type": "map", "data": {"@role": {}}}

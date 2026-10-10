@@ -3933,7 +3933,7 @@ public:
                 const u32 written = static_cast<u32>(n);
                 if (written == len) {
                     if (direct_proxy_close) ++study_http_direct_close_completed;
-                    (void)::shutdown(c.fd, SHUT_WR);
+                    if (::shutdown(c.fd, SHUT_WR) == 0) c.mark_write_half_closed();
                 }
                 if (backend.add_send_after_direct_write(
                         c.fd, c.id, buf, len, written, generation)) {
@@ -4159,7 +4159,9 @@ public:
     void end_stream_before_close(Connection& c) {
         // A send still in flight keeps the ordinary close ordering: half-
         // closing now would fail that send and truncate the response.
-        if (c.fd >= 0 && !c.tls_active && !c.send_armed) (void)::shutdown(c.fd, SHUT_WR);
+        if (c.fd >= 0 && !c.tls_active && !c.send_armed && !c.write_half_closed() &&
+            ::shutdown(c.fd, SHUT_WR) == 0)
+            c.mark_write_half_closed();
     }
 
     // Plaintext body relay: the one-shot body owner of an ordinary native

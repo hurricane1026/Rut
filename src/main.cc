@@ -537,6 +537,33 @@ static void configure_study_policy(Loop* loop) {
                               ? "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=on\n"
                               : "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=off\n");
         }
+        if constexpr (requires { loop->study_request_metadata_parse_reuse; }) {
+            for (char** item = environ; *item; ++item)
+                if (str_eq(*item, "RUT_STUDY_REQUEST_METADATA_PARSE_REUSE=on"))
+                    loop->study_request_metadata_parse_reuse = true;
+            if (report_study)
+                write_str(loop->study_request_metadata_parse_reuse
+                              ? "RUT_STUDY_REQUEST_METADATA_PARSE_REUSE mode=on\n"
+                              : "RUT_STUDY_REQUEST_METADATA_PARSE_REUSE mode=off\n");
+        }
+        if constexpr (requires { loop->study_request_policy_parse_reuse; }) {
+            for (char** item = environ; *item; ++item)
+                if (str_eq(*item, "RUT_STUDY_REQUEST_POLICY_PARSE_REUSE=on"))
+                    loop->study_request_policy_parse_reuse = true;
+            if (report_study)
+                write_str(loop->study_request_policy_parse_reuse
+                              ? "RUT_STUDY_REQUEST_POLICY_PARSE_REUSE mode=on\n"
+                              : "RUT_STUDY_REQUEST_POLICY_PARSE_REUSE mode=off\n");
+        }
+        if constexpr (requires { loop->study_request_policy_validation_reuse; }) {
+            for (char** item = environ; *item; ++item)
+                if (str_eq(*item, "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE=on"))
+                    loop->study_request_policy_validation_reuse = true;
+            if (report_study)
+                write_str(loop->study_request_policy_validation_reuse
+                              ? "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE mode=on\n"
+                              : "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE mode=off\n");
+        }
         if constexpr (requires { loop->study_http_coalesce_close_response; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_COALESCE_CLOSE=on"))
@@ -545,6 +572,40 @@ static void configure_study_policy(Loop* loop) {
                 write_str(loop->study_http_coalesce_close_response
                               ? "RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n"
                               : "RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n");
+        }
+        if constexpr (requires { loop->backend.study_accept_batch_limit; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item) {
+                if (str_eq(*item, "RUT_STUDY_EPOLL_ACCEPT_BATCH=4"))
+                    loop->backend.study_accept_batch_limit = 4;
+                if (str_eq(*item, "RUT_STUDY_EPOLL_ACCEPT_BATCH=8"))
+                    loop->backend.study_accept_batch_limit = 8;
+                if (str_eq(*item, "RUT_STUDY_EPOLL_ACCEPT_BATCH=16"))
+                    loop->backend.study_accept_batch_limit = 16;
+                if (str_eq(*item, "RUT_STUDY_EPOLL_ACCEPT_BATCH=32"))
+                    loop->backend.study_accept_batch_limit = 32;
+            }
+            if (report_study) {
+                write_str("RUT_STUDY_EPOLL_ACCEPT_BATCH limit=");
+                write_u32(loop->backend.study_accept_batch_limit);
+                write_str("\n");
+            }
+        }
+        if constexpr (requires { loop->backend.study_stable_upstream_relay; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_EPOLL_STABLE_RELAY=on"))
+                    loop->backend.study_stable_upstream_relay = true;
+            if (report_study)
+                write_str(loop->backend.study_stable_upstream_relay
+                              ? "RUT_STUDY_EPOLL_STABLE_RELAY mode=on\n"
+                              : "RUT_STUDY_EPOLL_STABLE_RELAY mode=off\n");
+        }
+        if constexpr (requires { loop->backend.enable_stable_upstream_events(); }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_EPOLL_STABLE_UPSTREAM=on")) {
+                    write_str(loop->backend.enable_stable_upstream_events()
+                                  ? "RUT_STUDY_EPOLL_STABLE_UPSTREAM mode=on\n"
+                                  : "RUT_STUDY_EPOLL_STABLE_UPSTREAM mode=unavailable\n");
+                }
         }
         if constexpr (requires { loop->study_http_direct_close_response; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)

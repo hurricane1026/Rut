@@ -457,6 +457,9 @@ void on_probe_response(void* lp, Connection& conn, IoEvent ev) {
 u8 map_log_method(HttpMethod method);
 u8 parse_log_method_fallback(const u8* data, u32 len, u32* method_len);
 void capture_request_metadata(Connection& conn);
+void capture_parsed_request_metadata(Connection& conn,
+                                     const ParsedRequest& request,
+                                     u32 header_end);
 
 template <typename Loop>
 bool handle_configured_unmatched_response(Loop* loop, Connection& conn, const RouteConfig* config);
@@ -1002,6 +1005,21 @@ bool format_response_with_body_and_headers(Connection& conn,
                                            bool suppress_default_content_type = false,
                                            bool headers_only = false);
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
+// A stack-local witness for ID1 serialization; views die when recv_buf changes.
+struct RequestPolicyParseWitness {
+    const u8* source = nullptr;
+    u32 source_len = 0;
+    u32 header_end = 0;
+    Str path{};
+    u32 content_length = 0;
+    bool has_content_length = false;
+};
+// Internal synchronous continuation: caller just inspected the unchanged request.
+inline bool materialize_validated_request_policy(
+    Connection& conn,
+    const sockaddr_in& endpoint,
+    u16 policy_id,
+    const RequestPolicyParseWitness* witness = nullptr);
 inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config);
 inline bool build_redirect_response(const Connection& conn,
                                     const RouteConfig& config,
@@ -1011,7 +1029,9 @@ inline bool build_redirect_response(const Connection& conn,
                                     u32* out_len);
 inline bool stage_redirect_response(Connection& conn, const RouteConfig& config, u16 policy_id);
 enum class RequestPolicyBodyState : u8 { Invalid, Complete, Waiting };
-RequestPolicyBodyState inspect_request_policy_body(const Connection& conn, u16 policy_id);
+RequestPolicyBodyState inspect_request_policy_body(const Connection& conn,
+                                                   u16 policy_id,
+                                                   RequestPolicyParseWitness* witness = nullptr);
 inline bool request_policy_body_response_domain(const Connection& conn);
 inline bool request_policy_body_response_admitted(const Connection& conn);
 inline bool strict_response_upload_ready(const Connection& conn);
@@ -2258,7 +2278,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     complete_pipeline_request = conn.pipeline_depth > 0 && pre_status == ParseStatus::Complete;
 
     conn.clear_response_accounting();
-    capture_request_metadata(conn);
+    bool reuse_metadata_parse = false;
+    if constexpr (requires { loop->study_request_metadata_parse_reuse; }) {
+        reuse_metadata_parse =
+            loop->study_request_metadata_parse_reuse && pre_status == ParseStatus::Complete;
+    }
+    if (reuse_metadata_parse)
+        capture_parsed_request_metadata(conn, pre_req, pre_parser.header_end);
+    else
+        capture_request_metadata(conn);
     if ((loop->access_log != nullptr) != (loop->live_access_log != nullptr))
         conn.capture_access_log_target_snapshot();
 
@@ -4435,8 +4463,16 @@ void handle_jit_outcome(Loop* loop,
                 static_cast<u16>(outcome.upstream_id), target.addr_count, monotonic_us());
             bool request_policy_prepared = false;
             if (outcome.request_policy_id != 0) {
-                const RequestPolicyBodyState body_state =
-                    inspect_request_policy_body(conn, outcome.request_policy_id);
+                bool reuse_parse = false;
+                if constexpr (requires { loop->study_request_policy_parse_reuse; }) {
+                    reuse_parse =
+                        loop->study_request_policy_parse_reuse && outcome.request_policy_id == 1 &&
+                        http1_pipeline_request_is_legacy(conn) &&
+                        conn.response_read_deadline_state == ResponseReadDeadlineState::None;
+                }
+                RequestPolicyParseWitness witness;
+                const RequestPolicyBodyState body_state = inspect_request_policy_body(
+                    conn, outcome.request_policy_id, reuse_parse ? &witness : nullptr);
                 if (body_state == RequestPolicyBodyState::Invalid) {
                     reject_request_policy(loop, conn);
                     return;
@@ -4457,8 +4493,25 @@ void handle_jit_outcome(Loop* loop,
                     if (!loop->submit_recv(conn)) loop->close_conn(conn);
                     return;
                 }
-                if (!apply_request_policy(
-                        conn, target.addrs[kBackend], outcome.request_policy_id)) {
+                bool reuse_validation = false;
+                if constexpr (requires { loop->study_request_policy_validation_reuse; }) {
+                    reuse_validation =
+                        loop->study_request_policy_validation_reuse &&
+                        outcome.request_policy_id == 1 && http1_pipeline_request_is_legacy(conn) &&
+                        conn.response_read_deadline_state == ResponseReadDeadlineState::None;
+                }
+                // Complete admission above and materialization below are adjacent:
+                // no callback, byte mutation or I/O occurs between them. The proof
+                // stays local; waiting bodies and other entry points revalidate.
+                const bool policy_applied =
+                    (reuse_validation || reuse_parse)
+                        ? materialize_validated_request_policy(conn,
+                                                               target.addrs[kBackend],
+                                                               outcome.request_policy_id,
+                                                               reuse_parse ? &witness : nullptr)
+                        : apply_request_policy(
+                              conn, target.addrs[kBackend], outcome.request_policy_id);
+                if (!policy_applied) {
                     if (conn.response_read_deadline_state == ResponseReadDeadlineState::Validated)
                         loop->close_conn(conn);
                     else
@@ -6308,7 +6361,9 @@ inline i32 request_policy_inline_request_header_index(const u8* p, u32 n) {
 // slot. The existing HTTP parser intentionally accepts identical duplicate
 // Content-Length fields; nginx's fixed policy does not, so count the raw fields
 // here and fail closed. The request buffer remains untouched by this function.
-inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn, u16 policy_id) {
+inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn,
+                                                          u16 policy_id,
+                                                          RequestPolicyParseWitness* witness) {
     if (policy_id == 0 || !request_policy_is_supported(policy_id) ||
         conn.protocol == ConnProtocol::Http2 ||
         conn.req_http_version != static_cast<u8>(HttpVersion::Http11) ||
@@ -6338,6 +6393,13 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     if (parser.parse(data, len, &req) != ParseStatus::Complete || req.path.ptr == nullptr ||
         req.path.len == 0 || req.path.ptr[0] != '/')
         return RequestPolicyBodyState::Invalid;
+    auto complete = [&]() {
+        if (witness && policy_id == 1) {
+            *witness = {
+                data, len, parser.header_end, req.path, req.content_length, req.has_content_length};
+        }
+        return RequestPolicyBodyState::Complete;
+    };
     // ID4 (host: .preserve) only: HTTP request targets cannot carry a URI
     // fragment (RFC 7230 §5.3); `apply_preserve_host_lowercase_request_
     // policy`'s own check (below) is retained as defense in depth. Moved
@@ -6591,7 +6653,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
     if (conn.req_wants_upgrade || cl_count > 1) return RequestPolicyBodyState::Invalid;
     if (cl_count == 0) {
         if (conn.req_body_mode != BodyMode::None) return RequestPolicyBodyState::Invalid;
-        return RequestPolicyBodyState::Complete;
+        return complete();
     }
     if (has_expect) return RequestPolicyBodyState::Invalid;
     // A bare `Upgrade` header without an actual upgrade nomination is not
@@ -6650,7 +6712,7 @@ inline RequestPolicyBodyState inspect_request_policy_body(const Connection& conn
         return RequestPolicyBodyState::Waiting;
     if (conn.req_body_mode != BodyMode::ContentLength && req.content_length != 0)
         return RequestPolicyBodyState::Invalid;
-    return RequestPolicyBodyState::Complete;
+    return complete();
 }
 
 // ID4 (Http11PreserveHostLowercase): the Envoy-compatible H1 profile. Unlike
@@ -7262,7 +7324,15 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
         return apply_preserve_host_lowercase_request_policy(conn, policy_id);
     if (inspect_request_policy_body(conn, policy_id) != RequestPolicyBodyState::Complete)
         return false;
+    return materialize_validated_request_policy(conn, endpoint, policy_id);
+}
 
+// The validated ordinary request bytes must not change between inspection and
+// this call. All public, asynchronous and retry entries use apply_request_policy.
+inline bool materialize_validated_request_policy(Connection& conn,
+                                                 const sockaddr_in& endpoint,
+                                                 u16 policy_id,
+                                                 const RequestPolicyParseWitness* witness) {
     if (request_policy_trims_sp_preserves_htab(policy_id)) {
         if (!http1_pipeline_request_is_legacy(conn) &&
             !http1_pipeline_successor_materialization_is_stable(conn, policy_id))
@@ -7301,7 +7371,19 @@ inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, 
     HttpParser parser;
     ParsedRequest req;
     parser.reset();
-    if (parser.parse(data, len, &req) != ParseStatus::Complete) return false;
+    if (witness) {
+        if (policy_id != 1 || witness->source != data || witness->source_len != len ||
+            witness->header_end > len || witness->header_end < 4 || witness->path.ptr == nullptr ||
+            witness->path.len == 0)
+            return false;
+        req.reset();
+        req.path = witness->path;
+        req.content_length = witness->content_length;
+        req.has_content_length = witness->has_content_length;
+        parser.header_end = witness->header_end;
+    } else if (parser.parse(data, len, &req) != ParseStatus::Complete) {
+        return false;
+    }
     const u32 body_len = req.has_content_length ? req.content_length : 0;
     const u8* end = data + parser.header_end;
     const u8* line_end = data;

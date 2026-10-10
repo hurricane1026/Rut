@@ -13,6 +13,8 @@
 
 namespace rut {
 
+struct UpstreamPool;
+
 // epoll backend — reactor internally, proactor API externally.
 // "Reactor disguised as proactor": wait() does the recv/send
 // and emits IoEvent completions, identical to io_uring's output.
@@ -37,6 +39,32 @@ struct EpollBackend {
     // fd via arm_yield_timerfd() whenever the heap's top entry changes.
     i32 yield_timer_fd = -1;
     i32 listen_fd = -1;
+    u32 study_accept_batch_limit = 1;
+    // Optional stable socket identity. Request ownership changes independently
+    // of the kernel token; per-fd state is shard-local, not per Connection.
+    static constexpr u32 kStableFdCapacity = 65536;
+    static constexpr u8 kStableUpstreamTag = 0xfe;
+    static constexpr u32 kStableReadySlotBit = 0x80000000u;
+    struct StableUpstream {
+        u32 generation = 0;
+        u32 version = 0;
+        u32 conn_id = 0;
+        u32 episode = 0;
+        u32 pool_slot = 0xffffffffu;
+        bool registered = false;
+        bool idle = false;
+        bool recv_enabled = false;
+        bool relay_read = false;
+    };
+    MappedArray<StableUpstream> stable_upstream;
+    UpstreamPool* stable_pool = nullptr;
+    bool study_stable_upstream_relay = false;
+    bool enable_stable_upstream_events();
+    void bind_stable_pool(UpstreamPool* pool);
+    void invalidate_stable_upstream(i32 fd);
+    void claim_stable_upstream(i32 fd, u32 conn_id, u32 episode);
+    void park_stable_upstream(i32 fd, u32 pool_slot);
+    i32 set_stable_upstream_interest(i32 fd, u32 conn_id, u32 episode, bool relay_read = false);
 
     // conn_id → fd mappings. Separate maps for client and upstream so that
     // proxy connections with both fds registered don't overwrite each other.
@@ -153,6 +181,7 @@ struct EpollBackend {
     // An interest change set_fd_interest() did not make: drop records for fd
     // and age both sides' harvested readiness.
     void invalidate_fd_interest(u32 conn_id, i32 fd) {
+        invalidate_stable_upstream(fd);
         if (conn_id >= connection_capacity) return;
         for (u32 side = 0; side < 2; side++) {
             FdInterest& r = fd_interest[2 * conn_id + side];
