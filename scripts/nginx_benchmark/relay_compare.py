@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 import threading
 import urllib.request
 
@@ -23,13 +24,16 @@ def api_origin_command(source, port, cpus, payload, delay_ms, fragment_bytes, fr
             "--fragment-delay-ms", str(fragment_delay_ms)]
 
 
-def wait_for_api_origin_ready(stream, workers):
-    ready_workers = 0
-    while ready_workers < workers:
-        line = stream.readline()
-        if not line:
+def wait_for_api_origin_ready(log, process, workers):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
             raise RuntimeError("API origin exited before readiness")
-        ready_workers += line.startswith("API_READY ")
+        ready_workers = sum(line.startswith("API_READY ") for line in log.read_text().splitlines())
+        if ready_workers >= workers:
+            return
+        time.sleep(.05)
+    raise RuntimeError("API origin readiness timeout")
 
 
 def direct_origin_port(args):
@@ -100,20 +104,22 @@ def main():
             cpu = options.origin_cpus
             if options.origin_mode == "api":
                 payload = self.out / "api-payload.bin"
-                payload.write_bytes(module.expected_body("proxy", getattr(self.args, "body_size", None)))
+                payload.write_bytes(module.expected_body("proxy", getattr(self.args, "body_size", None), True))
                 argv = api_origin_command(source, port, options.origin_cpus, payload,
                                           options.api_delay_ms, options.api_fragment_bytes,
                                           options.api_fragment_delay_ms)
-                child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         text=True)
+                origin_log = self.out / "api-origin.log"
+                log_handle = origin_log.open("w+")
+                child = subprocess.Popen(argv, stdout=log_handle, stderr=subprocess.STDOUT)
                 self.origin_pid = child.pid
                 try:
-                    wait_for_api_origin_ready(child.stdout, len(options.origin_cpus.split(",")))
+                    wait_for_api_origin_ready(origin_log, child, len(options.origin_cpus.split(",")))
                     yield child.pid
                 finally:
                     if child.poll() is None:
                         child.terminate()
                     child.wait(timeout=5)
+                    log_handle.close()
                 return
             path = self.out / config
             text = path.read_text().replace("worker_processes 1;", f"worker_processes {options.origin_workers};")
@@ -134,6 +140,18 @@ def main():
             yield pid
 
     module.Harness.nginx = origin
+    original_verify_origin_reuse = module.Harness.verify_origin_reuse
+
+    def verify_api_origin_reuse(self, expected_markers, fresh_downstream=False):
+        if options.origin_mode != "api":
+            return original_verify_origin_reuse(self, expected_markers, fresh_downstream)
+        logs = (self.out / "api-origin.log").read_text()
+        (self.out / f"{self.active_label}-origin-reuse.log").write_text(logs)
+        records = module.origin_reuse_records(logs, expected_markers)
+        if not module.valid_origin_reuse(records, expected_markers):
+            raise ValueError("API origin reuse evidence did not match expected markers")
+
+    module.Harness.verify_origin_reuse = verify_api_origin_reuse
     frontend = module.Harness.frontend
     original_popen = subprocess.Popen
     active_backend = None
@@ -159,6 +177,7 @@ def main():
         frontend_live = True
         if engine == "direct-origin":
             saved_port = self.args.front_port
+            self.active_label = label
             self.args.front_port = direct_origin_port(self.args)
             try:
                 yield self.origin_pid

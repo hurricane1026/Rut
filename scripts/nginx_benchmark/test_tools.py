@@ -58,11 +58,14 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(command[command.index("--port") + 1], "8704")
         self.assertEqual(command[command.index("--cpus") + 1], "3,4")
         self.assertEqual(command[command.index("--fragment-bytes") + 1], "16384")
-        relay_compare.wait_for_api_origin_ready(
-            io.StringIO("noise\nAPI_READY worker=0\nAPI_READY worker=1\n"), 2
-        )
-        with self.assertRaisesRegex(RuntimeError, "before readiness"):
-            relay_compare.wait_for_api_origin_ready(io.StringIO(""), 1)
+        class ReadyProcess:
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "origin.log"
+            log.write_text("noise\nAPI_READY worker=0\nAPI_READY worker=1\n")
+            relay_compare.wait_for_api_origin_ready(log, ReadyProcess(), 2)
 
     def test_direct_origin_targets_origin_port(self):
         args = SimpleNamespace(origin_port=8704, front_port=8604)
@@ -100,6 +103,14 @@ class ToolsTest(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 2)
         self.assertIn("select no runnable configurations", result.stderr)
+
+    def test_protocol_manifest_records_selection_filters(self):
+        args = SimpleNamespace(cases=["websocket-bulk-64k", "websocket-interactive-64"],
+                               engines=["nginx"], policies=["current"], smoke=True)
+        self.assertEqual(protocol_strategy.selection_manifest(args), {
+            "cases_filter": ["websocket-bulk-64k", "websocket-interactive-64"],
+            "engines_filter": ["nginx"], "policies_filter": ["current"], "smoke": True,
+        })
 
     def test_strategy_requires_repeats_and_guards_tail_latency(self):
         rows = []

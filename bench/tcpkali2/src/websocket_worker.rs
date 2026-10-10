@@ -6,6 +6,7 @@ use crate::error::TcpKaliError;
 use crate::stats::{LocalStatsCache, Stats};
 use crate::utils::{RatePacer, wait_for_benchmark_lifetime, wait_for_load_start};
 
+use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -19,6 +20,16 @@ use tungstenite::Message;
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWriter = SplitSink<WsStream, Message>;
 type WsReader = SplitStream<WsStream>;
+
+fn ping_payload(message: &Bytes, sequence: u64, verify: bool) -> Bytes {
+    if verify && message.len() >= std::mem::size_of::<u64>() {
+        let mut sequenced = message.to_vec();
+        sequenced[..8].copy_from_slice(&sequence.to_be_bytes());
+        Bytes::from(sequenced)
+    } else {
+        message.clone()
+    }
+}
 
 macro_rules! log_error {
     ($stats:expr, $config:expr, $($arg:tt)*) => {
@@ -158,6 +169,7 @@ async fn run_pingpong(
 ) -> Result<(), TcpKaliError> {
     let verify = stats.verify_payload;
     let message = config.message.as_ref().expect("Message must be provided");
+    let mut sequence = 0u64;
     let mut pacer = RatePacer::new(config.message_rate);
     let mut local_stats = LocalStatsCache::new(stats);
 
@@ -165,7 +177,8 @@ async fn run_pingpong(
         pacer.wait().await;
         let sent_at = Instant::now();
 
-        if let Err(error) = write.send(Message::Binary(message.clone())).await {
+        let payload = ping_payload(message, sequence, verify);
+        if let Err(error) = write.send(Message::Binary(payload.clone())).await {
             log_error!(stats, config, "WebSocket send error: {}", error);
             stats.record_connection_error();
             return Ok(());
@@ -173,17 +186,18 @@ async fn run_pingpong(
 
         match read.next().await {
             Some(Ok(Message::Binary(data))) => {
-                if verify && data.as_ref() != message.as_ref() {
+                if verify && data.as_ref() != payload.as_ref() {
                     log_error!(stats, config, "WebSocket echo payload mismatch");
                     stats.record_connection_error();
                     return Ok(());
                 }
                 local_stats.record_responses(
                     1,
-                    message.len(),
+                    payload.len(),
                     data.len(),
                     sent_at.elapsed().as_micros().max(1) as u64,
                 );
+                sequence = sequence.wrapping_add(1);
                 pacer.advance(1);
             }
             Some(Ok(_)) => {}
@@ -316,7 +330,7 @@ async fn pipeline_reader(
 
 #[cfg(test)]
 mod tests {
-    use super::websocket_worker;
+    use super::{ping_payload, websocket_worker};
     use crate::command::Config;
     use crate::stats::Stats;
     use bytes::Bytes;
@@ -327,6 +341,13 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
+    #[test]
+    fn unverified_ping_preserves_exact_payload() {
+        let message = Bytes::from_static(b"abcdefgh");
+        assert_eq!(ping_payload(&message, 7, false), message);
+        assert_eq!(&ping_payload(&message, 7, true)[..8], &7u64.to_be_bytes());
+    }
+
     #[tokio::test]
     async fn pingpong_rejects_corrupt_echo() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -334,15 +355,18 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            ws.send(first).await
+                .unwrap();
             let _ = ws.next().await;
-            ws.send(tungstenite::Message::Binary(Bytes::from_static(b"wrong")))
+            ws.send(tungstenite::Message::Binary(Bytes::from_static(b"\0\0\0\0\0\0\0\0")))
                 .await
                 .unwrap();
         });
         let config = Arc::new(Config {
             duration: Duration::from_secs(1),
             warmup_duration: Duration::ZERO,
-            message_size: 5,
+            message_size: 8,
             quiet: true,
             nagle: false,
             pipeline: false,
@@ -351,7 +375,7 @@ mod tests {
             connect_timeout: Duration::from_secs(1),
             channel_lifetime: None,
             first_message: None,
-            message: Some(Bytes::from_static(b"right")),
+            message: Some(Bytes::from_static(b"abcdefgh")),
             pipeline_message: None,
             pipeline_batch_size: 1,
             message_rate: None,
@@ -372,7 +396,7 @@ mod tests {
         .unwrap();
         server.await.unwrap();
         assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -27,6 +27,15 @@ CASES = [
 ]
 
 
+def selection_manifest(args):
+    return {
+        'cases_filter': sorted(args.cases) if args.cases else None,
+        'engines_filter': sorted(args.engines) if args.engines else None,
+        'policies_filter': sorted(args.policies) if args.policies else None,
+        'smoke': args.smoke,
+    }
+
+
 def ready(port, process, log, workers=0):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -193,6 +202,7 @@ def main():
                     ws_splice_mode=os.environ.get('RUT_STUDY_WS_SPLICE', 'off'),
                     ws_segment=os.environ.get('RUT_STUDY_WS_SEGMENT', '64k'),
                     ws_calls=os.environ.get('RUT_STUDY_WS_CALLS', '8'),
+                    **selection_manifest(args),
                     repeats=1 if args.smoke else args.repeats,
                     ws_nodelay=os.environ.get('RUT_STUDY_WS_NODELAY', 'on'),
                     io_stats=os.environ.get('RUT_STUDY_IO_STATS', 'off'),
