@@ -74,6 +74,17 @@ static bool str_eq(const char* a, const char* b) {
     return *a == *b;
 }
 
+static bool has_study_environment(char* const* environment) {
+    static constexpr char kPrefix[] = "RUT_STUDY_";
+    for (const char* const* item = environment; *item != nullptr; ++item) {
+        const char* value = *item;
+        u32 i = 0;
+        while (kPrefix[i] != '\0' && value[i] == kPrefix[i]) ++i;
+        if (kPrefix[i] == '\0') return true;
+    }
+    return false;
+}
+
 static bool starts_with_dash_dash(const char* s) {
     return s[0] != '\0' && s[0] == '-' && s[1] == '-';
 }
@@ -398,13 +409,15 @@ static void configure_study_policy(Loop* loop) {
                   }) {
         extern char**
             environ;  // NOLINT(readability-redundant-declaration): portable POSIX declaration
+        const bool report_study = has_study_environment(environ);
         const char* profile = "current";
         bool nodelay = false;
         for (const char* const* item = environ; *item != nullptr; ++item)
             if (str_eq(*item, "RUT_STUDY_HTTP_NODELAY=on")) nodelay = true;
         UpstreamPool::study_tcp_nodelay.store(nodelay, std::memory_order_relaxed);
-        write_str(nodelay ? "RUT_STUDY_HTTP_NODELAY mode=on\n"
-                          : "RUT_STUDY_HTTP_NODELAY mode=off\n");
+        if (report_study)
+            write_str(nodelay ? "RUT_STUDY_HTTP_NODELAY mode=on\n"
+                              : "RUT_STUDY_HTTP_NODELAY mode=off\n");
         for (const char* const* item = environ; *item != nullptr; ++item) {
             if (str_eq(*item, "RUT_STUDY_POLICY=latency")) profile = "latency";
             if (str_eq(*item, "RUT_STUDY_POLICY=balanced")) profile = "balanced";
@@ -417,8 +430,9 @@ static void configure_study_policy(Loop* loop) {
                     !loop->backend.enable_ws_recv_cache())
                     loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
             }
-            write_str(loop->backend.ws_recv_cache_enabled ? "RUT_STUDY_WS_RECV mode=cache\n"
-                                                          : "RUT_STUDY_WS_RECV mode=once\n");
+            if (report_study)
+                write_str(loop->backend.ws_recv_cache_enabled ? "RUT_STUDY_WS_RECV mode=cache\n"
+                                                              : "RUT_STUDY_WS_RECV mode=once\n");
         }
         if constexpr (requires { loop->ws_splice.enable(loop->connection_capacity); }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
@@ -446,28 +460,30 @@ static void configure_study_policy(Loop* loop) {
                 if (str_eq(*item, "RUT_STUDY_WS_CALLS=2")) loop->ws_splice.call_budget = 2;
                 if (str_eq(*item, "RUT_STUDY_WS_CALLS=16")) loop->ws_splice.call_budget = 16;
             }
-            write_str(loop->ws_splice.copy_first ? "RUT_STUDY_WS_COPY mode=on\n"
-                                                 : "RUT_STUDY_WS_COPY mode=off\n");
-            write_str(loop->ws_splice.check_available ? "RUT_STUDY_WS_AVAILABLE mode=on\n"
-                                                      : "RUT_STUDY_WS_AVAILABLE mode=off\n");
-            write_str(loop->ws_splice.fast_batch ? "RUT_STUDY_WS_FAST_BATCH mode=on\n"
-                                                 : "RUT_STUDY_WS_FAST_BATCH mode=off\n");
-            write_str(loop->ws_splice.fast_scan ? "RUT_STUDY_WS_FAST_SCAN mode=on\n"
-                                                : "RUT_STUDY_WS_FAST_SCAN mode=off\n");
-            write_str(loop->ws_splice.no_delay ? "RUT_STUDY_WS_NODELAY mode=on\n"
-                                               : "RUT_STUDY_WS_NODELAY mode=off\n");
-            write_str(loop->study_ws_sync_send ? "RUT_STUDY_WS_SYNC_SEND mode=on\n"
-                                               : "RUT_STUDY_WS_SYNC_SEND mode=off\n");
-            write_str("RUT_STUDY_WS_COPY_LIMIT bytes=");
-            write_u32(loop->ws_splice.copy_limit);
-            write_str("\n");
-            write_str("RUT_STUDY_WS_PARAMETERS chunk=");
-            write_u32(loop->ws_splice.chunk_size);
-            write_str(" calls=");
-            write_u32(loop->ws_splice.call_budget);
-            write_str("\n");
-            write_str(loop->ws_splice.enabled ? "RUT_STUDY_WS_SPLICE mode=on\n"
-                                              : "RUT_STUDY_WS_SPLICE mode=off\n");
+            if (report_study) {
+                write_str(loop->ws_splice.copy_first ? "RUT_STUDY_WS_COPY mode=on\n"
+                                                     : "RUT_STUDY_WS_COPY mode=off\n");
+                write_str(loop->ws_splice.check_available ? "RUT_STUDY_WS_AVAILABLE mode=on\n"
+                                                          : "RUT_STUDY_WS_AVAILABLE mode=off\n");
+                write_str(loop->ws_splice.fast_batch ? "RUT_STUDY_WS_FAST_BATCH mode=on\n"
+                                                     : "RUT_STUDY_WS_FAST_BATCH mode=off\n");
+                write_str(loop->ws_splice.fast_scan ? "RUT_STUDY_WS_FAST_SCAN mode=on\n"
+                                                    : "RUT_STUDY_WS_FAST_SCAN mode=off\n");
+                write_str(loop->ws_splice.no_delay ? "RUT_STUDY_WS_NODELAY mode=on\n"
+                                                   : "RUT_STUDY_WS_NODELAY mode=off\n");
+                write_str(loop->study_ws_sync_send ? "RUT_STUDY_WS_SYNC_SEND mode=on\n"
+                                                   : "RUT_STUDY_WS_SYNC_SEND mode=off\n");
+                write_str("RUT_STUDY_WS_COPY_LIMIT bytes=");
+                write_u32(loop->ws_splice.copy_limit);
+                write_str("\n");
+                write_str("RUT_STUDY_WS_PARAMETERS chunk=");
+                write_u32(loop->ws_splice.chunk_size);
+                write_str(" calls=");
+                write_u32(loop->ws_splice.call_budget);
+                write_str("\n");
+                write_str(loop->ws_splice.enabled ? "RUT_STUDY_WS_SPLICE mode=on\n"
+                                                  : "RUT_STUDY_WS_SPLICE mode=off\n");
+            }
         }
         const bool kLatency = str_eq(profile, "latency");
         const bool kBalanced = str_eq(profile, "balanced");
@@ -484,13 +500,15 @@ static void configure_study_policy(Loop* loop) {
             loop->study_relay_chunk_size = kThroughput ? 128u * 1024u : 64u * 1024u;
             loop->study_relay_owner_call_limit = kLatency ? 2u : (kThroughput ? 8u : 4u);
         }
-        write_str("RUT_STUDY_POLICY profile=");
-        write_str(profile);
-        write_str(" batch=");
-        write_u32(loop->study_event_batch_limit);
-        write_str(" chunk=");
-        write_u32(loop->study_relay_chunk_size);
-        write_str("\n");
+        if (report_study) {
+            write_str("RUT_STUDY_POLICY profile=");
+            write_str(profile);
+            write_str(" batch=");
+            write_u32(loop->study_event_batch_limit);
+            write_str(" chunk=");
+            write_u32(loop->study_relay_chunk_size);
+            write_str("\n");
+        }
     }
 }
 
