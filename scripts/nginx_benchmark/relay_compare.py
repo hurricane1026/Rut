@@ -90,10 +90,10 @@ def validate_distinct_url_scenarios(scenarios, enabled):
                          "pass --scenarios proxy-close proxy-keepalive")
 
 
-def validate_distinct_url_origin_mode(enabled, origin_mode):
-    if enabled and origin_mode == "api":
-        raise ValueError("--mixed-distinct-urls is not supported with --origin-mode api; "
-                         "the API origin serves one payload for every path")
+def validate_api_mixed_payload(origin_mode, mixed_small_bytes):
+    if origin_mode == "api" and mixed_small_bytes:
+        raise ValueError("mixed-size workloads are not supported with --origin-mode api; "
+                         "the API origin serves one payload for every request")
 
 
 def validate_mixed_small_rate_scenarios(scenarios, enabled):
@@ -226,7 +226,7 @@ def main():
     if options.mixed_distinct_urls and not options.mixed_small_bytes:
         parser.error("--mixed-distinct-urls requires --mixed-small-bytes")
     try:
-        validate_distinct_url_origin_mode(options.mixed_distinct_urls, options.origin_mode)
+        validate_api_mixed_payload(options.origin_mode, options.mixed_small_bytes)
     except ValueError as error:
         parser.error(str(error))
     try:
