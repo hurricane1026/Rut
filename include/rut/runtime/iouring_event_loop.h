@@ -3554,8 +3554,8 @@ public:
                 return;
             }
             if (!was_armed && c.upstream_recv_armed) {
-                if (--budget == 0) return;
-                ws_cache_rearm_budget = budget;
+                ws_cache_rearm_budget = --budget;
+                if (budget == 0) return;
             }
         }
     }
