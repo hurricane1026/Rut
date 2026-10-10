@@ -145,6 +145,10 @@ struct WsSpliceExperiment {
                 return;
             }
         }
+        // Hand the owner pin to the normal close/cancel ledger. Keeping this
+        // EOF marker set would make progress call close_conn again after the
+        // last poll CQE retires.
+        o.eof_closing = false;
         loop.close_conn(c);
     }
     template <class Loop>
@@ -292,6 +296,9 @@ struct WsSpliceExperiment {
             return;
         }
         if (!o.requested && !o.active && !o.closing) return;
+        // An external close can race a queued EOF completion. From this point
+        // the ordinary close ledger owns the polls and the owner pin.
+        o.eof_closing = false;
         o.closing = true;
         o.requested = false;
         o.active = false;
@@ -379,7 +386,7 @@ struct WsSpliceExperiment {
             if (o.closing) retire(loop, c);
             if (o.eof_closing) {
                 finish_eof_close(loop, c);
-                if (o.eof_closing)
+                if (o.eof_closing || o.closing)
                     queued[retained++] = kId;
                 else
                     o.queued = false;

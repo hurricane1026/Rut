@@ -125,6 +125,7 @@ static void full_duplex_burst(test::TestCase* _tc,
     const Peer kClient{downstream[1]}, kOrigin{upstream[1]};
     auto* conn = loop.alloc_conn();
     REQUIRE(conn != nullptr);
+    const u32 free_top_after_alloc = loop.free_top;
     conn->fd = downstream[0];
     conn->upstream_fd = upstream[0];
     REQUIRE(set_nonblocking(conn->fd));
@@ -275,7 +276,7 @@ static void full_duplex_burst(test::TestCase* _tc,
         }
         CHECK(loop.ws_splice.owners[conn->id].direction[0].eof);
         CHECK(loop.ws_splice.owners[conn->id].direction[1].eof);
-        CHECK(loop.ws_splice.owners[conn->id].eof_closing);
+        CHECK_FALSE(loop.ws_splice.owners[conn->id].eof_closing);
         CHECK_EQ(loop.ws_splice.owners[conn->id].direction[0].buffered, 0u);
         CHECK_EQ(loop.ws_splice.owners[conn->id].direction[1].buffered, 0u);
         CHECK_FALSE(loop.ws_splice.owners[conn->id].direction[0].armed);
@@ -328,6 +329,7 @@ static void full_duplex_burst(test::TestCase* _tc,
         if (kCount == 0) usleep(1000);
     }
     CHECK_EQ(conn->pending_ops, 0u);
+    if (fin_before_drain) CHECK_EQ(loop.free_top, free_top_after_alloc + 1);
     if (fast_batch && half_close) {
         // The initial burst can drain synchronously during handoff. FIN and
         // cancellation force actual readiness completions afterward.
@@ -873,6 +875,54 @@ TEST(websocket, iouring_splice_eof_retries_cancel_after_sq_full) {
                       false,
                       true,
                       true);
+}
+
+TEST(websocket, iouring_splice_eof_close_retires_owner_once) {
+    for (const bool delayed_cancel : {false, true}) {
+        LoopStorage storage;
+        if (!storage.init()) return;
+        auto& loop = *storage.loop;
+        REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+        int peers[2];
+        REQUIRE_EQ(test::stream_socketpair(peers), 0);
+        const Peer kPeer{peers[1]};
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 free_before = loop.free_top;
+        conn->fd = peers[0];
+        conn->pending_ops = delayed_cancel ? 2u : 1u;  // owner pin and optional cancel
+        auto& owner = loop.ws_splice.owners[conn->id];
+        owner.episode = 7;
+        owner.active = true;
+        owner.requested = true;
+        owner.eof_closing = true;
+        for (auto& direction : owner.direction) direction.eof = true;
+        if (delayed_cancel) owner.direction[0].cancel_owned = true;
+        loop.ws_splice.enqueue(conn->id);
+
+        if (delayed_cancel) {
+            loop.ws_splice.progress(loop);
+            loop.ws_splice.progress(loop);
+            CHECK_EQ(loop.free_top, free_before);
+            CHECK_EQ(conn->pending_ops, 2u);
+            const IoEvent cancel{
+                conn->id, -ENOENT, 0, 0, IoEventType::RelayRead, 0, 96, owner.episode};
+            CHECK(loop.ws_splice.dispatch(loop, cancel));
+        } else {
+            loop.ws_splice.progress(loop);
+        }
+        loop.ws_splice.progress(loop);
+        loop.ws_splice.progress(loop);
+        CHECK_EQ(conn->pending_ops, 0u);
+        CHECK_EQ(loop.free_top, free_before + 1);
+        CHECK_EQ(loop.ws_splice.queued_count, 0u);
+        CHECK_FALSE(owner.eof_closing);
+        u8 probe = 0;
+        CHECK_EQ(recv(kPeer.fd, &probe, sizeof(probe), 0), 0);
+        // A repeated progress turn must not retire the same connection twice.
+        loop.ws_splice.progress(loop);
+        CHECK_EQ(loop.free_top, free_before + 1);
+    }
 }
 
 TEST(websocket, iouring_splice_buffered_prefix_handoff) {
