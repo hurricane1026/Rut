@@ -126,30 +126,40 @@ async fn run_websocket_worker(
             return Ok(());
         }
 
-        match read.next().await {
-            Some(Ok(Message::Binary(data)))
-                if first_payload_matches(first_message, &data, stats.verify_payload) =>
-            {
-                let latency_us = sent_at.elapsed().as_micros().max(1) as u64;
-                stats.record_latency(latency_us, 0);
-                stats.record_request(first_message.len(), data.len());
-            }
-            Some(Ok(Message::Binary(_))) => {
-                log_error!(stats, config, "First WebSocket echo payload mismatch");
-                return Ok(());
-            }
-            Some(Err(error)) => {
-                log_error!(
-                    stats,
-                    config,
-                    "Failed to read first message response: {}",
-                    error
-                );
-                return Ok(());
-            }
-            _ => {
-                log_error!(stats, config, "Unexpected response to first message");
-                return Ok(());
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Ping(data))) => {
+                    if let Err(error) = write.send(Message::Pong(data)).await {
+                        log_error!(stats, config, "WebSocket pong error: {}", error);
+                        return Ok(());
+                    }
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Binary(data)))
+                    if first_payload_matches(first_message, &data, stats.verify_payload) =>
+                {
+                    let latency_us = sent_at.elapsed().as_micros().max(1) as u64;
+                    stats.record_latency(latency_us, 0);
+                    stats.record_request(first_message.len(), data.len());
+                    break;
+                }
+                Some(Ok(Message::Binary(_))) => {
+                    log_error!(stats, config, "First WebSocket echo payload mismatch");
+                    return Ok(());
+                }
+                Some(Err(error)) => {
+                    log_error!(
+                        stats,
+                        config,
+                        "Failed to read first message response: {}",
+                        error
+                    );
+                    return Ok(());
+                }
+                _ => {
+                    log_error!(stats, config, "Unexpected response to first message");
+                    return Ok(());
+                }
             }
         }
     }
@@ -353,7 +363,11 @@ async fn pipeline_reader(
                 return Ok(());
             }
             Ok(Message::Text(_)) => {
-                log_error!(stats, config, "Unexpected WebSocket text frame in binary pipeline");
+                log_error!(
+                    stats,
+                    config,
+                    "Unexpected WebSocket text frame in binary pipeline"
+                );
                 stats.record_connection_error();
                 return Ok(());
             }
@@ -408,12 +422,13 @@ mod tests {
                 .await
                 .unwrap();
             let _ = ws.next().await;
-            ws.send(first).await
-                .unwrap();
+            ws.send(first).await.unwrap();
             let _ = ws.next().await;
-            ws.send(tungstenite::Message::Binary(Bytes::from_static(b"\0\0\0\0\0\0\0\0")))
-                .await
-                .unwrap();
+            ws.send(tungstenite::Message::Binary(Bytes::from_static(
+                b"\0\0\0\0\0\0\0\0",
+            )))
+            .await
+            .unwrap();
         });
         let config = Arc::new(Config {
             duration: Duration::from_secs(1),
@@ -450,6 +465,129 @@ mod tests {
         server.await.unwrap();
         assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
         assert_eq!(stats.total_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_message_handles_control_frames_before_echo() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let first = websocket.next().await.unwrap().unwrap();
+            assert_eq!(first, Message::Binary(Bytes::from_static(b"init")));
+
+            let ping = Bytes::from_static(b"control ping");
+            websocket.send(Message::Ping(ping.clone())).await.unwrap();
+            assert_eq!(
+                websocket.next().await.unwrap().unwrap(),
+                Message::Pong(ping)
+            );
+            websocket
+                .send(Message::Pong(Bytes::from_static(b"unsolicited pong")))
+                .await
+                .unwrap();
+            websocket.send(first).await.unwrap();
+        });
+
+        let config = Arc::new(Config {
+            duration: Duration::from_secs(1),
+            warmup_duration: Duration::ZERO,
+            message_size: 4,
+            quiet: true,
+            nagle: false,
+            pipeline: false,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_secs(1),
+            init_timeout: Duration::from_millis(100),
+            channel_lifetime: None,
+            first_message: Some(Bytes::from_static(b"init")),
+            message: Some(Bytes::from_static(b"load")),
+            pipeline_message: Some(Bytes::from_static(b"load")),
+            pipeline_batch_size: 1,
+            message_rate: Some(0),
+            use_websocket: true,
+            output: None,
+        });
+        let stats = Arc::new(Stats::new());
+        stats.end_warmup();
+        let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(true);
+        let target = address.to_string();
+        let worker_stats = stats.clone();
+        let worker = tokio::spawn(async move {
+            websocket_worker(&target, config, worker_stats, load_start_rx, None).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stats.initialized_connections.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("first-message initialization did not complete");
+        assert_eq!(stats.success_connections.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 1);
+
+        worker.abort();
+        let _ = worker.await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_message_text_reply_remains_initialization_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            assert!(websocket.next().await.unwrap().unwrap().is_binary());
+            websocket
+                .send(Message::Text("not an echo".into()))
+                .await
+                .unwrap();
+        });
+
+        let config = Arc::new(Config {
+            duration: Duration::from_secs(1),
+            warmup_duration: Duration::ZERO,
+            message_size: 4,
+            quiet: true,
+            nagle: false,
+            pipeline: false,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_secs(1),
+            init_timeout: Duration::from_secs(1),
+            channel_lifetime: None,
+            first_message: Some(Bytes::from_static(b"init")),
+            message: Some(Bytes::from_static(b"load")),
+            pipeline_message: Some(Bytes::from_static(b"load")),
+            pipeline_batch_size: 1,
+            message_rate: Some(0),
+            use_websocket: true,
+            output: None,
+        });
+        let stats = Arc::new(Stats::new());
+        stats.end_warmup();
+        let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(true);
+        let target = address.to_string();
+        let worker_stats = stats.clone();
+        let worker = tokio::spawn(async move {
+            websocket_worker(&target, config, worker_stats, load_start_rx, None).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("invalid first-message response did not fail initialization")
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(stats.success_connections.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.initialized_connections.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

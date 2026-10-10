@@ -497,6 +497,68 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_control_frames_do_not_extend_missing_echo_deadline() {
+        use bytes::Bytes;
+        use futures::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+        use tungstenite::Message;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            assert_eq!(
+                websocket.next().await.unwrap().unwrap(),
+                Message::Binary(Bytes::from_static(b"init"))
+            );
+            let ping = Bytes::from_static(b"control ping");
+            websocket.send(Message::Ping(ping.clone())).await.unwrap();
+            assert_eq!(
+                websocket.next().await.unwrap().unwrap(),
+                Message::Pong(ping)
+            );
+            websocket
+                .send(Message::Pong(Bytes::from_static(b"unsolicited pong")))
+                .await
+                .unwrap();
+
+            // The runner must enforce its initialization deadline and drop
+            // the worker even though control frames arrived before the echo.
+            tokio::time::timeout(Duration::from_secs(1), websocket.next())
+                .await
+                .expect("runner did not close the pending WebSocket worker");
+        });
+        let matches = crate::command::command()
+            .try_get_matches_from(vec![
+                "tcpkali2".to_string(),
+                "-q".to_string(),
+                "--websocket".to_string(),
+                "--connect-timeout".to_string(),
+                "25ms".to_string(),
+                "--init-timeout".to_string(),
+                "50ms".to_string(),
+                "--duration".to_string(),
+                "100ms".to_string(),
+                "--first-message".to_string(),
+                "init".to_string(),
+                address.to_string(),
+            ])
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), super::async_main(matches))
+            .await
+            .expect("runner did not enforce the WebSocket initialization deadline");
+        assert!(matches!(
+            result,
+            Err(crate::error::TcpKaliError::Timeout(message))
+                if message == "timed out waiting for connection initialization"
+        ));
+        server.await.unwrap();
+    }
+
     #[test]
     fn readiness_timeout_tracks_configured_connection_timeout() {
         assert_eq!(
