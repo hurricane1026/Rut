@@ -41689,6 +41689,7 @@ TEST(iouring_cache_rearm, shared_budget_keeps_downstream_pending) {
     REQUIRE(loop.submit_recv_upstream(conn));
     loop.test_defer_recv_rearm(conn);
     conn.upstream_recv_pause_rearm_pending = true;
+    conn.upstream_recv_armed = false;
     const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
     loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;
     loop.test_rearm_cache_passes_with_budget(1);
