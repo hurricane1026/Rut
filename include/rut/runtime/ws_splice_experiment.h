@@ -217,25 +217,35 @@ struct WsSpliceExperiment {
                 ++calls;
                 --turn_budget_remaining;
                 if (!kWriting) ++read_calls[index];
-                if (copy) {
-                    n = kWriting ? ::send(kDestination,
-                                          buffer.data(),
-                                          d.buffered,
-                                          MSG_DONTWAIT | MSG_NOSIGNAL)
-                                 : ::recv(kSource, buffer.write_ptr(), kCopyLength, MSG_DONTWAIT);
+#ifdef RUT_TESTING
+                if (loop.test_eintr_next_ws_splice_call) {
+                    loop.test_eintr_next_ws_splice_call = false;
+                    n = -1;
+                    errno = EINTR;
                 } else
-                    n = kWriting ? ::splice(d.read_fd,
-                                            nullptr,
-                                            kDestination,
-                                            nullptr,
-                                            d.buffered,
-                                            SPLICE_F_NONBLOCK | SPLICE_F_MOVE)
-                                 : ::splice(kSource,
-                                            nullptr,
-                                            d.write_fd,
-                                            nullptr,
-                                            chunk_size,
-                                            SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
+#endif
+                {
+                    if (copy) {
+                        n = kWriting
+                                ? ::send(kDestination,
+                                         buffer.data(),
+                                         d.buffered,
+                                         MSG_DONTWAIT | MSG_NOSIGNAL)
+                                : ::recv(kSource, buffer.write_ptr(), kCopyLength, MSG_DONTWAIT);
+                    } else
+                        n = kWriting ? ::splice(d.read_fd,
+                                                nullptr,
+                                                kDestination,
+                                                nullptr,
+                                                d.buffered,
+                                                SPLICE_F_NONBLOCK | SPLICE_F_MOVE)
+                                     : ::splice(kSource,
+                                                nullptr,
+                                                d.write_fd,
+                                                nullptr,
+                                                chunk_size,
+                                                SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
+                }
             } while (n < 0 && errno == EINTR && turn_budget_remaining != 0);
             if (kSampled) {
                 const int kSavedErrno = errno;
@@ -246,12 +256,19 @@ struct WsSpliceExperiment {
                 ++eagain[kWriting ? 1 : 0];
                 if (!kWriting) d.probe_copy = true;
                 if (!arm(loop, c, index, kWriting)) loop.close_conn(c);
+                const auto& other = o.direction[index ^ 1u];
+                // If this was the last call, the opposite direction still needs
+                // one probe before both directions can sleep on readiness.
+                if (turn_budget_remaining == 0 && !other.armed && !other.cancel_owned &&
+                    (!other.eof || other.buffered != 0))
+                    o.budget_deferred = true;
                 o.next_direction = static_cast<u8>(index ^ 1u);
                 enqueue(c.id);
                 return;
             }
             if (n < 0 && errno == EINTR && turn_budget_remaining == 0) {
-                o.next_direction = static_cast<u8>(index ^ 1u);
+                o.next_direction = static_cast<u8>(index);
+                o.budget_deferred = true;
                 enqueue(c.id);
                 return;
             }
@@ -327,7 +344,7 @@ struct WsSpliceExperiment {
             }
         }
         if (turn_budget_remaining == 0) {
-            o.next_direction = static_cast<u8>(index ^ 1u);
+            o.next_direction = static_cast<u8>(d.buffered != 0 ? index : (index ^ 1u));
             o.budget_deferred = true;
             enqueue(c.id);
             return;

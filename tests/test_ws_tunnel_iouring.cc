@@ -863,6 +863,65 @@ TEST(websocket, iouring_splice_full_duplex) {
 TEST(websocket, iouring_splice_shard_budget_one) {
     full_duplex_burst(_tc, false, false, false, true, false, 0, false, 65536, 1, false, 2048);
 }
+TEST(websocket, iouring_splice_last_budget_eintr_remains_runnable) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    loop.ws_splice.call_budget = 1;
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    Peer client{downstream[1]}, origin{upstream[1]};
+    auto* connection = loop.alloc_conn();
+    REQUIRE(connection != nullptr);
+    connection->fd = downstream[0];
+    connection->upstream_fd = upstream[0];
+    connection->upstream_episode = 1;
+    REQUIRE(set_nonblocking(connection->fd));
+    REQUIRE(set_nonblocking(connection->upstream_fd));
+    auto& owner = loop.ws_splice.owners[connection->id];
+    owner.active = true;
+    owner.episode = connection->upstream_episode;
+    ++connection->pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner.direction[direction].read_fd = fds[0];
+        owner.direction[direction].write_fd = fds[1];
+    }
+    loop.ws_splice.enqueue(connection->id);
+    static constexpr u8 kPayload[] = "retry after interrupted final syscall";
+    REQUIRE(write_burst(client.fd, kPayload, sizeof(kPayload)));
+
+    loop.test_eintr_next_ws_splice_call = true;
+    const u64 calls_before = loop.ws_splice.calls;
+    loop.ws_splice.progress(loop);
+    CHECK_EQ(loop.ws_splice.calls - calls_before, 1u);
+    CHECK(loop.ws_splice.owners[connection->id].budget_deferred);
+    CHECK(loop.ws_splice.budget_deferred_runnable);
+    CHECK_FALSE(loop.should_wait_for_event());
+
+    u8 received[sizeof(kPayload)]{};
+    u32 received_bytes = 0;
+    for (u32 turn = 0; turn < 32 && received_bytes < sizeof(kPayload); ++turn) {
+        loop.ws_splice.progress(loop);
+        REQUIRE(read_available(origin.fd, received, &received_bytes, sizeof(kPayload)));
+    }
+    REQUIRE_EQ(received_bytes, sizeof(kPayload));
+    CHECK(__builtin_memcmp(received, kPayload, sizeof(kPayload)) == 0);
+
+    loop.close_conn(*connection);
+    for (u32 i = 0; i < 1000 && connection->pending_ops != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(connection->pending_ops, 0u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
+}
 TEST(websocket, iouring_splice_budget_deferred_work_skips_blocking_wait) {
     LoopStorage storage;
     if (!storage.init()) return;
@@ -940,9 +999,13 @@ TEST(websocket, iouring_splice_armed_owner_allows_blocking_wait) {
     }
     loop.ws_splice.enqueue(connection->id);
 
-    loop.ws_splice.progress(loop);
+    for (u32 turn = 0; turn < 4 && (!loop.ws_splice.owners[connection->id].direction[0].armed ||
+                                    !loop.ws_splice.owners[connection->id].direction[1].armed);
+         ++turn)
+        loop.ws_splice.progress(loop);
     CHECK_FALSE(loop.ws_splice.budget_deferred_runnable);
     CHECK(loop.ws_splice.owners[connection->id].direction[0].armed);
+    CHECK(loop.ws_splice.owners[connection->id].direction[1].armed);
     CHECK(loop.should_wait_for_event());
 
     loop.close_conn(*connection);

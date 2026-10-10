@@ -298,6 +298,9 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u64 relay_written_bytes = 0;
     bool test_fail_next_relay_poll = false;
     bool test_fail_next_ws_splice_cancel = false;
+#ifdef RUT_TESTING
+    bool test_eintr_next_ws_splice_call = false;
+#endif
     // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
     // global rules degrade to per-shard. main.cc points every shard at one
     // shared instance.
