@@ -39,6 +39,14 @@ def percentile(values, percent):
     return ordered[max(0, math.ceil(len(ordered) * percent / 100) - 1)]
 
 
+def result_is_complete(result):
+    return (result["planned_requests"] > 0
+            and result["issued_requests"] == result["planned_requests"]
+            and result["requests"] == result["planned_requests"]
+            and result["unissued_requests"] == 0 and result["unfinished_requests"] == 0
+            and not any(result["errors"].values()))
+
+
 async def run(args):
     errors = dict(connect=0, read=0, write=0, status=0, timeout=0)
     expected = b"Z" * args.body_size
@@ -107,7 +115,7 @@ async def run(args):
     if remaining > 0:
         await asyncio.sleep(remaining)
     count = len(latencies)
-    return dict(requests=count, seconds=args.duration, elapsed_seconds=time.perf_counter() - started,
+    result = dict(requests=count, seconds=args.duration, elapsed_seconds=time.perf_counter() - started,
                 rps=count / args.duration, offered_rps=args.rate, planned_requests=target,
                 issued_requests=issued, unissued_requests=target - issued,
                 unfinished_requests=issued - count, delivered_fraction=count / target if target else 0,
@@ -115,6 +123,8 @@ async def run(args):
                 p99_us=percentile(latencies, 99), service_p99_us=percentile(service, 99),
                 scheduling_lag_p99_us=percentile(lag, 99), errors=errors,
                 latency_basis="planned arrival to response completion; one outstanding per connection")
+    result["valid"] = result_is_complete(result)
+    return result
 
 
 def main():

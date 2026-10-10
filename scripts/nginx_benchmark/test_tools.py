@@ -175,6 +175,35 @@ class ToolsTest(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 relay_compare.mixed_cpu_masks(invalid)
 
+    def test_mixed_small_rate_requires_proxy_keepalive(self):
+        for scenario in ("static-close", "static-keepalive", "proxy-close"):
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(
+                    ValueError, "specifically proxy-keepalive"):
+                relay_compare.validate_mixed_small_rate_scenarios((scenario,), True)
+        relay_compare.validate_mixed_small_rate_scenarios(("proxy-keepalive",), True)
+
+    def test_paced_result_requires_exact_planned_completion(self):
+        base = dict(planned_requests=2, issued_requests=2, requests=2,
+                    unissued_requests=0, unfinished_requests=0,
+                    errors=dict(connect=0, read=0, write=0, status=0, timeout=0))
+        self.assertTrue(paced_http_client.result_is_complete(base))
+        for key in base["errors"]:
+            with self.subTest(error=key):
+                failed = dict(base, errors=dict(base["errors"], **{key: 1}))
+                self.assertFalse(paced_http_client.result_is_complete(failed))
+        for field in ("issued_requests", "requests", "unissued_requests", "unfinished_requests"):
+            with self.subTest(field=field):
+                failed = dict(base, **{field: 1 if field in ("unissued_requests", "unfinished_requests") else 0})
+                self.assertFalse(paced_http_client.result_is_complete(failed))
+        self.assertFalse(paced_http_client.result_is_complete(dict(base, planned_requests=0)))
+
+    def test_short_sync_readme_summary_digest_matches_committed_artifact(self):
+        root = Path(__file__).parents[2]
+        summary = root / "docs/performance/http-short-sync-request-20261010/summary.json"
+        readme = summary.with_name("README.md").read_text()
+        digest = __import__("hashlib").sha256(summary.read_bytes()).hexdigest()
+        self.assertIn(f"Raw summary SHA256: `{digest}`", readme)
+
     def test_distinct_urls_require_proxy_scenarios(self):
         with self.assertRaisesRegex(ValueError, "requires proxy-only scenarios"):
             relay_compare.validate_distinct_url_scenarios(relay_compare.DEFAULT_SCENARIOS, True)
