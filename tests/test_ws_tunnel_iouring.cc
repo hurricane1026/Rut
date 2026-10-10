@@ -1065,6 +1065,547 @@ TEST(websocket, iouring_splice_excludes_tls_inspection_and_throttle) {
     CHECK_EQ(loop.ws_splice.queued_count, 0u);
 }
 
+TEST(http, iouring_empty_terminal_scan_invalidates_on_real_publisher) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_http_terminal_scan = true;
+    IoEvent event{};
+    event.type = IoEventType::UpstreamRecv;
+    event.conn_id = loop.connection_capacity;  // stale HTTP identity, not a WS auxiliary
+    loop.dispatch_batch(&event, 1);
+    REQUIRE(!loop.response_read_terminal_scan_needed);
+    loop.dispatch_batch(&event, 1);
+    CHECK_EQ(loop.study_http_terminal_scans_skipped, 1u);
+    int fds[2];
+    REQUIRE_EQ(test::stream_socketpair(fds), 0);
+    const Peer kPeer{fds[1]};
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = fds[0];
+    conn->send_armed = true;
+    loop.mark_response_read_terminal_pending(*conn);
+    REQUIRE(loop.response_read_terminal_scan_needed);
+    loop.dispatch_batch(&event, 1);
+    CHECK(loop.response_read_terminal_scan_needed);
+    CHECK_EQ(loop.study_http_terminal_scans_skipped, 1u);
+    conn->response_read_deadline_post_commit_terminal_pending = false;
+    conn->send_armed = false;
+    loop.dispatch_batch(&event, 1);
+    CHECK(!loop.response_read_terminal_scan_needed);
+    loop.dispatch_batch(&event, 1);
+    CHECK_EQ(loop.study_http_terminal_scans_skipped, 2u);
+    loop.close_conn(*conn);
+}
+
+TEST(http, iouring_boundary_ready_set_preserves_reblocked_and_stale_owners) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_http_boundary_ready_set = true;
+    loop.initialize_slots_to(128);
+    int first[2];
+    int second[2];
+    REQUIRE_EQ(test::stream_socketpair(first), 0);
+    const Peer kFirstPeer{first[1]};
+    REQUIRE_EQ(test::stream_socketpair(second), 0);
+    const Peer kSecondPeer{second[1]};
+    auto& low = loop.conns[63];
+    auto& high = loop.conns[64];
+    low.fd = first[0];
+    high.fd = second[0];
+    low.http1_boundary_deferred = high.http1_boundary_deferred = true;
+    loop.maybe_publish_http1_boundary_ready(low);
+    loop.maybe_publish_http1_boundary_ready(high);
+    REQUIRE(low.http1_boundary_ready);
+    REQUIRE(high.http1_boundary_ready);
+    // Another CQE in the same batch can re-block an already published owner.
+    low.upstream_recv_cancel_inflight = high.upstream_recv_cancel_inflight = true;
+    loop.resume_deferred_http1_boundaries();
+    CHECK(!low.http1_boundary_ready);
+    CHECK(!high.http1_boundary_ready);
+    CHECK(low.http1_boundary_deferred);
+    CHECK(high.http1_boundary_deferred);
+    CHECK_EQ(loop.study_http_boundary_slots_visited, 2u);
+    low.upstream_recv_cancel_inflight = high.upstream_recv_cancel_inflight = false;
+    loop.maybe_publish_http1_boundary_ready(low);
+    loop.maybe_publish_http1_boundary_ready(high);
+    // Close/reset may invalidate readiness before the batch boundary.
+    low.http1_boundary_ready = false;
+    low.http1_boundary_deferred = high.http1_boundary_deferred = false;
+    loop.resume_deferred_http1_boundaries();
+    CHECK(!high.http1_boundary_ready);
+    CHECK_EQ(loop.http1_boundary_ready_words[0], 0u);
+    CHECK_EQ(loop.http1_boundary_ready_words[1], 0u);
+    CHECK_EQ(loop.study_http_boundary_slots_visited, 4u);
+    low.fd = high.fd = -1;
+    close(first[0]);
+    close(second[0]);
+}
+
+TEST(http, iouring_boundary_default_scan_keeps_ready_bitset_unpublished) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.initialize_slots_to(64);
+    int fds[2];
+    REQUIRE_EQ(test::stream_socketpair(fds), 0);
+    const Peer peer{fds[1]};
+    auto& conn = loop.conns[7];
+    conn.fd = fds[0];
+    conn.http1_boundary_deferred = true;
+    loop.maybe_publish_http1_boundary_ready(conn);
+    REQUIRE(conn.http1_boundary_ready);
+    REQUIRE(loop.http1_boundary_ready_pending);
+    CHECK_EQ(loop.http1_boundary_ready_words[0], 0u);
+    conn.http1_boundary_deferred = false;
+    loop.resume_deferred_http1_boundaries();
+    CHECK(!conn.http1_boundary_ready);
+    CHECK(!loop.http1_boundary_ready_pending);
+    CHECK_EQ(loop.http1_boundary_ready_words[0], 0u);
+    conn.fd = -1;
+    close(fds[0]);
+}
+
+TEST(http, iouring_relay_ring_preserves_fifo_across_wrap_removal_and_duplicate) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_http_relay_ring = true;
+    loop.initialize_slots_to(loop.kDeferredRelayReadLimit);
+    for (u32 id = 0; id < loop.kDeferredRelayReadLimit; ++id) {
+        auto& conn = loop.conns[id];
+        conn.relay_owner.upstream_episode = id + 1u;
+        loop.defer_response_splice_read(conn);
+    }
+    CHECK_EQ(loop.deferred_relay_read_count, loop.kDeferredRelayReadLimit);
+    // Duplicate publication at capacity must not fall through to a kernel poll.
+    loop.defer_response_splice_read(loop.conns[0]);
+    CHECK_EQ(loop.deferred_relay_read_count, loop.kDeferredRelayReadLimit);
+    u32 id = 0;
+    u32 episode = 0;
+    for (u32 expected = 0; expected < 100; ++expected) {
+        REQUIRE(loop.pop_deferred_relay_read(id, episode));
+        CHECK_EQ(id, expected);
+        CHECK_EQ(episode, expected + 1u);
+    }
+    for (u32 next = 0; next < 100; ++next) loop.defer_response_splice_read(loop.conns[next]);
+    loop.clear_deferred_relay_read(0);    // wrapped entry
+    loop.clear_deferred_relay_read(200);  // middle entry
+    CHECK_EQ(loop.deferred_relay_read_count, loop.kDeferredRelayReadLimit - 2u);
+    for (u32 offset = 0; offset < loop.kDeferredRelayReadLimit; ++offset) {
+        const u32 kExpected = (100u + offset) % loop.kDeferredRelayReadLimit;
+        if (kExpected == 0 || kExpected == 200) continue;
+        REQUIRE(loop.pop_deferred_relay_read(id, episode));
+        CHECK_EQ(id, kExpected);
+        CHECK_EQ(episode, kExpected + 1u);
+    }
+    CHECK(!loop.pop_deferred_relay_read(id, episode));
+    // A reused identity with a different episode is a distinct queue owner.
+    loop.defer_response_splice_read(loop.conns[7]);
+    loop.conns[7].relay_owner.upstream_episode = 999;
+    loop.defer_response_splice_read(loop.conns[7]);
+    CHECK_EQ(loop.deferred_relay_read_count, 2u);
+    loop.clear_deferred_relay_read(7);
+    CHECK_EQ(loop.deferred_relay_read_count, 0u);
+}
+
+static void byte_fairness(test::TestCase* _tc, bool byte_gate) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_http_byte_yield = byte_gate;
+    loop.study_relay_turn_byte_limit = 512 * 1024;
+    loop.ordinary_cq_wait_limit_ns = 0;
+    int first_up[2];
+    int second_up[2];
+    int first_down[2];
+    int second_down[2];
+    REQUIRE_EQ(test::stream_socketpair(first_up), 0);
+    REQUIRE_EQ(test::stream_socketpair(second_up), 0);
+    REQUIRE_EQ(test::stream_socketpair(first_down), 0);
+    REQUIRE_EQ(test::stream_socketpair(second_down), 0);
+    const Peer kFirstUpPeer{first_up[1]};
+    const Peer kSecondUpPeer{second_up[1]};
+    const Peer kFirstDownPeer{first_down[1]};
+    const Peer kSecondDownPeer{second_down[1]};
+    int buffer_size = 1024 * 1024;
+    REQUIRE_EQ(setsockopt(first_up[1], SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)),
+               0);
+    REQUIRE_EQ(setsockopt(first_down[0], SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)),
+               0);
+    static u8 payload[128 * 1024]{};
+    REQUIRE(write_burst(first_up[1], payload, sizeof(payload)));
+    auto* first = loop.alloc_conn();
+    auto* second = loop.alloc_conn();
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    first->fd = first_down[0];
+    first->upstream_fd = first_up[0];
+    second->fd = second_down[0];
+    second->upstream_fd = second_up[0];
+    Connection* targets[2] = {first, second};
+    for (auto* conn : targets) {
+        REQUIRE_EQ(fcntl(conn->fd, F_SETFL, fcntl(conn->fd, F_GETFL) | O_NONBLOCK), 0);
+        REQUIRE_EQ(
+            fcntl(conn->upstream_fd, F_SETFL, fcntl(conn->upstream_fd, F_GETFL) | O_NONBLOCK), 0);
+        conn->protocol = ConnProtocol::Http11;
+        conn->state = ConnState::Proxying;
+        conn->req_method = static_cast<u8>(LogHttpMethod::Get);
+        conn->request_upload_complete = true;
+        conn->resp_body_mode = BodyMode::ContentLength;
+        conn->resp_body_remaining = sizeof(payload);
+        conn->resp_status = 200;
+        conn->keep_alive = false;
+        conn->upstream_keep_alive = false;
+        loop.relay_budget_calls = 0;
+        REQUIRE(loop.start_response_splice(*conn));
+    }
+    REQUIRE_EQ(loop.deferred_relay_read_count, 2u);
+    loop.relay_budget_calls = 16;
+    loop.relay_budget_bytes = 512 * 1024;
+    u32 fake_head = 0;
+    u32 fake_tail = 1;
+    u32 fake_mask = 0;
+    const u32 kFreeTopBeforeFlush = loop.free_top;
+    io_uring_cqe ordinary{};
+    ordinary.user_data = encode_non_upstream_user_data({second->id, IoEventType::Send, 1});
+    auto* saved_head = loop.backend.cq_head;
+    auto* saved_tail = loop.backend.cq_tail;
+    auto* saved_entries = loop.backend.cq_entries;
+    auto* saved_mask = loop.backend.cq_ring_mask;
+    loop.backend.cq_head = &fake_head;
+    loop.backend.cq_tail = &fake_tail;
+    loop.backend.cq_entries = &ordinary;
+    loop.backend.cq_ring_mask = &fake_mask;
+    loop.flush_deferred_relay_reads();
+    loop.backend.cq_head = saved_head;
+    loop.backend.cq_tail = saved_tail;
+    loop.backend.cq_entries = saved_entries;
+    loop.backend.cq_ring_mask = saved_mask;
+    // The first read/write spends half the bytes while calls remain. A
+    // pending ordinary completion must leave the second relay queued.
+    CHECK_EQ(loop.relay_written_bytes, sizeof(payload));
+    CHECK_EQ(loop.deferred_relay_read_count, byte_gate ? 1u : 0u);
+    CHECK_EQ(second->relay_owner.read_armed, !byte_gate);
+    CHECK_EQ(loop.study_relay_yields, byte_gate ? 1u : 0u);
+    CHECK_EQ(loop.free_top, kFreeTopBeforeFlush + 1u);
+    CHECK_EQ(first->fd, -1);
+    CHECK(second->fd >= 0);
+    // The synchronous relay can complete the first response and return its
+    // slot during flush_deferred_relay_reads(). Only close the still-live
+    // second owner; closing the already-reset first slot would free it twice.
+    if (first->fd >= 0) loop.close_conn(*first);
+    if (second->fd >= 0) loop.close_conn(*second);
+    for (u32 i = 0; i < 1000 && (first->pending_ops != 0 || second->pending_ops != 0); ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 kCount =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, kCount);
+        if (kCount == 0) usleep(1000);
+    }
+    CHECK_EQ(first->pending_ops, 0u);
+    CHECK_EQ(second->pending_ops, 0u);
+    CHECK_EQ(loop.free_top, kFreeTopBeforeFlush + 2u);
+}
+
+TEST(http, byte_budget_completion_observation) {
+    byte_fairness(_tc, true);
+}
+TEST(http, call_budget_default_completion_observation) {
+    byte_fairness(_tc, false);
+}
+
+TEST(http, taskrun_readiness_is_observed_before_cq_publication) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    u32 head = 0;
+    u32 tail = 0;
+    u32 flags = 0;
+    auto* saved_head = loop.backend.cq_head;
+    auto* saved_tail = loop.backend.cq_tail;
+    auto* saved_flags = loop.backend.sq_flags;
+    loop.backend.cq_head = &head;
+    loop.backend.cq_tail = &tail;
+    loop.backend.sq_flags = &flags;
+    loop.study_http_taskrun_yield = true;
+    CHECK(!loop.has_ordinary_cq_work());
+    flags = IORING_SQ_TASKRUN;
+    CHECK(loop.has_ordinary_cq_work());
+    CHECK_EQ(head, 0u);
+    CHECK_EQ(flags, static_cast<u32>(IORING_SQ_TASKRUN));
+    flags = IORING_SQ_CQ_OVERFLOW;
+    CHECK(loop.has_ordinary_cq_work());
+    flags = IORING_SQ_NEED_WAKEUP;
+    CHECK(!loop.has_ordinary_cq_work());
+    loop.study_http_taskrun_yield = false;
+    flags = IORING_SQ_TASKRUN;
+    CHECK(!loop.has_ordinary_cq_work());
+    loop.backend.cq_head = saved_head;
+    loop.backend.cq_tail = saved_tail;
+    loop.backend.sq_flags = saved_flags;
+}
+
+TEST(http, newly_dispatched_relay_read_preserves_older_runnable_owner) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    int first_up[2], second_up[2], first_down[2], second_down[2];
+    REQUIRE_EQ(test::stream_socketpair(first_up), 0);
+    REQUIRE_EQ(test::stream_socketpair(second_up), 0);
+    REQUIRE_EQ(test::stream_socketpair(first_down), 0);
+    REQUIRE_EQ(test::stream_socketpair(second_down), 0);
+    const Peer first_up_peer{first_up[1]}, second_up_peer{second_up[1]};
+    const Peer first_down_peer{first_down[1]}, second_down_peer{second_down[1]};
+    static u8 payload[128 * 1024]{};
+    int capacity = 1024 * 1024;
+    for (int fd : {first_up[1], second_up[1], first_down[0], second_down[0]})
+        REQUIRE_EQ(setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &capacity, sizeof(capacity)), 0);
+    REQUIRE(write_burst(first_up[1], payload, sizeof(payload)));
+    REQUIRE(write_burst(second_up[1], payload, sizeof(payload)));
+    auto* first = loop.alloc_conn();
+    auto* second = loop.alloc_conn();
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    first->fd = first_down[0];
+    first->upstream_fd = first_up[0];
+    second->fd = second_down[0];
+    second->upstream_fd = second_up[0];
+    Connection* targets[2] = {first, second};
+    for (auto* c : targets) {
+        REQUIRE_EQ(fcntl(c->fd, F_SETFL, fcntl(c->fd, F_GETFL) | O_NONBLOCK), 0);
+        REQUIRE_EQ(fcntl(c->upstream_fd, F_SETFL, fcntl(c->upstream_fd, F_GETFL) | O_NONBLOCK), 0);
+        c->protocol = ConnProtocol::Http11;
+        c->state = ConnState::Proxying;
+        c->req_method = static_cast<u8>(LogHttpMethod::Get);
+        c->request_upload_complete = true;
+        c->resp_body_mode = BodyMode::ContentLength;
+        c->resp_body_remaining = sizeof(payload);
+        c->keep_alive = false;
+        c->upstream_keep_alive = false;
+    }
+    loop.relay_budget_calls = 0;
+    REQUIRE(loop.start_response_splice(*first));
+    loop.relay_budget_calls = 2;
+    loop.relay_budget_bytes = 256 * 1024;
+    loop.study_inside_cq = true;
+    REQUIRE(loop.start_response_splice(*second));
+    CHECK_EQ(loop.relay_written_bytes, 0u);
+    CHECK_EQ(loop.deferred_relay_read_count, 2u);
+    loop.study_inside_cq = false;
+    loop.flush_deferred_relay_reads();
+    CHECK_EQ(loop.relay_written_bytes, sizeof(payload));
+    CHECK_EQ(second->resp_body_remaining, sizeof(payload));
+    CHECK_EQ(loop.deferred_relay_read_count, 1u);
+    CHECK_EQ(loop.deferred_relay_read_ids[loop.deferred_relay_read_slot(0)], second->id);
+    loop.close_conn(*first);
+    loop.close_conn(*second);
+}
+
+static void early_submit(test::TestCase* _tc, bool enabled, bool failure = false) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_http_submit_before_relay = enabled;
+    int sender_fds[2];
+    int relay_up[2];
+    int relay_down[2];
+    REQUIRE_EQ(test::stream_socketpair(sender_fds), 0);
+    REQUIRE_EQ(test::stream_socketpair(relay_up), 0);
+    REQUIRE_EQ(test::stream_socketpair(relay_down), 0);
+    const Peer kSenderPeer{sender_fds[1]};
+    const Peer kRelayUpPeer{relay_up[1]};
+    const Peer kRelayDownPeer{relay_down[1]};
+    auto* sender = loop.alloc_conn();
+    auto* relay = loop.alloc_conn();
+    REQUIRE(sender != nullptr);
+    REQUIRE(relay != nullptr);
+    sender->fd = sender_fds[0];
+    sender->state = ConnState::Sending;
+    relay->fd = relay_down[0];
+    relay->upstream_fd = relay_up[0];
+    relay->protocol = ConnProtocol::Http11;
+    relay->state = ConnState::Proxying;
+    relay->req_method = static_cast<u8>(LogHttpMethod::Get);
+    relay->request_upload_complete = true;
+    relay->resp_body_mode = BodyMode::ContentLength;
+    relay->resp_body_remaining = 128 * 1024;
+    loop.relay_budget_calls = 0;
+    REQUIRE(loop.start_response_splice(*relay));
+    static const u8 kPayload[] = {1, 2, 3, 4};
+    REQUIRE(loop.submit_send_impl(*sender, kPayload, sizeof(kPayload)));
+    REQUIRE(loop.backend.pending != 0);
+    IoEvent empty[1]{};
+    if (failure) loop.backend.fatal_error.store(EIO);
+    loop.dispatch_batch(empty, 0);
+    // With a runnable relay still queued, ordinary I/O starts at this batch
+    // boundary instead of waiting behind its next compute quantum.
+    pollfd ready{sender_fds[1], POLLIN, 0};
+    const bool kSubmitted = enabled && !failure;
+    const int kReady = poll(&ready, 1, kSubmitted ? 20 : 0);
+    CHECK_EQ(kReady, kSubmitted ? 1 : 0);
+    CHECK_EQ(loop.study_http_submit_before_relay_attempts, enabled ? 1u : 0u);
+    CHECK_EQ(loop.deferred_relay_read_count, 1u);
+    CHECK_EQ(sender->pending_ops, 1u);  // submission is not completion consumption
+    CHECK(sender->send_armed);
+    if (failure) {
+        CHECK_EQ(loop.backend.failure_code(), EIO);
+        CHECK(loop.backend.pending != 0);
+        loop.backend.fatal_error.store(0);  // release the deterministic failure for cleanup
+    }
+    IoEvent events[8]{};
+    const u32 kCount = loop.backend.wait(events, 8, loop.conns, loop.slots_initialized, false);
+    loop.dispatch_batch(events, kCount);
+    loop.close_conn(*sender);
+    loop.close_conn(*relay);
+}
+
+TEST(http, submits_ordinary_io_before_deferred_relay_work) {
+    early_submit(_tc, true);
+}
+TEST(http, default_retains_submission_until_wait) {
+    early_submit(_tc, false);
+}
+
+TEST(http, coalesced_close_response_requires_complete_body_and_owned_capacity) {
+    Connection c;
+    c.reset();
+    c.protocol = ConnProtocol::Http11;
+    c.req_http_version = static_cast<u8>(HttpVersion::Http11);
+    c.req_method = static_cast<u8>(LogHttpMethod::Get);
+    c.request_policy_id = static_cast<u16>(RequestPolicyId::Http11FixedStrip);
+    c.req_keep_alive = true;
+    c.req_client_connection_close = true;
+    c.req_client_connection_close_exact = true;
+    c.req_client_connection_count = 1;
+    c.resp_body_mode = BodyMode::ContentLength;
+    c.resp_body_remaining = 4;
+    u8 raw[128]{}, rewritten[128]{};
+    c.upstream_recv_buf.bind(raw, sizeof(raw));
+    c.response_header_buf.bind(rewritten, sizeof(rewritten));
+    static const u8 wire[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody";
+    static const u8 header[] = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n";
+    constexpr u32 raw_header = sizeof(wire) - 1 - 4;
+    REQUIRE_EQ(c.upstream_recv_buf.write(wire, sizeof(wire) - 1), sizeof(wire) - 1);
+    REQUIRE_EQ(c.response_header_buf.write(header, sizeof(header) - 1), sizeof(header) - 1);
+    const u32 header_size = c.response_header_buf.len();
+    c.upstream_recv_buf.set_len(sizeof(wire) - 2);  // incomplete body
+    CHECK(!coalesce_complete_native_close_response(c, raw_header));
+    CHECK_EQ(c.response_header_buf.len(), header_size);
+    c.upstream_recv_buf.set_len(sizeof(wire) - 1);
+    c.resp_body_remaining = 3;  // surplus bytes must not be pooled
+    CHECK(!coalesce_complete_native_close_response(c, raw_header));
+    c.resp_body_remaining = 4;
+    c.throttle_down_bps = 1;
+    CHECK(!coalesce_complete_native_close_response(c, raw_header));
+    c.throttle_down_bps = 0;
+    c.response_header_buf.bind(rewritten, header_size + 3);
+    c.response_header_buf.set_len(header_size);
+    CHECK(!coalesce_complete_native_close_response(c, raw_header));
+    c.response_header_buf.bind(rewritten, sizeof(rewritten));
+    c.response_header_buf.set_len(header_size);
+    REQUIRE(coalesce_complete_native_close_response(c, raw_header));
+    CHECK_EQ(c.resp_body_remaining, 0u);
+    CHECK_EQ(c.upstream_send_len, sizeof(wire) - 1);
+    CHECK_EQ(c.resp_body_sent, header_size + 4);
+    CHECK_EQ(memcmp(c.response_header_buf.data() + header_size, "body", 4), 0);
+    CHECK_EQ(memcmp(raw, wire, sizeof(wire) - 1), 0);
+}
+
+TEST(http, direct_complete_proxy_response_keeps_completion_owner_after_fin) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    if (!loop.backend.nop_inject_result) return;
+    loop.study_http_direct_close_response = true;
+    int down[2];
+    REQUIRE_EQ(test::stream_socketpair(down), 0);
+    const Peer peer{down[1]};
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = down[0];
+    c->protocol = ConnProtocol::Http11;
+    c->req_method = static_cast<u8>(LogHttpMethod::Get);
+    c->req_body_mode = BodyMode::None;
+    c->req_client_connection_close_exact = true;
+    c->req_client_connection_count = 1;
+    c->request_upload_complete = true;
+    c->resp_body_mode = BodyMode::ContentLength;
+    c->resp_body_remaining = 0;
+    c->on_send = &on_proxy_response_sent<IoUringEventLoop>;
+    REQUIRE(loop.alloc_response_header_buf(*c));
+    static const u8 wire[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody";
+    REQUIRE_EQ(c->response_header_buf.write(wire, sizeof(wire) - 1), sizeof(wire) - 1);
+    c->resp_body_sent = sizeof(wire) - 1;
+    REQUIRE(loop.submit_send_impl(*c, c->response_header_buf.data(), c->response_header_buf.len()));
+    CHECK_EQ(loop.study_http_direct_close_completed, 1u);
+    CHECK(c->send_armed);
+    CHECK(c->direct_write_completion_pending);
+    CHECK_EQ(c->pending_ops, 1u);
+    u8 received[sizeof(wire)]{};
+    REQUIRE_EQ(recv(down[1], received, sizeof(received), MSG_DONTWAIT), sizeof(wire) - 1);
+    CHECK_EQ(memcmp(received, wire, sizeof(wire) - 1), 0);
+    CHECK_EQ(recv(down[1], received, sizeof(received), MSG_DONTWAIT), 0);
+    IoEvent events[8]{};
+    u32 count = 0;
+    for (u32 retry = 0; retry < 100 && count == 0; ++retry)
+        count = loop.backend.wait(events, 8, loop.conns, loop.slots_initialized, false);
+    REQUIRE_EQ(count, 1u);
+    CHECK_EQ(events[0].type, IoEventType::Send);
+    CHECK_EQ(events[0].result, sizeof(wire) - 1);
+    // The wire has completed, but the common dispatcher still owns retirement.
+    CHECK_EQ(c->pending_ops, 1u);
+    c->pending_ops = 0;
+    c->send_armed = false;
+    c->direct_write_completion_pending = false;
+    loop.close_conn(*c);
+}
+
+static void initial_http_receive_owner(test::TestCase* _tc, bool enabled, bool completed_request) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_http_initial_recv_once = enabled;
+    int sockets[2];
+    REQUIRE_EQ(test::stream_socketpair(sockets), 0);
+    const Peer peer{sockets[1]};
+    auto* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->fd = sockets[0];
+    c->protocol = ConnProtocol::Http11;
+    c->state = ConnState::ReadingHeader;
+    c->downstream_completed_request_count = completed_request ? 1 : 0;
+    c->on_recv = [](void*, Connection& conn, IoEvent) { ++conn.handler_gen; };
+    REQUIRE_EQ(send(sockets[1], "x", 1, MSG_NOSIGNAL), 1);
+    REQUIRE(loop.submit_recv_impl(*c));
+    CHECK_EQ(c->pending_ops, 1u);
+    IoEvent events[8]{};
+    u32 count = 0;
+    for (u32 retry = 0; retry < 100 && count == 0; ++retry)
+        count = loop.backend.wait(events, 8, loop.conns, loop.slots_initialized, false);
+    REQUIRE_EQ(count, 1u);
+    const bool once = enabled && !completed_request;
+    CHECK_EQ(events[0].more, once ? 0u : 1u);
+    loop.dispatch_batch(events, count);
+    CHECK_EQ(c->recv_armed, !once);
+    CHECK_EQ(c->pending_ops, once ? 0u : 1u);
+    CHECK_EQ(c->recv_buf.len(), 1u);
+    CHECK_EQ(c->recv_buf.data()[0], static_cast<u8>('x'));
+    loop.close_conn(*c);
+}
+
+TEST(http, initial_oneshot_receive_retires_kernel_owner_with_data) {
+    initial_http_receive_owner(_tc, true, false);
+}
+TEST(http, initial_receive_default_retains_multishot_owner) {
+    initial_http_receive_owner(_tc, false, false);
+}
+TEST(http, later_request_receive_retains_multishot_owner) {
+    initial_http_receive_owner(_tc, true, true);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

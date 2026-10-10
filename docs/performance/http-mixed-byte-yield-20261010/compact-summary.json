@@ -1,0 +1,512 @@
+[
+  {
+    "configuration": "uring128",
+    "rotation": 0,
+    "payload_bytes_per_second": 3558190851.3122897,
+    "server_cpu_pct": 62.28635872573843,
+    "origin_cpu_pct": 132.1868815442024,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3250.1246663342226,
+    "small_rps": 36667.0237271035,
+    "large_p99_us": 35656.0,
+    "small_p99_us": 1799.0,
+    "host_cpu2_pct": {
+      "user": 6.733167082294265,
+      "system": 55.61097256857855,
+      "idle": 0.0,
+      "irq": 0.3740648379052369,
+      "softirq": 37.281795511221944,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "uring256ring",
+    "rotation": 0,
+    "payload_bytes_per_second": 4177316778.448202,
+    "server_cpu_pct": 63.774531197914094,
+    "origin_cpu_pct": 152.88415013198582,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3822.3533600753713,
+    "small_rps": 41330.26893403551,
+    "large_p99_us": 29011.0,
+    "small_p99_us": 1830.0,
+    "host_cpu2_pct": {
+      "user": 6.8493150684931505,
+      "system": 56.787048567870485,
+      "idle": 0.12453300124533001,
+      "irq": 0.37359900373599003,
+      "softirq": 35.865504358655045,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "byte80",
+    "rotation": 0,
+    "payload_bytes_per_second": 8050704039.019135,
+    "server_cpu_pct": 59.54709750968297,
+    "origin_cpu_pct": 195.6190813368411,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 7666.844850224695,
+    "small_rps": 2791.634118634267,
+    "large_p99_us": 23900.0,
+    "small_p99_us": 23379.0,
+    "host_cpu2_pct": {
+      "user": 4.364089775561097,
+      "system": 55.236907730673316,
+      "idle": 0.12468827930174564,
+      "irq": 0.3740648379052369,
+      "softirq": 39.900249376558605,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "byte20",
+    "rotation": 0,
+    "payload_bytes_per_second": 3767898522.2435317,
+    "server_cpu_pct": 64.18970179887269,
+    "origin_cpu_pct": 149.48457792461207,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3418.538710199107,
+    "small_rps": 44751.19034614093,
+    "large_p99_us": 32833.0,
+    "small_p99_us": 1734.0,
+    "host_cpu2_pct": {
+      "user": 7.740324594257179,
+      "system": 56.17977528089887,
+      "idle": 0.0,
+      "irq": 0.37453183520599254,
+      "softirq": 35.70536828963795,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "nginx",
+    "rotation": 0,
+    "payload_bytes_per_second": 4045488230.2577147,
+    "server_cpu_pct": 81.51558570508736,
+    "origin_cpu_pct": 98.74246292913337,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3852.828540890989,
+    "small_rps": 1343.9184971691664,
+    "large_p99_us": 288191.0,
+    "small_p99_us": 37211.0,
+    "host_cpu2_pct": {
+      "user": 3.2378580323785804,
+      "system": 78.20672478206725,
+      "idle": 0.0,
+      "irq": 0.37359900373599003,
+      "softirq": 18.181818181818183,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "uring256ring",
+    "rotation": 1,
+    "payload_bytes_per_second": 4008622334.826551,
+    "server_cpu_pct": 64.52828822801825,
+    "origin_cpu_pct": 158.3876165596812,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3674.617666771925,
+    "small_rps": 37965.4395199006,
+    "large_p99_us": 32757.0,
+    "small_p99_us": 2027.0,
+    "host_cpu2_pct": {
+      "user": 7.356608478802992,
+      "system": 56.48379052369077,
+      "idle": 0.0,
+      "irq": 0.3740648379052369,
+      "softirq": 35.785536159600994,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "byte80",
+    "rotation": 1,
+    "payload_bytes_per_second": 6395035284.127654,
+    "server_cpu_pct": 61.02367019564013,
+    "origin_cpu_pct": 172.33883137050924,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 6057.067239848232,
+    "small_rps": 10678.697762830569,
+    "large_p99_us": 22021.0,
+    "small_p99_us": 6566.0,
+    "host_cpu2_pct": {
+      "user": 5.2434456928838955,
+      "system": 55.80524344569288,
+      "idle": 0.0,
+      "irq": 0.4993757802746567,
+      "softirq": 38.45193508114856,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "byte20",
+    "rotation": 1,
+    "payload_bytes_per_second": 3213575838.051898,
+    "server_cpu_pct": 63.94870514488564,
+    "origin_cpu_pct": 152.75247342225614,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 2879.0656294819514,
+    "small_rps": 47523.612439509605,
+    "large_p99_us": 36286.0,
+    "small_p99_us": 1321.0,
+    "host_cpu2_pct": {
+      "user": 7.615480649188514,
+      "system": 56.30461922596754,
+      "idle": 0.0,
+      "irq": 0.37453183520599254,
+      "softirq": 35.70536828963795,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "nginx",
+    "rotation": 1,
+    "payload_bytes_per_second": 4008314522.357259,
+    "server_cpu_pct": 81.63378410410482,
+    "origin_cpu_pct": 97.11174928592283,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3817.440396415653,
+    "small_rps": 1327.671202470421,
+    "large_p99_us": 309437.0,
+    "small_p99_us": 52352.0,
+    "host_cpu2_pct": {
+      "user": 3.2418952618453867,
+      "system": 78.30423940149626,
+      "idle": 0.0,
+      "irq": 0.3740648379052369,
+      "softirq": 18.079800498753116,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "uring128",
+    "rotation": 1,
+    "payload_bytes_per_second": 3234794512.259755,
+    "server_cpu_pct": 62.06186756521927,
+    "origin_cpu_pct": 129.86789188697793,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 2921.9026944840357,
+    "small_rps": 41737.66418175364,
+    "large_p99_us": 38254.0,
+    "small_p99_us": 1342.0,
+    "host_cpu2_pct": {
+      "user": 6.741573033707865,
+      "system": 55.181023720349565,
+      "idle": 0.0,
+      "irq": 0.37453183520599254,
+      "softirq": 37.70287141073658,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "byte80",
+    "rotation": 2,
+    "payload_bytes_per_second": 6050032352.120127,
+    "server_cpu_pct": 61.51272390070025,
+    "origin_cpu_pct": 170.3141341266853,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 5726.422846699063,
+    "small_rps": 11094.430961867729,
+    "large_p99_us": 21291.0,
+    "small_p99_us": 6403.0,
+    "host_cpu2_pct": {
+      "user": 5.493133583021224,
+      "system": 56.05493133583021,
+      "idle": 0.0,
+      "irq": 0.37453183520599254,
+      "softirq": 38.07740324594257,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "byte20",
+    "rotation": 2,
+    "payload_bytes_per_second": 5181237230.246712,
+    "server_cpu_pct": 62.885469838057446,
+    "origin_cpu_pct": 160.33299353552337,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 4847.17208783503,
+    "small_rps": 24074.4411799336,
+    "large_p99_us": 29646.0,
+    "small_p99_us": 3437.0,
+    "host_cpu2_pct": {
+      "user": 6.475716064757161,
+      "system": 56.28891656288916,
+      "idle": 0.0,
+      "irq": 0.49813200498132004,
+      "softirq": 36.73723536737236,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "nginx",
+    "rotation": 2,
+    "payload_bytes_per_second": 4045466376.4829526,
+    "server_cpu_pct": 81.52489761633935,
+    "origin_cpu_pct": 96.88104219032057,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3852.8941276230444,
+    "small_rps": 1321.792899533992,
+    "large_p99_us": 325280.0,
+    "small_p99_us": 111205.0,
+    "host_cpu2_pct": {
+      "user": 3.491271820448878,
+      "system": 78.05486284289277,
+      "idle": 0.0,
+      "irq": 0.3740648379052369,
+      "softirq": 18.079800498753116,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "uring128",
+    "rotation": 2,
+    "payload_bytes_per_second": 3348191504.701238,
+    "server_cpu_pct": 62.028568836173065,
+    "origin_cpu_pct": 134.04161555342023,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3062.8633959930044,
+    "small_rps": 33336.537203241554,
+    "large_p99_us": 37754.0,
+    "small_p99_us": 2058.0,
+    "host_cpu2_pct": {
+      "user": 6.973848069738481,
+      "system": 55.04358655043587,
+      "idle": 0.0,
+      "irq": 0.37359900373599003,
+      "softirq": 37.60896637608966,
+      "steal": 0.0
+    }
+  },
+  {
+    "configuration": "uring256ring",
+    "rotation": 2,
+    "payload_bytes_per_second": 3716857688.878381,
+    "server_cpu_pct": 63.5036128440486,
+    "origin_cpu_pct": 150.46239113933711,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "large_rps": 3356.833412931182,
+    "small_rps": 48086.60548844083,
+    "large_p99_us": 30755.0,
+    "small_p99_us": 1076.0,
+    "host_cpu2_pct": {
+      "user": 7.240948813982522,
+      "system": 56.30461922596754,
+      "idle": 0.0,
+      "irq": 0.37453183520599254,
+      "softirq": 36.079900124843945,
+      "steal": 0.0
+    }
+  }
+]

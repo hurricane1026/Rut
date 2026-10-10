@@ -485,6 +485,85 @@ static void configure_study_policy(Loop* loop) {
                                                   : "RUT_STUDY_WS_SPLICE mode=off\n");
             }
         }
+        if constexpr (requires { loop->study_http_terminal_scan; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_TERMINAL_SCAN=on"))
+                    loop->study_http_terminal_scan = true;
+            if (report_study)
+                write_str(loop->study_http_terminal_scan
+                              ? "RUT_STUDY_HTTP_TERMINAL_SCAN mode=on\n"
+                              : "RUT_STUDY_HTTP_TERMINAL_SCAN mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_boundary_ready_set; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_BOUNDARY_READY_SET=on"))
+                    loop->study_http_boundary_ready_set = true;
+            if (report_study)
+                write_str(loop->study_http_boundary_ready_set
+                              ? "RUT_STUDY_HTTP_BOUNDARY_READY_SET mode=on\n"
+                              : "RUT_STUDY_HTTP_BOUNDARY_READY_SET mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_relay_ring; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_RELAY_RING=on"))
+                    loop->study_http_relay_ring = true;
+            if (report_study)
+                write_str(loop->study_http_relay_ring ? "RUT_STUDY_HTTP_RELAY_RING mode=on\n"
+                                                      : "RUT_STUDY_HTTP_RELAY_RING mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_byte_yield; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_BYTE_YIELD=on"))
+                    loop->study_http_byte_yield = true;
+            if (report_study)
+                write_str(loop->study_http_byte_yield ? "RUT_STUDY_HTTP_BYTE_YIELD mode=on\n"
+                                                      : "RUT_STUDY_HTTP_BYTE_YIELD mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_taskrun_yield; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_TASKRUN_YIELD=on"))
+                    loop->study_http_taskrun_yield = true;
+            if (report_study)
+                write_str(loop->study_http_taskrun_yield
+                              ? "RUT_STUDY_HTTP_TASKRUN_YIELD mode=on\n"
+                              : "RUT_STUDY_HTTP_TASKRUN_YIELD mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_submit_before_relay; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY=on"))
+                    loop->study_http_submit_before_relay = true;
+            if (report_study)
+                write_str(loop->study_http_submit_before_relay
+                              ? "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=on\n"
+                              : "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_coalesce_close_response; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_COALESCE_CLOSE=on"))
+                    loop->study_http_coalesce_close_response = true;
+            if (report_study)
+                write_str(loop->study_http_coalesce_close_response
+                              ? "RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n"
+                              : "RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_direct_close_response; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_DIRECT_CLOSE=on"))
+                    loop->study_http_direct_close_response = true;
+            if (report_study)
+                write_str(loop->study_http_direct_close_response
+                              ? "RUT_STUDY_HTTP_DIRECT_CLOSE mode=on\n"
+                              : "RUT_STUDY_HTTP_DIRECT_CLOSE mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_initial_recv_once; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_HTTP_INITIAL_RECV_ONCE=on"))
+                    loop->study_http_initial_recv_once = true;
+            if (report_study)
+                write_str(loop->study_http_initial_recv_once
+                              ? "RUT_STUDY_HTTP_INITIAL_RECV_ONCE mode=on\n"
+                              : "RUT_STUDY_HTTP_INITIAL_RECV_ONCE mode=off\n");
+        }
         const bool kLatency = str_eq(profile, "latency");
         const bool kBalanced = str_eq(profile, "balanced");
         const bool kThroughput = str_eq(profile, "throughput");
@@ -496,6 +575,18 @@ static void configure_study_policy(Loop* loop) {
                 kLatency ? 512u * 1024u : (kThroughput ? 2u * 1024u * 1024u : 1024u * 1024u);
             loop->ordinary_cq_wait_limit_ns = kLatency ? 20ull * 1000u : 80ull * 1000u;
             loop->study_yield_enabled = !kThroughput;
+            // Explicit study knob: no response history or size prediction.
+            // Preserve the turn byte/call limits while changing one splice segment.
+            for (const char* const* item = environ; *item != nullptr; ++item) {
+                if (str_eq(*item, "RUT_STUDY_HTTP_SPLICE_CHUNK=256k"))
+                    loop->study_relay_chunk_size = 256u * 1024u;
+                if (str_eq(*item, "RUT_STUDY_HTTP_SPLICE_CHUNK=512k"))
+                    loop->study_relay_chunk_size = 512u * 1024u;
+                if (str_eq(*item, "RUT_STUDY_HTTP_CQ_WAIT=20us"))
+                    loop->ordinary_cq_wait_limit_ns = 20ull * 1000u;
+                if (str_eq(*item, "RUT_STUDY_HTTP_CQ_WAIT=40us"))
+                    loop->ordinary_cq_wait_limit_ns = 40ull * 1000u;
+            }
         } else if constexpr (requires { loop->study_relay_owner_call_limit; }) {
             loop->study_relay_chunk_size = kThroughput ? 128u * 1024u : 64u * 1024u;
             loop->study_relay_owner_call_limit = kLatency ? 2u : (kThroughput ? 8u : 4u);
@@ -897,6 +988,53 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                     }
                     write_str("\n");
                 }
+            }
+        }
+        if constexpr (requires { shards[0].loop->study_http_taskrun_observations; }) {
+            for (u32 i = 0; i < shard_count; ++i) {
+                const auto& loop = *shards[i].loop;
+                if (!loop.study_http_taskrun_yield) continue;
+                write_str("RUT_HTTP_TASKRUN observations=");
+                write_u64(loop.study_http_taskrun_observations);
+                write_str("\n");
+            }
+        }
+        if constexpr (requires { shards[0].loop->study_http_submit_before_relay_attempts; }) {
+            for (u32 i = 0; i < shard_count; ++i) {
+                const auto& loop = *shards[i].loop;
+                if (!loop.study_http_submit_before_relay) continue;
+                write_str("RUT_HTTP_EARLY_SUBMIT attempts=");
+                write_u64(loop.study_http_submit_before_relay_attempts);
+                write_str("\n");
+            }
+        }
+        if constexpr (requires { shards[0].loop->study_http_coalesced_close_responses; }) {
+            for (u32 i = 0; i < shard_count; ++i) {
+                const auto& loop = *shards[i].loop;
+                if (!loop.study_http_coalesce_close_response) continue;
+                write_str("RUT_HTTP_COALESCE_CLOSE responses=");
+                write_u64(loop.study_http_coalesced_close_responses);
+                write_str("\n");
+            }
+        }
+        if constexpr (requires { shards[0].loop->study_http_direct_close_attempts; }) {
+            for (u32 i = 0; i < shard_count; ++i) {
+                const auto& loop = *shards[i].loop;
+                if (!loop.study_http_direct_close_response) continue;
+                write_str("RUT_HTTP_DIRECT_CLOSE attempts=");
+                write_u64(loop.study_http_direct_close_attempts);
+                write_str(" completed=");
+                write_u64(loop.study_http_direct_close_completed);
+                write_str("\n");
+            }
+        }
+        if constexpr (requires { shards[0].loop->study_http_initial_recv_once_arms; }) {
+            for (u32 i = 0; i < shard_count; ++i) {
+                const auto& loop = *shards[i].loop;
+                if (!loop.study_http_initial_recv_once) continue;
+                write_str("RUT_HTTP_INITIAL_RECV_ONCE arms=");
+                write_u64(loop.study_http_initial_recv_once_arms);
+                write_str("\n");
             }
         }
         for (u32 i = 0; i < shard_count; i++) shards[i].shutdown();

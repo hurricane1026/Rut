@@ -4,9 +4,11 @@ import contextlib
 import argparse
 import io
 import json
+import math
 import os
+import re
 import signal
-import struct
+import socket
 import subprocess
 import sys
 import tempfile
@@ -20,8 +22,8 @@ import run
 import matrix
 import workload_strategy
 import protocol_workload
-import protocol_strategy
 import relay_compare
+import paced_http_client
 
 from run import (
     Harness,
@@ -50,7 +52,56 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
-    def test_api_origin_command_and_readiness_are_forwarded(self):
+    def test_api_origin_smoke_and_reuse_policy(self):
+        cpu = str(min(os.sched_getaffinity(0)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "payload.bin"
+            payload.write_bytes(b"api-smoke")
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            log = root / "api-origin.log"
+            with log.open("w+") as handle:
+                process = subprocess.Popen(
+                    relay_compare.api_origin_command(Path(relay_compare.__file__), port, cpu,
+                                                      payload, 0, 0, 0),
+                    stdout=handle, stderr=subprocess.STDOUT,
+                )
+            try:
+                relay_compare.wait_for_api_origin_ready(log, process, 1)
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                    for marker in ("smoke-0", "smoke-1"):
+                        client.sendall((f"GET / HTTP/1.1\r\nHost: test\r\n"
+                                        f"X-Rut-Benchmark-Preflight: {marker}\r\n\r\n").encode())
+                        response = client.recv(4096)
+                        self.assertIn(b"Content-Length: 9", response)
+                        self.assertIn(b"api-smoke", response)
+            finally:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            records = origin_reuse_records(log.read_text(), ["smoke-0", "smoke-1"])
+        self.assertTrue(relay_compare.valid_api_origin_records(records, ["smoke-0", "smoke-1"], True))
+        self.assertTrue(relay_compare.valid_api_origin_records(
+            records, ["smoke-0", "smoke-1"], True, True, "omit-connection"))
+        self.assertFalse(relay_compare.valid_api_origin_records(
+            [("smoke-0", 1, 1), ("smoke-1", 2, 1)], ["smoke-0", "smoke-1"],
+            False, True, "omit-connection"))
+        self.assertTrue(relay_compare.valid_api_origin_records(
+            [("smoke-0", 1, 1), ("smoke-1", 2, 1)], ["smoke-0", "smoke-1"],
+            True, False, "transparent"))
+
+    def test_api_origin_workers_match_explicit_cpu_assignment(self):
+        relay_compare.validate_api_origin_workers(2, "3,4", "api")
+        relay_compare.validate_api_origin_workers(4, "3,4", "native")
+        with self.assertRaisesRegex(ValueError, "must match"):
+            relay_compare.validate_api_origin_workers(1, "3,4", "api")
+
+    def test_api_origin_command_and_record_validation(self):
         command = relay_compare.api_origin_command(
             Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2
         )
@@ -58,48 +109,275 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(command[command.index("--port") + 1], "8704")
         self.assertEqual(command[command.index("--cpus") + 1], "3,4")
         self.assertEqual(command[command.index("--fragment-bytes") + 1], "16384")
-        relay_compare.wait_for_api_origin_ready(
-            io.StringIO("noise\nAPI_READY worker=0\nAPI_READY worker=1\n"), 2
+        markers = ["close-0", "close-1"]
+        fresh = [(markers[0], 10, 1), (markers[1], 11, 1)]
+        pooled = [(markers[0], 10, 1), (markers[1], 10, 2)]
+        self.assertTrue(relay_compare.valid_api_origin_records(fresh, markers, True))
+        self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, True))
+        self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, False))
+        self.assertFalse(relay_compare.valid_api_origin_records(pooled[:1], markers, True))
+
+    def test_direct_origin_and_mixed_rate_reject_close(self):
+        self.assertEqual(relay_compare.direct_origin_port(
+            SimpleNamespace(origin_port=8704, front_port=8604)), 8704)
+        with self.assertRaisesRegex(ValueError, "requires keepalive scenarios"):
+            relay_compare.validate_mixed_small_rate_scenarios(("proxy-close",), True)
+        relay_compare.validate_mixed_small_rate_scenarios(("proxy-keepalive",), True)
+        relay_compare.validate_mixed_small_rate_scenarios(("proxy-close",), False)
+
+    def test_direct_origin_preflight_rejects_static_and_disabled_keepalive(self):
+        with self.assertRaisesRegex(ValueError, "proxy scenarios only"):
+            relay_compare.validate_direct_origin_options(
+                ("direct-origin",), relay_compare.DEFAULT_SCENARIOS, [])
+        with self.assertRaisesRegex(ValueError, "reuse on"):
+            relay_compare.validate_direct_origin_options(
+                ("direct-origin",), ("proxy-keepalive",),
+                ["--native-origin-reuse", "off"])
+        relay_compare.validate_direct_origin_options(
+            ("direct-origin",), ("proxy-keepalive",), [])
+        relay_compare.validate_direct_origin_options(
+            ("uring",), relay_compare.DEFAULT_SCENARIOS, ["--native-origin-reuse", "off"])
+
+    def test_paced_tls_preflight_rejects_before_delegation(self):
+        for option in ("--tls-cert", "--tls-key"):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                    ValueError, "plaintext HTTP only"):
+                relay_compare.validate_paced_tls(True, [option, "unused"])
+        relay_compare.validate_paced_tls(True, [])
+        relay_compare.validate_paced_tls(False, ["--tls-cert", "unused"])
+
+    def test_direct_and_paced_preflights_run_before_module_or_process(self):
+        cases = (
+            ("--engines", "direct-origin"),
+            ("--engines", "direct-origin", "--scenarios", "proxy-keepalive",
+             "--native-origin-reuse", "off"),
+            ("--mixed-small-bytes", "4096", "--mixed-small-rate", "5000",
+             "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+             "--scenarios", "proxy-keepalive"),
         )
-        with self.assertRaisesRegex(RuntimeError, "before readiness"):
-            relay_compare.wait_for_api_origin_ready(io.StringIO(""), 1)
+        for args in cases:
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "must-not-be-created"
+                argv = [str(Path(relay_compare.__file__)), *args,
+                        "--output", str(output)]
+                with mock.patch.object(sys, "argv", argv), \
+                        mock.patch.object(relay_compare.importlib.util,
+                                          "spec_from_file_location") as load_module, \
+                        mock.patch.object(subprocess, "Popen") as popen, \
+                        contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit) as raised:
+                    relay_compare.main()
+                self.assertEqual(raised.exception.code, 2)
+                load_module.assert_not_called()
+                popen.assert_not_called()
+                self.assertFalse(output.exists())
 
-    def test_direct_origin_targets_origin_port(self):
-        args = SimpleNamespace(origin_port=8704, front_port=8604)
-        self.assertEqual(relay_compare.direct_origin_port(args), 8704)
-
-    def test_stream_deadline_allows_inflight_timeout_but_rejects_truncation(self):
-        fixed = bytes((i * 29) & 255 for i in range(16))
-
-        async def consume(raw, chunks, deadline):
+    def test_paced_http_probe_verifies_complete_framing_and_body(self):
+        async def check(payload):
             reader = protocol_workload.asyncio.StreamReader()
-            if raw is not None:
-                reader.feed_data(raw)
-            if deadline == float("inf"):
-                reader.feed_eof()
-            counts = dict(messages=0, bytes=0)
-            values = ([], [], [], [])
-            return await protocol_workload.consume_stream(
-                reader, 16, fixed, chunks, time.monotonic(), 0,
-                deadline, counts, *values
+            reader.feed_data(payload)
+            reader.feed_eof()
+            await paced_http_client.read_response(reader, b"ZZZZ")
+        protocol_workload.asyncio.run(check(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nZZZZ"))
+        for payload in (b"HTTP/1.1 500 Bad\r\nContent-Length: 4\r\n\r\nZZZZ",
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nZZZZ",
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nZZZZ",
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nZZZY"):
+            with self.subTest(payload=payload), self.assertRaises(paced_http_client.ResponseFailure):
+                protocol_workload.asyncio.run(check(payload))
+
+    def test_origin_workers_use_distinct_listeners_and_explicit_affinity(self):
+        config = "worker_processes 1; events { worker_connections 8192; } http { server { listen 127.0.0.1:8704; } }"
+        result = relay_compare.origin_worker_config(config, 4, "3,4,8,9", "on", 8704, True, True)
+        self.assertIn("worker_processes 4;", result)
+        self.assertIn("worker_cpu_affinity 1000 10000 100000000 1000000000;", result)
+        self.assertIn("listen 127.0.0.1:8704 reuseport;", result)
+        self.assertIn("multi_accept on;", result)
+        legacy = relay_compare.origin_worker_config(config, 4, "3,4,8,9", "on", 8704)
+        self.assertNotIn("reuseport", legacy)
+        self.assertNotIn("worker_cpu_affinity", legacy)
+        with self.assertRaises(ValueError):
+            relay_compare.origin_worker_config(config, 4, "3,4,8,8", "on", 8704, True, True)
+
+    def test_nginx_small_url_has_separate_buffer_tuning(self):
+        large = "location = /proxy { proxy_buffering off; proxy_buffer_size 1024k; proxy_buffers 8 1024k; proxy_busy_buffers_size 1024k; proxy_pass http://origin; }"
+        small = relay_compare.small_nginx_location(large, 16)
+        self.assertIn("location = /small", small)
+        self.assertIn("proxy_buffer_size 16k", small)
+        self.assertIn("proxy_buffers 8 16k", small)
+        self.assertIn("proxy_busy_buffers_size 32k", small)
+        self.assertIn("proxy_pass http://origin", small)
+        self.assertIn("proxy_buffer_size 1024k", large)
+
+    def test_cpu_accounting_includes_softirq_separately(self):
+        before = {'2': [0] * 8}
+        after = {'2': [20, 0, 30, 10, 0, 0, 40, 0]}
+        usage = relay_compare.cpu_percentages(before, after)['2']
+        self.assertEqual(usage['user'] + usage['system'], 50)
+        self.assertEqual(usage['softirq'], 40)
+        self.assertEqual(usage['idle'], 10)
+
+    def test_mixed_clients_have_disjoint_multiple_core_masks(self):
+        self.assertEqual(relay_compare.mixed_cpu_masks("5,7;6"), ("5,7", "6"))
+        self.assertEqual(relay_compare.mixed_cpu_masks("7,5"), ("7", "5"))
+        for invalid in ("5,7,6", "5,7;7", "5,5;6", "5,;6", "5;", "5;6;7"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                relay_compare.mixed_cpu_masks(invalid)
+
+    def test_mixed_small_rate_requires_proxy_keepalive(self):
+        for scenario in ("static-close", "static-keepalive", "proxy-close"):
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(
+                    ValueError, "specifically proxy-keepalive"):
+                relay_compare.validate_mixed_small_rate_scenarios((scenario,), True)
+        relay_compare.validate_mixed_small_rate_scenarios(("proxy-keepalive",), True)
+
+    def test_paced_result_requires_exact_planned_completion(self):
+        base = dict(planned_requests=2, issued_requests=2, requests=2,
+                    unissued_requests=0, unfinished_requests=0,
+                    errors=dict(connect=0, read=0, write=0, status=0, timeout=0))
+        self.assertTrue(paced_http_client.result_is_complete(base))
+        for key in base["errors"]:
+            with self.subTest(error=key):
+                failed = dict(base, errors=dict(base["errors"], **{key: 1}))
+                self.assertFalse(paced_http_client.result_is_complete(failed))
+        for field in ("issued_requests", "requests", "unissued_requests", "unfinished_requests"):
+            with self.subTest(field=field):
+                failed = dict(base, **{field: 1 if field in ("unissued_requests", "unfinished_requests") else 0})
+                self.assertFalse(paced_http_client.result_is_complete(failed))
+        self.assertFalse(paced_http_client.result_is_complete(dict(base, planned_requests=0)))
+
+    def test_short_sync_readme_summary_digest_matches_committed_artifact(self):
+        root = Path(__file__).parents[2]
+        import hashlib
+        for readme in (root / "docs").rglob("README.md"):
+            text = readme.read_text()
+            declaration = re.search(
+                r"Raw(?: performance)? summary SHA256:\s*`?([0-9a-f]{64})`?",
+                text,
+                re.IGNORECASE,
             )
+            if declaration is None:
+                continue
+            summary = readme.with_name("summary.json")
+            if not summary.exists():
+                summary = readme.with_name("compact-summary.json")
+            self.assertTrue(summary.exists(), readme)
+            digest = hashlib.sha256(summary.read_bytes()).hexdigest()
+            self.assertEqual(declaration.group(1), digest)
 
-        complete = b"10\r\n" + struct.pack("!QI", 1, 0) + fixed[12:] + b"\r\n0\r\n\r\n"
-        self.assertFalse(protocol_workload.asyncio.run(consume(complete, 1, float("inf"))))
-        with self.assertRaisesRegex(ValueError, "invalid terminator"):
-            protocol_workload.asyncio.run(consume(b"1\r\na\r\n0\r\n\r\n", 1, float("inf")))
-        self.assertTrue(protocol_workload.asyncio.run(consume(None, 1, time.monotonic() + .01)))
+    def test_paced_summary_validity_uses_exact_retained_request_counts(self):
+        root = Path(__file__).parents[2]
+        for name in ("http-mixed-paced1000-20261010",
+                     "http-mixed-paced-policies-20261010",
+                     "http-mixed-paced5000-policies-20261010"):
+            rows = json.loads((root / "docs/performance" / name / "summary.json").read_text())
+            self.assertTrue(rows)
+            for row in rows:
+                with self.subTest(study=name, configuration=row["configuration"],
+                                  rotation=row["rotation"]):
+                    complete = (row["planned_requests"] > 0
+                                and row["issued_requests"] == row["planned_requests"]
+                                and row["requests"] == row["planned_requests"]
+                                and row["unissued_requests"] == 0
+                                and row["unfinished_requests"] == 0
+                                and all(value == 0 for group in
+                                        (row["errors"], row["warmup_errors"],
+                                         row["small_errors"], row["large_errors"])
+                                        for value in group.values())
+                                and all(math.isfinite(row[key]) and row[key] > 0
+                                        for key in ("payload_bytes_per_second", "small_rps",
+                                                    "small_service_p99_us",
+                                                    "small_planned_p99_us", "large_rps",
+                                                    "large_p99_us")))
+                    self.assertEqual(row["result_is_complete"], complete)
+                    self.assertEqual(row["valid"], complete)
 
-    def test_smoke_engine_filter_rejects_empty_configuration(self):
+    def test_mixed_client_validity_requires_positive_finite_metrics(self):
+        good = dict(requests=1, rps=1.0, p99_us=2.0, errors={}, valid=True)
+        self.assertTrue(relay_compare.mixed_client_valid(good))
+        for field, value in (("requests", 0), ("rps", 0), ("rps", float("nan")),
+                             ("p99_us", 0), ("p99_us", float("inf"))):
+            with self.subTest(field=field, value=value):
+                self.assertFalse(relay_compare.mixed_client_valid(dict(good, **{field: value})))
+        self.assertFalse(relay_compare.mixed_client_valid(dict(good, errors={"read": 1})))
+
+    def test_distinct_small_route_preserves_native_forward_policy(self):
+        for policy in ("", ", request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection] }"):
+            config = 'route GET "/proxy" { return forward(backend' + policy + ') }\n'
+            updated = relay_compare.distinct_small_route(config)
+            routes = updated.splitlines()
+            self.assertEqual(routes, [config.rstrip("\n"),
+                                      config.rstrip("\n").replace('"/proxy"', '"/small"')])
+            self.assertIn('route GET "/proxy"', updated)
+            self.assertIn('route GET "/small"', updated)
+        with self.assertRaisesRegex(ValueError, "exactly one native /proxy route"):
+            relay_compare.distinct_small_route('route GET "/other" { return forward(backend) }\n')
+
+    def test_direct_origin_close_requires_fresh_origin_connections(self):
+        markers = ["close-0", "close-1", "close-2"]
+        fresh = [(marker, index + 1, 1) for index, marker in enumerate(markers)]
+        pooled = [(marker, 7, index + 1) for index, marker in enumerate(markers)]
+        self.assertTrue(relay_compare.valid_fresh_origin_records(fresh, markers))
+        self.assertFalse(relay_compare.valid_fresh_origin_records(pooled, markers))
+        self.assertFalse(relay_compare.valid_fresh_origin_records(fresh[::-1], markers))
+        self.assertTrue(relay_compare.valid_api_origin_records(
+            fresh, markers, fresh_downstream=True, reuse=True, request_policy="transparent"))
+        self.assertTrue(relay_compare.valid_api_origin_records(
+            pooled, markers, fresh_downstream=True, reuse=True, request_policy="omit-connection"))
+
+    def test_distinct_urls_require_proxy_scenarios(self):
+        with self.assertRaisesRegex(ValueError, "requires proxy-only scenarios"):
+            relay_compare.validate_distinct_url_scenarios(relay_compare.DEFAULT_SCENARIOS, True)
+        with self.assertRaisesRegex(ValueError, "requires proxy-only scenarios"):
+            relay_compare.validate_distinct_url_scenarios(("static-close", "proxy-close"), True)
+        relay_compare.validate_distinct_url_scenarios(("proxy-close", "proxy-keepalive"), True)
+        relay_compare.validate_distinct_url_scenarios(relay_compare.DEFAULT_SCENARIOS, False)
+
+    def test_api_origin_rejects_mixed_sizes(self):
+        with self.assertRaisesRegex(ValueError, "mixed-size workloads.*one payload"):
+            relay_compare.validate_api_mixed_payload("api", 4096)
+        relay_compare.validate_api_mixed_payload("api", 0)
+        relay_compare.validate_api_mixed_payload("native", 4096)
+
+    def test_api_mixed_size_rejected_before_output_module_or_process(self):
         with tempfile.TemporaryDirectory() as directory:
-            result = subprocess.run(
-                [sys.executable, str(Path(protocol_strategy.__file__)),
-                 "--output", directory, "--rut", "/bin/true",
-                 "--harness", str(Path(run.__file__)), "--smoke", "--engines", "nginx"],
-                capture_output=True, text=True
+            output = Path(directory) / "must-not-be-created"
+            cases = (
+                ("--mixed-distinct-urls",),
+                (),  # Header-selected /proxy also serves the same API payload.
             )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("select no runnable configurations", result.stderr)
+            for mixed_args in cases:
+                with self.subTest(mixed_args=mixed_args):
+                    argv = [
+                        str(Path(relay_compare.__file__)), "--engines", "direct-origin",
+                        "--origin-mode", "api", "--mixed-small-bytes", "4096",
+                        *mixed_args, "--scenarios", "proxy-keepalive",
+                        "--output", str(output),
+                    ]
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(relay_compare.importlib.util,
+                                              "spec_from_file_location") as load_module, \
+                            mock.patch.object(subprocess, "Popen") as popen, \
+                            contextlib.redirect_stderr(io.StringIO()), \
+                            self.assertRaises(SystemExit) as raised:
+                        relay_compare.main()
+                    self.assertEqual(raised.exception.code, 2)
+                    load_module.assert_not_called()
+                    popen.assert_not_called()
+                    self.assertFalse(output.exists())
+
+    def test_api_without_mixed_size_and_native_mixed_modes_are_valid(self):
+        relay_compare.validate_api_mixed_payload("api", 0)
+        relay_compare.validate_api_mixed_payload("native", 4096)
+        relay_compare.validate_distinct_url_scenarios(("proxy-keepalive",), True)
+
+    def test_distinct_url_scenario_defaults_and_explicit_lists(self):
+        self.assertEqual(
+            relay_compare.distinct_url_scenarios([]), relay_compare.DEFAULT_SCENARIOS)
+        self.assertEqual(
+            relay_compare.distinct_url_scenarios(
+                ["--scenarios", "proxy-close", "proxy-keepalive", "--repeats", "2"]),
+            ("proxy-close", "proxy-keepalive"))
 
     def test_strategy_requires_repeats_and_guards_tail_latency(self):
         rows = []
@@ -212,6 +490,23 @@ class ToolsTest(unittest.TestCase):
         missing = "\n".join(complete.splitlines()[:-1])
         self.assertFalse(valid_origin_reuse(origin_reuse_records(missing, markers), markers))
 
+    def test_explicit_request_rewrite_requires_reuse_across_downstream_close(self):
+        markers = [f"matched-close-{i}" for i in range(3)]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SimpleNamespace(
+                args=SimpleNamespace(proxy_profile="native-streaming", native_origin_reuse="on",
+                                     native_request_policy="omit-connection"),
+                out=Path(directory), origin_container_id="origin")
+            churn = "\n".join(f"marker={m} connection={i + 1} requests=1"
+                              for i, m in enumerate(markers))
+            fixture.command = lambda argv: SimpleNamespace(stdout=churn)
+            with self.assertRaisesRegex(ValueError, "origin reuse preflight failed"):
+                Harness.verify_origin_reuse(fixture, markers, fresh_downstream=True)
+            reused = "\n".join(f"marker={m} connection=11 requests={i + 1}"
+                               for i, m in enumerate(markers))
+            fixture.command = lambda argv: SimpleNamespace(stdout=reused)
+            Harness.verify_origin_reuse(fixture, markers, fresh_downstream=True)
+
     def test_bounded_origin_reuse_rejects_unsupported_profiles_and_transport(self):
         baseline = dict(proxy_profile="converter-bounded", bounded_origin_reuse="on",
                         tls_cert=None, scenarios=["proxy-close", "proxy-keepalive"])
@@ -237,6 +532,8 @@ class ToolsTest(unittest.TestCase):
                                 "concurrency": [1, 128]}))
         validate_proxy_profile(parser, large)
         self.assertEqual(large.body_size, 1048576)
+        scaling = SimpleNamespace(**(baseline | {"concurrency": [256, 512, 1024]}))
+        validate_proxy_profile(parser, scaling)
         for key, value in (("scenarios", ["static-close"]),
                            ("concurrency", [8]),
                            ("concurrency", []),
@@ -959,6 +1256,38 @@ class ToolsTest(unittest.TestCase):
                 self.assertEqual(started, expected)
                 self.assertEqual(started, [engine for entry in metadata_order
                                            for engine in entry["engines"]])
+
+    def test_benchmark_preserves_mixed_result_and_warmup_validity(self):
+        for invalid_sample in ("measurement", "warmup"):
+            with self.subTest(invalid_sample=invalid_sample), tempfile.TemporaryDirectory() as directory:
+                args = SimpleNamespace(
+                    output=Path(directory), scenarios=["proxy-close"], repeats=1,
+                    first_engine="rut", warmup=1, duration=1, concurrency=[1],
+                    workers=1, server_cpus="2", proxy_profile="native-streaming",
+                    static_profile="converter-return", body_size=None,
+                )
+                harness = Harness(args)
+                harness.frontend = lambda *_args: contextlib.nullcontext(123)
+                harness.validate = lambda *_args: None
+                sample = {
+                    "requests": 10, "seconds": 1.0, "rps": 10.0,
+                    "errors": dict.fromkeys(run.ERROR_NAMES, 0), "valid": True,
+                }
+                calls = 0
+
+                def fake_wrk(*_args):
+                    nonlocal calls
+                    calls += 1
+                    result = dict(sample)
+                    if (invalid_sample == "warmup" and calls == 1
+                            or invalid_sample == "measurement" and calls == 2):
+                        result["valid"] = False
+                    return result
+
+                harness.wrk = fake_wrk
+                with mock.patch.object(run, "proc_usage", return_value=(0.0, 0)), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertFalse(harness.benchmark(456))
 
     def test_fragmented_body_and_normal_close(self):
         sock = FakeSocket(

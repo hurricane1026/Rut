@@ -1,0 +1,338 @@
+[
+  {
+    "campaign": "r0-none",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18407.023585641775,
+    "p99_us": 15193.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 50.17271979453486,
+    "origin_cpu_pct": 36.616993194364
+  },
+  {
+    "campaign": "r0-terminal",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 19148.383477585816,
+    "p99_us": 14021.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 51.63813915044569,
+    "origin_cpu_pct": 37.961906470151085
+  },
+  {
+    "campaign": "r0-boundary",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 19794.922919078468,
+    "p99_us": 13888.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 53.49822491067825,
+    "origin_cpu_pct": 39.00567172280102
+  },
+  {
+    "campaign": "r0-both",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18106.847013109225,
+    "p99_us": 16277.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 49.87200758650002,
+    "origin_cpu_pct": 36.22543834641295
+  },
+  {
+    "campaign": "r1-terminal",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18918.576552909704,
+    "p99_us": 15194.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 51.15100539498027,
+    "origin_cpu_pct": 37.63785486113621
+  },
+  {
+    "campaign": "r1-boundary",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18023.44025247677,
+    "p99_us": 15468.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 51.05204445648438,
+    "origin_cpu_pct": 35.91019010391284
+  },
+  {
+    "campaign": "r1-both",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 17982.88008494238,
+    "p99_us": 15951.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 50.40722248589219,
+    "origin_cpu_pct": 35.17745411577041
+  },
+  {
+    "campaign": "r1-none",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18143.129861235804,
+    "p99_us": 14688.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 50.59438481692273,
+    "origin_cpu_pct": 36.04436565388613
+  },
+  {
+    "campaign": "r2-boundary",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18939.47284453328,
+    "p99_us": 15617.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 51.16810416800993,
+    "origin_cpu_pct": 37.28079964422049
+  },
+  {
+    "campaign": "r2-both",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18056.093168503274,
+    "p99_us": 15330.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 48.86135648069703,
+    "origin_cpu_pct": 35.445187413115804
+  },
+  {
+    "campaign": "r2-none",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18490.42760480197,
+    "p99_us": 14255.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 50.67957836578234,
+    "origin_cpu_pct": 36.27067863433442
+  },
+  {
+    "campaign": "r2-terminal",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "workload": "proxy",
+    "connection": "close",
+    "body_size": 1024,
+    "rps": 18016.009225537073,
+    "p99_us": 15772.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 49.78106718806864,
+    "origin_cpu_pct": 36.317740168924864
+  }
+]

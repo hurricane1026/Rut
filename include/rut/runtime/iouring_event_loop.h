@@ -244,6 +244,18 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     }
 
     bool study_yield_enabled = true;
+    bool study_http_byte_yield = false;
+    bool study_http_taskrun_yield = false;
+    bool study_http_submit_before_relay = false;
+    bool study_http_coalesce_close_response = false;
+    u64 study_http_coalesced_close_responses = 0;
+    bool study_http_direct_close_response = false;
+    u64 study_http_direct_close_attempts = 0;
+    u64 study_http_direct_close_completed = 0;
+    bool study_http_initial_recv_once = false;
+    u64 study_http_initial_recv_once_arms = 0;
+    u64 study_http_submit_before_relay_attempts = 0;
+    u64 study_http_taskrun_observations = 0;
     u64 ordinary_cq_wait_limit_ns = 80ull * 1000;
     u64 study_relay_turns = 0;
     u64 study_relay_yields = 0;
@@ -278,6 +290,8 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u32 relay_cancel_retry_count = 0;
     static constexpr u32 kDeferredRelayReadLimit = kMaxEventsPerWait;
     u32 deferred_relay_read_count = 0;
+    u32 deferred_relay_read_head = 0;
+    bool study_http_relay_ring = false;
     u32 deferred_relay_read_ids[kDeferredRelayReadLimit]{};
     u32 deferred_relay_read_episodes[kDeferredRelayReadLimit]{};
     // Read-only diagnostics for focused validation and post-run evidence.
@@ -285,6 +299,8 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // Conservative negative cache: only the terminal-pending publisher can
     // introduce an owner. Normal/mixed batches still scan unconditionally.
     bool response_read_terminal_scan_needed = true;
+    bool study_http_terminal_scan = false;
+    u64 study_http_terminal_scans_skipped = 0;
     bool study_ws_poll_first = false;
     u64 study_ws_poll_first_arms = 0;
     u32 study_ws_direct_recv_limit = 0;
@@ -459,6 +475,9 @@ public:
     // boundary eligible. The ordinary hot path avoids a connection-table scan;
     // the run loop consumes this after the complete wait batch.
     bool http1_boundary_ready_pending;
+    MappedArray<u64> http1_boundary_ready_words;
+    bool study_http_boundary_ready_set = false;
+    u64 study_http_boundary_slots_visited = 0;
     bool response_read_deadline_expiry_pending;
     bool response_read_deadline_body_pump_pending = false;
     MappedArray<u64> body_pump_ready_words;
@@ -596,6 +615,16 @@ public:
             conns.destroy();
             return core::make_unexpected(rearm_words.error());
         }
+        auto boundary_words = http1_boundary_ready_words.init((capacity + 63u) / 64u);
+        if (!boundary_words) {
+            recv_rearm_words.destroy();
+            body_pump_ready_words.destroy();
+            backend.destroy_send_state_storage();
+            pending_free.destroy();
+            free_stack.destroy();
+            conns.destroy();
+            return core::make_unexpected(boundary_words.error());
+        }
         recv_rearm_count = 0;
         recv_rearm_cursor = 0;
         ws_cache_rearm_cursor = 0;
@@ -621,9 +650,11 @@ public:
         slots_initialized = 0;
         pending_free_count = 0;
         deferred_relay_read_count = 0;
+        deferred_relay_read_head = 0;
         free_top = 0;
         response_read_deadline_body_pump_pending = false;
         body_pump_ready_words.destroy();
+        http1_boundary_ready_words.destroy();
         recv_rearm_words.destroy();
         recv_rearm_count = 0;
         backend.destroy_send_state_storage();
@@ -700,6 +731,7 @@ public:
         jit_code_ptr = nullptr;
         upstream_retirement_retry_count = 0;
         deferred_relay_read_count = 0;
+        deferred_relay_read_head = 0;
         http1_boundary_ready_pending = false;
         response_read_deadline_expiry_pending = false;
         response_read_deadline_body_pump_pending = false;
@@ -897,10 +929,19 @@ public:
     void shutdown() {
         close_deferred_idle_return_fds();
         reclaim_pending();
+        if (study_http_boundary_ready_set)
+            ::dprintf(2,
+                      "RUT_HTTP_BOUNDARY_READY_SET visited=%llu\n",
+                      static_cast<unsigned long long>(study_http_boundary_slots_visited));
         if (idle_trim_pidfd >= 0) {
             ::close(idle_trim_pidfd);
             idle_trim_pidfd = -1;
         }
+        if (study_http_terminal_scan)
+            ::fprintf(stderr,
+                      "RUT_HTTP_TERMINAL_SCAN skipped=%llu pending=%u\n",
+                      static_cast<unsigned long long>(study_http_terminal_scans_skipped),
+                      static_cast<unsigned>(response_read_terminal_scan_needed));
         if (backend.ws_recv_cache_enabled)
             ::fprintf(stderr,
                       "RUT_WS_CACHE deferred=%llu peak=%llu live=%u\n",
@@ -1043,6 +1084,8 @@ public:
             !c.response_read_timer_owner_is_neutral())
             return;
         c.http1_boundary_ready = true;
+        if (study_http_boundary_ready_set)
+            http1_boundary_ready_words[c.id >> 6] |= u64{1} << (c.id & 63u);
         http1_boundary_ready_pending = true;
     }
 
@@ -2859,117 +2902,137 @@ public:
         (void)process_buffered_tls_input(c);
     }
 
-    void resume_deferred_http1_boundaries() {
-        if (!http1_boundary_ready_pending) return;
-        http1_boundary_ready_pending = false;
-        for (u32 id = 0; id < slots_initialized; id++) {
-            Connection& c = conns[id];
-            if (!c.http1_boundary_ready) continue;
+    void resume_one_deferred_http1_boundary(u32 id) {
+        if (study_http_boundary_ready_set) ++study_http_boundary_slots_visited;
+        Connection& c = conns[id];
+        if (!c.http1_boundary_ready) return;
 
-            c.http1_boundary_ready = false;
-            if (!c.http1_boundary_deferred) continue;
-            if (strict_upstream_retirement_blocks_reclaim(c) ||
-                idle_return_drain_blocks_boundary(c) || !c.response_read_timer_owner_is_neutral())
-                continue;
-            const u32 expected_episode = c.http1_boundary_successor_episode;
+        if (study_http_boundary_ready_set)
+            http1_boundary_ready_words[id >> 6] &= ~(u64{1} << (id & 63u));
+        c.http1_boundary_ready = false;
+        if (!c.http1_boundary_deferred) return;
+        if (strict_upstream_retirement_blocks_reclaim(c) || idle_return_drain_blocks_boundary(c) ||
+            !c.response_read_timer_owner_is_neutral())
+            return;
+        const u32 expected_episode = c.http1_boundary_successor_episode;
 
-            if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
-                const bool has_request_callback =
-                    c.on_send || c.on_upstream_recv || c.on_upstream_send ||
-                    (c.uses_iouring_tls() ? c.tls_pending_on_recv != nullptr
-                                          : c.on_recv != nullptr);
-                const bool valid =
-                    c.id == id && c.fd >= 0 && !is_draining() && !c.upstream_episode_quarantined &&
-                    c.http1_prebuilt_wait == 0 && !strict_upstream_retirement_blocks_reclaim(c) &&
-                    c.upstream_close_episode == 0 && c.upstream_close_target_owned == 0 &&
-                    c.upstream_close_cancel_owned == 0 && !c.upstream_close_pause_cancel_owned &&
-                    valid_upstream_episode(expected_episode) &&
-                    c.upstream_episode == expected_episode && c.upstream_fd < 0 &&
-                    !c.upstream_slot_held && c.state == ConnState::Sending && !c.send_armed &&
-                    c.req_start_us == 0 && c.epoch_held && prebuilt_http1_response_is_complete(c) &&
-                    !c.upstream_connect_armed && !c.upstream_send_armed && !c.upstream_recv_armed &&
-                    !has_request_callback;
-                const bool explicit_close =
-                    (c.http1_prebuilt_deadline_profile ==
-                         ResponseReadDeadlineProfile::HeaderOnlyHead &&
-                     c.http1_prebuilt_response_purpose ==
-                         Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
-                     c.http1_prebuilt_deadline_upload.downstream_close &&
-                     response_read_timeout_header_only_head_response_is_stable(
-                         c,
-                         c.http1_prebuilt_deadline_upload,
-                         c.http1_prebuilt_deadline_config,
-                         c.http1_prebuilt_deadline_bundle_id,
-                         c.http1_prebuilt_deadline_generation,
-                         ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired)) ||
-                    (c.http1_prebuilt_deadline_config != nullptr &&
-                     c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
-                         c.http1_prebuilt_deadline_bundle_id) &&
-                     complete_content_length_explicit_close_request_is_stable(
-                         c,
-                         c.http1_prebuilt_deadline_upload,
-                         c.http1_prebuilt_deadline_config
-                             ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
-                             .response_buffering,
-                         c.http1_prebuilt_deadline_profile));
-                if (!valid || (!explicit_close && !normalize_prebuilt_http1_request_buffer(c))) {
-                    if (c.fd >= 0) close_conn(c);
-                    continue;
-                }
-
-                if (explicit_close) {
-                    c.http1_boundary_deferred = false;
-                    c.http1_boundary_successor_episode = 0;
-                    c.http1_prebuilt_wait = 0;
-                    end_stream_before_close(c);  // completed response
-                    close_conn(c);
-                    continue;
-                }
-
-                c.http1_boundary_deferred = false;
-                c.http1_boundary_successor_episode = 0;
-                c.http1_prebuilt_wait = 0;
-                c.http1_prebuilt_disposition = Http1RequestBufferDisposition::None;
-                c.http1_prebuilt_request_prefix_len = 0;
-                c.clear_http1_prebuilt_response_proof();
-                epoch_leave();
-                c.epoch_held = false;
-                continue_http1_request_boundary<IoUringEventLoop>(this, c);
-                resume_buffered_tls_request_input(c);
-                continue;
-            }
-
-            c.http1_boundary_deferred = false;
-            c.http1_boundary_successor_episode = 0;
-
+        if (c.http1_prebuilt_disposition != Http1RequestBufferDisposition::None) {
             const bool has_request_callback =
                 c.on_send || c.on_upstream_recv || c.on_upstream_send ||
                 (c.uses_iouring_tls() ? c.tls_pending_on_recv != nullptr : c.on_recv != nullptr);
             const bool valid =
                 c.id == id && c.fd >= 0 && !is_draining() && !c.upstream_episode_quarantined &&
-                !strict_upstream_retirement_blocks_reclaim(c) &&
+                c.http1_prebuilt_wait == 0 && !strict_upstream_retirement_blocks_reclaim(c) &&
+                c.upstream_close_episode == 0 && c.upstream_close_target_owned == 0 &&
+                c.upstream_close_cancel_owned == 0 && !c.upstream_close_pause_cancel_owned &&
                 valid_upstream_episode(expected_episode) &&
-                c.upstream_episode == expected_episode && c.state == ConnState::Sending &&
-                !c.send_armed && c.req_start_us == 0 && !has_request_callback;
-            if (!valid) {
-                if (c.fd >= 0) close_conn(c);
-                continue;
-            }
+                c.upstream_episode == expected_episode && c.upstream_fd < 0 &&
+                !c.upstream_slot_held && c.state == ConnState::Sending && !c.send_armed &&
+                c.req_start_us == 0 && c.epoch_held && prebuilt_http1_response_is_complete(c) &&
+                !c.upstream_connect_armed && !c.upstream_send_armed && !c.upstream_recv_armed &&
+                !has_request_callback;
             const bool explicit_close =
-                c.http1_prebuilt_deadline_upload.downstream_close &&
-                complete_content_length_explicit_close_request_is_stable(
-                    c,
-                    c.http1_prebuilt_deadline_upload,
-                    ForwardResponseBufferingMode::CompleteContentLength,
-                    ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
-            // Both branches close after a completed response.
-            if (c.http1_prebuilt_deadline_upload.downstream_close || explicit_close) {
-                end_stream_before_close(c);
-                close_conn(c);
-                continue;
+                (c.http1_prebuilt_deadline_profile == ResponseReadDeadlineProfile::HeaderOnlyHead &&
+                 c.http1_prebuilt_response_purpose ==
+                     Http1PrebuiltResponsePurpose::ResponseReadTimeout &&
+                 c.http1_prebuilt_deadline_upload.downstream_close &&
+                 response_read_timeout_header_only_head_response_is_stable(
+                     c,
+                     c.http1_prebuilt_deadline_upload,
+                     c.http1_prebuilt_deadline_config,
+                     c.http1_prebuilt_deadline_bundle_id,
+                     c.http1_prebuilt_deadline_generation,
+                     ResponseReadTimeoutHeaderOnlyHeadPhase::SendingRetired)) ||
+                (c.http1_prebuilt_deadline_config != nullptr &&
+                 c.http1_prebuilt_deadline_config->policy_bundle_id_is_valid(
+                     c.http1_prebuilt_deadline_bundle_id) &&
+                 complete_content_length_explicit_close_request_is_stable(
+                     c,
+                     c.http1_prebuilt_deadline_upload,
+                     c.http1_prebuilt_deadline_config
+                         ->policy_bundles[c.http1_prebuilt_deadline_bundle_id - 1]
+                         .response_buffering,
+                     c.http1_prebuilt_deadline_profile));
+            if (!valid || (!explicit_close && !normalize_prebuilt_http1_request_buffer(c))) {
+                if (c.fd >= 0) close_conn(c);
+                return;
             }
+
+            if (explicit_close) {
+                c.http1_boundary_deferred = false;
+                c.http1_boundary_successor_episode = 0;
+                c.http1_prebuilt_wait = 0;
+                end_stream_before_close(c);  // completed response
+                close_conn(c);
+                return;
+            }
+
+            c.http1_boundary_deferred = false;
+            c.http1_boundary_successor_episode = 0;
+            c.http1_prebuilt_wait = 0;
+            c.http1_prebuilt_disposition = Http1RequestBufferDisposition::None;
+            c.http1_prebuilt_request_prefix_len = 0;
+            c.clear_http1_prebuilt_response_proof();
+            epoch_leave();
+            c.epoch_held = false;
             continue_http1_request_boundary<IoUringEventLoop>(this, c);
             resume_buffered_tls_request_input(c);
+            return;
+        }
+
+        c.http1_boundary_deferred = false;
+        c.http1_boundary_successor_episode = 0;
+
+        const bool has_request_callback =
+            c.on_send || c.on_upstream_recv || c.on_upstream_send ||
+            (c.uses_iouring_tls() ? c.tls_pending_on_recv != nullptr : c.on_recv != nullptr);
+        const bool valid =
+            c.id == id && c.fd >= 0 && !is_draining() && !c.upstream_episode_quarantined &&
+            !strict_upstream_retirement_blocks_reclaim(c) &&
+            valid_upstream_episode(expected_episode) && c.upstream_episode == expected_episode &&
+            c.state == ConnState::Sending && !c.send_armed && c.req_start_us == 0 &&
+            !has_request_callback;
+        if (!valid) {
+            if (c.fd >= 0) close_conn(c);
+            return;
+        }
+        const bool explicit_close =
+            c.http1_prebuilt_deadline_upload.downstream_close &&
+            complete_content_length_explicit_close_request_is_stable(
+                c,
+                c.http1_prebuilt_deadline_upload,
+                ForwardResponseBufferingMode::CompleteContentLength,
+                ResponseReadDeadlineProfile::BodylessNonHeadContentLengthZero);
+        // Both branches close after a completed response.
+        if (c.http1_prebuilt_deadline_upload.downstream_close || explicit_close) {
+            end_stream_before_close(c);
+            close_conn(c);
+            return;
+        }
+        continue_http1_request_boundary<IoUringEventLoop>(this, c);
+        resume_buffered_tls_request_input(c);
+    }
+
+    void resume_deferred_http1_boundaries() {
+        if (!http1_boundary_ready_pending) return;
+        http1_boundary_ready_pending = false;
+        if (!study_http_boundary_ready_set) {
+            for (u32 id = 0; id < slots_initialized; ++id) resume_one_deferred_http1_boundary(id);
+            return;
+        }
+        // Keep the original ascending-slot order, including publication to a
+        // higher slot by a callback. Lower-slot republication waits for the
+        // next complete CQ batch, just as in the full-table walk.
+        const u32 kWords = (slots_initialized + 63u) >> 6;
+        for (u32 word = 0; word < kWords; ++word) {
+            u64 eligible = ~u64{0};
+            while (const u64 bits = http1_boundary_ready_words[word] & eligible) {
+                const u32 kBit = static_cast<u32>(__builtin_ctzll(bits));
+                const u32 kId = (word << 6) + kBit;
+                http1_boundary_ready_words[word] &= ~(u64{1} << kBit);
+                eligible = kBit == 63u ? 0 : (~u64{0} << (kBit + 1u));
+                if (kId < slots_initialized) resume_one_deferred_http1_boundary(kId);
+            }
         }
     }
 
@@ -3637,6 +3700,13 @@ public:
     }
     bool ws_has_cached_input(const Connection& c) const { return backend.has_ws_recv_cache(c.id); }
 
+    [[nodiscard]] bool use_one_shot_initial_http_recv(const Connection& c) const {
+        return study_http_initial_recv_once && !c.tls_active &&
+               c.protocol == ConnProtocol::Http11 && c.h2 == nullptr &&
+               c.state == ConnState::ReadingHeader && c.downstream_completed_request_count == 0 &&
+               !c.is_ws_tunnel && !c.is_ws_terminate && !c.is_ws_terminate_route;
+    }
+
     bool submit_recv_impl(Connection& c) {
         if (ws_splice.intercept_recv(*this, c)) return true;
         const bool tls_send_needs_recv =
@@ -3655,15 +3725,18 @@ public:
             return true;
         }
         bool submitted = false;
-        if (use_one_shot_websocket_recv(c)) {
+        const bool initial_http = use_one_shot_initial_http_recv(c);
+        if (use_one_shot_websocket_recv(c) || initial_http) {
             const u32 kAvailable = c.recv_buf.write_avail();
             const u32 kMaximum = kProvidedBufSize;
-            submitted = backend.add_recv_once(
-                c.fd,
-                c.id,
-                kAvailable < kMaximum ? kAvailable : kMaximum,
-                study_ws_poll_first && !c.is_ws_terminate && !c.is_ws_terminate_route);
-            if (submitted && study_ws_poll_first && !c.is_ws_terminate && !c.is_ws_terminate_route)
+            submitted = backend.add_recv_once(c.fd,
+                                              c.id,
+                                              kAvailable < kMaximum ? kAvailable : kMaximum,
+                                              !initial_http && study_ws_poll_first &&
+                                                  !c.is_ws_terminate && !c.is_ws_terminate_route);
+            if (submitted && initial_http) ++study_http_initial_recv_once_arms;
+            if (submitted && !initial_http && study_ws_poll_first && !c.is_ws_terminate &&
+                !c.is_ws_terminate_route)
                 ++study_ws_poll_first_arms;
         } else {
             submitted = backend.add_recv(c.fd, c.id);
@@ -3878,14 +3951,20 @@ public:
         }
         // The completion SQE is reserved first: once written, the bytes and
         // FIN cannot be withdrawn, so the send must stay accountable.
-        if (!deadline_send && final_local_response_send(c, buf, len) && backend.sq_has_room()) {
+        const bool direct_proxy_close = final_proxy_close_response_send(c, buf, len);
+        if (!deadline_send && (final_local_response_send(c, buf, len) || direct_proxy_close) &&
+            backend.sq_has_room()) {
+            if (direct_proxy_close) ++study_http_direct_close_attempts;
             // The last response on a closing plaintext connection: write it
             // directly and end the stream at once, as nginx does, so the FIN
             // follows the data before the client can close first.
             const ssize_t n = ::send(c.fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
             if (n > 0) {
                 const u32 written = static_cast<u32>(n);
-                if (written == len) (void)::shutdown(c.fd, SHUT_WR);
+                if (written == len) {
+                    if (direct_proxy_close) ++study_http_direct_close_completed;
+                    (void)::shutdown(c.fd, SHUT_WR);
+                }
                 if (backend.add_send_after_direct_write(
                         c.fd, c.id, buf, len, written, generation)) {
                     c.pending_ops++;
@@ -3999,6 +4078,25 @@ public:
                ((buf == c.send_buf.data() && len == c.send_buf.len() &&
                  c.local_body_send_len == 0) ||
                 (buf == c.local_body_cursor && len == c.local_body_send_len));
+    }
+
+    [[nodiscard]] bool final_proxy_close_response_send(const Connection& c,
+                                                       const u8* buf,
+                                                       u32 len) const {
+        return study_http_direct_close_response && backend.nop_inject_result && c.fd >= 0 &&
+               !c.keep_alive && !c.send_armed && c.send_progress == 0 &&
+               c.request_upload_complete && !c.upstream_send_armed && c.throttle_down_bps == 0 &&
+               !c.tls_active && c.protocol == ConnProtocol::Http11 && c.response_policy_id == 0 &&
+               c.response_read_deadline_owner_is_neutral() && c.resp_header_mutation_count == 0 &&
+               c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+               c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
+               !c.req_client_keep_alive && c.req_client_connection_close_exact &&
+               c.req_client_connection_count == 1 && c.resp_body_mode == BodyMode::ContentLength &&
+               c.resp_body_remaining == 0 && c.on_send == &on_proxy_response_sent<Self> &&
+               len != 0 && len <= static_cast<u32>(INT32_MAX) &&
+               c.response_header_slice != nullptr && buf == c.response_header_slice &&
+               buf == c.response_header_buf.data() && len == c.response_header_buf.len() &&
+               c.resp_body_sent == len && c.upstream_send_len == c.upstream_recv_buf.len();
     }
 
     static constexpr bool supports_buffered_send_vector() { return true; }
@@ -4215,18 +4313,41 @@ public:
         }
     }
 
+    u32 deferred_relay_read_slot(u32 offset) const {
+        return study_http_relay_ring ? (deferred_relay_read_head + offset) % kDeferredRelayReadLimit
+                                     : offset;
+    }
+
+    bool pop_deferred_relay_read(u32& id, u32& episode) {
+        if (deferred_relay_read_count == 0) return false;
+        const u32 kSlot = deferred_relay_read_slot(0);
+        id = deferred_relay_read_ids[kSlot];
+        episode = deferred_relay_read_episodes[kSlot];
+        --deferred_relay_read_count;
+        if (study_http_relay_ring) {
+            deferred_relay_read_head = (deferred_relay_read_head + 1u) % kDeferredRelayReadLimit;
+        } else {
+            for (u32 j = 0; j < deferred_relay_read_count; ++j) {
+                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
+                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
+            }
+        }
+        return true;
+    }
+
     void defer_response_splice_read(Connection& c) {
         RelayOwner& r = c.relay_owner;
         r.phase = RelayPhase::Reading;
         for (u32 i = 0; i < deferred_relay_read_count; i++) {
-            if (deferred_relay_read_ids[i] == c.id &&
-                deferred_relay_read_episodes[i] == r.upstream_episode)
+            if (deferred_relay_read_ids[deferred_relay_read_slot(i)] == c.id &&
+                deferred_relay_read_episodes[deferred_relay_read_slot(i)] == r.upstream_episode)
                 return;
         }
         if (deferred_relay_read_count < kDeferredRelayReadLimit) {
             study_queue_started[c.id] = monotonic_ns();
-            deferred_relay_read_ids[deferred_relay_read_count] = c.id;
-            deferred_relay_read_episodes[deferred_relay_read_count] = r.upstream_episode;
+            deferred_relay_read_ids[deferred_relay_read_slot(deferred_relay_read_count)] = c.id;
+            deferred_relay_read_episodes[deferred_relay_read_slot(deferred_relay_read_count)] =
+                r.upstream_episode;
             deferred_relay_read_count++;
             return;
         }
@@ -4237,6 +4358,14 @@ public:
 
     bool has_ordinary_cq_work() {
         ++study_cq_probes;
+        // A cooperative taskrun can own ready completions before they appear
+        // in CQ. Leave execution and flag clearing to backend.wait().
+        if (study_http_taskrun_yield && backend.sq_flags != nullptr &&
+            (__atomic_load_n(backend.sq_flags, __ATOMIC_ACQUIRE) &
+             (IORING_SQ_TASKRUN | IORING_SQ_CQ_OVERFLOW)) != 0) {
+            ++study_http_taskrun_observations;
+            return true;
+        }
         if (!backend.cq_head || !backend.cq_tail) return false;
         const u32 head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
         const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
@@ -4285,7 +4414,10 @@ public:
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
-            if (relay_budget_calls <= study_relay_turn_call_limit / 2 && study_yield_enabled) {
+            const bool kHalfTurn =
+                relay_budget_calls <= study_relay_turn_call_limit / 2 ||
+                (study_http_byte_yield && relay_budget_bytes <= study_relay_turn_byte_limit / 2);
+            if (kHalfTurn && study_yield_enabled) {
                 if (has_ordinary_cq_work()) {
                     const u64 now = monotonic_ns();
                     if (ordinary_since_ns == 0) ordinary_since_ns = now;
@@ -4297,13 +4429,11 @@ public:
                     ordinary_since_ns = 0;
                 }
             }
-            const u32 kId = deferred_relay_read_ids[0];
-            const u32 kEpisode = deferred_relay_read_episodes[0];
-            --deferred_relay_read_count;
-            for (u32 j = 0; j < deferred_relay_read_count; ++j) {
-                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
-                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
-            }
+            u32 id = 0;
+            u32 episode = 0;
+            if (!pop_deferred_relay_read(id, episode)) break;
+            const u32 kId = id;
+            const u32 kEpisode = episode;
             if (kId >= slots_initialized) continue;
             Connection& c = conns[kId];
             RelayOwner& r = c.relay_owner;
@@ -4351,14 +4481,16 @@ public:
 
     void clear_deferred_relay_read(u32 id) {
         for (u32 i = 0; i < deferred_relay_read_count;) {
-            if (deferred_relay_read_ids[i] != id) {
+            if (deferred_relay_read_ids[deferred_relay_read_slot(i)] != id) {
                 ++i;
                 continue;
             }
             --deferred_relay_read_count;
             for (u32 j = i; j < deferred_relay_read_count; ++j) {
-                deferred_relay_read_ids[j] = deferred_relay_read_ids[j + 1];
-                deferred_relay_read_episodes[j] = deferred_relay_read_episodes[j + 1];
+                deferred_relay_read_ids[deferred_relay_read_slot(j)] =
+                    deferred_relay_read_ids[deferred_relay_read_slot(j + 1)];
+                deferred_relay_read_episodes[deferred_relay_read_slot(j)] =
+                    deferred_relay_read_episodes[deferred_relay_read_slot(j + 1)];
             }
         }
     }
@@ -4472,6 +4604,13 @@ public:
         }
         if (ev.type == IoEventType::RelayRead) {
             r.read_armed = false;
+            // Already-runnable owners must get the next relay quantum before
+            // newly dispatched reads. Otherwise a stream of short responses
+            // can consume every turn inside CQ dispatch and starve the FIFO.
+            if (study_inside_cq && deferred_relay_read_count != 0) {
+                defer_response_splice_read(c);
+                return;
+            }
             if (relay_budget_calls < 2 || relay_budget_bytes < 2) {
                 defer_response_splice_read(c);
                 return;
@@ -7428,8 +7567,11 @@ public:
         study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
-        if (!ws_splice.fast_scan || !ws_splice.last_batch_ws_only ||
-            response_read_terminal_scan_needed) {
+        // The empty result stays exact until terminal publication invalidates
+        // it. Deadline expiry, body pumping and reclamation still run normally.
+        if (response_read_terminal_scan_needed ||
+            (!study_http_terminal_scan &&
+             (!ws_splice.fast_scan || !ws_splice.last_batch_ws_only))) {
             bool any_pending = false;
             for (u32 id = 0; id < slots_initialized; ++id) {
                 Connection& c = conns[id];
@@ -7444,14 +7586,26 @@ public:
             }
             response_read_terminal_scan_needed = any_pending;
         } else {
-            ++ws_splice.terminal_scans_skipped;
+            if (study_http_terminal_scan)
+                ++study_http_terminal_scans_skipped;
+            else
+                ++ws_splice.terminal_scans_skipped;
         }
         pump_response_read_deadline_bodies();
         // Retirement/header rendezvous owners publish only readiness during
         // dispatch. Admit parked HTTP/1 request boundaries after every CQE in
         // this wait batch, before reclamation or accept reuse.
         resume_deferred_http1_boundaries();
-        flush_deferred_relay_reads();
+        // Dispatch can queue ordinary send/recv SQEs. Start that I/O before
+        // spending the synchronous relay quantum; wait() remains the sole CQ
+        // consumer, and the existing flush preserves partial/error accounting.
+        bool relay_submission_ready = true;
+        if (study_http_submit_before_relay && deferred_relay_read_count != 0 &&
+            backend.pending != 0) {
+            ++study_http_submit_before_relay_attempts;
+            relay_submission_ready = backend.flush_pending_nonblocking();
+        }
+        if (relay_submission_ready) flush_deferred_relay_reads();
         response_read_batch_pin_count = 0;
         response_read_batch_owner_count = 0;
         response_read_batch_owner_index_active = false;

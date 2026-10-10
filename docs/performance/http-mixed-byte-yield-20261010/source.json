@@ -1,0 +1,10 @@
+{
+  "commit": "f157a285b36b246a9ac65c012202dacb90c9ffef",
+  "sha256": {
+    "rut": "78e027c4df20dfd008214990b54908ed364e4b6d797e76aa63b7b617af70b72d",
+    "rut-compile": "5a334101794963a9349287ef755d5b1cd63ea44d27dad54ed05806ef7bc08317",
+    "rut-nginx-convert": "19ce3b2228186966fe14194d995169eab9fd8e5afcc09b74c0a813ec8ec5d6ab"
+  },
+  "goal_nginx_ratio": 1.5,
+  "small_p99_regression_limit": 1.1
+}
