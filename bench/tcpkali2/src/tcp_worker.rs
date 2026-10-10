@@ -237,7 +237,12 @@ async fn pipeline_reader(
 
     loop {
         let bytes_read = match reader.read(&mut buffer).await {
-            Ok(0) => return Ok(()),
+            Ok(0) => {
+                if !stats.is_shutting_down() {
+                    stats.record_connection_error();
+                }
+                return Ok(());
+            }
             Ok(bytes_read) => bytes_read,
             Err(error) => {
                 log_error!(stats, config, "Read error: {}", error);
@@ -424,6 +429,61 @@ mod tests {
         assert_eq!(stats.initialized_connections.load(Ordering::Relaxed), 1);
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_counts_premature_peer_eof_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut message = [0; 4];
+            stream.read_exact(&mut message).await.unwrap();
+        });
+
+        let payload = Bytes::from_static(b"data");
+        let config = Arc::new(Config {
+            duration: Duration::from_secs(1),
+            warmup_duration: Duration::ZERO,
+            message_size: payload.len(),
+            quiet: true,
+            nagle: false,
+            pipeline: true,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_secs(1),
+            init_timeout: Duration::from_secs(1),
+            channel_lifetime: None,
+            first_message: None,
+            message: Some(payload.clone()),
+            pipeline_message: Some(payload),
+            pipeline_batch_size: 1,
+            message_rate: Some(1),
+            use_websocket: false,
+            output: None,
+        });
+        let stats = Arc::new(Stats::new());
+        stats.end_warmup();
+        let worker_stats = stats.clone();
+        let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(true);
+        let worker = tokio::spawn(async move {
+            tcp_worker(
+                &address.to_string(),
+                config,
+                worker_stats,
+                load_start_rx,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("pipeline did not stop on peer EOF")
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

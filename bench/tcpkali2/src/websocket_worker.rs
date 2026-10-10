@@ -352,6 +352,11 @@ async fn pipeline_reader(
                 }
                 return Ok(());
             }
+            Ok(Message::Text(_)) => {
+                log_error!(stats, config, "Unexpected WebSocket text frame in binary pipeline");
+                stats.record_connection_error();
+                return Ok(());
+            }
             Ok(_) => continue,
             Err(error) => {
                 log_error!(stats, config, "WebSocket receive error: {}", error);
@@ -582,6 +587,66 @@ mod tests {
             .unwrap();
         server.await.unwrap();
 
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_rejects_unexpected_text_replies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            assert!(websocket.next().await.unwrap().unwrap().is_binary());
+            websocket
+                .send(Message::Text("unexpected".into()))
+                .await
+                .unwrap();
+        });
+
+        let payload = Bytes::from_static(b"binary");
+        let config = Arc::new(Config {
+            duration: Duration::from_secs(1),
+            warmup_duration: Duration::ZERO,
+            message_size: payload.len(),
+            quiet: true,
+            nagle: false,
+            pipeline: true,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_secs(1),
+            init_timeout: Duration::from_secs(1),
+            channel_lifetime: None,
+            first_message: None,
+            message: Some(payload.clone()),
+            pipeline_message: Some(payload),
+            pipeline_batch_size: 1,
+            message_rate: Some(1),
+            use_websocket: true,
+            output: None,
+        });
+        let stats = Arc::new(Stats::new());
+        stats.end_warmup();
+        let worker_stats = stats.clone();
+        let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(true);
+        let worker = tokio::spawn(async move {
+            websocket_worker(
+                &address.to_string(),
+                config,
+                worker_stats,
+                load_start_rx,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("pipeline did not stop on text reply")
+            .unwrap();
+        server.await.unwrap();
         assert_eq!(stats.total_requests.load(Ordering::Relaxed), 0);
         assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
     }

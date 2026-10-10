@@ -3745,9 +3745,14 @@ set_tests_properties(test_cli_backend PROPERTIES LABELS "cli" RUN_SERIAL TRUE TI
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
-    add_test(NAME test_workload_handler
+    add_test(NAME test_workload_handler_epoll
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_workload_handler.py
                 $<TARGET_FILE:rut> epoll)
-    set_tests_properties(test_workload_handler PROPERTIES
+    set_tests_properties(test_workload_handler_epoll PROPERTIES
+        LABELS "cli;compiler;runtime" RUN_SERIAL TRUE TIMEOUT 45)
+    add_test(NAME test_workload_handler_iouring
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_workload_handler.py
+                $<TARGET_FILE:rut> io_uring)
+    set_tests_properties(test_workload_handler_iouring PROPERTIES
         LABELS "cli;compiler;runtime" RUN_SERIAL TRUE TIMEOUT 45)
 endif()

@@ -3,12 +3,37 @@
 #include "rut/runtime/route_table.h"
 #include "test.h"
 
+#include <string>
+
 using namespace rut;
 
 namespace {
 
 ForwardTargetTransformSpec transform(Str strip, Str replace) {
     return {strip, replace};
+}
+
+TEST(target_transform, retained_body_bridge_supports_workload_fixture_sizes) {
+    std::string body_64k(64 * 1024, 'a');
+    std::string body_1m(1024 * 1024, 'b');
+    rir::Module mod{};
+    mod.response_body_count = 2;
+    mod.response_bodies[0] = {body_64k.data(), static_cast<u32>(body_64k.size())};
+    mod.response_bodies[1] = {body_1m.data(), static_cast<u32>(body_1m.size())};
+
+    RouteConfig owned{};
+    CHECK_FALSE(populate_route_config(owned, mod));
+    CHECK_EQ(owned.response_body_count, 0u);
+
+    RouteConfig retained{};
+    REQUIRE(populate_route_config_with_retained_body_views(retained, mod));
+    REQUIRE_EQ(retained.response_body_count, 2u);
+    CHECK_EQ(retained.body_pool_used, 0u);
+    CHECK_EQ(retained.response_bodies[0].data, body_64k.data());
+    CHECK_EQ(retained.response_bodies[0].len, body_64k.size());
+    CHECK_EQ(retained.response_bodies[1].data, body_1m.data());
+    CHECK_EQ(retained.response_bodies[1].len, body_1m.size());
+    CHECK_EQ(retained.response_bodies[1].data[body_1m.size() - 1], 'b');
 }
 
 void make_short_transform(char (&strip)[8], char (&replace)[8], u32 n) {

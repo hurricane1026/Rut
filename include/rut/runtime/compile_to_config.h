@@ -692,8 +692,12 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
 
 }  // namespace detail
 
-// retain_response_body_views requires the caller to pin the module/source until
-// every user of cfg has retired (the serving loader's LoadedProgram does this).
+// The default copies response bodies into RouteConfig's 8 KiB owned pool.
+// Modules with larger response bodies must use
+// populate_route_config_with_retained_body_views() instead. That API stores
+// non-owning pointers into `mod`; keep the module and its backing storage alive
+// until every reader of cfg has retired (the serving loader's LoadedProgram
+// pins it through RouteConfig's RCU lifetime).
 inline bool populate_route_config(RouteConfig& cfg,
                                   const rir::Module& mod,
                                   bool retain_response_body_views = false) {
@@ -726,6 +730,16 @@ inline bool populate_route_config(RouteConfig& cfg,
     if (!strict_copied)
         __builtin_memcpy(static_cast<void*>(&cfg), before.get(), sizeof(RouteConfig));
     return strict_copied;
+}
+
+// Populate response bodies as views into the RIR module. Use this for bodies
+// larger than RouteConfig's owned 8 KiB pool, including workload fixtures.
+// The caller must retain `mod` and its backing storage until cfg is no longer
+// active and all readers have retired. For a self-contained config, use the
+// default populate_route_config() overload and keep bodies within its pool.
+inline bool populate_route_config_with_retained_body_views(RouteConfig& cfg,
+                                                           const rir::Module& mod) {
+    return populate_route_config(cfg, mod, /*retain_response_body_views=*/true);
 }
 
 inline bool populate_route_config_for_internal_propagation(RouteConfig& cfg,

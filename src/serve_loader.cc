@@ -326,7 +326,7 @@ bool load_rut_program(const char* path,
     // register_jit_routes then resolves each handler symbol and adds
     // the routes. Both fail closed.
     err.stage = LoadStage::Register;
-    if (!populate_route_config(out.config, out.rir.module, /*retain_response_body_views=*/true))
+    if (!populate_route_config_with_retained_body_views(out.config, out.rir.module))
         return false;
     // After the transactional populate: a failed populate restores a byte
     // snapshot, which would leak files created inside it.
