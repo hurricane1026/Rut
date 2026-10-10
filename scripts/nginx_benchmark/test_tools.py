@@ -226,6 +226,26 @@ class ToolsTest(unittest.TestCase):
                 self.assertFalse(relay_compare.mixed_client_valid(dict(good, **{field: value})))
         self.assertFalse(relay_compare.mixed_client_valid(dict(good, errors={"read": 1})))
 
+    def test_distinct_small_route_preserves_native_forward_policy(self):
+        for policy in ("", ", request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection] }"):
+            config = 'route GET "/proxy" { return forward(backend' + policy + ') }\n'
+            self.assertEqual(relay_compare.distinct_small_route(config),
+                             config.replace('"/proxy"', '"/small"'))
+        with self.assertRaisesRegex(ValueError, "exactly one native /proxy route"):
+            relay_compare.distinct_small_route('route GET "/other" { return forward(backend) }\n')
+
+    def test_direct_origin_close_requires_fresh_origin_connections(self):
+        markers = ["close-0", "close-1", "close-2"]
+        fresh = [(marker, index + 1, 1) for index, marker in enumerate(markers)]
+        pooled = [(marker, 7, index + 1) for index, marker in enumerate(markers)]
+        self.assertTrue(relay_compare.valid_fresh_origin_records(fresh, markers))
+        self.assertFalse(relay_compare.valid_fresh_origin_records(pooled, markers))
+        self.assertFalse(relay_compare.valid_fresh_origin_records(fresh[::-1], markers))
+        self.assertTrue(relay_compare.valid_api_origin_records(
+            fresh, markers, fresh_downstream=True, reuse=True, request_policy="transparent"))
+        self.assertTrue(relay_compare.valid_api_origin_records(
+            pooled, markers, fresh_downstream=True, reuse=True, request_policy="omit-connection"))
+
     def test_distinct_urls_require_proxy_scenarios(self):
         with self.assertRaisesRegex(ValueError, "requires proxy-only scenarios"):
             relay_compare.validate_distinct_url_scenarios(relay_compare.DEFAULT_SCENARIOS, True)
@@ -1157,6 +1177,38 @@ class ToolsTest(unittest.TestCase):
                 self.assertEqual(started, expected)
                 self.assertEqual(started, [engine for entry in metadata_order
                                            for engine in entry["engines"]])
+
+    def test_benchmark_preserves_mixed_result_and_warmup_validity(self):
+        for invalid_sample in ("measurement", "warmup"):
+            with self.subTest(invalid_sample=invalid_sample), tempfile.TemporaryDirectory() as directory:
+                args = SimpleNamespace(
+                    output=Path(directory), scenarios=["proxy-close"], repeats=1,
+                    first_engine="rut", warmup=1, duration=1, concurrency=[1],
+                    workers=1, server_cpus="2", proxy_profile="native-streaming",
+                    static_profile="converter-return", body_size=None,
+                )
+                harness = Harness(args)
+                harness.frontend = lambda *_args: contextlib.nullcontext(123)
+                harness.validate = lambda *_args: None
+                sample = {
+                    "requests": 10, "seconds": 1.0, "rps": 10.0,
+                    "errors": dict.fromkeys(run.ERROR_NAMES, 0), "valid": True,
+                }
+                calls = 0
+
+                def fake_wrk(*_args):
+                    nonlocal calls
+                    calls += 1
+                    result = dict(sample)
+                    if (invalid_sample == "warmup" and calls == 1
+                            or invalid_sample == "measurement" and calls == 2):
+                        result["valid"] = False
+                    return result
+
+                harness.wrk = fake_wrk
+                with mock.patch.object(run, "proc_usage", return_value=(0.0, 0)), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertFalse(harness.benchmark(456))
 
     def test_fragmented_body_and_normal_close(self):
         sock = FakeSocket(

@@ -932,8 +932,10 @@ class Harness:
                                 server_rss_bytes=rss,
                                 valid=bool(result["requests"])
                                 and not any(result["errors"].values())
+                                and result.get("valid", True)
                                 and bool(warmup["requests"])
-                                and not any(warmup["errors"].values()),
+                                and not any(warmup["errors"].values())
+                                and warmup.get("valid", True),
                             )
                             self.results.append(result)
                             save_json(self.out / "results.json", self.results)

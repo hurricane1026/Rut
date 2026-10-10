@@ -51,6 +51,13 @@ def module_valid_origin_reuse(records, expected_markers):
                for index, row in enumerate(records))
 
 
+def valid_fresh_origin_records(records, expected_markers):
+    return (len(records) == len(expected_markers)
+            and [row[0] for row in records] == list(expected_markers)
+            and len({row[1] for row in records}) == len(records)
+            and all(row[1] > 0 and row[2] == 1 for row in records))
+
+
 def valid_api_origin_records(records, expected_markers, fresh_downstream,
                              reuse=True, request_policy="transparent"):
     if not reuse:
@@ -160,6 +167,15 @@ def small_nginx_location(location, kib):
     small = location.replace("/proxy", "/small", 1)
     return re.sub(r"proxy_buffer_size\s+\S+;\s*proxy_buffers\s+\d+\s+\S+;\s*proxy_busy_buffers_size\s+\S+;",
                   f"proxy_buffer_size {kib}k; proxy_buffers 8 {kib}k; proxy_busy_buffers_size {2 * kib}k;", small)
+
+
+def distinct_small_route(config):
+    """Copy the generated proxy route's forwarding policy to the small URL."""
+    updated, count = re.subn(r'(?m)^route GET "/proxy"(?=\s)',
+                             'route GET "/small"', config)
+    if count != 1:
+        raise ValueError("expected exactly one native /proxy route")
+    return updated
 
 
 def origin_worker_config(text, workers, cpus, multi_accept, port, reuseport=False, pin=False):
@@ -370,6 +386,27 @@ def main():
     active_output = None
     active_rut = None
     frontend_live = False
+    active_engine = None
+
+    original_verify_origin_reuse = module.Harness.verify_origin_reuse
+
+    def verify_origin_reuse(self, expected_markers, fresh_downstream=False):
+        if active_engine != "direct-origin" or not fresh_downstream:
+            return original_verify_origin_reuse(self, expected_markers, fresh_downstream)
+        logs = ((self.out / "api-origin.log").read_text()
+                if options.origin_mode == "api"
+                else self.command(["docker", "logs", getattr(self, "origin_container_id", "")]).stdout)
+        marker_prefix = expected_markers[0].rsplit("-", 1)[0]
+        (self.out / f"{marker_prefix}-origin-reuse.log").write_text(logs)
+        records = module.origin_reuse_records(logs, expected_markers)
+        # The direct-origin engine has no frontend policy layer to strip
+        # Connection: close, so every close request must use a fresh origin
+        # connection even when the Rut frontend policy omits that header.
+        valid = valid_fresh_origin_records(records, expected_markers)
+        if not valid:
+            raise ValueError(f"direct-origin close preflight expected fresh origin connections: {records!r}")
+
+    module.Harness.verify_origin_reuse = verify_origin_reuse
 
     def selected(argv, *args, **kwargs):
         if isinstance(argv, list) and argv and argv[0] == "taskset" and active_backend and active_output:
@@ -383,10 +420,11 @@ def main():
 
     @contextlib.contextmanager
     def chosen_frontend(self, engine, work, label):
-        nonlocal active_backend, active_output, active_rut, frontend_live
+        nonlocal active_backend, active_output, active_rut, frontend_live, active_engine
         if frontend_live:
             raise RuntimeError("frontends must run serially")
         frontend_live = True
+        active_engine = engine
         if engine == "direct-origin":
             saved_port = self.args.front_port
             self.active_label = label
@@ -396,6 +434,7 @@ def main():
             finally:
                 self.args.front_port = saved_port
                 frontend_live = False
+                active_engine = None
             return
         active_backend = "epoll" if engine == "epoll" else "io_uring"
         active_output = self.out
@@ -405,7 +444,7 @@ def main():
         rut_config = self.out / (work + ".rut")
         saved_rut_config = rut_config.read_text()
         if options.mixed_distinct_urls:
-            rut_config.write_text(saved_rut_config + '\nroute GET "/small" { return forward(backend) }\n')
+            rut_config.write_text(distinct_small_route(saved_rut_config))
             (self.out / (label + "-effective.rut")).write_text(rut_config.read_text())
         try:
             if engine == "baseline-uring":
@@ -445,6 +484,7 @@ def main():
             config.write_text(saved)
             rut_config.write_text(saved_rut_config)
             frontend_live = False
+            active_engine = None
             active_backend = active_output = None
             active_rut = None
 
