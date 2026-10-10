@@ -411,6 +411,107 @@ TEST(websocket, iouring_sync_send_reserves_suffix_before_direct_write) {
     conn->pending_ops = 0;
     loop.close_conn(*conn);
 }
+
+// Exercise the production tunnel callbacks in both directions. A small send
+// buffer makes the first synchronous write short; the callback must then keep
+// the complete source buffer alive until the async suffix completes.
+static void sync_callback_short_write(test::TestCase* _tc, bool client_to_upstream, bool sq_full) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_ws_sync_send = true;
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    int filler[2];
+    REQUIRE_EQ(test::stream_socketpair(filler), 0);
+    const Peer kClient{downstream[1]}, kOrigin{upstream[1]};
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = downstream[0];
+    conn->upstream_fd = upstream[0];
+    REQUIRE(set_nonblocking(conn->fd));
+    REQUIRE(set_nonblocking(conn->upstream_fd));
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->protocol = ConnProtocol::Http11;
+    conn->state = ConnState::Sending;
+    conn->upstream_episode = 1;
+    conn->is_ws_tunnel = true;
+    conn->set_slots(&on_ws_client_recv<IoUringEventLoop>,
+                    &on_ws_upstream_to_client_sent<IoUringEventLoop>,
+                    &on_ws_upstream_recv<IoUringEventLoop>,
+                    &on_ws_client_to_upstream_sent<IoUringEventLoop>);
+
+    constexpr u32 kLength = SlicePool::kSliceSize;
+    u8 expected[kLength], received[kLength];
+    for (u32 i = 0; i < kLength; ++i) expected[i] = static_cast<u8>(i * 31u + 7u);
+    auto& buffer = client_to_upstream ? conn->recv_buf : conn->upstream_recv_buf;
+    __builtin_memcpy(buffer.write_ptr(), expected, kLength);
+    buffer.commit(kLength);
+    int small = 4096;
+    const i32 target = client_to_upstream ? conn->upstream_fd : conn->fd;
+    const i32 peer = client_to_upstream ? kOrigin.fd : kClient.fd;
+    REQUIRE_EQ(setsockopt(target, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small)), 0);
+    REQUIRE_EQ(setsockopt(peer, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)), 0);
+
+    if (sq_full) {
+        u32 guard = 0;
+        while (loop.backend.sq_has_room() && guard++ < 4u * loop.backend.sq_ring_entries)
+            (void)loop.backend.add_recv(filler[0], loop.connection_capacity - 1u);
+        REQUIRE_FALSE(loop.backend.sq_has_room());
+    }
+
+    const bool queued = client_to_upstream ? ws_try_send_client_to_upstream(&loop, *conn)
+                                           : ws_try_send_upstream_to_client(&loop, *conn);
+    REQUIRE(queued);
+    CHECK(client_to_upstream ? conn->ws_client_send_pending : conn->ws_upstream_send_pending);
+    CHECK(client_to_upstream ? conn->upstream_send_armed : conn->send_armed);
+    if (sq_full) {
+        CHECK_EQ(loop.study_ws_sync_attempts, 0u);
+        CHECK_EQ(loop.study_ws_sync_bytes, 0u);
+    } else {
+        CHECK(loop.study_ws_sync_partial > 0);
+    }
+    CHECK_EQ(buffer.len(), kLength);  // Original bytes stay owned through the suffix send.
+
+    u32 received_len = 0;
+    const u64 deadline = monotonic_ns() + 4ull * 1000 * 1000 * 1000;
+    while (received_len < kLength && monotonic_ns() < deadline) {
+        REQUIRE(read_available(peer, received, &received_len, kLength));
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        REQUIRE_EQ(loop.backend.failure_code(), 0);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(received_len, kLength);
+    CHECK(__builtin_memcmp(received, expected, kLength) == 0);
+    CHECK_EQ(buffer.len(), 0u);
+    loop.close_conn(*conn);
+    for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(conn->pending_ops, 0u);
+}
+
+TEST(websocket, iouring_sync_callback_short_write_client_to_upstream) {
+    sync_callback_short_write(_tc, true, false);
+}
+TEST(websocket, iouring_sync_callback_short_write_upstream_to_client) {
+    sync_callback_short_write(_tc, false, false);
+}
+TEST(websocket, iouring_sync_callback_full_sq_fallback_client_to_upstream) {
+    sync_callback_short_write(_tc, true, true);
+}
+TEST(websocket, iouring_sync_callback_full_sq_fallback_upstream_to_client) {
+    sync_callback_short_write(_tc, false, true);
+}
+
 TEST(websocket, iouring_sync_send_close_with_async_suffix_owned) {
     full_duplex_burst(_tc,
                       false,
