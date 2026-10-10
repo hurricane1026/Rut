@@ -52,7 +52,6 @@ struct UpstreamPool {
     std::atomic<u32> idle_count{0};
     void* idle_close_ctx = nullptr;
     void (*before_idle_close)(void*, i32) = nullptr;
-    bool (*idle_reuse_probe_required)(void*, i32, u32) = nullptr;
 
     void close_idle_fd(i32 fd) {
         if (before_idle_close != nullptr) before_idle_close(idle_close_ctx, fd);
@@ -134,11 +133,6 @@ struct UpstreamPool {
                 continue;
             }
             const i32 fd = c.fd;
-            // The callback remains responsible for watcher-side ownership fencing
-            // and stale-event invalidation. It cannot suppress this probe: bytes
-            // may arrive after the last harvested event and before take_idle().
-            (void)(idle_reuse_probe_required == nullptr ||
-                   idle_reuse_probe_required(idle_close_ctx, fd, i));
             release_slot(i);
             char probe;
             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);

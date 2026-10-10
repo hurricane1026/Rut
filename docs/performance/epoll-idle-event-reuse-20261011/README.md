@@ -4,7 +4,7 @@ Branch `perf/epoll-full-et`, isolated worktree `/tmp/rut-ws-pr-20261010`; no com
 
 ## Policy
 
-Keep an idle read watch and eagerly reject known-stale idle sockets. Readiness callbacks and pool return/cleanup paths use the existing context hook to invalidate the exact descriptor/slot before it can be borrowed. Every borrow still performs the nonblocking `MSG_PEEK` liveness/surplus probe: a readiness event not yet harvested cannot prove that no bytes arrived after parking. The probe can reject data, EOF, and hard errors before reuse; a residual probe-versus-send race remains. No heap allocation or Connection fields are added; the pool adds one hook pointer per shard.
+Keep an idle read watch and eagerly reject known-stale idle sockets. Readiness handling discards the exact pool slot, whose existing pre-close hook unregisters the descriptor before closing it. Every borrow still performs the nonblocking `MSG_PEEK` liveness/surplus probe: a readiness event not yet harvested cannot prove that no bytes arrived after parking. The probe can reject data, EOF, and hard errors before reuse; a residual probe-versus-send race remains. No heap allocation or Connection fields are added.
 
 Return-to-pool checks retained ET readiness and harvested active events before retirement of their owner version. Known readiness triggers MSG_PEEK once after the pool owns the descriptor: EAGAIN retains it, data/EOF/hard error discards it. Idle event callbacks retain their existing conditional MSG_PEEK. Borrowed sockets still establish a fresh owner/version and episode, preserving stale-event fences. FD close invalidates the watch before release; reload/sweep continue through the pool close hook.
 
