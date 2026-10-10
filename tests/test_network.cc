@@ -41737,6 +41737,40 @@ TEST(iouring_cache_rearm, upstream_budget_one_round_robins_pending_owners) {
     first.cleanup();
     second.cleanup();
 }
+
+TEST(iouring_cache_rearm, budget_one_alternates_repending_upstream_and_downstream) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture upstream;
+    OneShotRecvFixture downstream;
+    REQUIRE(upstream.stage(guard.loop, /*plaintext=*/true));
+    REQUIRE(downstream.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    upstream.conn->is_ws_tunnel = downstream.conn->is_ws_tunnel = true;
+    REQUIRE(loop.submit_recv(*upstream.conn));
+    REQUIRE(loop.submit_recv(*downstream.conn));
+    upstream.conn->upstream_recv_pause_rearm_pending = true;
+    upstream.conn->upstream_recv_armed = false;
+    loop.test_defer_recv_rearm(*downstream.conn);
+    downstream.conn->recv_armed = false;
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK(upstream.conn->upstream_recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+
+    // Upstream remains eligible every turn, but the persistent direction
+    // cursor gives downstream the next single available buffer.
+    upstream.conn->upstream_recv_armed = false;
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 2u);
+    CHECK(downstream.conn->recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    upstream.cleanup();
+    downstream.cleanup();
+}
 #endif  // RUT_ENABLE_WEBSOCKET
 
 namespace {

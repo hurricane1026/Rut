@@ -470,6 +470,7 @@ public:
     u32 recv_rearm_slot_cursor = 0;
     u32 ws_cache_rearm_cursor = 0;  // connection where the upstream pass resumes
     u32 ws_cache_rearm_budget = 0;
+    bool ws_cache_rearm_upstream_turn = true;
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
         CompleteBody,
@@ -597,6 +598,8 @@ public:
         recv_rearm_count = 0;
         recv_rearm_cursor = 0;
         ws_cache_rearm_cursor = 0;
+        recv_rearm_slot_cursor = 0;
+        ws_cache_rearm_upstream_turn = true;
         // conns[] is mapped but neither constructed nor reset (lazy pages);
         // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
         // the stack so pops ascend.
@@ -775,8 +778,7 @@ public:
             if (backend.ws_recv_cache_enabled) {
                 ws_cache_rearm_budget = cache_rearm_budget(backend.cq_unharvested());
             }
-            rearm_deferred_ws_cache_recvs();
-            rearm_deferred_recvs(/*force=*/false);
+            rearm_deferred_cache_passes(/*force=*/false);
             retry_deferred_accepts();
             poll_command();
             // Re-arm timers after a possible hot reload (see EpollEventLoop::run).
@@ -3542,6 +3544,17 @@ public:
                 if (budget == 0) return;
             }
         }
+    }
+
+    void rearm_deferred_cache_passes(bool force) {
+        if (ws_cache_rearm_upstream_turn) {
+            rearm_deferred_ws_cache_recvs();
+            rearm_deferred_recvs(force);
+        } else {
+            rearm_deferred_recvs(force);
+            rearm_deferred_ws_cache_recvs();
+        }
+        ws_cache_rearm_upstream_turn = !ws_cache_rearm_upstream_turn;
     }
 
     u32 cache_rearm_budget(u32 pinned) const {
@@ -7352,8 +7365,7 @@ public:
     void test_defer_recv_rearm(const Connection& c) { defer_recv_rearm(c); }
     void test_rearm_cache_passes_with_budget(u32 budget) {
         ws_cache_rearm_budget = budget;
-        rearm_deferred_ws_cache_recvs();
-        rearm_deferred_recvs(false);
+        rearm_deferred_cache_passes(false);
     }
     bool test_use_one_shot_websocket_recv(const Connection& c) const {
         return use_one_shot_websocket_recv(c);
