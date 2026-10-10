@@ -20,6 +20,43 @@ import urllib.request
 DEFAULT_SCENARIOS = ("static-close", "static-keepalive", "proxy-close", "proxy-keepalive")
 
 
+def api_origin_command(source, port, cpus, payload, delay_ms, fragment_bytes, fragment_delay_ms):
+    return [sys.executable, str(source.with_name("api_origin.py")), "--port", str(port),
+            "--cpus", cpus, "--payload", str(payload), "--delay-ms", str(delay_ms),
+            "--fragment-bytes", str(fragment_bytes),
+            "--fragment-delay-ms", str(fragment_delay_ms)]
+
+
+def wait_for_api_origin_ready(log, process, workers):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("API origin exited before readiness")
+        ready_workers = sum(line.startswith("API_READY ") for line in log.read_text().splitlines())
+        if ready_workers >= workers:
+            return
+        time.sleep(.05)
+    raise RuntimeError("API origin readiness timeout")
+
+
+def direct_origin_port(args):
+    return args.origin_port
+
+
+def module_valid_origin_reuse(records, expected_markers):
+    if not records or [row[0] for row in records] != list(expected_markers):
+        return False
+    return all(row[1] == records[0][1] and row[2] == records[0][2] + index
+               for index, row in enumerate(records))
+
+
+def valid_api_origin_records(records, expected_markers, fresh_downstream):
+    if fresh_downstream:
+        return (len(records) == len(expected_markers)
+                and [row[0] for row in records] == list(expected_markers))
+    return module_valid_origin_reuse(records, expected_markers)
+
+
 def distinct_url_scenarios(remaining):
     """Return the scenarios requested in the delegated run.py arguments."""
     for index, argument in enumerate(remaining):
@@ -39,6 +76,11 @@ def validate_distinct_url_scenarios(scenarios, enabled):
     if enabled and any(scenario.startswith("static-") for scenario in scenarios):
         raise ValueError("--mixed-distinct-urls requires proxy-only scenarios; "
                          "pass --scenarios proxy-close proxy-keepalive")
+
+
+def validate_mixed_small_rate_scenarios(scenarios, enabled):
+    if enabled and any(scenario.endswith("-close") for scenario in scenarios):
+        raise ValueError("--mixed-small-rate requires keepalive scenarios; paced small probe does not support close")
 
 
 def mixed_cpu_masks(value):
@@ -118,6 +160,10 @@ def main():
     parser.add_argument("--origin-multi-accept", choices=("on", "off"), default="on")
     parser.add_argument("--origin-reuseport", choices=("on", "off"), default="off")
     parser.add_argument("--origin-pin-workers", action="store_true")
+    parser.add_argument("--origin-mode", choices=("native", "api"), default="native")
+    parser.add_argument("--api-delay-ms", type=float, default=0)
+    parser.add_argument("--api-fragment-bytes", type=int, default=0)
+    parser.add_argument("--api-fragment-delay-ms", type=float, default=0)
     parser.add_argument("--mixed-small-bytes", type=int, default=0)
     parser.add_argument("--small-connections", type=int, default=32)
     parser.add_argument("--mixed-small-rate", type=int, default=0,
@@ -133,13 +179,15 @@ def main():
     if not any(arg == "--origin-cpu" or arg.startswith("--origin-cpu=") for arg in remaining):
         remaining += ["--origin-cpu", options.origin_cpus.split(",")[0]]
     engines = options.engines.split(",")
-    if not engines or any(e not in ("uring", "baseline-uring", "epoll", "nginx") for e in engines):
-        parser.error("--engines must contain uring, baseline-uring, epoll or nginx")
+    if not engines or any(e not in ("uring", "baseline-uring", "epoll", "nginx", "direct-origin") for e in engines):
+        parser.error("--engines must contain uring, baseline-uring, epoll, nginx or direct-origin")
     if "baseline-uring" in engines and options.baseline_rut is None:
         parser.error("baseline-uring requires --baseline-rut and its matching rut-compile")
     if options.origin_workers < 1 or options.nginx_buffer_kib < 16 or options.nginx_small_buffer_kib < 16:
         parser.error("origin workers must be positive; nginx buffers must be at least 16KiB")
-    if options.mixed_small_bytes < 0 or options.small_connections < 1 or options.mixed_small_rate < 0:
+    if (options.mixed_small_bytes < 0 or options.small_connections < 1
+            or options.mixed_small_rate < 0 or options.api_delay_ms < 0
+            or options.api_fragment_bytes < 0 or options.api_fragment_delay_ms < 0):
         parser.error("invalid mixed workload size or connection count")
     try:
         mixed_masks = mixed_cpu_masks(options.mixed_client_cpus)
@@ -150,7 +198,9 @@ def main():
     if options.mixed_distinct_urls and not options.mixed_small_bytes:
         parser.error("--mixed-distinct-urls requires --mixed-small-bytes")
     try:
-        validate_distinct_url_scenarios(distinct_url_scenarios(remaining), options.mixed_distinct_urls)
+        scenarios = distinct_url_scenarios(remaining)
+        validate_distinct_url_scenarios(scenarios, options.mixed_distinct_urls)
+        validate_mixed_small_rate_scenarios(scenarios, bool(options.mixed_small_rate))
     except ValueError as error:
         parser.error(str(error))
     source = Path(__file__).with_name("run.py")
@@ -198,6 +248,25 @@ def main():
             if options.mixed_small_bytes and self.tls_context:
                 raise ValueError("mixed-size preflight currently supports plaintext HTTP only")
             cpu = options.origin_cpus
+            if options.origin_mode == "api":
+                payload = self.out / "api-payload.bin"
+                payload.write_bytes(module.expected_body("proxy", getattr(self.args, "body_size", None), True))
+                argv = api_origin_command(source, port, options.origin_cpus, payload,
+                                          options.api_delay_ms, options.api_fragment_bytes,
+                                          options.api_fragment_delay_ms)
+                origin_log = self.out / "api-origin.log"
+                log_handle = origin_log.open("w+")
+                child = subprocess.Popen(argv, stdout=log_handle, stderr=subprocess.STDOUT)
+                self.origin_pid = child.pid
+                try:
+                    wait_for_api_origin_ready(origin_log, child, len(options.origin_cpus.split(",")))
+                    yield child.pid
+                finally:
+                    if child.poll() is None:
+                        child.terminate()
+                    child.wait(timeout=5)
+                    log_handle.close()
+                return
             path = self.out / config
             text = origin_worker_config(path.read_text(), options.origin_workers, options.origin_cpus,
                                         options.origin_multi_accept, port,
@@ -238,9 +307,23 @@ def main():
                 else:
                     raise RuntimeError(f"origin worker affinity mismatch: {workers}")
                 (self.out / "origin-worker-affinity.json").write_text(json.dumps(workers, indent=2) + "\n")
+            if name == "origin":
+                self.origin_pid = pid
             yield pid
 
     module.Harness.nginx = origin
+    original_verify_origin_reuse = module.Harness.verify_origin_reuse
+
+    def verify_api_origin_reuse(self, expected_markers, fresh_downstream=False):
+        if options.origin_mode != "api":
+            return original_verify_origin_reuse(self, expected_markers, fresh_downstream)
+        logs = (self.out / "api-origin.log").read_text()
+        (self.out / f"{self.active_label}-origin-reuse.log").write_text(logs)
+        records = module.origin_reuse_records(logs, expected_markers)
+        if not valid_api_origin_records(records, expected_markers, fresh_downstream):
+            raise ValueError("API origin reuse evidence did not match expected markers")
+
+    module.Harness.verify_origin_reuse = verify_api_origin_reuse
     frontend = module.Harness.frontend
     original_popen = subprocess.Popen
     active_backend = None
@@ -264,6 +347,16 @@ def main():
         if frontend_live:
             raise RuntimeError("frontends must run serially")
         frontend_live = True
+        if engine == "direct-origin":
+            saved_port = self.args.front_port
+            self.active_label = label
+            self.args.front_port = direct_origin_port(self.args)
+            try:
+                yield self.origin_pid
+            finally:
+                self.args.front_port = saved_port
+                frontend_live = False
+            return
         active_backend = "epoll" if engine == "epoll" else "io_uring"
         active_output = self.out
         saved_rut = self.args.rut
