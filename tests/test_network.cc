@@ -41687,9 +41687,7 @@ TEST(iouring_cache_rearm, shared_budget_keeps_downstream_pending) {
     conn.is_ws_tunnel = true;
     REQUIRE(loop.submit_recv(conn));
     REQUIRE(loop.submit_recv_upstream(conn));
-    IoEvent downstream{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv};
-    downstream.provided_ring_empty = 1;
-    loop.dispatch(downstream);
+    loop.test_defer_recv_rearm(conn);
     conn.upstream_recv_pause_rearm_pending = true;
     const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
     loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;

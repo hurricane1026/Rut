@@ -7359,6 +7359,7 @@ public:
         rearm_deferred_recvs(false);
     }
     u32 test_recv_rearm_count() const { return recv_rearm_count; }
+    void test_defer_recv_rearm(const Connection& c) { defer_recv_rearm(c); }
     void test_rearm_cache_passes_with_budget(u32 budget) {
         ws_cache_rearm_budget = budget;
         rearm_deferred_ws_cache_recvs();
