@@ -144,6 +144,10 @@ struct IoUringBackend {
 
     // Pending SQE count (for submission)
     u32 pending = 0;
+    bool study_io_stats = false;
+    u64 study_wait_calls = 0, study_wait_enter_calls = 0;
+    u64 study_wait_submitted = 0, study_wait_events = 0, study_wait_empty = 0;
+    u32 study_wait_max_events = 0;
 
     // Sticky fatal error from io_uring_enter. A zero-event wait is otherwise a
     // legitimate result, so the event loop/control plane must inspect this
@@ -232,6 +236,33 @@ struct IoUringBackend {
     // No user buffer needed — kernel picks from provided ring.
     // Returns false if SQ is full (no SQE submitted).
     bool add_recv(i32 fd, u32 conn_id);
+    // Experimental bounded provided-buffer cache for transparent byte tunnels.
+    struct WsRecvCacheNode {
+        IoEvent event{};
+        u32 next = 0xffffffffu;
+        bool queued = false;
+    };
+    struct WsRecvCacheOwner {
+        u32 queued = 0;
+        u32 scan_generation = 0;
+    };
+    MappedArray<WsRecvCacheNode> ws_recv_cache_nodes;
+    MappedArray<WsRecvCacheOwner> ws_recv_cache_owners;
+    bool ws_recv_cache_enabled = false;
+    u32 ws_recv_cache_head = 0xffffffffu;
+    u32 ws_recv_cache_tail = 0xffffffffu;
+    u32 ws_recv_cache_generation = 0;
+    u64 ws_recv_cache_deferred = 0;
+    u64 ws_recv_cache_peak = 0;
+    u32 ws_recv_cache_count = 0;
+    bool enable_ws_recv_cache();
+    bool has_ws_recv_cache(u32 conn_id) const;
+    bool cache_ws_recv(Connection& conn, u16 buffer_id, const IoEvent& event);
+    u32 drain_ws_recv_cache(IoEvent* events, u32 maximum, Connection* conns, u32 max_conns);
+    // Bounded one-shot selected-buffer receive for backpressured byte tunnels.
+    // poll_first arms readiness before the initial transfer attempt; completion
+    // identity, bounded size and cancellation ownership stay unchanged.
+    bool add_recv_once(i32 fd, u32 conn_id, u32 max_len, bool poll_first = false);
 
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.
@@ -245,7 +276,8 @@ struct IoUringBackend {
     bool add_recv_upstream_once(i32 fd,
                                 u32 conn_id,
                                 u32 upstream_episode = 1,
-                                u32 max_len = kProvidedBufSize);
+                                u32 max_len = kProvidedBufSize,
+                                bool poll_first = false);
     // Direct one-shot recv: IORING_OP_RECV straight into a caller-owned
     // buffer region (sqe->addr/len), with no IOSQE_BUFFER_SELECT and no
     // provided-buffer ring involved — the kernel writes the bytes exactly
@@ -269,8 +301,20 @@ struct IoUringBackend {
     // every intermediate arrival, so an origin that trickles steadily (each
     // gap under the timeout) but fills `len` more slowly than the timeout
     // would be expired as idle.
-    bool add_recv_upstream_direct(i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len);
-    bool add_relay_poll(i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode);
+    bool add_recv_upstream_direct(
+        i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len, bool poll_first = false);
+    bool cancel_ws_splice_poll(
+        u64 target, u32 conn_id, IoEventType type, u8 auxiliary, u32 episode) {
+        if ((auxiliary != 96 && auxiliary != 97) ||
+            (type != IoEventType::RelayRead && type != IoEventType::RelayWrite))
+            return false;
+        if (target !=
+            encode_upstream_user_data(conn_id, type, episode, static_cast<u8>(auxiliary - 64)))
+            return false;
+        return cancel_by_user_data(target, conn_id, type, auxiliary, episode);
+    }
+    bool add_relay_poll(
+        i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode, u8 auxiliary = 0);
     // Dedicated single submission point for the bounded explicit
     // first-response deadline.  It intentionally does not inherit the ordinary
     // recv path's idempotent/deferred-rearm semantics.

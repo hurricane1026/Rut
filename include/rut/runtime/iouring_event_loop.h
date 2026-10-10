@@ -27,6 +27,7 @@
 #include "rut/runtime/tls_iouring.h"
 #include "rut/runtime/upstream_concurrency.h"
 #include "rut/runtime/upstream_pool.h"
+#include "rut/runtime/ws_splice_experiment.h"
 #include <atomic>
 
 #include <errno.h>
@@ -34,6 +35,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -267,6 +269,10 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // Shared fairness budget for synchronous relay progress within one wait turn.
     static constexpr u32 kRelayTurnMaxCalls = 16;
     static constexpr u32 kRelayTurnMaxBytes = 1024 * 1024;
+    u32 study_event_batch_limit = kMaxEventsPerWait;
+    u32 study_relay_chunk_size = kResponseSpliceChunkSize;
+    u32 study_relay_turn_call_limit = kRelayTurnMaxCalls;
+    u32 study_relay_turn_byte_limit = kRelayTurnMaxBytes;
     u32 relay_budget_calls = kRelayTurnMaxCalls;
     u32 relay_budget_bytes = kRelayTurnMaxBytes;
     u32 relay_cancel_retry_count = 0;
@@ -275,6 +281,18 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     u32 deferred_relay_read_ids[kDeferredRelayReadLimit]{};
     u32 deferred_relay_read_episodes[kDeferredRelayReadLimit]{};
     // Read-only diagnostics for focused validation and post-run evidence.
+    WsSpliceExperiment ws_splice;
+    // Conservative negative cache: only the terminal-pending publisher can
+    // introduce an owner. Normal/mixed batches still scan unconditionally.
+    bool response_read_terminal_scan_needed = true;
+    bool study_ws_poll_first = false;
+    u64 study_ws_poll_first_arms = 0;
+    u32 study_ws_direct_recv_limit = 0;
+    u64 study_ws_direct_recv_arms = 0;
+    bool study_ws_sync_send = false;
+    u64 study_ws_sync_attempts = 0, study_ws_sync_full = 0, study_ws_sync_partial = 0;
+    u64 study_ws_sync_blocked = 0, study_ws_sync_errors = 0, study_ws_sync_bytes = 0;
+    u64 study_ws_sync_cached = 0;
     u64 relay_admissions = 0;
     u64 relay_pulled_bytes = 0;
     u64 relay_written_bytes = 0;
@@ -718,6 +736,9 @@ public:
     }
 
     void run() {
+        struct rusage study_usage_begin{};
+        const bool kStudyUsageValid =
+            backend.study_io_stats && ::getrusage(RUSAGE_THREAD, &study_usage_begin) == 0;
         rearm_accept();
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
@@ -731,8 +752,9 @@ public:
         while (is_running()) {
             retry_strict_upstream_retirement_cancels();
             retry_response_splice_cancels();
+            ws_splice.progress(*this);
             const u32 kEventCount = backend.wait(events,
-                                                 kMaxEventsPerWait,
+                                                 study_event_batch_limit,
                                                  conns,
                                                  slots_initialized,
                                                  deferred_relay_read_count == 0);
@@ -743,8 +765,8 @@ public:
                 running_.store(false, std::memory_order_release);
                 break;
             }
-            relay_budget_calls = kRelayTurnMaxCalls;
-            relay_budget_bytes = kRelayTurnMaxBytes;
+            relay_budget_calls = study_relay_turn_call_limit;
+            relay_budget_bytes = study_relay_turn_byte_limit;
             dispatch_batch(events, kEventCount);
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
@@ -771,6 +793,14 @@ public:
                     running_.store(false, std::memory_order_relaxed);
                 }
             }
+        }
+        if (kStudyUsageValid) {
+            struct rusage usage{};
+            if (::getrusage(RUSAGE_THREAD, &usage) == 0)
+                ::fprintf(stderr,
+                          "RUT_WS_THREAD voluntary=%ld involuntary=%ld\n",
+                          usage.ru_nvcsw - study_usage_begin.ru_nvcsw,
+                          usage.ru_nivcsw - study_usage_begin.ru_nivcsw);
         }
     }
 
@@ -860,7 +890,63 @@ public:
             ::close(idle_trim_pidfd);
             idle_trim_pidfd = -1;
         }
+        if (backend.ws_recv_cache_enabled)
+            ::fprintf(stderr,
+                      "RUT_WS_CACHE deferred=%llu peak=%llu live=%u\n",
+                      static_cast<unsigned long long>(backend.ws_recv_cache_deferred),
+                      static_cast<unsigned long long>(backend.ws_recv_cache_peak),
+                      backend.ws_recv_cache_count);
         backend.shutdown();
+        if (ws_splice.enabled)
+            ::fprintf(stderr,
+                      "RUT_WS_SPLICE admissions=%llu client_bytes=%llu upstream_bytes=%llu "
+                      "calls=%llu polls=%llu read_eagain=%llu write_eagain=%llu "
+                      "pipe_grow_failures=%llu min_pipe_capacity=%u\n",
+                      static_cast<unsigned long long>(ws_splice.admissions),
+                      static_cast<unsigned long long>(ws_splice.transferred[0]),
+                      static_cast<unsigned long long>(ws_splice.transferred[1]),
+                      static_cast<unsigned long long>(ws_splice.calls),
+                      static_cast<unsigned long long>(ws_splice.polls),
+                      static_cast<unsigned long long>(ws_splice.eagain[0]),
+                      static_cast<unsigned long long>(ws_splice.eagain[1]),
+                      static_cast<unsigned long long>(ws_splice.pipe_grow_failures),
+                      ws_splice.minimum_pipe_capacity);
+        if (study_ws_poll_first)
+            ::fprintf(stderr,
+                      "RUT_WS_POLL_FIRST arms=%llu\n",
+                      static_cast<unsigned long long>(study_ws_poll_first_arms));
+        if (study_ws_direct_recv_limit != 0)
+            ::fprintf(stderr,
+                      "RUT_WS_DIRECT arms=%llu limit=%u\n",
+                      static_cast<unsigned long long>(study_ws_direct_recv_arms),
+                      study_ws_direct_recv_limit);
+        if (study_ws_sync_send)
+            ::fprintf(stderr,
+                      "RUT_WS_SYNC attempts=%llu full=%llu partial=%llu blocked=%llu "
+                      "errors=%llu bytes=%llu cached=%llu\n",
+                      static_cast<unsigned long long>(study_ws_sync_attempts),
+                      static_cast<unsigned long long>(study_ws_sync_full),
+                      static_cast<unsigned long long>(study_ws_sync_partial),
+                      static_cast<unsigned long long>(study_ws_sync_blocked),
+                      static_cast<unsigned long long>(study_ws_sync_errors),
+                      static_cast<unsigned long long>(study_ws_sync_bytes),
+                      static_cast<unsigned long long>(study_ws_sync_cached));
+        if (backend.study_io_stats)
+            ::fprintf(stderr,
+                      "RUT_IO_WAIT calls=%llu enters=%llu submitted=%llu events=%llu "
+                      "empty=%llu max_events=%u\n",
+                      static_cast<unsigned long long>(backend.study_wait_calls),
+                      static_cast<unsigned long long>(backend.study_wait_enter_calls),
+                      static_cast<unsigned long long>(backend.study_wait_submitted),
+                      static_cast<unsigned long long>(backend.study_wait_events),
+                      static_cast<unsigned long long>(backend.study_wait_empty),
+                      backend.study_wait_max_events);
+        if (ws_splice.enabled)
+            ::fprintf(stderr,
+                      "RUT_WS_NODELAY changes=%llu failures=%llu\n",
+                      static_cast<unsigned long long>(ws_splice.nodelay_changes),
+                      static_cast<unsigned long long>(ws_splice.nodelay_failures));
+        ws_splice.shutdown();
         // No further CQE can retire relay polls after the backend has stopped.
         // Close every connection-owned pipe explicitly before destroying the
         // mmap-backed slots; integer pipe descriptors are not owned by reset().
@@ -3436,7 +3522,77 @@ public:
         }
     }
 
+    // Tunnel callbacks consume one contiguous block while its paired send
+    // owns that memory. A terminal bounded recv prevents a multishot burst
+    // from filling the same buffer before dispatch can apply backpressure.
+    bool use_one_shot_websocket_recv(const Connection& c) const {
+        if (backend.ws_recv_cache_enabled) return false;
+        return c.is_ws_tunnel && !c.tls_active && c.protocol == ConnProtocol::Http11 && c.fd >= 0 &&
+               c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode);
+    }
+
+    // Terminal one-shot reads and bounded-cache multishot reads can lend this
+    // connection buffer to an immediate send. Multishot writes only into
+    // selected kernel buffers; wait() retains later blocks while a send owns
+    // the connection buffer, so an armed cached receive cannot overwrite it.
+    // A positive short write leaves the entire source buffer intact; the caller
+    // submits the unsent suffix through the original send ledger and consumes
+    // the full source only when that suffix completes.
+    bool try_ws_sync_send(Connection& c, bool upstream, const u8* source, u32 length, i32* sent) {
+        if (!study_ws_sync_send || ws_splice.enabled) return false;
+        const bool kCached = ws_recv_cache_active(c) && c.protocol == ConnProtocol::Http11 &&
+                             c.fd >= 0 && c.upstream_fd >= 0 &&
+                             valid_upstream_episode(c.upstream_episode);
+        if ((!use_one_shot_websocket_recv(c) && !kCached) || c.is_ws_terminate ||
+            c.is_ws_terminate_route || c.ws_closing || c.ws_client_eof || c.ws_upstream_eof ||
+            c.throttle_down_bps != 0 || c.response_policy_id != 0 ||
+            (upstream ? c.upstream_send_armed : c.send_armed) || c.recv_pause_cancel_pending ||
+            c.recv_pause_target_inflight || c.upstream_recv_pause_cancel_pending ||
+            c.upstream_recv_cancel_inflight || length == 0)
+            return false;
+        auto& buffer = upstream ? c.recv_buf : c.upstream_recv_buf;
+        if (source != buffer.data() || length != buffer.len() ||
+            (!kCached && (upstream ? c.recv_armed : c.upstream_recv_armed)))
+            return false;
+        ++study_ws_sync_attempts;
+        if (kCached) ++study_ws_sync_cached;
+        const bool kSampled = backend.study_io_stats && (++study_splice_calls[1] & 63u) == 0;
+        const u64 kStarted = kSampled ? monotonic_ns() : 0;
+        ssize_t n;
+        do {
+            n = ::send(
+                upstream ? c.upstream_fd : c.fd, source, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+        } while (n < 0 && errno == EINTR);
+        const int kSavedErrno = errno;
+        if (kSampled) study_record_syscall(1, monotonic_ns() - kStarted);
+        errno = kSavedErrno;
+        if (n < 0) {
+            if (kSavedErrno == EAGAIN || kSavedErrno == EWOULDBLOCK) {
+                ++study_ws_sync_blocked;
+                *sent = 0;
+            } else {
+                ++study_ws_sync_errors;
+                *sent = -kSavedErrno;
+            }
+        } else {
+            *sent = static_cast<i32>(n);
+            study_ws_sync_bytes += static_cast<u32>(n);
+            if (static_cast<u32>(n) == length)
+                ++study_ws_sync_full;
+            else
+                ++study_ws_sync_partial;
+        }
+        return true;
+    }
+
+    bool ws_recv_cache_active(const Connection& c) const {
+        return backend.ws_recv_cache_enabled && c.is_ws_tunnel && !c.is_ws_terminate &&
+               !c.tls_active;
+    }
+    bool ws_has_cached_input(const Connection& c) const { return backend.has_ws_recv_cache(c.id); }
+
     bool submit_recv_impl(Connection& c) {
+        if (ws_splice.intercept_recv(*this, c)) return true;
         const bool tls_send_needs_recv =
             c.uses_iouring_tls() && c.tls_pending_on_recv == &tls_resume_pending_send_recv<Self>;
         if (tls_send_needs_recv) c.recv_paused_for_send = false;
@@ -3452,7 +3608,21 @@ public:
             if (c.recv_pause_cancel_pending) c.recv_pause_rearm_pending = true;
             return true;
         }
-        if (backend.add_recv(c.fd, c.id)) {
+        bool submitted = false;
+        if (use_one_shot_websocket_recv(c)) {
+            const u32 kAvailable = c.recv_buf.write_avail();
+            const u32 kMaximum = kProvidedBufSize;
+            submitted = backend.add_recv_once(
+                c.fd,
+                c.id,
+                kAvailable < kMaximum ? kAvailable : kMaximum,
+                study_ws_poll_first && !c.is_ws_terminate && !c.is_ws_terminate_route);
+            if (submitted && study_ws_poll_first && !c.is_ws_terminate && !c.is_ws_terminate_route)
+                ++study_ws_poll_first_arms;
+        } else {
+            submitted = backend.add_recv(c.fd, c.id);
+        }
+        if (submitted) {
             c.pending_ops++;
             c.recv_armed = true;
             c.recv_pause_rearm_pending = false;
@@ -4069,7 +4239,7 @@ public:
             // Keep the first half of the turn for bounded relay progress, but
             // do not spend the larger quantum behind newly posted completions.
             // An idle CQ can still use all eight FIFO segments.
-            if (relay_budget_calls <= 8 && study_yield_enabled) {
+            if (relay_budget_calls <= study_relay_turn_call_limit / 2 && study_yield_enabled) {
                 if (has_ordinary_cq_work()) {
                     const u64 now = monotonic_ns();
                     if (ordinary_since_ns == 0) ordinary_since_ns = now;
@@ -4185,8 +4355,8 @@ public:
             // F_SETPIPE_SZ returns the actual capacity. The pipe is still
             // private here, so a second F_GETPIPE_SZ only adds a syscall to
             // every new relay connection.
-            int capacity = ::fcntl(fds[1], F_SETPIPE_SZ, kResponseSpliceChunkSize);
-            if (capacity < 64 * 1024 && kResponseSpliceChunkSize > 64 * 1024)
+            int capacity = ::fcntl(fds[1], F_SETPIPE_SZ, study_relay_chunk_size);
+            if (capacity < 64 * 1024 && study_relay_chunk_size > 64 * 1024)
                 capacity = ::fcntl(fds[1], F_SETPIPE_SZ, 64 * 1024);
             if (capacity < 64 * 1024) {
                 ::close(fds[0]);
@@ -4262,7 +4432,7 @@ public:
             }
             --relay_budget_calls;
             const u32 want =
-                std::min<u32>(std::min<u32>(c.resp_body_remaining, kResponseSpliceChunkSize),
+                std::min<u32>(std::min<u32>(c.resp_body_remaining, study_relay_chunk_size),
                               relay_budget_bytes / 2);
             if (study_inside_cq) ++study_cq_splice_calls;
             const bool sampled = (++study_splice_calls[0] & 63u) == 0;
@@ -4475,6 +4645,7 @@ public:
     }
 
     bool submit_recv_upstream_impl(Connection& c) {
+        if (ws_splice.intercept_recv(*this, c)) return true;
         if (c.upstream_recv_paused_for_send) {
             c.upstream_recv_pause_rearm_pending = true;
             return true;
@@ -4500,32 +4671,43 @@ public:
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
-        const bool one_shot = use_one_shot_upstream_recv(c);
+        const bool kPollFirst = study_ws_poll_first && use_one_shot_websocket_recv(c) &&
+                                !c.is_ws_terminate && !c.is_ws_terminate_route;
+        const bool kOneShot = use_one_shot_websocket_recv(c) || use_one_shot_upstream_recv(c);
         bool submitted = false;
         bool direct = false;
-        if (one_shot) {
+        if (kOneShot) {
             const u32 available = c.upstream_recv_buf.write_avail();
             if (available == 0) return false;
-            if (pool.is_bulk(c.upstream_recv_slice)) {
+            const bool kDirectWs = study_ws_direct_recv_limit != 0 &&
+                                   use_one_shot_websocket_recv(c) && !c.is_ws_terminate &&
+                                   !c.is_ws_terminate_route && c.response_policy_id == 0 &&
+                                   c.throttle_down_bps == 0 && !ws_splice.enabled;
+            if (kDirectWs || pool.is_bulk(c.upstream_recv_slice)) {
                 // The destination is a bulk relay buffer: recv straight into
                 // it (Part A/B) instead of through a provided-buffer ring, so
                 // a 256 KiB chunk costs one CQE and no ring-to-buffer copy.
                 direct = true;
-                submitted = backend.add_recv_upstream_direct(c.upstream_fd,
-                                                             c.id,
-                                                             c.upstream_episode,
-                                                             c.upstream_recv_buf.write_ptr(),
-                                                             available);
+                submitted = backend.add_recv_upstream_direct(
+                    c.upstream_fd,
+                    c.id,
+                    c.upstream_episode,
+                    c.upstream_recv_buf.write_ptr(),
+                    kDirectWs && available > study_ws_direct_recv_limit ? study_ws_direct_recv_limit
+                                                                        : available,
+                    kPollFirst);
+                if (submitted && kDirectWs) ++study_ws_direct_recv_arms;
             } else {
                 const u32 max_len = backend.upstream_once_max_len();
                 const u32 recv_len = available < max_len ? available : max_len;
                 submitted = backend.add_recv_upstream_once(
-                    c.upstream_fd, c.id, c.upstream_episode, recv_len);
+                    c.upstream_fd, c.id, c.upstream_episode, recv_len, kPollFirst);
             }
         } else {
             submitted = backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
         }
         if (submitted) {
+            if (kPollFirst) ++study_ws_poll_first_arms;
             c.upstream_recv_direct_armed = direct;
             c.pending_ops++;
             c.upstream_recv_armed = true;
@@ -5246,9 +5428,29 @@ public:
     }
 
     void prepare_response_read_deadline_batch(const IoEvent* events, u32 count) {
+        ws_splice.last_batch_ws_only = false;
         response_read_batch_events = events;
         response_read_batch_owner_count = 0;
         response_read_batch_owner_index_active = false;
+        // These auxiliary domains belong exclusively to the opaque WebSocket
+        // relay ledger, including its cancel acknowledgements. They cannot
+        // contribute HTTP response-read deadline owners. Keep the common
+        // post-dispatch maintenance, and always prepare mixed batches normally.
+        bool ws_only = ws_splice.enabled && ws_splice.fast_batch && count != 0;
+        for (u32 i = 0; ws_only && i < count; ++i) {
+            const auto& ev = events[i];
+            ws_only = (ev.type == IoEventType::RelayRead || ev.type == IoEventType::RelayWrite) &&
+                      (ev.aux == 32 || ev.aux == 33 || ev.aux == 96 || ev.aux == 97);
+        }
+        if (ws_only) {
+            ws_splice.last_batch_ws_only = true;
+            response_read_batch_event_count = count;
+            response_read_batch_event_index = 0;
+            response_read_batch_pin_count = 0;
+            for (u32 i = 0; i < count; ++i) response_read_batch_event_owner[i] = 0;
+            ++ws_splice.deadline_batches_skipped;
+            return;
+        }
         __builtin_memset(
             response_read_batch_owner_index, 0, sizeof(response_read_batch_owner_index));
         response_read_batch_owner_index_active = true;
@@ -6051,6 +6253,11 @@ public:
             ::close(fd);
     }
 
+    void mark_response_read_terminal_pending(Connection& c) {
+        c.response_read_deadline_post_commit_terminal_pending = true;
+        response_read_terminal_scan_needed = true;
+    }
+
     [[nodiscard]] bool finish_bounded_content_length_release(Connection& c,
                                                              u32 target,
                                                              bool close_after_drain,
@@ -6091,7 +6298,7 @@ public:
                 // already-harvested post-terminal positive recv records.
                 c.upstream_recv_terminal_stale = true;
             }
-            c.response_read_deadline_post_commit_terminal_pending = true;
+            mark_response_read_terminal_pending(c);
             return true;
         }
         const bool reusable_origin = bounded_origin_can_return_idle(c, target, close_after_drain);
@@ -7150,21 +7357,30 @@ public:
                 }
                 continue;
             }
-            dispatch(events[i]);
+            if (!ws_splice.dispatch(*this, events[i])) dispatch(events[i]);
         }
+        ws_splice.progress(*this);
         study_inside_cq = false;
         study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
         settle_response_read_deadline_batch();
         resolve_response_read_deadline_expiries();
-        for (u32 id = 0; id < slots_initialized; ++id) {
-            Connection& c = conns[id];
-            if (c.response_read_deadline_post_commit_terminal_pending && !c.send_armed &&
-                c.response_read_deadline_post_commit_phase ==
-                    ResponseReadDeadlinePostCommitPhase::WaitingBody &&
-                !c.upstream_recv_armed && !c.upstream_recv_pause_cancel_pending &&
-                !c.upstream_recv_cancel_inflight && !c.upstream_recv_pause_rearm_pending &&
-                !c.upstream_recv_paused_for_send && c.response_read_timer_owner_is_neutral())
-                defer_response_read_deadline_body_pump(c);
+        if (!ws_splice.fast_scan || !ws_splice.last_batch_ws_only ||
+            response_read_terminal_scan_needed) {
+            bool any_pending = false;
+            for (u32 id = 0; id < slots_initialized; ++id) {
+                Connection& c = conns[id];
+                any_pending = any_pending || c.response_read_deadline_post_commit_terminal_pending;
+                if (c.response_read_deadline_post_commit_terminal_pending && !c.send_armed &&
+                    c.response_read_deadline_post_commit_phase ==
+                        ResponseReadDeadlinePostCommitPhase::WaitingBody &&
+                    !c.upstream_recv_armed && !c.upstream_recv_pause_cancel_pending &&
+                    !c.upstream_recv_cancel_inflight && !c.upstream_recv_pause_rearm_pending &&
+                    !c.upstream_recv_paused_for_send && c.response_read_timer_owner_is_neutral())
+                    defer_response_read_deadline_body_pump(c);
+            }
+            response_read_terminal_scan_needed = any_pending;
+        } else {
+            ++ws_splice.terminal_scans_skipped;
         }
         pump_response_read_deadline_bodies();
         // Retirement/header rendezvous owners publish only readiness during
@@ -7338,6 +7554,7 @@ public:
     }
 
     void close_conn_impl(Connection& c) {
+        ws_splice.close(*this, c);
         if (c.tls_out_inflight) {
             // TLS close custody belongs to the actual ciphertext SQE, not the
             // logical plaintext continuation. The common ledger survives
@@ -8593,9 +8810,9 @@ public:
                             // deliver a terminal the response pumps treat as fatal
                             // (header) or as already re-armed (body). This batch's
                             // buffers were returned before dispatch.
-                            const bool one_shot_ring_empty = ev.provided_ring_empty &&
-                                                             ev.result == -ENOBUFS &&
-                                                             use_one_shot_upstream_recv(conn);
+                            const bool kOneShotRingEmpty =
+                                ev.provided_ring_empty && ev.result == -ENOBUFS &&
+                                (use_one_shot_upstream_recv(conn) || ws_recv_cache_active(conn));
                             // A torn-down h2-proxy episode's recv terminal has now drained;
                             // discard any stale positive bytes it left so the next stream
                             // can't parse them as its response. Gated on the flag so the
@@ -8621,7 +8838,7 @@ public:
                                 this->close_conn(conn);
                                 break;
                             }
-                            if (one_shot_ring_empty) {
+                            if (kOneShotRingEmpty) {
                                 if (!this->submit_recv_upstream(conn)) this->close_conn(conn);
                                 break;
                             }

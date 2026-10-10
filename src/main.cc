@@ -2,6 +2,8 @@
 #include "rut/platform/socket.h"
 #include "rut/runtime/access_log_startup.h"
 #include "rut/runtime/connection_capacity.h"
+#include "rut/runtime/upstream_pool.h"
+#include <atomic>
 #ifdef __linux__
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_backend.h"
@@ -388,6 +390,110 @@ static void report_source_live_start_error(const SourceLiveAccessLogStartError& 
     write_str(")\n");
 }
 
+template <typename Loop>
+static void configure_study_policy(Loop* loop) {
+    if constexpr (requires {
+                      loop->study_event_batch_limit;
+                      loop->study_relay_chunk_size;
+                  }) {
+        extern char**
+            environ;  // NOLINT(readability-redundant-declaration): portable POSIX declaration
+        const char* profile = "current";
+        bool nodelay = false;
+        for (const char* const* item = environ; *item != nullptr; ++item)
+            if (str_eq(*item, "RUT_STUDY_HTTP_NODELAY=on")) nodelay = true;
+        UpstreamPool::study_tcp_nodelay.store(nodelay, std::memory_order_relaxed);
+        write_str(nodelay ? "RUT_STUDY_HTTP_NODELAY mode=on\n"
+                          : "RUT_STUDY_HTTP_NODELAY mode=off\n");
+        for (const char* const* item = environ; *item != nullptr; ++item) {
+            if (str_eq(*item, "RUT_STUDY_POLICY=latency")) profile = "latency";
+            if (str_eq(*item, "RUT_STUDY_POLICY=balanced")) profile = "balanced";
+            if (str_eq(*item, "RUT_STUDY_POLICY=current")) profile = "current";
+            if (str_eq(*item, "RUT_STUDY_POLICY=throughput")) profile = "throughput";
+        }
+        if constexpr (requires { loop->backend.enable_ws_recv_cache(); }) {
+            for (const char* const* item = environ; *item != nullptr; ++item) {
+                if (str_eq(*item, "RUT_STUDY_WS_RECV=cache") &&
+                    !loop->backend.enable_ws_recv_cache())
+                    loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
+            }
+            write_str(loop->backend.ws_recv_cache_enabled ? "RUT_STUDY_WS_RECV mode=cache\n"
+                                                          : "RUT_STUDY_WS_RECV mode=once\n");
+        }
+        if constexpr (requires { loop->ws_splice.enable(loop->connection_capacity); }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_WS_SPLICE=on") &&
+                    !loop->ws_splice.enable(loop->connection_capacity))
+                    loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
+            for (const char* const* item = environ; *item != nullptr; ++item) {
+                if (str_eq(*item, "RUT_STUDY_WS_COPY=on")) loop->ws_splice.copy_first = true;
+                if (str_eq(*item, "RUT_STUDY_WS_NODELAY=off")) loop->ws_splice.no_delay = false;
+                if (str_eq(*item, "RUT_STUDY_IO_STATS=on")) loop->backend.study_io_stats = true;
+                if (str_eq(*item, "RUT_STUDY_WS_SYNC_SEND=on")) loop->study_ws_sync_send = true;
+                if (str_eq(*item, "RUT_STUDY_WS_POLL_FIRST=on")) loop->study_ws_poll_first = true;
+                if (str_eq(*item, "RUT_STUDY_WS_DIRECT_RECV=4k"))
+                    loop->study_ws_direct_recv_limit = 4096;
+                if (str_eq(*item, "RUT_STUDY_WS_DIRECT_RECV=16k"))
+                    loop->study_ws_direct_recv_limit = 16384;
+                if (str_eq(*item, "RUT_STUDY_WS_FAST_BATCH=on")) loop->ws_splice.fast_batch = true;
+                if (str_eq(*item, "RUT_STUDY_WS_FAST_SCAN=on")) loop->ws_splice.fast_scan = true;
+                if (str_eq(*item, "RUT_STUDY_WS_AVAILABLE=on"))
+                    loop->ws_splice.check_available = true;
+                if (str_eq(*item, "RUT_STUDY_WS_COPY_LIMIT=16k"))
+                    loop->ws_splice.copy_limit = 16384;
+                if (str_eq(*item, "RUT_STUDY_WS_SEGMENT=16k")) loop->ws_splice.chunk_size = 16384;
+                if (str_eq(*item, "RUT_STUDY_WS_SEGMENT=128k")) loop->ws_splice.chunk_size = 131072;
+                if (str_eq(*item, "RUT_STUDY_WS_CALLS=2")) loop->ws_splice.call_budget = 2;
+                if (str_eq(*item, "RUT_STUDY_WS_CALLS=16")) loop->ws_splice.call_budget = 16;
+            }
+            write_str(loop->ws_splice.copy_first ? "RUT_STUDY_WS_COPY mode=on\n"
+                                                 : "RUT_STUDY_WS_COPY mode=off\n");
+            write_str(loop->ws_splice.check_available ? "RUT_STUDY_WS_AVAILABLE mode=on\n"
+                                                      : "RUT_STUDY_WS_AVAILABLE mode=off\n");
+            write_str(loop->ws_splice.fast_batch ? "RUT_STUDY_WS_FAST_BATCH mode=on\n"
+                                                 : "RUT_STUDY_WS_FAST_BATCH mode=off\n");
+            write_str(loop->ws_splice.fast_scan ? "RUT_STUDY_WS_FAST_SCAN mode=on\n"
+                                                : "RUT_STUDY_WS_FAST_SCAN mode=off\n");
+            write_str(loop->ws_splice.no_delay ? "RUT_STUDY_WS_NODELAY mode=on\n"
+                                               : "RUT_STUDY_WS_NODELAY mode=off\n");
+            write_str(loop->study_ws_sync_send ? "RUT_STUDY_WS_SYNC_SEND mode=on\n"
+                                               : "RUT_STUDY_WS_SYNC_SEND mode=off\n");
+            write_str("RUT_STUDY_WS_COPY_LIMIT bytes=");
+            write_u32(loop->ws_splice.copy_limit);
+            write_str("\n");
+            write_str("RUT_STUDY_WS_PARAMETERS chunk=");
+            write_u32(loop->ws_splice.chunk_size);
+            write_str(" calls=");
+            write_u32(loop->ws_splice.call_budget);
+            write_str("\n");
+            write_str(loop->ws_splice.enabled ? "RUT_STUDY_WS_SPLICE mode=on\n"
+                                              : "RUT_STUDY_WS_SPLICE mode=off\n");
+        }
+        const bool kLatency = str_eq(profile, "latency");
+        const bool kBalanced = str_eq(profile, "balanced");
+        const bool kThroughput = str_eq(profile, "throughput");
+        loop->study_event_batch_limit = kLatency ? 32u : (kBalanced ? 64u : kMaxEventsPerWait);
+        if constexpr (requires { loop->study_relay_turn_call_limit; }) {
+            loop->study_relay_chunk_size = (kLatency || kBalanced) ? 64u * 1024u : 128u * 1024u;
+            loop->study_relay_turn_call_limit = kLatency ? 8u : (kThroughput ? 32u : 16u);
+            loop->study_relay_turn_byte_limit =
+                kLatency ? 512u * 1024u : (kThroughput ? 2u * 1024u * 1024u : 1024u * 1024u);
+            loop->ordinary_cq_wait_limit_ns = kLatency ? 20ull * 1000u : 80ull * 1000u;
+            loop->study_yield_enabled = !kThroughput;
+        } else if constexpr (requires { loop->study_relay_owner_call_limit; }) {
+            loop->study_relay_chunk_size = kThroughput ? 128u * 1024u : 64u * 1024u;
+            loop->study_relay_owner_call_limit = kLatency ? 2u : (kThroughput ? 8u : 4u);
+        }
+        write_str("RUT_STUDY_POLICY profile=");
+        write_str(profile);
+        write_str(" batch=");
+        write_u32(loop->study_event_batch_limit);
+        write_str(" chunk=");
+        write_u32(loop->study_relay_chunk_size);
+        write_str("\n");
+    }
+}
+
 template <typename EventLoopType>
 static RunShardsOutcome run_shards(ListenerSpec listener,
                                    u32 shard_count,
@@ -474,6 +580,7 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                                      : RunShardsOutcomeKind::Failure;
             return {outcome};
         }
+        configure_study_policy(shards[i].loop);
         if constexpr (requires { shards[i].loop->tls_server; }) {
             shards[i].loop->tls_server = tls_server;
         }
@@ -1164,7 +1271,8 @@ int main(int argc, char** argv) {
     // Environment variable override: RUE_ACCESS_LOG_COMPRESS=1
     // getenv without stdlib — scan environ directly.
     {
-        extern char** environ;
+        extern char**
+            environ;  // NOLINT(readability-redundant-declaration): portable POSIX declaration
         static const char kEnv[] = "RUE_ACCESS_LOG_COMPRESS=1";
         for (char** e = environ; *e; e++) {
             if (str_eq(*e, kEnv)) {

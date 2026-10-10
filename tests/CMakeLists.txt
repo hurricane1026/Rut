@@ -3743,3 +3743,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
     set_tests_properties(test_workload_handler PROPERTIES
         LABELS "cli;compiler;runtime" RUN_SERIAL TRUE TIMEOUT 45)
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_WEBSOCKET)
+    add_executable(test_ws_tunnel_iouring test_ws_tunnel_iouring.cc)
+    target_link_libraries(test_ws_tunnel_iouring rut_runtime)
+    target_include_directories(test_ws_tunnel_iouring PRIVATE
+        ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test_ws_tunnel_iouring PRIVATE RUT_TESTING=1)
+    add_test(NAME test_ws_tunnel_iouring COMMAND test_ws_tunnel_iouring)
+    set_tests_properties(test_ws_tunnel_iouring PROPERTIES LABELS "unit;runtime" TIMEOUT 15)
+endif()
