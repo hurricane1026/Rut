@@ -153,7 +153,8 @@ def main():
                 raise RuntimeError('preserved incomplete or failed case: ' + label)
             row = samples[0]
         else:
-            argv = common + ['--engines', engine, '--origin-mode', workload['mode'],
+            origin_mode = 'api' if workload['mode'] == 'api' else 'native'
+            argv = common + ['--engines', engine, '--origin-mode', origin_mode,
                              '--api-delay-ms', str(workload.get('delay', 0)),
                              '--api-fragment-bytes', str(workload.get('fragment', 0)),
                              '--api-fragment-delay-ms', str(workload.get('gap', 0)),

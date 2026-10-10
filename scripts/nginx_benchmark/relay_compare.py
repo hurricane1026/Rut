@@ -28,18 +28,25 @@ def main():
     parser.add_argument("--mixed-client-cpus", default="7,5")
     parser.add_argument("--nginx-buffering", choices=("on", "off"), default="off")
     parser.add_argument("--nginx-buffer-kib", type=int, default=1024)
+    parser.add_argument("--origin-mode", choices=("native", "api"), default="native")
+    parser.add_argument("--api-delay-ms", type=float, default=0)
+    parser.add_argument("--api-fragment-bytes", type=int, default=0)
+    parser.add_argument("--api-fragment-delay-ms", type=float, default=0)
     options, remaining = parser.parse_known_args()
     if not any(arg == "--origin-cpu" or arg.startswith("--origin-cpu=") for arg in remaining):
         remaining += ["--origin-cpu", options.origin_cpus.split(",")[0]]
     engines = options.engines.split(",")
-    if not engines or any(e not in ("uring", "baseline-uring", "epoll", "nginx") for e in engines):
-        parser.error("--engines must contain uring, baseline-uring, epoll or nginx")
+    if not engines or any(e not in ("direct-origin", "uring", "baseline-uring", "epoll", "nginx") for e in engines):
+        parser.error("--engines must contain direct-origin, uring, baseline-uring, epoll or nginx")
     if "baseline-uring" in engines and options.baseline_rut is None:
         parser.error("baseline-uring requires --baseline-rut and its matching rut-compile")
     if options.origin_workers < 1 or options.nginx_buffer_kib < 16:
         parser.error("origin workers must be positive; nginx buffers must be at least 16KiB")
     if options.mixed_small_bytes < 0 or options.small_connections < 1:
         parser.error("invalid mixed workload size or connection count")
+    if (options.api_delay_ms < 0 or options.api_fragment_bytes < 0
+            or options.api_fragment_delay_ms < 0):
+        parser.error("API origin delays and fragment size must be nonnegative")
     source = Path(__file__).with_name("run.py")
     sys.path.insert(0, str(source.parent))
     if "--help" in remaining:
@@ -71,6 +78,30 @@ def main():
             if options.mixed_small_bytes and self.tls_context:
                 raise ValueError("mixed-size preflight currently supports plaintext HTTP only")
             cpu = options.origin_cpus
+            if options.origin_mode == "api":
+                payload = self.out / "api-payload.bin"
+                payload.write_bytes(module.expected_body("proxy", getattr(self.args, "body_size", None)))
+                argv = [sys.executable, str(source.with_name("api_origin.py")), "--port", str(port),
+                        "--cpus", options.origin_cpus, "--payload", str(payload),
+                        "--delay-ms", str(options.api_delay_ms),
+                        "--fragment-bytes", str(options.api_fragment_bytes),
+                        "--fragment-delay-ms", str(options.api_fragment_delay_ms)]
+                child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True)
+                self.origin_pid = child.pid
+                try:
+                    ready_workers = 0
+                    while ready_workers < len(options.origin_cpus.split(",")):
+                        line = child.stdout.readline()
+                        if not line:
+                            raise RuntimeError("API origin exited before readiness")
+                        ready_workers += line.startswith("API_READY ")
+                    yield child.pid
+                finally:
+                    if child.poll() is None:
+                        child.terminate()
+                    child.wait(timeout=5)
+                return
             path = self.out / config
             text = path.read_text().replace("worker_processes 1;", f"worker_processes {options.origin_workers};")
             text = text.replace("worker_connections 8192;", f"worker_connections 8192; multi_accept {options.origin_multi_accept};")
@@ -86,6 +117,7 @@ def main():
             data["origin_workers"] = options.origin_workers
             metadata.write_text(json.dumps(data, indent=2) + "\n")
         with nginx(self, name, config, cpu, port) as pid:
+            self.origin_pid = pid
             yield pid
 
     module.Harness.nginx = origin
@@ -112,6 +144,15 @@ def main():
         if frontend_live:
             raise RuntimeError("frontends must run serially")
         frontend_live = True
+        if engine == "direct-origin":
+            saved_port = self.args.front_port
+            self.args.front_port = self.args.origin_port
+            try:
+                yield self.origin_pid
+            finally:
+                self.args.front_port = saved_port
+                frontend_live = False
+            return
         active_backend = "epoll" if engine == "epoll" else "io_uring"
         active_output = self.out
         saved_rut = self.args.rut

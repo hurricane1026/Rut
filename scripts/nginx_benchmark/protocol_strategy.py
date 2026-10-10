@@ -239,6 +239,8 @@ def main():
         if args.policies:
             configurations = [(engine, policy) for engine, policy in configurations
                               if engine not in ['uring', 'epoll'] or policy in args.policies]
+        if not configurations:
+            parser.error('--smoke/--engines/--policies select no runnable configurations')
         repeats = 1 if args.smoke else args.repeats
         for repeat in range(1, repeats + 1):
             offset = (repeat - 1) % len(configurations)
