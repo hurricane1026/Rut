@@ -5,6 +5,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -30,6 +32,8 @@ struct WsSpliceExperiment {
     bool enabled = false, copy_first = false, check_available = false, fast_batch = false;
     bool fast_scan = false, last_batch_ws_only = false;
     u64 deadline_batches_skipped = 0, terminal_scans_skipped = 0;
+    bool no_delay = true;
+    u64 nodelay_changes = 0, nodelay_failures = 0;
     u64 admissions = 0, transferred[2]{}, calls = 0;
     u32 chunk_size = 65536, call_budget = 8;
     u32 copy_limit = 4096;
@@ -140,6 +144,10 @@ struct WsSpliceExperiment {
                 loop.close_conn(c);
                 return;
             }
+            const u32 kKind = kWriting ? 1u : 0u;
+            const bool kSampled =
+                loop.backend.study_io_stats && (++loop.study_splice_calls[kKind] & 63u) == 0;
+            const u64 kStarted = kSampled ? monotonic_ns() : 0;
             ssize_t n;
             do {
                 ++calls;
@@ -163,6 +171,11 @@ struct WsSpliceExperiment {
                                             chunk_size,
                                             SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
             } while (n < 0 && errno == EINTR);
+            if (kSampled) {
+                const int kSavedErrno = errno;
+                loop.study_record_syscall(kKind, monotonic_ns() - kStarted);
+                errno = kSavedErrno;
+            }
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 ++eagain[kWriting ? 1 : 0];
                 if (!kWriting) d.probe_copy = true;
@@ -317,6 +330,20 @@ struct WsSpliceExperiment {
                     c.recv_paused_for_send = c.upstream_recv_paused_for_send = false;
                     if (!loop.submit_recv(c) || !loop.submit_recv_upstream(c)) loop.close_conn(c);
                 } else {
+                    if (!no_delay) {
+                        const int kSavedErrno = errno;
+                        const int kDisabled = 0;
+                        const i32 kFds[2] = {c.fd, c.upstream_fd};
+                        for (const i32 kFd : kFds) {
+                            if (::setsockopt(
+                                    kFd, IPPROTO_TCP, TCP_NODELAY, &kDisabled, sizeof(kDisabled)) ==
+                                0)
+                                ++nodelay_changes;
+                            else
+                                ++nodelay_failures;
+                        }
+                        errno = kSavedErrno;
+                    }
                     o.requested = false;
                     o.active = true;
                     ++admissions;

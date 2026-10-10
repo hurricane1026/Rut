@@ -87,10 +87,14 @@ static void full_duplex_burst(test::TestCase* _tc,
                               u32 payload_bytes = 64 * 1024 + 73,
                               u32 copy_limit = 4096,
                               bool check_available = false,
-                              bool fast_batch = false) {
+                              bool fast_batch = false,
+                              bool sync_send = false,
+                              u32 direct_recv_limit = 0) {
     LoopStorage storage;
     if (!storage.init()) return;
     auto& loop = *storage.loop;
+    loop.study_ws_sync_send = sync_send;
+    loop.study_ws_direct_recv_limit = direct_recv_limit;
     if (cache) REQUIRE(loop.backend.enable_ws_recv_cache());
     if (splice) {
         REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
@@ -101,6 +105,12 @@ static void full_duplex_burst(test::TestCase* _tc,
         loop.ws_splice.check_available = check_available;
         loop.ws_splice.fast_batch = fast_batch;
         loop.ws_splice.fast_scan = fast_batch;
+        if (fast_batch) {
+            loop.backend.study_io_stats = true;
+            // Force both sampled syscall paths while exercising real byte
+            // transfer, slow-reader backpressure, FIN and cancellation.
+            loop.study_splice_calls[0] = loop.study_splice_calls[1] = 63;
+        }
     }
     int downstream[2], upstream[2];
     REQUIRE_EQ(test::stream_socketpair(downstream), 0);
@@ -161,8 +171,9 @@ static void full_duplex_burst(test::TestCase* _tc,
         REQUIRE(loop.ws_splice.owners[conn->id].failed);
     }
     if (early_close) {
-        for (u32 i = 0; i < 100 && (splice ? loop.ws_splice.admissions == 0
-                                           : loop.backend.ws_recv_cache_count == 0);
+        for (u32 i = 0; i < 100 && (splice  ? loop.ws_splice.admissions == 0
+                                    : cache ? loop.backend.ws_recv_cache_count == 0
+                                            : (!conn->send_armed && !conn->upstream_send_armed));
              ++i) {
             IoEvent events[kMaxEventsPerWait]{};
             const u32 kCount = loop.backend.wait(
@@ -170,7 +181,9 @@ static void full_duplex_burst(test::TestCase* _tc,
             loop.dispatch_batch(events, kCount);
             usleep(1000);
         }
-        REQUIRE(splice ? loop.ws_splice.admissions > 0 : loop.backend.ws_recv_cache_count > 0);
+        REQUIRE(splice  ? loop.ws_splice.admissions > 0
+                : cache ? loop.backend.ws_recv_cache_count > 0
+                        : (conn->send_armed || conn->upstream_send_armed));
         loop.close_conn(*conn);
         for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
             IoEvent events[kMaxEventsPerWait]{};
@@ -202,6 +215,14 @@ static void full_duplex_burst(test::TestCase* _tc,
     }
     REQUIRE_EQ(client_bytes, kBytes);
     REQUIRE_EQ(origin_bytes, kBytes);
+    if (direct_recv_limit != 0) CHECK(loop.study_ws_direct_recv_arms > 0);
+    if (sync_send) {
+        CHECK(loop.study_ws_sync_attempts > 0);
+        if (slow_reader)
+            CHECK(loop.study_ws_sync_partial + loop.study_ws_sync_blocked > 0);
+        else
+            CHECK(loop.study_ws_sync_full > 0);
+    }
     CHECK(__builtin_memcmp(received_client, sent_origin, kBytes) == 0);
     CHECK(__builtin_memcmp(received_origin, sent_client, kBytes) == 0);
     if (cache) {
@@ -268,6 +289,162 @@ static void full_duplex_burst(test::TestCase* _tc,
 TEST(websocket, iouring_full_duplex_burst_exceeds_receive_slice) {
     full_duplex_burst(_tc, false);
 }
+TEST(websocket, iouring_sync_send_full_duplex_small) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64,
+                      4096,
+                      false,
+                      false,
+                      true);
+}
+TEST(websocket, iouring_sync_send_short_write_suffix_and_slow_reader) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true);
+}
+TEST(websocket, iouring_sync_send_close_with_async_suffix_owned) {
+    full_duplex_burst(_tc,
+                      false,
+                      true,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true);
+}
+
+TEST(websocket, iouring_direct_recv_sync_full_duplex_slow_and_close) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true,
+                      4096);
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true,
+                      16384);
+    full_duplex_burst(_tc,
+                      false,
+                      true,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true,
+                      16384);
+}
+
+TEST(websocket, iouring_direct_recv_close_while_kernel_owns_destination) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_ws_direct_recv_limit = 16384;
+    int fds[2];
+    REQUIRE_EQ(test::stream_socketpair(fds), 0);
+    const Peer kOrigin{fds[1]};
+    int clients[2];
+    REQUIRE_EQ(test::stream_socketpair(clients), 0);
+    const Peer kClient{clients[1]};
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = clients[0];
+    conn->upstream_fd = fds[0];
+    REQUIRE(set_nonblocking(conn->upstream_fd));
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->protocol = ConnProtocol::Http11;
+    conn->upstream_episode = 1;
+    conn->is_ws_tunnel = true;
+    REQUIRE(loop.submit_recv_upstream(*conn));
+    REQUIRE(conn->upstream_recv_direct_armed);
+    REQUIRE_EQ(conn->pending_ops, 1u);
+    const u8* const kDestination = conn->upstream_recv_slice;
+    // Submit the receive while the peer is idle, before closing the owner.
+    // This covers kernel-held storage as well as queued SQE ownership.
+    IoEvent idle_events[kMaxEventsPerWait]{};
+    REQUIRE_EQ(loop.backend.wait(
+                   idle_events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false),
+               0u);
+    REQUIRE_EQ(loop.backend.pending, 0u);
+    REQUIRE(conn->upstream_recv_direct_armed);
+    loop.close_conn(*conn);
+    CHECK(conn->upstream_recv_slice == kDestination);
+    for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 kCount =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, kCount);
+        if (kCount == 0) usleep(1000);
+    }
+    CHECK_EQ(loop.backend.failure_code(), 0);
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK(!conn->upstream_recv_direct_armed);
+    CHECK(conn->upstream_recv_slice == nullptr);
+}
+
 TEST(websocket, iouring_multishot_cache_full_duplex_burst) {
     full_duplex_burst(_tc, true);
 }

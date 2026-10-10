@@ -424,6 +424,13 @@ static void configure_study_policy(Loop* loop) {
                     loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
             for (char** item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_WS_COPY=on")) loop->ws_splice.copy_first = true;
+                if (str_eq(*item, "RUT_STUDY_WS_NODELAY=off")) loop->ws_splice.no_delay = false;
+                if (str_eq(*item, "RUT_STUDY_IO_STATS=on")) loop->backend.study_io_stats = true;
+                if (str_eq(*item, "RUT_STUDY_WS_SYNC_SEND=on")) loop->study_ws_sync_send = true;
+                if (str_eq(*item, "RUT_STUDY_WS_DIRECT_RECV=4k"))
+                    loop->study_ws_direct_recv_limit = 4096;
+                if (str_eq(*item, "RUT_STUDY_WS_DIRECT_RECV=16k"))
+                    loop->study_ws_direct_recv_limit = 16384;
                 if (str_eq(*item, "RUT_STUDY_WS_FAST_BATCH=on")) loop->ws_splice.fast_batch = true;
                 if (str_eq(*item, "RUT_STUDY_WS_FAST_SCAN=on")) loop->ws_splice.fast_scan = true;
                 if (str_eq(*item, "RUT_STUDY_WS_AVAILABLE=on"))
@@ -443,6 +450,10 @@ static void configure_study_policy(Loop* loop) {
                                                  : "RUT_STUDY_WS_FAST_BATCH mode=off\n");
             write_str(loop->ws_splice.fast_scan ? "RUT_STUDY_WS_FAST_SCAN mode=on\n"
                                                 : "RUT_STUDY_WS_FAST_SCAN mode=off\n");
+            write_str(loop->ws_splice.no_delay ? "RUT_STUDY_WS_NODELAY mode=on\n"
+                                               : "RUT_STUDY_WS_NODELAY mode=off\n");
+            write_str(loop->study_ws_sync_send ? "RUT_STUDY_WS_SYNC_SEND mode=on\n"
+                                               : "RUT_STUDY_WS_SYNC_SEND mode=off\n");
             write_str("RUT_STUDY_WS_COPY_LIMIT bytes=");
             write_u32(loop->ws_splice.copy_limit);
             write_str("\n");

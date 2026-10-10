@@ -144,6 +144,10 @@ struct IoUringBackend {
 
     // Pending SQE count (for submission)
     u32 pending = 0;
+    bool study_io_stats = false;
+    u64 study_wait_calls = 0, study_wait_enter_calls = 0;
+    u64 study_wait_submitted = 0, study_wait_events = 0, study_wait_empty = 0;
+    u32 study_wait_max_events = 0;
 
     // Sticky fatal error from io_uring_enter. A zero-event wait is otherwise a
     // legitimate result, so the event loop/control plane must inspect this

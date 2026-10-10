@@ -35,6 +35,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -284,6 +285,11 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // Conservative negative cache: only the terminal-pending publisher can
     // introduce an owner. Normal/mixed batches still scan unconditionally.
     bool response_read_terminal_scan_needed = true;
+    u32 study_ws_direct_recv_limit = 0;
+    u64 study_ws_direct_recv_arms = 0;
+    bool study_ws_sync_send = false;
+    u64 study_ws_sync_attempts = 0, study_ws_sync_full = 0, study_ws_sync_partial = 0;
+    u64 study_ws_sync_blocked = 0, study_ws_sync_errors = 0, study_ws_sync_bytes = 0;
     u64 relay_admissions = 0;
     u64 relay_pulled_bytes = 0;
     u64 relay_written_bytes = 0;
@@ -727,6 +733,9 @@ public:
     }
 
     void run() {
+        struct rusage study_usage_begin{};
+        const bool kStudyUsageValid =
+            backend.study_io_stats && ::getrusage(RUSAGE_THREAD, &study_usage_begin) == 0;
         rearm_accept();
         // Arm timer deadlines from activation (config is installed before run()),
         // so `every: D` measures from here rather than from the first 1s tick.
@@ -781,6 +790,14 @@ public:
                     running_.store(false, std::memory_order_relaxed);
                 }
             }
+        }
+        if (kStudyUsageValid) {
+            struct rusage usage{};
+            if (::getrusage(RUSAGE_THREAD, &usage) == 0)
+                ::fprintf(stderr,
+                          "RUT_WS_THREAD voluntary=%ld involuntary=%ld\n",
+                          usage.ru_nvcsw - study_usage_begin.ru_nvcsw,
+                          usage.ru_nivcsw - study_usage_begin.ru_nivcsw);
         }
     }
 
@@ -885,6 +902,36 @@ public:
                       static_cast<unsigned long long>(ws_splice.eagain[1]),
                       static_cast<unsigned long long>(ws_splice.pipe_grow_failures),
                       ws_splice.minimum_pipe_capacity);
+        if (study_ws_direct_recv_limit != 0)
+            ::fprintf(stderr,
+                      "RUT_WS_DIRECT arms=%llu limit=%u\n",
+                      static_cast<unsigned long long>(study_ws_direct_recv_arms),
+                      study_ws_direct_recv_limit);
+        if (study_ws_sync_send)
+            ::fprintf(stderr,
+                      "RUT_WS_SYNC attempts=%llu full=%llu partial=%llu blocked=%llu "
+                      "errors=%llu bytes=%llu\n",
+                      static_cast<unsigned long long>(study_ws_sync_attempts),
+                      static_cast<unsigned long long>(study_ws_sync_full),
+                      static_cast<unsigned long long>(study_ws_sync_partial),
+                      static_cast<unsigned long long>(study_ws_sync_blocked),
+                      static_cast<unsigned long long>(study_ws_sync_errors),
+                      static_cast<unsigned long long>(study_ws_sync_bytes));
+        if (backend.study_io_stats)
+            ::fprintf(stderr,
+                      "RUT_IO_WAIT calls=%llu enters=%llu submitted=%llu events=%llu "
+                      "empty=%llu max_events=%u\n",
+                      static_cast<unsigned long long>(backend.study_wait_calls),
+                      static_cast<unsigned long long>(backend.study_wait_enter_calls),
+                      static_cast<unsigned long long>(backend.study_wait_submitted),
+                      static_cast<unsigned long long>(backend.study_wait_events),
+                      static_cast<unsigned long long>(backend.study_wait_empty),
+                      backend.study_wait_max_events);
+        if (ws_splice.enabled)
+            ::fprintf(stderr,
+                      "RUT_WS_NODELAY changes=%llu failures=%llu\n",
+                      static_cast<unsigned long long>(ws_splice.nodelay_changes),
+                      static_cast<unsigned long long>(ws_splice.nodelay_failures));
         ws_splice.shutdown();
         // No further CQE can retire relay polls after the backend has stopped.
         // Close every connection-owned pipe explicitly before destroying the
@@ -3470,6 +3517,52 @@ public:
                c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode);
     }
 
+    // Only terminal one-shot opaque tunnel reads can lend this buffer to an
+    // immediate send. A positive short write leaves the entire source buffer
+    // intact; the caller submits the unsent suffix through the original send
+    // ledger and consumes the full source only when that suffix completes.
+    bool try_ws_sync_send(Connection& c, bool upstream, const u8* source, u32 length, i32* sent) {
+        if (!study_ws_sync_send || ws_splice.enabled || !use_one_shot_websocket_recv(c) ||
+            c.is_ws_terminate || c.is_ws_terminate_route || c.ws_closing || c.ws_client_eof ||
+            c.ws_upstream_eof || c.throttle_down_bps != 0 || c.response_policy_id != 0 ||
+            (upstream ? c.upstream_send_armed : c.send_armed) || c.recv_pause_cancel_pending ||
+            c.recv_pause_target_inflight || c.upstream_recv_pause_cancel_pending ||
+            c.upstream_recv_cancel_inflight || length == 0)
+            return false;
+        auto& buffer = upstream ? c.recv_buf : c.upstream_recv_buf;
+        if (source != buffer.data() || length != buffer.len() ||
+            (upstream ? c.recv_armed : c.upstream_recv_armed))
+            return false;
+        ++study_ws_sync_attempts;
+        const bool kSampled = backend.study_io_stats && (++study_splice_calls[1] & 63u) == 0;
+        const u64 kStarted = kSampled ? monotonic_ns() : 0;
+        ssize_t n;
+        do {
+            n = ::send(
+                upstream ? c.upstream_fd : c.fd, source, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+        } while (n < 0 && errno == EINTR);
+        const int kSavedErrno = errno;
+        if (kSampled) study_record_syscall(1, monotonic_ns() - kStarted);
+        errno = kSavedErrno;
+        if (n < 0) {
+            if (kSavedErrno == EAGAIN || kSavedErrno == EWOULDBLOCK) {
+                ++study_ws_sync_blocked;
+                *sent = 0;
+            } else {
+                ++study_ws_sync_errors;
+                *sent = -kSavedErrno;
+            }
+        } else {
+            *sent = static_cast<i32>(n);
+            study_ws_sync_bytes += static_cast<u32>(n);
+            if (static_cast<u32>(n) == length)
+                ++study_ws_sync_full;
+            else
+                ++study_ws_sync_partial;
+        }
+        return true;
+    }
+
     bool ws_recv_cache_active(const Connection& c) const {
         return backend.ws_recv_cache_enabled && c.is_ws_tunnel && !c.is_ws_terminate &&
                !c.tls_active;
@@ -4557,16 +4650,23 @@ public:
         if (one_shot) {
             const u32 available = c.upstream_recv_buf.write_avail();
             if (available == 0) return false;
-            if (pool.is_bulk(c.upstream_recv_slice)) {
+            const bool kDirectWs = study_ws_direct_recv_limit != 0 &&
+                                   use_one_shot_websocket_recv(c) && !c.is_ws_terminate &&
+                                   !c.is_ws_terminate_route && c.response_policy_id == 0 &&
+                                   c.throttle_down_bps == 0 && !ws_splice.enabled;
+            if (kDirectWs || pool.is_bulk(c.upstream_recv_slice)) {
                 // The destination is a bulk relay buffer: recv straight into
                 // it (Part A/B) instead of through a provided-buffer ring, so
                 // a 256 KiB chunk costs one CQE and no ring-to-buffer copy.
                 direct = true;
-                submitted = backend.add_recv_upstream_direct(c.upstream_fd,
-                                                             c.id,
-                                                             c.upstream_episode,
-                                                             c.upstream_recv_buf.write_ptr(),
-                                                             available);
+                submitted = backend.add_recv_upstream_direct(
+                    c.upstream_fd,
+                    c.id,
+                    c.upstream_episode,
+                    c.upstream_recv_buf.write_ptr(),
+                    kDirectWs && available > study_ws_direct_recv_limit ? study_ws_direct_recv_limit
+                                                                        : available);
+                if (submitted && kDirectWs) ++study_ws_direct_recv_arms;
             } else {
                 const u32 max_len = backend.upstream_once_max_len();
                 const u32 recv_len = available < max_len ? available : max_len;

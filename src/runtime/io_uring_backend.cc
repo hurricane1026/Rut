@@ -1360,6 +1360,7 @@ u32 IoUringBackend::drain_ws_recv_cache(IoEvent* events,
 u32 IoUringBackend::wait(
     IoEvent* events, u32 max_events, Connection* conns, u32 max_conns, bool wait_for_event) {
     if (failure_code() != 0) return 0;
+    if (study_io_stats) ++study_wait_calls;
     const u32 cached_count = drain_ws_recv_cache(events, max_events, conns, max_conns);
     if (cached_count != 0) wait_for_event = false;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
@@ -1375,9 +1376,13 @@ u32 IoUringBackend::wait(
     u32 flags = IORING_ENTER_GETEVENTS;
     i32 ret;
     while (pending != 0 || (wait_for_event && !ready) || kernel_work) {
+        if (study_io_stats) ++study_wait_enter_calls;
         if (pending > 0) {
             ret = io_uring_enter(ring_fd, pending, wait_for_event ? 1u : 0u, flags);
-            if (ret >= 0) pending -= static_cast<u32>(ret);
+            if (ret >= 0) {
+                if (study_io_stats) study_wait_submitted += static_cast<u32>(ret);
+                pending -= static_cast<u32>(ret);
+            }
         } else {
             ret = io_uring_enter(ring_fd, 0, wait_for_event ? 1u : 0u, flags);
         }
@@ -2385,6 +2390,11 @@ u32 IoUringBackend::wait(
     } else {
         downstream_recv_progress_head = 0;
         downstream_recv_progress_valid = false;
+    }
+    if (study_io_stats) {
+        study_wait_events += count;
+        if (count == 0) ++study_wait_empty;
+        if (count > study_wait_max_events) study_wait_max_events = count;
     }
     return count;
 }

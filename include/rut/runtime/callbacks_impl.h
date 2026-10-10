@@ -10249,7 +10249,30 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
     }
 #endif
     const u32 kSendLen = conn.recv_buf.len();
-    if (!loop->submit_send_upstream(conn, conn.recv_buf.data(), kSendLen)) return false;
+    // Mutable in the io_uring specialization; other backends discard that branch.
+    u32 immediate = 0;  // NOLINT(misc-const-correctness)
+    if constexpr (requires(i32* sent) {
+                      loop->try_ws_sync_send(conn, true, conn.recv_buf.data(), kSendLen, sent);
+                  }) {
+        i32 sent = 0;
+        if (loop->try_ws_sync_send(conn, true, conn.recv_buf.data(), kSendLen, &sent)) {
+            if (sent < 0) return false;
+            immediate = static_cast<u32>(sent);
+            if (immediate == kSendLen) {
+                conn.ws_client_send_pending = true;
+                conn.ws_client_send_len = kSendLen;
+                IoEvent completed{};
+                completed.conn_id = conn.id;
+                completed.type = IoEventType::UpstreamSend;
+                completed.upstream_episode = conn.upstream_episode;
+                completed.result = sent;
+                on_ws_client_to_upstream_sent<Loop>(loop, conn, completed);
+                return true;
+            }
+        }
+    }
+    if (!loop->submit_send_upstream(conn, conn.recv_buf.data() + immediate, kSendLen - immediate))
+        return false;
     conn.ws_client_send_pending = true;
     conn.ws_client_send_len = kSendLen;
     return ws_pause_client_recv(loop, conn);
@@ -10328,7 +10351,30 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
 #endif
     const u32 kSendLen = conn.upstream_recv_buf.len();
     if (throttle_pause_before_pump(loop, conn, kSendLen)) return true;
-    if (!client_send(loop, conn, conn.upstream_recv_buf.data(), kSendLen)) return false;
+    // Mutable in the io_uring specialization; other backends discard that branch.
+    u32 immediate = 0;  // NOLINT(misc-const-correctness)
+    if constexpr (requires(i32* sent) {
+                      loop->try_ws_sync_send(
+                          conn, false, conn.upstream_recv_buf.data(), kSendLen, sent);
+                  }) {
+        i32 sent = 0;
+        if (loop->try_ws_sync_send(conn, false, conn.upstream_recv_buf.data(), kSendLen, &sent)) {
+            if (sent < 0) return false;
+            immediate = static_cast<u32>(sent);
+            if (immediate == kSendLen) {
+                conn.ws_upstream_send_pending = true;
+                conn.ws_upstream_send_len = kSendLen;
+                IoEvent completed{};
+                completed.conn_id = conn.id;
+                completed.type = IoEventType::Send;
+                completed.result = sent;
+                on_ws_upstream_to_client_sent<Loop>(loop, conn, completed);
+                return true;
+            }
+        }
+    }
+    if (!client_send(loop, conn, conn.upstream_recv_buf.data() + immediate, kSendLen - immediate))
+        return false;
     conn.ws_upstream_send_pending = true;
     conn.ws_upstream_send_len = kSendLen;
     return ws_pause_upstream_recv(loop, conn);
