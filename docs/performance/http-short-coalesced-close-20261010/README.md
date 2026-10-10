@@ -10,7 +10,7 @@ Single frontend CPU2, separate clients5/7, four pinned reuseport origins3/4/8/9.
 | on | uring | 3 | 21912 | 12.415 | 3/3 | 0 |
 
 Full raw evidence/configs/frozen binaries: `/home/hurricane/private/code/rut-performance-checkpoints/http-short-coalesced-close-20261010`.
-Raw summary SHA256: `c87ed0b198a3b104b5a4fa807edee856197a0bcfc3a3cd56d55061adad1aa5ba`.
+Raw summary SHA256: `0d101fac74a8be5bd0e2a7b5e1e0bbdc7f6fae9adb00389f476e839efd375d63`.
 
 No merge or default promotion. Study source/head/binary hashes and runner preserve precise configuration. The synchronous-request experiment was archived on study/http-sync-request-20261010 and removed from the active implementation after throughput and tail regressed. Exact scan controls show no consistent large improvement. At1024 concurrency nginx has75 timeouts, zero warmup errors: INVALID. Its8192 worker_connections limit does not by itself explain these timeouts; listener backlog and connection burst pressure remain unconfirmed possibilities. These are screening measurements rather than fully reproduced official cross-machine tests.
 

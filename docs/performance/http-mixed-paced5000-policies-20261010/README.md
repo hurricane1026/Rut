@@ -9,6 +9,6 @@ Same serial, single frontend core and four pinned reuseport origins as the 1,000
 | nginx | 3.696 | 27.282 | 0.26422 |
 
 Raw records and frozen binaries: `/home/hurricane/private/code/rut-performance-checkpoints/http-mixed-paced5000-policies-20261010`.
-Raw summary SHA256: `3ec8acc3c7aaf0eb1906020ca8f65d648f63c0ebbb3465ce1843b8910bed565c`.
+Raw summary SHA256: `6a55365ba48516d057a8921fcf1fd589927e175e4d0548e2f6f8d4ae217ccd67`.
 
 Service latency starts at request transmission. Planned latency additionally includes scheduling/queued arrivals. One outstanding request per API connection; unissued plans are recorded. This local study does not establish an advantage across every workload.

@@ -5,6 +5,7 @@ import argparse
 import io
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -199,10 +200,26 @@ class ToolsTest(unittest.TestCase):
 
     def test_short_sync_readme_summary_digest_matches_committed_artifact(self):
         root = Path(__file__).parents[2]
-        summary = root / "docs/performance/http-short-sync-request-20261010/summary.json"
-        readme = summary.with_name("README.md").read_text()
-        digest = __import__("hashlib").sha256(summary.read_bytes()).hexdigest()
-        self.assertIn(f"Raw summary SHA256: `{digest}`", readme)
+        import hashlib
+        for readme in (root / "docs").rglob("README.md"):
+            text = readme.read_text()
+            if "Raw summary SHA256:" not in text:
+                continue
+            summary = readme.with_name("summary.json")
+            if not summary.exists():
+                summary = readme.with_name("compact-summary.json")
+            self.assertTrue(summary.exists(), readme)
+            digest = hashlib.sha256(summary.read_bytes()).hexdigest()
+            self.assertRegex(text, rf"Raw summary SHA256:\s*`?{digest}`?")
+
+    def test_mixed_client_validity_requires_positive_finite_metrics(self):
+        good = dict(requests=1, rps=1.0, p99_us=2.0, errors={}, valid=True)
+        self.assertTrue(relay_compare.mixed_client_valid(good))
+        for field, value in (("requests", 0), ("rps", 0), ("rps", float("nan")),
+                             ("p99_us", 0), ("p99_us", float("inf"))):
+            with self.subTest(field=field, value=value):
+                self.assertFalse(relay_compare.mixed_client_valid(dict(good, **{field: value})))
+        self.assertFalse(relay_compare.mixed_client_valid(dict(good, errors={"read": 1})))
 
     def test_distinct_urls_require_proxy_scenarios(self):
         with self.assertRaisesRegex(ValueError, "requires proxy-only scenarios"):
