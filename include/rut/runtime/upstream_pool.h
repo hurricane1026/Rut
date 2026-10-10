@@ -114,7 +114,7 @@ struct UpstreamPool {
     }
 
     // Borrow a reusable idle fd for the given endpoint, or -1 if none is live.
-    // Without an idle event watcher, candidates are checked with MSG_PEEK: a socket the
+    // Every candidate is checked with MSG_PEEK: a socket the
     // backend already closed (EOF) or errored is closed and skipped, and one with
     // unexpected pending bytes (a desynced/half-pipelined socket) is discarded too
     // — only an EAGAIN (nothing buffered, still open) socket is handed back. This
