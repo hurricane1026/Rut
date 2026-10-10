@@ -1,0 +1,321 @@
+[
+  {
+    "engine": "epoll",
+    "role": "origin",
+    "requests": 131981,
+    "rows": [
+      {
+        "syscall": "fstat",
+        "calls": 132102,
+        "per_request": 1.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "openat",
+        "calls": 132102,
+        "per_request": 1.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "recvfrom",
+        "calls": 132102,
+        "per_request": 1.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "writev",
+        "calls": 132102,
+        "per_request": 1.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "close",
+        "calls": 132102,
+        "per_request": 1.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "pread64",
+        "calls": 132102,
+        "per_request": 1.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 131574,
+        "per_request": 0.9969,
+        "errors": {}
+      }
+    ]
+  },
+  {
+    "engine": "epoll",
+    "role": "frontend",
+    "requests": 131981,
+    "rows": [
+      {
+        "syscall": "recvfrom",
+        "calls": 396342,
+        "per_request": 3.003,
+        "errors": {
+          "11": 132102
+        }
+      },
+      {
+        "syscall": "epoll_ctl",
+        "calls": 396314,
+        "per_request": 3.0028,
+        "errors": {}
+      },
+      {
+        "syscall": "sendto",
+        "calls": 264204,
+        "per_request": 2.0018,
+        "errors": {}
+      },
+      {
+        "syscall": "accept4",
+        "calls": 133889,
+        "per_request": 1.0145,
+        "errors": {
+          "11": 1779
+        }
+      },
+      {
+        "syscall": "close",
+        "calls": 132110,
+        "per_request": 1.001,
+        "errors": {}
+      },
+      {
+        "syscall": "madvise",
+        "calls": 21590,
+        "per_request": 0.1636,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 16797,
+        "per_request": 0.1273,
+        "errors": {}
+      },
+      {
+        "syscall": "rt_sigtimedwait",
+        "calls": 81,
+        "per_request": 0.0006,
+        "errors": {
+          "11": 80
+        }
+      },
+      {
+        "syscall": "read",
+        "calls": 8,
+        "per_request": 0.0001,
+        "errors": {}
+      }
+    ]
+  },
+  {
+    "engine": "epoll",
+    "role": "client",
+    "requests": 131981,
+    "rows": [
+      {
+        "syscall": "epoll_ctl",
+        "calls": 792381,
+        "per_request": 6.0038,
+        "errors": {}
+      },
+      {
+        "syscall": "fcntl",
+        "calls": 264218,
+        "per_request": 2.0019,
+        "errors": {}
+      },
+      {
+        "syscall": "socket",
+        "calls": 132110,
+        "per_request": 1.001,
+        "errors": {}
+      },
+      {
+        "syscall": "connect",
+        "calls": 132110,
+        "per_request": 1.001,
+        "errors": {
+          "115": 132109
+        }
+      },
+      {
+        "syscall": "setsockopt",
+        "calls": 132109,
+        "per_request": 1.001,
+        "errors": {}
+      },
+      {
+        "syscall": "write",
+        "calls": 132103,
+        "per_request": 1.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "close",
+        "calls": 131992,
+        "per_request": 1.0001,
+        "errors": {}
+      },
+      {
+        "syscall": "read",
+        "calls": 131991,
+        "per_request": 1.0001,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 92710,
+        "per_request": 0.7024,
+        "errors": {}
+      },
+      {
+        "syscall": "mmap",
+        "calls": 30,
+        "per_request": 0.0002,
+        "errors": {}
+      },
+      {
+        "syscall": "rt_sigprocmask",
+        "calls": 9,
+        "per_request": 0.0001,
+        "errors": {}
+      },
+      {
+        "syscall": "fstat",
+        "calls": 9,
+        "per_request": 0.0001,
+        "errors": {}
+      },
+      {
+        "syscall": "openat",
+        "calls": 8,
+        "per_request": 0.0001,
+        "errors": {}
+      },
+      {
+        "syscall": "mprotect",
+        "calls": 8,
+        "per_request": 0.0001,
+        "errors": {}
+      },
+      {
+        "syscall": "munmap",
+        "calls": 6,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "madvise",
+        "calls": 4,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "getrandom",
+        "calls": 4,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "rt_sigaction",
+        "calls": 4,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "brk",
+        "calls": 3,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "rseq",
+        "calls": 3,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "set_robust_list",
+        "calls": 3,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_create",
+        "calls": 2,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "exit",
+        "calls": 2,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "clone3",
+        "calls": 2,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "pread64",
+        "calls": 2,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "futex",
+        "calls": 2,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "clock_nanosleep",
+        "calls": 1,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "access",
+        "calls": 1,
+        "per_request": 0.0,
+        "errors": {
+          "2": 1
+        }
+      },
+      {
+        "syscall": "set_tid_address",
+        "calls": 1,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "exit_group",
+        "calls": 1,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "arch_prctl",
+        "calls": 1,
+        "per_request": 0.0,
+        "errors": {}
+      },
+      {
+        "syscall": "prlimit64",
+        "calls": 1,
+        "per_request": 0.0,
+        "errors": {}
+      }
+    ]
+  }
+]

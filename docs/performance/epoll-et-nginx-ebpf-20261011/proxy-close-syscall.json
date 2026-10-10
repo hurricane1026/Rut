@@ -1,0 +1,126 @@
+[
+  {
+    "engine": "epoll",
+    "role": "frontend",
+    "requests": 154485,
+    "rows": [
+      {
+        "syscall": "recvfrom",
+        "calls": 463794,
+        "per_request": 3.0022,
+        "errors": {
+          "11": 154590
+        }
+      },
+      {
+        "syscall": "sendto",
+        "calls": 309180,
+        "per_request": 2.0014,
+        "errors": {}
+      },
+      {
+        "syscall": "accept4",
+        "calls": 155107,
+        "per_request": 1.004,
+        "errors": {
+          "11": 493
+        }
+      },
+      {
+        "syscall": "epoll_ctl",
+        "calls": 154614,
+        "per_request": 1.0008,
+        "errors": {}
+      },
+      {
+        "syscall": "close",
+        "calls": 154614,
+        "per_request": 1.0008,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 20096,
+        "per_request": 0.1301,
+        "errors": {}
+      },
+      {
+        "syscall": "madvise",
+        "calls": 260,
+        "per_request": 0.0017,
+        "errors": {}
+      },
+      {
+        "syscall": "rt_sigtimedwait",
+        "calls": 80,
+        "per_request": 0.0005,
+        "errors": {
+          "11": 80
+        }
+      },
+      {
+        "syscall": "read",
+        "calls": 8,
+        "per_request": 0.0001,
+        "errors": {}
+      }
+    ]
+  },
+  {
+    "engine": "nginx",
+    "role": "frontend",
+    "requests": 134633,
+    "rows": [
+      {
+        "syscall": "epoll_ctl",
+        "calls": 269507,
+        "per_request": 2.0018,
+        "errors": {}
+      },
+      {
+        "syscall": "recvfrom",
+        "calls": 269437,
+        "per_request": 2.0013,
+        "errors": {}
+      },
+      {
+        "syscall": "writev",
+        "calls": 269420,
+        "per_request": 2.0011,
+        "errors": {}
+      },
+      {
+        "syscall": "accept4",
+        "calls": 138506,
+        "per_request": 1.0288,
+        "errors": {
+          "11": 3744
+        }
+      },
+      {
+        "syscall": "close",
+        "calls": 134832,
+        "per_request": 1.0015,
+        "errors": {}
+      },
+      {
+        "syscall": "getsockopt",
+        "calls": 134815,
+        "per_request": 1.0014,
+        "errors": {}
+      },
+      {
+        "syscall": "setsockopt",
+        "calls": 134675,
+        "per_request": 1.0003,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 3803,
+        "per_request": 0.0282,
+        "errors": {}
+      }
+    ]
+  }
+]
