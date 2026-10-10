@@ -889,6 +889,30 @@ TEST(http, iouring_boundary_ready_set_preserves_reblocked_and_stale_owners) {
     close(second[0]);
 }
 
+TEST(http, iouring_boundary_default_scan_keeps_ready_bitset_unpublished) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.initialize_slots_to(64);
+    int fds[2];
+    REQUIRE_EQ(test::stream_socketpair(fds), 0);
+    const Peer peer{fds[1]};
+    auto& conn = loop.conns[7];
+    conn.fd = fds[0];
+    conn.http1_boundary_deferred = true;
+    loop.maybe_publish_http1_boundary_ready(conn);
+    REQUIRE(conn.http1_boundary_ready);
+    REQUIRE(loop.http1_boundary_ready_pending);
+    CHECK_EQ(loop.http1_boundary_ready_words[0], 0u);
+    conn.http1_boundary_deferred = false;
+    loop.resume_deferred_http1_boundaries();
+    CHECK(!conn.http1_boundary_ready);
+    CHECK(!loop.http1_boundary_ready_pending);
+    CHECK_EQ(loop.http1_boundary_ready_words[0], 0u);
+    conn.fd = -1;
+    close(fds[0]);
+}
+
 TEST(http, iouring_relay_ring_preserves_fifo_across_wrap_removal_and_duplicate) {
     LoopStorage storage;
     if (!storage.init()) return;

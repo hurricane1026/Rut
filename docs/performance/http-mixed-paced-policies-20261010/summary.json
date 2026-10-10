@@ -23,7 +23,28 @@
     "small_planned_p99_us": 1941.4150156080723,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 6639.61729844955
+    "large_rps": 6639.61729844955,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 19040.0
   },
   {
     "configuration": "latency256",
@@ -49,7 +70,28 @@
     "small_planned_p99_us": 3569.6772392839193,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 7102.058590591366
+    "large_rps": 7102.058590591366,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 14230.0
   },
   {
     "configuration": "balanced256",
@@ -75,7 +117,28 @@
     "small_planned_p99_us": 1872.8869035840034,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 6550.1912567600875
+    "large_rps": 6550.1912567600875,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 19262.0
   },
   {
     "configuration": "throughput256",
@@ -101,7 +164,28 @@
     "small_planned_p99_us": 3631.108906120062,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 7110.28155840494
+    "large_rps": 7110.28155840494,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 14249.0
   },
   {
     "configuration": "nginx",
@@ -127,7 +211,28 @@
     "small_planned_p99_us": 240623.59100207686,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 3741.387017904014
+    "large_rps": 3741.387017904014,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 27031.0
   },
   {
     "configuration": "latency256",
@@ -153,7 +258,28 @@
     "small_planned_p99_us": 2187.8487896174192,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 6331.524235200024
+    "large_rps": 6331.524235200024,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 20572.0
   },
   {
     "configuration": "balanced256",
@@ -179,7 +305,28 @@
     "small_planned_p99_us": 3744.9761293828487,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 6890.912350929035
+    "large_rps": 6890.912350929035,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 14359.0
   },
   {
     "configuration": "throughput256",
@@ -205,7 +352,28 @@
     "small_planned_p99_us": 4085.2909442037344,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 6917.886126009442
+    "large_rps": 6917.886126009442,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 14531.0
   },
   {
     "configuration": "nginx",
@@ -231,7 +399,28 @@
     "small_planned_p99_us": 242587.09093555808,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 3755.8708126367437
+    "large_rps": 3755.8708126367437,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 26542.0
   },
   {
     "configuration": "current256",
@@ -257,7 +446,28 @@
     "small_planned_p99_us": 3567.1021323651075,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 7163.850718047871
+    "large_rps": 7163.850718047871,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 13757.0
   },
   {
     "configuration": "balanced256",
@@ -283,13 +493,34 @@
     "small_planned_p99_us": 3229.882102459669,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 6846.355301915068
+    "large_rps": 6846.355301915068,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 14259.0
   },
   {
     "configuration": "throughput256",
     "rotation": 2,
     "payload_bytes_per_second": 7091207274.896393,
-    "valid": true,
+    "valid": false,
     "errors": {
       "connect": 0,
       "read": 0,
@@ -309,7 +540,28 @@
     "small_planned_p99_us": 3675.2489395439625,
     "small_wrk_p99_us": null,
     "delivered_fraction": 0.9999166666666667,
-    "large_rps": 6758.796325902677
+    "large_rps": 6758.796325902677,
+    "result_is_complete": false,
+    "planned_requests": 12000,
+    "issued_requests": 11999,
+    "requests": 11999,
+    "unissued_requests": 1,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 14752.0
   },
   {
     "configuration": "nginx",
@@ -335,7 +587,28 @@
     "small_planned_p99_us": 233651.0068271309,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 3756.287117091468
+    "large_rps": 3756.287117091468,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 26461.0
   },
   {
     "configuration": "current256",
@@ -361,7 +634,28 @@
     "small_planned_p99_us": 3784.1591984033585,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 6795.258451368331
+    "large_rps": 6795.258451368331,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 14424.0
   },
   {
     "configuration": "latency256",
@@ -387,6 +681,27 @@
     "small_planned_p99_us": 1904.0079787373543,
     "small_wrk_p99_us": null,
     "delivered_fraction": 1.0,
-    "large_rps": 6244.372239945742
+    "large_rps": 6244.372239945742,
+    "result_is_complete": true,
+    "planned_requests": 12000,
+    "issued_requests": 12000,
+    "requests": 12000,
+    "unissued_requests": 0,
+    "unfinished_requests": 0,
+    "small_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "large_p99_us": 20669.0
   }
 ]

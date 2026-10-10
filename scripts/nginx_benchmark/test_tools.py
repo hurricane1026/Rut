@@ -4,6 +4,7 @@ import contextlib
 import argparse
 import io
 import json
+import math
 import os
 import re
 import signal
@@ -124,6 +125,53 @@ class ToolsTest(unittest.TestCase):
         relay_compare.validate_mixed_small_rate_scenarios(("proxy-keepalive",), True)
         relay_compare.validate_mixed_small_rate_scenarios(("proxy-close",), False)
 
+    def test_direct_origin_preflight_rejects_static_and_disabled_keepalive(self):
+        with self.assertRaisesRegex(ValueError, "proxy scenarios only"):
+            relay_compare.validate_direct_origin_options(
+                ("direct-origin",), relay_compare.DEFAULT_SCENARIOS, [])
+        with self.assertRaisesRegex(ValueError, "reuse on"):
+            relay_compare.validate_direct_origin_options(
+                ("direct-origin",), ("proxy-keepalive",),
+                ["--native-origin-reuse", "off"])
+        relay_compare.validate_direct_origin_options(
+            ("direct-origin",), ("proxy-keepalive",), [])
+        relay_compare.validate_direct_origin_options(
+            ("uring",), relay_compare.DEFAULT_SCENARIOS, ["--native-origin-reuse", "off"])
+
+    def test_paced_tls_preflight_rejects_before_delegation(self):
+        for option in ("--tls-cert", "--tls-key"):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                    ValueError, "plaintext HTTP only"):
+                relay_compare.validate_paced_tls(True, [option, "unused"])
+        relay_compare.validate_paced_tls(True, [])
+        relay_compare.validate_paced_tls(False, ["--tls-cert", "unused"])
+
+    def test_direct_and_paced_preflights_run_before_module_or_process(self):
+        cases = (
+            ("--engines", "direct-origin"),
+            ("--engines", "direct-origin", "--scenarios", "proxy-keepalive",
+             "--native-origin-reuse", "off"),
+            ("--mixed-small-bytes", "4096", "--mixed-small-rate", "5000",
+             "--tls-cert", "unused.pem", "--tls-key", "unused.key",
+             "--scenarios", "proxy-keepalive"),
+        )
+        for args in cases:
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "must-not-be-created"
+                argv = [str(Path(relay_compare.__file__)), *args,
+                        "--output", str(output)]
+                with mock.patch.object(sys, "argv", argv), \
+                        mock.patch.object(relay_compare.importlib.util,
+                                          "spec_from_file_location") as load_module, \
+                        mock.patch.object(subprocess, "Popen") as popen, \
+                        contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit) as raised:
+                    relay_compare.main()
+                self.assertEqual(raised.exception.code, 2)
+                load_module.assert_not_called()
+                popen.assert_not_called()
+                self.assertFalse(output.exists())
+
     def test_paced_http_probe_verifies_complete_framing_and_body(self):
         async def check(payload):
             reader = protocol_workload.asyncio.StreamReader()
@@ -216,6 +264,33 @@ class ToolsTest(unittest.TestCase):
             self.assertTrue(summary.exists(), readme)
             digest = hashlib.sha256(summary.read_bytes()).hexdigest()
             self.assertEqual(declaration.group(1), digest)
+
+    def test_paced_summary_validity_uses_exact_retained_request_counts(self):
+        root = Path(__file__).parents[2]
+        for name in ("http-mixed-paced1000-20261010",
+                     "http-mixed-paced-policies-20261010",
+                     "http-mixed-paced5000-policies-20261010"):
+            rows = json.loads((root / "docs/performance" / name / "summary.json").read_text())
+            self.assertTrue(rows)
+            for row in rows:
+                with self.subTest(study=name, configuration=row["configuration"],
+                                  rotation=row["rotation"]):
+                    complete = (row["planned_requests"] > 0
+                                and row["issued_requests"] == row["planned_requests"]
+                                and row["requests"] == row["planned_requests"]
+                                and row["unissued_requests"] == 0
+                                and row["unfinished_requests"] == 0
+                                and all(value == 0 for group in
+                                        (row["errors"], row["warmup_errors"],
+                                         row["small_errors"], row["large_errors"])
+                                        for value in group.values())
+                                and all(math.isfinite(row[key]) and row[key] > 0
+                                        for key in ("payload_bytes_per_second", "small_rps",
+                                                    "small_service_p99_us",
+                                                    "small_planned_p99_us", "large_rps",
+                                                    "large_p99_us")))
+                    self.assertEqual(row["result_is_complete"], complete)
+                    self.assertEqual(row["valid"], complete)
 
     def test_mixed_client_validity_requires_positive_finite_metrics(self):
         good = dict(requests=1, rps=1.0, p99_us=2.0, errors={}, valid=True)

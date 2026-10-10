@@ -3,7 +3,7 @@
 Local Linux single frontend core study, four nginx origin workers. Frontends run serially. Runtime candidates remain opt-in; no default promotion.
 
 Full raw logs, effective configurations and frozen binaries: `/home/hurricane/private/code/rut-performance-checkpoints/http-mixed-paced-policies-20261010`.
-Raw summary SHA256: `3a33d57751c659259a02d4bca4923a35d17c4d691405d65c41046d6345c5b22f`.
+Raw summary SHA256: `e5ec5ed7a5aa0eeaa785dc25b5a7b32ecb4fb44130408e354bb7131056320bd2`.
 
 Compact results retain errors and delivered request fractions. Saturated closed-loop mixed tests complete different proportions of small and large requests, so aggregate byte throughput alone is not a matched-workload comparison. Planned-rate tests report scheduling-inclusive latency separately from send-to-completion service latency. They use one outstanding request per small connection and expose unissued plans.
 
@@ -16,7 +16,7 @@ Three rotated repeats, 96 persistent 1MiB bulk connections plus 32 persistent 4K
 | current, 256KiB | 6.640 | 1.81 | 2.953 |
 | latency, 256KiB | 6.187 | 1.69 | 1.389 |
 | balanced, 256KiB | 6.690 | 1.82 | 2.598 |
-| throughput, 256KiB | 6.760 | 1.84 | 3.026 |
+| throughput, 256KiB | 6.854 | 1.87 | 3.233 |
 | nginx | 3.672 | 1.00 | 26.500 |
 
-All latency-profile repeats exceed 1.5× their same-rotation nginx result. All transport and warmup error counters are zero. Throughput profile rotation2 delivers 11,999/12,000 planned API requests; every other cell delivers all 12,000. These medians are local evidence, not confidence intervals. Service p99 starts at request transmission; planned-arrival p99 additionally includes client scheduling/queued arrival delay.
+All medians and paired ratios exclude cells whose frozen raw planned, issued, completed, unissued, or unfinished counts are incomplete. Fourteen of fifteen cells have zero measurement/warmup errors, finite client metrics, and exact completion; throughput profile rotation2 delivered 11,999/12,000 and is marked invalid. All latency-profile repeats exceed 1.5× their same-rotation nginx result. These medians are local evidence, not confidence intervals. Service p99 starts at request transmission; planned-arrival p99 additionally includes client scheduling/queued arrival delay.

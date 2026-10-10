@@ -1074,7 +1074,8 @@ public:
             !c.response_read_timer_owner_is_neutral())
             return;
         c.http1_boundary_ready = true;
-        http1_boundary_ready_words[c.id >> 6] |= u64{1} << (c.id & 63u);
+        if (study_http_boundary_ready_set)
+            http1_boundary_ready_words[c.id >> 6] |= u64{1} << (c.id & 63u);
         http1_boundary_ready_pending = true;
     }
 
@@ -2896,7 +2897,8 @@ public:
         Connection& c = conns[id];
         if (!c.http1_boundary_ready) return;
 
-        http1_boundary_ready_words[id >> 6] &= ~(u64{1} << (id & 63u));
+        if (study_http_boundary_ready_set)
+            http1_boundary_ready_words[id >> 6] &= ~(u64{1} << (id & 63u));
         c.http1_boundary_ready = false;
         if (!c.http1_boundary_deferred) return;
         if (strict_upstream_retirement_blocks_reclaim(c) || idle_return_drain_blocks_boundary(c) ||
