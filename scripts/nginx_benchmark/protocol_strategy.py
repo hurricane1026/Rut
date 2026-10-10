@@ -55,15 +55,22 @@ def ready(port, process, log, workers=0):
 @contextlib.contextmanager
 def process(argv, log, env=None):
     with log.open('w') as handle:
-        child = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT, env=env)
+        child = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT, env=env,
+                                 start_new_session=True)
         try:
             yield child
         finally:
-            child.terminate()
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 child.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                child.kill()
+                try:
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 child.wait()
 
 

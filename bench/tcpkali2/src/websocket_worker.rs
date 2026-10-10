@@ -31,6 +31,10 @@ fn ping_payload(message: &Bytes, sequence: u64, verify: bool) -> Bytes {
     }
 }
 
+fn first_payload_matches(expected: &Bytes, received: &[u8], verify: bool) -> bool {
+    !verify || expected.as_ref() == received
+}
+
 macro_rules! log_error {
     ($stats:expr, $config:expr, $($arg:tt)*) => {
         if !$stats.is_shutting_down() && !$config.quiet {
@@ -122,10 +126,17 @@ async fn run_websocket_worker(
         }
 
         match read.next().await {
-            Some(Ok(Message::Binary(data))) => {
+            Some(Ok(Message::Binary(data)))
+                if first_payload_matches(first_message, &data, stats.verify_payload) =>
+            {
                 let latency_us = sent_at.elapsed().as_micros().max(1) as u64;
                 stats.record_latency(latency_us, 0);
                 stats.record_request(first_message.len(), data.len());
+            }
+            Some(Ok(Message::Binary(_))) => {
+                log_error!(stats, config, "First WebSocket echo payload mismatch");
+                stats.record_connection_error();
+                return Ok(());
             }
             Some(Err(error)) => {
                 log_error!(
@@ -176,6 +187,7 @@ async fn run_pingpong(
     loop {
         pacer.wait().await;
         let sent_at = Instant::now();
+        let measurement = !stats.is_warmup();
 
         let payload = ping_payload(message, sequence, verify);
         if let Err(error) = write.send(Message::Binary(payload.clone())).await {
@@ -200,12 +212,14 @@ async fn run_pingpong(
                         stats.record_connection_error();
                         return Ok(());
                     }
-                    local_stats.record_responses(
-                        1,
-                        payload.len(),
-                        data.len(),
-                        sent_at.elapsed().as_micros().max(1) as u64,
-                    );
+                    if measurement {
+                        local_stats.record_responses(
+                            1,
+                            payload.len(),
+                            data.len(),
+                            sent_at.elapsed().as_micros().max(1) as u64,
+                        );
+                    }
                     sequence = sequence.wrapping_add(1);
                     pacer.advance(1);
                     break;
@@ -345,7 +359,7 @@ async fn pipeline_reader(
 
 #[cfg(test)]
 mod tests {
-    use super::{ping_payload, websocket_worker};
+    use super::{first_payload_matches, ping_payload, websocket_worker};
     use crate::command::Config;
     use crate::stats::Stats;
     use bytes::Bytes;
@@ -361,6 +375,9 @@ mod tests {
         let message = Bytes::from_static(b"abcdefgh");
         assert_eq!(ping_payload(&message, 7, false), message);
         assert_eq!(&ping_payload(&message, 7, true)[..8], &7u64.to_be_bytes());
+        assert!(first_payload_matches(&message, b"wrong", false));
+        assert!(!first_payload_matches(&message, b"wrong", true));
+        assert!(first_payload_matches(&message, b"abcdefgh", true));
     }
 
     #[tokio::test]

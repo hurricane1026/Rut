@@ -127,6 +127,7 @@ def main():
               '--native-nginx-buffering', 'off', '--native-origin-reuse', 'on', '--scenarios', 'proxy-keepalive']
     env = dict(os.environ)
     env.pop('DOCKER_HOST', None)
+    env.pop('RUT_STUDY_POLICY', None)
     env['RUT_BENCH_RELAY_STATS'] = '1'
     rows = []
     selected = {}

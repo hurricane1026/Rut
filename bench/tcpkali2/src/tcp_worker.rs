@@ -24,6 +24,7 @@ macro_rules! log_error {
 struct SentBatch {
     sent_at: Instant,
     remaining: usize,
+    measurement: bool,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -130,6 +131,7 @@ async fn run_pingpong(
     loop {
         pacer.wait().await;
         let sent_at = Instant::now();
+        let measurement = !stats.is_warmup();
 
         if let Err(error) = writer.write_all(message).await {
             log_error!(stats, config, "Write error: {}", error);
@@ -143,12 +145,14 @@ async fn run_pingpong(
             return Ok(());
         }
 
-        local_stats.record_responses(
-            1,
-            message.len(),
-            message.len(),
-            sent_at.elapsed().as_micros().max(1) as u64,
-        );
+        if measurement {
+            local_stats.record_responses(
+                1,
+                message.len(),
+                message.len(),
+                sent_at.elapsed().as_micros().max(1) as u64,
+            );
+        }
         pacer.advance(1);
     }
 }
@@ -194,10 +198,12 @@ async fn pipeline_writer(
             .expect("Pipeline semaphore must remain open");
 
         let sent_at = Instant::now();
+        let measurement = !stats.is_warmup();
         if sent_tx
             .send(SentBatch {
                 sent_at,
                 remaining: message_count,
+                measurement,
                 _permit: permit,
             })
             .is_err()
@@ -255,12 +261,14 @@ async fn pipeline_reader(
             };
 
             let count = response_count.min(batch.remaining);
-            local_stats.record_responses(
-                count,
-                message_size,
-                message_size,
-                batch.sent_at.elapsed().as_micros().max(1) as u64,
-            );
+            if batch.measurement {
+                local_stats.record_responses(
+                    count,
+                    message_size,
+                    message_size,
+                    batch.sent_at.elapsed().as_micros().max(1) as u64,
+                );
+            }
             response_count -= count;
 
             batch.remaining -= count;
