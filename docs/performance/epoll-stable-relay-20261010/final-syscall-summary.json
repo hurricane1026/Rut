@@ -1,0 +1,295 @@
+{
+  "on": {
+    "engine": "epoll",
+    "role": "frontend",
+    "requests": 19736,
+    "rows": [
+      {
+        "syscall": "splice",
+        "calls": 634866,
+        "per_request": 32.1679,
+        "errors": {
+          "32": 37,
+          "104": 44,
+          "11": 88
+        }
+      },
+      {
+        "syscall": "recvfrom",
+        "calls": 79371,
+        "per_request": 4.0216,
+        "errors": {
+          "104": 39,
+          "11": 19735
+        }
+      },
+      {
+        "syscall": "sendto",
+        "calls": 59589,
+        "per_request": 3.0193,
+        "errors": {
+          "104": 2,
+          "32": 5
+        }
+      },
+      {
+        "syscall": "epoll_ctl",
+        "calls": 40104,
+        "per_request": 2.032,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 12665,
+        "per_request": 0.6417,
+        "errors": {}
+      },
+      {
+        "syscall": "close",
+        "calls": 473,
+        "per_request": 0.024,
+        "errors": {}
+      },
+      {
+        "syscall": "accept4",
+        "calls": 220,
+        "per_request": 0.0111,
+        "errors": {
+          "11": 91
+        }
+      },
+      {
+        "syscall": "pipe2",
+        "calls": 128,
+        "per_request": 0.0065,
+        "errors": {}
+      },
+      {
+        "syscall": "socket",
+        "calls": 128,
+        "per_request": 0.0065,
+        "errors": {}
+      },
+      {
+        "syscall": "connect",
+        "calls": 128,
+        "per_request": 0.0065,
+        "errors": {
+          "115": 128
+        }
+      },
+      {
+        "syscall": "madvise",
+        "calls": 128,
+        "per_request": 0.0065,
+        "errors": {}
+      },
+      {
+        "syscall": "getsockopt",
+        "calls": 128,
+        "per_request": 0.0065,
+        "errors": {}
+      },
+      {
+        "syscall": "fcntl",
+        "calls": 128,
+        "per_request": 0.0065,
+        "errors": {}
+      },
+      {
+        "syscall": "rt_sigtimedwait",
+        "calls": 80,
+        "per_request": 0.0041,
+        "errors": {
+          "11": 80
+        }
+      },
+      {
+        "syscall": "read",
+        "calls": 8,
+        "per_request": 0.0004,
+        "errors": {}
+      }
+    ]
+  },
+  "off": {
+    "engine": "epoll",
+    "role": "frontend",
+    "requests": 20385,
+    "rows": [
+      {
+        "syscall": "splice",
+        "calls": 655776,
+        "per_request": 32.1695,
+        "errors": {
+          "104": 32,
+          "32": 65
+        }
+      },
+      {
+        "syscall": "epoll_ctl",
+        "calls": 102655,
+        "per_request": 5.0358,
+        "errors": {}
+      },
+      {
+        "syscall": "recvfrom",
+        "calls": 81976,
+        "per_request": 4.0214,
+        "errors": {
+          "104": 13,
+          "11": 20399
+        }
+      },
+      {
+        "syscall": "sendto",
+        "calls": 61539,
+        "per_request": 3.0188,
+        "errors": {
+          "104": 6,
+          "32": 12
+        }
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 12950,
+        "per_request": 0.6353,
+        "errors": {}
+      },
+      {
+        "syscall": "close",
+        "calls": 500,
+        "per_request": 0.0245,
+        "errors": {}
+      },
+      {
+        "syscall": "accept4",
+        "calls": 246,
+        "per_request": 0.0121,
+        "errors": {
+          "11": 117
+        }
+      },
+      {
+        "syscall": "fcntl",
+        "calls": 128,
+        "per_request": 0.0063,
+        "errors": {}
+      },
+      {
+        "syscall": "pipe2",
+        "calls": 128,
+        "per_request": 0.0063,
+        "errors": {}
+      },
+      {
+        "syscall": "madvise",
+        "calls": 128,
+        "per_request": 0.0063,
+        "errors": {}
+      },
+      {
+        "syscall": "socket",
+        "calls": 114,
+        "per_request": 0.0056,
+        "errors": {}
+      },
+      {
+        "syscall": "getsockopt",
+        "calls": 114,
+        "per_request": 0.0056,
+        "errors": {}
+      },
+      {
+        "syscall": "connect",
+        "calls": 114,
+        "per_request": 0.0056,
+        "errors": {
+          "115": 114
+        }
+      },
+      {
+        "syscall": "rt_sigtimedwait",
+        "calls": 81,
+        "per_request": 0.004,
+        "errors": {
+          "11": 80
+        }
+      },
+      {
+        "syscall": "read",
+        "calls": 8,
+        "per_request": 0.0004,
+        "errors": {}
+      }
+    ]
+  },
+  "small": {
+    "engine": "epoll",
+    "role": "frontend",
+    "requests": 309183,
+    "rows": [
+      {
+        "syscall": "recvfrom",
+        "calls": 928056,
+        "per_request": 3.0016,
+        "errors": {
+          "104": 98,
+          "11": 309309
+        }
+      },
+      {
+        "syscall": "sendto",
+        "calls": 618618,
+        "per_request": 2.0008,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 38781,
+        "per_request": 0.1254,
+        "errors": {}
+      },
+      {
+        "syscall": "accept4",
+        "calls": 231,
+        "per_request": 0.0007,
+        "errors": {
+          "11": 102
+        }
+      },
+      {
+        "syscall": "epoll_ctl",
+        "calls": 129,
+        "per_request": 0.0004,
+        "errors": {}
+      },
+      {
+        "syscall": "close",
+        "calls": 129,
+        "per_request": 0.0004,
+        "errors": {}
+      },
+      {
+        "syscall": "madvise",
+        "calls": 128,
+        "per_request": 0.0004,
+        "errors": {}
+      },
+      {
+        "syscall": "rt_sigtimedwait",
+        "calls": 81,
+        "per_request": 0.0003,
+        "errors": {
+          "11": 80
+        }
+      },
+      {
+        "syscall": "read",
+        "calls": 8,
+        "per_request": 0.0,
+        "errors": {}
+      }
+    ]
+  }
+}

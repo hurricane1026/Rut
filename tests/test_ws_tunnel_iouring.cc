@@ -1246,6 +1246,7 @@ TEST(http, direct_complete_proxy_response_keeps_completion_owner_after_fin) {
     c->resp_body_sent = sizeof(wire) - 1;
     REQUIRE(loop.submit_send_impl(*c, c->response_header_buf.data(), c->response_header_buf.len()));
     CHECK_EQ(loop.study_http_direct_close_completed, 1u);
+    CHECK(c->write_half_closed());
     CHECK(c->send_armed);
     CHECK(c->direct_write_completion_pending);
     CHECK_EQ(c->pending_ops, 1u);
@@ -1266,6 +1267,7 @@ TEST(http, direct_complete_proxy_response_keeps_completion_owner_after_fin) {
     c->send_armed = false;
     c->direct_write_completion_pending = false;
     loop.close_conn(*c);
+    CHECK(!c->write_half_closed());
 }
 
 static void initial_http_receive_owner(test::TestCase* _tc, bool enabled, bool completed_request) {

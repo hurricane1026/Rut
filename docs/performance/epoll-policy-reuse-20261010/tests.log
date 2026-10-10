@@ -1,0 +1,19 @@
+Test project /tmp/rut-ws-pr-20261010-build
+    Start  27: test_network
+1/4 Test  #27: test_network .....................   Passed    9.89 sec
+    Start  29: test_splice
+2/4 Test  #29: test_splice ......................   Passed    0.09 sec
+    Start 270: test_cli_backend
+3/4 Test #270: test_cli_backend .................   Passed    0.07 sec
+    Start 272: test_ws_tunnel_iouring
+4/4 Test #272: test_ws_tunnel_iouring ...........   Passed    1.25 sec
+
+100% tests passed, 0 tests failed out of 4
+
+Label Time Summary:
+cli        =   0.07 sec*proc (1 test)
+network    =   9.97 sec*proc (2 tests)
+runtime    =   1.25 sec*proc (1 test)
+unit       =  11.22 sec*proc (3 tests)
+
+Total Test time (real) =  11.30 sec

@@ -30691,6 +30691,68 @@ TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     destroy_real_loop(loop);
 }
 
+TEST(epoll_loop, accept_events_own_their_ipv4_peer_addresses) {
+    ScopedListenerTestFd listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+    REQUIRE(listener.fd >= 0);
+    sockaddr_in address = listener_test_ipv4(INADDR_LOOPBACK, 0);
+    REQUIRE(bind(listener.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(listen(listener.fd, 8) == 0);
+    socklen_t address_len = sizeof(address);
+    REQUIRE(getsockname(listener.fd, reinterpret_cast<sockaddr*>(&address), &address_len) == 0);
+
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, listener.fd).has_value());
+    backend.study_accept_batch_limit = 2;
+    backend.add_accept();
+    ScopedListenerTestFd clients[3];
+    sockaddr_in client_addresses[3] = {};
+    for (u32 i = 0; i < 3; i++) {
+        clients[i].fd = socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(clients[i].fd >= 0);
+        REQUIRE(connect(clients[i].fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ==
+                0);
+        socklen_t len = sizeof(client_addresses[i]);
+        REQUIRE(getsockname(
+                    clients[i].fd, reinterpret_cast<sockaddr*>(&client_addresses[i]), &len) == 0);
+    }
+    IoEvent accepted[3] = {};
+    // A one-event output buffer must cap the batch even with queued accepts.
+    for (;;) {
+        IoEvent event = {};
+        REQUIRE(backend.wait(&event, 1, nullptr, 0) == 1);
+        if (event.type == IoEventType::Accept) {
+            accepted[0] = event;
+            break;
+        }
+    }
+    IoEvent batch[3] = {};
+    // The configured limit caps the batch independently of output capacity.
+    u32 batch_count = 0;
+    do {
+        batch_count = backend.wait(batch, 3, nullptr, 0);
+    } while (batch_count == 1 && batch[0].type == IoEventType::Timeout);
+    REQUIRE_EQ(batch_count, 2u);
+    accepted[1] = batch[0];
+    accepted[2] = batch[1];
+    CHECK(accepted[0].accept_peer_valid);
+    CHECK(accepted[1].accept_peer_valid);
+    CHECK_NE(accepted[0].accept_peer_port, accepted[1].accept_peer_port);
+    for (u32 i = 0; i < 3; i++) {
+        CHECK_EQ(accepted[i].type, IoEventType::Accept);
+        CHECK(accepted[i].accept_peer_valid);
+        sockaddr_in actual = {};
+        socklen_t len = sizeof(actual);
+        REQUIRE(getpeername(accepted[i].result, reinterpret_cast<sockaddr*>(&actual), &len) == 0);
+        CHECK_EQ(accepted[i].accept_peer_addr, actual.sin_addr.s_addr);
+        CHECK_EQ(accepted[i].accept_peer_port, ntohs(actual.sin_port));
+        CHECK(accepted[i].accept_peer_port == ntohs(client_addresses[0].sin_port) ||
+              accepted[i].accept_peer_port == ntohs(client_addresses[1].sin_port) ||
+              accepted[i].accept_peer_port == ntohs(client_addresses[2].sin_port));
+        close(accepted[i].result);
+    }
+    backend.shutdown();
+}
+
 // add_recv/set_fd_interest skip an epoll_ctl that would re-install the
 // registration they last made. Closing an fd drops it from the epoll set, so
 // the record must not survive close_conn: a reallocated slot whose new socket
@@ -30722,6 +30784,27 @@ TEST(epoll_loop, redundant_rearm_is_skipped_and_fd_reuse_reregisters) {
     loop->backend.invalidate_fd_interest(cid, a[0]);
     REQUIRE(loop->backend.add_recv(a[0], cid));
     CHECK_EQ(loop->backend.fd_interest[slot].fd, a[0]);
+
+    // Invalidation is not proof of absence: ADD must recover from EEXIST
+    // and replace the live kernel token, preserving downstream ownership.
+    struct epoll_event foreign = {};
+    foreign.events = EPOLLIN;
+    foreign.data.u64 = 0x1234;
+    REQUIRE(epoll_ctl(loop->backend.epoll_fd, EPOLL_CTL_MOD, a[0], &foreign) == 0);
+    loop->backend.invalidate_fd_interest(cid, a[0]);
+    REQUIRE(loop->backend.add_recv(a[0], cid));
+    const u8 probe = 'p';
+    REQUIRE(send(a[1], &probe, 1, 0) == 1);
+    struct epoll_event ready[8];
+    const i32 ready_count = epoll_wait(loop->backend.epoll_fd, ready, 8, 1000);
+    bool current_token = false;
+    for (i32 i = 0; i < ready_count; i++)
+        if (ready[i].data.u64 == encode_non_upstream_user_data({cid, IoEventType::Recv, 0}))
+            current_token = true;
+    CHECK(current_token);
+    u8 consumed = 0;
+    REQUIRE(recv(a[0], &consumed, 1, 0) == 1);
+    CHECK_EQ(consumed, probe);
 
     loop->close_conn(*c);  // closes a[0]
     CHECK_EQ(loop->backend.fd_interest[slot].fd, -1);
