@@ -228,6 +228,44 @@ struct EdgeEpollFixture {
         backend.shutdown();
     }
 };
+
+struct AcceptEpollFixture {
+    EpollBackend backend{};
+    i32 listener = -1;
+    i32 client = -1;
+    i32 accepted = -1;
+    i32 send_pair[2] = {-1, -1};
+
+    bool init() {
+        listener = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (listener < 0) return false;
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t length = sizeof(address);
+        if (bind(listener, reinterpret_cast<sockaddr*>(&address), length) != 0 ||
+            listen(listener, 8) != 0 ||
+            getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) != 0 ||
+            !backend.init(0, listener, 4).has_value() || !backend.enable_edge_trigger())
+            return false;
+        backend.add_accept();
+        client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (client < 0 || connect(client, reinterpret_cast<sockaddr*>(&address), length) != 0 ||
+            socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, send_pair) != 0)
+            return false;
+        backend.accept_pending = true;
+        return true;
+    }
+
+    ~AcceptEpollFixture() {
+        backend.shutdown();
+        if (accepted >= 0) close(accepted);
+        if (listener >= 0) close(listener);
+        if (client >= 0) close(client);
+        if (send_pair[0] >= 0) close(send_pair[0]);
+        if (send_pair[1] >= 0) close(send_pair[1]);
+    }
+};
 }  // namespace
 
 TEST(epoll_full_edge, one_peer_write_drains_across_multiple_buffer_turns) {
@@ -512,6 +550,30 @@ TEST(epoll_stable_edge, full_reads_continue_with_an_unchanged_kernel_registratio
     CHECK_EQ(f.backend.fd_interest[1].gen, generation);
 }
 
+TEST(epoll_stable_edge, healthy_keepalive_survives_pending_read_probe_and_reuse) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE_EQ(::send(f.peer, "first", 5, MSG_NOSIGNAL), 5);
+    IoEvent event{};
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    REQUIRE_EQ(event.result, 5);
+    f.conns[0].upstream_recv_buf.reset();
+
+    REQUIRE(f.park(0));
+    CHECK_EQ(f.pool.idle_count.load(), 1u);
+    CHECK(f.backend.stable_upstream[fd].registered);
+    CHECK_FALSE(f.backend.stable_upstream[fd].idle_probe_pending);
+    CHECK_GE(fcntl(fd, F_GETFD), 0);
+    REQUIRE_EQ(f.borrow(1), fd);
+    REQUIRE(f.backend.add_recv_upstream(fd, 1, f.conns[1].upstream_episode));
+    REQUIRE_EQ(::send(f.peer, "again", 5, MSG_NOSIGNAL), 5);
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(event.conn_id, 1u);
+    CHECK_EQ(event.result, 5);
+    CHECK_EQ(memcmp(f.conns[1].upstream_recv_buf.data(), "again", 5), 0);
+}
+
 TEST(epoll_accept_edge, fd_exhaustion_retries_on_timer_without_another_connection) {
     const pid_t child = fork();
     REQUIRE(child >= 0);
@@ -578,6 +640,40 @@ TEST(epoll_accept_edge, fd_exhaustion_retries_on_timer_without_another_connectio
     REQUIRE_EQ(waitpid(child, &status, 0), child);
     REQUIRE(WIFEXITED(status));
     CHECK_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(epoll_accept_edge, chained_pending_completions_yield_to_bounded_accepts) {
+    AcceptEpollFixture f;
+    REQUIRE(f.init());
+    f.backend.accept_io_budget = 3;
+
+    IoEvent stale{};
+    stale.conn_id = 3;
+    stale.type = IoEventType::UpstreamRecv;
+    stale.upstream_episode = 1;
+    f.backend.pending_completions[0] = stale;
+    f.backend.pending_count = 1;
+    IoEvent event{};
+    CHECK_EQ(f.backend.wait(&event, 1, nullptr, 0), 0u);
+    CHECK_EQ(f.backend.accept_io_budget, 3u);
+
+    const u8 byte = 's';
+    for (u32 completion = 0; completion < 3; ++completion) {
+        REQUIRE(f.backend.add_send(f.send_pair[0], 0, &byte, 1));
+        REQUIRE_EQ(f.backend.wait(&event, 1, nullptr, 0), 1u);
+        CHECK_EQ(event.type, IoEventType::Send);
+        CHECK_EQ(f.backend.accept_io_budget, 2u - completion);
+    }
+
+    REQUIRE(f.backend.add_send(f.send_pair[0], 0, &byte, 1));
+    REQUIRE_EQ(f.backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.type, IoEventType::Accept);
+    REQUIRE(event.result >= 0);
+    f.accepted = event.result;
+    CHECK_EQ(f.backend.accept_io_budget, 2u * EpollBackend::kReadyBatch);
+    REQUIRE_EQ(f.backend.wait(&event, 1, nullptr, 0), 1u);
+    CHECK_EQ(event.type, IoEventType::Send);
+    CHECK_EQ(f.backend.accept_io_budget, 2u * EpollBackend::kReadyBatch - 1u);
 }
 
 TEST(epoll_stable_relay, same_registration_changes_consumer_without_reading_bytes) {

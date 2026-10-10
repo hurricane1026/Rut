@@ -321,8 +321,14 @@ void EpollBackend::park_stable_upstream(i32 fd, u32 pool_slot) {
         transport.pool_slot = pool_slot;
         // A terminal edge already consumed by the active owner will not be
         // delivered again merely because ownership moved into the idle pool.
-        if (transport.idle_probe_pending && stable_pool != nullptr)
-            stable_pool->discard_idle(pool_slot, fd);
+        if (transport.idle_probe_pending && stable_pool != nullptr) {
+            u8 probe = 0;
+            const ssize_t result = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+                stable_pool->discard_idle(pool_slot, fd);
+            else
+                transport.idle_probe_pending = false;
+        }
     }
 }
 
@@ -1337,6 +1343,9 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 continue;
             events[0] = {};
             events[0] = candidate;
+            if (study_accept_edge_trigger && accept_pending && !accept_retry_on_timer &&
+                accept_io_budget > 0)
+                --accept_io_budget;
             if (pending_count == 0)
                 pending_streak = 0;
             else if (pending_streak < kPendingBurstQuota)
@@ -1347,15 +1356,15 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         return 0;
     };
 
+    if (study_accept_edge_trigger && accept_pending && !accept_retry_on_timer &&
+        accept_io_budget == 0)
+        return drain_accept(events, max_events);
+
     if (pending_count == 0) {
         pending_streak = 0;
     } else if (pending_streak < kPendingBurstQuota) {
         return pop_pending(conns, max_conns);
     }
-
-    if (study_accept_edge_trigger && accept_pending && !accept_retry_on_timer &&
-        accept_io_budget == 0)
-        return drain_accept(events, max_events);
 
     u32 r = 0;
     epoll_event runnable_event = {};
