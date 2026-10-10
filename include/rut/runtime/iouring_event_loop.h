@@ -7359,6 +7359,9 @@ public:
         rearm_deferred_recvs(false);
     }
     u32 test_recv_rearm_count() const { return recv_rearm_count; }
+    bool test_use_one_shot_websocket_recv(const Connection& c) const {
+        return use_one_shot_websocket_recv(c);
+    }
 #endif
 
 public:

@@ -41652,6 +41652,29 @@ TEST(iouring_downstream_recv, cache_empty_ring_defers_until_ordinary_buffer_retu
     CHECK(conn.recv_armed);
     fixture.cleanup();
 }
+
+TEST(iouring_upstream_recv, cache_partial_capacity_and_terminate_keep_one_shot) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    auto& conn = *fixture.conn;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    conn.is_ws_tunnel = true;
+    conn.is_ws_terminate = true;
+    CHECK(loop.test_use_one_shot_websocket_recv(conn));
+    conn.is_ws_terminate = false;
+    CHECK(!loop.test_use_one_shot_websocket_recv(conn));
+
+    conn.upstream_recv_pause_rearm_pending = true;
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 2u;
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop.test_rearm_deferred_ws_cache_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK(conn.upstream_recv_armed);
+    fixture.cleanup();
+}
 #endif  // RUT_ENABLE_WEBSOCKET
 
 namespace {
