@@ -135,6 +135,7 @@ def main():
                     p99_increase_limit=args.p99_increase_limit, practical_rps_gain=.03,
                     screen_seconds=args.screen_seconds, confirm_seconds=args.confirm_seconds,
                     confirm_repeats=3, serial_frontends=True,
+                    skip_nginx=args.skip_nginx,
                     binaries={str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
                               for path in [args.rut, args.rut.with_name('rut-compile'), args.converter, args.wrk]})
     prior = out / 'study.json'

@@ -214,6 +214,11 @@ async def connect_ws(port):
               for line in header.split(b'\r\n')[1:] if b':' in line}
     if fields.get(b'sec-websocket-accept') != expected:
         raise ValueError('invalid upgrade accept')
+    if fields.get(b'upgrade', b'').lower() != b'websocket':
+        raise ValueError('invalid upgrade header')
+    connection_tokens = {token.strip().lower() for token in fields.get(b'connection', b'').split(b',')}
+    if b'upgrade' not in connection_tokens:
+        raise ValueError('invalid connection upgrade token')
     return reader, writer
 
 
@@ -221,14 +226,18 @@ async def ws_preflight(port):
     reader, writer = await connect_ws(port)
     writer.write(frame(b'probe', 9, True))
     await writer.drain()
-    assert await read_frame(reader, False) == (10, True, b'probe')
+    if await read_frame(reader, False) != (10, True, b'probe'):
+        raise ValueError('ping/pong preflight failed')
     writer.write(frame(b'first', 2, True, False) + frame(b'second', 0, True))
     await writer.drain()
-    assert await read_frame(reader, False) == (2, False, b'first')
-    assert await read_frame(reader, False) == (0, True, b'second')
+    if await read_frame(reader, False) != (2, False, b'first'):
+        raise ValueError('fragment preflight failed')
+    if await read_frame(reader, False) != (0, True, b'second'):
+        raise ValueError('fragment continuation preflight failed')
     writer.write(frame(struct.pack('!H', 1000), 8, True))
     await writer.drain()
-    assert await read_frame(reader, False) == (8, True, struct.pack('!H', 1000))
+    if await read_frame(reader, False) != (8, True, struct.pack('!H', 1000)):
+        raise ValueError('close preflight failed')
     writer.close()
     await writer.wait_closed()
 
@@ -259,7 +268,11 @@ def client_worker(cpu, args, output):
                         began = time.monotonic_ns()
                         writer.write(outgoing)
                         await writer.drain()
-                        opcode, final, body = await read_frame(reader, False)
+                        try:
+                            async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                                opcode, final, body = await read_frame(reader, False)
+                        except TimeoutError:
+                            break
                         if opcode != 2 or not final or body != expected:
                             raise ValueError('echo sequence or content mismatch')
                         sequence += 1
@@ -281,7 +294,7 @@ def client_worker(cpu, args, output):
                         await consume_stream(reader, args.size, fixed, args.chunks, began,
                                              measurement, deadline, counts, first, delivery,
                                              gaps, source_gaps)
-                if args.kind == 'websocket':
+                if args.kind == 'websocket' and time.monotonic() < deadline:
                     writer.write(frame(struct.pack('!H', 1000), 8, True))
                     await writer.drain()
                     opcode, _, _ = await read_frame(reader, False)

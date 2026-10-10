@@ -40,6 +40,20 @@ def direct_origin_port(args):
     return args.origin_port
 
 
+def valid_api_origin_records(records, expected_markers, fresh_downstream):
+    if fresh_downstream:
+        return (len(records) == len(expected_markers)
+                and [row[0] for row in records] == list(expected_markers))
+    return module_valid_origin_reuse(records, expected_markers)
+
+
+def module_valid_origin_reuse(records, expected_markers):
+    if not records or [row[0] for row in records] != list(expected_markers):
+        return False
+    return all(row[1] == records[0][1] and row[2] == records[0][2] + index
+               for index, row in enumerate(records))
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--engines", default="uring,nginx")
@@ -148,7 +162,8 @@ def main():
         logs = (self.out / "api-origin.log").read_text()
         (self.out / f"{self.active_label}-origin-reuse.log").write_text(logs)
         records = module.origin_reuse_records(logs, expected_markers)
-        if not module.valid_origin_reuse(records, expected_markers):
+        valid = valid_api_origin_records(records, expected_markers, fresh_downstream)
+        if not valid:
             raise ValueError("API origin reuse evidence did not match expected markers")
 
     module.Harness.verify_origin_reuse = verify_api_origin_reuse

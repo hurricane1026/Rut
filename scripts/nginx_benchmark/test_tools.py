@@ -71,6 +71,16 @@ class ToolsTest(unittest.TestCase):
         args = SimpleNamespace(origin_port=8704, front_port=8604)
         self.assertEqual(relay_compare.direct_origin_port(args), 8704)
 
+    def test_api_origin_fresh_close_accepts_valid_pooled_or_distinct_markers(self):
+        markers = ["close-0", "close-1"]
+        fresh = [(markers[0], 10, 1), (markers[1], 11, 1)]
+        pooled = [(markers[0], 10, 1), (markers[1], 10, 2)]
+        self.assertTrue(relay_compare.valid_api_origin_records(fresh, markers, True))
+        self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, True))
+        self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, False))
+        self.assertFalse(relay_compare.valid_api_origin_records(pooled[:1], markers, True))
+        self.assertFalse(relay_compare.valid_api_origin_records([pooled[1], pooled[0]], markers, True))
+
     def test_stream_deadline_allows_inflight_timeout_but_rejects_truncation(self):
         fixed = bytes((i * 29) & 255 for i in range(16))
 
