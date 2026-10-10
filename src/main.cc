@@ -541,25 +541,28 @@ static void configure_study_policy(Loop* loop) {
             for (char** item = environ; *item; ++item)
                 if (str_eq(*item, "RUT_STUDY_REQUEST_METADATA_PARSE_REUSE=on"))
                     loop->study_request_metadata_parse_reuse = true;
-            write_str(loop->study_request_metadata_parse_reuse
-                          ? "RUT_STUDY_REQUEST_METADATA_PARSE_REUSE mode=on\n"
-                          : "RUT_STUDY_REQUEST_METADATA_PARSE_REUSE mode=off\n");
+            if (report_study)
+                write_str(loop->study_request_metadata_parse_reuse
+                              ? "RUT_STUDY_REQUEST_METADATA_PARSE_REUSE mode=on\n"
+                              : "RUT_STUDY_REQUEST_METADATA_PARSE_REUSE mode=off\n");
         }
         if constexpr (requires { loop->study_request_policy_parse_reuse; }) {
             for (char** item = environ; *item; ++item)
                 if (str_eq(*item, "RUT_STUDY_REQUEST_POLICY_PARSE_REUSE=on"))
                     loop->study_request_policy_parse_reuse = true;
-            write_str(loop->study_request_policy_parse_reuse
-                          ? "RUT_STUDY_REQUEST_POLICY_PARSE_REUSE mode=on\n"
-                          : "RUT_STUDY_REQUEST_POLICY_PARSE_REUSE mode=off\n");
+            if (report_study)
+                write_str(loop->study_request_policy_parse_reuse
+                              ? "RUT_STUDY_REQUEST_POLICY_PARSE_REUSE mode=on\n"
+                              : "RUT_STUDY_REQUEST_POLICY_PARSE_REUSE mode=off\n");
         }
         if constexpr (requires { loop->study_request_policy_validation_reuse; }) {
             for (char** item = environ; *item; ++item)
                 if (str_eq(*item, "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE=on"))
                     loop->study_request_policy_validation_reuse = true;
-            write_str(loop->study_request_policy_validation_reuse
-                          ? "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE mode=on\n"
-                          : "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE mode=off\n");
+            if (report_study)
+                write_str(loop->study_request_policy_validation_reuse
+                              ? "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE mode=on\n"
+                              : "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE mode=off\n");
         }
         if constexpr (requires { loop->study_http_coalesce_close_response; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
@@ -581,17 +584,20 @@ static void configure_study_policy(Loop* loop) {
                 if (str_eq(*item, "RUT_STUDY_EPOLL_ACCEPT_BATCH=32"))
                     loop->backend.study_accept_batch_limit = 32;
             }
-            write_str("RUT_STUDY_EPOLL_ACCEPT_BATCH limit=");
-            write_u32(loop->backend.study_accept_batch_limit);
-            write_str("\n");
+            if (report_study) {
+                write_str("RUT_STUDY_EPOLL_ACCEPT_BATCH limit=");
+                write_u32(loop->backend.study_accept_batch_limit);
+                write_str("\n");
+            }
         }
         if constexpr (requires { loop->backend.study_stable_upstream_relay; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_EPOLL_STABLE_RELAY=on"))
                     loop->backend.study_stable_upstream_relay = true;
-            write_str(loop->backend.study_stable_upstream_relay
-                          ? "RUT_STUDY_EPOLL_STABLE_RELAY mode=on\n"
-                          : "RUT_STUDY_EPOLL_STABLE_RELAY mode=off\n");
+            if (report_study)
+                write_str(loop->backend.study_stable_upstream_relay
+                              ? "RUT_STUDY_EPOLL_STABLE_RELAY mode=on\n"
+                              : "RUT_STUDY_EPOLL_STABLE_RELAY mode=off\n");
         }
         if constexpr (requires { loop->backend.enable_stable_upstream_events(); }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
