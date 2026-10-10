@@ -119,8 +119,24 @@ struct WsSpliceExperiment {
     void finish_eof_close(Loop& loop, Connection& c) {
         auto& o = owners[c.id];
         if (!o.eof_closing) return;
-        for (auto& d : o.direction)
-            if (!d.eof || d.buffered != 0 || d.armed || d.cancel_owned) return;
+        for (u32 index = 0; index < 2; ++index) {
+            auto& d = o.direction[index];
+            if (!d.eof || d.buffered != 0) return;
+            if (d.armed || d.cancel_owned) {
+                if (d.armed && !d.cancel_owned) {
+                    const auto kType =
+                        d.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
+                    const u64 kTarget = encode_upstream_event_token(
+                        {c.id, kType, o.episode, static_cast<u8>(32 + index)});
+                    if (loop.backend.cancel_ws_splice_poll(
+                            kTarget, c.id, kType, static_cast<u8>(96 + index), o.episode)) {
+                        d.cancel_owned = true;
+                        ++c.pending_ops;
+                    }
+                }
+                return;
+            }
+        }
         loop.close_conn(c);
     }
     template <class Loop>

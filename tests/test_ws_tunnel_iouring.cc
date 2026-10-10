@@ -302,7 +302,19 @@ static void full_duplex_burst(test::TestCase* _tc,
             if (kCount == 0) usleep(1000);
         }
         REQUIRE(loop.ws_splice.owners[conn->id].direction[0].eof);
-        REQUIRE(conn->fd >= 0);
+        for (u32 i = 0; i < 1000 && conn->fd >= 0; ++i) {
+            IoEvent events[kMaxEventsPerWait]{};
+            const u32 kCount = loop.backend.wait(
+                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+            loop.dispatch_batch(events, kCount);
+            if (kCount == 0) usleep(1000);
+        }
+        if (conn->fd < 0) {
+            // First FIN is terminal after the already-buffered opposite pipe
+            // drains; do not inject a second reverse payload or FIN.
+            u8 probe = 0;
+            CHECK_EQ(recv(kClient.fd, &probe, sizeof(probe), MSG_DONTWAIT), 0);
+        } else {
         constexpr u32 kReply = 19;
         u8 reply[kReply];
         u32 reply_bytes = 0;
@@ -326,6 +338,7 @@ static void full_duplex_burst(test::TestCase* _tc,
             if (kCount == 0) usleep(1000);
         }
         REQUIRE(conn->fd < 0);
+        }
     } else
         loop.close_conn(*conn);
     for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
@@ -382,6 +395,42 @@ TEST(websocket, iouring_sync_send_short_write_suffix_and_slow_reader) {
                       false,
                       false,
                       true);
+}
+
+TEST(websocket, iouring_sync_send_reserves_suffix_before_direct_write) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.study_ws_sync_send = true;
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    const Peer kClient{downstream[1]}, kOrigin{upstream[1]};
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = downstream[0];
+    conn->upstream_fd = upstream[0];
+    REQUIRE(loop.alloc_upstream_buf(*conn));
+    conn->protocol = ConnProtocol::Http11;
+    conn->state = ConnState::Sending;
+    conn->upstream_episode = 1;
+    conn->is_ws_tunnel = true;
+    static constexpr u8 kPayload[] = "short-write-reservation";
+    __builtin_memcpy(conn->recv_buf.write_ptr(), kPayload, sizeof(kPayload) - 1);
+    conn->recv_buf.commit(sizeof(kPayload) - 1);
+    const u32 head = __atomic_load_n(loop.backend.sq_head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(loop.backend.sq_tail, head + loop.backend.sq_ring_entries, __ATOMIC_RELEASE);
+    loop.backend.disable_full_sq_flush = true;
+    i32 sent = 0;
+    CHECK_FALSE(loop.try_ws_sync_send(
+        *conn, true, conn->recv_buf.data(), conn->recv_buf.len(), &sent));
+    CHECK_EQ(sent, 0);
+    u8 probe = 0;
+    errno = 0;
+    CHECK_EQ(recv(kOrigin.fd, &probe, sizeof(probe), MSG_DONTWAIT), -1);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+    conn->pending_ops = 0;
+    loop.close_conn(*conn);
 }
 TEST(websocket, iouring_sync_send_close_with_async_suffix_owned) {
     full_duplex_burst(_tc,

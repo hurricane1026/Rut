@@ -3596,6 +3596,9 @@ public:
         if (source != buffer.data() || length != buffer.len() ||
             (!kCached && (upstream ? c.recv_armed : c.upstream_recv_armed)))
             return false;
+        // A short direct write must be followed by an owned async suffix.
+        // Reserve that completion SQE before sending any irreversible bytes.
+        if (!backend.sq_has_room()) return false;
         ++study_ws_sync_attempts;
         if (kCached) ++study_ws_sync_cached;
         const bool kSampled = backend.study_io_stats && (++study_splice_calls[1] & 63u) == 0;
