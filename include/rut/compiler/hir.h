@@ -15,6 +15,7 @@
 #include "rut/compiler/diagnostic.h"
 #include <deque>
 #include <string>
+#include <sys/mman.h>
 
 namespace rut {
 
@@ -1398,6 +1399,8 @@ struct HirGeneratedName {
     HirGeneratedName* next = nullptr;
     char* text = nullptr;
     u32 len = 0;
+    bool mapped = false;
+    bool mapped_node = false;
 };
 
 // Owns the generated function names of one analysis tree. The root module owns
@@ -1419,8 +1422,14 @@ struct HirGeneratedNames {
         HirGeneratedName* node = head;
         while (node != nullptr) {
             HirGeneratedName* next = node->next;
-            delete[] node->text;
-            delete node;
+            if (node->mapped)
+                munmap(node->text, node->len);
+            else
+                delete[] node->text;
+            if (node->mapped_node)
+                munmap(node, sizeof(HirGeneratedName));
+            else
+                delete node;
             node = next;
         }
         delete this;

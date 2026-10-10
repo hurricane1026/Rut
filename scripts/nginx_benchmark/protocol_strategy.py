@@ -130,6 +130,8 @@ def summarize(rows):
                          and row['engine'] == engine and row['policy'] == policy]
                 if len(group) < 3:
                     continue
+                frontend_cpu = [row.get('frontend_cpu_observation_pct') for row in group
+                                 if row.get('frontend_cpu_observation_pct') is not None]
                 metric = 'rtt_us' if case['kind'] == 'websocket' else 'delivery_us'
                 item = dict(case=case['name'], engine=engine, policy=policy,
                             rate=statistics.median(row['messages_per_second'] for row in group),
@@ -139,8 +141,10 @@ def summarize(rows):
                                         max(row['messages_per_second'] for row in group)],
                             p99_range_us=[min(row[metric]['p99_us'] for row in group),
                                           max(row[metric]['p99_us'] for row in group)],
-                            origin_cpu_pct=statistics.median(row['origin_cpu_pct'] for row in group),
-                            frontend_cpu_pct=statistics.median(row['frontend_cpu_pct'] for row in group))
+                            origin_cpu_observation_pct=statistics.median(
+                                row['origin_cpu_observation_pct'] for row in group),
+                            frontend_cpu_observation_pct=(statistics.median(frontend_cpu)
+                                                          if frontend_cpu else None))
                 if case['kind'] == 'streaming':
                     item['first_p99_us'] = statistics.median(row['first_us']['p99_us'] for row in group)
                     item['source_gap_p99_us'] = statistics.median(row['source_gap_us']['p99_us'] for row in group)
@@ -188,6 +192,11 @@ def main():
     args = parser.parse_args()
     if args.connections_per_client < 1 or args.repeats < 1:
         parser.error('connections and repeats must be positive')
+    if not args.smoke and args.repeats < 3:
+        parser.error('non-smoke studies require at least three repeats')
+    cases = [case for case in CASES if not args.cases or case['name'] in args.cases]
+    if args.tcpkali2 and any(case['kind'] != 'websocket' for case in cases):
+        parser.error('--tcpkali2 requires a WebSocket-only --cases selection')
     out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
     spec = importlib.util.spec_from_file_location('runtime_benchmark', args.harness)
     harness = importlib.util.module_from_spec(spec); spec.loader.exec_module(harness)
@@ -227,11 +236,7 @@ def main():
     env = dict(os.environ); env.pop('DOCKER_HOST', None)
     if args.tcpkali2:
         env['TCPKALI2_BENCH_FULL_LATENCY'] = '1'; env['TCPKALI2_BENCH_VERIFY'] = '1'
-    cases = [case for case in CASES if not args.cases or case['name'] in args.cases]
-
     for case in cases:
-        if args.tcpkali2 and case['kind'] != 'websocket':
-            raise RuntimeError('tcpkali2 is only used for WebSocket cases')
         # Protocol paths do not enter Content-Length body splice. current and
         # throughput have identical effective settings, so compare three batches.
         configurations = [('direct-origin', 'current')]
@@ -343,7 +348,7 @@ def main():
                         if case['kind'] == 'websocket':
                             subprocess.run(fixture + ['preflight', '--port', str(port)], check=True, timeout=10, env=env)
                         usage_started = time.monotonic()
-                        before, _ = harness.proc_usage(frontend_pid)
+                        before, _ = harness.proc_usage(frontend_pid) if engine != 'direct-origin' else (None, None)
                         origin_before, _ = harness.proc_usage(origin.pid)
                         client_command = fixture + ['client', '--port', str(port), '--cpus', args.client_cpus,
                                                     '--connections', str(args.connections_per_client), '--duration', str(args.duration),
@@ -364,7 +369,7 @@ def main():
                             row = tcpkali2_result(native_csv, case, manifest['connections'], args.duration,
                                                 client_usage, args.client_cpus)
                             result_file.write_text(json.dumps(row, indent=2) + '\n')
-                        after, _ = harness.proc_usage(frontend_pid)
+                        after, _ = harness.proc_usage(frontend_pid) if engine != 'direct-origin' else (None, None)
                         origin_after, _ = harness.proc_usage(origin.pid)
                         usage_seconds = time.monotonic() - usage_started
                         row = json.loads(result_file.read_text())
@@ -374,8 +379,10 @@ def main():
                                    ws_segment=manifest['ws_segment'] if engine == 'uring' else None,
                                    ws_calls=manifest['ws_calls'] if engine == 'uring' else None,
                                    cpu_observation_seconds=usage_seconds,
-                                   frontend_cpu_pct=100 * (after - before) / usage_seconds,
-                                   origin_cpu_pct=100 * (origin_after - origin_before) / usage_seconds)
+                                   frontend_cpu_observation_pct=(100 * (after - before) / usage_seconds
+                                                                 if before is not None else None),
+                                   origin_cpu_observation_pct=100 * (origin_after - origin_before) / usage_seconds,
+                                   cpu_observation_scope='setup+warmup+measurement+teardown')
                         result_file.write_text(json.dumps(row, indent=2) + '\n')
                 rows.append(row)
                 (out / 'measurements.json').write_text(json.dumps(rows, indent=2) + '\n')

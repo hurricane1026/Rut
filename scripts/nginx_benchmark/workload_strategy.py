@@ -137,7 +137,8 @@ def main():
                     confirm_repeats=3, serial_frontends=True,
                     skip_nginx=args.skip_nginx,
                     binaries={str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
-                              for path in [args.rut, args.rut.with_name('rut-compile'), args.converter, args.wrk]})
+                              for path in [args.rut, args.rut.with_name('rut-compile'), args.converter, args.wrk,
+                                           args.relay_script, args.relay_script.with_name('api_origin.py')]})
     prior = out / 'study.json'
     if prior.exists() and json.loads(prior.read_text()) != manifest:
         raise RuntimeError('study manifest changed; use a new output directory')

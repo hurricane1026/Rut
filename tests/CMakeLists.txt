@@ -773,6 +773,14 @@ target_include_directories(test_frontend PRIVATE
 add_test(NAME test_frontend COMMAND test_frontend)
 set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler")
 
+add_executable(test_hir_generated_names_lifetime test_hir_generated_names_lifetime.cc)
+target_include_directories(test_hir_generated_names_lifetime PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_hir_generated_names_lifetime COMMAND test_hir_generated_names_lifetime)
+set_tests_properties(test_hir_generated_names_lifetime PROPERTIES LABELS "unit;compiler")
+
 add_executable(test_listener test_listener.cc
     ${PROJECT_SOURCE_DIR}/src/runtime/socket.cc
     ${PROJECT_SOURCE_DIR}/src/placement_new.cc)

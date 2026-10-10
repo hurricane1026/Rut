@@ -114,6 +114,18 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("select no runnable configurations", result.stderr)
 
+    def test_protocol_cli_rejects_incompatible_cases_and_short_non_smoke(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = [sys.executable, str(Path(protocol_strategy.__file__)),
+                    "--output", directory, "--rut", "/bin/true",
+                    "--harness", str(Path(run.__file__))]
+            incompatible = subprocess.run(base + ["--tcpkali2", "/bin/true"], capture_output=True, text=True)
+            short = subprocess.run(base + ["--repeats", "2"], capture_output=True, text=True)
+        self.assertEqual(incompatible.returncode, 2)
+        self.assertIn("WebSocket-only", incompatible.stderr)
+        self.assertEqual(short.returncode, 2)
+        self.assertIn("at least three repeats", short.stderr)
+
     def test_protocol_manifest_records_selection_filters(self):
         args = SimpleNamespace(cases=["websocket-bulk-64k", "websocket-interactive-64"],
                                engines=["nginx"], policies=["current"], smoke=True)
@@ -121,6 +133,19 @@ class ToolsTest(unittest.TestCase):
             "cases_filter": ["websocket-bulk-64k", "websocket-interactive-64"],
             "engines_filter": ["nginx"], "policies_filter": ["current"], "smoke": True,
         })
+
+    def test_protocol_summary_labels_full_cpu_observation(self):
+        case = protocol_strategy.CASES[0]
+        rows = [dict(case=case, engine="nginx", policy="current", messages_per_second=100,
+                     received_mib_per_second=1, rtt_us=dict(p99_us=10),
+                     origin_cpu_observation_pct=12, frontend_cpu_observation_pct=34)
+                for _ in range(3)]
+        summary = protocol_strategy.summarize(rows)[0]
+        self.assertEqual(summary["origin_cpu_observation_pct"], 12)
+        self.assertEqual(summary["frontend_cpu_observation_pct"], 34)
+        self.assertNotIn("origin_cpu_pct", summary)
+        self.assertNotIn("frontend_cpu_pct", summary)
+        self.assertNotIn("cpu_measurement_seconds", summary)
 
     def test_strategy_requires_repeats_and_guards_tail_latency(self):
         rows = []

@@ -1753,19 +1753,40 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
         store = new (std::nothrow) HirGeneratedNames;
         if (store == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
     }
-    auto* buf = new (std::nothrow) char[len];
-    if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
+    bool mapped = false;
+    char* buf = nullptr;
+    if (len >= 4096) {
+        void* region =
+            mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region == MAP_FAILED) return frontend_error(FrontendError::OutOfMemory, {});
+        buf = static_cast<char*>(region);
+        mapped = true;
+    } else {
+        buf = new (std::nothrow) char[len];
+        if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
+    }
     u32 off = 0;
     for (u32 i = 0; i < segment_count; i++) {
         for (u32 j = 0; j < segments[i].len; j++) buf[off++] = segments[i].ptr[j];
     }
-    auto* node = new (std::nothrow) HirGeneratedName;
+    void* node_region = mmap(nullptr,
+                             sizeof(HirGeneratedName),
+                             PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS,
+                             -1,
+                             0);
+    auto* node = node_region == MAP_FAILED ? nullptr : static_cast<HirGeneratedName*>(node_region);
     if (node == nullptr) {
-        delete[] buf;
+        if (mapped)
+            munmap(buf, len);
+        else
+            delete[] buf;
         return frontend_error(FrontendError::OutOfMemory, {});
     }
     node->text = buf;
     node->len = len;
+    node->mapped = mapped;
+    node->mapped_node = true;
     node->next = store->head;
     store->head = node;
     return Str{buf, len};

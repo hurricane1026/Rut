@@ -184,33 +184,48 @@ async fn run_pingpong(
             return Ok(());
         }
 
-        match read.next().await {
-            Some(Ok(Message::Binary(data))) => {
-                if verify && data.as_ref() != payload.as_ref() {
-                    log_error!(stats, config, "WebSocket echo payload mismatch");
+        loop {
+            match read.next().await {
+                Some(Ok(Message::Ping(data))) => {
+                    if let Err(error) = write.send(Message::Pong(data)).await {
+                        log_error!(stats, config, "WebSocket pong error: {}", error);
+                        stats.record_connection_error();
+                        return Ok(());
+                    }
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Binary(data))) => {
+                    if verify && data.as_ref() != payload.as_ref() {
+                        log_error!(stats, config, "WebSocket echo payload mismatch");
+                        stats.record_connection_error();
+                        return Ok(());
+                    }
+                    local_stats.record_responses(
+                        1,
+                        payload.len(),
+                        data.len(),
+                        sent_at.elapsed().as_micros().max(1) as u64,
+                    );
+                    sequence = sequence.wrapping_add(1);
+                    pacer.advance(1);
+                    break;
+                }
+                Some(Ok(_)) => {
+                    log_error!(stats, config, "Unexpected WebSocket data frame");
                     stats.record_connection_error();
                     return Ok(());
                 }
-                local_stats.record_responses(
-                    1,
-                    payload.len(),
-                    data.len(),
-                    sent_at.elapsed().as_micros().max(1) as u64,
-                );
-                sequence = sequence.wrapping_add(1);
-                pacer.advance(1);
-            }
-            Some(Ok(_)) => {}
-            Some(Err(error)) => {
-                log_error!(stats, config, "WebSocket receive error: {}", error);
-                stats.record_connection_error();
-                return Ok(());
-            }
-            None => {
-                if !stats.is_shutting_down() {
+                Some(Err(error)) => {
+                    log_error!(stats, config, "WebSocket receive error: {}", error);
                     stats.record_connection_error();
+                    return Ok(());
                 }
-                return Ok(());
+                None => {
+                    if !stats.is_shutting_down() {
+                        stats.record_connection_error();
+                    }
+                    return Ok(());
+                }
             }
         }
     }
@@ -356,6 +371,10 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
             let first = ws.next().await.unwrap().unwrap();
+            ws.send(tungstenite::Message::Ping(Bytes::from_static(b"control")))
+                .await
+                .unwrap();
+            let _ = ws.next().await;
             ws.send(first).await
                 .unwrap();
             let _ = ws.next().await;

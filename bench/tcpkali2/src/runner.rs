@@ -15,6 +15,14 @@ use std::time::Duration;
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time;
 
+fn handshakes_ready(success: u64, failures: u64, expected: u64) -> bool {
+    success.saturating_add(failures) >= expected
+}
+
+fn measurement_elapsed(start: time::Instant, end: time::Instant) -> Duration {
+    end.duration_since(start)
+}
+
 /// Asynchronous main function responsible for executing load tests
 ///
 /// # Arguments
@@ -91,6 +99,26 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
         }
     }
 
+    // Do not open the measurement window while handshakes are still joining.
+    // Every attempt reaches either success_connections or connection_errors
+    // before waiting on load_start.
+    let handshake_deadline = time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let total = stats.total_connections.load(Ordering::Relaxed);
+        if handshakes_ready(
+            stats.success_connections.load(Ordering::Relaxed),
+            stats.connection_errors.load(Ordering::Relaxed),
+            spawned_connections,
+        ) && total == spawned_connections {
+            break;
+        }
+        if time::Instant::now() >= handshake_deadline {
+            return Err(TcpKaliError::Timeout(
+                "timed out waiting for connection handshakes".into(),
+            ));
+        }
+        time::sleep(Duration::from_millis(1)).await;
+    }
     let _ = load_start_tx.send(true);
 
     // Warmup phase
@@ -100,13 +128,13 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
     let _ = benchmark_start_tx.send(Some(start_time));
 
     // Execute benchmark
-    execute_benchmark(&config, &stats, &mut tasks).await;
+    let measurement_end = execute_benchmark(&config, &stats, &mut tasks).await;
 
     if let Some(stats_printer) = stats_printer {
         stats_printer.abort();
     }
 
-    let elapsed = start_time.elapsed();
+    let elapsed = measurement_elapsed(start_time, measurement_end);
 
     // Output statistical results
     Stats::print_final_stats(&stats, elapsed, !config.quiet);
@@ -208,12 +236,13 @@ async fn execute_benchmark(
     config: &Config,
     stats: &Arc<Stats>,
     tasks: &mut JoinSet<Result<(), TcpKaliError>>,
-) {
+) -> time::Instant {
     tokio::select! {
         _ = time::sleep(config.duration) => {}
         _ = tokio::signal::ctrl_c() => {}
     }
 
+    let measurement_end = time::Instant::now();
     // Mark benchmark as shutting down
     stats.set_shutting_down();
     tasks.abort_all();
@@ -221,6 +250,7 @@ async fn execute_benchmark(
     while let Some(result) = tasks.join_next().await {
         report_task_result(result, config.quiet);
     }
+    measurement_end
 }
 
 fn report_task_result(result: Result<Result<(), TcpKaliError>, JoinError>, quiet: bool) {
@@ -228,5 +258,27 @@ fn report_task_result(result: Result<Result<(), TcpKaliError>, JoinError>, quiet
         Ok(Err(error)) if !quiet => eprintln!("Task error: {}", error),
         Err(error) if !error.is_cancelled() && !quiet => eprintln!("Task join error: {}", error),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handshakes_ready, measurement_elapsed};
+    use tokio::time::{Duration, Instant};
+
+    #[test]
+    fn warmup_gate_waits_for_every_handshake_attempt() {
+        assert!(!handshakes_ready(2, 0, 3));
+        assert!(handshakes_ready(2, 1, 3));
+        assert!(handshakes_ready(0, 3, 3));
+    }
+
+    #[tokio::test]
+    async fn elapsed_stops_at_measurement_boundary_before_teardown() {
+        let start = Instant::now();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let end = Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(measurement_elapsed(start, end) < Duration::from_millis(15));
     }
 }
