@@ -248,6 +248,20 @@ void EpollBackend::bind_stable_pool(UpstreamPool* pool) {
     if (stable_upstream.data() == nullptr || pool == nullptr) return;
     stable_pool = pool;
     pool->idle_close_ctx = this;
+    pool->idle_reuse_probe_required = [](void* context, i32 fd, u32 slot) {
+        auto* backend = static_cast<EpollBackend*>(context);
+        if (fd < 0 || static_cast<u32>(fd) >= kStableFdCapacity) return true;
+        const auto& transport = backend->stable_upstream[fd];
+        if (!transport.registered || !transport.idle || transport.pool_slot != slot ||
+            transport.idle_probe_pending || transport.version == 0xffffffffu)
+            return true;
+        // A harvested idle edge must be checked before changing its owner.
+        for (u32 i = backend->ready_head; i < backend->ready_count; ++i)
+            if (backend->ready_slot[i] == (kStableReadySlotBit | static_cast<u32>(fd)) &&
+                backend->ready_gen[i] == transport.version)
+                return true;
+        return false;
+    };
     pool->before_idle_close = [](void* context, i32 fd) {
         auto* backend = static_cast<EpollBackend*>(context);
         if (fd < 0 || static_cast<u32>(fd) >= kStableFdCapacity ||

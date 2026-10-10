@@ -52,6 +52,7 @@ struct UpstreamPool {
     std::atomic<u32> idle_count{0};
     void* idle_close_ctx = nullptr;
     void (*before_idle_close)(void*, i32) = nullptr;
+    bool (*idle_reuse_probe_required)(void*, i32, u32) = nullptr;
 
     void close_idle_fd(i32 fd) {
         if (before_idle_close != nullptr) before_idle_close(idle_close_ctx, fd);
@@ -113,12 +114,15 @@ struct UpstreamPool {
     }
 
     // Borrow a reusable idle fd for the given endpoint, or -1 if none is live.
-    // Each candidate is liveness-probed with a non-blocking MSG_PEEK: a socket the
+    // Without an idle event watcher, candidates are checked with MSG_PEEK: a socket the
     // backend already closed (EOF) or errored is closed and skipped, and one with
     // unexpected pending bytes (a desynced/half-pipelined socket) is discarded too
     // — only an EAGAIN (nothing buffered, still open) socket is handed back. This
     // catches the common idle-timeout race before any request bytes are sent; the
     // residual probe-vs-send race is handled by the caller's idempotent resend.
+    // An idle watcher may skip probing only when it owns the exact pool slot and
+    // has no known readiness. Event-versus-borrow races still require the caller
+    // to handle upstream failure; even a synchronous probe cannot prevent them.
     // Candidates are tried most recently parked first (the likeliest to be live).
     i32 take_idle(u16 upstream_id, u8 backend_idx) {
         if (idle_count.load(std::memory_order_acquire) == 0) return -1;
@@ -130,7 +134,10 @@ struct UpstreamPool {
                 continue;
             }
             const i32 fd = c.fd;
+            const bool probe_required = idle_reuse_probe_required == nullptr ||
+                                        idle_reuse_probe_required(idle_close_ctx, fd, i);
             release_slot(i);
+            if (!probe_required) return fd;
             char probe;
             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy

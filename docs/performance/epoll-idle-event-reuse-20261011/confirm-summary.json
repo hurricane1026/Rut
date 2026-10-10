@@ -1,0 +1,134 @@
+[
+  {
+    "campaign": "proxy-keepalive-1024-r0-before",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 74576.6795543596,
+    "p99_us": 1935.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r0-after",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 75437.1018128849,
+    "p99_us": 1921.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r1-after",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 73265.43556746405,
+    "p99_us": 1958.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r1-before",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 72704.76476013148,
+    "p99_us": 1908.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r2-before",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 73350.85444985153,
+    "p99_us": 1951.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r2-after",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 74607.59208880624,
+    "p99_us": 1894.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  }
+]
