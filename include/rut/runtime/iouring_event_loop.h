@@ -3610,12 +3610,12 @@ public:
         }
         bool submitted = false;
         if (use_one_shot_websocket_recv(c)) {
-            const u32 available = c.recv_buf.write_avail();
-            const u32 maximum = kProvidedBufSize;
+            const u32 kAvailable = c.recv_buf.write_avail();
+            const u32 kMaximum = kProvidedBufSize;
             submitted = backend.add_recv_once(
                 c.fd,
                 c.id,
-                available < maximum ? available : maximum,
+                kAvailable < kMaximum ? kAvailable : kMaximum,
                 study_ws_poll_first && !c.is_ws_terminate && !c.is_ws_terminate_route);
             if (submitted && study_ws_poll_first && !c.is_ws_terminate && !c.is_ws_terminate_route)
                 ++study_ws_poll_first_arms;
@@ -4673,10 +4673,10 @@ public:
         }
         const bool kPollFirst = study_ws_poll_first && use_one_shot_websocket_recv(c) &&
                                 !c.is_ws_terminate && !c.is_ws_terminate_route;
-        const bool one_shot = use_one_shot_websocket_recv(c) || use_one_shot_upstream_recv(c);
+        const bool kOneShot = use_one_shot_websocket_recv(c) || use_one_shot_upstream_recv(c);
         bool submitted = false;
         bool direct = false;
-        if (one_shot) {
+        if (kOneShot) {
             const u32 available = c.upstream_recv_buf.write_avail();
             if (available == 0) return false;
             const bool kDirectWs = study_ws_direct_recv_limit != 0 &&
@@ -8810,7 +8810,7 @@ public:
                             // deliver a terminal the response pumps treat as fatal
                             // (header) or as already re-armed (body). This batch's
                             // buffers were returned before dispatch.
-                            const bool one_shot_ring_empty =
+                            const bool kOneShotRingEmpty =
                                 ev.provided_ring_empty && ev.result == -ENOBUFS &&
                                 (use_one_shot_upstream_recv(conn) || ws_recv_cache_active(conn));
                             // A torn-down h2-proxy episode's recv terminal has now drained;
@@ -8838,7 +8838,7 @@ public:
                                 this->close_conn(conn);
                                 break;
                             }
-                            if (one_shot_ring_empty) {
+                            if (kOneShotRingEmpty) {
                                 if (!this->submit_recv_upstream(conn)) this->close_conn(conn);
                                 break;
                             }

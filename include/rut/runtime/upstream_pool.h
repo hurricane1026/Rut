@@ -150,14 +150,14 @@ struct UpstreamPool {
     // Create a non-blocking upstream socket. Returns fd on success, -1 on failure.
     inline static std::atomic<bool> study_tcp_nodelay{false};
     static i32 create_socket() {
-        const i32 fd = platform::stream_socket();
-        if (fd >= 0 && study_tcp_nodelay.load(std::memory_order_relaxed)) {
-            const int one = 1;
-            const int saved_errno = errno;
-            (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-            errno = saved_errno;
+        const i32 kFd = platform::stream_socket();
+        if (kFd >= 0 && study_tcp_nodelay.load(std::memory_order_relaxed)) {
+            const int kOne = 1;
+            const int kSavedErrno = errno;
+            (void)::setsockopt(kFd, IPPROTO_TCP, TCP_NODELAY, &kOne, sizeof(kOne));
+            errno = kSavedErrno;
         }
-        return fd;
+        return kFd;
     }
 
 private:

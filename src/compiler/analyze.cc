@@ -9758,23 +9758,25 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         // bytes into the root owned-strings store so a byte-literal body in an
         // imported file does not outlive that file's temporary AstFile pool.
         if (stmt.workload_body_bytes != 0) {
-            const u32 count = stmt.workload_body_bytes;
-            if (count > 1048576 || g_analyze_owned_buffers == nullptr ||
+            const u32 kCount = stmt.workload_body_bytes;
+            if (kCount > 1048576 || g_analyze_owned_buffers == nullptr ||
                 (*g_analyze_owned_buffers != nullptr &&
-                 (*g_analyze_owned_buffers)->workload_bytes > 16777216 - count))
+                 (*g_analyze_owned_buffers)->workload_bytes > 16777216 - kCount))
                 return frontend_error(FrontendError::TooManyItems, stmt.span);
             MappedArray<u8> payload;
-            if (!payload.init(count)) return frontend_error(FrontendError::TooManyItems, stmt.span);
-            for (u32 i = 0; i < count; ++i) {
-                const u32 block = i / 4096;
-                const u32 offset = i % 4096;
-                payload[i] = static_cast<u8>(offset < 4 ? (block >> (offset * 8)) & 255
-                                                        : (block * 17 + (offset - 4) * 29) & 255);
+            if (!payload.init(kCount))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            for (u32 i = 0; i < kCount; ++i) {
+                const u32 kBlock = i / 4096;
+                const u32 kOffset = i % 4096;
+                payload[i] =
+                    static_cast<u8>(kOffset < 4 ? (kBlock >> (kOffset * 8)) & 255
+                                                : (kBlock * 17 + (kOffset - 4) * 29) & 255);
             }
             auto body =
-                intern_owned_response_body({reinterpret_cast<const char*>(payload.data()), count});
+                intern_owned_response_body({reinterpret_cast<const char*>(payload.data()), kCount});
             if (!body) return core::make_unexpected(body.error());
-            (*g_analyze_owned_buffers)->workload_bytes += count;
+            (*g_analyze_owned_buffers)->workload_bytes += kCount;
             term.response_body = body.value();
         } else if (stmt.has_response_body) {
             auto body = intern_owned_response_body(stmt.response_body);

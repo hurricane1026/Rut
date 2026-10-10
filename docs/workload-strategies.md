@@ -191,3 +191,18 @@ throughput and increases RTT p99 by 27.5% versus the one-shot control. Keep it
 experimental. Direct block sends and fewer completion/copy stages remain
 follow-ups; no speedup is claimed for them. These are measured offline choices,
 not automatic per-URL runtime policies or global optima.
+
+## Latest WebSocket confirmation
+
+The [multishot comparison](benchmarks/websocket-multishot-sync-2026-10-10/README.md)
+uses a frozen study binary, one frontend core, four origin cores, and three
+rotated repeats with verified tcpkali2 payloads. At 64B, bounded-cache multishot
+receive with asynchronous sends measured 97,574 messages/s versus nginx 83,986
+(+16.2%), with p99 2.517ms versus 2.729ms. At 1KiB it measured 88,480 versus
+77,808 (+13.7%); p99 was effectively unchanged (2.767ms versus 2.777ms).
+The immediate-send combination was slower. At 16KiB the existing copy/splice
+profile remains substantially faster; do not enable multishot globally.
+
+All runtime strategy switches remain opt-in study settings. These measurements
+precede the integration onto current main; correctness checks were rerun on
+the integrated branch, but its final head was not performance-confirmed.

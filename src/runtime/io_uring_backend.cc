@@ -7,6 +7,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/response_read_deadline.h"
+#include <atomic>
 
 #include <errno.h>
 #include <linux/io_uring.h>
@@ -1288,8 +1289,8 @@ bool IoUringBackend::cache_ws_recv(Connection& conn, u16 buffer_id, const IoEven
     else
         ws_recv_cache_head = buffer_id;
     ws_recv_cache_tail = buffer_id;
-    const u32 owner = conn.id * 2u + (event.type == IoEventType::UpstreamRecv ? 1u : 0u);
-    ++ws_recv_cache_owners[owner].queued;
+    const u32 kOwner = conn.id * 2u + (event.type == IoEventType::UpstreamRecv ? 1u : 0u);
+    ++ws_recv_cache_owners[kOwner].queued;
     ++conn.pending_ops;  // pins the numeric slot until this cached completion is delivered
     ++ws_recv_cache_deferred;
     ++ws_recv_cache_count;
@@ -1312,36 +1313,36 @@ u32 IoUringBackend::drain_ws_recv_cache(IoEvent* events,
     u32 current = ws_recv_cache_head;
     while (current != 0xffffffffu && count < maximum) {
         auto& node = ws_recv_cache_nodes[current];
-        const IoEvent event = node.event;
-        if (event.conn_id >= max_conns) {
+        const IoEvent kEvent = node.event;
+        if (kEvent.conn_id >= max_conns) {
             fatal_error.store(EPROTO, std::memory_order_release);
             break;
         }
-        auto& conn = conns[event.conn_id];
-        const bool upstream = event.type == IoEventType::UpstreamRecv;
-        auto& owner = ws_recv_cache_owners[event.conn_id * 2u + (upstream ? 1u : 0u)];
-        auto& target = upstream ? conn.upstream_recv_buf : conn.recv_buf;
-        const bool stale =
-            conn.fd < 0 || (upstream && event.upstream_episode != conn.upstream_episode);
-        const bool busy = upstream ? conn.ws_upstream_send_pending : conn.ws_client_send_pending;
-        if (!stale && (owner.scan_generation == ws_recv_cache_generation || busy ||
-                       target.write_avail() < static_cast<u32>(event.result))) {
+        auto& conn = conns[kEvent.conn_id];
+        const bool kUpstream = kEvent.type == IoEventType::UpstreamRecv;
+        auto& owner = ws_recv_cache_owners[kEvent.conn_id * 2u + (kUpstream ? 1u : 0u)];
+        auto& target = kUpstream ? conn.upstream_recv_buf : conn.recv_buf;
+        const bool kStale =
+            conn.fd < 0 || (kUpstream && kEvent.upstream_episode != conn.upstream_episode);
+        const bool kBusy = kUpstream ? conn.ws_upstream_send_pending : conn.ws_client_send_pending;
+        if (!kStale && (owner.scan_generation == ws_recv_cache_generation || kBusy ||
+                        target.write_avail() < static_cast<u32>(kEvent.result))) {
             owner.scan_generation = ws_recv_cache_generation;
             previous = current;
             current = node.next;
             continue;
         }
-        if (!stale) {
+        if (!kStale) {
             __builtin_memcpy(target.write_ptr(),
                              provided_buffer_data(static_cast<u16>(current)),
-                             static_cast<u32>(event.result));
-            target.commit(static_cast<u32>(event.result));
+                             static_cast<u32>(kEvent.result));
+            target.commit(static_cast<u32>(kEvent.result));
         }
-        const u32 next = node.next;
+        const u32 kNext = node.next;
         if (previous == 0xffffffffu)
-            ws_recv_cache_head = next;
+            ws_recv_cache_head = kNext;
         else
-            ws_recv_cache_nodes[previous].next = next;
+            ws_recv_cache_nodes[previous].next = kNext;
         if (ws_recv_cache_tail == current) ws_recv_cache_tail = previous;
         node = {};
         --owner.queued;
@@ -1352,8 +1353,8 @@ u32 IoUringBackend::drain_ws_recv_cache(IoEvent* events,
         }
         --conn.pending_ops;
         return_buffer(static_cast<u16>(current));
-        events[count++] = event;
-        current = next;
+        events[count++] = kEvent;
+        current = kNext;
     }
     return count;
 }
@@ -1362,8 +1363,8 @@ u32 IoUringBackend::wait(
     IoEvent* events, u32 max_events, Connection* conns, u32 max_conns, bool wait_for_event) {
     if (failure_code() != 0) return 0;
     if (study_io_stats) ++study_wait_calls;
-    const u32 cached_count = drain_ws_recv_cache(events, max_events, conns, max_conns);
-    if (cached_count != 0) wait_for_event = false;
+    const u32 kCachedCount = drain_ws_recv_cache(events, max_events, conns, max_conns);
+    if (kCachedCount != 0) wait_for_event = false;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
 
@@ -1397,7 +1398,7 @@ u32 IoUringBackend::wait(
     u32 head = __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
     u32 tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
     u32 mask = *cq_ring_mask;
-    u32 count = cached_count;
+    u32 count = kCachedCount;
     u64 last_read_owner_token = 0;
     u32 last_read_owner_head = 0;
     bool last_read_owner_valid = false;
@@ -1750,20 +1751,20 @@ u32 IoUringBackend::wait(
                 const u8* src = provided_buffer_data(buf_id);
                 u32 avail = target_buf.write_avail();
                 auto& conn = conns[conn_id];
-                const bool ws_owner =
+                const bool kWsOwner =
                     ws_recv_cache_enabled && conn.is_ws_tunnel && !conn.is_ws_terminate &&
                     !conn.tls_active &&
                     (type == IoEventType::Recv || type == IoEventType::UpstreamRecv);
-                if (ws_owner) {
-                    const bool upstream = type == IoEventType::UpstreamRecv;
-                    const u32 owner = conn_id * 2u + (upstream ? 1u : 0u);
-                    const bool sending =
-                        upstream ? conn.ws_upstream_send_pending : conn.ws_client_send_pending;
+                if (kWsOwner) {
+                    const bool kUpstream = type == IoEventType::UpstreamRecv;
+                    const u32 kOwner = conn_id * 2u + (kUpstream ? 1u : 0u);
+                    const bool kSending =
+                        kUpstream ? conn.ws_upstream_send_pending : conn.ws_client_send_pending;
                     if (nbytes > provided_buffer_size(buf_id)) {
                         protocol_failure();
                         break;
                     }
-                    if (ws_recv_cache_owners[owner].queued != 0 || sending || nbytes > avail) {
+                    if (ws_recv_cache_owners[kOwner].queued != 0 || kSending || nbytes > avail) {
                         IoEvent cached{};
                         cached.conn_id = conn_id;
                         cached.type = type;

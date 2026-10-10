@@ -2,6 +2,8 @@
 #include "rut/platform/socket.h"
 #include "rut/runtime/access_log_startup.h"
 #include "rut/runtime/connection_capacity.h"
+#include "rut/runtime/upstream_pool.h"
+#include <atomic>
 #ifdef __linux__
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_backend.h"
@@ -394,22 +396,23 @@ static void configure_study_policy(Loop* loop) {
                       loop->study_event_batch_limit;
                       loop->study_relay_chunk_size;
                   }) {
-        extern char** environ;
+        extern char**
+            environ;  // NOLINT(readability-redundant-declaration): portable POSIX declaration
         const char* profile = "current";
         bool nodelay = false;
-        for (char** item = environ; *item != nullptr; ++item)
+        for (const char* const* item = environ; *item != nullptr; ++item)
             if (str_eq(*item, "RUT_STUDY_HTTP_NODELAY=on")) nodelay = true;
         UpstreamPool::study_tcp_nodelay.store(nodelay, std::memory_order_relaxed);
         write_str(nodelay ? "RUT_STUDY_HTTP_NODELAY mode=on\n"
                           : "RUT_STUDY_HTTP_NODELAY mode=off\n");
-        for (char** item = environ; *item != nullptr; ++item) {
+        for (const char* const* item = environ; *item != nullptr; ++item) {
             if (str_eq(*item, "RUT_STUDY_POLICY=latency")) profile = "latency";
             if (str_eq(*item, "RUT_STUDY_POLICY=balanced")) profile = "balanced";
             if (str_eq(*item, "RUT_STUDY_POLICY=current")) profile = "current";
             if (str_eq(*item, "RUT_STUDY_POLICY=throughput")) profile = "throughput";
         }
         if constexpr (requires { loop->backend.enable_ws_recv_cache(); }) {
-            for (char** item = environ; *item != nullptr; ++item) {
+            for (const char* const* item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_WS_RECV=cache") &&
                     !loop->backend.enable_ws_recv_cache())
                     loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
@@ -418,11 +421,11 @@ static void configure_study_policy(Loop* loop) {
                                                           : "RUT_STUDY_WS_RECV mode=once\n");
         }
         if constexpr (requires { loop->ws_splice.enable(loop->connection_capacity); }) {
-            for (char** item = environ; *item != nullptr; ++item)
+            for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_WS_SPLICE=on") &&
                     !loop->ws_splice.enable(loop->connection_capacity))
                     loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
-            for (char** item = environ; *item != nullptr; ++item) {
+            for (const char* const* item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_WS_COPY=on")) loop->ws_splice.copy_first = true;
                 if (str_eq(*item, "RUT_STUDY_WS_NODELAY=off")) loop->ws_splice.no_delay = false;
                 if (str_eq(*item, "RUT_STUDY_IO_STATS=on")) loop->backend.study_io_stats = true;
@@ -466,20 +469,20 @@ static void configure_study_policy(Loop* loop) {
             write_str(loop->ws_splice.enabled ? "RUT_STUDY_WS_SPLICE mode=on\n"
                                               : "RUT_STUDY_WS_SPLICE mode=off\n");
         }
-        const bool latency = str_eq(profile, "latency");
-        const bool balanced = str_eq(profile, "balanced");
-        const bool throughput = str_eq(profile, "throughput");
-        loop->study_event_batch_limit = latency ? 32u : (balanced ? 64u : kMaxEventsPerWait);
+        const bool kLatency = str_eq(profile, "latency");
+        const bool kBalanced = str_eq(profile, "balanced");
+        const bool kThroughput = str_eq(profile, "throughput");
+        loop->study_event_batch_limit = kLatency ? 32u : (kBalanced ? 64u : kMaxEventsPerWait);
         if constexpr (requires { loop->study_relay_turn_call_limit; }) {
-            loop->study_relay_chunk_size = (latency || balanced) ? 64u * 1024u : 128u * 1024u;
-            loop->study_relay_turn_call_limit = latency ? 8u : (throughput ? 32u : 16u);
+            loop->study_relay_chunk_size = (kLatency || kBalanced) ? 64u * 1024u : 128u * 1024u;
+            loop->study_relay_turn_call_limit = kLatency ? 8u : (kThroughput ? 32u : 16u);
             loop->study_relay_turn_byte_limit =
-                latency ? 512u * 1024u : (throughput ? 2u * 1024u * 1024u : 1024u * 1024u);
-            loop->ordinary_cq_wait_limit_ns = latency ? 20ull * 1000u : 80ull * 1000u;
-            loop->study_yield_enabled = !throughput;
+                kLatency ? 512u * 1024u : (kThroughput ? 2u * 1024u * 1024u : 1024u * 1024u);
+            loop->ordinary_cq_wait_limit_ns = kLatency ? 20ull * 1000u : 80ull * 1000u;
+            loop->study_yield_enabled = !kThroughput;
         } else if constexpr (requires { loop->study_relay_owner_call_limit; }) {
-            loop->study_relay_chunk_size = throughput ? 128u * 1024u : 64u * 1024u;
-            loop->study_relay_owner_call_limit = latency ? 2u : (throughput ? 8u : 4u);
+            loop->study_relay_chunk_size = kThroughput ? 128u * 1024u : 64u * 1024u;
+            loop->study_relay_owner_call_limit = kLatency ? 2u : (kThroughput ? 8u : 4u);
         }
         write_str("RUT_STUDY_POLICY profile=");
         write_str(profile);
@@ -1268,7 +1271,8 @@ int main(int argc, char** argv) {
     // Environment variable override: RUE_ACCESS_LOG_COMPRESS=1
     // getenv without stdlib — scan environ directly.
     {
-        extern char** environ;
+        extern char**
+            environ;  // NOLINT(readability-redundant-declaration): portable POSIX declaration
         static const char kEnv[] = "RUE_ACCESS_LOG_COMPRESS=1";
         for (char** e = environ; *e; e++) {
             if (str_eq(*e, kEnv)) {

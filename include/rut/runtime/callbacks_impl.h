@@ -10665,11 +10665,11 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     // both TCP legs so a partial final block does not wait for a delayed ACK.
     // The option is performance-only (AF_UNIX test transports do not support
     // it); preserve errno for callers that use synthetic events.
-    const int saved_errno = errno;
-    const int no_delay = 1;
-    (void)::setsockopt(conn.fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
-    (void)::setsockopt(conn.upstream_fd, IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
-    errno = saved_errno;
+    const int kSavedErrno = errno;
+    const int kNoDelay = 1;
+    (void)::setsockopt(conn.fd, IPPROTO_TCP, TCP_NODELAY, &kNoDelay, sizeof(kNoDelay));
+    (void)::setsockopt(conn.upstream_fd, IPPROTO_TCP, TCP_NODELAY, &kNoDelay, sizeof(kNoDelay));
+    errno = kSavedErrno;
     conn.is_ws_tunnel = true;
     conn.ws_client_send_pending = false;
     conn.ws_upstream_send_pending = false;

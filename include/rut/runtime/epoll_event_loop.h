@@ -409,8 +409,9 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
-            u32 n = backend.wait(events, study_event_batch_limit, conns, connection_capacity);
-            dispatch_batch(events, n);
+            const u32 kN =
+                backend.wait(events, study_event_batch_limit, conns, connection_capacity);
+            dispatch_batch(events, kN);
             poll_command();
             // poll_command may have installed a new config (hot reload); re-arm
             // timers now so a freshly activated `every: D` measures from the reload
@@ -834,7 +835,7 @@ public:
         // ready connections can run before this owner gets another turn.
         for (u32 calls = 0; calls < study_relay_owner_call_limit; ++calls) {
             const bool writing = r.segment_len != 0;
-            const u32 want =
+            const u32 kWant =
                 writing ? r.segment_len - r.segment_sent
                         : (c.resp_body_remaining < study_relay_chunk_size ? c.resp_body_remaining
                                                                           : study_relay_chunk_size);
@@ -844,20 +845,20 @@ public:
                                        nullptr,
                                        c.fd,
                                        nullptr,
-                                       want,
+                                       kWant,
                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK)
                             : ::splice(c.upstream_fd,
                                        nullptr,
                                        r.pipe_write,
                                        nullptr,
-                                       want,
+                                       kWant,
                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
             } while (n < 0 && errno == EINTR);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (!arm_epoll_splice(c, writing)) this->close_conn(c);
                 return;
             }
-            if (n <= 0 || static_cast<u32>(n) > want) {
+            if (n <= 0 || static_cast<u32>(n) > kWant) {
                 this->close_conn(c);
                 return;
             }
