@@ -715,6 +715,68 @@ TEST(epoll_stable, old_harvested_owner_is_dropped_before_socket_read) {
     CHECK_EQ(f.conns[1].upstream_recv_buf.data()[0], byte);
 }
 
+TEST(epoll_stable_edge, park_probes_terminal_event_remaining_in_harvested_batch) {
+    for (u32 terminal : {EPOLLIN, EPOLLRDHUP}) {
+        StableEpollFixture f;
+        REQUIRE(f.init(true));
+        const i32 upstream_fd = f.conns[0].upstream_fd;
+        i32 downstream[2];
+        REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, downstream), 0);
+        f.conns[0].fd = downstream[0];
+        f.conns[0].recv_buf.bind(f.buffers[0], sizeof(f.buffers[0]));
+        REQUIRE(f.backend.add_recv(downstream[0], 0));
+        const u8 byte = 'd';
+        REQUIRE_EQ(send(downstream[1], &byte, 1, 0), 1);
+        if (terminal == EPOLLIN)
+            REQUIRE_EQ(send(f.peer, "u", 1, 0), 1);
+        else
+            REQUIRE_EQ(shutdown(f.peer, SHUT_WR), 0);
+
+        const auto& downstream_interest = f.backend.fd_interest[0];
+        const auto& upstream_interest = f.backend.fd_interest[1];
+        f.backend.ready[0] = {EPOLLIN, {.u64 = downstream_interest.data}};
+        f.backend.ready_slot[0] = 0;
+        f.backend.ready_gen[0] = downstream_interest.gen;
+        f.backend.ready[1] = {terminal, {.u64 = upstream_interest.data}};
+        f.backend.ready_slot[1] = EpollBackend::kStableReadySlotBit | static_cast<u32>(upstream_fd);
+        f.backend.ready_gen[1] = f.backend.stable_upstream[upstream_fd].version;
+        f.backend.ready_head = 0;
+        f.backend.ready_count = 2;
+
+        IoEvent event{};
+        REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+        REQUIRE_EQ(event.type, IoEventType::Recv);
+        REQUIRE_EQ(event.result, 1);
+        REQUIRE(f.park(0));
+        CHECK_EQ(f.pool.idle_count.load(), 0u);
+        CHECK_FALSE(f.backend.stable_upstream[upstream_fd].registered);
+        CHECK_EQ(fcntl(upstream_fd, F_GETFD), -1);
+        CHECK_EQ(errno, EBADF);
+        close(downstream[0]);
+        close(downstream[1]);
+        f.conns[0].fd = -1;
+    }
+}
+
+TEST(epoll_stable_edge, unrelated_harvested_record_does_not_poison_idle_transport) {
+    for (bool wrong_fd : {false, true}) {
+        StableEpollFixture f;
+        REQUIRE(f.init(true));
+        const i32 fd = f.conns[0].upstream_fd;
+        f.backend.ready[0] = {EPOLLIN, {.u64 = f.backend.fd_interest[1].data}};
+        f.backend.ready_slot[0] =
+            EpollBackend::kStableReadySlotBit | static_cast<u32>(fd + (wrong_fd ? 1 : 0));
+        f.backend.ready_gen[0] = f.backend.stable_upstream[fd].version + (wrong_fd ? 0 : 1);
+        f.backend.ready_head = 0;
+        f.backend.ready_count = 1;
+
+        REQUIRE(f.park(0));
+        CHECK_EQ(f.pool.idle_count.load(), 1u);
+        CHECK(f.backend.stable_upstream[fd].registered);
+        CHECK_GE(fcntl(fd, F_GETFD), 0);
+    }
+}
+
 TEST(epoll_stable, idle_fin_and_unsolicited_bytes_discard_only_the_idle_socket) {
     for (u32 data = 0; data < 2; ++data) {
         StableEpollFixture f;

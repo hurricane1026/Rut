@@ -836,8 +836,23 @@ bool EpollBackend::detach_upstream(Connection& conn, i32* detached_fd) {
             retained = &transport;
     }
     if (retained != nullptr) {
-        retained->idle_probe_pending =
-            study_edge_trigger && edge_runnable[2 * conn.id + 1].read_eof;
+        // Readiness belongs to the active owner until the version advances
+        // below. Probe after parking if unread bytes or a terminal event are
+        // known locally or still waiting in the harvested batch.
+        bool idle_probe_pending =
+            study_edge_trigger &&
+            (edge_runnable[2 * conn.id + 1].read_ready || edge_runnable[2 * conn.id + 1].read_eof);
+        if (study_edge_trigger) {
+            const u32 stable_slot = kStableReadySlotBit | static_cast<u32>(fd);
+            for (u32 i = ready_head; i < ready_count; ++i) {
+                if (ready_slot[i] == stable_slot && ready_gen[i] == retained->version &&
+                    (ready[i].events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR))) {
+                    idle_probe_pending = true;
+                    break;
+                }
+            }
+        }
+        retained->idle_probe_pending = idle_probe_pending;
         // Keep the legacy detach's fence for both sides of this connection,
         // without invalidating the independent socket registration.
         for (u32 side = 0; side < 2; ++side) {
