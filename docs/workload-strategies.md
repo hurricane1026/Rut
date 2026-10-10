@@ -194,7 +194,7 @@ not automatic per-URL runtime policies or global optima.
 
 ## Latest WebSocket confirmation
 
-The [retained io_uring relay benchmark](benchmarks/iouring-relay-2026-10-10/README.md)
+The [retained WebSocket multishot comparison](benchmarks/websocket-multishot-sync-2026-10-10/README.md)
 uses a frozen study binary, one frontend core, four origin cores, and three
 rotated repeats with verified tcpkali2 payloads. At 64B, bounded-cache multishot
 receive with asynchronous sends measured 97,574 messages/s versus nginx 83,986

@@ -6,6 +6,7 @@ import io
 import json
 import os
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ import run
 import matrix
 import workload_strategy
 import protocol_workload
+import protocol_strategy
+import relay_compare
 
 from run import (
     Harness,
@@ -47,6 +50,57 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_api_origin_command_and_readiness_are_forwarded(self):
+        command = relay_compare.api_origin_command(
+            Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2
+        )
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[command.index("--port") + 1], "8704")
+        self.assertEqual(command[command.index("--cpus") + 1], "3,4")
+        self.assertEqual(command[command.index("--fragment-bytes") + 1], "16384")
+        relay_compare.wait_for_api_origin_ready(
+            io.StringIO("noise\nAPI_READY worker=0\nAPI_READY worker=1\n"), 2
+        )
+        with self.assertRaisesRegex(RuntimeError, "before readiness"):
+            relay_compare.wait_for_api_origin_ready(io.StringIO(""), 1)
+
+    def test_direct_origin_targets_origin_port(self):
+        args = SimpleNamespace(origin_port=8704, front_port=8604)
+        self.assertEqual(relay_compare.direct_origin_port(args), 8704)
+
+    def test_stream_deadline_allows_inflight_timeout_but_rejects_truncation(self):
+        fixed = bytes((i * 29) & 255 for i in range(16))
+
+        async def consume(raw, chunks, deadline):
+            reader = protocol_workload.asyncio.StreamReader()
+            if raw is not None:
+                reader.feed_data(raw)
+            if deadline == float("inf"):
+                reader.feed_eof()
+            counts = dict(messages=0, bytes=0)
+            values = ([], [], [], [])
+            return await protocol_workload.consume_stream(
+                reader, 16, fixed, chunks, time.monotonic(), 0,
+                deadline, counts, *values
+            )
+
+        complete = b"10\r\n" + struct.pack("!QI", 1, 0) + fixed[12:] + b"\r\n0\r\n\r\n"
+        self.assertFalse(protocol_workload.asyncio.run(consume(complete, 1, float("inf"))))
+        with self.assertRaisesRegex(ValueError, "invalid terminator"):
+            protocol_workload.asyncio.run(consume(b"1\r\na\r\n0\r\n\r\n", 1, float("inf")))
+        self.assertTrue(protocol_workload.asyncio.run(consume(None, 1, time.monotonic() + .01)))
+
+    def test_smoke_engine_filter_rejects_empty_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, str(Path(protocol_strategy.__file__)),
+                 "--output", directory, "--rut", "/bin/true",
+                 "--harness", str(Path(run.__file__)), "--smoke", "--engines", "nginx"],
+                capture_output=True, text=True
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("select no runnable configurations", result.stderr)
+
     def test_strategy_requires_repeats_and_guards_tail_latency(self):
         rows = []
         for policy, rate, tail in [('current', 100, 100), ('throughput', 150, 130),

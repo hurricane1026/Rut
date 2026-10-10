@@ -98,6 +98,33 @@ async def stream_records(reader, size):
             raise ValueError('invalid chunk framing')
 
 
+async def consume_stream(reader, size, fixed, chunks, began, measurement, deadline,
+                         counts, first, delivery, gaps, source_gaps):
+    sequence = 0
+    previous = previous_source = None
+    try:
+        async with asyncio.timeout(max(0, deadline - time.monotonic())):
+            async for body in stream_records(reader, size):
+                ended = time.monotonic_ns()
+                sent, index = struct.unpack('!QI', body[:12])
+                if index != sequence or body[12:] != fixed[12:]:
+                    raise ValueError('stream sequence or content mismatch')
+                if ended / 1e9 >= measurement and ended / 1e9 <= deadline:
+                    counts['messages'] += 1; counts['bytes'] += len(body)
+                    delivery.append((ended - sent) / 1000)
+                    if sequence == 0:
+                        first.append((ended - began) / 1000)
+                    if previous is not None:
+                        gaps.append((ended - previous) / 1000)
+                        source_gaps.append((sent - previous_source) / 1000)
+                previous = ended; previous_source = sent; sequence += 1
+    except TimeoutError:
+        return True
+    if sequence != chunks:
+        raise ValueError('truncated stream')
+    return False
+
+
 def percentiles(values):
     if not values:
         return dict(p50_us=None, p95_us=None, p99_us=None, max_us=None)
@@ -251,28 +278,9 @@ def client_worker(cpu, args, output):
                         header = await reader.readuntil(b'\r\n\r\n')
                         if not header.startswith(b'HTTP/1.1 200 ') or b'transfer-encoding: chunked' not in header.lower():
                             raise ValueError('invalid chunked response: ' + repr(header))
-                        sequence = 0; previous = None; previous_source = None
-                        timed_out = False
-                        try:
-                            async with asyncio.timeout(max(0, deadline - time.monotonic())):
-                                async for body in stream_records(reader, args.size):
-                                    ended = time.monotonic_ns()
-                                    sent, index = struct.unpack('!QI', body[:12])
-                                    if index != sequence or body[12:] != fixed[12:]:
-                                        raise ValueError('stream sequence or content mismatch')
-                                    if ended / 1e9 >= measurement and ended / 1e9 <= deadline:
-                                        counts['messages'] += 1; counts['bytes'] += len(body)
-                                        delivery.append((ended - sent) / 1000)
-                                        if sequence == 0:
-                                            first.append((ended - began) / 1000)
-                                        if previous is not None:
-                                            gaps.append((ended - previous) / 1000)
-                                            source_gaps.append((sent - previous_source) / 1000)
-                                    previous = ended; previous_source = sent; sequence += 1
-                        except TimeoutError:
-                            timed_out = True
-                        if not timed_out and sequence != args.chunks:
-                            raise ValueError('truncated stream')
+                        await consume_stream(reader, args.size, fixed, args.chunks, began,
+                                             measurement, deadline, counts, first, delivery,
+                                             gaps, source_gaps)
                 if args.kind == 'websocket':
                     writer.write(frame(struct.pack('!H', 1000), 8, True))
                     await writer.drain()

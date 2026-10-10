@@ -16,6 +16,26 @@ import threading
 import urllib.request
 
 
+def api_origin_command(source, port, cpus, payload, delay_ms, fragment_bytes, fragment_delay_ms):
+    return [sys.executable, str(source.with_name("api_origin.py")), "--port", str(port),
+            "--cpus", cpus, "--payload", str(payload), "--delay-ms", str(delay_ms),
+            "--fragment-bytes", str(fragment_bytes),
+            "--fragment-delay-ms", str(fragment_delay_ms)]
+
+
+def wait_for_api_origin_ready(stream, workers):
+    ready_workers = 0
+    while ready_workers < workers:
+        line = stream.readline()
+        if not line:
+            raise RuntimeError("API origin exited before readiness")
+        ready_workers += line.startswith("API_READY ")
+
+
+def direct_origin_port(args):
+    return args.origin_port
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--engines", default="uring,nginx")
@@ -81,21 +101,14 @@ def main():
             if options.origin_mode == "api":
                 payload = self.out / "api-payload.bin"
                 payload.write_bytes(module.expected_body("proxy", getattr(self.args, "body_size", None)))
-                argv = [sys.executable, str(source.with_name("api_origin.py")), "--port", str(port),
-                        "--cpus", options.origin_cpus, "--payload", str(payload),
-                        "--delay-ms", str(options.api_delay_ms),
-                        "--fragment-bytes", str(options.api_fragment_bytes),
-                        "--fragment-delay-ms", str(options.api_fragment_delay_ms)]
+                argv = api_origin_command(source, port, options.origin_cpus, payload,
+                                          options.api_delay_ms, options.api_fragment_bytes,
+                                          options.api_fragment_delay_ms)
                 child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          text=True)
                 self.origin_pid = child.pid
                 try:
-                    ready_workers = 0
-                    while ready_workers < len(options.origin_cpus.split(",")):
-                        line = child.stdout.readline()
-                        if not line:
-                            raise RuntimeError("API origin exited before readiness")
-                        ready_workers += line.startswith("API_READY ")
+                    wait_for_api_origin_ready(child.stdout, len(options.origin_cpus.split(",")))
                     yield child.pid
                 finally:
                     if child.poll() is None:
@@ -146,7 +159,7 @@ def main():
         frontend_live = True
         if engine == "direct-origin":
             saved_port = self.args.front_port
-            self.args.front_port = self.args.origin_port
+            self.args.front_port = direct_origin_port(self.args)
             try:
                 yield self.origin_pid
             finally:
