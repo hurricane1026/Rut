@@ -229,8 +229,12 @@ class ToolsTest(unittest.TestCase):
     def test_distinct_small_route_preserves_native_forward_policy(self):
         for policy in ("", ", request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection] }"):
             config = 'route GET "/proxy" { return forward(backend' + policy + ') }\n'
-            self.assertEqual(relay_compare.distinct_small_route(config),
-                             config.replace('"/proxy"', '"/small"'))
+            updated = relay_compare.distinct_small_route(config)
+            routes = updated.splitlines()
+            self.assertEqual(routes, [config.rstrip("\n"),
+                                      config.rstrip("\n").replace('"/proxy"', '"/small"')])
+            self.assertIn('route GET "/proxy"', updated)
+            self.assertIn('route GET "/small"', updated)
         with self.assertRaisesRegex(ValueError, "exactly one native /proxy route"):
             relay_compare.distinct_small_route('route GET "/other" { return forward(backend) }\n')
 

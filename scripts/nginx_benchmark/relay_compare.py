@@ -170,9 +170,16 @@ def small_nginx_location(location, kib):
 
 
 def distinct_small_route(config):
-    """Copy the generated proxy route's forwarding policy to the small URL."""
-    updated, count = re.subn(r'(?m)^route GET "/proxy"(?=\s)',
-                             'route GET "/small"', config)
+    """Keep the proxy route and add an adjacent small route with the same policy."""
+    route_pattern = re.compile(r'(?m)^([ \t]*route GET "/proxy"[^\r\n]*)(\r?\n|$)')
+
+    def add_small_route(match):
+        original = match.group(1)
+        newline = match.group(2)
+        small = original.replace('"/proxy"', '"/small"', 1)
+        return original + newline + small + newline
+
+    updated, count = route_pattern.subn(add_small_route, config)
     if count != 1:
         raise ValueError("expected exactly one native /proxy route")
     return updated
