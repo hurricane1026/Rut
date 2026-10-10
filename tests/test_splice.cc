@@ -977,6 +977,22 @@ TEST(epoll_stable, harvested_idle_readiness_and_reload_reject_idle_transport) {
     CHECK_EQ(reload.pool.idle_count.load(), 0u);
 }
 
+TEST(epoll_stable, backend_teardown_restores_pool_probe_fallback) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE(f.park(0));
+    REQUIRE(f.pool.idle_reuse_probe_required != nullptr);
+
+    // The pool outlives this backend during a shard/backend rebind.
+    f.backend.shutdown();
+    CHECK(f.pool.idle_reuse_probe_required == nullptr);
+    CHECK(f.pool.idle_close_ctx == nullptr);
+    CHECK_EQ(f.pool.take_idle(0, 0), fd);
+    CHECK_EQ(fcntl(fd, F_GETFD) >= 0, 1);
+    close(fd);
+}
+
 TEST(epoll_stable, generation_rejects_old_token_even_when_owner_version_matches) {
     StableEpollFixture f;
     REQUIRE(f.init());
