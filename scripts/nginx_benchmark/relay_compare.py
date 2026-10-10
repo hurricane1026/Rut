@@ -109,6 +109,31 @@ def validate_mixed_small_rate_scenarios(scenarios, enabled):
                          "proxy-keepalive; paced small probe is a proxy workload")
 
 
+def delegated_option(remaining, name, default=None):
+    for index, argument in enumerate(remaining):
+        if argument == name:
+            return remaining[index + 1] if index + 1 < len(remaining) else default
+        if argument.startswith(name + "="):
+            return argument.split("=", 1)[1]
+    return default
+
+
+def validate_direct_origin_options(engines, scenarios, remaining):
+    if "direct-origin" not in engines:
+        return
+    if any(scenario.startswith("static-") for scenario in scenarios):
+        raise ValueError("direct-origin supports proxy scenarios only")
+    if "proxy-keepalive" in scenarios and delegated_option(
+            remaining, "--native-origin-reuse", "on") == "off":
+        raise ValueError("direct-origin proxy-keepalive requires native origin reuse on")
+
+
+def validate_paced_tls(enabled, remaining):
+    if enabled and (delegated_option(remaining, "--tls-cert") is not None
+                    or delegated_option(remaining, "--tls-key") is not None):
+        raise ValueError("--mixed-small-rate currently supports plaintext HTTP only")
+
+
 def mixed_client_valid(sample):
     errors = sample.get("errors", {})
     return (sample.get("requests", 0) > 0
@@ -260,6 +285,8 @@ def main():
         scenarios = distinct_url_scenarios(remaining)
         validate_distinct_url_scenarios(scenarios, options.mixed_distinct_urls)
         validate_mixed_small_rate_scenarios(scenarios, bool(options.mixed_small_rate))
+        validate_direct_origin_options(engines, scenarios, remaining)
+        validate_paced_tls(bool(options.mixed_small_rate), remaining)
     except ValueError as error:
         parser.error(str(error))
     source = Path(__file__).with_name("run.py")
