@@ -258,6 +258,8 @@ pub struct Stats {
     pub success_connections: AtomicU64,
     /// Connections that completed the TCP or WebSocket transport handshake
     pub transport_connections: AtomicU64,
+    /// Attempts that failed before completing the transport handshake
+    pub transport_errors: AtomicU64,
     /// Attempts that reached a terminal initialization outcome
     pub initialized_connections: AtomicU64,
     /// Total requests
@@ -301,6 +303,7 @@ impl Stats {
             total_connections: AtomicU64::new(0),
             success_connections: AtomicU64::new(0),
             transport_connections: AtomicU64::new(0),
+            transport_errors: AtomicU64::new(0),
             initialized_connections: AtomicU64::new(0),
             total_requests: AtomicU64::new(0),
             total_bytes_sent: AtomicU64::new(0),
@@ -493,6 +496,7 @@ impl Stats {
 pub struct ConnectionInitialization<'a> {
     stats: &'a Stats,
     successful: bool,
+    transport_ready: bool,
 }
 
 impl<'a> ConnectionInitialization<'a> {
@@ -500,7 +504,12 @@ impl<'a> ConnectionInitialization<'a> {
         Self {
             stats,
             successful: false,
+            transport_ready: false,
         }
+    }
+
+    pub fn transport_ready(&mut self) {
+        self.transport_ready = true;
     }
 
     pub fn succeed(&mut self) {
@@ -518,6 +527,9 @@ impl Drop for ConnectionInitialization<'_> {
     fn drop(&mut self) {
         if !self.successful {
             self.stats.record_connection_error();
+            if !self.transport_ready {
+                self.stats.transport_errors.fetch_add(1, Ordering::Relaxed);
+            }
             self.stats
                 .initialized_connections
                 .fetch_add(1, Ordering::Relaxed);

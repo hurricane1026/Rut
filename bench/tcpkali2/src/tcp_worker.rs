@@ -73,6 +73,7 @@ async fn run_tcp_worker(
     };
 
     stats.transport_connections.fetch_add(1, Ordering::Relaxed);
+    initialization.transport_ready();
     stream.set_nodelay(!config.nagle)?;
     let (mut reader, mut writer) = stream.into_split();
 

@@ -460,7 +460,32 @@ mod tests {
         assert_eq!(raw.first_message.as_ref().unwrap().as_ref(), b"A\\x42\n");
         let decoded = first_message_config(&path, true).unwrap();
         assert_eq!(decoded.first_message.as_ref().unwrap().as_ref(), b"AB\n");
+
+        std::fs::write(&path, b"\\x00\\x7F\\x80\\xFF\xc3\xa9").unwrap();
+        let decoded = first_message_config(&path, true).unwrap();
+        assert_eq!(
+            decoded.first_message.as_ref().unwrap().as_ref(),
+            &[0x00, 0x7f, 0x80, 0xff, 0xc3, 0xa9]
+        );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn first_message_cli_preserves_high_byte_hex_escapes() {
+        let matches = super::command()
+            .try_get_matches_from([
+                "tcpkali2",
+                "--unescape-message-args",
+                "--first-message",
+                r"\x00\x7F\x80\xFFé",
+                "127.0.0.1:1234",
+            ])
+            .unwrap();
+        let config = super::parse_config(&matches).unwrap();
+        assert_eq!(
+            config.first_message.as_ref().unwrap().as_ref(),
+            &[0x00, 0x7f, 0x80, 0xff, 0xc3, 0xa9]
+        );
     }
 
     #[test]

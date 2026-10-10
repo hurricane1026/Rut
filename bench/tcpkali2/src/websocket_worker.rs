@@ -46,6 +46,7 @@ macro_rules! log_error {
 struct SentBatch {
     sent_at: Instant,
     remaining: usize,
+    measurement: bool,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -110,6 +111,7 @@ async fn run_websocket_worker(
     };
 
     stats.transport_connections.fetch_add(1, Ordering::Relaxed);
+    initialization.transport_ready();
     let (mut write, mut read) = ws_stream.split();
 
     if let Some(first_message) = &config.first_message {
@@ -281,6 +283,7 @@ async fn pipeline_writer(
             .send(SentBatch {
                 sent_at,
                 remaining: message_count,
+                measurement: !stats.is_warmup(),
                 _permit: permit,
             })
             .is_err()
@@ -330,16 +333,24 @@ async fn pipeline_reader(
                     },
                 };
 
-                local_stats.record_responses(
-                    1,
-                    message_size,
-                    data.len(),
-                    batch.sent_at.elapsed().as_micros().max(1) as u64,
-                );
+                if batch.measurement {
+                    local_stats.record_responses(
+                        1,
+                        message_size,
+                        data.len(),
+                        batch.sent_at.elapsed().as_micros().max(1) as u64,
+                    );
+                }
                 batch.remaining -= 1;
                 if batch.remaining > 0 {
                     current_batch = Some(batch);
                 }
+            }
+            Ok(Message::Close(_)) => {
+                if !stats.is_shutting_down() {
+                    stats.record_connection_error();
+                }
+                return Ok(());
             }
             Ok(_) => continue,
             Err(error) => {
@@ -350,6 +361,9 @@ async fn pipeline_reader(
         }
     }
 
+    if !stats.is_shutting_down() {
+        stats.record_connection_error();
+    }
     Ok(())
 }
 
@@ -365,6 +379,7 @@ mod tests {
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
+    use tungstenite::Message;
 
     #[test]
     fn unverified_ping_preserves_exact_payload() {
@@ -501,5 +516,73 @@ mod tests {
             responses <= 2_000,
             "rate limiter allowed {responses} responses"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipeline_excludes_warmup_batch_and_counts_peer_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            let message = websocket.next().await.unwrap().unwrap();
+            sent_tx.send(()).unwrap();
+            resume_rx.await.unwrap();
+            websocket.send(message).await.unwrap();
+            websocket.send(Message::Close(None)).await.unwrap();
+        });
+
+        let payload = Bytes::from_static(b"warmup");
+        let config = Arc::new(Config {
+            duration: Duration::from_secs(1),
+            warmup_duration: Duration::ZERO,
+            message_size: payload.len(),
+            quiet: true,
+            nagle: false,
+            pipeline: true,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_secs(1),
+            init_timeout: Duration::from_secs(1),
+            channel_lifetime: None,
+            first_message: None,
+            message: Some(payload.clone()),
+            pipeline_message: Some(payload),
+            pipeline_batch_size: 1,
+            message_rate: Some(1),
+            use_websocket: true,
+            output: None,
+        });
+        let stats = Arc::new(Stats::new());
+        let worker_stats = stats.clone();
+        let (_load_start_tx, load_start_rx) = tokio::sync::watch::channel(true);
+        let worker = tokio::spawn(async move {
+            websocket_worker(
+                &address.to_string(),
+                config,
+                worker_stats,
+                load_start_rx,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), sent_rx)
+            .await
+            .expect("pipeline did not send its warmup batch")
+            .unwrap();
+        stats.end_warmup();
+        resume_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("pipeline did not stop on peer close")
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
     }
 }

@@ -43,7 +43,7 @@ async fn wait_for_readiness(
         let ready = if transport_stage {
             handshakes_ready(
                 stats.transport_connections.load(Ordering::Relaxed),
-                stats.connection_errors.load(Ordering::Relaxed),
+                stats.transport_errors.load(Ordering::Relaxed),
                 expected,
             )
         } else {
@@ -243,7 +243,7 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
     // Export to CSV if --output is specified
     if let Some(ref path) = config.output {
         let target = targets.first().map(|s| s.as_str()).unwrap_or("");
-        crate::csv_export::export_csv(path, &config, &stats, elapsed, target, workers);
+        crate::csv_export::export_csv(path, &config, &stats, elapsed, target, workers)?;
     }
 
     Ok(())
@@ -393,6 +393,7 @@ mod tests {
         assert!(handshakes_ready(1, 0, 1));
         assert!(!initializations_ready(0, 1));
         assert!(initializations_ready(1, 1));
+        assert!(!handshakes_ready(1, 0, 2));
     }
 
     #[tokio::test]
@@ -416,6 +417,42 @@ mod tests {
         assert_eq!(stats.connection_errors.load(Ordering::Relaxed), 1);
         assert_eq!(stats.initialized_connections.load(Ordering::Relaxed), 1);
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_transport_init_error_does_not_satisfy_transport_gate() {
+        let stats = Arc::new(Stats::new());
+        stats.transport_connections.store(1, Ordering::Relaxed);
+        stats.connection_errors.store(1, Ordering::Relaxed);
+        stats.initialized_connections.store(1, Ordering::Relaxed);
+        let mut tasks = JoinSet::new();
+        let worker_stats = stats.clone();
+        tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            worker_stats
+                .transport_connections
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+
+        let start = Instant::now();
+        assert!(
+            super::wait_for_readiness(
+                &mut tasks,
+                &stats,
+                2,
+                true,
+                Some((
+                    Instant::now() + Duration::from_millis(250),
+                    "transport timeout",
+                )),
+                true,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(start.elapsed() >= Duration::from_millis(40));
+        assert_eq!(stats.transport_connections.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

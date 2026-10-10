@@ -183,48 +183,50 @@ pub fn parse_rate(s: &str) -> Result<u64, String> {
 /// * `s` - String containing escape sequences
 ///
 /// # Returns
-/// * `String` - Unescaped string
+/// * `Vec<u8>` - Unescaped message bytes
 ///
 /// # Examples
 /// ```
 /// unescape_string("hello\\nworld")  // "hello\nworld"
 /// unescape_string("\\x41\\x42\\x43") // "ABC"
 /// ```
-pub fn unescape_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+pub fn unescape_string(s: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('n') => result.push('\n'),
-                Some('r') => result.push('\r'),
-                Some('t') => result.push('\t'),
-                Some('\\') => result.push('\\'),
-                Some('0') => result.push('\0'),
+                Some('n') => result.push(b'\n'),
+                Some('r') => result.push(b'\r'),
+                Some('t') => result.push(b'\t'),
+                Some('\\') => result.push(b'\\'),
+                Some('0') => result.push(0),
                 Some('x') => {
                     // Handle hex escape sequences like \x41
                     let hex_digits: String = chars.by_ref().take(2).collect();
                     if hex_digits.len() == 2 {
                         if let Ok(byte) = u8::from_str_radix(&hex_digits, 16) {
-                            result.push(byte as char);
+                            result.push(byte);
                         } else {
-                            result.push_str(&format!("\\x{}", hex_digits));
+                            result.extend_from_slice(format!("\\x{}", hex_digits).as_bytes());
                         }
                     } else {
-                        result.push_str("\\x");
-                        result.push_str(&hex_digits);
+                        result.extend_from_slice(b"\\x");
+                        result.extend_from_slice(hex_digits.as_bytes());
                     }
                 }
                 Some(c) => {
                     // Unknown escape sequence, keep both characters
-                    result.push('\\');
-                    result.push(c);
+                    result.push(b'\\');
+                    let mut encoded = [0; 4];
+                    result.extend_from_slice(c.encode_utf8(&mut encoded).as_bytes());
                 }
-                None => result.push('\\'), // Backslash at end of string
+                None => result.push(b'\\'), // Backslash at end of string
             }
         } else {
-            result.push(c);
+            let mut encoded = [0; 4];
+            result.extend_from_slice(c.encode_utf8(&mut encoded).as_bytes());
         }
     }
 
@@ -316,7 +318,7 @@ pub fn unix_timestamp_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{duration_for_count, wait_for_load_start};
+    use super::{duration_for_count, unescape_string, wait_for_load_start};
     use std::time::Duration;
 
     #[test]
@@ -328,6 +330,14 @@ mod tests {
     #[test]
     fn rate_deadline_supports_sub_millisecond_intervals() {
         assert_eq!(duration_for_count(1, 10_000), Duration::from_micros(100));
+    }
+
+    #[test]
+    fn hex_escapes_preserve_exact_binary_bytes_and_utf8_text() {
+        assert_eq!(
+            unescape_string(r"\x00\x7F\x80\xFFé"),
+            [0x00, 0x7f, 0x80, 0xff, 0xc3, 0xa9]
+        );
     }
 
     #[tokio::test]

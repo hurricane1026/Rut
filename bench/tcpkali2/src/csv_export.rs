@@ -4,7 +4,7 @@
 use crate::command::Config;
 use crate::stats::{Stats, megabits_per_second, rate_per_second};
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -202,35 +202,42 @@ pub fn export_csv(
     duration: Duration,
     target: &str,
     workers: usize,
-) {
+) -> io::Result<()> {
     let expected_header = header_line();
     let row = build_row(config, stats, duration, target, workers);
 
-    if let Ok(file) = fs::File::open(path) {
-        // File exists — check if headers match
-        let reader = std::io::BufReader::new(file);
-        if let Some(Ok(first_line)) = reader.lines().next()
-            && first_line.trim() == expected_header
-        {
-            // Headers match - append
-            if let Ok(mut f) = fs::OpenOptions::new().append(true).open(path) {
-                let _ = writeln!(f, "{}", row);
-                return;
+    match fs::File::open(path) {
+        Ok(file) => {
+            let reader = std::io::BufReader::new(file);
+            if let Some(first_line) = reader.lines().next().transpose()?
+                && first_line.trim() == expected_header
+            {
+                let mut file = fs::OpenOptions::new().append(true).open(path)?;
+                write_csv_lines(&mut file, std::iter::once(row.as_str()))?;
+                return Ok(());
             }
         }
-        // Headers don't match or couldn't read — fall through to overwrite
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
 
-    // Create / overwrite
-    if let Ok(mut f) = fs::File::create(path) {
-        let _ = writeln!(f, "{}", expected_header);
-        let _ = writeln!(f, "{}", row);
+    let mut file = fs::File::create(path)?;
+    write_csv_lines(&mut file, [expected_header.as_str(), row.as_str()])
+}
+
+fn write_csv_lines(
+    writer: &mut impl Write,
+    lines: impl IntoIterator<Item = impl AsRef<str>>,
+) -> io::Result<()> {
+    for line in lines {
+        writeln!(writer, "{}", line.as_ref())?;
     }
+    writer.flush()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HEADERS, build_row};
+    use super::{HEADERS, build_row, export_csv, write_csv_lines};
     use crate::command::Config;
     use crate::stats::Stats;
     use bytes::Bytes;
@@ -280,5 +287,58 @@ mod tests {
         assert_eq!(value("connection_error_rate_pct"), "75.00");
         assert_eq!(value("traffic_down_mbps"), "4.00");
         assert_eq!(value("traffic_up_mbps"), "8.00");
+    }
+
+    #[test]
+    fn csv_export_propagates_create_and_write_failures() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected write failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        assert!(write_csv_lines(&mut FailingWriter, ["row"]).is_err());
+
+        let config = Config {
+            duration: Duration::from_secs(1),
+            warmup_duration: Duration::ZERO,
+            message_size: 1,
+            quiet: true,
+            nagle: false,
+            pipeline: false,
+            connections: 1,
+            connect_rate: 0,
+            connect_timeout: Duration::from_secs(1),
+            init_timeout: Duration::from_secs(30),
+            channel_lifetime: None,
+            first_message: None,
+            message: Some(Bytes::from_static(b"x")),
+            pipeline_message: None,
+            pipeline_batch_size: 1,
+            message_rate: None,
+            use_websocket: false,
+            output: None,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "tcpkali2-csv-missing-{}/out.csv",
+            std::process::id()
+        ));
+        let stats = Stats::new();
+        assert!(
+            export_csv(
+                &path.to_string_lossy(),
+                &config,
+                &stats,
+                Duration::from_secs(1),
+                "",
+                1
+            )
+            .is_err()
+        );
     }
 }
