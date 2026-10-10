@@ -201,25 +201,33 @@ def origin_worker(cpu, port, size, delay_ms, chunks):
 
 async def connect_ws(port):
     reader, writer = await asyncio.open_connection('127.0.0.1', port)
-    writer.get_extra_info('socket').setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    key = base64.b64encode(os.urandom(16))
-    writer.write(b'GET /ws HTTP/1.1\r\nHost: fixture.example\r\nUpgrade: websocket\r\n'
-                 b'Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ' + key + b'\r\n\r\n')
-    await writer.drain()
-    header = await reader.readuntil(b'\r\n\r\n')
-    if not header.startswith(b'HTTP/1.1 101 '):
-        raise ValueError('upgrade failed: ' + repr(header))
-    expected = base64.b64encode(hashlib.sha1(key + GUID).digest())
-    fields = {line.split(b':', 1)[0].lower(): line.split(b':', 1)[1].strip()
-              for line in header.split(b'\r\n')[1:] if b':' in line}
-    if fields.get(b'sec-websocket-accept') != expected:
-        raise ValueError('invalid upgrade accept')
-    if fields.get(b'upgrade', b'').lower() != b'websocket':
-        raise ValueError('invalid upgrade header')
-    connection_tokens = {token.strip().lower() for token in fields.get(b'connection', b'').split(b',')}
-    if b'upgrade' not in connection_tokens:
-        raise ValueError('invalid connection upgrade token')
-    return reader, writer
+    try:
+        writer.get_extra_info('socket').setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        key = base64.b64encode(os.urandom(16))
+        writer.write(b'GET /ws HTTP/1.1\r\nHost: fixture.example\r\nUpgrade: websocket\r\n'
+                     b'Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ' + key + b'\r\n\r\n')
+        await writer.drain()
+        header = await reader.readuntil(b'\r\n\r\n')
+        if not header.startswith(b'HTTP/1.1 101 '):
+            raise ValueError('upgrade failed: ' + repr(header))
+        expected = base64.b64encode(hashlib.sha1(key + GUID).digest())
+        fields = {line.split(b':', 1)[0].lower(): line.split(b':', 1)[1].strip()
+                  for line in header.split(b'\r\n')[1:] if b':' in line}
+        if fields.get(b'sec-websocket-accept') != expected:
+            raise ValueError('invalid upgrade accept')
+        if fields.get(b'upgrade', b'').lower() != b'websocket':
+            raise ValueError('invalid upgrade header')
+        connection_tokens = {token.strip().lower() for token in fields.get(b'connection', b'').split(b',')}
+        if b'upgrade' not in connection_tokens:
+            raise ValueError('invalid connection upgrade token')
+        return reader, writer
+    except BaseException:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except ConnectionError:
+            pass
+        raise
 
 
 async def ws_preflight(port):
@@ -250,15 +258,27 @@ def client_worker(cpu, args, output):
     async def run():
         counts = dict(messages=0, bytes=0, connections=0, errors=0)
         latency = []; first = []; delivery = []; gaps = []; source_gaps = []
-        deadline = time.monotonic() + args.warmup + args.duration
-        measurement = deadline - args.duration
+        ready = asyncio.Event()
+        ready_count = 0
+        startup_failed = False
+        deadline = measurement = 0
+        sessions = []
 
         async def session():
+            nonlocal ready_count, startup_failed, deadline, measurement
             reader = writer = None
             try:
                 if args.kind == 'websocket':
                     reader, writer = await connect_ws(args.port)
                     counts['connections'] += 1
+                    ready_count += 1
+                    if ready_count == args.connections:
+                        measurement = time.monotonic() + args.warmup
+                        deadline = measurement + args.duration
+                        ready.set()
+                    await ready.wait()
+                    if startup_failed:
+                        return
                     sequence = 0
                     while time.monotonic() < deadline:
                         expected = struct.pack('!Q', sequence) + fixed[8:] if len(fixed) >= 8 else fixed
@@ -284,6 +304,14 @@ def client_worker(cpu, args, output):
                     reader, writer = await asyncio.open_connection('127.0.0.1', args.port)
                     writer.get_extra_info('socket').setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     counts['connections'] += 1
+                    ready_count += 1
+                    if ready_count == args.connections:
+                        measurement = time.monotonic() + args.warmup
+                        deadline = measurement + args.duration
+                        ready.set()
+                    await ready.wait()
+                    if startup_failed:
+                        return
                     while time.monotonic() < deadline:
                         began = time.monotonic_ns()
                         writer.write(b'GET /stream HTTP/1.1\r\nHost: fixture.example\r\n\r\n')
@@ -301,6 +329,13 @@ def client_worker(cpu, args, output):
                     if opcode != 8:
                         raise ValueError('close handshake mismatch')
             except Exception as error:
+                if not ready.is_set():
+                    startup_failed = True
+                    ready.set()
+                    current = asyncio.current_task()
+                    for task in sessions:
+                        if task is not current and not task.done():
+                            task.cancel()
                 counts['errors'] += 1
                 if counts['errors'] <= 4:
                     print('CLIENT_ERROR ' + repr(error), flush=True)
@@ -311,7 +346,8 @@ def client_worker(cpu, args, output):
                         await writer.wait_closed()
                     except ConnectionError:
                         pass
-        await asyncio.gather(*(session() for _ in range(args.connections)))
+        sessions = [asyncio.create_task(session()) for _ in range(args.connections)]
+        await asyncio.gather(*sessions, return_exceptions=True)
         return dict(counts=counts, rtt_us=latency, first_us=first, delivery_us=delivery,
                     gap_us=gaps, source_gap_us=source_gaps)
     sample = asyncio.run(run())

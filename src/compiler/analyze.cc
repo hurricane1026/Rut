@@ -1750,6 +1750,10 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
             return frontend_error(FrontendError::OutOfMemory, {});
         len += segments[i].len;
     }
+    // Preserve the non-null sentinel used for an explicitly empty response
+    // body without asking mmap for a zero-length mapping.
+    static char empty_generated_name = '\0';
+    if (len == 0) return Str{&empty_generated_name, 0};
     if (store == nullptr) {
         void* owner_region = mmap(nullptr,
                                   sizeof(HirGeneratedNames),

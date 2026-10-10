@@ -103,6 +103,39 @@ class ToolsTest(unittest.TestCase):
             protocol_workload.asyncio.run(consume(b"1\r\na\r\n0\r\n\r\n", 1, float("inf")))
         self.assertTrue(protocol_workload.asyncio.run(consume(None, 1, time.monotonic() + .01)))
 
+    def test_client_connection_failure_cancels_other_startup_attempts(self):
+        entered = 0
+        cancelled = []
+
+        async def open_connection(_host, _port):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                raise ConnectionError('injected handshake failure')
+            try:
+                while entered < 2:
+                    await protocol_workload.asyncio.sleep(0)
+                await protocol_workload.asyncio.Event().wait()
+            except protocol_workload.asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        class Output:
+            sample = None
+
+            def put(self, value):
+                self.sample = value
+
+        output = Output()
+        args = SimpleNamespace(kind='streaming', size=16, warmup=0, duration=1,
+                               connections=2, port=12345, chunks=1)
+        cpu = min(os.sched_getaffinity(0))
+        with mock.patch.object(protocol_workload.asyncio, 'open_connection', open_connection):
+            protocol_workload.client_worker(cpu, args, output)
+        self.assertEqual(output.sample['counts']['errors'], 1)
+        self.assertEqual(output.sample['counts']['connections'], 0)
+        self.assertEqual(cancelled, [True])
+
     def test_smoke_engine_filter_rejects_empty_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
@@ -183,6 +216,45 @@ class ToolsTest(unittest.TestCase):
         self.assertNotIn("origin_cpu_pct", summary)
         self.assertNotIn("frontend_cpu_pct", summary)
         self.assertNotIn("cpu_measurement_seconds", summary)
+
+    def test_protocol_summary_keeps_missing_first_chunk_percentile_out_of_selection(self):
+        case = next(case for case in protocol_strategy.CASES
+                    if case['name'] == 'streaming-live-256')
+        rows = []
+        for policy in ('current', 'latency', 'balanced'):
+            for repeat in range(3):
+                rows.append(dict(case=case, engine='uring', policy=policy,
+                                 messages_per_second=100, received_mib_per_second=1,
+                                 delivery_us=dict(p99_us=100),
+                                 first_us=dict(p99_us=5 if policy == 'current' and repeat != 1 else None),
+                                 source_gap_us=dict(p99_us=20),
+                                 origin_cpu_observation_pct=10))
+        summaries = protocol_strategy.summarize(rows)
+        self.assertTrue(all(row['first_p99_us'] is None for row in summaries))
+        current = next(row for row in summaries if row['policy'] == 'current')
+        self.assertEqual(current['throughput_policy'], 'current')
+
+    def test_run_client_cleans_group_when_wait_is_interrupted(self):
+        class Child:
+            pid = 12345
+
+            def __init__(self):
+                self.waits = [KeyboardInterrupt(), 0, 0]
+
+            def wait(self, timeout=None):
+                result = self.waits.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+        child = Child()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(protocol_strategy.subprocess, 'Popen', return_value=child), \
+                mock.patch.object(protocol_strategy.os, 'killpg') as killpg:
+            with self.assertRaises(KeyboardInterrupt):
+                protocol_strategy.run_client(['client'], Path(directory) / 'client.log', 1, {})
+        self.assertEqual([call.args[1] for call in killpg.call_args_list],
+                         [protocol_strategy.signal.SIGTERM, protocol_strategy.signal.SIGKILL])
 
     def test_strategy_requires_repeats_and_guards_tail_latency(self):
         rows = []

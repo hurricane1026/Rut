@@ -107,10 +107,22 @@ def run_client(argv, log, timeout, env):
                                  env=env, start_new_session=True)
         try:
             code = child.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
+        finally:
+            # The group can contain helpers that outlive its leader. Always
+            # tear it down, including on Ctrl-C and other wait failures.
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             child.wait()
-            raise
         if code:
             raise subprocess.CalledProcessError(code, argv)
     cpu_after = resource.getrusage(resource.RUSAGE_CHILDREN)
@@ -177,7 +189,10 @@ def summarize(rows):
                             frontend_cpu_observation_pct=(statistics.median(frontend_cpu)
                                                           if frontend_cpu else None))
                 if case['kind'] == 'streaming':
-                    item['first_p99_us'] = statistics.median(row['first_us']['p99_us'] for row in group)
+                    first_p99 = [row['first_us']['p99_us'] for row in group]
+                    item['first_p99_us'] = (statistics.median(first_p99)
+                                            if all(value is not None for value in first_p99)
+                                            else None)
                     item['source_gap_p99_us'] = statistics.median(row['source_gap_us']['p99_us'] for row in group)
                 options.append(item)
         direct = next((item for item in options if item['engine'] == 'direct-origin'), None)
@@ -187,7 +202,12 @@ def summarize(rows):
             if not current:
                 continue
             eligible = [item for item in candidates if item['p99_us'] <= current['p99_us'] * 1.1
-                        and (case['kind'] == 'websocket' or item['first_p99_us'] <= current['first_p99_us'] * 1.1)]
+                        and (case['kind'] == 'websocket' or
+                             (current['first_p99_us'] is not None and
+                              item['first_p99_us'] is not None and
+                              item['first_p99_us'] <= current['first_p99_us'] * 1.1))]
+            if not eligible:
+                eligible = [current]
             winner = max(eligible, key=lambda item: item['rate'])
             current['experimental_throughput_candidate'] = winner['policy']
             if winner['rate'] < current['rate'] * 1.03 or winner['rate_range'][0] <= current['rate_range'][1]:

@@ -195,6 +195,11 @@ def main():
             self.active_label = label
             self.args.front_port = direct_origin_port(self.args)
             try:
+                if options.mixed_small_bytes:
+                    request = urllib.request.Request(f"http://127.0.0.1:{self.args.front_port}/proxy", headers={"Host": "client.example", "X-Payload": "small"})
+                    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=3) as response:
+                        if response.read() != b"Z" * options.mixed_small_bytes:
+                            raise RuntimeError("small payload preflight failed")
                 yield self.origin_pid
             finally:
                 self.args.front_port = saved_port
@@ -226,7 +231,7 @@ def main():
                 if engine != "nginx":
                     if "Backend: " + active_backend not in (self.out / (label + "-server.log")).read_text():
                         raise RuntimeError("runtime selected an unexpected backend")
-                if options.mixed_small_bytes:
+                if options.mixed_small_bytes and engine != "direct-origin":
                     request = urllib.request.Request(f"http://127.0.0.1:{self.args.front_port}/proxy", headers={"Host": "client.example", "X-Payload": "small"})
                     with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=3) as response:
                         if response.read() != b"Z" * options.mixed_small_bytes:
