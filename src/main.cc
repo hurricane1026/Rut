@@ -401,7 +401,7 @@ static void report_source_live_start_error(const SourceLiveAccessLogStartError& 
 }
 
 template <typename Loop>
-static void configure_study_policy(Loop* loop) {
+static bool configure_study_policy(Loop* loop) {
     if constexpr (requires {
                       loop->study_event_batch_limit;
                       loop->study_relay_chunk_size;
@@ -427,8 +427,10 @@ static void configure_study_policy(Loop* loop) {
         if constexpr (requires { loop->backend.enable_ws_recv_cache(); }) {
             for (const char* const* item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_WS_RECV=cache") &&
-                    !loop->backend.enable_ws_recv_cache())
-                    loop->backend.set_failure_code(ENOMEM);
+                    !loop->backend.enable_ws_recv_cache()) {
+                    write_str("Failed to configure RUT_STUDY_WS_RECV cache\n");
+                    return false;
+                }
             }
             if (report_study)
                 write_str(loop->backend.ws_recv_cache_enabled ? "RUT_STUDY_WS_RECV mode=cache\n"
@@ -437,8 +439,10 @@ static void configure_study_policy(Loop* loop) {
         if constexpr (requires { loop->ws_splice.enable(loop->connection_capacity); }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_WS_SPLICE=on") &&
-                    !loop->ws_splice.enable(loop->connection_capacity))
-                    loop->backend.set_failure_code(ENOMEM);
+                    !loop->ws_splice.enable(loop->connection_capacity)) {
+                    write_str("Failed to configure RUT_STUDY_WS_SPLICE\n");
+                    return false;
+                }
             for (const char* const* item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_WS_COPY=on")) loop->ws_splice.copy_first = true;
                 if (str_eq(*item, "RUT_STUDY_WS_NODELAY=off")) loop->ws_splice.no_delay = false;
@@ -510,6 +514,7 @@ static void configure_study_policy(Loop* loop) {
             write_str("\n");
         }
     }
+    return true;
 }
 
 template <typename EventLoopType>
@@ -598,7 +603,10 @@ static RunShardsOutcome run_shards(ListenerSpec listener,
                                                      : RunShardsOutcomeKind::Failure;
             return {outcome};
         }
-        configure_study_policy(shards[i].loop);
+        if (!configure_study_policy(shards[i].loop)) {
+            for (u32 j = 0; j <= i; j++) shards[j].shutdown();
+            return {RunShardsOutcomeKind::Failure};
+        }
         if constexpr (requires { shards[i].loop->tls_server; }) {
             shards[i].loop->tls_server = tls_server;
         }

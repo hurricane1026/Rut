@@ -1265,9 +1265,12 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
 bool IoUringBackend::enable_ws_recv_cache() {
     if (ws_recv_cache_enabled) return true;
     if (connection_capacity == 0 || connection_capacity > 0x7fffffffu) return false;
-    if (!ws_recv_cache_nodes.init(kProvidedBufCount + kLargeProvidedBufCount) ||
-        !ws_recv_cache_owners.init(connection_capacity * 2u))
+    if (!ws_recv_cache_nodes.init(kProvidedBufCount + kLargeProvidedBufCount)) return false;
+    if (test_fail_ws_recv_cache_owners_init) {
+        test_fail_ws_recv_cache_owners_init = false;
         return false;
+    }
+    if (!ws_recv_cache_owners.init(connection_capacity * 2u)) return false;
     ws_recv_cache_enabled = true;
     return true;
 }

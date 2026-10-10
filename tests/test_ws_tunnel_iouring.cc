@@ -93,8 +93,7 @@ static void full_duplex_burst(test::TestCase* _tc,
                               u32 direct_recv_limit = 0,
                               bool poll_first = false,
                               bool queued_fin = false,
-                              bool fin_before_drain = false,
-                              bool fail_first_cancel = false) {
+                              bool fin_before_drain = false) {
     REQUIRE(!half_close || splice);
     LoopStorage storage;
     if (!storage.init()) return;
@@ -167,7 +166,6 @@ static void full_duplex_burst(test::TestCase* _tc,
     REQUIRE(write_burst(kOrigin.fd, sent_origin + prefix, kBytes - prefix));
     REQUIRE(loop.submit_recv(*conn));
     REQUIRE(loop.submit_recv_upstream(*conn));
-    if (fin_before_drain) loop.test_fail_next_ws_splice_cancel = fail_first_cancel;
     if (pipe_failure) {
         struct rlimit saved{};
         REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &saved), 0);
@@ -235,9 +233,15 @@ static void full_duplex_burst(test::TestCase* _tc,
         // in the pipe, so this case proves buffered drain without depending on
         // new reads or a reverse reply after EOF.
         if (fin_before_drain && !fin_sent &&
-            loop.ws_splice.owners[conn->id].direction[1].buffered != 0) {
+            loop.ws_splice.owners[conn->id].direction[1].buffered != 0 &&
+            loop.ws_splice.owners[conn->id].direction[1].armed &&
+            loop.ws_splice.owners[conn->id].direction[1].writing) {
             REQUIRE_EQ(shutdown(kClient.fd, SHUT_WR), 0);
             fin_sent = true;
+        }
+        const auto& eof_owner = loop.ws_splice.owners[conn->id];
+        if (fin_before_drain && eof_owner.eof_closing && eof_owner.direction[1].buffered != 0) {
+            CHECK_FALSE(eof_owner.eof_reverse_write_cancel_attempted);
         }
         if (!slow_reader || monotonic_ns() - kStart >= 30ull * 1000 * 1000) {
             const bool client_read_ok =
@@ -311,6 +315,8 @@ static void full_duplex_burst(test::TestCase* _tc,
         REQUIRE(conn->fd < 0);
         const auto& owner = loop.ws_splice.owners[conn->id];
         REQUIRE(owner.eof_snapshot_taken);
+        REQUIRE(owner.eof_opposite_buffered_at_snapshot != 0);
+        CHECK_FALSE(owner.eof_reverse_write_cancel_attempted);
         CHECK_EQ(loop.ws_splice.read_calls[0], owner.eof_read_calls[0]);
         CHECK_EQ(loop.ws_splice.read_calls[1], owner.eof_read_calls[1]);
         CHECK_EQ(loop.ws_splice.transferred[0], owner.eof_forwarded_bytes[0]);
@@ -1260,28 +1266,70 @@ TEST(websocket, iouring_splice_first_eof_drains_pipe_and_closes_peer) {
                       false,
                       true);
 }
-TEST(websocket, iouring_splice_eof_retries_cancel_after_sq_full) {
-    full_duplex_burst(_tc,
-                      false,
-                      false,
-                      true,
-                      true,
-                      true,
-                      0,
-                      false,
-                      65536,
-                      2,
-                      false,
-                      64 * 1024 + 73,
-                      4096,
-                      false,
-                      false,
-                      false,
-                      0,
-                      false,
-                      false,
-                      true,
-                      true);
+TEST(websocket, iouring_splice_eof_retries_failed_read_cancel_without_wait) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    Peer client{downstream[1]}, origin{upstream[1]};
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = downstream[0];
+    conn->upstream_fd = upstream[0];
+    conn->upstream_episode = 1;
+    REQUIRE(set_nonblocking(conn->fd));
+    REQUIRE(set_nonblocking(conn->upstream_fd));
+    auto& owner = loop.ws_splice.owners[conn->id];
+    owner.active = true;
+    owner.requested = true;
+    owner.episode = conn->upstream_episode;
+    ++conn->pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner.direction[direction].read_fd = fds[0];
+        owner.direction[direction].write_fd = fds[1];
+    }
+    REQUIRE(loop.ws_splice.arm(loop, *conn, 1, false));
+    REQUIRE_EQ(shutdown(client.fd, SHUT_WR), 0);
+    loop.ws_splice.enqueue(conn->id);
+    loop.test_fail_next_ws_splice_cancel = true;
+
+    loop.ws_splice.progress(loop);
+    CHECK(owner.eof_closing);
+    CHECK(owner.eof_cancel_retry_deferred);
+    CHECK(owner.budget_deferred);
+    CHECK(owner.queued);
+    CHECK(owner.direction[1].armed);
+    CHECK_FALSE(loop.should_wait_for_event());
+
+    loop.close_conn(*conn);
+    for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
+}
+
+TEST(websocket, iouring_splice_recv_cache_partial_configuration_is_reclaimable) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& backend = storage.loop->backend;
+    backend.test_fail_ws_recv_cache_owners_init = true;
+    CHECK_FALSE(backend.enable_ws_recv_cache());
+    CHECK_FALSE(backend.ws_recv_cache_enabled);
+    CHECK(backend.ws_recv_cache_nodes.initialized());
+    CHECK_FALSE(backend.ws_recv_cache_owners.initialized());
+    backend.shutdown();
+    CHECK_FALSE(backend.ws_recv_cache_nodes.initialized());
+    CHECK_FALSE(backend.ws_recv_cache_owners.initialized());
 }
 
 TEST(websocket, iouring_splice_eof_close_retires_owner_once) {

@@ -249,6 +249,7 @@ struct IoUringBackend {
     MappedArray<WsRecvCacheNode> ws_recv_cache_nodes;
     MappedArray<WsRecvCacheOwner> ws_recv_cache_owners;
     bool ws_recv_cache_enabled = false;
+    bool test_fail_ws_recv_cache_owners_init = false;
     u32 ws_recv_cache_head = 0xffffffffu;
     u32 ws_recv_cache_tail = 0xffffffffu;
     u32 ws_recv_cache_generation = 0;

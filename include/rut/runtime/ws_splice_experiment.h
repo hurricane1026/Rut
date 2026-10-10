@@ -27,7 +27,9 @@ struct WsSpliceExperiment {
         u8 next_direction = 0;
 #ifdef RUT_TESTING
         u64 eof_read_calls[2]{}, eof_forwarded_bytes[2]{};
-        bool eof_snapshot_taken = false;
+        u32 eof_opposite_buffered_at_snapshot = 0;
+        bool eof_snapshot_taken = false, eof_reverse_write_cancel_attempted = false,
+             eof_cancel_retry_deferred = false;
 #endif
         bool requested = false, active = false, closing = false, eof_closing = false,
              queued = false, failed = false, budget_deferred = false, reclaim_pending = false;
@@ -296,7 +298,15 @@ struct WsSpliceExperiment {
                 const u32 kOther = index ^ 1u;
                 auto& other = o.direction[kOther];
                 other.eof = true;
-                if (other.armed && !other.cancel_owned) {
+#ifdef RUT_TESTING
+                o.eof_opposite_buffered_at_snapshot = other.buffered;
+                o.eof_reverse_write_cancel_attempted =
+                    other.armed && other.writing && !other.cancel_owned;
+#endif
+                // A buffered reverse write is part of the EOF snapshot and
+                // must drain before either endpoint is closed. Only an armed
+                // read can be canceled to stop new bytes entering the pipe.
+                if (other.armed && !other.writing && !other.cancel_owned) {
                     const auto kType =
                         other.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                     const u64 kTarget = encode_upstream_event_token(
@@ -314,6 +324,15 @@ struct WsSpliceExperiment {
                     if (kCancelSubmitted) {
                         other.cancel_owned = true;
                         ++c.pending_ops;
+                    } else {
+                        // The owner may have been dequeued before this EOF
+                        // arrived. Keep it runnable so cancellation is retried
+                        // without waiting for unrelated readiness.
+                        o.budget_deferred = true;
+                        enqueue(c.id);
+#ifdef RUT_TESTING
+                        o.eof_cancel_retry_deferred = true;
+#endif
                     }
                 }
                 pump(loop, c, kOther);
