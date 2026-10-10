@@ -523,7 +523,7 @@ TEST(epoll_stable_edge, consumed_fin_is_not_lost_when_returning_to_idle_pool) {
     CHECK_EQ(errno, EBADF);
 }
 
-TEST(epoll_stable_edge, healthy_watched_idle_socket_skips_probe_and_preserves_owner) {
+TEST(epoll_stable_edge, healthy_watched_idle_socket_preserves_owner) {
     StableEpollFixture f;
     REQUIRE(f.init(true));
     const i32 fd = f.conns[0].upstream_fd;
@@ -541,22 +541,30 @@ TEST(epoll_stable_edge, healthy_watched_idle_socket_skips_probe_and_preserves_ow
     CHECK_EQ(event.result, 4);
 }
 
-TEST(epoll_stable_edge, fin_racing_borrow_is_delivered_to_the_new_episode) {
+TEST(epoll_stable_edge, bytes_arriving_after_park_are_rejected_before_borrow) {
     StableEpollFixture f;
     REQUIRE(f.init(true));
     const i32 fd = f.conns[0].upstream_fd;
     REQUIRE(f.park(0));
-    // No event has been harvested yet: event-driven borrowing can race FIN.
+    REQUIRE_EQ(::send(f.peer, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody", 42, MSG_NOSIGNAL),
+               42);
+    CHECK_EQ(f.pool.take_idle(0, 0), -1);
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+}
+
+TEST(epoll_stable_edge, fin_racing_borrow_rejects_before_new_episode) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE(f.park(0));
+    // No event has been harvested yet: the borrow-time probe must still catch FIN.
     REQUIRE_EQ(::shutdown(f.peer, SHUT_WR), 0);
-    REQUIRE_EQ(f.borrow(1), fd);
-    REQUIRE(f.backend.add_recv_upstream(fd, 1, f.conns[1].upstream_episode));
-    IoEvent event{};
-    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
-    CHECK_EQ(event.type, IoEventType::UpstreamRecv);
-    CHECK_EQ(event.conn_id, 1u);
-    CHECK_EQ(event.upstream_episode, f.conns[1].upstream_episode);
-    CHECK_EQ(event.result, 0);
-    CHECK_EQ(f.conns[0].upstream_recv_buf.len(), 0u);
+    CHECK_EQ(f.borrow(1), -1);
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
 }
 
 TEST(epoll_stable_edge, exhausted_full_read_is_probed_once_when_parked) {

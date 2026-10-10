@@ -120,9 +120,9 @@ struct UpstreamPool {
     // — only an EAGAIN (nothing buffered, still open) socket is handed back. This
     // catches the common idle-timeout race before any request bytes are sent; the
     // residual probe-vs-send race is handled by the caller's idempotent resend.
-    // An idle watcher may skip probing only when it owns the exact pool slot and
-    // has no known readiness. Event-versus-borrow races still require the caller
-    // to handle upstream failure; even a synchronous probe cannot prevent them.
+    // An idle watcher may eagerly invalidate known readiness, but every borrow
+    // still probes the socket. Userspace readiness state cannot prove that the
+    // kernel had no new bytes after parking and before this borrow.
     // Candidates are tried most recently parked first (the likeliest to be live).
     i32 take_idle(u16 upstream_id, u8 backend_idx) {
         if (idle_count.load(std::memory_order_acquire) == 0) return -1;
@@ -134,10 +134,12 @@ struct UpstreamPool {
                 continue;
             }
             const i32 fd = c.fd;
-            const bool probe_required = idle_reuse_probe_required == nullptr ||
-                                        idle_reuse_probe_required(idle_close_ctx, fd, i);
+            // The callback remains responsible for watcher-side ownership fencing
+            // and stale-event invalidation. It cannot suppress this probe: bytes
+            // may arrive after the last harvested event and before take_idle().
+            (void)(idle_reuse_probe_required == nullptr ||
+                   idle_reuse_probe_required(idle_close_ctx, fd, i));
             release_slot(i);
-            if (!probe_required) return fd;
             char probe;
             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
