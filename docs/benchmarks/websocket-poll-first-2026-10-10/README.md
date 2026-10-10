@@ -38,7 +38,7 @@ One screen each, 6 s measured + 2 s warmup, IO diagnostics enabled for all Rut m
 
 16KiB shows no screening throughput gain from POLL_FIRST. Current copy/splice remains much faster. Do not enable this globally or infer a nginx win from the modest one-shot improvement.
 
-POLL_FIRST arms counters confirm actual activation; IO wait counters cover process lifetime and exclude other flush paths. Exact benchmark source patch, base commit and frozen binary hashes are archived alongside raw tcpkali2 CSVs and frontend logs. The later native direct-receive transfer test changes only tests, not benchmark binaries.
+POLL_FIRST arms counters confirm actual activation; IO wait counters cover process lifetime and exclude other flush paths. Raw tcpkali2 CSVs and frontend logs are retained in this checkpoint; source and binary provenance artifacts are not included here. The later native direct-receive transfer test changes only tests, not benchmark binaries.
 
 ## Validation
 

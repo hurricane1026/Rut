@@ -61,4 +61,4 @@ Native WebSocket/splice CTests pass: small messages, forced short writes, slow r
 
 A newly added test initially crashed because it reused the splice-only reverse-after-FIN fixture without allocating splice state. GDB identified the fixture dereference. The fixture now rejects that combination and has a distinct cached-FIN drain/close case; all data and lifetime assertions pass. Failed test/GDB logs are archived, not counted as successful runs. This was not a demonstrated runtime crash. Benchmark runtime code is unchanged after freezing except comment wrapping; later changes strengthen tests only.
 
-Raw CSVs, logs, exact benchmark study.patch and source-manifest.json are retained. Counter totals cover process lifetime rather than just the timed interval; wait enters exclude other flush paths.
+Raw CSVs and logs are retained in this checkpoint. Counter totals cover process lifetime rather than just the timed interval; wait enters exclude other flush paths. Source and binary provenance artifacts are not included here.
