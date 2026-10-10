@@ -466,7 +466,8 @@ public:
     // count keeps the ordinary hot path from touching the bitmap.
     MappedArray<u64> recv_rearm_words;
     u32 recv_rearm_count = 0;
-    u32 recv_rearm_cursor = 0;  // word where the next capped pass resumes
+    u32 recv_rearm_cursor = 0;      // word where the next capped pass resumes
+    u32 ws_cache_rearm_cursor = 0;  // connection where the upstream pass resumes
     u32 ws_cache_rearm_budget = 0;
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
@@ -594,6 +595,7 @@ public:
         }
         recv_rearm_count = 0;
         recv_rearm_cursor = 0;
+        ws_cache_rearm_cursor = 0;
         // conns[] is mapped but neither constructed nor reset (lazy pages);
         // alloc_conn_impl constructs and resets a slot on first hand-out. Seed
         // the stack so pops ascend.
@@ -3541,7 +3543,10 @@ public:
         if (!backend.ws_recv_cache_enabled) return;
         u32 budget = ws_cache_rearm_budget;
         if (budget == 0) return;
-        for (u32 id = 0; id < slots_initialized; ++id) {
+        if (slots_initialized == 0) return;
+        const u32 start = ws_cache_rearm_cursor < slots_initialized ? ws_cache_rearm_cursor : 0;
+        for (u32 offset = 0; offset < slots_initialized; ++offset) {
+            const u32 id = (start + offset) % slots_initialized;
             Connection& c = conns[id];
             if (!ws_recv_cache_active(c) || !c.upstream_recv_pause_rearm_pending ||
                 c.upstream_recv_armed)
@@ -3552,6 +3557,7 @@ public:
                 return;
             }
             if (!was_armed && c.upstream_recv_armed) {
+                ws_cache_rearm_cursor = (id + 1u) % slots_initialized;
                 ws_cache_rearm_budget = --budget;
                 if (budget == 0) return;
             }

@@ -41705,6 +41705,38 @@ TEST(iouring_cache_rearm, shared_budget_keeps_downstream_pending) {
     CHECK_EQ(loop.test_recv_rearm_count(), 0u);
     fixture.cleanup();
 }
+
+TEST(iouring_cache_rearm, upstream_budget_one_round_robins_pending_owners) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture first;
+    OneShotRecvFixture second;
+    REQUIRE(first.stage(guard.loop, /*plaintext=*/true));
+    REQUIRE(second.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    first.conn->is_ws_tunnel = second.conn->is_ws_tunnel = true;
+    REQUIRE(loop.submit_recv(*first.conn));
+    REQUIRE(loop.submit_recv(*second.conn));
+    first.conn->upstream_recv_pause_rearm_pending = true;
+    second.conn->upstream_recv_pause_rearm_pending = true;
+    first.conn->upstream_recv_armed = false;
+    second.conn->upstream_recv_armed = false;
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK(first.conn->upstream_recv_armed);
+    CHECK_FALSE(second.conn->upstream_recv_armed);
+
+    // Return the first owner's slot and repeat the same one-buffer turn. The
+    // cursor must advance, otherwise the low-id owner monopolizes every pass.
+    first.conn->upstream_recv_armed = false;
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 2u);
+    CHECK(second.conn->upstream_recv_armed);
+    first.cleanup();
+    second.cleanup();
+}
 #endif  // RUT_ENABLE_WEBSOCKET
 
 namespace {

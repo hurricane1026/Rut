@@ -3752,4 +3752,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_WEBSOCKET)
     target_compile_definitions(test_ws_tunnel_iouring PRIVATE RUT_TESTING=1)
     add_test(NAME test_ws_tunnel_iouring COMMAND test_ws_tunnel_iouring)
     set_tests_properties(test_ws_tunnel_iouring PROPERTIES LABELS "unit;runtime" TIMEOUT 15)
+    # Keep the websocket-only executable in the aggregate check while the
+    # target itself remains absent from non-websocket configurations.
+    add_custom_target(check_ws_tunnel_iouring
+        COMMAND $<TARGET_FILE:test_ws_tunnel_iouring>
+        DEPENDS test_ws_tunnel_iouring
+        COMMENT "Running WebSocket io_uring tunnel tests...")
+    add_dependencies(check check_ws_tunnel_iouring)
 endif()
