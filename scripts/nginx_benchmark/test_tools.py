@@ -6,6 +6,7 @@ import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,55 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_api_origin_smoke_and_reuse_policy(self):
+        cpu = str(min(os.sched_getaffinity(0)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "payload.bin"
+            payload.write_bytes(b"api-smoke")
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                port = listener.getsockname()[1]
+            log = root / "api-origin.log"
+            with log.open("w+") as handle:
+                process = subprocess.Popen(
+                    relay_compare.api_origin_command(Path(relay_compare.__file__), port, cpu,
+                                                      payload, 0, 0, 0),
+                    stdout=handle, stderr=subprocess.STDOUT,
+                )
+            try:
+                relay_compare.wait_for_api_origin_ready(log, process, 1)
+                with socket.create_connection(("127.0.0.1", port), timeout=3) as client:
+                    for marker in ("smoke-0", "smoke-1"):
+                        client.sendall((f"GET / HTTP/1.1\r\nHost: test\r\n"
+                                        f"X-Rut-Benchmark-Preflight: {marker}\r\n\r\n").encode())
+                        response = client.recv(4096)
+                        self.assertIn(b"Content-Length: 9", response)
+                        self.assertIn(b"api-smoke", response)
+            finally:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            records = origin_reuse_records(log.read_text(), ["smoke-0", "smoke-1"])
+        self.assertTrue(relay_compare.valid_api_origin_records(records, ["smoke-0", "smoke-1"], True))
+        self.assertTrue(relay_compare.valid_api_origin_records(
+            records, ["smoke-0", "smoke-1"], True, True, "omit-connection"))
+        self.assertFalse(relay_compare.valid_api_origin_records(
+            [("smoke-0", 1, 1), ("smoke-1", 2, 1)], ["smoke-0", "smoke-1"],
+            False, True, "omit-connection"))
+        self.assertTrue(relay_compare.valid_api_origin_records(
+            [("smoke-0", 1, 1), ("smoke-1", 2, 1)], ["smoke-0", "smoke-1"],
+            True, False, "transparent"))
+
+    def test_api_origin_workers_match_explicit_cpu_assignment(self):
+        relay_compare.validate_api_origin_workers(2, "3,4", "api")
+        relay_compare.validate_api_origin_workers(4, "3,4", "native")
+        with self.assertRaisesRegex(ValueError, "must match"):
+            relay_compare.validate_api_origin_workers(1, "3,4", "api")
+
     def test_api_origin_command_and_record_validation(self):
         command = relay_compare.api_origin_command(
             Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2

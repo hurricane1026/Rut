@@ -50,11 +50,22 @@ def module_valid_origin_reuse(records, expected_markers):
                for index, row in enumerate(records))
 
 
-def valid_api_origin_records(records, expected_markers, fresh_downstream):
-    if fresh_downstream:
+def valid_api_origin_records(records, expected_markers, fresh_downstream,
+                             reuse=True, request_policy="transparent"):
+    if not reuse:
+        return (len(records) == len(expected_markers)
+                and [row[0] for row in records] == list(expected_markers)
+                and len({row[1] for row in records}) == len(records)
+                and all(row[1] > 0 and row[2] == 1 for row in records))
+    if fresh_downstream and request_policy != "omit-connection":
         return (len(records) == len(expected_markers)
                 and [row[0] for row in records] == list(expected_markers))
     return module_valid_origin_reuse(records, expected_markers)
+
+
+def validate_api_origin_workers(origin_workers, cpus, origin_mode):
+    if origin_mode == "api" and origin_workers != len(cpus.split(",")):
+        raise ValueError("API origin workers must match the number of --origin-cpus")
 
 
 def distinct_url_scenarios(remaining):
@@ -198,6 +209,10 @@ def main():
     if options.mixed_distinct_urls and not options.mixed_small_bytes:
         parser.error("--mixed-distinct-urls requires --mixed-small-bytes")
     try:
+        validate_api_origin_workers(options.origin_workers, options.origin_cpus, options.origin_mode)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
         scenarios = distinct_url_scenarios(remaining)
         validate_distinct_url_scenarios(scenarios, options.mixed_distinct_urls)
         validate_mixed_small_rate_scenarios(scenarios, bool(options.mixed_small_rate))
@@ -320,7 +335,11 @@ def main():
         logs = (self.out / "api-origin.log").read_text()
         (self.out / f"{self.active_label}-origin-reuse.log").write_text(logs)
         records = module.origin_reuse_records(logs, expected_markers)
-        if not valid_api_origin_records(records, expected_markers, fresh_downstream):
+        reuse = (getattr(self.args, "native_origin_reuse", "on") == "on"
+                 if getattr(self.args, "proxy_profile", "converter-strict") == "native-streaming"
+                 else getattr(self.args, "bounded_origin_reuse", "off") == "on")
+        policy = getattr(self.args, "native_request_policy", "transparent")
+        if not valid_api_origin_records(records, expected_markers, fresh_downstream, reuse, policy):
             raise ValueError("API origin reuse evidence did not match expected markers")
 
     module.Harness.verify_origin_reuse = verify_api_origin_reuse
