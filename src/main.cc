@@ -489,69 +489,80 @@ static void configure_study_policy(Loop* loop) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_TERMINAL_SCAN=on"))
                     loop->study_http_terminal_scan = true;
-            write_str(loop->study_http_terminal_scan ? "RUT_STUDY_HTTP_TERMINAL_SCAN mode=on\n"
-                                                     : "RUT_STUDY_HTTP_TERMINAL_SCAN mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_terminal_scan
+                              ? "RUT_STUDY_HTTP_TERMINAL_SCAN mode=on\n"
+                              : "RUT_STUDY_HTTP_TERMINAL_SCAN mode=off\n");
         }
         if constexpr (requires { loop->study_http_boundary_ready_set; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_BOUNDARY_READY_SET=on"))
                     loop->study_http_boundary_ready_set = true;
-            write_str(loop->study_http_boundary_ready_set
-                          ? "RUT_STUDY_HTTP_BOUNDARY_READY_SET mode=on\n"
-                          : "RUT_STUDY_HTTP_BOUNDARY_READY_SET mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_boundary_ready_set
+                              ? "RUT_STUDY_HTTP_BOUNDARY_READY_SET mode=on\n"
+                              : "RUT_STUDY_HTTP_BOUNDARY_READY_SET mode=off\n");
         }
         if constexpr (requires { loop->study_http_relay_ring; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_RELAY_RING=on"))
                     loop->study_http_relay_ring = true;
-            write_str(loop->study_http_relay_ring ? "RUT_STUDY_HTTP_RELAY_RING mode=on\n"
-                                                  : "RUT_STUDY_HTTP_RELAY_RING mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_relay_ring ? "RUT_STUDY_HTTP_RELAY_RING mode=on\n"
+                                                      : "RUT_STUDY_HTTP_RELAY_RING mode=off\n");
         }
         if constexpr (requires { loop->study_http_byte_yield; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_BYTE_YIELD=on"))
                     loop->study_http_byte_yield = true;
-            write_str(loop->study_http_byte_yield ? "RUT_STUDY_HTTP_BYTE_YIELD mode=on\n"
-                                                  : "RUT_STUDY_HTTP_BYTE_YIELD mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_byte_yield ? "RUT_STUDY_HTTP_BYTE_YIELD mode=on\n"
+                                                      : "RUT_STUDY_HTTP_BYTE_YIELD mode=off\n");
         }
         if constexpr (requires { loop->study_http_taskrun_yield; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_TASKRUN_YIELD=on"))
                     loop->study_http_taskrun_yield = true;
-            write_str(loop->study_http_taskrun_yield ? "RUT_STUDY_HTTP_TASKRUN_YIELD mode=on\n"
-                                                     : "RUT_STUDY_HTTP_TASKRUN_YIELD mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_taskrun_yield
+                              ? "RUT_STUDY_HTTP_TASKRUN_YIELD mode=on\n"
+                              : "RUT_STUDY_HTTP_TASKRUN_YIELD mode=off\n");
         }
         if constexpr (requires { loop->study_http_submit_before_relay; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY=on"))
                     loop->study_http_submit_before_relay = true;
-            write_str(loop->study_http_submit_before_relay
-                          ? "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=on\n"
-                          : "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_submit_before_relay
+                              ? "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=on\n"
+                              : "RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=off\n");
         }
         if constexpr (requires { loop->study_http_coalesce_close_response; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_COALESCE_CLOSE=on"))
                     loop->study_http_coalesce_close_response = true;
-            write_str(loop->study_http_coalesce_close_response
-                          ? "RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n"
-                          : "RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_coalesce_close_response
+                              ? "RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n"
+                              : "RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n");
         }
         if constexpr (requires { loop->study_http_direct_close_response; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_DIRECT_CLOSE=on"))
                     loop->study_http_direct_close_response = true;
-            write_str(loop->study_http_direct_close_response
-                          ? "RUT_STUDY_HTTP_DIRECT_CLOSE mode=on\n"
-                          : "RUT_STUDY_HTTP_DIRECT_CLOSE mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_direct_close_response
+                              ? "RUT_STUDY_HTTP_DIRECT_CLOSE mode=on\n"
+                              : "RUT_STUDY_HTTP_DIRECT_CLOSE mode=off\n");
         }
         if constexpr (requires { loop->study_http_initial_recv_once; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_INITIAL_RECV_ONCE=on"))
                     loop->study_http_initial_recv_once = true;
-            write_str(loop->study_http_initial_recv_once
-                          ? "RUT_STUDY_HTTP_INITIAL_RECV_ONCE mode=on\n"
-                          : "RUT_STUDY_HTTP_INITIAL_RECV_ONCE mode=off\n");
+            if (report_study)
+                write_str(loop->study_http_initial_recv_once
+                              ? "RUT_STUDY_HTTP_INITIAL_RECV_ONCE mode=on\n"
+                              : "RUT_STUDY_HTTP_INITIAL_RECV_ONCE mode=off\n");
         }
         const bool kLatency = str_eq(profile, "latency");
         const bool kBalanced = str_eq(profile, "balanced");
