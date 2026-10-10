@@ -3,7 +3,6 @@
 #include "rut/runtime/access_log_startup.h"
 #include "rut/runtime/connection_capacity.h"
 #include "rut/runtime/upstream_pool.h"
-#include <atomic>
 #ifdef __linux__
 #include "rut/runtime/epoll_event_loop.h"
 #include "rut/runtime/io_backend.h"
@@ -429,7 +428,7 @@ static void configure_study_policy(Loop* loop) {
             for (const char* const* item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_WS_RECV=cache") &&
                     !loop->backend.enable_ws_recv_cache())
-                    loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
+                    loop->backend.set_failure_code(ENOMEM);
             }
             if (report_study)
                 write_str(loop->backend.ws_recv_cache_enabled ? "RUT_STUDY_WS_RECV mode=cache\n"
@@ -439,7 +438,7 @@ static void configure_study_policy(Loop* loop) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_WS_SPLICE=on") &&
                     !loop->ws_splice.enable(loop->connection_capacity))
-                    loop->backend.fatal_error.store(ENOMEM, std::memory_order_release);
+                    loop->backend.set_failure_code(ENOMEM);
             for (const char* const* item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_WS_COPY=on")) loop->ws_splice.copy_first = true;
                 if (str_eq(*item, "RUT_STUDY_WS_NODELAY=off")) loop->ws_splice.no_delay = false;

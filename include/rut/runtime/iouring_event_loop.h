@@ -743,6 +743,10 @@ public:
         return {};
     }
 
+    bool should_wait_for_event() const {
+        return deferred_relay_read_count == 0 && !ws_splice.budget_deferred_runnable;
+    }
+
     void run() {
         struct rusage study_usage_begin{};
         const bool kStudyUsageValid =
@@ -761,11 +765,8 @@ public:
             retry_strict_upstream_retirement_cancels();
             retry_response_splice_cancels();
             ws_splice.progress(*this);
-            const u32 kEventCount = backend.wait(events,
-                                                 study_event_batch_limit,
-                                                 conns,
-                                                 slots_initialized,
-                                                 deferred_relay_read_count == 0);
+            const u32 kEventCount = backend.wait(
+                events, study_event_batch_limit, conns, slots_initialized, should_wait_for_event());
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent

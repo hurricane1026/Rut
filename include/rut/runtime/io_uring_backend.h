@@ -488,6 +488,8 @@ struct IoUringBackend {
 
     i32 failure_code() const { return fatal_error.load(std::memory_order_acquire); }
 
+    void set_failure_code(i32 error) { fatal_error.store(error, std::memory_order_release); }
+
     // Completions the kernel has posted that wait() has not harvested yet. Each
     // positive recv among them still holds its provided buffer, so this bounds
     // how many buffers are missing from the ring right now. CQEs parked on the

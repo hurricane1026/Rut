@@ -863,6 +863,175 @@ TEST(websocket, iouring_splice_full_duplex) {
 TEST(websocket, iouring_splice_shard_budget_one) {
     full_duplex_burst(_tc, false, false, false, true, false, 0, false, 65536, 1, false, 2048);
 }
+TEST(websocket, iouring_splice_budget_deferred_work_skips_blocking_wait) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    loop.ws_splice.call_budget = 1;
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    Peer client{downstream[1]}, origin{upstream[1]};
+    auto* connection = loop.alloc_conn();
+    REQUIRE(connection != nullptr);
+    connection->fd = downstream[0];
+    connection->upstream_fd = upstream[0];
+    connection->upstream_episode = 1;
+    REQUIRE(set_nonblocking(connection->fd));
+    REQUIRE(set_nonblocking(connection->upstream_fd));
+    auto& owner = loop.ws_splice.owners[connection->id];
+    owner.active = true;
+    owner.episode = connection->upstream_episode;
+    ++connection->pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner.direction[direction].read_fd = fds[0];
+        owner.direction[direction].write_fd = fds[1];
+    }
+    loop.ws_splice.enqueue(connection->id);
+    const u8 payload[] = "budget deferred";
+    REQUIRE(write_burst(client.fd, payload, sizeof(payload)));
+
+    const u64 calls_before = loop.ws_splice.calls;
+    loop.ws_splice.progress(loop);
+    CHECK_EQ(loop.ws_splice.calls - calls_before, 1u);
+    CHECK(loop.ws_splice.budget_deferred_runnable);
+    CHECK_FALSE(loop.should_wait_for_event());
+
+    loop.close_conn(*connection);
+    for (u32 i = 0; i < 1000 && connection->pending_ops != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(connection->pending_ops, 0u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
+}
+TEST(websocket, iouring_splice_armed_owner_allows_blocking_wait) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    loop.ws_splice.call_budget = 1;
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    Peer client{downstream[1]}, origin{upstream[1]};
+    auto* connection = loop.alloc_conn();
+    REQUIRE(connection != nullptr);
+    connection->fd = downstream[0];
+    connection->upstream_fd = upstream[0];
+    connection->upstream_episode = 1;
+    REQUIRE(set_nonblocking(connection->fd));
+    REQUIRE(set_nonblocking(connection->upstream_fd));
+    auto& owner = loop.ws_splice.owners[connection->id];
+    owner.active = true;
+    owner.episode = connection->upstream_episode;
+    ++connection->pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner.direction[direction].read_fd = fds[0];
+        owner.direction[direction].write_fd = fds[1];
+    }
+    loop.ws_splice.enqueue(connection->id);
+
+    loop.ws_splice.progress(loop);
+    CHECK_FALSE(loop.ws_splice.budget_deferred_runnable);
+    CHECK(loop.ws_splice.owners[connection->id].direction[0].armed);
+    CHECK(loop.should_wait_for_event());
+
+    loop.close_conn(*connection);
+    for (u32 i = 0; i < 1000 && connection->pending_ops != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(connection->pending_ops, 0u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
+}
+TEST(websocket, iouring_splice_retires_last_external_owner_pin) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    auto* connection = loop.alloc_conn();
+    REQUIRE(connection != nullptr);
+    const u32 id = connection->id;
+    auto& owner = loop.ws_splice.owners[id];
+    owner.closing = true;
+    owner.episode = 1;
+    connection->pending_ops = 1;  // Deferred free is held by the splice owner pin.
+    loop.free_conn(*connection);
+    REQUIRE_EQ(loop.pending_free_count, 1u);
+    REQUIRE_EQ(loop.conns[id].pending_ops, 1u);
+    loop.ws_splice.enqueue(id);
+
+    loop.ws_splice.progress(loop);
+    CHECK_EQ(loop.conns[id].pending_ops, 0u);
+    CHECK_EQ(loop.pending_free_count, 0u);
+    CHECK_EQ(loop.free_top, loop.connection_capacity);
+    auto* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, id);
+    loop.free_conn(*reused);
+}
+TEST(websocket, iouring_splice_external_close_reclaims_queued_owner_slot) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    Peer client{downstream[1]}, origin{upstream[1]};
+    auto* connection = loop.alloc_conn();
+    REQUIRE(connection != nullptr);
+    const u32 id = connection->id;
+    const u32 free_top_before = loop.free_top;
+    connection->fd = downstream[0];
+    connection->upstream_fd = upstream[0];
+    connection->upstream_episode = 1;
+    REQUIRE(set_nonblocking(connection->fd));
+    REQUIRE(set_nonblocking(connection->upstream_fd));
+    auto& owner = loop.ws_splice.owners[id];
+    owner.active = true;
+    owner.episode = connection->upstream_episode;
+    ++connection->pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner.direction[direction].read_fd = fds[0];
+        owner.direction[direction].write_fd = fds[1];
+    }
+    REQUIRE(loop.ws_splice.arm(loop, *connection, 0, false));
+    loop.ws_splice.enqueue(id);
+    REQUIRE_EQ(connection->pending_ops, 2u);
+
+    loop.close_conn(*connection);
+    REQUIRE_EQ(loop.pending_free_count, 1u);
+    for (u32 i = 0; i < 1000 && loop.pending_free_count != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(loop.backend.failure_code(), 0);
+    CHECK_EQ(loop.pending_free_count, 0u);
+    CHECK_EQ(loop.free_top, free_top_before + 1);
+    CHECK_FALSE(loop.ws_splice.owners[id].reclaim_pending);
+    auto* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, id);
+    loop.free_conn(*reused);
+}
 TEST(websocket, iouring_splice_shard_budget_fair_across_active_owners) {
     LoopStorage storage;
     if (!storage.init()) return;

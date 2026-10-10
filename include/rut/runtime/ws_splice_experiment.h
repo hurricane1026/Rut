@@ -30,12 +30,13 @@ struct WsSpliceExperiment {
         bool eof_snapshot_taken = false;
 #endif
         bool requested = false, active = false, closing = false, eof_closing = false,
-             queued = false, failed = false;
+             queued = false, failed = false, budget_deferred = false, reclaim_pending = false;
     };
     MappedArray<Owner> owners;
     MappedArray<u32> queued;
     u32 queued_count = 0, queued_head = 0, turn_budget_remaining = 0;
     bool turn_budget_active = false;
+    bool budget_deferred_runnable = false;
     u32 admission_budget_remaining = 0;
     bool enabled = false, copy_first = false, check_available = false, fast_batch = false;
     bool fast_scan = false, last_batch_ws_only = false;
@@ -327,6 +328,7 @@ struct WsSpliceExperiment {
         }
         if (turn_budget_remaining == 0) {
             o.next_direction = static_cast<u8>(index ^ 1u);
+            o.budget_deferred = true;
             enqueue(c.id);
             return;
         }
@@ -375,8 +377,15 @@ struct WsSpliceExperiment {
             o.closing = false;
             if (c.pending_ops == 0)
                 loop.backend.fatal_error.store(EPROTO);
-            else
+            else {
                 --c.pending_ops;
+                if (c.fd < 0 && c.pending_ops == 0) {
+                    if (o.queued)
+                        o.reclaim_pending = true;
+                    else
+                        loop.reclaim_slot(c.id);
+                }
+            }
         }
     }
     template <class Loop>
@@ -423,12 +432,19 @@ struct WsSpliceExperiment {
     }
     template <class Loop>
     void progress(Loop& loop) {
+        budget_deferred_runnable = false;
         if (!turn_budget_active) begin_turn();
         const u32 kOwnersToVisit = queued_count < call_budget ? queued_count : call_budget;
         for (u32 i = 0; i < kOwnersToVisit; ++i) {
             const u32 kId = dequeue();
             auto& c = loop.conns[kId];
             auto& o = owners[kId];
+            o.budget_deferred = false;
+            if (o.reclaim_pending) {
+                o.reclaim_pending = false;
+                loop.reclaim_slot(kId);
+                continue;
+            }
             if (o.closing) retire(loop, c);
             if (o.eof_closing) {
                 finish_eof_close(loop, c);
@@ -446,6 +462,7 @@ struct WsSpliceExperiment {
             }
             if (o.active) {
                 if (turn_budget_remaining == 0) {
+                    o.budget_deferred = true;
                     enqueue(kId);
                     break;
                 }
@@ -465,6 +482,7 @@ struct WsSpliceExperiment {
                 !c.ws_upstream_send_pending && c.recv_buf.len() == 0 &&
                 c.upstream_recv_buf.len() == 0 && !loop.backend.has_ws_recv_cache(c.id)) {
                 if (admission_budget_remaining == 0) {
+                    o.budget_deferred = true;
                     enqueue(kId);
                     break;
                 }
@@ -525,6 +543,10 @@ struct WsSpliceExperiment {
             }
             if (o.requested || o.closing || o.eof_closing) enqueue(kId);
         }
+        for (u32 i = 0; i < queued_count; ++i)
+            budget_deferred_runnable =
+                budget_deferred_runnable ||
+                owners[queued[(queued_head + i) % queued.size()]].budget_deferred;
         turn_budget_active = false;
     }
 };
