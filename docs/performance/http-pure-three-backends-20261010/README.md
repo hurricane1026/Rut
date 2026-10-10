@@ -36,6 +36,6 @@ Transparent Rut forwards downstream Connection: close upstream; nginx strips it 
 100KiB io_uring persistent rows are INVALID and must not be used to claim throughput superiority. All three default-control repeats also time out: neither ring nor larger segments alone explain the failure. No root cause established yet.
 
 Full logs/configs/frozen binaries: `/home/hurricane/private/code/rut-performance-checkpoints/http-pure-three-backends-20261010`.
-Raw summary SHA256: `b100af94c252f72dcff61ad61e77a48341491568e8e910176d98fc5278b11a72`.
+Raw summary SHA256: `eae90a2372057b129fe027f7002a6028420e0c4c1b543e606d35b834e064e6e7`.
 
 For isolation, default = current profile/128KiB/ring off/byte gate off; chunk256 = 256KiB/ring off/byte gate off; ring256 = 256KiB/ring on/byte gate off. The runner is authoritative for per-cell overrides. All controls preserve current CQ wait and turn budgets.

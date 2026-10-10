@@ -11,4 +11,4 @@ Single serial12-second sample after2-second warmup for each engine/configuration
 About7.8% throughput improvement, no tail improvement demonstrated. One sample is only a control, not a repeat-confirmed gain or general workload proof.
 
 Full raw logs/configs/frozen binaries: /home/hurricane/private/code/rut-performance-checkpoints/http-close-coalesce-4k-control-20261010
-Raw summary SHA256: `c1c52e798d9bba5f52628670f5de64b2cbc0ea85a1f0cca9dd928e6c25038d20`.
+Raw summary SHA256: `6c44c4c6375a6791e0384dad35b561122d48100162a6d363f8b9ea441dea619e`.

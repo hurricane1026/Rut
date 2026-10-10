@@ -11,6 +11,6 @@ Single frontend core, four pinned reuseport origin workers, two separate physica
 This explains most epoll loss but leaves an io_uring short-connection deficit. Connection initialization, peer getpeername, receive/close cancellation and CQ processing are hypotheses for follow-up profiling, not proven cost attribution. Route workload policies cannot tune pre-route accept retroactively.
 
 Full evidence/frozen binaries: `/home/hurricane/private/code/rut-performance-checkpoints/http-short-origin-reuse-20261010`.
-Raw summary SHA256: `bf07b28d451f04f69f69c0689ded393bc56c6c12f77a0347c786f28099221122`.
+Raw summary SHA256: `cacf1b41b39ff7978427cf433fb22a338a8826aff3c47f9187836629f9f0a17e`.
 
 No runtime defaults changed; no new language syntax introduced. Runtime binaries unchanged. Benchmark tool tests cover strict reuse gating; real preflight covers ID1 rewrite, actual origin reuse and downstream response semantics.
