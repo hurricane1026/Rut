@@ -834,10 +834,10 @@ public:
         // ready connections can run before this owner gets another turn.
         for (u32 calls = 0; calls < study_relay_owner_call_limit; ++calls) {
             const bool writing = r.segment_len != 0;
-            const u32 want = writing ? r.segment_len - r.segment_sent
-                                     : (c.resp_body_remaining < study_relay_chunk_size
-                                            ? c.resp_body_remaining
-                                            : study_relay_chunk_size);
+            const u32 want =
+                writing ? r.segment_len - r.segment_sent
+                        : (c.resp_body_remaining < study_relay_chunk_size ? c.resp_body_remaining
+                                                                          : study_relay_chunk_size);
             ssize_t n;
             do {
                 n = writing ? ::splice(r.pipe_read,
