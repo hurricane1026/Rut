@@ -234,30 +234,43 @@ class ToolsTest(unittest.TestCase):
         relay_compare.validate_distinct_url_scenarios(("proxy-close", "proxy-keepalive"), True)
         relay_compare.validate_distinct_url_scenarios(relay_compare.DEFAULT_SCENARIOS, False)
 
-    def test_distinct_urls_reject_single_payload_api_origin(self):
-        with self.assertRaisesRegex(ValueError, "API origin serves one payload"):
-            relay_compare.validate_distinct_url_origin_mode(True, "api")
-        relay_compare.validate_distinct_url_origin_mode(True, "native")
-        relay_compare.validate_distinct_url_origin_mode(False, "api")
+    def test_api_origin_rejects_mixed_sizes(self):
+        with self.assertRaisesRegex(ValueError, "mixed-size workloads.*one payload"):
+            relay_compare.validate_api_mixed_payload("api", 4096)
+        relay_compare.validate_api_mixed_payload("api", 0)
+        relay_compare.validate_api_mixed_payload("native", 4096)
 
-    def test_distinct_url_api_origin_rejected_before_output_or_frontend(self):
+    def test_api_mixed_size_rejected_before_output_module_or_process(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "must-not-be-created"
-            argv = [
-                str(Path(relay_compare.__file__)), "--engines", "direct-origin",
-                "--origin-mode", "api", "--mixed-small-bytes", "4096",
-                "--mixed-distinct-urls", "--scenarios", "proxy-keepalive",
-                "--output", str(output),
-            ]
-            with mock.patch.object(sys, "argv", argv), \
-                    mock.patch.object(relay_compare.importlib.util,
-                                      "spec_from_file_location") as load_module, \
-                    contextlib.redirect_stderr(io.StringIO()), \
-                    self.assertRaises(SystemExit) as raised:
-                relay_compare.main()
-            self.assertEqual(raised.exception.code, 2)
-            load_module.assert_not_called()
-            self.assertFalse(output.exists())
+            cases = (
+                ("--mixed-distinct-urls",),
+                (),  # Header-selected /proxy also serves the same API payload.
+            )
+            for mixed_args in cases:
+                with self.subTest(mixed_args=mixed_args):
+                    argv = [
+                        str(Path(relay_compare.__file__)), "--engines", "direct-origin",
+                        "--origin-mode", "api", "--mixed-small-bytes", "4096",
+                        *mixed_args, "--scenarios", "proxy-keepalive",
+                        "--output", str(output),
+                    ]
+                    with mock.patch.object(sys, "argv", argv), \
+                            mock.patch.object(relay_compare.importlib.util,
+                                              "spec_from_file_location") as load_module, \
+                            mock.patch.object(subprocess, "Popen") as popen, \
+                            contextlib.redirect_stderr(io.StringIO()), \
+                            self.assertRaises(SystemExit) as raised:
+                        relay_compare.main()
+                    self.assertEqual(raised.exception.code, 2)
+                    load_module.assert_not_called()
+                    popen.assert_not_called()
+                    self.assertFalse(output.exists())
+
+    def test_api_without_mixed_size_and_native_mixed_modes_are_valid(self):
+        relay_compare.validate_api_mixed_payload("api", 0)
+        relay_compare.validate_api_mixed_payload("native", 4096)
+        relay_compare.validate_distinct_url_scenarios(("proxy-keepalive",), True)
 
     def test_distinct_url_scenario_defaults_and_explicit_lists(self):
         self.assertEqual(
