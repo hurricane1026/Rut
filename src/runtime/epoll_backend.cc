@@ -1481,6 +1481,7 @@ dispatch_ready:
                                   (type == IoEventType::RelayWrite &&
                                    relay.phase == RelayPhase::Writing && relay.write_armed);
             if (!owner || (!client_closed && !runnable)) continue;
+            if (study_accept_edge_trigger && accept_io_budget > 0) --accept_io_budget;
             events[out] = {};
             events[out].conn_id = conn_id;
             events[out].type = type;
@@ -1730,10 +1731,7 @@ dispatch_ready:
                     if (nr > 0) {
                         buf.commit(static_cast<u32>(nr));
                         result = static_cast<i32>(nr);
-                        if (study_edge_trigger)
-                            edge_runnable[recv_slot].read_ready =
-                                static_cast<u32>(nr) == avail ||
-                                (ep_events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR));
+                        if (study_edge_trigger) edge_runnable[recv_slot].read_ready = true;
                     } else if (nr == 0) {
                         result = 0;
                         if (study_edge_trigger) edge_runnable[recv_slot].read_ready = false;
