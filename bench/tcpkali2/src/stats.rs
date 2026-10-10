@@ -153,7 +153,9 @@ mod tests {
     use super::{
         LATENCY_FLUSH_THRESHOLD, LocalStatsCache, Stats, megabits_per_second, rate_per_second,
     };
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::thread;
     use std::time::Duration;
 
     #[test]
@@ -185,6 +187,38 @@ mod tests {
         drop(cache);
 
         assert_eq!(stats.total_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn measurement_worker_observes_warmup_reset_before_recording() {
+        let mut initial_stats = Stats::new();
+        initial_stats.latency_sample_shift = 0;
+        initial_stats.total_requests.store(7, Ordering::Relaxed);
+        initial_stats.total_bytes_sent.store(70, Ordering::Relaxed);
+        initial_stats
+            .total_bytes_received
+            .store(140, Ordering::Relaxed);
+        initial_stats.latency_histogram.lock().record(11).unwrap();
+        let stats = Arc::new(initial_stats);
+
+        let worker_stats = stats.clone();
+        let worker = thread::spawn(move || {
+            while worker_stats.is_warmup() {
+                thread::yield_now();
+            }
+            worker_stats.record_request(5, 8);
+            worker_stats.record_latency(42, 0);
+        });
+
+        stats.end_warmup();
+        worker.join().unwrap();
+
+        assert_eq!(stats.total_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.total_bytes_sent.load(Ordering::Relaxed), 5);
+        assert_eq!(stats.total_bytes_received.load(Ordering::Relaxed), 8);
+        let histogram = stats.latency_histogram.lock();
+        assert_eq!(histogram.len(), 1);
+        assert_eq!(histogram.value_at_percentile(50.0), 42);
     }
 
     #[test]
@@ -379,7 +413,7 @@ impl Stats {
         self.last_print_count.store(0, Ordering::Relaxed);
         self.last_print_time
             .store(unix_timestamp_millis(), Ordering::Relaxed);
-        self.is_warmup.store(false, Ordering::Relaxed);
+        self.is_warmup.store(false, Ordering::Release);
     }
 
     /// Check if currently in warmup phase
@@ -387,7 +421,7 @@ impl Stats {
     /// # Returns
     /// * `bool` - True if in warmup phase, false otherwise
     pub fn is_warmup(&self) -> bool {
-        self.is_warmup.load(Ordering::Relaxed)
+        self.is_warmup.load(Ordering::Acquire)
     }
 
     /// Set shutting down flag
