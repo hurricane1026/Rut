@@ -1,0 +1,21 @@
+Loaded program: /home/hurricane/private/code/rut-performance-checkpoints/http-boundary-ready-set-20261010-diagnostics/screen-1048576-uring-off/proxy.rut (opt O2)
+Backend: io_uring
+RUT_STUDY_HTTP_NODELAY mode=off
+RUT_STUDY_WS_RECV mode=once
+RUT_STUDY_WS_COPY mode=off
+RUT_STUDY_WS_AVAILABLE mode=off
+RUT_STUDY_WS_FAST_BATCH mode=off
+RUT_STUDY_WS_FAST_SCAN mode=off
+RUT_STUDY_WS_NODELAY mode=on
+RUT_STUDY_WS_SYNC_SEND mode=off
+RUT_STUDY_WS_COPY_LIMIT bytes=4096
+RUT_STUDY_WS_PARAMETERS chunk=65536 calls=8
+RUT_STUDY_WS_SPLICE mode=off
+RUT_STUDY_HTTP_TERMINAL_SCAN mode=off
+RUT_STUDY_HTTP_BOUNDARY_READY_SET mode=off
+RUT_STUDY_POLICY profile=current batch=256 chunk=131072
+Listening on port 8604 with 1 shard(s)
+Draining connections (1s)...
+RUT_WS_THREAD voluntary=1805 involuntary=209
+RUT_IO_WAIT calls=92119 enters=75986 submitted=137429 events=182851 empty=8815 max_events=128
+Shutdown complete.

@@ -363,9 +363,14 @@ class Harness:
                 (self.out / "static-nginx.conf").write_text(self.nginx_config(server, workers=self.args.workers))
                 continue
             if native_streaming:
+                request_policy = (', request_policy: { version: .http11, host: .upstream, '
+                                  'connection: .omit, strip_headers: [.connection, .keepAlive, '
+                                  '.te, .expect, .upgrade] }'
+                                  if getattr(a, "native_request_policy", "transparent") == "omit-connection"
+                                  else '')
                 native = (f'listen 127.0.0.1:{a.front_port}\n'
                           f'upstream backend at "127.0.0.1:{a.origin_port}"\n'
-                          'route GET "/proxy" { return forward(backend) }\n')
+                          'route GET "/proxy" { return forward(backend' + request_policy + ') }\n')
                 (self.out / (work + ".source.rut")).write_text(native)
                 runnable = native
                 if self.tls_context:
@@ -809,7 +814,7 @@ class Harness:
                      and [row[0] for row in records] == expected_markers
                      and len({row[1] for row in records}) == len(records)
                      and all(row[1] > 0 and row[2] == 1 for row in records))
-        elif fresh_downstream:
+        elif fresh_downstream and getattr(self.args, "native_request_policy", "transparent") != "omit-connection":
             # A native Rut downstream close also closes its origin; nginx may
             # pool that origin. Only the persistent stage promises reuse.
             valid = len(records) == len(expected_markers) and [row[0] for row in records] == expected_markers
@@ -1078,8 +1083,8 @@ def validate_proxy_profile(parser, args):
         parser.error("native-streaming requires a body between 1 byte and 1 MiB")
     if not args.scenarios or any(value not in ("proxy-close", "proxy-keepalive") for value in args.scenarios):
         parser.error("native-streaming supports only proxy-close and proxy-keepalive")
-    if not args.concurrency or any(value not in (1, 32, 128) for value in args.concurrency):
-        parser.error("native-streaming supports only concurrency values 1, 32 and 128")
+    if not args.concurrency or any(value not in (1, 32, 128, 256, 512, 1024) for value in args.concurrency):
+        parser.error("native-streaming supports concurrency values 1, 32, 128, 256, 512 and 1024")
     if args.keepalive_header != "implicit":
         parser.error("native-streaming requires --keepalive-header implicit")
     if args.body_size is None:
@@ -1194,6 +1199,9 @@ def arguments():
                         default="converter-strict", help="proxy implementation profile; default preserves converter behavior")
     parser.add_argument("--native-origin-reuse", choices=("on", "off"), default="on",
                         help="native-streaming origin reuse; off isolates response forwarding from connection pooling")
+    parser.add_argument("--native-request-policy", choices=("transparent", "omit-connection"),
+                        default="transparent",
+                        help="use existing request policy to separate downstream close from origin reuse; preflight verifies reuse")
     parser.add_argument("--bounded-origin-reuse", choices=("on", "off"), default="off",
                         help="converter-bounded origin reuse; requires origin connection-ID preflight proof")
     parser.add_argument("--native-nginx-buffering", choices=("on", "off"), default="off",

@@ -1,0 +1,200 @@
+[
+  {
+    "campaign": "100k-default",
+    "rep": 1,
+    "body_size": 102400,
+    "rps": 31545.626676471387,
+    "p99_us": 4443.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "100k-default",
+    "rep": 2,
+    "body_size": 102400,
+    "rps": 31567.732528105815,
+    "p99_us": 4402.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "100k-default",
+    "rep": 3,
+    "body_size": 102400,
+    "rps": 30820.46157563518,
+    "p99_us": 4523.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "1m-256",
+    "rep": 1,
+    "body_size": 1048576,
+    "rps": 7232.252884560646,
+    "p99_us": 18504.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "1m-256",
+    "rep": 2,
+    "body_size": 1048576,
+    "rps": 6962.206244216027,
+    "p99_us": 20969.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "1m-256",
+    "rep": 3,
+    "body_size": 1048576,
+    "rps": 6730.678575116469,
+    "p99_us": 23682.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "1k-default",
+    "rep": 1,
+    "body_size": 1024,
+    "rps": 108048.72436230599,
+    "p99_us": 1513.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "1k-default",
+    "rep": 2,
+    "body_size": 1024,
+    "rps": 108519.23518469837,
+    "p99_us": 1522.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "1k-default",
+    "rep": 3,
+    "body_size": 1024,
+    "rps": 108613.57901761738,
+    "p99_us": 1562.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  }
+]

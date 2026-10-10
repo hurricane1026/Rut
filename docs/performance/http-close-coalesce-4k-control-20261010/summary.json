@@ -1,0 +1,74 @@
+[
+  {
+    "campaign": "r0-off",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "body_size": 4096,
+    "rps": 18437.33688171679,
+    "p99_us": 14812.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "r0-on",
+    "engine": "uring",
+    "rep": 1,
+    "concurrency": 128,
+    "body_size": 4096,
+    "rps": 19879.334818007243,
+    "p99_us": 14928.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  },
+  {
+    "campaign": "r0-nginx",
+    "engine": "nginx",
+    "rep": 1,
+    "concurrency": 128,
+    "body_size": 4096,
+    "rps": 27621.809069767092,
+    "p99_us": 8258.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true
+  }
+]

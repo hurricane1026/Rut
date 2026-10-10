@@ -1,0 +1,40 @@
+Loaded program: /home/hurricane/private/code/rut-performance-checkpoints/http-100k-timeout-diagnostic-20261010/default/proxy.rut (opt O2)
+Backend: io_uring
+RUT_STUDY_HTTP_NODELAY mode=off
+RUT_STUDY_WS_RECV mode=once
+RUT_STUDY_WS_COPY mode=off
+RUT_STUDY_WS_AVAILABLE mode=off
+RUT_STUDY_WS_FAST_BATCH mode=off
+RUT_STUDY_WS_FAST_SCAN mode=off
+RUT_STUDY_WS_NODELAY mode=on
+RUT_STUDY_WS_SYNC_SEND mode=off
+RUT_STUDY_WS_COPY_LIMIT bytes=4096
+RUT_STUDY_WS_PARAMETERS chunk=65536 calls=8
+RUT_STUDY_WS_SPLICE mode=off
+RUT_STUDY_HTTP_TERMINAL_SCAN mode=off
+RUT_STUDY_HTTP_BOUNDARY_READY_SET mode=off
+RUT_STUDY_HTTP_RELAY_RING mode=off
+RUT_STUDY_HTTP_BYTE_YIELD mode=off
+RUT_STUDY_HTTP_TASKRUN_YIELD mode=off
+RUT_STUDY_HTTP_SUBMIT_BEFORE_RELAY mode=off
+RUT_STUDY_POLICY profile=current batch=256 chunk=131072
+Listening on port 8604 with 1 shard(s)
+Draining connections (1s)...
+RUT_WS_THREAD voluntary=402 involuntary=139
+RUT_RELAY_STATS admissions=360582 pulled_bytes=31075677909 written_bytes=31075677909
+RUT_SMALL_PHASE_SAMPLES count=0 drops=0
+RUT_SMALL_PHASE kind=0 sum_us=0 max_us=0 hist=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+RUT_SMALL_PHASE kind=1 sum_us=0 max_us=0 hist=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+RUT_SMALL_PHASE kind=2 sum_us=0 max_us=0 hist=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+RUT_SMALL_PHASE kind=3 sum_us=0 max_us=0 hist=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+RUT_PHASE_STATS cq_calls=720320 cq_bytes=31023569303 cq_ns=4681619083 flush_ns=14736066
+RUT_PIPE_STATS large=260 small=0
+RUT_SPLICE_STATS read_calls=360781 write_calls=360781 read_eagain=0 write_eagain=0 read_short=3 write_short=0 budget_write_polls=0
+RUT_WAIT_STATS kind=0 sum_ns=0 max_ns=0 hist=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+RUT_WAIT_STATS kind=1 sum_ns=0 max_ns=0 hist=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+RUT_WAIT_STATS kind=2 sum_ns=1037743813264 max_ns=3608550127 hist=0,0,0,0,0,0,0,0,0,0,0,0,0,6,15,0,1,11,54,141,191,202,0,0,0,0,0,0,0,0,0,0,
+RUT_SYSCALL_STATS kind=0 hist=2373,1244,1993,11,16,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+RUT_SYSCALL_STATS kind=1 hist=0,1,4030,1568,37,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+RUT_SCHED_STATS turns=60742 yields=4 calls=1242 probes=61168 inspected=60410 types=16,60317,0,0,74,0,0,0,3,0,0,0,
+RUT_IO_WAIT calls=60742 enters=60698 submitted=1082153 events=1442999 empty=38 max_events=128
+Shutdown complete.

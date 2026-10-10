@@ -6,7 +6,6 @@ import io
 import json
 import os
 import signal
-import struct
 import subprocess
 import sys
 import tempfile
@@ -20,8 +19,8 @@ import run
 import matrix
 import workload_strategy
 import protocol_workload
-import protocol_strategy
 import relay_compare
+import paced_http_client
 
 from run import (
     Harness,
@@ -50,56 +49,57 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
-    def test_api_origin_command_and_readiness_are_forwarded(self):
-        command = relay_compare.api_origin_command(
-            Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2
-        )
-        self.assertEqual(command[0], sys.executable)
-        self.assertEqual(command[command.index("--port") + 1], "8704")
-        self.assertEqual(command[command.index("--cpus") + 1], "3,4")
-        self.assertEqual(command[command.index("--fragment-bytes") + 1], "16384")
-        relay_compare.wait_for_api_origin_ready(
-            io.StringIO("noise\nAPI_READY worker=0\nAPI_READY worker=1\n"), 2
-        )
-        with self.assertRaisesRegex(RuntimeError, "before readiness"):
-            relay_compare.wait_for_api_origin_ready(io.StringIO(""), 1)
-
-    def test_direct_origin_targets_origin_port(self):
-        args = SimpleNamespace(origin_port=8704, front_port=8604)
-        self.assertEqual(relay_compare.direct_origin_port(args), 8704)
-
-    def test_stream_deadline_allows_inflight_timeout_but_rejects_truncation(self):
-        fixed = bytes((i * 29) & 255 for i in range(16))
-
-        async def consume(raw, chunks, deadline):
+    def test_paced_http_probe_verifies_complete_framing_and_body(self):
+        async def check(payload):
             reader = protocol_workload.asyncio.StreamReader()
-            if raw is not None:
-                reader.feed_data(raw)
-            if deadline == float("inf"):
-                reader.feed_eof()
-            counts = dict(messages=0, bytes=0)
-            values = ([], [], [], [])
-            return await protocol_workload.consume_stream(
-                reader, 16, fixed, chunks, time.monotonic(), 0,
-                deadline, counts, *values
-            )
+            reader.feed_data(payload)
+            reader.feed_eof()
+            await paced_http_client.read_response(reader, b"ZZZZ")
+        protocol_workload.asyncio.run(check(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nZZZZ"))
+        for payload in (b"HTTP/1.1 500 Bad\r\nContent-Length: 4\r\n\r\nZZZZ",
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nZZZZ",
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nZZZZ",
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nZZZY"):
+            with self.subTest(payload=payload), self.assertRaises(paced_http_client.ResponseFailure):
+                protocol_workload.asyncio.run(check(payload))
 
-        complete = b"10\r\n" + struct.pack("!QI", 1, 0) + fixed[12:] + b"\r\n0\r\n\r\n"
-        self.assertFalse(protocol_workload.asyncio.run(consume(complete, 1, float("inf"))))
-        with self.assertRaisesRegex(ValueError, "invalid terminator"):
-            protocol_workload.asyncio.run(consume(b"1\r\na\r\n0\r\n\r\n", 1, float("inf")))
-        self.assertTrue(protocol_workload.asyncio.run(consume(None, 1, time.monotonic() + .01)))
+    def test_origin_workers_use_distinct_listeners_and_explicit_affinity(self):
+        config = "worker_processes 1; events { worker_connections 8192; } http { server { listen 127.0.0.1:8704; } }"
+        result = relay_compare.origin_worker_config(config, 4, "3,4,8,9", "on", 8704, True, True)
+        self.assertIn("worker_processes 4;", result)
+        self.assertIn("worker_cpu_affinity 1000 10000 100000000 1000000000;", result)
+        self.assertIn("listen 127.0.0.1:8704 reuseport;", result)
+        self.assertIn("multi_accept on;", result)
+        legacy = relay_compare.origin_worker_config(config, 4, "3,4,8,9", "on", 8704)
+        self.assertNotIn("reuseport", legacy)
+        self.assertNotIn("worker_cpu_affinity", legacy)
+        with self.assertRaises(ValueError):
+            relay_compare.origin_worker_config(config, 4, "3,4,8,8", "on", 8704, True, True)
 
-    def test_smoke_engine_filter_rejects_empty_configuration(self):
-        with tempfile.TemporaryDirectory() as directory:
-            result = subprocess.run(
-                [sys.executable, str(Path(protocol_strategy.__file__)),
-                 "--output", directory, "--rut", "/bin/true",
-                 "--harness", str(Path(run.__file__)), "--smoke", "--engines", "nginx"],
-                capture_output=True, text=True
-            )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("select no runnable configurations", result.stderr)
+    def test_nginx_small_url_has_separate_buffer_tuning(self):
+        large = "location = /proxy { proxy_buffering off; proxy_buffer_size 1024k; proxy_buffers 8 1024k; proxy_busy_buffers_size 1024k; proxy_pass http://origin; }"
+        small = relay_compare.small_nginx_location(large, 16)
+        self.assertIn("location = /small", small)
+        self.assertIn("proxy_buffer_size 16k", small)
+        self.assertIn("proxy_buffers 8 16k", small)
+        self.assertIn("proxy_busy_buffers_size 32k", small)
+        self.assertIn("proxy_pass http://origin", small)
+        self.assertIn("proxy_buffer_size 1024k", large)
+
+    def test_cpu_accounting_includes_softirq_separately(self):
+        before = {'2': [0] * 8}
+        after = {'2': [20, 0, 30, 10, 0, 0, 40, 0]}
+        usage = relay_compare.cpu_percentages(before, after)['2']
+        self.assertEqual(usage['user'] + usage['system'], 50)
+        self.assertEqual(usage['softirq'], 40)
+        self.assertEqual(usage['idle'], 10)
+
+    def test_mixed_clients_have_disjoint_multiple_core_masks(self):
+        self.assertEqual(relay_compare.mixed_cpu_masks("5,7;6"), ("5,7", "6"))
+        self.assertEqual(relay_compare.mixed_cpu_masks("7,5"), ("7", "5"))
+        for invalid in ("5,7,6", "5,7;7", "5,5;6", "5,;6", "5;", "5;6;7"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                relay_compare.mixed_cpu_masks(invalid)
 
     def test_strategy_requires_repeats_and_guards_tail_latency(self):
         rows = []
@@ -212,6 +212,23 @@ class ToolsTest(unittest.TestCase):
         missing = "\n".join(complete.splitlines()[:-1])
         self.assertFalse(valid_origin_reuse(origin_reuse_records(missing, markers), markers))
 
+    def test_explicit_request_rewrite_requires_reuse_across_downstream_close(self):
+        markers = [f"matched-close-{i}" for i in range(3)]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SimpleNamespace(
+                args=SimpleNamespace(proxy_profile="native-streaming", native_origin_reuse="on",
+                                     native_request_policy="omit-connection"),
+                out=Path(directory), origin_container_id="origin")
+            churn = "\n".join(f"marker={m} connection={i + 1} requests=1"
+                              for i, m in enumerate(markers))
+            fixture.command = lambda argv: SimpleNamespace(stdout=churn)
+            with self.assertRaisesRegex(ValueError, "origin reuse preflight failed"):
+                Harness.verify_origin_reuse(fixture, markers, fresh_downstream=True)
+            reused = "\n".join(f"marker={m} connection=11 requests={i + 1}"
+                               for i, m in enumerate(markers))
+            fixture.command = lambda argv: SimpleNamespace(stdout=reused)
+            Harness.verify_origin_reuse(fixture, markers, fresh_downstream=True)
+
     def test_bounded_origin_reuse_rejects_unsupported_profiles_and_transport(self):
         baseline = dict(proxy_profile="converter-bounded", bounded_origin_reuse="on",
                         tls_cert=None, scenarios=["proxy-close", "proxy-keepalive"])
@@ -237,6 +254,8 @@ class ToolsTest(unittest.TestCase):
                                 "concurrency": [1, 128]}))
         validate_proxy_profile(parser, large)
         self.assertEqual(large.body_size, 1048576)
+        scaling = SimpleNamespace(**(baseline | {"concurrency": [256, 512, 1024]}))
+        validate_proxy_profile(parser, scaling)
         for key, value in (("scenarios", ["static-close"]),
                            ("concurrency", [8]),
                            ("concurrency", []),

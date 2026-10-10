@@ -3184,6 +3184,23 @@ inline bool request_policy_downstream_close_shape(const Connection& conn) {
            !conn.resp_header_mutation_pending_overflow && !conn.resp_header_mutation_overflow;
 }
 
+// The body must already be complete in the current receive buffer. Reuse the
+// owned header slice; no extra receive, allocation or future-size prediction.
+inline bool coalesce_complete_native_close_response(Connection& conn, u32 raw_header_end) {
+    if (!request_policy_downstream_close_shape(conn) || conn.throttle_down_bps != 0 ||
+        conn.resp_body_mode != BodyMode::ContentLength || conn.resp_body_remaining == 0 ||
+        conn.response_header_buf.len() == 0 || raw_header_end > conn.upstream_recv_buf.len())
+        return false;
+    const u32 body = conn.upstream_recv_buf.len() - raw_header_end;
+    if (body != conn.resp_body_remaining || body > conn.response_header_buf.write_avail())
+        return false;
+    conn.response_header_buf.write(conn.upstream_recv_buf.data() + raw_header_end, body);
+    conn.resp_body_remaining = 0;
+    conn.upstream_send_len = conn.upstream_recv_buf.len();
+    conn.resp_body_sent = conn.response_header_buf.len();
+    return true;
+}
+
 // Serialize only the rewritten upstream HTTP/1 header block into dedicated,
 // response-lifetime storage. The original upstream buffer (including its body)
 // stays untouched and is streamed after this header send completes.
@@ -14462,6 +14479,17 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
                 conn, kHeaderLen, loop->is_draining(), force_downstream_close_header)) {
             loop->close_conn(conn);
             return;
+        }
+        if constexpr (requires { loop->study_http_coalesce_close_response; }) {
+            if (loop->study_http_coalesce_close_response && force_downstream_close_header &&
+                coalesce_complete_native_close_response(conn, kHeaderLen)) {
+                ++loop->study_http_coalesced_close_responses;
+                conn.proxy_resp_started = true;
+                conn.transition_to_sending(&on_proxy_response_sent<Loop>);
+                client_send(
+                    loop, conn, conn.response_header_buf.data(), conn.response_header_buf.len());
+                return;
+            }
         }
         conn.resp_body_sent = conn.response_header_buf.len();
         // Once the rewritten header send drains, consume only the ORIGINAL
