@@ -24,18 +24,25 @@ struct WsSpliceExperiment {
     struct Owner {
         Direction direction[2];
         u32 episode = 0;
+        u8 next_direction = 0;
+#ifdef RUT_TESTING
+        u64 eof_read_calls[2]{}, eof_forwarded_bytes[2]{};
+        bool eof_snapshot_taken = false;
+#endif
         bool requested = false, active = false, closing = false, eof_closing = false,
              queued = false, failed = false;
     };
     MappedArray<Owner> owners;
     MappedArray<u32> queued;
-    u32 queued_count = 0;
+    u32 queued_count = 0, queued_head = 0, turn_budget_remaining = 0;
+    bool turn_budget_active = false;
+    u32 admission_budget_remaining = 0;
     bool enabled = false, copy_first = false, check_available = false, fast_batch = false;
     bool fast_scan = false, last_batch_ws_only = false;
     u64 deadline_batches_skipped = 0, terminal_scans_skipped = 0;
     bool no_delay = true;
     u64 nodelay_changes = 0, nodelay_failures = 0;
-    u64 admissions = 0, transferred[2]{}, calls = 0;
+    u64 admissions = 0, transferred[2]{}, calls = 0, read_calls[2]{};
     u32 chunk_size = 65536, call_budget = 8;
     u32 copy_limit = 4096;
     u64 polls = 0, eagain[2]{}, pipe_grow_failures = 0;
@@ -43,13 +50,27 @@ struct WsSpliceExperiment {
     bool enable(u32 capacity) {
         if (!owners.init(capacity) || !queued.init(capacity)) return false;
         enabled = true;
+        queued_head = queued_count = 0;
         return true;
+    }
+    void begin_turn() {
+        turn_budget_remaining = call_budget;
+        admission_budget_remaining = 1;
+        turn_budget_active = true;
     }
     void enqueue(u32 id) {
         if (!owners[id].queued) {
             owners[id].queued = true;
-            queued[queued_count++] = id;
+            queued[(queued_head + queued_count) % queued.size()] = id;
+            ++queued_count;
         }
+    }
+    u32 dequeue() {
+        const u32 id = queued[queued_head];
+        queued_head = (queued_head + 1) % queued.size();
+        --queued_count;
+        owners[id].queued = false;
+        return id;
     }
     static void close_pipes(Owner& owner) {
         for (auto& d : owner.direction) {
@@ -65,7 +86,8 @@ struct WsSpliceExperiment {
         owners.destroy();
         queued.destroy();
         enabled = false;
-        queued_count = 0;
+        queued_head = queued_count = 0;
+        turn_budget_active = false;
     }
     template <class Loop>
     bool intercept_recv(Loop& loop, Connection& c) {
@@ -167,7 +189,7 @@ struct WsSpliceExperiment {
         // two extra syscalls per turn; never extend from a guessed frame size.
         u32 turn_limit = call_budget;
         bool extended = false;
-        for (u32 budget = 0; budget < turn_limit; ++budget) {
+        for (u32 budget = 0; budget < turn_limit && turn_budget_remaining != 0; ++budget) {
             const bool kWriting = d.buffered != 0;
             auto& buffer = index == 0 ? c.recv_buf : c.upstream_recv_buf;
             bool copy = kWriting ? d.copying : (copy_first && d.probe_copy);
@@ -192,6 +214,8 @@ struct WsSpliceExperiment {
             ssize_t n;
             do {
                 ++calls;
+                --turn_budget_remaining;
+                if (!kWriting) ++read_calls[index];
                 if (copy) {
                     n = kWriting ? ::send(kDestination,
                                           buffer.data(),
@@ -211,7 +235,7 @@ struct WsSpliceExperiment {
                                             nullptr,
                                             chunk_size,
                                             SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
-            } while (n < 0 && errno == EINTR);
+            } while (n < 0 && errno == EINTR && turn_budget_remaining != 0);
             if (kSampled) {
                 const int kSavedErrno = errno;
                 loop.study_record_syscall(kKind, monotonic_ns() - kStarted);
@@ -221,6 +245,13 @@ struct WsSpliceExperiment {
                 ++eagain[kWriting ? 1 : 0];
                 if (!kWriting) d.probe_copy = true;
                 if (!arm(loop, c, index, kWriting)) loop.close_conn(c);
+                o.next_direction = static_cast<u8>(index ^ 1u);
+                enqueue(c.id);
+                return;
+            }
+            if (n < 0 && errno == EINTR && turn_budget_remaining == 0) {
+                o.next_direction = static_cast<u8>(index ^ 1u);
+                enqueue(c.id);
                 return;
             }
             if (n < 0 || (kWriting && n == 0)) {
@@ -231,6 +262,16 @@ struct WsSpliceExperiment {
                 d.eof = true;
                 (void)::shutdown(kDestination, SHUT_WR);
                 o.eof_closing = true;
+#ifdef RUT_TESTING
+                if (!o.eof_snapshot_taken) {
+                    o.eof_snapshot_taken = true;
+                    for (u32 direction = 0; direction < 2; ++direction) {
+                        o.eof_read_calls[direction] = read_calls[direction];
+                        o.eof_forwarded_bytes[direction] =
+                            transferred[direction] + o.direction[direction].buffered;
+                    }
+                }
+#endif
                 // Keep the owner queued: a failed cancellation submission must
                 // be retried by the next progress turn until its cancel CQE.
                 o.requested = true;
@@ -283,6 +324,11 @@ struct WsSpliceExperiment {
                     }
                 }
             }
+        }
+        if (turn_budget_remaining == 0) {
+            o.next_direction = static_cast<u8>(index ^ 1u);
+            enqueue(c.id);
+            return;
         }
         if (!arm(loop, c, index, d.buffered != 0)) loop.close_conn(c);
         finish_eof_close(loop, c);
@@ -377,19 +423,39 @@ struct WsSpliceExperiment {
     }
     template <class Loop>
     void progress(Loop& loop) {
-        u32 retained = 0;
-        const u32 kCount = queued_count;
-        for (u32 i = 0; i < kCount; ++i) {
-            const u32 kId = queued[i];
+        if (!turn_budget_active) begin_turn();
+        const u32 kOwnersToVisit = queued_count < call_budget ? queued_count : call_budget;
+        for (u32 i = 0; i < kOwnersToVisit; ++i) {
+            const u32 kId = dequeue();
             auto& c = loop.conns[kId];
             auto& o = owners[kId];
             if (o.closing) retire(loop, c);
             if (o.eof_closing) {
                 finish_eof_close(loop, c);
-                if (o.eof_closing || o.closing)
-                    queued[retained++] = kId;
-                else
-                    o.queued = false;
+                for (u32 offset = 0; offset < 2 && o.eof_closing && turn_budget_remaining != 0;
+                     ++offset) {
+                    const u32 direction = (o.next_direction + offset) & 1u;
+                    if (o.direction[direction].buffered != 0 && !o.direction[direction].armed &&
+                        !o.direction[direction].cancel_owned)
+                        pump(loop, c, direction);
+                }
+                o.next_direction ^= 1u;
+                finish_eof_close(loop, c);
+                if (o.eof_closing || o.closing) enqueue(kId);
+                continue;
+            }
+            if (o.active) {
+                if (turn_budget_remaining == 0) {
+                    enqueue(kId);
+                    break;
+                }
+                const u32 first = o.next_direction;
+                pump(loop, c, first);
+                o.next_direction = static_cast<u8>(first ^ 1u);
+                if (turn_budget_remaining != 0 && c.fd >= 0) {
+                    pump(loop, c, o.next_direction);
+                    o.next_direction ^= 1u;
+                }
                 continue;
             }
             if (o.requested && c.fd >= 0 && !c.recv_armed && !c.upstream_recv_armed &&
@@ -398,8 +464,14 @@ struct WsSpliceExperiment {
                 !c.send_armed && !c.upstream_send_armed && !c.ws_client_send_pending &&
                 !c.ws_upstream_send_pending && c.recv_buf.len() == 0 &&
                 c.upstream_recv_buf.len() == 0 && !loop.backend.has_ws_recv_cache(c.id)) {
+                if (admission_budget_remaining == 0) {
+                    enqueue(kId);
+                    break;
+                }
+                --admission_budget_remaining;
                 bool ok = true;
                 for (auto& d : o.direction) {
+                    if (d.read_fd >= 0) continue;
                     int fds[2];
                     if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) {
                         ok = false;
@@ -421,6 +493,10 @@ struct WsSpliceExperiment {
                     --c.pending_ops;
                     c.recv_paused_for_send = c.upstream_recv_paused_for_send = false;
                     if (!loop.submit_recv(c) || !loop.submit_recv_upstream(c)) loop.close_conn(c);
+                } else if (o.direction[0].read_fd < 0 || o.direction[1].read_fd < 0) {
+                    // Keep a partially prepared owner queued; the next shard turn
+                    // finishes setup before any tunnel bytes are consumed.
+                    enqueue(kId);
                 } else {
                     if (!no_delay) {
                         const int kSavedErrno = errno;
@@ -439,16 +515,17 @@ struct WsSpliceExperiment {
                     o.requested = false;
                     o.active = true;
                     ++admissions;
-                    pump(loop, c, 0);
-                    if (c.fd >= 0) pump(loop, c, 1);
+                    pump(loop, c, o.next_direction);
+                    o.next_direction ^= 1u;
+                    if (turn_budget_remaining != 0 && c.fd >= 0) {
+                        pump(loop, c, o.next_direction);
+                        o.next_direction ^= 1u;
+                    }
                 }
             }
-            if (o.requested || o.closing)
-                queued[retained++] = kId;
-            else
-                o.queued = false;
+            if (o.requested || o.closing || o.eof_closing) enqueue(kId);
         }
-        queued_count = retained;
+        turn_budget_active = false;
     }
 };
 }  // namespace rut

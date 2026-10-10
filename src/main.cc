@@ -414,7 +414,8 @@ static void configure_study_policy(Loop* loop) {
         bool nodelay = false;
         for (const char* const* item = environ; *item != nullptr; ++item)
             if (str_eq(*item, "RUT_STUDY_HTTP_NODELAY=on")) nodelay = true;
-        UpstreamPool::study_tcp_nodelay.store(nodelay, std::memory_order_relaxed);
+        // Startup-only configuration: publish before shard threads are created.
+        UpstreamPool::study_tcp_nodelay = nodelay;
         if (report_study)
             write_str(nodelay ? "RUT_STUDY_HTTP_NODELAY mode=on\n"
                               : "RUT_STUDY_HTTP_NODELAY mode=off\n");

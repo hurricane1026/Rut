@@ -7386,6 +7386,7 @@ public:
     // same-batch arbitration tests.
     void dispatch_batch(const IoEvent* events, u32 count) {
         study_turn_started_ns = monotonic_ns();
+        if (ws_splice.enabled) ws_splice.begin_turn();
         study_inside_cq = true;
         if (count > kMaxEventsPerWait) count = kMaxEventsPerWait;
         prepare_response_read_deadline_batch(events, count);
