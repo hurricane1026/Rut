@@ -427,6 +427,7 @@ static void configure_study_policy(Loop* loop) {
                 if (str_eq(*item, "RUT_STUDY_WS_NODELAY=off")) loop->ws_splice.no_delay = false;
                 if (str_eq(*item, "RUT_STUDY_IO_STATS=on")) loop->backend.study_io_stats = true;
                 if (str_eq(*item, "RUT_STUDY_WS_SYNC_SEND=on")) loop->study_ws_sync_send = true;
+                if (str_eq(*item, "RUT_STUDY_WS_POLL_FIRST=on")) loop->study_ws_poll_first = true;
                 if (str_eq(*item, "RUT_STUDY_WS_DIRECT_RECV=4k"))
                     loop->study_ws_direct_recv_limit = 4096;
                 if (str_eq(*item, "RUT_STUDY_WS_DIRECT_RECV=16k"))

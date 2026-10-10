@@ -612,12 +612,13 @@ bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
     return true;
 }
 
-bool IoUringBackend::add_recv_once(i32 fd, u32 conn_id, u32 max_len) {
+bool IoUringBackend::add_recv_once(i32 fd, u32 conn_id, u32 max_len, bool poll_first) {
     if (conn_id >= connection_capacity || max_len == 0 || max_len > kProvidedBufSize) return false;
     io_uring_sqe* sqe = get_sqe_flushing();
     if (!sqe) return false;
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
+    if (poll_first) sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
     sqe->fd = fd;
     sqe->len = max_len;
     sqe->buf_group = kBufGroupId;
@@ -648,10 +649,8 @@ bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode
     return true;
 }
 
-bool IoUringBackend::add_recv_upstream_once(i32 fd,
-                                            u32 conn_id,
-                                            u32 upstream_episode,
-                                            u32 max_len) {
+bool IoUringBackend::add_recv_upstream_once(
+    i32 fd, u32 conn_id, u32 upstream_episode, u32 max_len, bool poll_first) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
         max_len == 0 || max_len > upstream_once_max_len())
         return false;
@@ -660,6 +659,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
+    if (poll_first) sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
     sqe->fd = fd;
     sqe->len = max_len;
     sqe->buf_group = large_buf_ring != nullptr ? kLargeBufGroupId : kBufGroupId;
@@ -673,7 +673,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
 }
 
 bool IoUringBackend::add_recv_upstream_direct(
-    i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len) {
+    i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len, bool poll_first) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
         dst == nullptr || len == 0)
         return false;
@@ -682,6 +682,7 @@ bool IoUringBackend::add_recv_upstream_direct(
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
+    if (poll_first) sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
     sqe->fd = fd;
     sqe->addr = reinterpret_cast<u64>(dst);
     sqe->len = len;

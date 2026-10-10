@@ -285,6 +285,8 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // Conservative negative cache: only the terminal-pending publisher can
     // introduce an owner. Normal/mixed batches still scan unconditionally.
     bool response_read_terminal_scan_needed = true;
+    bool study_ws_poll_first = false;
+    u64 study_ws_poll_first_arms = 0;
     u32 study_ws_direct_recv_limit = 0;
     u64 study_ws_direct_recv_arms = 0;
     bool study_ws_sync_send = false;
@@ -902,6 +904,10 @@ public:
                       static_cast<unsigned long long>(ws_splice.eagain[1]),
                       static_cast<unsigned long long>(ws_splice.pipe_grow_failures),
                       ws_splice.minimum_pipe_capacity);
+        if (study_ws_poll_first)
+            ::fprintf(stderr,
+                      "RUT_WS_POLL_FIRST arms=%llu\n",
+                      static_cast<unsigned long long>(study_ws_poll_first_arms));
         if (study_ws_direct_recv_limit != 0)
             ::fprintf(stderr,
                       "RUT_WS_DIRECT arms=%llu limit=%u\n",
@@ -3590,8 +3596,13 @@ public:
         if (use_one_shot_websocket_recv(c)) {
             const u32 available = c.recv_buf.write_avail();
             const u32 maximum = kProvidedBufSize;
-            submitted =
-                backend.add_recv_once(c.fd, c.id, available < maximum ? available : maximum);
+            submitted = backend.add_recv_once(
+                c.fd,
+                c.id,
+                available < maximum ? available : maximum,
+                study_ws_poll_first && !c.is_ws_terminate && !c.is_ws_terminate_route);
+            if (submitted && study_ws_poll_first && !c.is_ws_terminate && !c.is_ws_terminate_route)
+                ++study_ws_poll_first_arms;
         } else {
             submitted = backend.add_recv(c.fd, c.id);
         }
@@ -4644,6 +4655,8 @@ public:
             c.upstream_recv_pause_rearm_pending = true;
             return true;
         }
+        const bool kPollFirst = study_ws_poll_first && use_one_shot_websocket_recv(c) &&
+                                !c.is_ws_terminate && !c.is_ws_terminate_route;
         const bool one_shot = use_one_shot_websocket_recv(c) || use_one_shot_upstream_recv(c);
         bool submitted = false;
         bool direct = false;
@@ -4665,18 +4678,20 @@ public:
                     c.upstream_episode,
                     c.upstream_recv_buf.write_ptr(),
                     kDirectWs && available > study_ws_direct_recv_limit ? study_ws_direct_recv_limit
-                                                                        : available);
+                                                                        : available,
+                    kPollFirst);
                 if (submitted && kDirectWs) ++study_ws_direct_recv_arms;
             } else {
                 const u32 max_len = backend.upstream_once_max_len();
                 const u32 recv_len = available < max_len ? available : max_len;
                 submitted = backend.add_recv_upstream_once(
-                    c.upstream_fd, c.id, c.upstream_episode, recv_len);
+                    c.upstream_fd, c.id, c.upstream_episode, recv_len, kPollFirst);
             }
         } else {
             submitted = backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
         }
         if (submitted) {
+            if (kPollFirst) ++study_ws_poll_first_arms;
             c.upstream_recv_direct_armed = direct;
             c.pending_ops++;
             c.upstream_recv_armed = true;

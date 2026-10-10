@@ -89,12 +89,14 @@ static void full_duplex_burst(test::TestCase* _tc,
                               bool check_available = false,
                               bool fast_batch = false,
                               bool sync_send = false,
-                              u32 direct_recv_limit = 0) {
+                              u32 direct_recv_limit = 0,
+                              bool poll_first = false) {
     LoopStorage storage;
     if (!storage.init()) return;
     auto& loop = *storage.loop;
     loop.study_ws_sync_send = sync_send;
     loop.study_ws_direct_recv_limit = direct_recv_limit;
+    loop.study_ws_poll_first = poll_first;
     if (cache) REQUIRE(loop.backend.enable_ws_recv_cache());
     if (splice) {
         REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
@@ -216,6 +218,7 @@ static void full_duplex_burst(test::TestCase* _tc,
     REQUIRE_EQ(client_bytes, kBytes);
     REQUIRE_EQ(origin_bytes, kBytes);
     if (direct_recv_limit != 0) CHECK(loop.study_ws_direct_recv_arms > 0);
+    if (poll_first) CHECK(loop.study_ws_poll_first_arms > 0);
     if (sync_send) {
         CHECK(loop.study_ws_sync_attempts > 0);
         if (slow_reader)
@@ -398,11 +401,12 @@ TEST(websocket, iouring_direct_recv_sync_full_duplex_slow_and_close) {
                       16384);
 }
 
-TEST(websocket, iouring_direct_recv_close_while_kernel_owns_destination) {
+static void direct_recv_idle_close(test::TestCase* _tc, bool poll_first) {
     LoopStorage storage;
     if (!storage.init()) return;
     auto& loop = *storage.loop;
     loop.study_ws_direct_recv_limit = 16384;
+    loop.study_ws_poll_first = poll_first;
     int fds[2];
     REQUIRE_EQ(test::stream_socketpair(fds), 0);
     const Peer kOrigin{fds[1]};
@@ -443,6 +447,86 @@ TEST(websocket, iouring_direct_recv_close_while_kernel_owns_destination) {
     CHECK_EQ(conn->pending_ops, 0u);
     CHECK(!conn->upstream_recv_direct_armed);
     CHECK(conn->upstream_recv_slice == nullptr);
+}
+
+TEST(websocket, iouring_direct_recv_close_while_kernel_owns_destination) {
+    direct_recv_idle_close(_tc, false);
+    direct_recv_idle_close(_tc, true);
+}
+
+TEST(websocket, iouring_poll_first_sync_small_slow_and_close) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64,
+                      4096,
+                      false,
+                      false,
+                      true,
+                      0,
+                      true);
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true,
+                      0,
+                      true);
+    full_duplex_burst(_tc,
+                      false,
+                      true,
+                      true,
+                      false,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true,
+                      0,
+                      true);
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      false,
+                      false,
+                      12345,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true,
+                      16384,
+                      true);
 }
 
 TEST(websocket, iouring_multishot_cache_full_duplex_burst) {

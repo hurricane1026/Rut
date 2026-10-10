@@ -260,7 +260,9 @@ struct IoUringBackend {
     bool cache_ws_recv(Connection& conn, u16 buffer_id, const IoEvent& event);
     u32 drain_ws_recv_cache(IoEvent* events, u32 maximum, Connection* conns, u32 max_conns);
     // Bounded one-shot selected-buffer receive for backpressured byte tunnels.
-    bool add_recv_once(i32 fd, u32 conn_id, u32 max_len);
+    // poll_first arms readiness before the initial transfer attempt; completion
+    // identity, bounded size and cancellation ownership stay unchanged.
+    bool add_recv_once(i32 fd, u32 conn_id, u32 max_len, bool poll_first = false);
 
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.
@@ -274,7 +276,8 @@ struct IoUringBackend {
     bool add_recv_upstream_once(i32 fd,
                                 u32 conn_id,
                                 u32 upstream_episode = 1,
-                                u32 max_len = kProvidedBufSize);
+                                u32 max_len = kProvidedBufSize,
+                                bool poll_first = false);
     // Direct one-shot recv: IORING_OP_RECV straight into a caller-owned
     // buffer region (sqe->addr/len), with no IOSQE_BUFFER_SELECT and no
     // provided-buffer ring involved — the kernel writes the bytes exactly
@@ -298,7 +301,8 @@ struct IoUringBackend {
     // every intermediate arrival, so an origin that trickles steadily (each
     // gap under the timeout) but fills `len` more slowly than the timeout
     // would be expired as idle.
-    bool add_recv_upstream_direct(i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len);
+    bool add_recv_upstream_direct(
+        i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len, bool poll_first = false);
     bool cancel_ws_splice_poll(
         u64 target, u32 conn_id, IoEventType type, u8 auxiliary, u32 episode) {
         if ((auxiliary != 96 && auxiliary != 97) ||
