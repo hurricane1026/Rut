@@ -1,0 +1,11 @@
+Test project /tmp/rut-epoll-stable-asan-20261010
+    Start 27: test_splice
+1/1 Test #27: test_splice ......................   Passed    1.09 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Label Time Summary:
+network    =   1.09 sec*proc (1 test)
+unit       =   1.09 sec*proc (1 test)
+
+Total Test time (real) =   1.09 sec

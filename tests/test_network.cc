@@ -30691,6 +30691,71 @@ TEST(epoll_loop, add_recv_preserves_pending_send_epollout) {
     destroy_real_loop(loop);
 }
 
+TEST(epoll_loop, edge_accept_continuation_preserves_capacity_fairness_and_cancel) {
+    ScopedListenerTestFd listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+    REQUIRE(listener.fd >= 0);
+    sockaddr_in address = listener_test_ipv4(INADDR_LOOPBACK, 0);
+    REQUIRE(bind(listener.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(listen(listener.fd, 16) == 0);
+    socklen_t length = sizeof(address);
+    REQUIRE(getsockname(listener.fd, reinterpret_cast<sockaddr*>(&address), &length) == 0);
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, listener.fd, 4).has_value());
+    backend.study_accept_edge_trigger = true;
+    backend.study_accept_batch_limit = 2;
+    backend.add_accept();
+    ScopedListenerTestFd clients[7];
+    ScopedListenerTestFd accepted[7];
+    for (u32 i = 0; i < 7; ++i) {
+        clients[i].fd = socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(clients[i].fd >= 0);
+        REQUIRE(connect(clients[i].fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ==
+                0);
+    }
+    IoEvent events[4]{};
+    REQUIRE_EQ(backend.wait(events, 1, nullptr, 0), 1u);
+    REQUIRE_EQ(events[0].type, IoEventType::Accept);
+    accepted[0].fd = events[0].result;
+    REQUIRE(events[0].accept_peer_valid);
+    REQUIRE(backend.accept_pending);
+    Connection conn{};
+    u8 bytes[32]{};
+    conn.reset();
+    conn.id = 0;
+    conn.fd = accepted[0].fd;
+    conn.recv_buf.bind(bytes, sizeof(bytes));
+    REQUIRE(backend.add_recv(conn.fd, conn.id));
+    REQUIRE_EQ(send(clients[0].fd, "x", 1, 0), 1);
+    REQUIRE_EQ(backend.wait(events, 4, &conn, 1), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Recv);
+    CHECK_EQ(conn.recv_buf.len(), 1u);
+    u32 count = 1;
+    while (count < 7) {
+        const u32 n = backend.wait(events, 4, &conn, 1);
+        REQUIRE(n <= 2);
+        for (u32 i = 0; i < n; ++i) {
+            if (events[i].type != IoEventType::Accept) continue;
+            REQUIRE(count < 7);
+            accepted[count++].fd = events[i].result;
+            CHECK(events[i].accept_peer_valid);
+        }
+    }
+    // Consume the final EAGAIN without waiting for a new edge.
+    CHECK_EQ(backend.wait(events, 4, &conn, 1), 0u);
+    CHECK_FALSE(backend.accept_pending);
+    ScopedListenerTestFd next(socket(AF_INET, SOCK_STREAM, 0));
+    REQUIRE(next.fd >= 0);
+    REQUIRE(connect(next.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE_EQ(backend.wait(events, 1, &conn, 1), 1u);
+    ScopedListenerTestFd last(events[0].result);
+    CHECK_EQ(events[0].type, IoEventType::Accept);
+    backend.cancel_accept();
+    CHECK_FALSE(backend.accept_pending);
+    CHECK_FALSE(backend.accept_enabled);
+    CHECK_EQ(backend.drain_accept(events, 4), 0u);
+    backend.shutdown();
+}
+
 TEST(epoll_loop, accept_events_own_their_ipv4_peer_addresses) {
     ScopedListenerTestFd listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
     REQUIRE(listener.fd >= 0);
@@ -31626,6 +31691,8 @@ struct RealEpollEpisodeGuard {
         auto result = loop->init(0, -1, 0);
         if (!result.has_value()) return false;
         initialized = true;
+        const char* edge = getenv("RUT_TEST_EPOLL_ET");
+        if (edge != nullptr && strcmp(edge, "on") == 0) return loop->backend.enable_edge_trigger();
         return true;
     }
 
