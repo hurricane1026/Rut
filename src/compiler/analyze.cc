@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -1755,15 +1756,12 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
     }
     bool mapped = false;
     char* buf = nullptr;
-    if (len >= 4096) {
+    {
         void* region =
             mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (region == MAP_FAILED) return frontend_error(FrontendError::OutOfMemory, {});
         buf = static_cast<char*>(region);
         mapped = true;
-    } else {
-        buf = new (std::nothrow) char[len];
-        if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
     }
     u32 off = 0;
     for (u32 i = 0; i < segment_count; i++) {
@@ -1775,7 +1773,9 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
                              MAP_PRIVATE | MAP_ANONYMOUS,
                              -1,
                              0);
-    auto* node = node_region == MAP_FAILED ? nullptr : static_cast<HirGeneratedName*>(node_region);
+    auto* node = node_region == MAP_FAILED
+                     ? nullptr
+                     : ::new (node_region) HirGeneratedName{};
     if (node == nullptr) {
         if (mapped)
             munmap(buf, len);

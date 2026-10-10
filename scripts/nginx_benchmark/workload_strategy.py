@@ -39,6 +39,10 @@ def study_environment(source):
     return env
 
 
+def format_cpu(value):
+    return 'n/a' if value is None else f'{value:.1f}'
+
+
 def metric(row):
     if 'small_client' in row:
         return row['small_client']['p99_us']
@@ -198,8 +202,10 @@ def main():
         rows.append(row)
         (out / 'measurements.json').write_text(json.dumps(rows, indent=2) + '\n')
         (out / 'summary.json').write_text(json.dumps(summarize(rows, args.p99_increase_limit), indent=2) + '\n')
+        frontend_cpu = row.get('server_cpu_pct')
+        frontend_text = format_cpu(frontend_cpu)
         print(f'END {label}: {row["rps"]:.0f} RPS p99={metric(row)/1000:.3f}ms '
-              f'frontendCPU={row["server_cpu_pct"]:.1f} originCPU={row["origin_cpu_pct"]:.1f}', flush=True)
+              f'frontendCPU={frontend_text} originCPU={row["origin_cpu_pct"]:.1f}', flush=True)
         return row
 
     for workload in workloads:

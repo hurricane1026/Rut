@@ -1,17 +1,29 @@
 #include "rut/compiler/hir.h"
 #include "test.h"
 #include <cstring>
+#include <new>
 
 #include <sys/mman.h>
 
 using namespace rut;
 
-TEST(hir_generated_names, releases_small_and_mapped_storage) {
+TEST(hir_generated_names, releases_small_and_large_mapped_storage) {
     auto* names = new HirGeneratedNames;
-    auto* small = new HirGeneratedName;
-    small->len = 32;
-    small->text = new char[small->len];
+    auto* small = static_cast<HirGeneratedName*>(mmap(nullptr,
+                                                      sizeof(HirGeneratedName),
+                                                      PROT_READ | PROT_WRITE,
+                                                      MAP_PRIVATE | MAP_ANONYMOUS,
+                                                      -1,
+                                                      0));
+    REQUIRE(small != MAP_FAILED);
+    ::new (small) HirGeneratedName{};
+    small->len = 512;
+    small->text = static_cast<char*>(
+        mmap(nullptr, small->len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    REQUIRE(small->text != MAP_FAILED);
     std::memset(small->text, 's', small->len);
+    small->mapped = true;
+    small->mapped_node = true;
 
     constexpr u32 kLargeLength = 8192;
     auto* large_text = static_cast<char*>(

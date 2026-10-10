@@ -160,6 +160,8 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(protocol_strategy.frontend_cpu_observation("uring", 1, 3, 1), 200)
         self.assertIsNone(run.server_cpu_observation("direct-origin", 1, 3, 1))
         self.assertEqual(run.server_cpu_observation("uring", 1, 3, 1), 200)
+        self.assertEqual(workload_strategy.format_cpu(None), "n/a")
+        self.assertEqual(workload_strategy.format_cpu(12.345), "12.3")
 
     def test_protocol_summary_labels_full_cpu_observation(self):
         case = protocol_strategy.CASES[0]

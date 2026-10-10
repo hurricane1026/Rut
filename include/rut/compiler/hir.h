@@ -1427,10 +1427,12 @@ struct HirGeneratedNames {
                 munmap(node->text, node->len);
             else
                 delete[] node->text;
-            if (node->mapped_node)
+            if (node->mapped_node) {
+                node->~HirGeneratedName();
                 munmap(node, sizeof(HirGeneratedName));
-            else
+            } else {
                 delete node;
+            }
             node = next;
         }
         delete this;
