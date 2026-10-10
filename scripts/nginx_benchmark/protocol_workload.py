@@ -5,6 +5,7 @@ Client metrics include the Python client ceiling. Compare against direct-origin
 capacity before attributing differences to the gateway; this is not wrk RPS.
 """
 import argparse
+import ctypes
 import asyncio
 import base64
 import hashlib
@@ -20,10 +21,24 @@ import time
 
 GUID = b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 TABLES = [bytes(value ^ mask for value in range(256)) for mask in range(256)]
+MASK_HELPER_MIN = int(os.environ.get('RUT_BENCH_WS_MASK_MIN', '4096'))
+if MASK_HELPER_MIN < 0:
+    raise ValueError('RUT_BENCH_WS_MASK_MIN must be nonnegative')
+MASK_HELPER = None
+if os.environ.get('RUT_BENCH_WS_MASK_HELPER'):
+    MASK_HELPER = ctypes.CDLL(os.environ['RUT_BENCH_WS_MASK_HELPER']).rut_bench_ws_mask
+    MASK_HELPER.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_char_p]
+    MASK_HELPER.restype = None
 
 
 def masking(data, key):
+    if len(key) != 4:
+        raise ValueError('WebSocket mask key must have four bytes')
     output = bytearray(len(data))
+    if MASK_HELPER is not None and len(data) >= MASK_HELPER_MIN:
+        target = (ctypes.c_ubyte * len(data)).from_buffer(output)
+        MASK_HELPER(target, data, len(data), key)
+        return bytes(output)
     for offset in range(4):
         output[offset::4] = data[offset::4].translate(TABLES[key[offset]])
     return bytes(output)
@@ -193,6 +208,7 @@ async def ws_preflight(port):
 
 def client_worker(cpu, args, output):
     os.sched_setaffinity(0, {cpu})
+    cpu_started = time.process_time(); wall_started = time.monotonic()
     fixed = bytes((i * 29) & 255 for i in range(args.size))
 
     async def run():
@@ -272,7 +288,11 @@ def client_worker(cpu, args, output):
         await asyncio.gather(*(session() for _ in range(args.connections)))
         return dict(counts=counts, rtt_us=latency, first_us=first, delivery_us=delivery,
                     gap_us=gaps, source_gap_us=source_gaps)
-    output.put(asyncio.run(run()))
+    sample = asyncio.run(run())
+    sample['cpu_seconds'] = time.process_time() - cpu_started
+    sample['observation_seconds'] = time.monotonic() - wall_started
+    sample['cpu'] = cpu
+    output.put(sample)
 
 
 def main():
@@ -329,7 +349,10 @@ def main():
                       duration_seconds=args.duration, **counts,
                       messages_per_second=counts['messages'] / args.duration,
                       received_mib_per_second=counts['bytes'] / args.duration / 1048576,
-                      valid=counts['errors'] == 0 and counts['messages'] > 0)
+                      valid=counts['errors'] == 0 and counts['messages'] > 0,
+                      client_workers=[dict(cpu=sample['cpu'], cpu_seconds=sample['cpu_seconds'],
+                                           observation_seconds=sample['observation_seconds'],
+                                           cpu_pct=100 * sample['cpu_seconds']/sample['observation_seconds']) for sample in samples])
         for metric in ['rtt_us', 'first_us', 'delivery_us', 'gap_us', 'source_gap_us']:
             result[metric] = percentiles([value for sample in samples for value in sample[metric]])
         if args.output:
