@@ -1294,6 +1294,7 @@ bool IoUringBackend::cache_ws_recv(Connection& conn, u16 buffer_id, const IoEven
     ++conn.pending_ops;  // pins the numeric slot until this cached completion is delivered
     ++ws_recv_cache_deferred;
     ++ws_recv_cache_count;
+    if (buffer_id < kProvidedBufCount) ++ws_recv_cache_ordinary_count;
     if (ws_recv_cache_count > ws_recv_cache_peak) ws_recv_cache_peak = ws_recv_cache_count;
     return true;
 }
@@ -1347,6 +1348,7 @@ u32 IoUringBackend::drain_ws_recv_cache(IoEvent* events,
         node = {};
         --owner.queued;
         --ws_recv_cache_count;
+        if (current < kProvidedBufCount) --ws_recv_cache_ordinary_count;
         if (conn.pending_ops == 0) {
             fatal_error.store(EPROTO, std::memory_order_release);
             break;
@@ -2409,6 +2411,7 @@ void IoUringBackend::shutdown() {
     ws_recv_cache_owners.destroy();
     ws_recv_cache_head = ws_recv_cache_tail = 0xffffffffu;
     ws_recv_cache_count = 0;
+    ws_recv_cache_ordinary_count = 0;
     reset_downstream_recv_wait_state();
     if (timer_fd >= 0) {
         close(timer_fd);

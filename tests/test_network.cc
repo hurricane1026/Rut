@@ -41557,6 +41557,7 @@ TEST(iouring_upstream_recv, empty_ring_terminal_rearms_one_shot_body_recv) {
     }
 }
 
+#if RUT_ENABLE_WEBSOCKET
 TEST(iouring_upstream_recv, empty_ring_terminal_rearms_default_websocket_recv) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");
@@ -41583,6 +41584,44 @@ TEST(iouring_upstream_recv, empty_ring_terminal_rearms_default_websocket_recv) {
     CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_first + 1u);
     fixture.cleanup();
 }
+#endif  // RUT_ENABLE_WEBSOCKET
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(iouring_upstream_recv, cache_empty_ring_defers_until_ordinary_buffer_returns) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    auto& conn = *fixture.conn;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    conn.is_ws_tunnel = true;
+    conn.on_upstream_recv = &on_ws_upstream_recv<IoUringEventLoop>;
+    REQUIRE(loop.submit_recv_upstream(conn));
+    const u32 tail_after_terminal = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    IoEvent terminal{
+        conn.id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+    terminal.provided_ring_empty = 1;
+    loop.dispatch(terminal);
+    REQUIRE(conn.upstream_recv_pause_rearm_pending);
+
+    // Mark the ordinary ring exhausted. Repeated service attempts must not
+    // submit SQEs until one ordinary cached block is returned.
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount;
+    loop.test_rearm_deferred_ws_cache_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal);
+    CHECK(conn.upstream_recv_pause_rearm_pending);
+    loop.test_rearm_deferred_ws_cache_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal);
+
+    --loop.backend.ws_recv_cache_ordinary_count;
+    loop.test_rearm_deferred_ws_cache_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal + 1u);
+    CHECK(!conn.upstream_recv_pause_rearm_pending);
+    CHECK(conn.upstream_recv_armed);
+    fixture.cleanup();
+}
+#endif  // RUT_ENABLE_WEBSOCKET
 
 namespace {
 

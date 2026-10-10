@@ -636,6 +636,28 @@ TEST(websocket, iouring_multishot_cache_slow_reader) {
     full_duplex_burst(_tc, true, false, true);
 }
 
+TEST(websocket, iouring_multishot_cache_slow_reader_rearms_after_return) {
+    // A slow destination retains every selected block briefly. The upstream
+    // terminal must park until one is returned, then resume the tunnel without
+    // repeatedly submitting doomed -ENOBUFS receives.
+    full_duplex_burst(_tc,
+                      true,
+                      false,
+                      true,
+                      false,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      2,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      true);
+}
+
 TEST(websocket, iouring_splice_full_duplex) {
     full_duplex_burst(_tc, false, false, false, true);
 }

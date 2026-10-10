@@ -255,8 +255,15 @@ struct IoUringBackend {
     u64 ws_recv_cache_deferred = 0;
     u64 ws_recv_cache_peak = 0;
     u32 ws_recv_cache_count = 0;
+    u32 ws_recv_cache_ordinary_count = 0;
     bool enable_ws_recv_cache();
     bool has_ws_recv_cache(u32 conn_id) const;
+    bool ws_recv_cache_has_capacity() const {
+        // WebSocket cache receives use the ordinary provided-buffer ring. Large
+        // buffers are a separate ring and do not make another ordinary buffer
+        // selectable after ordinary-ring ENOBUFS.
+        return ws_recv_cache_ordinary_count < kProvidedBufCount;
+    }
     bool cache_ws_recv(Connection& conn, u16 buffer_id, const IoEvent& event);
     u32 drain_ws_recv_cache(IoEvent* events, u32 maximum, Connection* conns, u32 max_conns);
     // Bounded one-shot selected-buffer receive for backpressured byte tunnels.

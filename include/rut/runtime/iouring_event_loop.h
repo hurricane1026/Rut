@@ -768,6 +768,7 @@ public:
             relay_budget_calls = study_relay_turn_call_limit;
             relay_budget_bytes = study_relay_turn_byte_limit;
             dispatch_batch(events, kEventCount);
+            rearm_deferred_ws_cache_recvs();
             rearm_deferred_recvs(/*force=*/false);
             retry_deferred_accepts();
             poll_command();
@@ -3519,6 +3520,23 @@ public:
             }
             recv_rearm_words[w] |= retained;
             recv_rearm_cursor = (w + 1u) % words;
+        }
+    }
+
+    // Cache-mode upstream recvs must wait for a retained provided buffer to
+    // return. Retrying while the cache owns every buffer only produces another
+    // -ENOBUFS CQE and can spin the shard without making progress.
+    void rearm_deferred_ws_cache_recvs() {
+        if (!backend.ws_recv_cache_enabled || !backend.ws_recv_cache_has_capacity()) return;
+        for (u32 id = 0; id < slots_initialized; ++id) {
+            Connection& c = conns[id];
+            if (!ws_recv_cache_active(c) || !c.upstream_recv_pause_rearm_pending ||
+                c.upstream_recv_armed)
+                continue;
+            if (!try_deferred_upstream_rearm(c)) {
+                close_conn(c);
+                return;
+            }
         }
     }
 
@@ -7310,6 +7328,7 @@ public:
         drain_response_read_deadline_body_pump_ready(static_cast<Callback&&>(callback));
     }
     void test_close_listen() { close_listen(); }
+    void test_rearm_deferred_ws_cache_recvs() { rearm_deferred_ws_cache_recvs(); }
 #endif
 
 public:
@@ -8840,6 +8859,10 @@ public:
                                 break;
                             }
                             if (kOneShotRingEmpty) {
+                                if (ws_recv_cache_active(conn)) {
+                                    conn.upstream_recv_pause_rearm_pending = true;
+                                    break;
+                                }
                                 if (!this->submit_recv_upstream(conn)) this->close_conn(conn);
                                 break;
                             }
