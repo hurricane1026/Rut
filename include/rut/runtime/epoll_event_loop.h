@@ -901,7 +901,16 @@ public:
             timer.refresh(&c,
                           c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
         }
-        if (!arm_epoll_splice(c, r.segment_len != 0)) this->close_conn(c);
+        const bool writing = r.segment_len != 0;
+        if (!arm_epoll_splice(c, writing)) {
+            this->close_conn(c);
+        } else if (backend.study_edge_trigger) {
+            // Budget exhaustion is not EAGAIN: retain the runnable owner even
+            // when this fd's readiness has not changed since the last edge.
+            const auto type = writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
+            backend.queue_edge(EpollBackend::fd_interest_slot(c.id, type),
+                               writing ? EPOLLOUT : EPOLLIN);
+        }
     }
 
     // Promote only a large self-framed plaintext body, between sends. Epoll

@@ -1,0 +1,69 @@
+[
+  {
+    "engine": "epoll",
+    "role": "frontend",
+    "requests": 140367,
+    "rows": [
+      {
+        "syscall": "recvfrom",
+        "calls": 421560,
+        "per_request": 3.0033,
+        "errors": {
+          "11": 140493
+        }
+      },
+      {
+        "syscall": "epoll_ctl",
+        "calls": 421482,
+        "per_request": 3.0027,
+        "errors": {}
+      },
+      {
+        "syscall": "sendto",
+        "calls": 280986,
+        "per_request": 2.0018,
+        "errors": {}
+      },
+      {
+        "syscall": "accept4",
+        "calls": 140588,
+        "per_request": 1.0016,
+        "errors": {
+          "11": 92
+        }
+      },
+      {
+        "syscall": "close",
+        "calls": 140496,
+        "per_request": 1.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "epoll_wait",
+        "calls": 17997,
+        "per_request": 0.1282,
+        "errors": {}
+      },
+      {
+        "syscall": "madvise",
+        "calls": 126,
+        "per_request": 0.0009,
+        "errors": {}
+      },
+      {
+        "syscall": "rt_sigtimedwait",
+        "calls": 81,
+        "per_request": 0.0006,
+        "errors": {
+          "11": 80
+        }
+      },
+      {
+        "syscall": "read",
+        "calls": 8,
+        "per_request": 0.0001,
+        "errors": {}
+      }
+    ]
+  }
+]

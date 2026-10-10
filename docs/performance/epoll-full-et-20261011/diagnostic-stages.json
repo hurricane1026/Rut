@@ -1,0 +1,18 @@
+[
+  {
+    "stage": "tls",
+    "returncode": 0
+  },
+  {
+    "stage": "protocol",
+    "returncode": 0
+  },
+  {
+    "stage": "bpf-lt",
+    "returncode": 0
+  },
+  {
+    "stage": "bpf-et",
+    "returncode": 0
+  }
+]

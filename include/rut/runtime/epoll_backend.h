@@ -40,6 +40,31 @@ struct EpollBackend {
     i32 yield_timer_fd = -1;
     i32 listen_fd = -1;
     u32 study_accept_batch_limit = 1;
+    bool study_accept_edge_trigger = false;
+    bool study_edge_trigger = false;
+    struct EdgeRunnable {
+        u32 events = 0;
+        bool queued = false;
+        bool read_submitted = false;
+        bool read_ready = false;
+        bool read_eof = false;
+    };
+    MappedArray<EdgeRunnable> edge_runnable;
+    MappedArray<u32> edge_queue;
+    u32 edge_head = 0;
+    u32 edge_tail = 0;
+    u32 edge_count = 0;
+    u32 edge_streak = 0;
+    bool enable_edge_trigger();
+    void queue_edge(u32 slot, u32 events);
+    bool pop_edge(epoll_event& event);
+    void clear_edge(u32 slot) {
+        if (edge_runnable.data() != nullptr) edge_runnable[slot].events = 0;
+    }
+    bool accept_enabled = false;
+    bool accept_pending = false;
+    u32 accept_io_budget = 0;
+    bool accept_retry_on_timer = false;
     // Optional stable socket identity. Request ownership changes independently
     // of the kernel token; per-fd state is shard-local, not per Connection.
     static constexpr u32 kStableFdCapacity = 65536;
@@ -55,6 +80,7 @@ struct EpollBackend {
         bool idle = false;
         bool recv_enabled = false;
         bool relay_read = false;
+        bool idle_probe_pending = false;
     };
     MappedArray<StableUpstream> stable_upstream;
     UpstreamPool* stable_pool = nullptr;
@@ -169,12 +195,23 @@ struct EpollBackend {
 
     // Register listen socket for accept events.
     void add_accept();
+    u32 drain_accept(IoEvent* events, u32 max_events);
 
     // Register fd for EPOLLIN — actual recv happens inside wait().
     bool add_recv(i32 fd, u32 conn_id);
     // A connection slot is closed or (re)allocated: forget its registrations.
     void forget_fd_interest(u32 conn_id) {
         if (conn_id >= connection_capacity) return;
+        clear_edge(2 * conn_id);
+        clear_edge(2 * conn_id + 1);
+        if (study_edge_trigger) {
+            edge_runnable[2 * conn_id].read_submitted = false;
+            edge_runnable[2 * conn_id + 1].read_submitted = false;
+            edge_runnable[2 * conn_id].read_ready = false;
+            edge_runnable[2 * conn_id + 1].read_ready = false;
+            edge_runnable[2 * conn_id].read_eof = false;
+            edge_runnable[2 * conn_id + 1].read_eof = false;
+        }
         reset_fd_interest(fd_interest[2 * conn_id]);
         reset_fd_interest(fd_interest[2 * conn_id + 1]);
     }
@@ -185,10 +222,18 @@ struct EpollBackend {
         if (conn_id >= connection_capacity) return;
         for (u32 side = 0; side < 2; side++) {
             FdInterest& r = fd_interest[2 * conn_id + side];
-            if (r.fd == fd)
+            if (r.fd == fd) {
+                clear_edge(2 * conn_id + side);
                 reset_fd_interest(r);
-            else
+            } else {
+                // LT would report an aged harvested record again. ET retains
+                // its readiness when only the other socket changed ownership.
+                if (study_edge_trigger)
+                    for (u32 i = ready_head; i < ready_count; ++i)
+                        if (ready_slot[i] == 2 * conn_id + side && ready_gen[i] == r.gen)
+                            queue_edge(2 * conn_id + side, ready[i].events);
                 r.gen++;
+            }
         }
     }
     bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode);

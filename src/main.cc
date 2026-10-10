@@ -590,6 +590,27 @@ static void configure_study_policy(Loop* loop) {
                 write_str("\n");
             }
         }
+        if constexpr (requires { loop->backend.enable_edge_trigger(); }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_EPOLL_ET=on")) {
+                    if (!loop->backend.enable_edge_trigger()) {
+                        write_str("RUT_STUDY_EPOLL_ET initialization failed\n");
+                        _exit(1);
+                    }
+                }
+            if (report_study)
+                write_str(loop->backend.study_edge_trigger ? "RUT_STUDY_EPOLL_ET mode=on\n"
+                                                           : "RUT_STUDY_EPOLL_ET mode=off\n");
+        }
+        if constexpr (requires { loop->backend.study_accept_edge_trigger; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item)
+                if (str_eq(*item, "RUT_STUDY_EPOLL_ACCEPT_ET=on"))
+                    loop->backend.study_accept_edge_trigger = true;
+            if (report_study)
+                write_str(loop->backend.study_accept_edge_trigger
+                              ? "RUT_STUDY_EPOLL_ACCEPT_ET mode=on\n"
+                              : "RUT_STUDY_EPOLL_ACCEPT_ET mode=off\n");
+        }
         if constexpr (requires { loop->backend.study_stable_upstream_relay; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_EPOLL_STABLE_RELAY=on"))

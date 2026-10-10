@@ -115,7 +115,9 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
                            u32 events,
                            u32 upstream_episode,
                            EpollBackend* backend = nullptr) {
-    if (backend != nullptr && backend->stable_upstream.data() != nullptr &&
+    if (backend != nullptr && backend->stable_upstream.data() != nullptr && fd >= 0 &&
+        static_cast<u32>(fd) < EpollBackend::kStableFdCapacity && conn_id < capacity &&
+        backend->stable_upstream[fd].generation != 0xffffffffu &&
         (type == IoEventType::UpstreamRecv ||
          (backend->study_stable_upstream_relay && type == IoEventType::RelayRead)) &&
         events == EPOLLIN)
@@ -133,6 +135,10 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
     }
     struct epoll_event ev;
     ev.events = events;
+    if (backend != nullptr && backend->study_edge_trigger) {
+        ev.events |= EPOLLET;
+        if (events & EPOLLIN) ev.events |= EPOLLRDHUP;
+    }
     ev.data.u64 = io_event_uses_upstream_episode(type)
                       ? encode_upstream_event_token({conn_id, type, upstream_episode, 0})
                       : encode_non_upstream_user_data({conn_id, type, 0});
@@ -165,8 +171,73 @@ static i32 set_fd_interest(EpollBackend::FdInterest* interest,
         errno = err;
         return -err;
     }
-    if (last != nullptr) *last = {fd, events, ev.data.u64, last->gen + 1};
+    if (last != nullptr) {
+        if (backend != nullptr) {
+            const u32 slot = EpollBackend::fd_interest_slot(conn_id, type);
+            backend->clear_edge(slot);
+            if (backend->study_edge_trigger && last->fd != fd) {
+                backend->edge_runnable[slot].read_ready = false;
+                backend->edge_runnable[slot].read_eof = false;
+            }
+        }
+        *last = {fd, events, ev.data.u64, last->gen + 1};
+    }
     return 0;
+}
+
+bool EpollBackend::enable_edge_trigger() {
+    if (study_edge_trigger) return true;
+    if (connection_capacity == 0 || stable_upstream.data() != nullptr || accept_enabled)
+        return false;
+    for (u32 slot = 0; slot < connection_capacity * 2; ++slot)
+        if (fd_interest[slot].fd >= 0) return false;
+    if (!edge_runnable.init(connection_capacity * 2)) return false;
+    if (!edge_queue.init(connection_capacity * 2)) {
+        edge_runnable.destroy();
+        return false;
+    }
+    for (u32 slot = 0; slot < connection_capacity * 2; ++slot) edge_runnable[slot] = {};
+    edge_head = edge_tail = edge_count = edge_streak = 0;
+    study_edge_trigger = study_accept_edge_trigger = true;
+    return true;
+}
+
+void EpollBackend::queue_edge(u32 slot, u32 events) {
+    if (!study_edge_trigger || events == 0 || slot >= connection_capacity * 2) return;
+    auto& runnable = edge_runnable[slot];
+    runnable.events |= events;
+    if (runnable.queued) return;
+    // One entry per side, including invalidated entries waiting to be popped.
+    // Capacity is exactly the number of sides; no submission can overflow it.
+    runnable.queued = true;
+    edge_queue[edge_tail] = slot;
+    if (++edge_tail == connection_capacity * 2) edge_tail = 0;
+    ++edge_count;
+}
+
+bool EpollBackend::pop_edge(epoll_event& event) {
+    while (edge_count != 0) {
+        const u32 slot = edge_queue[edge_head];
+        if (++edge_head == connection_capacity * 2) edge_head = 0;
+        --edge_count;
+        auto& runnable = edge_runnable[slot];
+        const auto& interest = fd_interest[slot];
+        const u32 mask = interest.events | ((interest.events & EPOLLIN) ? EPOLLRDHUP : 0u);
+        const u32 events = (runnable.events & mask) | (runnable.events & (EPOLLHUP | EPOLLERR));
+        const bool read_submitted = runnable.read_submitted;
+        const bool read_ready = runnable.read_ready;
+        const bool read_eof = runnable.read_eof;
+        runnable = {};
+        runnable.read_submitted = read_submitted;
+        runnable.read_ready = read_ready;
+        runnable.read_eof = read_eof;
+        if (interest.fd < 0 || events == 0) continue;
+        event = {};
+        event.events = events | ((read_eof && (events & EPOLLIN)) ? EPOLLRDHUP : 0u);
+        event.data.u64 = interest.data;
+        return true;
+    }
+    return false;
 }
 
 bool EpollBackend::enable_stable_upstream_events() {
@@ -201,6 +272,7 @@ void EpollBackend::invalidate_stable_upstream(i32 fd) {
         transport.registered = false;
         transport.idle = false;
         transport.recv_enabled = false;
+        transport.idle_probe_pending = false;
         if (transport.version != 0xffffffffu) ++transport.version;
     }
 }
@@ -214,19 +286,44 @@ void EpollBackend::claim_stable_upstream(i32 fd, u32 conn_id, u32 episode) {
         invalidate_stable_upstream(fd);
         return;
     }
+    const u32 previous_version = transport.version;
     ++transport.version;
     transport.idle = false;
+    transport.idle_probe_pending = false;
     transport.recv_enabled = false;
     transport.conn_id = conn_id;
     transport.episode = episode;
     transport.pool_slot = UpstreamPool::kNoSlot;
+    if (study_edge_trigger && conn_id < connection_capacity) {
+        const u32 slot = fd_interest_slot(conn_id, IoEventType::UpstreamRecv);
+        clear_edge(slot);
+        auto& runnable = edge_runnable[slot];
+        runnable.read_submitted = runnable.read_ready = runnable.read_eof = false;
+        // An idle event harvested before the claim is not re-delivered by ET.
+        // Carry its readiness into the new owner, but do not read before that
+        // owner explicitly submits receive after sending its request.
+        for (u32 i = ready_head; i < ready_count; ++i)
+            if (ready_slot[i] == (kStableReadySlotBit | static_cast<u32>(fd)) &&
+                ready_gen[i] == previous_version) {
+                runnable.read_ready = true;
+                runnable.read_eof |= (ready[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
+            }
+        auto& interest = fd_interest[slot];
+        interest = {fd, EPOLLIN, stable_upstream_token(fd, transport.generation), interest.gen + 1};
+    }
 }
 
 void EpollBackend::park_stable_upstream(i32 fd, u32 pool_slot) {
     if (stable_upstream.data() == nullptr || fd < 0 || static_cast<u32>(fd) >= kStableFdCapacity)
         return;
     auto& transport = stable_upstream[fd];
-    if (transport.registered && transport.idle) transport.pool_slot = pool_slot;
+    if (transport.registered && transport.idle) {
+        transport.pool_slot = pool_slot;
+        // A terminal edge already consumed by the active owner will not be
+        // delivered again merely because ownership moved into the idle pool.
+        if (transport.idle_probe_pending && stable_pool != nullptr)
+            stable_pool->discard_idle(pool_slot, fd);
+    }
 }
 
 i32 EpollBackend::set_stable_upstream_interest(i32 fd, u32 conn_id, u32 episode, bool relay_read) {
@@ -240,7 +337,8 @@ i32 EpollBackend::set_stable_upstream_interest(i32 fd, u32 conn_id, u32 episode,
                                conn_id,
                                kType,
                                EPOLLIN,
-                               episode);
+                               episode,
+                               this);
     auto& transport = stable_upstream[fd];
     auto& interest = fd_interest[fd_interest_slot(conn_id, IoEventType::UpstreamRecv)];
     if (transport.registered && transport.relay_read != relay_read &&
@@ -248,11 +346,31 @@ i32 EpollBackend::set_stable_upstream_interest(i32 fd, u32 conn_id, u32 episode,
         invalidate_stable_upstream(fd);
     if (transport.registered && !transport.idle && transport.conn_id == conn_id &&
         transport.episode == episode) {
+        const u64 token = stable_upstream_token(fd, transport.generation);
+        const bool mode_changed = transport.relay_read != relay_read;
+        const bool same_interest = interest.fd == fd && interest.events == EPOLLIN &&
+                                   interest.data == token && !mode_changed;
+        if (study_edge_trigger && mode_changed) {
+            auto& runnable = edge_runnable[fd_interest_slot(conn_id, kType)];
+            for (u32 i = ready_head; i < ready_count; ++i)
+                if (ready_slot[i] == (kStableReadySlotBit | static_cast<u32>(fd)) &&
+                    ready_gen[i] == transport.version) {
+                    runnable.read_ready = true;
+                    runnable.read_eof |=
+                        (ready[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
+                }
+        }
         // Mode changes retire any harvested record for the previous consumer.
-        if (transport.relay_read != relay_read) ++transport.version;
+        if (mode_changed) ++transport.version;
         transport.relay_read = relay_read;
         transport.recv_enabled = true;
-        interest = {fd, EPOLLIN, stable_upstream_token(fd, transport.generation), interest.gen + 1};
+        if (!study_edge_trigger || !same_interest)
+            interest = {fd, EPOLLIN, token, interest.gen + 1};
+        if (study_edge_trigger && mode_changed) {
+            const u32 slot = fd_interest_slot(conn_id, kType);
+            clear_edge(slot);
+            if (edge_runnable[slot].read_ready) queue_edge(slot, EPOLLIN);
+        }
         return 0;
     }
     invalidate_stable_upstream(fd);
@@ -264,10 +382,11 @@ i32 EpollBackend::set_stable_upstream_interest(i32 fd, u32 conn_id, u32 episode,
                                conn_id,
                                kType,
                                EPOLLIN,
-                               episode);
+                               episode,
+                               this);
     const u32 kGeneration = transport.generation + 1;
     struct epoll_event event = {};
-    event.events = EPOLLIN;
+    event.events = EPOLLIN | (study_edge_trigger ? (EPOLLET | EPOLLRDHUP) : 0u);
     event.data.u64 = stable_upstream_token(fd, kGeneration);
     const bool kRecorded = interest.fd == fd;
     i32 result = epoll_ctl(epoll_fd, kRecorded ? EPOLL_CTL_MOD : EPOLL_CTL_ADD, fd, &event);
@@ -276,6 +395,11 @@ i32 EpollBackend::set_stable_upstream_interest(i32 fd, u32 conn_id, u32 episode,
     if (result < 0) return -errno;
     transport = {
         kGeneration, 1, conn_id, episode, UpstreamPool::kNoSlot, true, false, true, relay_read};
+    if (study_edge_trigger) {
+        const u32 slot = fd_interest_slot(conn_id, kType);
+        clear_edge(slot);
+        edge_runnable[slot].read_ready = edge_runnable[slot].read_eof = false;
+    }
     interest = {fd, EPOLLIN, event.data.u64, interest.gen + 1};
     return 0;
 }
@@ -309,7 +433,7 @@ static void rearm_recv_interest(EpollBackend::FdInterest* interest,
     i32 fd = downstream_fd_map[conn_id];
     if (fd >= 0)
         (void)set_fd_interest(
-            interest, capacity, epoll_fd, fd, conn_id, IoEventType::Recv, EPOLLIN, 0);
+            interest, capacity, epoll_fd, fd, conn_id, IoEventType::Recv, EPOLLIN, 0, backend);
 }
 
 u64 EpollBackend::encode_data(u32 conn_id, IoEventType type, u32 upstream_episode) {
@@ -395,6 +519,10 @@ void EpollBackend::destroy_state_storage() {
     }
     stable_pool = nullptr;
     stable_upstream.destroy();
+    edge_runnable.destroy();
+    edge_queue.destroy();
+    edge_head = edge_tail = edge_count = edge_streak = 0;
+    study_edge_trigger = false;
     connection_capacity = 0;
     fd_interest.destroy();
     upstream_send_state.destroy();
@@ -411,6 +539,8 @@ core::Expected<void, Error> EpollBackend::init(u32 /*shard_id*/, i32 lfd, u32 ca
     auto storage = init_state_storage(capacity);
     if (!storage) return core::make_unexpected(storage.error());
     listen_fd = lfd;
+    accept_enabled = accept_pending = accept_retry_on_timer = false;
+    accept_io_budget = 0;
     epoll_fd = -1;
     timer_fd = -1;
     yield_timer_fd = -1;
@@ -485,9 +615,60 @@ void EpollBackend::arm_yield_timerfd(u64 deadline_ns) {
 void EpollBackend::add_accept() {
     if (epoll_fd < 0 || listen_fd < 0) return;
     struct epoll_event ev;
-    ev.events = EPOLLIN;
+    ev.events = EPOLLIN | (study_accept_edge_trigger ? EPOLLET : 0u);
     ev.data.u64 = encode_data(kListenConnId, IoEventType::Accept, 0);
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev) == 0) accept_enabled = true;
+}
+
+u32 EpollBackend::drain_accept(IoEvent* events, u32 max_events) {
+    if (!accept_enabled || listen_fd < 0 || max_events == 0 ||
+        (study_accept_edge_trigger && accept_retry_on_timer))
+        return 0;
+    u32 out = 0;
+    const u32 accept_limit = study_accept_batch_limit == 0 ? 1 : study_accept_batch_limit;
+    for (u32 accepted = 0; accepted < accept_limit && out < max_events; ++accepted) {
+        struct sockaddr_in peer = {};
+        socklen_t peer_len = sizeof(peer);
+        i32 fd = accept4(listen_fd,
+                         reinterpret_cast<struct sockaddr*>(&peer),
+                         &peer_len,
+                         SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (fd < 0) {
+            if (study_accept_edge_trigger) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    accept_pending = false;
+                else if (errno == EINTR || errno == ECONNABORTED || errno == EPROTO ||
+                         errno == ENETDOWN || errno == ENOPROTOOPT || errno == EHOSTDOWN ||
+                         errno == ENONET || errno == EHOSTUNREACH || errno == EOPNOTSUPP ||
+                         errno == ENETUNREACH)
+                    continue;
+                else
+                    accept_retry_on_timer = true;
+            }
+            break;
+        }
+        events[out] = {};
+        events[out].conn_id = 0;
+        events[out].type = IoEventType::Accept;
+        events[out].result = fd;
+        events[out].buf_id = 0;
+        events[out].has_buf = 0;
+        events[out].more = 0;
+        events[out].aux = 0;
+        events[out].upstream_episode = 0;
+        if (peer_len >= sizeof(peer) && peer.sin_family == AF_INET) {
+            events[out].accept_peer_valid = 1;
+            events[out].accept_peer_addr = peer.sin_addr.s_addr;
+            events[out].accept_peer_port = ntohs(peer.sin_port);
+        }
+        out++;
+    }
+    pending_streak = 0;
+    // A replenishment batch should not run ahead of the previously admitted
+    // connections' I/O and completion callbacks. Still bounded: if no socket
+    // is ready, wait() resumes pending accepts immediately without this quota.
+    if (study_accept_edge_trigger) accept_io_budget = 2 * kReadyBatch;
+    return out;
 }
 
 bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
@@ -514,8 +695,15 @@ bool EpollBackend::add_recv(i32 fd, u32 conn_id) {
             }
         }
     }
-    set_fd_interest(
-        fd_interest.data(), connection_capacity, epoll_fd, fd, conn_id, type, events, 0, this);
+    const u32 slot = fd_interest_slot(conn_id, type);
+    const u32 generation = fd_interest[slot].gen;
+    if (set_fd_interest(
+            fd_interest.data(), connection_capacity, epoll_fd, fd, conn_id, type, events, 0, this) <
+        0)
+        return false;
+    if (study_edge_trigger) edge_runnable[slot].read_submitted = true;
+    if (study_edge_trigger && fd_interest[slot].gen == generation && edge_runnable[slot].read_ready)
+        queue_edge(slot, EPOLLIN);
     return true;
 }
 
@@ -543,6 +731,8 @@ bool EpollBackend::quiesce_recv(u32 conn_id, bool upstream, u32 upstream_episode
     if (conn_id >= connection_capacity) return false;
     i32 fd = upstream ? upstream_fd_map[conn_id] : downstream_fd_map[conn_id];
     if (fd < 0) return false;
+    if (study_edge_trigger)
+        edge_runnable[2 * conn_id + (upstream ? 1u : 0u)].read_submitted = false;
     const auto& ss = upstream ? upstream_send_state[conn_id] : send_state[conn_id];
     if (ss.remaining > 0 && ss.fd == fd && (!upstream || ss.upstream_episode == upstream_episode)) {
         // Keep flushing the in-flight send. Downstream registers type=Send so the
@@ -580,6 +770,12 @@ bool EpollBackend::begin_upstream_episode(u32 conn_id, u32 episode) {
     if (!upstream_send_state_detached(upstream_send_state[conn_id])) return false;
 
     active_upstream_episode[conn_id] = episode;
+    clear_edge(fd_interest_slot(conn_id, IoEventType::UpstreamRecv));
+    if (study_edge_trigger) {
+        edge_runnable[2 * conn_id + 1].read_submitted = false;
+        edge_runnable[2 * conn_id + 1].read_ready = false;
+        edge_runnable[2 * conn_id + 1].read_eof = false;
+    }
     reset_fd_interest(fd_interest[fd_interest_slot(conn_id, IoEventType::UpstreamRecv)]);
     return true;
 }
@@ -640,14 +836,27 @@ bool EpollBackend::detach_upstream(Connection& conn, i32* detached_fd) {
             retained = &transport;
     }
     if (retained != nullptr) {
+        retained->idle_probe_pending =
+            study_edge_trigger && edge_runnable[2 * conn.id + 1].read_eof;
         // Keep the legacy detach's fence for both sides of this connection,
         // without invalidating the independent socket registration.
         for (u32 side = 0; side < 2; ++side) {
             auto& interest = fd_interest[2 * conn.id + side];
-            if (interest.fd == fd)
+            if (interest.fd == fd) {
+                const u32 slot = 2 * conn.id + side;
+                clear_edge(slot);
+                if (study_edge_trigger) {
+                    auto& runnable = edge_runnable[slot];
+                    runnable.read_submitted = runnable.read_ready = runnable.read_eof = false;
+                }
                 reset_fd_interest(interest);
-            else
+            } else {
+                if (study_edge_trigger)
+                    for (u32 i = ready_head; i < ready_count; ++i)
+                        if (ready_slot[i] == 2 * conn.id + side && ready_gen[i] == interest.gen)
+                            queue_edge(2 * conn.id + side, ready[i].events);
                 ++interest.gen;
+            }
         }
         ++retained->version;
         retained->idle = true;
@@ -713,6 +922,7 @@ void EpollBackend::pause_recv(u32 conn_id, bool preserve_send_interest) {
     if (conn_id >= connection_capacity) return;
     i32 fd = downstream_fd_map[conn_id];
     if (fd < 0) return;
+    if (study_edge_trigger) edge_runnable[2 * conn_id].read_submitted = false;
     // Mask EPOLLIN so client data bytes during wait(ms) don't wake us on
     // a level-triggered ready socket with no handler to consume them
     // (busy-loop risk on a full recv_buf). KEEP EPOLLRDHUP so a clean
@@ -744,6 +954,7 @@ void EpollBackend::pause_upstream_recv(u32 conn_id,
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return;
     i32 fd = upstream_fd_map[conn_id];
     if (fd < 0) return;
+    if (study_edge_trigger) edge_runnable[2 * conn_id + 1].read_submitted = false;
     // Mask all readability (events=0) so neither buffered upstream data nor a
     // half-close (EPOLLRDHUP, which dispatch folds into has_read) can fire
     // UpstreamRecv and drive the pipeline past the parked @throttle pump.
@@ -810,8 +1021,17 @@ bool EpollBackend::add_send_upstream(
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.u64 = encode_data(conn_id, IoEventType::UpstreamRecv, upstream_episode);
     invalidate_fd_interest(conn_id, fd);
-    i32 rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-    if (rc < 0 && errno == ENOENT) {
+    i32 rc = study_edge_trigger ? set_fd_interest(fd_interest.data(),
+                                                  connection_capacity,
+                                                  epoll_fd,
+                                                  fd,
+                                                  conn_id,
+                                                  IoEventType::UpstreamRecv,
+                                                  EPOLLIN | EPOLLOUT,
+                                                  upstream_episode,
+                                                  this)
+                                : epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+    if (!study_edge_trigger && rc < 0 && errno == ENOENT) {
         rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     }
     if (rc < 0) {
@@ -858,6 +1078,8 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) 
             }
         }
     }
+    const u32 slot = fd_interest_slot(conn_id, type);
+    const u32 generation = fd_interest[slot].gen;
     if (set_fd_interest(fd_interest.data(),
                         connection_capacity,
                         epoll_fd,
@@ -877,6 +1099,9 @@ bool EpollBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) 
                                         kLocalSubmitFailureAux,
                                         upstream_episode);
     }
+    if (study_edge_trigger) edge_runnable[slot].read_submitted = true;
+    if (study_edge_trigger && fd_interest[slot].gen == generation && edge_runnable[slot].read_ready)
+        queue_edge(slot, EPOLLIN);
     return true;
 }
 
@@ -910,8 +1135,17 @@ bool EpollBackend::add_send(i32 fd, u32 conn_id, const u8* buf, u32 len, bool mo
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLOUT;
     ev.data.u64 = encode_data(conn_id, IoEventType::Send, 0);
-    i32 rc = epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
-    if (rc < 0 && errno == ENOENT) {
+    i32 rc = study_edge_trigger ? set_fd_interest(fd_interest.data(),
+                                                  connection_capacity,
+                                                  epoll_fd,
+                                                  fd,
+                                                  conn_id,
+                                                  IoEventType::Send,
+                                                  EPOLLIN | EPOLLOUT,
+                                                  0,
+                                                  this)
+                                : epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+    if (!study_edge_trigger && rc < 0 && errno == ENOENT) {
         rc = epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     }
     if (rc < 0) {
@@ -1067,6 +1301,8 @@ u32 EpollBackend::cancel(i32 fd,
 }
 
 void EpollBackend::cancel_accept() {
+    accept_enabled = accept_pending = accept_retry_on_timer = false;
+    accept_io_budget = 0;
     if (listen_fd >= 0) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, listen_fd, nullptr);
     }
@@ -1102,10 +1338,23 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         return pop_pending(conns, max_conns);
     }
 
-    u32 r;
+    if (study_accept_edge_trigger && accept_pending && !accept_retry_on_timer &&
+        accept_io_budget == 0)
+        return drain_accept(events, max_events);
+
+    u32 r = 0;
+    epoll_event runnable_event = {};
+    bool from_edge = false;
+    if (edge_streak < kPendingBurstQuota && pop_edge(runnable_event)) {
+        ++edge_streak;
+        from_edge = true;
+        goto dispatch_ready;
+    }
     for (;;) {
         if (ready_head == ready_count) {
-            const bool probe_pending = pending_count > 0;
+            const bool runnable_accept =
+                study_accept_edge_trigger && accept_pending && !accept_retry_on_timer;
+            const bool probe_pending = pending_count > 0 || runnable_accept || edge_count > 0;
             i32 harvested;
             for (;;) {
                 harvested = epoll_wait(epoll_fd, ready, kReadyBatch, probe_pending ? 0 : -1);
@@ -1118,6 +1367,12 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 return 0;
             }
             if (harvested == 0) {
+                edge_streak = 0;
+                if (pop_edge(runnable_event)) {
+                    from_edge = true;
+                    goto dispatch_ready;
+                }
+                if (runnable_accept) return drain_accept(events, max_events);
                 if (probe_pending) {
                     pending_streak = 0;
                     return pop_pending(conns, max_conns);
@@ -1156,8 +1411,10 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             break;
         }
     }
+    edge_streak = 0;
+dispatch_ready:
     pending_streak = 0;
-    const struct epoll_event ep_events[1] = {ready[r]};
+    const struct epoll_event ep_events[1] = {from_edge ? runnable_event : ready[r]};
     const i32 n = 1;
 
     u32 out = 0;
@@ -1166,6 +1423,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
         u32 conn_id;
         IoEventType type;
         u32 upstream_episode = 0;
+        bool stable_recv_disabled = false;
         if (static_cast<u8>(ep_events[i].data.u64) == kStableUpstreamTag) {
             const u32 kFd = static_cast<u32>((ep_events[i].data.u64 >> 8) & kIoUserDataMaxConnId);
             const u32 kGeneration = static_cast<u32>(ep_events[i].data.u64 >> 32);
@@ -1186,7 +1444,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 continue;
             }
             conn_id = transport.conn_id;
-            if (!transport.recv_enabled) continue;
+            stable_recv_disabled = !transport.recv_enabled;
             upstream_episode = transport.episode;
             type = transport.relay_read ? IoEventType::RelayRead : IoEventType::UpstreamRecv;
             if (conn_id >= connection_capacity || upstream_fd_map[conn_id] != static_cast<i32>(kFd))
@@ -1203,6 +1461,14 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
              conns[conn_id].upstream_episode != upstream_episode ||
              active_upstream_episode[conn_id] != upstream_episode))
             continue;
+        if (study_edge_trigger && !from_edge && conn_id < connection_capacity &&
+            (ep_events[i].events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) &&
+            type != IoEventType::UpstreamConnect) {
+            auto& runnable = edge_runnable[fd_interest_slot(conn_id, type)];
+            runnable.read_ready = true;
+            runnable.read_eof |= (ep_events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
+        }
+        if (stable_recv_disabled) continue;
         if (type == IoEventType::RelayRead || type == IoEventType::RelayWrite) {
             const auto& relay = conns[conn_id].relay_owner;
             const bool owner = relay.active() && relay.upstream_episode == upstream_episode &&
@@ -1249,33 +1515,18 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             }
         }
 
+        if (study_accept_edge_trigger && conn_id != kListenConnId && accept_io_budget > 0)
+            --accept_io_budget;
         if (conn_id == kListenConnId) {
-            const u32 accept_limit = study_accept_batch_limit == 0 ? 1 : study_accept_batch_limit;
-            for (u32 accepted = 0; accepted < accept_limit && out < max_events; ++accepted) {
-                struct sockaddr_in peer = {};
-                socklen_t peer_len = sizeof(peer);
-                i32 fd = accept4(listen_fd,
-                                 reinterpret_cast<struct sockaddr*>(&peer),
-                                 &peer_len,
-                                 SOCK_NONBLOCK | SOCK_CLOEXEC);
-                if (fd < 0) break;
-                events[out] = {};
-                events[out].conn_id = 0;
-                events[out].type = IoEventType::Accept;
-                events[out].result = fd;
-                events[out].buf_id = 0;
-                events[out].has_buf = 0;
-                events[out].more = 0;
-                events[out].aux = 0;
-                events[out].upstream_episode = 0;
-                if (peer_len >= sizeof(peer) && peer.sin_family == AF_INET) {
-                    events[out].accept_peer_valid = 1;
-                    events[out].accept_peer_addr = peer.sin_addr.s_addr;
-                    events[out].accept_peer_port = ntohs(peer.sin_port);
-                }
-                out++;
+            if (!accept_enabled || listen_fd < 0) continue;
+            if (study_accept_edge_trigger) {
+                if (!accept_pending) accept_io_budget = 0;
+                accept_pending = true;
+                if (accept_io_budget > 0) continue;
             }
+            return drain_accept(events, max_events);
         } else if (conn_id == kTimerConnId) {
+            if (type == IoEventType::Timeout) accept_retry_on_timer = false;
             // Two timerfds share kTimerConnId; the decoded type disambiguates.
             // HandlerTimer → yield_timer_fd (one-shot, ms precision, per-heap-top).
             // Timeout      → timer_fd      (1 Hz interval, drives keepalive wheel).
@@ -1313,6 +1564,9 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
             out++;
             continue;
         } else if (send_ready) {
+            const auto& state =
+                type == IoEventType::Send ? send_state[conn_id] : upstream_send_state[conn_id];
+            if (has_read && !state.tls) queue_edge(fd_interest_slot(conn_id, type), EPOLLIN);
             goto handle_epollout;
         } else if (type == IoEventType::Recv && conn_id < max_conns && conns != nullptr &&
                    conns[conn_id].tls_active && (has_read || has_write)) {
@@ -1327,6 +1581,17 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                                                               : downstream_fd_map[conn_id];
             }
             if (fd < 0 || conn_id >= max_conns || conns == nullptr) continue;
+            const u32 recv_slot = fd_interest_slot(conn_id, recv_type);
+            const auto& concurrent_send = recv_type == IoEventType::UpstreamRecv
+                                              ? upstream_send_state[conn_id]
+                                              : send_state[conn_id];
+            if (has_write && concurrent_send.remaining > 0 && concurrent_send.fd == fd &&
+                (!io_event_is_upstream(recv_type) ||
+                 concurrent_send.upstream_episode == upstream_episode))
+                queue_edge(recv_slot, EPOLLOUT);
+            if (study_edge_trigger && !edge_runnable[recv_slot].read_submitted &&
+                !(ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP)))
+                continue;
 
             auto& conn = conns[conn_id];
             auto& buf =
@@ -1360,6 +1625,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         } else {
                             i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, rc);
                             if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+                                if (study_edge_trigger) edge_runnable[recv_slot].read_ready = false;
                                 set_fd_interest(fd_interest.data(),
                                                 connection_capacity,
                                                 epoll_fd,
@@ -1372,6 +1638,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                                 continue;
                             }
                             result = map_tls_error(ssl, rc);
+                            if (study_edge_trigger) edge_runnable[recv_slot].read_submitted = false;
                             events[out] = {};
                             events[out].conn_id = conn_id;
                             events[out].type = recv_type;
@@ -1389,6 +1656,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     u32 avail = buf.write_avail();
                     if (avail == 0) {
                         result = -ENOBUFS;
+                        if (study_edge_trigger) edge_runnable[recv_slot].read_ready = true;
                     } else {
                         errno = 0;
                         i32 nr = get_tls_hooks()->ssl_read(
@@ -1396,6 +1664,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         if (nr > 0) {
                             buf.commit(static_cast<u32>(nr));
                             result = nr;
+                            if (study_edge_trigger) edge_runnable[recv_slot].read_ready = true;
                             if (type == IoEventType::Send && conn_id < connection_capacity &&
                                 send_state[conn_id].remaining > 0) {
                                 set_fd_interest(fd_interest.data(),
@@ -1421,6 +1690,7 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                         } else {
                             i32 ssl_err = get_tls_hooks()->ssl_get_error(ssl, nr);
                             if (ssl_err == SSL_ERROR_WANT_READ || ssl_err == SSL_ERROR_WANT_WRITE) {
+                                if (study_edge_trigger) edge_runnable[recv_slot].read_ready = false;
                                 if (type == IoEventType::Send && conn_id < connection_capacity &&
                                     send_state[conn_id].remaining > 0) {
                                     set_fd_interest(
@@ -1460,9 +1730,15 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                     if (nr > 0) {
                         buf.commit(static_cast<u32>(nr));
                         result = static_cast<i32>(nr);
+                        if (study_edge_trigger)
+                            edge_runnable[recv_slot].read_ready =
+                                static_cast<u32>(nr) == avail ||
+                                (ep_events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR));
                     } else if (nr == 0) {
                         result = 0;
+                        if (study_edge_trigger) edge_runnable[recv_slot].read_ready = false;
                     } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        if (study_edge_trigger) edge_runnable[recv_slot].read_ready = false;
                         // Spurious or stale readiness (e.g. a harvested record
                         // for a closed fd whose number was reused): no data is
                         // not a completion. Level-triggered interest re-fires.
@@ -1473,6 +1749,15 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
                 } else {
                     result = -ENOBUFS;
                 }
+            }
+
+            // ET retains socket readiness, but each submitted read still owns
+            // just one completion. The callback re-submits after releasing or
+            // consuming the buffer; stale harvested IN cannot read it twice.
+            if (study_edge_trigger) {
+                edge_runnable[recv_slot].read_submitted = false;
+                if (result > 0)
+                    queue_edge(recv_slot, ep_events[i].events & (EPOLLHUP | EPOLLERR | EPOLLRDHUP));
             }
 
             // A current upstream recv token may coexist briefly with a send
@@ -1674,6 +1959,8 @@ u32 EpollBackend::wait(IoEvent* events, u32 max_events, Connection* conns, u32 m
 }
 
 void EpollBackend::shutdown() {
+    accept_enabled = accept_pending = accept_retry_on_timer = false;
+    accept_io_budget = 0;
     pending_count = 0;
     pending_streak = 0;
     ready_head = 0;
