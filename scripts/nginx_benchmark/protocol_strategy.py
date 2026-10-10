@@ -198,6 +198,7 @@ def main():
                     io_stats=os.environ.get('RUT_STUDY_IO_STATS', 'off'),
                     ws_sync_send=os.environ.get('RUT_STUDY_WS_SYNC_SEND', 'off'),
                     ws_direct_recv=os.environ.get('RUT_STUDY_WS_DIRECT_RECV', 'off'),
+                    ws_poll_first=os.environ.get('RUT_STUDY_WS_POLL_FIRST', 'off'),
                     ws_copy=os.environ.get('RUT_STUDY_WS_COPY', 'off'),
                     ws_copy_limit=os.environ.get('RUT_STUDY_WS_COPY_LIMIT', '4k'),
                     ws_available=os.environ.get('RUT_STUDY_WS_AVAILABLE', 'off'),
