@@ -49,6 +49,30 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_api_origin_command_and_record_validation(self):
+        command = relay_compare.api_origin_command(
+            Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2
+        )
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[command.index("--port") + 1], "8704")
+        self.assertEqual(command[command.index("--cpus") + 1], "3,4")
+        self.assertEqual(command[command.index("--fragment-bytes") + 1], "16384")
+        markers = ["close-0", "close-1"]
+        fresh = [(markers[0], 10, 1), (markers[1], 11, 1)]
+        pooled = [(markers[0], 10, 1), (markers[1], 10, 2)]
+        self.assertTrue(relay_compare.valid_api_origin_records(fresh, markers, True))
+        self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, True))
+        self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, False))
+        self.assertFalse(relay_compare.valid_api_origin_records(pooled[:1], markers, True))
+
+    def test_direct_origin_and_mixed_rate_reject_close(self):
+        self.assertEqual(relay_compare.direct_origin_port(
+            SimpleNamespace(origin_port=8704, front_port=8604)), 8704)
+        with self.assertRaisesRegex(ValueError, "requires keepalive scenarios"):
+            relay_compare.validate_mixed_small_rate_scenarios(("proxy-close",), True)
+        relay_compare.validate_mixed_small_rate_scenarios(("proxy-keepalive",), True)
+        relay_compare.validate_mixed_small_rate_scenarios(("proxy-close",), False)
+
     def test_paced_http_probe_verifies_complete_framing_and_body(self):
         async def check(payload):
             reader = protocol_workload.asyncio.StreamReader()
