@@ -1171,6 +1171,110 @@ TEST(websocket, iouring_splice_shard_budget_fair_across_active_owners) {
     }
     loop.ws_splice.progress(loop);
 }
+
+TEST(websocket, iouring_splice_requested_owner_survives_exhausted_turn_admission) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    loop.ws_splice.call_budget = 2;
+    Connection* connections[2]{};
+    Peer clients[2], origins[2];
+    u8 sent_client[64], sent_origin[64], received_client[64]{}, received_origin[64]{};
+    u32 client_bytes[2]{}, origin_bytes[2]{};
+
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    clients[0].fd = downstream[1];
+    origins[0].fd = upstream[1];
+    connections[0] = loop.alloc_conn();
+    REQUIRE(connections[0] != nullptr);
+    auto& active_connection = *connections[0];
+    active_connection.fd = downstream[0];
+    active_connection.upstream_fd = upstream[0];
+    active_connection.upstream_episode = 1;
+    REQUIRE(set_nonblocking(active_connection.fd));
+    REQUIRE(set_nonblocking(active_connection.upstream_fd));
+    auto& active_owner = loop.ws_splice.owners[active_connection.id];
+    active_owner.active = true;
+    active_owner.episode = active_connection.upstream_episode;
+    ++active_connection.pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        active_owner.direction[direction].read_fd = fds[0];
+        active_owner.direction[direction].write_fd = fds[1];
+    }
+    loop.ws_splice.enqueue(active_connection.id);
+
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    clients[1].fd = downstream[1];
+    origins[1].fd = upstream[1];
+    connections[1] = loop.alloc_conn();
+    REQUIRE(connections[1] != nullptr);
+    auto& requested_connection = *connections[1];
+    requested_connection.fd = downstream[0];
+    requested_connection.upstream_fd = upstream[0];
+    requested_connection.upstream_episode = 1;
+    requested_connection.protocol = ConnProtocol::Http11;
+    requested_connection.is_ws_tunnel = true;
+    REQUIRE(loop.alloc_upstream_buf(requested_connection));
+    REQUIRE(loop.ws_splice.intercept_recv(loop, requested_connection));
+    CHECK(loop.ws_splice.owners[requested_connection.id].requested);
+
+    for (u32 i = 0; i < 64; ++i) {
+        sent_client[i] = static_cast<u8>(i * 7u + 3u);
+        sent_origin[i] = static_cast<u8>(i * 11u + 4u);
+    }
+    // The active owner has no source bytes, so its two EAGAIN probes spend
+    // the whole turn before the requested owner is admitted. Its pumps must
+    // preserve the new owner as runnable without spending calls.
+    REQUIRE(write_burst(clients[1].fd, sent_client, 64));
+    REQUIRE(write_burst(origins[1].fd, sent_origin, 64));
+
+    const u64 calls_before = loop.ws_splice.calls;
+    loop.ws_splice.progress(loop);
+    CHECK_EQ(loop.ws_splice.calls - calls_before, 2u);
+    auto& deferred_owner = loop.ws_splice.owners[requested_connection.id];
+    CHECK_FALSE(deferred_owner.requested);
+    CHECK(deferred_owner.active);
+    CHECK(deferred_owner.queued);
+    CHECK(deferred_owner.budget_deferred);
+    CHECK_FALSE(loop.should_wait_for_event());
+
+    bool transferred_all = false;
+    for (u32 turn = 0; turn < 256 && !transferred_all; ++turn) {
+        const u64 before_turn = loop.ws_splice.calls;
+        loop.ws_splice.progress(loop);
+        CHECK(loop.ws_splice.calls - before_turn <= loop.ws_splice.call_budget);
+        REQUIRE(read_available(clients[1].fd, received_client, &client_bytes[1], 64));
+        REQUIRE(read_available(origins[1].fd, received_origin, &origin_bytes[1], 64));
+        transferred_all = client_bytes[1] == 64 && origin_bytes[1] == 64;
+    }
+    REQUIRE(transferred_all);
+    CHECK(deferred_owner.active || deferred_owner.eof_closing);
+    CHECK(__builtin_memcmp(received_client, sent_origin, 64) == 0);
+    CHECK(__builtin_memcmp(received_origin, sent_client, 64) == 0);
+    loop.close_conn(*connections[0]);
+    loop.close_conn(*connections[1]);
+    for (u32 i = 0;
+         i < 1000 && (connections[0]->pending_ops != 0 || connections[1]->pending_ops != 0);
+         ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(connections[0]->pending_ops, 0u);
+    CHECK_EQ(connections[1]->pending_ops, 0u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
+    loop.ws_splice.progress(loop);
+    CHECK_EQ(loop.ws_splice.queued_count, 0u);
+}
+
 TEST(websocket, iouring_splice_failed_admission_does_not_starve_next_owner) {
     LoopStorage storage;
     if (!storage.init()) return;
