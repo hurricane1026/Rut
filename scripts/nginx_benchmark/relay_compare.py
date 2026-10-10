@@ -90,8 +90,9 @@ def validate_distinct_url_scenarios(scenarios, enabled):
 
 
 def validate_mixed_small_rate_scenarios(scenarios, enabled):
-    if enabled and any(scenario.endswith("-close") for scenario in scenarios):
-        raise ValueError("--mixed-small-rate requires keepalive scenarios; paced small probe does not support close")
+    if enabled and any(scenario != "proxy-keepalive" for scenario in scenarios):
+        raise ValueError("--mixed-small-rate requires keepalive scenarios and specifically "
+                         "proxy-keepalive; paced small probe is a proxy workload")
 
 
 def mixed_cpu_masks(value):
@@ -471,6 +472,8 @@ def main():
             result = dict(large)
             result.update(large_client=large, small_client=little)
             result["errors"] = {key: large["errors"][key] + little["errors"][key] for key in large["errors"]}
+            result["valid"] = bool(large.get("valid", not any(large["errors"].values()))
+                                    and little.get("valid", not any(little["errors"].values())))
             for key in ("requests", "rps", "client_cpu_seconds"):
                 result[key] = large[key] + little[key]
             return result
