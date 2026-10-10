@@ -1,0 +1,32 @@
+# Validation of the submitted checkpoint
+
+- Rebuilt `rut`, `rut-compile` and `test_network` in Release with clang on Linux.
+  The PR runtime/test source was checked byte-for-byte against that build's
+  source tree. Pre-existing test compilation warnings remain.
+- `ctest -R '^test_network$' --output-on-failure`: passed after the final changes.
+- clang-format dry-run with warnings as errors: all six changed C++ files passed.
+- Full CI-scope clang-tidy 22: all 60 source/helper translation units passed
+  with bugprone/performance warnings treated as errors, without line filters.
+  Fixed the HTTP/2 CRTP fallback shadowing, checked the study-cache environment
+  conversion, and split LLVM definition arguments consistently across source,
+  test and benchmark targets. CI lint now pins clang/clang-tidy/LLVM to 22.
+- CI repair validation: test_network, test_splice, test_arena, test_jit,
+  test_serve_loader and test_harness all passed after the final rebuild.
+  The standalone splice driver now matches nonblocking runnable-work pumping,
+  and the owner-count test still exceeds one shared turn rather than weakening
+  its budget/fairness checks. The checked numeric conversion has a regression
+  covering malformed/overflow input and errno preservation.
+- Python byte-compilation and both entry-point help commands: passed.
+- Repository scanner end-to-end smoke: all 11 buffer configurations plus two
+  selected nginx candidates and Rut completed, 14 valid measurement rows and
+  zero client errors. Checked each saved effective nginx configuration against
+  the requested buffering mode, buffer sizes and disabled temp-file writes.
+- Repository mixed-load smoke: io_uring candidate, alternative 64KiB binary,
+  epoll candidate, and nginx completed serially, four valid rows, successful
+  small/large payload preflights and zero client errors. Explicit runtime
+  backend selection was checked by the script.
+
+Smoke runs used one second of warmup and one second of measurement; they validate
+script wiring, not throughput claims. The longer measurements are preserved in
+the experiment subdirectories. Full CI, sanitizers and macOS/kqueue have not
+been run locally for this submission.

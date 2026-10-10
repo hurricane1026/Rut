@@ -1,0 +1,82 @@
+{
+  "harness_revision": "8fbce03bb72d8b8824539944372c28171a130814",
+  "harness_dirty": true,
+  "started_at": "2026-10-09T16:36:32Z",
+  "arguments": {
+    "rut": "/home/hurricane/private/code/rut-performance-checkpoints/iouring-128k-chunk-study-20261009/candidate/rut",
+    "converter": "/tmp/rut-latest-compare-20261008-build/src/rut-nginx-convert",
+    "wrk": "/home/hurricane/private/code/rut-nginx-gap-next-bench-20261004/wrk-boringssl-src2",
+    "output": "/home/hurricane/private/code/rut-performance-checkpoints/origin-accept-matched-20261010/on-r2",
+    "mode": "benchmark",
+    "server_cpu": 2,
+    "server_cpus": "2",
+    "workers": 1,
+    "origin_cpu": 3,
+    "client_cpus": "5,7",
+    "keepalive_header": "implicit",
+    "body_size": 1048576,
+    "static_profile": "converter-return",
+    "proxy_profile": "native-streaming",
+    "native_origin_reuse": "on",
+    "bounded_origin_reuse": "off",
+    "native_nginx_buffering": "off",
+    "tls_cert": null,
+    "tls_key": null,
+    "front_port": 8604,
+    "origin_port": 8704,
+    "concurrency": [
+      128
+    ],
+    "profile": "acceptance",
+    "duration": 15,
+    "warmup": 3,
+    "repeats": 1,
+    "first_engine": "nginx",
+    "scenarios": [
+      "proxy-keepalive"
+    ]
+  },
+  "static_profile": "converter-return",
+  "proxy_profile": {
+    "name": "native-streaming",
+    "body_size": 1048576,
+    "origin_keepalive": "enabled; 60s idle timeout",
+    "nginx_response_buffering": "off",
+    "native_origin_reuse_observation": "conditional access log for marked preflight requests only",
+    "nginx_keepalive_requests": {
+      "origin": 1000000000,
+      "upstream_idle_connection": 1000000000,
+      "frontend_downstream": 1000000000
+    }
+  },
+  "engine_order_by_scenario_and_repeat": [
+    {
+      "scenario": "proxy-keepalive",
+      "repeat": 1,
+      "engines": [
+        "uring"
+      ]
+    }
+  ],
+  "binaries_sha256": {
+    "/home/hurricane/private/code/rut-performance-checkpoints/iouring-128k-chunk-study-20261009/candidate/rut": "d2122fa05f529486f3cbf9693e284ce1afe582c6a74184c47b28aaf5d9f621d2",
+    "/tmp/rut-latest-compare-20261008-build/src/rut-nginx-convert": "19ce3b2228186966fe14194d995169eab9fd8e5afcc09b74c0a813ec8ec5d6ab",
+    "/home/hurricane/private/code/rut-nginx-gap-next-bench-20261004/wrk-boringssl-src2": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30"
+  },
+  "nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "nginx_image_id": "sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "kernel": [
+    "Linux",
+    "leopard",
+    "6.19.10-300.fc44.x86_64",
+    "#1 SMP PREEMPT_DYNAMIC Wed Mar 25 18:23:49 UTC 2026",
+    "x86_64"
+  ],
+  "cpu_topology": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           39 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz\nCPU family:                              6\nModel:                                   165\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                5\nCPU(s) scaling MHz:                      56%\nCPU max MHz:                             4800.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                5799.77\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx rdseed adx smap clflushopt intel_pt xsaveopt xsavec xgetbv1 xsaves dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp vnmi pku ospke md_clear flush_l1d arch_capabilities\nVirtualization:                          VT-x\nL1d cache:                               256 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                2 MiB (8 instances)\nL3 cache:                                16 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Mitigation; Microcode\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             KVM: Mitigation: Split huge pages\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Mitigation; Clear CPU buffers; SMT vulnerable\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Mitigation; Microcode\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace\n",
+  "workers": 1,
+  "server_cpus": "2",
+  "tcp_tw_reuse": "2",
+  "note": "Harness revision is not proof of binary source revision. Record build provenance separately.",
+  "origin_cpu": "3,4",
+  "origin_workers": 2
+}
