@@ -466,7 +466,8 @@ public:
     // count keeps the ordinary hot path from touching the bitmap.
     MappedArray<u64> recv_rearm_words;
     u32 recv_rearm_count = 0;
-    u32 recv_rearm_cursor = 0;      // word where the next capped pass resumes
+    u32 recv_rearm_cursor = 0;  // word where the next capped pass resumes
+    u32 recv_rearm_slot_cursor = 0;
     u32 ws_cache_rearm_cursor = 0;  // connection where the upstream pass resumes
     u32 ws_cache_rearm_budget = 0;
 
@@ -3492,47 +3493,26 @@ public:
         u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
         if (backend.ws_recv_cache_enabled && budget > cache_free) budget = cache_free;
         if (budget == 0 && force) budget = 1;  // the backstop always makes progress
-        const u32 words = (slots_initialized + 63u) >> 6;
-        if (words == 0) return;
-        const u32 start = recv_rearm_cursor < words ? recv_rearm_cursor : 0;
-        for (u32 n = 0; n < words && recv_rearm_count != 0 && budget != 0; ++n) {
-            const u32 w = (start + n) % words;
-            u64 bits = recv_rearm_words[w];
-            u64 retained = 0;
-            while (bits != 0) {
-                if (budget == 0) {
-                    recv_rearm_cursor = w;  // resume inside this word
+        if (slots_initialized == 0) return;
+        const u32 start = recv_rearm_slot_cursor < slots_initialized ? recv_rearm_slot_cursor : 0;
+        for (u32 n = 0; n < slots_initialized && recv_rearm_count != 0 && budget != 0; ++n) {
+            const u32 cid = (start + n) % slots_initialized;
+            const u64 bit = u64{1} << (cid & 63u);
+            u64& word = recv_rearm_words[cid >> 6];
+            if ((word & bit) == 0) continue;
+            Connection& c = conns[cid];
+            if (c.fd >= 0) {
+                const bool was_armed = c.recv_armed;
+                if (!submit_recv_impl(c)) {
+                    recv_rearm_slot_cursor = cid;
                     return;
                 }
-                const u32 cid = (w << 6) + static_cast<u32>(__builtin_ctzll(bits));
-                const u64 bit = u64{1} << (cid & 63u);
-                bits &= ~bit;
-                if (cid >= slots_initialized) {
-                    clear_deferred_recv(cid);
-                    continue;
-                }
-                Connection& c = conns[cid];
-                if (c.fd >= 0) {
-                    const bool was_armed = c.recv_armed;
-                    if (!submit_recv_impl(c)) {
-                        recv_rearm_cursor = w;
-                        return;  // SQ full: retry later
-                    }
-                    if (!was_armed && !c.recv_armed) {
-                        // A pause/cancel rendezvous accepted the request but
-                        // deliberately did not submit a successor yet. Keep
-                        // the bitmap bit until the owner CQE or resume path
-                        // makes the re-arm legal.
-                        retained |= bit;
-                        continue;
-                    }
-                    budget--;
-                    if (backend.ws_recv_cache_enabled) ws_cache_rearm_budget = budget;
-                }
-                clear_deferred_recv(cid);
+                if (!was_armed && !c.recv_armed) continue;
+                budget--;
+                recv_rearm_slot_cursor = (cid + 1u) % slots_initialized;
+                if (backend.ws_recv_cache_enabled) ws_cache_rearm_budget = budget;
             }
-            recv_rearm_words[w] |= retained;
-            recv_rearm_cursor = (w + 1u) % words;
+            clear_deferred_recv(cid);
         }
     }
 

@@ -24,7 +24,8 @@ struct WsSpliceExperiment {
     struct Owner {
         Direction direction[2];
         u32 episode = 0;
-        bool requested = false, active = false, closing = false, queued = false, failed = false;
+        bool requested = false, active = false, closing = false, eof_closing = false,
+             queued = false, failed = false;
     };
     MappedArray<Owner> owners;
     MappedArray<u32> queued;
@@ -115,10 +116,22 @@ struct WsSpliceExperiment {
         return true;
     }
     template <class Loop>
+    void finish_eof_close(Loop& loop, Connection& c) {
+        auto& o = owners[c.id];
+        if (!o.eof_closing) return;
+        for (auto& d : o.direction)
+            if (!d.eof || d.buffered != 0 || d.armed || d.cancel_owned) return;
+        loop.close_conn(c);
+    }
+    template <class Loop>
     void pump(Loop& loop, Connection& c, u32 index) {
         auto& o = owners[c.id];
         auto& d = o.direction[index];
-        if (!o.active || o.closing || d.armed || d.eof) return;
+        if (!o.active || o.closing || d.armed) return;
+        if (d.eof && d.buffered == 0) {
+            finish_eof_close(loop, c);
+            return;
+        }
         const i32 kSource = index == 0 ? c.fd : c.upstream_fd;
         const i32 kDestination = index == 0 ? c.upstream_fd : c.fd;
         // A full copied prefix can leave immediately available bytes behind it.
@@ -189,13 +202,33 @@ struct WsSpliceExperiment {
             if (!kWriting && n == 0) {
                 d.eof = true;
                 (void)::shutdown(kDestination, SHUT_WR);
-                if (o.direction[0].eof && o.direction[1].eof) loop.close_conn(c);
+                o.eof_closing = true;
+                const u32 kOther = index ^ 1u;
+                auto& other = o.direction[kOther];
+                other.eof = true;
+                if (other.armed && !other.cancel_owned) {
+                    const auto kType =
+                        other.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
+                    const u64 kTarget = encode_upstream_event_token(
+                        {c.id, kType, o.episode, static_cast<u8>(32 + kOther)});
+                    if (loop.backend.cancel_ws_splice_poll(
+                            kTarget, c.id, kType, static_cast<u8>(96 + kOther), o.episode)) {
+                        other.cancel_owned = true;
+                        ++c.pending_ops;
+                    }
+                }
+                pump(loop, c, kOther);
+                finish_eof_close(loop, c);
                 return;
             }
             if (kWriting) {
                 d.buffered -= static_cast<u32>(n);
                 if (copy) buffer.consume(static_cast<u32>(n));
                 transferred[index] += static_cast<u32>(n);
+                if (d.eof && d.buffered == 0) {
+                    finish_eof_close(loop, c);
+                    return;
+                }
             } else {
                 d.copying = copy;
                 d.buffered = static_cast<u32>(n);
@@ -212,6 +245,7 @@ struct WsSpliceExperiment {
             }
         }
         if (!arm(loop, c, index, d.buffered != 0)) loop.close_conn(c);
+        finish_eof_close(loop, c);
     }
     template <class Loop>
     void close(Loop& loop, Connection& c) {
@@ -283,7 +317,14 @@ struct WsSpliceExperiment {
             retire(loop, c);
             return true;
         }
-        if (kCancel || c.fd < 0) return true;
+        if (kCancel) {
+            if (o.eof_closing) {
+                pump(loop, c, kIndex);
+                finish_eof_close(loop, c);
+            }
+            return true;
+        }
+        if (c.fd < 0) return true;
         if (ev.result < 0) {
             loop.close_conn(c);
             return true;

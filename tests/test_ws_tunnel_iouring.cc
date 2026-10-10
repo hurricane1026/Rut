@@ -228,7 +228,7 @@ static void full_duplex_burst(test::TestCase* _tc,
             loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
         loop.dispatch_batch(events, kCount);
         REQUIRE_EQ(loop.backend.failure_code(), 0);
-        REQUIRE(queued_fin || conn->fd >= 0);
+        REQUIRE(fin_before_drain || queued_fin || conn->fd >= 0);
         if (!slow_reader || monotonic_ns() - kStart >= 30ull * 1000 * 1000) {
             REQUIRE(read_available(kClient.fd, received_client, &client_bytes, kBytes));
             REQUIRE(read_available(kOrigin.fd, received_origin, &origin_bytes, kBytes));
@@ -258,7 +258,32 @@ static void full_duplex_burst(test::TestCase* _tc,
         CHECK_EQ(loop.ws_splice.transferred[0], pipe_failure ? 0u : kBytes - prefix);
         CHECK_EQ(loop.ws_splice.transferred[1], pipe_failure ? 0u : kBytes - prefix);
     }
-    if (queued_fin) {
+    if (fin_before_drain) {
+        // The first FIN terminates the tunnel after already-buffered bytes
+        // drain. No reverse payload or second FIN is sent; the peer socket
+        // itself remains open until its owner observes the close.
+        for (u32 i = 0; i < 1000 && conn->fd >= 0; ++i) {
+            IoEvent events[kMaxEventsPerWait]{};
+            const u32 kCount = loop.backend.wait(
+                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+            loop.dispatch_batch(events, kCount);
+            if (kCount == 0) usleep(1000);
+        }
+        CHECK(loop.ws_splice.owners[conn->id].direction[0].eof);
+        CHECK(loop.ws_splice.owners[conn->id].direction[1].eof);
+        CHECK(loop.ws_splice.owners[conn->id].eof_closing);
+        CHECK_EQ(loop.ws_splice.owners[conn->id].direction[0].buffered, 0u);
+        CHECK_EQ(loop.ws_splice.owners[conn->id].direction[1].buffered, 0u);
+        CHECK_FALSE(loop.ws_splice.owners[conn->id].direction[0].armed);
+        CHECK_FALSE(loop.ws_splice.owners[conn->id].direction[1].armed);
+        CHECK_FALSE(loop.ws_splice.owners[conn->id].direction[0].cancel_owned);
+        CHECK_FALSE(loop.ws_splice.owners[conn->id].direction[1].cancel_owned);
+        REQUIRE(conn->fd < 0);
+        u8 probe = 0;
+        // The client never sends a second FIN; EOF here is generated only by
+        // the tunnel closing after its buffered bytes were drained.
+        CHECK_EQ(recv(kClient.fd, &probe, sizeof(probe), MSG_DONTWAIT), 0);
+    } else if (queued_fin) {
         for (u32 i = 0; i < 1000 && conn->fd >= 0; ++i) {
             IoEvent events[kMaxEventsPerWait]{};
             const u32 kCount = loop.backend.wait(
