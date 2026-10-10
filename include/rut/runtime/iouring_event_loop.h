@@ -3476,10 +3476,15 @@ public:
     // connection is reached. A recv that finds no SQE stays pending.
     void rearm_deferred_recvs(bool force) {
         if (recv_rearm_count == 0) return;
-        if (backend.ws_recv_cache_enabled && !backend.ws_recv_cache_has_capacity()) return;
+        u32 cache_free = kProvidedBufCount;
+        if (backend.ws_recv_cache_enabled) {
+            cache_free = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
+            if (cache_free == 0) return;
+        }
         const u32 pinned = backend.cq_unharvested();
         if (!force && pinned >= kProvidedBufCount / 2) return;
         u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
+        if (backend.ws_recv_cache_enabled && budget > cache_free) budget = cache_free;
         if (budget == 0 && force) budget = 1;  // the backstop always makes progress
         const u32 words = (slots_initialized + 63u) >> 6;
         if (words == 0) return;
@@ -3528,16 +3533,20 @@ public:
     // return. Retrying while the cache owns every buffer only produces another
     // -ENOBUFS CQE and can spin the shard without making progress.
     void rearm_deferred_ws_cache_recvs() {
-        if (!backend.ws_recv_cache_enabled || !backend.ws_recv_cache_has_capacity()) return;
+        if (!backend.ws_recv_cache_enabled) return;
+        u32 budget = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
+        if (budget == 0) return;
         for (u32 id = 0; id < slots_initialized; ++id) {
             Connection& c = conns[id];
             if (!ws_recv_cache_active(c) || !c.upstream_recv_pause_rearm_pending ||
                 c.upstream_recv_armed)
                 continue;
+            const bool was_armed = c.upstream_recv_armed;
             if (!try_deferred_upstream_rearm(c)) {
                 close_conn(c);
                 return;
             }
+            if (!was_armed && c.upstream_recv_armed && --budget == 0) return;
         }
     }
 
@@ -3545,9 +3554,11 @@ public:
     // owns that memory. A terminal bounded recv prevents a multishot burst
     // from filling the same buffer before dispatch can apply backpressure.
     bool use_one_shot_websocket_recv(const Connection& c) const {
-        if (backend.ws_recv_cache_enabled) return false;
-        return c.is_ws_tunnel && !c.tls_active && c.protocol == ConnProtocol::Http11 && c.fd >= 0 &&
-               c.upstream_fd >= 0 && valid_upstream_episode(c.upstream_episode);
+        const bool cache_eligible = c.is_ws_tunnel && !c.is_ws_terminate && !c.tls_active;
+        if (backend.ws_recv_cache_enabled && cache_eligible) return false;
+        return (c.is_ws_tunnel || c.is_ws_terminate) && !c.tls_active &&
+               c.protocol == ConnProtocol::Http11 && c.fd >= 0 && c.upstream_fd >= 0 &&
+               valid_upstream_episode(c.upstream_episode);
     }
 
     // Terminal one-shot reads and bounded-cache multishot reads can lend this
