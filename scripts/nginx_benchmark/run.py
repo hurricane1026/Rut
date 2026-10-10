@@ -1157,12 +1157,13 @@ def normalize_cpu_arguments(parser, args):
     return args
 
 
-def validate_cpu_topology(parser, args):
+def validate_cpu_topology(parser, args, origin_cpus=None):
     try:
         clients = [int(cpu) for cpu in args.client_cpus.split(",")]
+        origins = [args.origin_cpu] if origin_cpus is None else list(origin_cpus)
     except (AttributeError, ValueError):
-        parser.error("client-cpus must be comma-separated integer CPU IDs")
-    cpus = [*map(int, args.server_cpus.split(",")), args.origin_cpu, *clients]
+        parser.error("CPU assignments must contain integer CPU IDs")
+    cpus = [*map(int, args.server_cpus.split(",")), *origins, *clients]
     if (not clients or len(set(cpus)) != len(cpus)
             or not set(cpus) <= os.sched_getaffinity(0)):
         parser.error("CPU IDs must be available and disjoint")

@@ -5,6 +5,7 @@ import argparse
 import io
 import json
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -99,6 +100,96 @@ class ToolsTest(unittest.TestCase):
             log = Path(directory) / "origin.log"
             log.write_text("noise\nAPI_READY worker=0\nAPI_READY worker=1\n")
             relay_compare.wait_for_api_origin_ready(log, ReadyProcess(), 2)
+
+    def test_relay_api_delays_must_be_finite_and_nonnegative_before_side_effects(self):
+        invalid = ("-1", "nan", "inf", "-inf")
+        with tempfile.TemporaryDirectory() as directory:
+            for option in ("--api-delay-ms", "--api-fragment-delay-ms"):
+                for value in invalid:
+                    with self.subTest(option=option, value=value):
+                        output = Path(directory) / f"{option[2:]}-{value}"
+                        stderr = io.StringIO()
+                        with mock.patch.object(sys, "argv", [
+                            "relay_compare.py", option, value, "--output", str(output)
+                        ]), mock.patch.object(relay_compare.subprocess, "Popen") as popen, \
+                                contextlib.redirect_stderr(stderr):
+                            with self.assertRaises(SystemExit) as error:
+                                relay_compare.main()
+                        self.assertEqual(error.exception.code, 2)
+                        self.assertFalse(output.exists())
+                        popen.assert_not_called()
+
+        parser = argparse.ArgumentParser()
+        for value in (0.0, 0.25):
+            relay_compare.validate_api_delays(parser, value, value)
+
+    def test_relay_validates_complete_origin_cpu_topology(self):
+        def validate(origin_cpus="3,6", origin_workers=2, origin_cpu="3",
+                     server_cpus="2", workers=1, client_cpus="4,5",
+                     mixed_small_bytes=0, mixed_client_cpus="5,4", siblings=None,
+                     available=None):
+            options = SimpleNamespace(
+                origin_cpus=origin_cpus,
+                origin_workers=origin_workers,
+                mixed_small_bytes=mixed_small_bytes,
+                mixed_client_cpus=mixed_client_cpus,
+            )
+            remaining = ["--server-cpus", server_cpus, "--workers", str(workers),
+                         "--origin-cpu", origin_cpu, "--client-cpus", client_cpus]
+            parser = argparse.ArgumentParser(add_help=False)
+            siblings = siblings or {}
+            available = set(range(2, 16)) if available is None else available
+
+            def topology_text(path, *args, **kwargs):
+                match = re.search(r"cpu(\d+)/topology/(physical_package_id|core_id)$", str(path))
+                if not match:
+                    raise AssertionError(f"unexpected topology path: {path}")
+                cpu, field = int(match.group(1)), match.group(2)
+                return "0\n" if field == "physical_package_id" else f"{siblings.get(cpu, cpu)}\n"
+
+            with mock.patch.object(run.os, "sched_getaffinity", return_value=available), \
+                    mock.patch.object(run.Path, "read_text", topology_text), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                return relay_compare.validate_origin_cpu_configuration(
+                    parser, run, options, remaining
+                )
+
+        invalid = (
+            dict(origin_cpus="3,99"),                         # unavailable later CPU
+            dict(origin_cpus="3,3"),                          # duplicate
+            dict(origin_cpus="3,7", siblings={3: 1, 7: 1}),    # SMT siblings
+            dict(origin_cpus="3,2"),                          # later CPU overlaps frontend
+            dict(origin_cpus="3,4"),                          # later CPU overlaps client
+            dict(origin_workers=1),                            # worker count mismatch
+            dict(origin_cpu="6"),                             # legacy first CPU mismatch
+            dict(mixed_small_bytes=4096, mixed_client_cpus="2,4"),  # frontend overlap
+            dict(mixed_small_bytes=4096, mixed_client_cpus="3,4"),  # origin overlap
+        )
+        for case in invalid:
+            with self.subTest(case=case), self.assertRaises(SystemExit):
+                validate(**case)
+
+        self.assertEqual(validate(origin_cpus="03,06"), [3, 6])
+
+    def test_relay_rejects_unavailable_later_origin_cpu_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "study"
+            stderr = io.StringIO()
+            args = [
+                "relay_compare.py", "--origin-workers", "2", "--origin-cpus", "3,99",
+                "--output", str(output), "--server-cpu", "2", "--origin-cpu", "3",
+                "--client-cpus", "4,5", "--rut", "rut", "--converter", "converter",
+                "--wrk", "wrk",
+            ]
+            with mock.patch.object(sys, "argv", args), \
+                    mock.patch.object(run.os, "sched_getaffinity", return_value={2, 3, 4, 5}), \
+                    mock.patch.object(relay_compare.subprocess, "Popen") as popen, \
+                    contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    relay_compare.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(output.exists())
+            popen.assert_not_called()
 
     def test_direct_origin_targets_origin_port(self):
         args = SimpleNamespace(origin_port=8704, front_port=8604)

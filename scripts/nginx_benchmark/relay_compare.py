@@ -45,6 +45,46 @@ def direct_origin_port(args):
     return args.origin_port
 
 
+def parse_cpu_list(parser, value, option):
+    try:
+        cpus = [int(cpu) for cpu in value.split(",")]
+    except (AttributeError, ValueError):
+        parser.error(f"{option} must be comma-separated integer CPU IDs")
+    if not cpus or len(set(cpus)) != len(cpus):
+        parser.error(f"{option} must contain unique CPU IDs")
+    return cpus
+
+
+def validate_api_delays(parser, delay_ms, fragment_delay_ms):
+    if (not math.isfinite(delay_ms) or delay_ms < 0
+            or not math.isfinite(fragment_delay_ms) or fragment_delay_ms < 0):
+        parser.error("API origin delays must be finite and nonnegative")
+
+
+def validate_origin_cpu_configuration(parser, run_module, options, remaining):
+    origin_cpus = parse_cpu_list(parser, options.origin_cpus, "--origin-cpus")
+    if len(origin_cpus) != options.origin_workers:
+        parser.error("--origin-workers must equal the number of --origin-cpus")
+
+    if not any(arg == "--origin-cpu" or arg.startswith("--origin-cpu=") for arg in remaining):
+        remaining += ["--origin-cpu", str(origin_cpus[0])]
+
+    cpu_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    run_module.add_cpu_arguments(cpu_parser)
+    cpu_args, _ = cpu_parser.parse_known_args(remaining)
+    run_module.normalize_cpu_arguments(cpu_parser, cpu_args)
+    if cpu_args.origin_cpu != origin_cpus[0]:
+        parser.error("--origin-cpu must match the first CPU in --origin-cpus")
+    run_module.validate_cpu_topology(cpu_parser, cpu_args, origin_cpus=origin_cpus)
+
+    if options.mixed_small_bytes:
+        mixed_clients = parse_cpu_list(parser, options.mixed_client_cpus, "--mixed-client-cpus")
+        clients = parse_cpu_list(parser, cpu_args.client_cpus, "--client-cpus")
+        if len(mixed_clients) != 2 or not set(mixed_clients) <= set(clients):
+            parser.error("--mixed-client-cpus must name two CPUs from --client-cpus")
+    return origin_cpus
+
+
 def valid_api_origin_records(records, expected_markers, fresh_downstream, reuse=True):
     if [row[0] for row in records] != list(expected_markers):
         return False
@@ -94,8 +134,6 @@ def main():
     parser.add_argument("--api-fragment-bytes", type=int, default=0)
     parser.add_argument("--api-fragment-delay-ms", type=float, default=0)
     options, remaining = parser.parse_known_args()
-    if not any(arg == "--origin-cpu" or arg.startswith("--origin-cpu=") for arg in remaining):
-        remaining += ["--origin-cpu", options.origin_cpus.split(",")[0]]
     engines = options.engines.split(",")
     if not engines or any(e not in ("direct-origin", "uring", "baseline-uring", "epoll", "nginx") for e in engines):
         parser.error("--engines must contain direct-origin, uring, baseline-uring, epoll or nginx")
@@ -108,9 +146,9 @@ def main():
     if (not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+", options.mixed_small_path)
             or options.mixed_small_path == "/proxy"):
         parser.error("--mixed-small-path must be a non-root absolute path")
-    if (options.api_delay_ms < 0 or options.api_fragment_bytes < 0
-            or options.api_fragment_delay_ms < 0):
-        parser.error("API origin delays and fragment size must be nonnegative")
+    validate_api_delays(parser, options.api_delay_ms, options.api_fragment_delay_ms)
+    if options.api_fragment_bytes < 0:
+        parser.error("API fragment size must be nonnegative")
     source = Path(__file__).with_name("run.py")
     sys.path.insert(0, str(source.parent))
     if "--help" in remaining:
@@ -118,6 +156,9 @@ def main():
     spec = importlib.util.spec_from_file_location("relay_bench", source)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if "--help" not in remaining:
+        options.origin_cpus = ",".join(map(str, validate_origin_cpu_configuration(
+            parser, module, options, remaining)))
     sys.argv = [str(source), *remaining]
     module.engine_order = lambda first, rep: tuple(engines[(rep - 1) % len(engines):] + engines[:(rep - 1) % len(engines)])
     command = module.Harness.command
