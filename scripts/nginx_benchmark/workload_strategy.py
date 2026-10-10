@@ -142,6 +142,8 @@ def main():
     p.add_argument('--p99-increase-limit', type=float, default=.10)
     p.add_argument('--skip-nginx', action='store_true')
     args = p.parse_args()
+    if args.screen_seconds <= 0 or args.confirm_seconds <= 0:
+        p.error('--screen-seconds and --confirm-seconds must be positive')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     workloads = [w for w in WORKLOADS if not args.workloads or w['name'] in args.workloads]

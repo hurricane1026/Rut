@@ -249,6 +249,8 @@ def main():
     parser.add_argument('--policies', nargs='+', choices=['latency', 'balanced', 'current'])
     parser.add_argument('--engines', nargs='+', choices=['direct-origin', 'uring', 'epoll', 'nginx'])
     args = parser.parse_args()
+    if args.duration <= 0:
+        parser.error('--duration must be positive')
     if args.connections_per_client < 1 or args.repeats < 1:
         parser.error('connections and repeats must be positive')
     if not args.smoke and args.repeats < 3:

@@ -159,6 +159,53 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(short.returncode, 2)
         self.assertIn("at least three repeats", short.stderr)
 
+    def test_protocol_cli_rejects_nonpositive_duration_before_output_or_process(self):
+        for duration in ('0', '-1'):
+            with self.subTest(duration=duration), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'study'
+                argv = ['protocol_strategy.py', '--output', str(output), '--rut', '/bin/true',
+                        '--harness', str(Path(run.__file__)), '--duration', duration]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(protocol_strategy.subprocess, 'Popen') as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        protocol_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
+
+    def test_workload_cli_rejects_nonpositive_durations_before_output_or_process(self):
+        for flag in ('--screen-seconds', '--confirm-seconds'):
+            for duration in ('0', '-1'):
+                with self.subTest(flag=flag, duration=duration), tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / 'study'
+                    argv = ['workload_strategy.py', '--output', str(output),
+                            '--relay-script', str(Path(relay_compare.__file__)),
+                            '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                            flag, duration]
+                    with mock.patch.object(sys, 'argv', argv), \
+                            mock.patch.object(workload_strategy.subprocess, 'Popen') as launch:
+                        with self.assertRaises(SystemExit) as raised:
+                            workload_strategy.main()
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertFalse(output.exists())
+                    launch.assert_not_called()
+
+    def test_workload_cli_keeps_positive_duration_values_valid(self):
+        class ReachedOutputSetup(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            argv = ['workload_strategy.py', '--output', str(Path(directory) / 'study'),
+                    '--relay-script', str(Path(relay_compare.__file__)),
+                    '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                    '--screen-seconds', '1', '--confirm-seconds', '1']
+            with mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(Path, 'mkdir', side_effect=ReachedOutputSetup), \
+                    mock.patch.object(workload_strategy.subprocess, 'Popen') as launch:
+                with self.assertRaises(ReachedOutputSetup):
+                    workload_strategy.main()
+            launch.assert_not_called()
+
     def test_protocol_manifest_records_selection_filters(self):
         args = SimpleNamespace(cases=["websocket-bulk-64k", "websocket-interactive-64"],
                                engines=["nginx"], policies=["current"], smoke=True)
