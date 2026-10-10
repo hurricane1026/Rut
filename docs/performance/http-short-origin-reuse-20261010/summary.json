@@ -1,0 +1,209 @@
+[
+  {
+    "engine": "uring",
+    "rep": 1,
+    "rps": 18097.692985392907,
+    "p99_us": 16136.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  },
+  {
+    "engine": "epoll",
+    "rep": 1,
+    "rps": 25406.330662806038,
+    "p99_us": 11489.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  },
+  {
+    "engine": "nginx",
+    "rep": 1,
+    "rps": 27318.75254894564,
+    "p99_us": 8373.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  },
+  {
+    "engine": "epoll",
+    "rep": 2,
+    "rps": 25258.89414937907,
+    "p99_us": 9322.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  },
+  {
+    "engine": "nginx",
+    "rep": 2,
+    "rps": 26320.761063823076,
+    "p99_us": 8870.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  },
+  {
+    "engine": "uring",
+    "rep": 2,
+    "rps": 17817.4414302688,
+    "p99_us": 15409.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  },
+  {
+    "engine": "nginx",
+    "rep": 3,
+    "rps": 27140.1815518559,
+    "p99_us": 8326.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  },
+  {
+    "engine": "uring",
+    "rep": 3,
+    "rps": 18378.089134776073,
+    "p99_us": 14897.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  },
+  {
+    "engine": "epoll",
+    "rep": 3,
+    "rps": 25350.315607311644,
+    "p99_us": 8689.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "connection": "close",
+    "body_size": 1024
+  }
+]

@@ -1,0 +1,8 @@
+{
+  "commit": "5be5001aeddee8860d881f0d24e103302b10230e",
+  "sha256": {
+    "rut": "0a19c561c491aefb5f2a3c0b689d507347aad32a2499719440369646fa737487",
+    "rut-compile": "3e6cb19816587b93fc8bd8c7f6df05815891e2f72e1b802f0d4fe18fde39a8c2",
+    "rut-nginx-convert": "19ce3b2228186966fe14194d995169eab9fd8e5afcc09b74c0a813ec8ec5d6ab"
+  }
+}

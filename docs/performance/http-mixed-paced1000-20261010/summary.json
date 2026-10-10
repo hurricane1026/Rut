@@ -1,0 +1,314 @@
+[
+  {
+    "configuration": "uring128",
+    "rotation": 0,
+    "payload_bytes_per_second": 5634844615.42168,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 983.3839721977711,
+    "small_planned_p99_us": 1847.6259429007769,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 5369.90033666771
+  },
+  {
+    "configuration": "byte80",
+    "rotation": 0,
+    "payload_bytes_per_second": 7269016868.822492,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 2941.2289150059223,
+    "small_planned_p99_us": 3674.430074170232,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 6928.36844331979
+  },
+  {
+    "configuration": "early80",
+    "rotation": 0,
+    "payload_bytes_per_second": 7320786697.9492,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 2951.639937236905,
+    "small_planned_p99_us": 3596.506081521511,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 6977.739999722671
+  },
+  {
+    "configuration": "nginx",
+    "rotation": 0,
+    "payload_bytes_per_second": 3946452566.00149,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 27689.30303864181,
+    "small_planned_p99_us": 244375.21607615054,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 3759.7242031111623
+  },
+  {
+    "configuration": "byte80",
+    "rotation": 1,
+    "payload_bytes_per_second": 7585430424.410467,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 3522.641956806183,
+    "small_planned_p99_us": 4170.394968241453,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 7230.123924646823
+  },
+  {
+    "configuration": "early80",
+    "rotation": 1,
+    "payload_bytes_per_second": 7467808559.763334,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 3429.3029457330704,
+    "small_planned_p99_us": 4035.5941746383905,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 7117.95097328504
+  },
+  {
+    "configuration": "nginx",
+    "rotation": 1,
+    "payload_bytes_per_second": 3923215175.513932,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 999.9166666666666,
+    "small_service_p99_us": 26945.191901177168,
+    "small_planned_p99_us": 242589.0900194645,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 0.9999166666666667,
+    "large_rps": 3737.563626143709
+  },
+  {
+    "configuration": "uring128",
+    "rotation": 1,
+    "payload_bytes_per_second": 5679832083.015422,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 1211.6539292037487,
+    "small_planned_p99_us": 2022.1369341015816,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 5412.803729072019
+  },
+  {
+    "configuration": "early80",
+    "rotation": 2,
+    "payload_bytes_per_second": 7069199176.887439,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 2818.562090396881,
+    "small_planned_p99_us": 3442.3370379954576,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 6737.807442557753
+  },
+  {
+    "configuration": "nginx",
+    "rotation": 2,
+    "payload_bytes_per_second": 3981429195.3890085,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 26328.80420424044,
+    "small_planned_p99_us": 241679.54991571605,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 3793.0805162324987
+  },
+  {
+    "configuration": "uring128",
+    "rotation": 2,
+    "payload_bytes_per_second": 5585702137.584412,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 951.2300603091717,
+    "small_planned_p99_us": 1841.5029626339674,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 5323.034417709743
+  },
+  {
+    "configuration": "byte80",
+    "rotation": 2,
+    "payload_bytes_per_second": 7240816591.402823,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "small_rps": 1000.0,
+    "small_service_p99_us": 3421.2060272693634,
+    "small_planned_p99_us": 4038.3636951446533,
+    "small_wrk_p99_us": null,
+    "delivered_fraction": 1.0,
+    "large_rps": 6901.474563029121
+  }
+]

@@ -1,0 +1,15 @@
+{
+  "commit": "f71fffa524ede044433cafd2e067e78891e02fc1",
+  "sha256": {
+    "rut": "6034efe9fab887b32b46417bce6acc6e2b3a87c2be3d7dfa85c7c0b232cc9de1",
+    "rut-compile": "c315c9e0c889bc6108a7b617dce61a19ca3bb5c3a566e8ff7d1f58d96897ac7a",
+    "rut-nginx-convert": "19ce3b2228186966fe14194d995169eab9fd8e5afcc09b74c0a813ec8ec5d6ab"
+  },
+  "environment": {
+    "RUT_STUDY_POLICY": "current",
+    "RUT_STUDY_HTTP_SPLICE_CHUNK": "256k",
+    "RUT_STUDY_HTTP_RELAY_RING": "on",
+    "RUT_STUDY_HTTP_BYTE_YIELD": "on"
+  },
+  "scope": "local single-core plaintext proxy, 4 pinned origin workers; not official cross-machine replication"
+}
