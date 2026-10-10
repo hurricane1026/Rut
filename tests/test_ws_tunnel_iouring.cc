@@ -309,36 +309,11 @@ static void full_duplex_burst(test::TestCase* _tc,
             loop.dispatch_batch(events, kCount);
             if (kCount == 0) usleep(1000);
         }
-        if (conn->fd < 0) {
-            // First FIN is terminal after the already-buffered opposite pipe
-            // drains; do not inject a second reverse payload or FIN.
-            u8 probe = 0;
-            CHECK_EQ(recv(kClient.fd, &probe, sizeof(probe), MSG_DONTWAIT), 0);
-        } else {
-            constexpr u32 kReply = 19;
-            u8 reply[kReply];
-            u32 reply_bytes = 0;
-            REQUIRE(write_burst(kOrigin.fd, sent_origin, kReply));
-            for (u32 i = 0; i < 1000 && reply_bytes < kReply; ++i) {
-                IoEvent events[kMaxEventsPerWait]{};
-                const u32 kCount = loop.backend.wait(
-                    events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
-                loop.dispatch_batch(events, kCount);
-                REQUIRE(read_available(kClient.fd, reply, &reply_bytes, kReply));
-                if (kCount == 0) usleep(1000);
-            }
-            REQUIRE_EQ(reply_bytes, kReply);
-            CHECK(__builtin_memcmp(reply, sent_origin, kReply) == 0);
-            REQUIRE_EQ(shutdown(kOrigin.fd, SHUT_WR), 0);
-            for (u32 i = 0; i < 1000 && conn->fd >= 0; ++i) {
-                IoEvent events[kMaxEventsPerWait]{};
-                const u32 kCount = loop.backend.wait(
-                    events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
-                loop.dispatch_batch(events, kCount);
-                if (kCount == 0) usleep(1000);
-            }
-            REQUIRE(conn->fd < 0);
-        }
+        REQUIRE(conn->fd < 0);
+        // The first FIN is terminal after the already-buffered opposite pipe
+        // drains; never inject reverse data or a second FIN.
+        u8 probe = 0;
+        CHECK_EQ(recv(kClient.fd, &probe, sizeof(probe), MSG_DONTWAIT), 0);
     } else
         loop.close_conn(*conn);
     for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
@@ -351,7 +326,7 @@ static void full_duplex_burst(test::TestCase* _tc,
     CHECK_EQ(conn->pending_ops, 0u);
     if (fast_batch && half_close) {
         // The initial burst can drain synchronously during handoff. FIN and
-        // the reverse reply force actual readiness completions afterward.
+        // cancellation force actual readiness completions afterward.
         CHECK(loop.ws_splice.deadline_batches_skipped > 0);
         CHECK(loop.ws_splice.terminal_scans_skipped > 0);
     }

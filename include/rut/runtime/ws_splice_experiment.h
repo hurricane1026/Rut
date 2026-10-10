@@ -218,6 +218,9 @@ struct WsSpliceExperiment {
                 d.eof = true;
                 (void)::shutdown(kDestination, SHUT_WR);
                 o.eof_closing = true;
+                // Keep the owner queued: a failed cancellation submission must
+                // be retried by the next progress turn until its cancel CQE.
+                o.requested = true;
                 const u32 kOther = index ^ 1u;
                 auto& other = o.direction[kOther];
                 other.eof = true;
@@ -356,6 +359,14 @@ struct WsSpliceExperiment {
             auto& c = loop.conns[kId];
             auto& o = owners[kId];
             if (o.closing) retire(loop, c);
+            if (o.eof_closing) {
+                finish_eof_close(loop, c);
+                if (o.eof_closing)
+                    queued[retained++] = kId;
+                else
+                    o.queued = false;
+                continue;
+            }
             if (o.requested && c.fd >= 0 && !c.recv_armed && !c.upstream_recv_armed &&
                 !c.recv_pause_cancel_pending && !c.recv_pause_target_inflight &&
                 !c.upstream_recv_pause_cancel_pending && !c.upstream_recv_cancel_inflight &&
