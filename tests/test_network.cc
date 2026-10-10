@@ -41675,6 +41675,33 @@ TEST(iouring_upstream_recv, cache_partial_capacity_and_terminate_keep_one_shot) 
     CHECK(conn.upstream_recv_armed);
     fixture.cleanup();
 }
+
+TEST(iouring_cache_rearm, shared_budget_keeps_downstream_pending) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    auto& conn = *fixture.conn;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    conn.is_ws_tunnel = true;
+    REQUIRE(loop.submit_recv(conn));
+    REQUIRE(loop.submit_recv_upstream(conn));
+    IoEvent downstream{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv};
+    downstream.provided_ring_empty = 1;
+    loop.dispatch(downstream);
+    conn.upstream_recv_pause_rearm_pending = true;
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 2u;
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    fixture.cleanup();
+}
 #endif  // RUT_ENABLE_WEBSOCKET
 
 namespace {
