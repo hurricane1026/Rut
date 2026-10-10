@@ -770,9 +770,7 @@ public:
             relay_budget_bytes = study_relay_turn_byte_limit;
             dispatch_batch(events, kEventCount);
             if (backend.ws_recv_cache_enabled) {
-                const u32 free = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
-                const u32 pinned = backend.cq_unharvested();
-                ws_cache_rearm_budget = free > pinned ? free - pinned : 0;
+                ws_cache_rearm_budget = cache_rearm_budget(backend.cq_unharvested());
             }
             rearm_deferred_ws_cache_recvs();
             rearm_deferred_recvs(/*force=*/false);
@@ -3558,6 +3556,11 @@ public:
                 if (budget == 0) return;
             }
         }
+    }
+
+    u32 cache_rearm_budget(u32 pinned) const {
+        const u32 free = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
+        return free > pinned ? free - pinned : 0;
     }
 
     // Tunnel callbacks consume one contiguous block while its paired send
@@ -7359,6 +7362,7 @@ public:
         rearm_deferred_recvs(false);
     }
     u32 test_recv_rearm_count() const { return recv_rearm_count; }
+    u32 test_cache_rearm_budget(u32 pinned) const { return cache_rearm_budget(pinned); }
     void test_defer_recv_rearm(const Connection& c) { defer_recv_rearm(c); }
     void test_rearm_cache_passes_with_budget(u32 budget) {
         ws_cache_rearm_budget = budget;
