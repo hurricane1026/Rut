@@ -203,14 +203,19 @@ class ToolsTest(unittest.TestCase):
         import hashlib
         for readme in (root / "docs").rglob("README.md"):
             text = readme.read_text()
-            if "Raw summary SHA256:" not in text:
+            declaration = re.search(
+                r"Raw(?: performance)? summary SHA256:\s*`?([0-9a-f]{64})`?",
+                text,
+                re.IGNORECASE,
+            )
+            if declaration is None:
                 continue
             summary = readme.with_name("summary.json")
             if not summary.exists():
                 summary = readme.with_name("compact-summary.json")
             self.assertTrue(summary.exists(), readme)
             digest = hashlib.sha256(summary.read_bytes()).hexdigest()
-            self.assertRegex(text, rf"Raw summary SHA256:\s*`?{digest}`?")
+            self.assertEqual(declaration.group(1), digest)
 
     def test_mixed_client_validity_requires_positive_finite_metrics(self):
         good = dict(requests=1, rps=1.0, p99_us=2.0, errors={}, valid=True)
