@@ -93,7 +93,8 @@ static void full_duplex_burst(test::TestCase* _tc,
                               u32 direct_recv_limit = 0,
                               bool poll_first = false,
                               bool queued_fin = false,
-                              bool fin_before_drain = false) {
+                              bool fin_before_drain = false,
+                              bool fail_first_cancel = false) {
     REQUIRE(!half_close || splice);
     LoopStorage storage;
     if (!storage.init()) return;
@@ -168,7 +169,10 @@ static void full_duplex_burst(test::TestCase* _tc,
     // Keep the opposite peer open while the splice pipe drains bytes that
     // were queued before the first FIN. This exercises directional EOF rather
     // than allowing the full-duplex loop to finish both directions together.
-    if (fin_before_drain) REQUIRE_EQ(shutdown(kClient.fd, SHUT_WR), 0);
+    if (fin_before_drain) {
+        loop.test_fail_next_ws_splice_cancel = fail_first_cancel;
+        REQUIRE_EQ(shutdown(kClient.fd, SHUT_WR), 0);
+    }
     if (pipe_failure) {
         struct rlimit saved{};
         REQUIRE_EQ(getrlimit(RLIMIT_NOFILE, &saved), 0);
@@ -744,6 +748,29 @@ TEST(websocket, iouring_splice_first_eof_drains_pipe_and_keeps_peer_open) {
                       0,
                       false,
                       false,
+                      true);
+}
+TEST(websocket, iouring_splice_eof_retries_cancel_after_sq_full) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      true,
+                      0,
+                      false,
+                      65536,
+                      2,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      true,
                       true);
 }
 

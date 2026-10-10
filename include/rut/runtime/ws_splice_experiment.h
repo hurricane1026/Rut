@@ -127,8 +127,17 @@ struct WsSpliceExperiment {
                     const auto kType = d.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                     const u64 kTarget = encode_upstream_event_token(
                         {c.id, kType, o.episode, static_cast<u8>(32 + index)});
-                    if (loop.backend.cancel_ws_splice_poll(
-                            kTarget, c.id, kType, static_cast<u8>(96 + index), o.episode)) {
+#ifdef RUT_TESTING
+                    const bool kCancelSubmitted =
+                        loop.test_fail_next_ws_splice_cancel
+                            ? (loop.test_fail_next_ws_splice_cancel = false, false)
+                            : loop.backend.cancel_ws_splice_poll(
+                                  kTarget, c.id, kType, static_cast<u8>(96 + index), o.episode);
+#else
+                    const bool kCancelSubmitted = loop.backend.cancel_ws_splice_poll(
+                        kTarget, c.id, kType, static_cast<u8>(96 + index), o.episode);
+#endif
+                    if (kCancelSubmitted) {
                         d.cancel_owned = true;
                         ++c.pending_ops;
                     }
@@ -229,8 +238,17 @@ struct WsSpliceExperiment {
                         other.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                     const u64 kTarget = encode_upstream_event_token(
                         {c.id, kType, o.episode, static_cast<u8>(32 + kOther)});
-                    if (loop.backend.cancel_ws_splice_poll(
-                            kTarget, c.id, kType, static_cast<u8>(96 + kOther), o.episode)) {
+                    const bool kCancelSubmitted =
+#ifdef RUT_TESTING
+                        loop.test_fail_next_ws_splice_cancel
+                            ? (loop.test_fail_next_ws_splice_cancel = false, false)
+                            : loop.backend.cancel_ws_splice_poll(
+                                  kTarget, c.id, kType, static_cast<u8>(96 + kOther), o.episode);
+#else
+                        loop.backend.cancel_ws_splice_poll(
+                            kTarget, c.id, kType, static_cast<u8>(96 + kOther), o.episode);
+#endif
+                    if (kCancelSubmitted) {
                         other.cancel_owned = true;
                         ++c.pending_ops;
                     }
