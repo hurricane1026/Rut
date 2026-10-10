@@ -17,6 +17,8 @@ from unittest import mock
 
 import run
 import matrix
+import workload_strategy
+import protocol_workload
 
 from run import (
     Harness,
@@ -45,6 +47,54 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_strategy_requires_repeats_and_guards_tail_latency(self):
+        rows = []
+        for policy, rate, tail in [('current', 100, 100), ('throughput', 150, 130),
+                                   ('balanced', 120, 105), ('latency', 90, 70)]:
+            for repeat in range(3):
+                rows.append(dict(stage='confirm', workload_profile={'name': 'static-1m'},
+                                 engine='uring', policy=policy, rps=rate, p99_us=tail,
+                                 server_cpu_pct=100, origin_cpu_pct=100))
+        result = workload_strategy.summarize(rows, .10)['decisions'][0]
+        self.assertEqual(result['throughput_policy'], 'balanced')
+        self.assertEqual(result['latency_policy'], 'latency')
+        self.assertEqual(workload_strategy.summarize(rows[:2], .10)['decisions'], [])
+
+    def test_mixed_throughput_weights_bytes_instead_of_request_count(self):
+        current = dict(rps=10100, large_client={'rps': 100}, small_client={'rps': 10000})
+        more_small = dict(rps=20040, large_client={'rps': 40}, small_client={'rps': 20000})
+        self.assertLess(current['rps'], more_small['rps'])
+        self.assertGreater(workload_strategy.throughput_score(current),
+                           workload_strategy.throughput_score(more_small))
+
+    def test_mixed_strategy_guards_small_client_tail(self):
+        row = {'p99_us': 50000, 'small_client': {'p99_us': 200}}
+        self.assertEqual(workload_strategy.metric(row), 200)
+
+    def test_stream_records_ignore_http_chunk_boundaries(self):
+        expected = [b'abcdefgh', b'ijklmnop', b'qrstuvwx']
+        for physical in [[b''.join(expected)], [b'ab', b'cdefghijk', b'lmnopqrs', b'tuvwx']]:
+            raw = b''.join(f'{len(part):x}\r\n'.encode() + part + b'\r\n' for part in physical) + b'0\r\n\r\n'
+            async def decode():
+                reader = protocol_workload.asyncio.StreamReader()
+                reader.feed_data(raw)
+                reader.feed_eof()
+                return [record async for record in protocol_workload.stream_records(reader, 8)]
+            self.assertEqual(protocol_workload.asyncio.run(decode()), expected)
+
+    def test_websocket_masking_and_extended_lengths(self):
+        for size in [0, 64, 125, 126, 65535, 65536]:
+            data = bytes((i * 29) & 255 for i in range(size))
+            key = b'\x00\x11\x80\xff'
+            self.assertEqual(protocol_workload.masking(protocol_workload.masking(data, key), key), data)
+            raw = protocol_workload.frame(data, masked=True)
+            async def decode():
+                reader = protocol_workload.asyncio.StreamReader()
+                reader.feed_data(raw)
+                reader.feed_eof()
+                return await protocol_workload.read_frame(reader, True)
+            self.assertEqual(protocol_workload.asyncio.run(decode()), (2, True, data))
+
     def test_native_streaming_payload_and_reuse_evidence_reject_corruption(self):
         wanted = expected_body("proxy", native_streaming=True)
         self.assertEqual(len(wanted), 256 * 1024)
