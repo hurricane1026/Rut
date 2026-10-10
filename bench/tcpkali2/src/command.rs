@@ -80,6 +80,18 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
         generate_payload(message_size)
     };
     let (pipeline_message, pipeline_batch_size) = build_pipeline_message(message.as_ref());
+    let first_message_file = matches.get_one::<String>("first-message-file");
+    let first_message = if let Some(message) = get_message_arg(matches, "first-message", unescape) {
+        Some(message)
+    } else if first_message_file.is_some() {
+        Some(
+            get_file_arg(matches, "first-message-file", unescape).ok_or_else(|| {
+                TcpKaliError::Config("Cannot read requested first message file".into())
+            })?,
+        )
+    } else {
+        None
+    };
 
     let config = Config {
         duration: *matches.get_one::<Duration>("duration").unwrap(),
@@ -91,8 +103,7 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
         connect_rate: *matches.get_one::<u64>("connect-rate").unwrap(),
         connect_timeout: *matches.get_one::<Duration>("connect-timeout").unwrap(),
         channel_lifetime: matches.get_one::<Duration>("channel-lifetime").cloned(),
-        first_message: get_message_arg(matches, "first-message", unescape)
-            .or_else(|| get_file_arg(matches, "first-message-file", unescape)),
+        first_message,
         message,
         pipeline_message,
         pipeline_batch_size,
@@ -345,6 +356,70 @@ fn command() -> Command {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::TcpKaliError;
+
+    fn first_message_config(
+        path: &std::path::Path,
+        unescape: bool,
+    ) -> Result<std::sync::Arc<super::Config>, TcpKaliError> {
+        let mut argv = vec![
+            "tcpkali2".to_string(),
+            "--first-message-file".to_string(),
+            path.to_str().unwrap().to_string(),
+        ];
+        if unescape {
+            argv.push("--unescape-message-args".to_string());
+        }
+        argv.push("127.0.0.1:1234".to_string());
+        let matches = super::command().try_get_matches_from(argv).unwrap();
+        super::parse_config(&matches)
+    }
+
+    #[test]
+    fn first_message_file_read_failures_are_configuration_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "tcpkali2-first-message-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let missing = root.join("missing.bin");
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let non_utf8 = root.join("non-utf8.bin");
+        std::fs::write(&non_utf8, [0xff, 0xfe]).unwrap();
+
+        for (path, unescape) in [(&missing, false), (&directory, false), (&non_utf8, true)] {
+            assert!(matches!(
+                first_message_config(path, unescape),
+                Err(TcpKaliError::Config(message))
+                    if message == "Cannot read requested first message file"
+            ));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn first_message_file_preserves_exact_bytes_or_requested_unescaping() {
+        let path = std::env::temp_dir().join(format!(
+            "tcpkali2-first-message-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"A\\x42\n").unwrap();
+        let raw = first_message_config(&path, false).unwrap();
+        assert_eq!(raw.first_message.as_ref().unwrap().as_ref(), b"A\\x42\n");
+        let decoded = first_message_config(&path, true).unwrap();
+        assert_eq!(decoded.first_message.as_ref().unwrap().as_ref(), b"AB\n");
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn binary_message_file_is_not_replaced_by_default_payload() {
         let path = std::env::temp_dir().join(format!(

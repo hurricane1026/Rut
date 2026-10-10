@@ -65,6 +65,18 @@ def script_hashes(relay_script):
             for path in paths}
 
 
+def pinned_nginx_image(pin_file=None):
+    if pin_file is None:
+        pin_file = Path(__file__).resolve().parents[2] / 'tests/pinned-nginx-image.txt'
+    return pin_file.read_text().strip()
+
+
+def pinned_nginx_image_sha256(pin_file=None):
+    if pin_file is None:
+        pin_file = Path(__file__).resolve().parents[2] / 'tests/pinned-nginx-image.txt'
+    return hashlib.sha256(pin_file.read_bytes()).hexdigest()
+
+
 def require_matching_manifest(prior, manifest):
     if prior.exists() and json.loads(prior.read_text()) != manifest:
         raise RuntimeError('study manifest changed; use a new output directory')
@@ -165,6 +177,8 @@ def main():
                     screen_seconds=args.screen_seconds, confirm_seconds=args.confirm_seconds,
                     confirm_repeats=3, serial_frontends=True,
                     skip_nginx=args.skip_nginx,
+                    nginx_image=pinned_nginx_image(),
+                    nginx_image_pin_sha256=pinned_nginx_image_sha256(),
                     binaries=binaries | script_hashes(args.relay_script))
     prior = out / 'study.json'
     require_matching_manifest(prior, manifest)

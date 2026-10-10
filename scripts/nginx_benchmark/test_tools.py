@@ -84,6 +84,10 @@ class ToolsTest(unittest.TestCase):
         self.assertTrue(relay_compare.valid_api_origin_records(fresh, markers, True))
         self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, True))
         self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, False))
+        self.assertTrue(relay_compare.valid_api_origin_records(fresh, markers, True, reuse=False))
+        self.assertFalse(relay_compare.valid_api_origin_records(pooled, markers, True, reuse=False))
+        self.assertFalse(relay_compare.valid_api_origin_records(pooled, markers, False, reuse=False))
+        self.assertFalse(relay_compare.valid_api_origin_records(fresh, markers, False, reuse=True))
         self.assertFalse(relay_compare.valid_api_origin_records(pooled[:1], markers, True))
         self.assertFalse(relay_compare.valid_api_origin_records([pooled[1], pooled[0]], markers, True))
 
@@ -286,6 +290,57 @@ class ToolsTest(unittest.TestCase):
         self.assertTrue(all(row['first_p99_us'] is None for row in summaries))
         current = next(row for row in summaries if row['policy'] == 'current')
         self.assertEqual(current['throughput_policy'], 'current')
+
+    def test_protocol_summary_keeps_unavailable_source_gap_out_of_summary(self):
+        case = next(case for case in protocol_strategy.CASES
+                    if case['name'] == 'streaming-live-256')
+
+        def rows_with_source_gaps(values):
+            return [dict(case=case, engine='uring', policy='current',
+                         messages_per_second=100, received_mib_per_second=1,
+                         delivery_us=dict(p99_us=100), first_us=dict(p99_us=5),
+                         source_gap_us=dict(p99_us=value), origin_cpu_observation_pct=10)
+                    for value in values]
+
+        missing = protocol_strategy.summarize(rows_with_source_gaps([None, None, None]))
+        self.assertIsNone(missing[0]['source_gap_p99_us'])
+        partial = protocol_strategy.summarize(rows_with_source_gaps([10, None, float('nan'), 30]))
+        self.assertEqual(partial[0]['source_gap_p99_us'], 20)
+        self.assertEqual(missing[0]['throughput_policy'], 'current')
+
+    def test_resumed_protocol_result_rebuilds_missing_aggregate_files(self):
+        row = dict(case=protocol_strategy.CASES[0], engine='nginx', policy='reference',
+                   repeat=1, valid=True, messages_per_second=100,
+                   received_mib_per_second=1, rtt_us=dict(p99_us=10),
+                   origin_cpu_observation_pct=12, frontend_cpu_observation_pct=34)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            (out / 'measurements.json').write_text('stale')
+            (out / 'summary.json').write_text('stale')
+            rows = []
+            protocol_strategy.append_preserved_result(row, 'saved-case', rows, out)
+            second = row | dict(engine='epoll', policy='latency')
+            protocol_strategy.append_preserved_result(second, 'saved-case-2', rows, out)
+            self.assertEqual(json.loads((out / 'measurements.json').read_text()), [row, second])
+            self.assertEqual(json.loads((out / 'summary.json').read_text()), [])
+            self.assertFalse((out / 'measurements.json.tmp').exists())
+            self.assertFalse((out / 'summary.json.tmp').exists())
+
+    def test_workload_manifest_pinned_nginx_content_rejects_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pin = Path(directory) / 'pinned-nginx-image.txt'
+            prior = Path(directory) / 'study.json'
+            pin.write_text('nginx@sha256:first\n')
+            first_hash = workload_strategy.pinned_nginx_image_sha256(pin)
+            workload_strategy.require_matching_manifest(
+                prior, dict(nginx_image=workload_strategy.pinned_nginx_image(pin),
+                            nginx_image_pin_sha256=first_hash))
+            pin.write_text('nginx@sha256:first \n')
+            self.assertEqual(workload_strategy.pinned_nginx_image(pin), 'nginx@sha256:first')
+            with self.assertRaisesRegex(RuntimeError, 'manifest changed'):
+                workload_strategy.require_matching_manifest(
+                    prior, dict(nginx_image=workload_strategy.pinned_nginx_image(pin),
+                                nginx_image_pin_sha256=workload_strategy.pinned_nginx_image_sha256(pin)))
 
     def test_run_client_cleans_group_when_wait_is_interrupted(self):
         class Child:

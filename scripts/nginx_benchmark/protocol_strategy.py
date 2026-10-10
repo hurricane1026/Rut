@@ -7,6 +7,7 @@ import resource
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -163,6 +164,24 @@ def save_container_log(name, destination, env):
     destination.write_text(logs.stdout + logs.stderr)
 
 
+def write_json_atomic(path, value):
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n')
+    temporary.replace(path)
+
+
+def save_aggregates(out, rows):
+    write_json_atomic(out / 'measurements.json', rows)
+    write_json_atomic(out / 'summary.json', summarize(rows))
+
+
+def append_preserved_result(row, label, rows, out):
+    if not row['valid'] or not all(key in row for key in ['case', 'engine', 'policy', 'repeat']):
+        raise RuntimeError('preserved invalid or incomplete case: ' + label)
+    rows.append(row)
+    save_aggregates(out, rows)
+
+
 def summarize(rows):
     summaries = []
     for case in CASES:
@@ -193,7 +212,11 @@ def summarize(rows):
                     item['first_p99_us'] = (statistics.median(first_p99)
                                             if all(value is not None for value in first_p99)
                                             else None)
-                    item['source_gap_p99_us'] = statistics.median(row['source_gap_us']['p99_us'] for row in group)
+                    source_gap_p99 = [row['source_gap_us']['p99_us'] for row in group]
+                    available_source_gap = [value for value in source_gap_p99
+                                            if isinstance(value, (int, float)) and math.isfinite(value)]
+                    item['source_gap_p99_us'] = (statistics.median(available_source_gap)
+                                                 if available_source_gap else None)
                 options.append(item)
         direct = next((item for item in options if item['engine'] == 'direct-origin'), None)
         for engine in ['uring', 'epoll']:
@@ -328,9 +351,7 @@ def main():
                 result_file = directory / 'result.json'
                 if result_file.exists():
                     row = json.loads(result_file.read_text())
-                    if not row['valid'] or not all(key in row for key in ['case', 'engine', 'policy', 'repeat']):
-                        raise RuntimeError('preserved invalid or incomplete case: ' + label)
-                    rows.append(row)
+                    append_preserved_result(row, label, rows, out)
                     continue
                 if directory.exists():
                     raise RuntimeError('preserved incomplete case: ' + label)
@@ -447,8 +468,7 @@ def main():
                                    cpu_observation_scope='setup+warmup+measurement+teardown')
                         result_file.write_text(json.dumps(row, indent=2) + '\n')
                 rows.append(row)
-                (out / 'measurements.json').write_text(json.dumps(rows, indent=2) + '\n')
-                (out / 'summary.json').write_text(json.dumps(summarize(rows), indent=2) + '\n')
+                save_aggregates(out, rows)
                 print(f'END {label}: {row["messages_per_second"]:.0f} messages/chunks per second, '
                       f'{row["received_mib_per_second"]:.1f} MiB/s, errors={row["errors"]}', flush=True)
     print('PROTOCOL STUDY COMPLETE', flush=True)
