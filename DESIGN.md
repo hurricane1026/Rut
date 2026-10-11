@@ -7709,3 +7709,28 @@ connection headers, canonical status reasons, and local/failure reply layouts
 are typed Rut policy fields available equally to handwritten programs.
 The helper never interprets a request or selects a runtime compatibility flag.
 Unsupported source configuration is rejected at conversion time.
+
+## Builtin test workload responses
+
+Use `return workload(bytes: N)` in a route to return HTTP 200 with a
+compile-time generated deterministic binary body and `application/octet-stream`.
+`N` must be a literal integer from 1 through 1048576. Generated workload bodies
+are limited to 16 MiB per analysis tree, including imports. This contextual
+builder does not reserve `workload` as a global keyword.
+
+```swift
+route GET "/static4k" { return workload(bytes: 4096) }
+route GET "/static1m" { return workload(bytes: 1048576) }
+route GET "/api4k" {
+    wait(1ms)
+    return workload(bytes: 4096)
+}
+```
+
+This is a synthetic test handler, not filesystem serving or upstream proxying.
+Each 4096-byte block starts with its little-endian 32-bit block index; subsequent
+bytes are `(blockIndex * 17 + payloadOffset * 29) & 255`, with payloadOffset
+starting at zero after the index. The final block may be partial. Bodies are
+owned by the compiled program; generation performs no per-request allocation.
+Use existing `wait` for application delay. Timed response fragments are not
+provided by this builder.

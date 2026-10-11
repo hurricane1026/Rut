@@ -1,0 +1,5 @@
+// Run protocol_workload.py origin on :8805 before starting this gateway.
+listen 127.0.0.1:8804
+upstream origin at "127.0.0.1:8805"
+route GET "/ws" { return websocket(origin) }
+route GET "/stream" { return forward(origin) }

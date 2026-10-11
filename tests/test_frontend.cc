@@ -39776,3 +39776,41 @@ route GET "/" {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(frontend, workload_payload_routes_preserve_binary_bytes) {
+    auto tokens =
+        lex(lit("route GET \"/small\" { return workload(bytes: 4097) }\n"
+                "route GET \"/large\" { return workload(bytes: 1048576) }\n"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    ast.reset();
+    const auto& small = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(small.response_body.len, 4097u);
+    CHECK_EQ(static_cast<u8>(small.response_body.ptr[4]), 0u);
+    CHECK_EQ(static_cast<u8>(small.response_body.ptr[5]), 29u);
+    CHECK_EQ(static_cast<u8>(small.response_body.ptr[4096]), 1u);
+    REQUIRE_EQ(hir->routes[1].control.direct_term.response_body.len, 1048576u);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.response_body_count, 2u);
+    rir.destroy();
+}
+
+TEST(frontend, workload_rejects_invalid_sizes_and_labels) {
+    const char* sources[] = {
+        "route GET \"/x\" { return workload(bytes: 0) }",
+        "route GET \"/x\" { return workload(bytes: 1048577) }",
+        "route GET \"/x\" { return workload(bytes: 999999999999999) }",
+        "route GET \"/x\" { return workload(size: 4096) }",
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK(!parse_file_heap(tokens.value()));
+    }
+}

@@ -2955,6 +2955,34 @@ struct Parser {
 #endif
             }
 
+            // Contextual test payload builder; no globally reserved keyword.
+            if (cur().type == TokenType::Ident && cur().text.eq({"workload", 8}) &&
+                peek().type == TokenType::LParen) {
+                pos++;
+                auto open = expect(TokenType::LParen);
+                if (!open) return core::make_unexpected(open.error());
+                auto label = expect(TokenType::Ident);
+                if (!label) return core::make_unexpected(label.error());
+                if (!label.value()->text.eq({"bytes", 5}))
+                    return frontend_error(FrontendError::UnsupportedSyntax, span_from(start));
+                auto colon = expect(TokenType::Colon);
+                if (!colon) return core::make_unexpected(colon.error());
+                auto count = expect(TokenType::IntLit);
+                if (!count) return core::make_unexpected(count.error());
+                auto parsed = parse_status_i32(*count.value());
+                if (!parsed) return core::make_unexpected(parsed.error());
+                if (parsed.value() < 1 || parsed.value() > 1048576)
+                    return frontend_error(FrontendError::InvalidInteger, span_from(start));
+                auto close = expect(TokenType::RParen);
+                if (!close) return core::make_unexpected(close.error());
+                stmt.status_code = 200;
+                stmt.workload_body_bytes = static_cast<u32>(parsed.value());
+                stmt.response_headers.push(
+                    {{"Content-Type", 12}, {"application/octet-stream", 24}});
+                stmt.span = Span{start.start, close.value()->end, start.line, start.col};
+                return stmt;
+            }
+
             // Peek for the response builder. We recognise `response`
             // by the literal identifier text; no dedicated keyword yet
             // because `response` is also a valid identifier elsewhere.

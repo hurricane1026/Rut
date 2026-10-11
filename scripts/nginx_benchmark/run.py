@@ -918,17 +918,13 @@ class Harness:
                                 workers=self.args.workers,
                                 server_cpus=self.args.server_cpus,
                                 warmup_errors=warmup["errors"],
-                                server_cpu_pct=100
-                                * (after - before)
-                                / result["seconds"],
+                                server_cpu_pct=server_cpu_observation(
+                                    engine, before, after, result["seconds"]),
                                 origin_cpu_pct=100
                                 * (origin_after - origin_before)
                                 / result["seconds"],
                                 server_rss_bytes=rss,
-                                valid=bool(result["requests"])
-                                and not any(result["errors"].values())
-                                and bool(warmup["requests"])
-                                and not any(warmup["errors"].values()),
+                                valid=valid_warmup_result(result, warmup),
                             )
                             self.results.append(result)
                             save_json(self.out / "results.json", self.results)
@@ -1036,11 +1032,43 @@ class Harness:
         return all(r["valid"] for r in self.results)
 
 
+def server_cpu_observation(engine, before, after, seconds):
+    if engine == "direct-origin" or before is None or after is None:
+        return None
+    return 100 * (after - before) / seconds
+
+
 def positive(value):
     number = int(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("must be positive")
     return number
+
+
+def validate_executable(parser, name, path):
+    path = Path(path).resolve()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        parser.error(f"{name} must name an executable file")
+    return path
+
+
+def validate_direct_origin_configuration(parser, args):
+    if args.proxy_profile != "native-streaming":
+        parser.error("direct-origin requires --proxy-profile native-streaming")
+    validate_proxy_profile(parser, args)
+    if args.tls_cert:
+        parser.error("direct-origin supports plaintext HTTP only")
+    if args.mode != "benchmark":
+        parser.error("direct-origin supports benchmark mode only")
+
+
+def valid_warmup_result(result, warmup):
+    return (bool(result["requests"])
+            and result.get("valid", True)
+            and not any(result["errors"].values())
+            and warmup.get("valid", True)
+            and bool(warmup["requests"])
+            and not any(warmup["errors"].values()))
 
 
 def origin_reuse_records(logs, expected_markers):
@@ -1146,12 +1174,13 @@ def normalize_cpu_arguments(parser, args):
     return args
 
 
-def validate_cpu_topology(parser, args):
+def validate_cpu_topology(parser, args, origin_cpus=None):
     try:
         clients = [int(cpu) for cpu in args.client_cpus.split(",")]
+        origins = [args.origin_cpu] if origin_cpus is None else list(origin_cpus)
     except (AttributeError, ValueError):
-        parser.error("client-cpus must be comma-separated integer CPU IDs")
-    cpus = [*map(int, args.server_cpus.split(",")), args.origin_cpu, *clients]
+        parser.error("CPU assignments must contain integer CPU IDs")
+    cpus = [*map(int, args.server_cpus.split(",")), *origins, *clients]
     if (not clients or len(set(cpus)) != len(cpus)
             or not set(cpus) <= os.sched_getaffinity(0)):
         parser.error("CPU IDs must be available and disjoint")
@@ -1229,10 +1258,7 @@ def arguments():
     ) != len(args.scenarios):
         parser.error("duplicate concurrency or scenario")
     for attr in ("rut", "converter", "wrk"):
-        path = getattr(args, attr).resolve()
-        if not path.is_file() or not os.access(path, os.X_OK):
-            parser.error(f"{attr} must name an executable file")
-        setattr(args, attr, path)
+        setattr(args, attr, validate_executable(parser, attr, getattr(args, attr)))
     args.output = args.output.resolve()
     if args.output.exists() and (
         not args.output.is_dir() or any(args.output.iterdir())

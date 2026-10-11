@@ -302,3 +302,38 @@ screens 11 buffer configurations, then rechecks two candidates against Rut.
 See [the relay checkpoint](../../docs/benchmarks/iouring-relay-2026-10-10/README.md)
 for commands, measured results and limitations. Both reuse the harness's existing
 dependencies and preflight/error validation.
+
+
+### Verified tcpkali2 WebSocket comparisons
+
+The optional native client is vendored under `bench/tcpkali2`; see its `RUT.md`
+for the pinned upstream version, local verification changes and build commands.
+`protocol_strategy.py --tcpkali2 PATH` uses plaintext WebSocket ping-pong with
+full latency sampling and binary echo verification. It rejects errors, wrong
+payload sizes, incomplete sampling and pipeline-mode output. Run both Rut and
+nginx through this same client and keep frontend measurements serial.
+
+Example (use a matching Rut/compiler build):
+
+```sh
+python3 scripts/nginx_benchmark/protocol_strategy.py \
+  --rut /path/to/rut --harness scripts/nginx_benchmark/run.py \
+  --tcpkali2 bench/tcpkali2/target/release/tcpkali2 \
+  --output /tmp/ws-native-study --cases websocket-interactive-64 websocket-bulk-64k \
+  --engines uring nginx --policies current --repeats 3 --duration 8 \
+  --client-cpus 5,6,7 --origin-cpus 3,4,8,9 --connections-per-client 64
+```
+
+This CPU layout uses all eight physical cores on the study host; choose an
+appropriate layout for other hosts. RTT includes client frame preparation.
+Receive bandwidth counts application payload in one direction. These closed-loop
+results do not establish fixed-arrival-rate tail latency. Record native client,
+fixture and frontend hashes; the output manifest includes experimental copy,
+queued-byte, batch/scan settings and the nginx buffer size.
+
+The optional Python masking accelerator is selected with
+`RUT_BENCH_WS_MASK_HELPER=/path/to/libbench_ws_mask.so` and
+`RUT_BENCH_WS_MASK_MIN=4096` (default). The study branch provides the explicit
+`bench_ws_mask` CMake target, excluded from the default build. The same origin
+setting must apply to every frontend. Small-message ctypes calls can be slower;
+64B diagnostics found a regression, so the accelerator remains off by default.

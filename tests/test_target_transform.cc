@@ -11,6 +11,31 @@ ForwardTargetTransformSpec transform(Str strip, Str replace) {
     return {strip, replace};
 }
 
+TEST(target_transform, retained_body_bridge_supports_workload_fixture_sizes) {
+    static char body_64k[64 * 1024];
+    static char body_1m[1024 * 1024];
+    for (char& byte : body_64k) byte = 'a';
+    for (char& byte : body_1m) byte = 'b';
+    rir::Module mod{};
+    mod.response_body_count = 2;
+    mod.response_bodies[0] = {body_64k, sizeof(body_64k)};
+    mod.response_bodies[1] = {body_1m, sizeof(body_1m)};
+
+    RouteConfig owned{};
+    CHECK_FALSE(populate_route_config(owned, mod));
+    CHECK_EQ(owned.response_body_count, 0u);
+
+    RouteConfig retained{};
+    REQUIRE(populate_route_config_with_retained_body_views(retained, mod));
+    REQUIRE_EQ(retained.response_body_count, 2u);
+    CHECK_EQ(retained.body_pool_used, 0u);
+    CHECK_EQ(retained.response_bodies[0].data, body_64k);
+    CHECK_EQ(retained.response_bodies[0].len, sizeof(body_64k));
+    CHECK_EQ(retained.response_bodies[1].data, body_1m);
+    CHECK_EQ(retained.response_bodies[1].len, sizeof(body_1m));
+    CHECK_EQ(retained.response_bodies[1].data[sizeof(body_1m) - 1], 'b');
+}
+
 void make_short_transform(char (&strip)[8], char (&replace)[8], u32 n) {
     const char hex[] = "0123456789abcdef";
     strip[0] = '/';

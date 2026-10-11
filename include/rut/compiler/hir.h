@@ -13,8 +13,11 @@
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
+#include "rut/runtime/arena.h"
 #include <deque>
 #include <string>
+
+#include <sys/mman.h>
 
 namespace rut {
 
@@ -1400,13 +1403,14 @@ struct HirGeneratedName {
     u32 len = 0;
 };
 
-// Owns the generated function names of one analysis tree. The root module owns
-// the store; imported modules write into the root's store and HirModule copies
-// share it, so every merged or copied function keeps a valid name view. The
-// store is reference-counted and freed when the last owner is destroyed.
+// Owns generated function names shared by an analysis tree and its HIR copies.
+// One mmap-backed arena amortizes allocation and releases all name bytes/nodes
+// together when the final module owner is dropped.
 struct HirGeneratedNames {
+    u32 workload_bytes = 0;
     u32 refs = 1;
     HirGeneratedName* head = nullptr;
+    MmapArena arena{};
 
     HirGeneratedNames() = default;
     HirGeneratedNames(const HirGeneratedNames&) = delete;
@@ -1415,14 +1419,9 @@ struct HirGeneratedNames {
     void retain() { refs++; }
     void release() {
         if (--refs != 0) return;
-        HirGeneratedName* node = head;
-        while (node != nullptr) {
-            HirGeneratedName* next = node->next;
-            delete[] node->text;
-            delete node;
-            node = next;
-        }
-        delete this;
+        arena.destroy();
+        this->~HirGeneratedNames();
+        munmap(this, sizeof(HirGeneratedNames));
     }
 };
 
