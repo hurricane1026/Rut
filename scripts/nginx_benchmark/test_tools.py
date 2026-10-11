@@ -315,6 +315,61 @@ class ToolsTest(unittest.TestCase):
                 self.assertFalse(output.exists())
                 launch.assert_not_called()
 
+    def test_protocol_cpu_assignments_validate_full_topology_and_normalize_masks(self):
+        def validate(origin_cpus='03,06', client_cpus='05,07', siblings=None,
+                     available=None):
+            args = SimpleNamespace(origin_cpus=origin_cpus, client_cpus=client_cpus)
+            parser = argparse.ArgumentParser(add_help=False)
+            siblings = siblings or {}
+            available = set(range(2, 16)) if available is None else available
+
+            def topology_text(path, *args, **kwargs):
+                match = re.search(r'cpu(\d+)/topology/(physical_package_id|core_id)$', str(path))
+                if not match:
+                    raise AssertionError(f'unexpected topology path: {path}')
+                cpu, field = int(match.group(1)), match.group(2)
+                return '0\n' if field == 'physical_package_id' else f'{siblings.get(cpu, cpu)}\n'
+
+            with mock.patch.object(run.os, 'sched_getaffinity', return_value=available), \
+                    mock.patch.object(run.Path, 'read_text', topology_text):
+                result = protocol_strategy.validate_cpu_assignments(parser, run, args)
+            return args, result
+
+        args, (origins, clients) = validate()
+        self.assertEqual(origins, [3, 6])
+        self.assertEqual(clients, [5, 7])
+        self.assertEqual(args.origin_cpus, '3,6')
+        self.assertEqual(args.client_cpus, '5,7')
+        invalid = (
+            dict(origin_cpus='3,3'),
+            dict(client_cpus='5,5'),
+            dict(origin_cpus='3,99'),
+            dict(origin_cpus='3,4', client_cpus='4,7'),
+            dict(origin_cpus='2,6'),
+            dict(origin_cpus='3,6', client_cpus='5,7', siblings={3: 1, 5: 1}),
+        )
+        for case in invalid:
+            with self.subTest(case=case), self.assertRaises(SystemExit):
+                validate(**case)
+
+    def test_protocol_mask_threshold_parsing_and_early_rejection(self):
+        parser = argparse.ArgumentParser()
+        self.assertEqual(protocol_strategy.parse_mask_helper_min(parser, '0'), 0)
+        self.assertEqual(protocol_strategy.parse_mask_helper_min(parser, '4096'), 4096)
+        for value in ('-1', 'bad'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'study'
+                argv = ['protocol_strategy.py', '--output', str(output), '--rut', '/bin/true',
+                        '--harness', str(Path(run.__file__))]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.dict(os.environ, {'RUT_BENCH_WS_MASK_MIN': value}), \
+                        mock.patch.object(protocol_strategy.subprocess, 'Popen') as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        protocol_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
+
     def test_workload_cli_rejects_nonpositive_durations_before_output_or_process(self):
         for flag in ('--screen-seconds', '--confirm-seconds'):
             for duration in ('0', '-1'):

@@ -61,6 +61,63 @@ def selection_manifest(args):
     }
 
 
+def validate_cpu_assignments(parser, harness, args):
+    try:
+        origins = [int(cpu) for cpu in args.origin_cpus.split(',')]
+        clients = [int(cpu) for cpu in args.client_cpus.split(',')]
+    except (AttributeError, ValueError):
+        parser.error('CPU assignments must contain comma-separated integer CPU IDs')
+    if not origins or len(set(origins)) != len(origins):
+        parser.error('--origin-cpus must contain unique CPU IDs')
+    if not clients or len(set(clients)) != len(clients):
+        parser.error('--client-cpus must contain unique CPU IDs')
+
+    cpu_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    harness.add_cpu_arguments(cpu_parser)
+    cpu_args = cpu_parser.parse_args([
+        '--server-cpu', '2', '--origin-cpu', str(origins[0]),
+        '--client-cpus', ','.join(map(str, clients)),
+    ])
+    harness.normalize_cpu_arguments(cpu_parser, cpu_args)
+    harness.validate_cpu_topology(cpu_parser, cpu_args, origin_cpus=origins)
+    args.origin_cpus = ','.join(map(str, origins))
+    args.client_cpus = cpu_args.client_cpus
+    return origins, clients
+
+
+def parse_mask_helper_min(parser, value):
+    try:
+        minimum = int(value)
+    except ValueError:
+        parser.error('RUT_BENCH_WS_MASK_MIN must be a nonnegative integer')
+    if minimum < 0:
+        parser.error('RUT_BENCH_WS_MASK_MIN must be a nonnegative integer')
+    return minimum
+
+
+def protocol_configurations(case, args, parser):
+    configurations = [('direct-origin', 'current')]
+    for engine in ['uring', 'epoll']:
+        policies = ['latency', 'balanced', 'current']
+        random.Random(20261010 + len(case['name']) + (engine == 'epoll')).shuffle(policies)
+        configurations += [(engine, policy) for policy in policies]
+    configurations += [('nginx', 'reference')]
+    if args.smoke:
+        configurations = [('uring', 'current'), ('epoll', 'current')]
+    if args.engines:
+        configurations = [(engine, policy) for engine, policy in configurations
+                           if engine in args.engines]
+        if 'direct-origin' in args.engines and not any(
+                engine == 'direct-origin' for engine, _ in configurations):
+            configurations.insert(0, ('direct-origin', 'current'))
+    if args.policies:
+        configurations = [(engine, policy) for engine, policy in configurations
+                          if engine not in ['uring', 'epoll'] or policy in args.policies]
+    if not configurations:
+        parser.error('--smoke/--engines/--policies select no runnable configurations')
+    return configurations
+
+
 def ready(port, process, log, workers=0):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -283,12 +340,18 @@ def main():
     cases = [case for case in CASES if not args.cases or case['name'] in args.cases]
     if args.tcpkali2 and any(case['kind'] != 'websocket' for case in cases):
         parser.error('--tcpkali2 requires a WebSocket-only --cases selection')
-    out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
+    configurations_by_case = {
+        case['name']: protocol_configurations(case, args, parser) for case in cases
+    }
+    mask_helper_min = parse_mask_helper_min(
+        parser, os.environ.get('RUT_BENCH_WS_MASK_MIN', '4096'))
     spec = importlib.util.spec_from_file_location('runtime_benchmark', args.harness)
     harness = importlib.util.module_from_spec(spec); spec.loader.exec_module(harness)
+    origin_cpus, client_cpus = validate_cpu_assignments(parser, harness, args)
+    out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
     image = (harness.ROOT / 'tests/pinned-nginx-image.txt').read_text().strip()
-    manifest = dict(cases=CASES, duration=args.duration, frontend_cpus=[2], origin_cpus=[int(x) for x in args.origin_cpus.split(',')],
-                    client_cpus=[int(x) for x in args.client_cpus.split(',')], connections=args.connections_per_client * len(args.client_cpus.split(',')), client='tcpkali2 verified pingpong' if args.tcpkali2 else 'Python asyncio; direct-origin ceiling required',
+    manifest = dict(cases=CASES, duration=args.duration, frontend_cpus=[2], origin_cpus=origin_cpus,
+                    client_cpus=client_cpus, connections=args.connections_per_client * len(client_cpus), client='tcpkali2 verified pingpong' if args.tcpkali2 else 'Python asyncio; direct-origin ceiling required',
                     tcpkali2_sha256=hashlib.sha256(args.tcpkali2.read_bytes()).hexdigest() if args.tcpkali2 else None,
                     rut_sha256=hashlib.sha256(args.rut.read_bytes()).hexdigest(), nginx_image=image,
                     fixture_sha256=hashlib.sha256(args.fixture.read_bytes()).hexdigest(),
@@ -310,7 +373,7 @@ def main():
                     ws_available=os.environ.get('RUT_STUDY_WS_AVAILABLE', 'off'),
                     ws_fast_batch=os.environ.get('RUT_STUDY_WS_FAST_BATCH', 'off'),
                     ws_fast_scan=os.environ.get('RUT_STUDY_WS_FAST_SCAN', 'off'),
-                    mask_helper_min=int(os.environ.get('RUT_BENCH_WS_MASK_MIN', '4096')),
+                    mask_helper_min=mask_helper_min,
                     mask_helper=os.environ.get('RUT_BENCH_WS_MASK_HELPER'),
                     mask_helper_sha256=hashlib.sha256(Path(os.environ['RUT_BENCH_WS_MASK_HELPER']).read_bytes()).hexdigest() if os.environ.get('RUT_BENCH_WS_MASK_HELPER') else None)
     prior = out / 'study.json'
@@ -324,25 +387,7 @@ def main():
     if args.tcpkali2:
         env['TCPKALI2_BENCH_FULL_LATENCY'] = '1'; env['TCPKALI2_BENCH_VERIFY'] = '1'
     for case in cases:
-        # Protocol paths do not enter Content-Length body splice. current and
-        # throughput have identical effective settings, so compare three batches.
-        configurations = [('direct-origin', 'current')]
-        for engine in ['uring', 'epoll']:
-            policies = ['latency', 'balanced', 'current']
-            random.Random(20261010 + len(case['name']) + (engine == 'epoll')).shuffle(policies)
-            configurations += [(engine, policy) for policy in policies]
-        configurations += [('nginx', 'reference')]
-        if args.smoke:
-            configurations = [('uring', 'current'), ('epoll', 'current')]
-        if args.engines:
-            configurations = [(engine, policy) for engine, policy in configurations if engine in args.engines]
-            if 'direct-origin' in args.engines and not any(engine == 'direct-origin' for engine, _ in configurations):
-                configurations.insert(0, ('direct-origin', 'current'))
-        if args.policies:
-            configurations = [(engine, policy) for engine, policy in configurations
-                              if engine not in ['uring', 'epoll'] or policy in args.policies]
-        if not configurations:
-            parser.error('--smoke/--engines/--policies select no runnable configurations')
+        configurations = configurations_by_case[case['name']]
         repeats = 1 if args.smoke else args.repeats
         for repeat in range(1, repeats + 1):
             offset = (repeat - 1) % len(configurations)
