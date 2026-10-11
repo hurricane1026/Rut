@@ -502,6 +502,28 @@ struct IoUringBackend {
                __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
     }
 
+    // Unlike cq_unharvested(), count only CQEs that still hold an ordinary
+    // provided buffer. Unrelated sends, timers, and polls consume CQ capacity
+    // but do not reduce the ordinary buffer ring available to receive SQEs.
+    // As with cq_unharvested(), kernel overflow-list CQEs are not observable.
+    u32 cq_unharvested_ordinary_buffers() const {
+        if (cq_head == nullptr || cq_tail == nullptr || cq_entries == nullptr ||
+            cq_ring_mask == nullptr || cq_ring_entries == 0)
+            return 0;
+        const u32 head = __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
+        const u32 tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
+        const u32 pending = tail - head;
+        if (pending > cq_ring_entries) return pending;
+        u32 selected = 0;
+        for (u32 offset = 0; offset < pending; ++offset) {
+            const u32 flags = cq_entries[(head + offset) & *cq_ring_mask].flags;
+            if ((flags & IORING_CQE_F_BUFFER) == 0) continue;
+            const u16 buffer_id = static_cast<u16>(flags >> IORING_CQE_BUFFER_SHIFT);
+            if (buffer_id < kProvidedBufCount) ++selected;
+        }
+        return selected;
+    }
+
     // Shutdown and unmap all resources.
     void shutdown();
 

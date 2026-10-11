@@ -802,7 +802,8 @@ public:
             relay_budget_bytes = study_relay_turn_byte_limit;
             dispatch_batch(events, kEventCount);
             if (backend.ws_recv_cache_enabled) {
-                ws_cache_rearm_budget = cache_rearm_budget(backend.cq_unharvested());
+                ws_cache_rearm_budget =
+                    cache_rearm_budget(backend.cq_unharvested_ordinary_buffers());
             }
             rearm_deferred_cache_passes(/*force=*/false);
             retry_deferred_accepts();
@@ -3515,13 +3516,14 @@ public:
         // Recompute from current cache occupancy so a stale larger budget
         // cannot over-arm receives after the ring filled in this batch.
         if (force && backend.ws_recv_cache_enabled)
-            ws_cache_rearm_budget = cache_rearm_budget(backend.cq_unharvested());
+            ws_cache_rearm_budget = cache_rearm_budget(backend.cq_unharvested_ordinary_buffers());
         u32 cache_free = kProvidedBufCount;
         if (backend.ws_recv_cache_enabled) {
             cache_free = ws_cache_rearm_budget;
             if (cache_free == 0) return;
         }
-        const u32 pinned = backend.cq_unharvested();
+        const u32 pinned = backend.ws_recv_cache_enabled ? backend.cq_unharvested_ordinary_buffers()
+                                                         : backend.cq_unharvested();
         if (!force && pinned >= kProvidedBufCount / 2) return;
         u32 budget = pinned < kProvidedBufCount ? kProvidedBufCount - pinned : 0;
         if (backend.ws_recv_cache_enabled && budget > cache_free) budget = cache_free;
