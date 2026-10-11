@@ -135,3 +135,64 @@ samples are archived in
 `/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-accept-default-20261011/`.
 The earlier configuration-only comparison is archived in the adjacent
 `epoll-et-accept-tuning-20261011/` directory.
+
+## Complete close-response coalescing as the ET default (2026-10-11)
+
+Full epoll ET now enables the existing complete close-response coalescer after
+successful initialization. `RUT_STUDY_HTTP_COALESCE_CLOSE=off` explicitly restores
+the split-send path; exact `on` enables it on other backends as before. Unknown
+values preserve the effective default. LT and io_uring remain off by default.
+
+The helper and its admission rules are unchanged: it requires the admitted
+plaintext HTTP/1.1 GET close-request policy, an ordinary 200 Content-Length
+response, an exactly complete buffered body, sufficient existing owned header
+buffer capacity and no downstream throttle. Partial or surplus bodies, large
+responses without capacity, TLS and other policy shapes retain their existing
+paths. It neither waits for more body bytes nor allocates another buffer.
+
+The final binary was compared with parent `c4213ae7` in five alternating paired
+rounds using the preceding section's 4 KiB native-streaming workload, CPU pins,
+128 connections, warmup and measurement durations. Both used full ET, stable
+upstream and relay events, and batch 16 in the withdrawn automatic-batch
+prototype, with no coalescing override. These results are specific to that
+configuration; the current ET default preserves batch one. All 20 samples and warmups had zero errors and passed response and
+origin-reuse preflights.
+
+| Downstream connection | Baseline median RPS | Candidate median RPS | Change | Baseline p99 | Candidate p99 |
+|---|---:|---:|---:|---:|---:|
+| Short | 26,733 | 33,710 | +26.10% | 5.372 ms | 4.028 ms |
+| Keep-alive | 66,575 | 64,914 | -2.50% | 2.225 ms | 2.250 ms |
+
+Every short-connection pair improved (+23.40% to +48.13%). An independent
+same-binary on/off comparison gave +29.75% short RPS and -24.42% p99. Its
+keep-alive median changed +2.64%, while the final-binary control changed -2.50%;
+these short runs do not establish a keep-alive improvement. Mixed workloads,
+TLS and multiple workers have not been measured for this default change.
+
+CLI validation covers ET/LT defaults, explicit on/off and unknown values.
+All 66 HTTP/WebSocket test cases passed (70,481 checks), including incomplete,
+surplus, throttled and insufficient-capacity coalescing rejection, owned-body
+copying, completion ownership and partial-send/close regressions. Sol review,
+changed-file formatting and whitespace checks passed.
+
+Binaries, hashes, commands, preflights and paired samples are archived in
+`/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-coalesce-default-20261011/`;
+the independent configuration screen is in adjacent `epoll-et-coalesce-tuning-20261011/`.
+
+A five-pair 1 MiB control at 32 connections passed all preflights with zero
+measurement/warmup errors and zero coalesced responses. Median short RPS was
+2,269 -> 2,314 (+1.96%), with noisy pairs ranging -26.59% to +11.69%; keep-alive
+was 2,061 -> 2,080 (+0.92%). This validates the large-body fallback under load,
+but establishes neither a large-body throughput gain nor a precise regression
+bound. The individual controls are archived as `large-samples.json`.
+
+After withdrawing automatic batch tuning, five new alternating paired rounds
+compared the current batch-one default against parent `63d8e2da`, with no accept
+batch or coalescing override. The same 4 KiB workload and pins gave short RPS
+24,263 -> 29,573 (+21.89%) and p99 9.744 -> 8.125 ms (-16.62%). Every short pair
+improved (+19.86% to +25.85%). Keep-alive median RPS was 66,639 -> 66,832
+(+0.29%), p99 2.178 -> 2.198 ms; no keep-alive gain is claimed. All 20 samples
+and warmups had zero errors and passed response/reuse preflights. CLI defaults
+and overrides passed on the current binary. This confirms the coalescing
+benefit without selecting a machine-specific accept batch. Evidence is in
+`/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-coalesce-batch1-20261011/`.
