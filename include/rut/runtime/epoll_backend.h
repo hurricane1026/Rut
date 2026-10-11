@@ -48,6 +48,7 @@ struct EpollBackend {
         bool read_submitted = false;
         bool read_ready = false;
         bool read_eof = false;
+        bool urgent_seen = false;
     };
     MappedArray<EdgeRunnable> edge_runnable;
     MappedArray<u32> edge_queue;
@@ -80,6 +81,7 @@ struct EpollBackend {
         bool idle = false;
         bool recv_enabled = false;
         bool relay_read = false;
+        bool idle_urgent_pending = false;
         bool idle_probe_pending = false;
     };
     MappedArray<StableUpstream> stable_upstream;
@@ -211,6 +213,8 @@ struct EpollBackend {
             edge_runnable[2 * conn_id + 1].read_ready = false;
             edge_runnable[2 * conn_id].read_eof = false;
             edge_runnable[2 * conn_id + 1].read_eof = false;
+            edge_runnable[2 * conn_id].urgent_seen = false;
+            edge_runnable[2 * conn_id + 1].urgent_seen = false;
         }
         reset_fd_interest(fd_interest[2 * conn_id]);
         reset_fd_interest(fd_interest[2 * conn_id + 1]);
