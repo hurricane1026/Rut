@@ -199,6 +199,7 @@ bool EpollBackend::enable_edge_trigger() {
     for (u32 slot = 0; slot < connection_capacity * 2; ++slot) edge_runnable[slot] = {};
     edge_head = edge_tail = edge_count = edge_streak = 0;
     study_edge_trigger = study_accept_edge_trigger = true;
+    if (study_accept_batch_limit == 1) study_accept_batch_limit = 16;
     return true;
 }
 

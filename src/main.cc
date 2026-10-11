@@ -588,11 +588,6 @@ static bool configure_study_policy(Loop* loop) {
                 if (str_eq(*item, "RUT_STUDY_EPOLL_ACCEPT_BATCH=32"))
                     loop->backend.study_accept_batch_limit = 32;
             }
-            if (report_study) {
-                write_str("RUT_STUDY_EPOLL_ACCEPT_BATCH limit=");
-                write_u32(loop->backend.study_accept_batch_limit);
-                write_str("\n");
-            }
         }
         if constexpr (requires { loop->backend.enable_edge_trigger(); }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
@@ -605,6 +600,13 @@ static bool configure_study_policy(Loop* loop) {
             if (report_study)
                 write_str(loop->backend.study_edge_trigger ? "RUT_STUDY_EPOLL_ET mode=on\n"
                                                            : "RUT_STUDY_EPOLL_ET mode=off\n");
+        }
+        if constexpr (requires { loop->backend.study_accept_batch_limit; }) {
+            if (report_study) {
+                write_str("RUT_STUDY_EPOLL_ACCEPT_BATCH limit=");
+                write_u32(loop->backend.study_accept_batch_limit);
+                write_str("\n");
+            }
         }
         if constexpr (requires { loop->backend.study_accept_edge_trigger; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)

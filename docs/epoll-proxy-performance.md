@@ -92,3 +92,44 @@ local name, causing recursive verification before any load could run. A
 regression checks that the composed native wrappers delegate exactly once;
 all 68 benchmark tool tests pass. This harness fix applies equally to both
 RPS variants and does not skip any preflight.
+
+## Bounded accept batches as the ET default (2026-10-11)
+
+Successful full ET initialization now raises the default accept batch from
+one to 16. Explicitly configured batches remain unchanged, repeated enabling
+does not reset the limit, and failed initialization leaves it untouched.
+LT retains its default of one. The existing output-capacity clamp and I/O
+service budget still bound accept work. Startup diagnostics report the limit
+after ET initialization so the recorded setting matches the effective one.
+
+The final binary was compared with parent commit `8f2c7fc6` in five paired,
+alternating rounds. Both enabled ET, stable upstream events and stable relay
+events, with no accept-batch environment override. The workload was a 4 KiB
+native-streaming proxy response, 128 connections and one Rut worker on CPU 2;
+origin workers ran on CPUs 3/4/8/9 and wrk on CPUs 5/7. Each cell used one second
+of warmup and five seconds of measurement. All 20 measured samples and warmups
+had zero errors and passed response and origin-reuse preflights.
+
+| Downstream connection | Baseline median RPS | Candidate median RPS | Change | Baseline p99 | Candidate p99 |
+|---|---:|---:|---:|---:|---:|
+| Short | 24,470 | 26,741 | +9.28% | 9.940 ms | 5.503 ms |
+| Keep-alive | 64,681 | 67,158 | +3.83% | 2.301 ms | 2.234 ms |
+
+Every short-connection pair improved RPS (+6.40% to +14.29%). The keep-alive
+control was noisy (-9.78% to +23.15% per pair); its median increase does not
+establish a steady-state throughput gain. An earlier same-binary batch-1 vs
+batch-16 comparison also improved short-connection median RPS by 6.69% and
+reduced p99 from 10.335 to 5.500 ms, while keep-alive RPS changed by -0.15%.
+These local samples do not cover mixed workloads, TLS or multiple workers.
+
+Default and ET network tests each passed 1,608 cases; splice tests each passed
+49 cases. Real TCP regression coverage queues 19 connections and verifies an
+output cap of two, the default batch cap of 16, and draining the final accept.
+Additional coverage checks overrides, idempotence and initialization failure.
+Sol review, changed-file formatting and whitespace checks passed.
+
+Final binaries, hashes, commands, configurations, test logs and individual
+samples are archived in
+`/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-accept-default-20261011/`.
+The earlier configuration-only comparison is archived in the adjacent
+`epoll-et-accept-tuning-20261011/` directory.

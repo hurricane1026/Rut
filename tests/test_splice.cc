@@ -407,6 +407,7 @@ TEST(epoll_full_edge, enabling_after_socket_registration_is_rejected) {
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
     ASSERT_TRUE(backend.add_recv(sockets[0], 0));
     const bool enabled = backend.enable_edge_trigger();
+    ASSERT_EQ(backend.study_accept_batch_limit, 1u);
     close(sockets[0]);
     close(sockets[1]);
     backend.shutdown();

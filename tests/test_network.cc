@@ -30756,6 +30756,67 @@ TEST(epoll_loop, edge_accept_continuation_preserves_capacity_fairness_and_cancel
     backend.shutdown();
 }
 
+TEST(epoll_loop, edge_accept_defaults_to_bounded_batch_and_respects_output_cap) {
+    ScopedListenerTestFd listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
+    REQUIRE(listener.fd >= 0);
+    sockaddr_in address = listener_test_ipv4(INADDR_LOOPBACK, 0);
+    REQUIRE(bind(listener.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    REQUIRE(listen(listener.fd, 32) == 0);
+    socklen_t length = sizeof(address);
+    REQUIRE(getsockname(listener.fd, reinterpret_cast<sockaddr*>(&address), &length) == 0);
+
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, listener.fd, 8).has_value());
+    CHECK_EQ(backend.study_accept_batch_limit, 1u);
+    REQUIRE(backend.enable_edge_trigger());
+    CHECK_EQ(backend.study_accept_batch_limit, 16u);
+    REQUIRE(backend.enable_edge_trigger());
+    CHECK_EQ(backend.study_accept_batch_limit, 16u);
+    backend.add_accept();
+
+    ScopedListenerTestFd clients[19];
+    ScopedListenerTestFd accepted[19];
+    for (u32 i = 0; i < 19; ++i) {
+        clients[i].fd = socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(clients[i].fd >= 0);
+        REQUIRE(connect(clients[i].fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ==
+                0);
+    }
+
+    IoEvent events[32]{};
+    REQUIRE_EQ(backend.wait(events, 2, nullptr, 0), 2u);
+    for (u32 i = 0; i < 2; ++i) {
+        CHECK_EQ(events[i].type, IoEventType::Accept);
+        REQUIRE(events[i].result >= 0);
+        accepted[i].fd = events[i].result;
+    }
+    CHECK(backend.accept_pending);
+
+    REQUIRE_EQ(backend.wait(events, 32, nullptr, 0), 16u);
+    for (u32 i = 0; i < 16; ++i) {
+        CHECK_EQ(events[i].type, IoEventType::Accept);
+        REQUIRE(events[i].result >= 0);
+        accepted[i + 2].fd = events[i].result;
+    }
+    REQUIRE_EQ(backend.wait(events, 32, nullptr, 0), 1u);
+    CHECK_EQ(events[0].type, IoEventType::Accept);
+    accepted[18].fd = events[0].result;
+    CHECK_FALSE(backend.accept_pending);
+    backend.shutdown();
+}
+
+TEST(epoll_loop, edge_accept_preserves_configured_batch_and_idempotence) {
+    EpollBackend backend{};
+    REQUIRE(backend.init(0, -1, 4).has_value());
+    backend.study_accept_batch_limit = 4;
+    REQUIRE(backend.enable_edge_trigger());
+    CHECK_EQ(backend.study_accept_batch_limit, 4u);
+    backend.study_accept_batch_limit = 8;
+    REQUIRE(backend.enable_edge_trigger());
+    CHECK_EQ(backend.study_accept_batch_limit, 8u);
+    backend.shutdown();
+}
+
 TEST(epoll_loop, accept_events_own_their_ipv4_peer_addresses) {
     ScopedListenerTestFd listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
     REQUIRE(listener.fd >= 0);
