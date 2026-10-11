@@ -1571,21 +1571,33 @@ class ToolsTest(unittest.TestCase):
             child_file = out / "child.pid"
             harness = Harness(SimpleNamespace(output=out))
             code = (
-                "import subprocess,sys,time; from pathlib import Path; "
+                "import os,subprocess,sys,time; from pathlib import Path; "
                 "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
-                "Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(30)"
+                "fields=Path(f'/proc/{p.pid}/stat').read_text().rsplit(')',1)[1].split(); "
+                "Path(sys.argv[1]).write_text(f'{p.pid} {os.getpgid(p.pid)} {fields[19]}'); "
+                "time.sleep(30)"
             )
             with self.assertRaises(subprocess.TimeoutExpired):
                 harness.command(
                     [sys.executable, "-c", code, str(child_file)], timeout=1
                 )
-            stat = Path(f"/proc/{int(child_file.read_text())}/stat")
-            try:
-                state = stat.read_text().rsplit(")", 1)[1].split()[0]
-            except FileNotFoundError:
-                pass  # Already reaped by init.
-            else:
-                self.assertEqual(state, "Z")
+            child_pid, child_pgid, child_start = map(int, child_file.read_text().split())
+            stat = Path(f"/proc/{child_pid}/stat")
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    fields = stat.read_text().rsplit(")", 1)[1].split()
+                except FileNotFoundError:
+                    break  # Already reaped by init.
+                state, process_group, start_time = fields[0], int(fields[2]), int(fields[19])
+                if start_time != child_start or process_group != child_pgid or state == "Z":
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail(
+                        f"original load child still running: pid={child_pid}, "
+                        f"pgid={process_group}, start={start_time}, state={state}"
+                    )
+                time.sleep(0.01)
             self.assertTrue((out / "command-failure-1.log").exists())
 
     def test_valid_ratio_and_warmup_error_totals(self):
