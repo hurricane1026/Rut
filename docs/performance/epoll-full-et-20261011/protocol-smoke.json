@@ -1,0 +1,224 @@
+[
+  {
+    "kind": "websocket",
+    "payload_bytes": 64,
+    "concurrent_connections": 8,
+    "duration_seconds": 2,
+    "messages": 115107,
+    "bytes": 7366848,
+    "connections": 8,
+    "errors": 0,
+    "messages_per_second": 57553.5,
+    "received_mib_per_second": 3.512786865234375,
+    "valid": true,
+    "client_workers": [
+      {
+        "cpu": 5,
+        "cpu_seconds": 3.620582503,
+        "observation_seconds": 4.001023358898237,
+        "cpu_pct": 90.49141127726384
+      },
+      {
+        "cpu": 7,
+        "cpu_seconds": 3.584381583,
+        "observation_seconds": 4.001052621984854,
+        "cpu_pct": 89.58596453604875
+      }
+    ],
+    "rtt_us": {
+      "p50_us": 142.542,
+      "p95_us": 179.722,
+      "p99_us": 208.114,
+      "max_us": 471.773
+    },
+    "first_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "delivery_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "gap_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "source_gap_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "case": {
+      "name": "websocket-interactive-64",
+      "kind": "websocket",
+      "size": 64,
+      "chunks": 16,
+      "delay": 0
+    },
+    "engine": "epoll",
+    "policy": "current",
+    "repeat": 1,
+    "ws_recv_mode": null,
+    "ws_splice_mode": null,
+    "ws_segment": null,
+    "ws_calls": null,
+    "cpu_observation_seconds": 4.120414813049138,
+    "frontend_cpu_pct": 45.86916817244878,
+    "origin_cpu_pct": 173.28352420702873
+  },
+  {
+    "kind": "websocket",
+    "payload_bytes": 1048576,
+    "concurrent_connections": 8,
+    "duration_seconds": 2,
+    "messages": 1226,
+    "bytes": 1285554176,
+    "connections": 8,
+    "errors": 0,
+    "messages_per_second": 613.0,
+    "received_mib_per_second": 613.0,
+    "valid": true,
+    "client_workers": [
+      {
+        "cpu": 5,
+        "cpu_seconds": 3.9521489869999997,
+        "observation_seconds": 4.060017814161256,
+        "cpu_pct": 97.3431439934817
+      },
+      {
+        "cpu": 7,
+        "cpu_seconds": 3.94434284,
+        "observation_seconds": 4.060510155977681,
+        "cpu_pct": 97.13909554427131
+      }
+    ],
+    "rtt_us": {
+      "p50_us": 10763.449,
+      "p95_us": 12428.263,
+      "p99_us": 14521.002,
+      "max_us": 16045.383
+    },
+    "first_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "delivery_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "gap_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "source_gap_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "case": {
+      "name": "websocket-bulk-1m",
+      "kind": "websocket",
+      "size": 1048576,
+      "chunks": 16,
+      "delay": 0
+    },
+    "engine": "epoll",
+    "policy": "current",
+    "repeat": 1,
+    "ws_recv_mode": null,
+    "ws_splice_mode": null,
+    "ws_segment": null,
+    "ws_calls": null,
+    "cpu_observation_seconds": 4.171965043991804,
+    "frontend_cpu_pct": 54.171115437669044,
+    "origin_cpu_pct": 185.7637808150155
+  },
+  {
+    "kind": "streaming",
+    "payload_bytes": 4096,
+    "concurrent_connections": 8,
+    "duration_seconds": 2,
+    "messages": 417514,
+    "bytes": 1710137344,
+    "connections": 8,
+    "errors": 0,
+    "messages_per_second": 208757.0,
+    "received_mib_per_second": 815.45703125,
+    "valid": true,
+    "client_workers": [
+      {
+        "cpu": 7,
+        "cpu_seconds": 3.780576689,
+        "observation_seconds": 4.001726686954498,
+        "cpu_pct": 94.47363562645495
+      },
+      {
+        "cpu": 5,
+        "cpu_seconds": 3.777494063,
+        "observation_seconds": 4.001538755139336,
+        "cpu_pct": 94.4010365549606
+      }
+    ],
+    "rtt_us": {
+      "p50_us": null,
+      "p95_us": null,
+      "p99_us": null,
+      "max_us": null
+    },
+    "first_us": {
+      "p50_us": 494.802,
+      "p95_us": 665.799,
+      "p99_us": 700.403,
+      "max_us": 918.318
+    },
+    "delivery_us": {
+      "p50_us": 385.019,
+      "p95_us": 557.863,
+      "p99_us": 596.641,
+      "max_us": 804.825
+    },
+    "gap_us": {
+      "p50_us": 5.227,
+      "p95_us": 7.572,
+      "p99_us": 10.716,
+      "max_us": 314.428
+    },
+    "source_gap_us": {
+      "p50_us": 8.127,
+      "p95_us": 12.608,
+      "p99_us": 17.872,
+      "max_us": 64.076
+    },
+    "case": {
+      "name": "streaming-bulk-64k",
+      "kind": "streaming",
+      "size": 4096,
+      "chunks": 16,
+      "delay": 0
+    },
+    "engine": "epoll",
+    "policy": "current",
+    "repeat": 1,
+    "ws_recv_mode": null,
+    "ws_splice_mode": null,
+    "ws_segment": null,
+    "ws_calls": null,
+    "cpu_observation_seconds": 4.321330541046336,
+    "frontend_cpu_pct": 63.174986825677486,
+    "origin_cpu_pct": 190.45060130964305
+  }
+]

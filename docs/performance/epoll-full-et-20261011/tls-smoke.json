@@ -1,0 +1,171 @@
+[
+  {
+    "requests": 99820,
+    "seconds": 2.016692,
+    "rps": 49496.8988819314,
+    "p50_us": 2474.0,
+    "p95_us": 2571.0,
+    "p99_us": 21679.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "client_cpu_seconds": 1.09,
+    "host_cpu_pct": {
+      "0": {
+        "user": 1.9801980198019802,
+        "system": 0.0,
+        "idle": 97.52475247524752,
+        "irq": 0.0,
+        "softirq": 0.49504950495049505,
+        "steal": 0.0
+      },
+      "1": {
+        "user": 0.0,
+        "system": 0.0,
+        "idle": 100.0,
+        "irq": 0.0,
+        "softirq": 0.0,
+        "steal": 0.0
+      },
+      "2": {
+        "user": 24.137931034482758,
+        "system": 49.75369458128079,
+        "idle": 0.9852216748768473,
+        "irq": 0.49261083743842365,
+        "softirq": 24.63054187192118,
+        "steal": 0.0
+      },
+      "3": {
+        "user": 7.5829383886255926,
+        "system": 19.90521327014218,
+        "idle": 68.24644549763033,
+        "irq": 0.0,
+        "softirq": 4.265402843601896,
+        "steal": 0.0
+      },
+      "4": {
+        "user": 7.035175879396985,
+        "system": 18.592964824120603,
+        "idle": 69.34673366834171,
+        "irq": 0.0,
+        "softirq": 5.025125628140704,
+        "steal": 0.0
+      },
+      "5": {
+        "user": 10.144927536231885,
+        "system": 20.28985507246377,
+        "idle": 62.80193236714976,
+        "irq": 0.0,
+        "softirq": 6.763285024154589,
+        "steal": 0.0
+      },
+      "6": {
+        "user": 0.0,
+        "system": 0.0,
+        "idle": 100.0,
+        "irq": 0.0,
+        "softirq": 0.0,
+        "steal": 0.0
+      },
+      "7": {
+        "user": 8.955223880597014,
+        "system": 20.398009950248756,
+        "idle": 63.18407960199005,
+        "irq": 0.0,
+        "softirq": 7.462686567164179,
+        "steal": 0.0
+      },
+      "8": {
+        "user": 7.177033492822966,
+        "system": 14.354066985645932,
+        "idle": 74.64114832535886,
+        "irq": 0.4784688995215311,
+        "softirq": 3.349282296650718,
+        "steal": 0.0
+      },
+      "9": {
+        "user": 5.9405940594059405,
+        "system": 16.831683168316832,
+        "idle": 72.77227722772277,
+        "irq": 0.0,
+        "softirq": 4.455445544554456,
+        "steal": 0.0
+      },
+      "10": {
+        "user": 0.0,
+        "system": 0.0,
+        "idle": 100.0,
+        "irq": 0.0,
+        "softirq": 0.0,
+        "steal": 0.0
+      },
+      "11": {
+        "user": 0.0,
+        "system": 0.0,
+        "idle": 100.0,
+        "irq": 0.0,
+        "softirq": 0.0,
+        "steal": 0.0
+      },
+      "12": {
+        "user": 0.0,
+        "system": 0.0,
+        "idle": 100.0,
+        "irq": 0.0,
+        "softirq": 0.0,
+        "steal": 0.0
+      },
+      "13": {
+        "user": 0.0,
+        "system": 0.0,
+        "idle": 100.0,
+        "irq": 0.0,
+        "softirq": 0.0,
+        "steal": 0.0
+      },
+      "14": {
+        "user": 1.0,
+        "system": 0.0,
+        "idle": 99.0,
+        "irq": 0.0,
+        "softirq": 0.0,
+        "steal": 0.0
+      },
+      "15": {
+        "user": 0.0,
+        "system": 0.0,
+        "idle": 100.0,
+        "irq": 0.0,
+        "softirq": 0.0,
+        "steal": 0.0
+      }
+    },
+    "workload": "proxy",
+    "proxy_profile": "native-streaming",
+    "static_profile": "converter-return",
+    "transport": "https",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "engine": "epoll",
+    "rep": 1,
+    "concurrency": 128,
+    "workers": 1,
+    "server_cpus": "2",
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "server_cpu_pct": 74.37923093858655,
+    "origin_cpu_pct": 87.27163096794158,
+    "server_rss_bytes": 80252928,
+    "valid": true,
+    "campaign": "proxy-keepalive-1024-r0-et"
+  }
+]
