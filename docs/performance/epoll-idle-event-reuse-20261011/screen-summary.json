@@ -1,0 +1,398 @@
+[
+  {
+    "campaign": "proxy-close-1024-r0-before",
+    "body_size": 1024,
+    "connection": "close",
+    "rps": 39300.0699346171,
+    "p99_us": 3428.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-close-1024-r0-after",
+    "body_size": 1024,
+    "connection": "close",
+    "rps": 39880.580335453385,
+    "p99_us": 3399.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-close-1024-r1-after",
+    "body_size": 1024,
+    "connection": "close",
+    "rps": 39190.32902204804,
+    "p99_us": 3661.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-close-1024-r1-before",
+    "body_size": 1024,
+    "connection": "close",
+    "rps": 38540.5240797952,
+    "p99_us": 3614.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-close-1024-r2-before",
+    "body_size": 1024,
+    "connection": "close",
+    "rps": 38208.75013139356,
+    "p99_us": 3587.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-close-1024-r2-after",
+    "body_size": 1024,
+    "connection": "close",
+    "rps": 38773.88466387544,
+    "p99_us": 3491.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r0-before",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 75609.20695253563,
+    "p99_us": 1902.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r0-after",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 74507.72207491462,
+    "p99_us": 2048.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r1-after",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 75359.37333339304,
+    "p99_us": 2085.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r1-before",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 74843.94146868118,
+    "p99_us": 2033.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r2-before",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 74505.11515341476,
+    "p99_us": 1921.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1024-r2-after",
+    "body_size": 1024,
+    "connection": "keepalive",
+    "rps": 73593.0656849453,
+    "p99_us": 1944.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1048576-r0-before",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "rps": 4691.350604574232,
+    "p99_us": 29262.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1048576-r0-after",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "rps": 4810.088609165949,
+    "p99_us": 28346.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1048576-r1-after",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "rps": 4894.619990074138,
+    "p99_us": 27967.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1048576-r1-before",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "rps": 4873.300171783997,
+    "p99_us": 27949.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1048576-r2-before",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "rps": 4845.907189581325,
+    "p99_us": 27892.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  },
+  {
+    "campaign": "proxy-keepalive-1048576-r2-after",
+    "body_size": 1048576,
+    "connection": "keepalive",
+    "rps": 4753.128608018261,
+    "p99_us": 28637.0,
+    "valid": true,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    }
+  }
+]

@@ -113,12 +113,15 @@ struct UpstreamPool {
     }
 
     // Borrow a reusable idle fd for the given endpoint, or -1 if none is live.
-    // Each candidate is liveness-probed with a non-blocking MSG_PEEK: a socket the
+    // Every candidate is checked with MSG_PEEK: a socket the
     // backend already closed (EOF) or errored is closed and skipped, and one with
     // unexpected pending bytes (a desynced/half-pipelined socket) is discarded too
     // — only an EAGAIN (nothing buffered, still open) socket is handed back. This
     // catches the common idle-timeout race before any request bytes are sent; the
     // residual probe-vs-send race is handled by the caller's idempotent resend.
+    // An idle watcher may eagerly invalidate known readiness, but every borrow
+    // still probes the socket. Userspace readiness state cannot prove that the
+    // kernel had no new bytes after parking and before this borrow.
     // Candidates are tried most recently parked first (the likeliest to be live).
     i32 take_idle(u16 upstream_id, u8 backend_idx) {
         if (idle_count.load(std::memory_order_acquire) == 0) return -1;

@@ -523,6 +523,64 @@ TEST(epoll_stable_edge, consumed_fin_is_not_lost_when_returning_to_idle_pool) {
     CHECK_EQ(errno, EBADF);
 }
 
+TEST(epoll_stable_edge, healthy_watched_idle_socket_preserves_owner) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE(f.park(0));
+    REQUIRE_EQ(f.borrow(1), fd);
+    REQUIRE_EQ(::send(f.peer, "body", 4, MSG_NOSIGNAL), 4);
+    REQUIRE(f.backend.add_recv_upstream(fd, 1, f.conns[1].upstream_episode));
+    IoEvent event{};
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    CHECK_EQ(event.conn_id, 1u);
+    CHECK_EQ(event.result, 4);
+}
+
+TEST(epoll_stable_edge, bytes_arriving_after_park_are_rejected_before_borrow) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE(f.park(0));
+    REQUIRE_EQ(::send(f.peer, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody", 42, MSG_NOSIGNAL),
+               42);
+    CHECK_EQ(f.pool.take_idle(0, 0), -1);
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+}
+
+TEST(epoll_stable_edge, fin_racing_borrow_rejects_before_new_episode) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE(f.park(0));
+    // No event has been harvested yet: the borrow-time probe must still catch FIN.
+    REQUIRE_EQ(::shutdown(f.peer, SHUT_WR), 0);
+    CHECK_EQ(f.borrow(1), -1);
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+}
+
+TEST(epoll_stable_edge, exhausted_full_read_is_probed_once_when_parked) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    const i32 fd = f.conns[0].upstream_fd;
+    u8 bytes[64];
+    fill_pattern(bytes, sizeof(bytes));
+    REQUIRE(send_all(f.peer, bytes, sizeof(bytes)));
+    IoEvent event{};
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    REQUIRE_EQ(event.result, 64);
+    REQUIRE(f.backend.edge_runnable[1].read_ready);
+    REQUIRE(f.park(0));
+    const auto& transport = f.backend.stable_upstream[fd];
+    CHECK(transport.registered);
+    CHECK_FALSE(transport.idle_probe_pending);
+    REQUIRE_EQ(f.borrow(1), fd);
+}
+
 TEST(epoll_stable_edge, full_reads_continue_with_an_unchanged_kernel_registration) {
     StableEpollFixture f;
     REQUIRE(f.init(true));
@@ -896,13 +954,19 @@ TEST(epoll_stable, idle_fin_and_unsolicited_bytes_discard_only_the_idle_socket) 
     }
 }
 
-TEST(epoll_stable, borrow_probe_and_reload_still_reject_idle_transport) {
+TEST(epoll_stable, harvested_idle_readiness_and_reload_reject_idle_transport) {
     StableEpollFixture f;
     REQUIRE(f.init());
     const i32 fd = f.conns[0].upstream_fd;
     REQUIRE(f.park(0));
     const u8 byte = 's';
     REQUIRE_EQ(send(f.peer, &byte, 1, 0), 1);
+    // The event was harvested but its idle callback has not run yet.
+    f.backend.ready[0] = {EPOLLIN, {.u64 = f.backend.fd_interest[1].data}};
+    f.backend.ready_slot[0] = EpollBackend::kStableReadySlotBit | static_cast<u32>(fd);
+    f.backend.ready_gen[0] = f.backend.stable_upstream[fd].version;
+    f.backend.ready_head = 0;
+    f.backend.ready_count = 1;
     CHECK_EQ(f.pool.take_idle(0, 0), -1);
     CHECK_FALSE(f.backend.stable_upstream[fd].registered);
     CHECK_EQ(f.pool.idle_count.load(), 0u);
@@ -914,6 +978,23 @@ TEST(epoll_stable, borrow_probe_and_reload_still_reject_idle_transport) {
     reload.pool.drain();
     CHECK_FALSE(reload.backend.stable_upstream[reload_fd].registered);
     CHECK_EQ(reload.pool.idle_count.load(), 0u);
+}
+
+TEST(epoll_stable, backend_teardown_clears_idle_close_hook) {
+    StableEpollFixture f;
+    REQUIRE(f.init());
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE(f.park(0));
+    REQUIRE(f.pool.before_idle_close != nullptr);
+
+    // The pool outlives this backend during a shard/backend rebind.
+    f.backend.shutdown();
+    CHECK(f.pool.before_idle_close == nullptr);
+    CHECK(f.pool.idle_close_ctx == nullptr);
+    REQUIRE_EQ(::send(f.peer, "x", 1, MSG_NOSIGNAL), 1);
+    CHECK_EQ(f.pool.take_idle(0, 0), -1);
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
 }
 
 TEST(epoll_stable, generation_rejects_old_token_even_when_owner_version_matches) {
