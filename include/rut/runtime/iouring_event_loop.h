@@ -495,6 +495,7 @@ public:
     u32 recv_rearm_slot_cursor = 0;
     u32 ws_cache_rearm_cursor = 0;  // connection where the upstream pass resumes
     u32 ws_cache_rearm_budget = 0;
+    u32 ws_cache_upstream_rearm_pending_count = 0;
     bool ws_cache_rearm_upstream_turn = true;
 
     enum class CompleteContentLengthTerminalDisposition : u8 {
@@ -623,6 +624,7 @@ public:
         recv_rearm_count = 0;
         recv_rearm_cursor = 0;
         ws_cache_rearm_cursor = 0;
+        ws_cache_upstream_rearm_pending_count = 0;
         recv_rearm_slot_cursor = 0;
         ws_cache_rearm_upstream_turn = true;
         // conns[] is mapped but neither constructed nor reset (lazy pages);
@@ -645,6 +647,7 @@ public:
         slots_initialized = 0;
         pending_free_count = 0;
         deferred_relay_read_count = 0;
+        ws_cache_upstream_rearm_pending_count = 0;
         free_top = 0;
         response_read_deadline_body_pump_pending = false;
         body_pump_ready_words.destroy();
@@ -1990,7 +1993,7 @@ public:
             return false;
         c.chain_direct_recv_owner = {c.response_body_tail.tail, dst, len, c.upstream_episode, true};
         c.upstream_recv_direct_armed = true;
-        c.upstream_recv_pause_rearm_pending = false;
+        set_upstream_cache_rearm_pending(c, false);
         return true;
     }
 
@@ -3369,6 +3372,7 @@ public:
 
     void free_conn_impl(Connection& c) {
         u32 cid = c.id;
+        set_upstream_cache_rearm_pending(c, false);
         timer.remove(&c);
         // A recv waiting for buffers must not re-arm on a reused slot.
         clear_deferred_recv(cid);
@@ -3554,11 +3558,12 @@ public:
     // Cache-mode upstream recvs must wait for a retained provided buffer to
     // return. Retrying while the cache owns every buffer only produces another
     // -ENOBUFS CQE and can spin the shard without making progress.
-    void rearm_deferred_ws_cache_recvs() {
-        if (!backend.ws_recv_cache_enabled) return;
+    bool rearm_deferred_ws_cache_recvs() {
+        if (!backend.ws_recv_cache_enabled) return false;
+        if (ws_cache_upstream_rearm_pending_count == 0) return false;
         u32 budget = ws_cache_rearm_budget;
-        if (budget == 0) return;
-        if (slots_initialized == 0) return;
+        if (budget == 0) return false;
+        if (slots_initialized == 0) return false;
         const u32 start = ws_cache_rearm_cursor < slots_initialized ? ws_cache_rearm_cursor : 0;
         for (u32 offset = 0; offset < slots_initialized; ++offset) {
             const u32 id = (start + offset) % slots_initialized;
@@ -3569,14 +3574,24 @@ public:
             const bool was_armed = c.upstream_recv_armed;
             if (!try_deferred_upstream_rearm(c)) {
                 close_conn(c);
-                return;
+                return true;
             }
             if (!was_armed && c.upstream_recv_armed) {
                 ws_cache_rearm_cursor = (id + 1u) % slots_initialized;
                 ws_cache_rearm_budget = --budget;
-                if (budget == 0) return;
+                if (budget == 0) return true;
             }
         }
+        return true;
+    }
+
+    void set_upstream_cache_rearm_pending(Connection& c, bool pending) {
+        if (c.upstream_recv_pause_rearm_pending == pending) return;
+        if (pending)
+            ++ws_cache_upstream_rearm_pending_count;
+        else if (ws_cache_upstream_rearm_pending_count != 0)
+            --ws_cache_upstream_rearm_pending_count;
+        c.upstream_recv_pause_rearm_pending = pending;
     }
 
     void rearm_deferred_cache_passes(bool force) {
@@ -4147,6 +4162,10 @@ public:
     // A relay switches to bulk buffers only while at least this much body is
     // still to come; shorter tails finish in ordinary slices.
     static constexpr u32 kBulkRelayMinRemaining = 128 * 1024;
+
+    void mark_upstream_cache_rearm_pending(Connection& c, bool pending) {
+        set_upstream_cache_rearm_pending(c, pending);
+    }
 
 #ifdef RUT_TESTING
 public:
@@ -4725,7 +4744,7 @@ public:
     bool submit_recv_upstream_impl(Connection& c) {
         if (ws_splice.intercept_recv(*this, c)) return true;
         if (c.upstream_recv_paused_for_send) {
-            c.upstream_recv_pause_rearm_pending = true;
+            set_upstream_cache_rearm_pending(c, true);
             return true;
         }
         if (c.upstream_recv_armed) {
@@ -4734,7 +4753,7 @@ public:
             // If either the cancel or that recv terminal is still in flight, this isn't a
             // live recv we can rely on — remember the re-arm so it fires once both drain.
             if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight)
-                c.upstream_recv_pause_rearm_pending = true;
+                set_upstream_cache_rearm_pending(c, true);
             return true;
         }
         // Defer-until-drains: a prior pause's cancel SQE and/or the cancelled recv are
@@ -4746,7 +4765,7 @@ public:
         // clears cancel_inflight; try_deferred_upstream_rearm re-arms once both are clear.
         // (epoll's pause is synchronous and never sets these, so this is io_uring-only.)
         if (c.upstream_recv_pause_cancel_pending || c.upstream_recv_cancel_inflight) {
-            c.upstream_recv_pause_rearm_pending = true;
+            set_upstream_cache_rearm_pending(c, true);
             return true;
         }
         const bool kPollFirst = study_ws_poll_first && use_one_shot_websocket_recv(c) &&
@@ -4789,7 +4808,7 @@ public:
             c.upstream_recv_direct_armed = direct;
             c.pending_ops++;
             c.upstream_recv_armed = true;
-            c.upstream_recv_pause_rearm_pending = false;
+            set_upstream_cache_rearm_pending(c, false);
             return true;
         }
         return false;
@@ -7388,9 +7407,15 @@ public:
         drain_response_read_deadline_body_pump_ready(static_cast<Callback&&>(callback));
     }
     void test_close_listen() { close_listen(); }
-    void test_rearm_deferred_ws_cache_recvs() {
+    bool test_rearm_deferred_ws_cache_recvs() {
         ws_cache_rearm_budget = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
-        rearm_deferred_ws_cache_recvs();
+        return rearm_deferred_ws_cache_recvs();
+    }
+    void test_mark_upstream_cache_rearm_pending(Connection& c, bool pending) {
+        set_upstream_cache_rearm_pending(c, pending);
+    }
+    u32 test_ws_cache_upstream_rearm_pending_count() const {
+        return ws_cache_upstream_rearm_pending_count;
     }
     void test_rearm_deferred_recvs() {
         ws_cache_rearm_budget = kProvidedBufCount - backend.ws_recv_cache_ordinary_count;
@@ -7627,7 +7652,7 @@ public:
             // upstream call, which happens only once the upstream is connected.
             return true;
         }
-        c.upstream_recv_pause_rearm_pending = false;
+        set_upstream_cache_rearm_pending(c, false);
         return submit_recv_upstream_impl(c);
     }
 
@@ -8969,7 +8994,7 @@ public:
                             }
                             if (kOneShotRingEmpty) {
                                 if (ws_recv_cache_active(conn)) {
-                                    conn.upstream_recv_pause_rearm_pending = true;
+                                    set_upstream_cache_rearm_pending(conn, true);
                                     break;
                                 }
                                 if (!this->submit_recv_upstream(conn)) this->close_conn(conn);

@@ -1476,6 +1476,61 @@ TEST(websocket, iouring_splice_eof_retries_failed_read_cancel_without_wait) {
     CHECK_EQ(loop.backend.failure_code(), 0);
 }
 
+TEST(websocket, iouring_splice_external_close_retries_failed_poll_cancel_without_wait) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    Peer client{downstream[1]}, origin{upstream[1]};
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 free_before = loop.free_top;
+    conn->fd = downstream[0];
+    conn->upstream_fd = upstream[0];
+    conn->upstream_episode = 1;
+    REQUIRE(set_nonblocking(conn->fd));
+    REQUIRE(set_nonblocking(conn->upstream_fd));
+    auto& owner = loop.ws_splice.owners[conn->id];
+    owner.active = true;
+    owner.requested = true;
+    owner.episode = conn->upstream_episode;
+    ++conn->pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner.direction[direction].read_fd = fds[0];
+        owner.direction[direction].write_fd = fds[1];
+    }
+    REQUIRE(loop.ws_splice.arm(loop, *conn, 1, false));
+    loop.test_fail_next_ws_splice_cancel = true;
+
+    loop.close_conn(*conn);
+    CHECK(owner.closing);
+    CHECK(owner.queued);
+    CHECK(owner.budget_deferred);
+    CHECK_EQ(loop.ws_splice.budget_deferred_runnable_count, 1u);
+    CHECK_FALSE(loop.should_wait_for_event());
+
+    // Retry the failed cancel before any wait; the cancel CQE and target CQE
+    // then retire the owner pin exactly once.
+    loop.ws_splice.progress(loop);
+    CHECK(owner.direction[1].cancel_owned || !owner.direction[1].armed);
+    for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(conn->pending_ops, 0u);
+    CHECK_EQ(loop.free_top, free_before + 1u);
+    CHECK_EQ(loop.ws_splice.budget_deferred_runnable_count, 0u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
+}
+
 TEST(websocket, iouring_splice_repeated_eof_cancel_failures_stay_runnable) {
     LoopStorage storage;
     if (!storage.init()) return;

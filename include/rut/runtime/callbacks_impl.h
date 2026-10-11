@@ -10349,8 +10349,14 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
             // A pre-tunnel upstream recv cancel in flight will clear upstream_recv_armed —
             // mark a deferred re-arm so its completion re-arms (a zero-output early backend
             // frame coalesced with the 101 would otherwise stop further backend reads).
-            if (conn.upstream_recv_pause_cancel_pending)
-                conn.upstream_recv_pause_rearm_pending = true;
+            if (conn.upstream_recv_pause_cancel_pending) {
+                if constexpr (requires(Loop* l, Connection& c) {
+                                  l->mark_upstream_cache_rearm_pending(c, true);
+                              })
+                    loop->mark_upstream_cache_rearm_pending(conn, true);
+                else
+                    conn.upstream_recv_pause_rearm_pending = true;
+            }
             if (!conn.upstream_recv_armed) {
                 conn.upstream_recv_paused_for_send = false;
                 return loop->submit_recv_upstream(conn);

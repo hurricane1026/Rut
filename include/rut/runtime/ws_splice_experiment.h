@@ -73,6 +73,7 @@ struct WsSpliceExperiment {
             queued[(queued_head + queued_count) % queued.size()] = id;
             ++queued_count;
             if (owners[id].budget_deferred) ++budget_deferred_runnable_count;
+            budget_deferred_runnable = budget_deferred_runnable_count != 0;
         }
     }
     void set_budget_deferred(u32 id, bool deferred) {
@@ -85,6 +86,7 @@ struct WsSpliceExperiment {
                 --budget_deferred_runnable_count;
         }
         owner.budget_deferred = deferred;
+        budget_deferred_runnable = budget_deferred_runnable_count != 0;
     }
     u32 dequeue() {
         const u32 id = queued[queued_head];
@@ -93,6 +95,7 @@ struct WsSpliceExperiment {
         owners[id].queued = false;
         if (owners[id].budget_deferred && budget_deferred_runnable_count != 0)
             --budget_deferred_runnable_count;
+        budget_deferred_runnable = budget_deferred_runnable_count != 0;
         return id;
     }
     static void close_pipes(Owner& owner) {
@@ -428,10 +431,18 @@ struct WsSpliceExperiment {
                 const auto kType = d.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                 const u64 kTarget = encode_upstream_event_token(
                     {c.id, kType, o.episode, static_cast<u8>(32 + index)});
-                if (loop.backend.cancel_ws_splice_poll(
-                        kTarget, c.id, kType, static_cast<u8>(96 + index), o.episode)) {
+                bool submitted = false;
+#ifdef RUT_TESTING
+                if (!loop.test_consume_ws_splice_cancel_failure())
+#endif
+                    submitted = loop.backend.cancel_ws_splice_poll(
+                        kTarget, c.id, kType, static_cast<u8>(96 + index), o.episode);
+                if (submitted) {
                     d.cancel_owned = true;
                     ++c.pending_ops;
+                } else {
+                    set_budget_deferred(c.id, true);
+                    enqueue(c.id);
                 }
             }
             pending = pending || d.armed || d.cancel_owned || d.cancel_acknowledged;

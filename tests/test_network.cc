@@ -40798,7 +40798,7 @@ struct OneShotRecvFixture {
             conn->upstream_recv_armed = false;
             conn->upstream_recv_paused_for_send = false;
             conn->upstream_recv_pause_cancel_pending = false;
-            conn->upstream_recv_pause_rearm_pending = false;
+            loop->test_mark_upstream_cache_rearm_pending(*conn, false);
             conn->upstream_recv_cancel_inflight = false;
             conn->upstream_recv_terminal_stale = false;
             if (conn->fd >= 0)
@@ -41667,7 +41667,7 @@ TEST(iouring_upstream_recv, cache_partial_capacity_and_terminate_keep_one_shot) 
     conn.is_ws_terminate = false;
     CHECK(!loop.test_use_one_shot_websocket_recv(conn));
 
-    conn.upstream_recv_pause_rearm_pending = true;
+    loop.test_mark_upstream_cache_rearm_pending(conn, true);
     loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 2u;
     const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
     loop.test_rearm_deferred_ws_cache_recvs();
@@ -41688,7 +41688,7 @@ TEST(iouring_cache_rearm, shared_budget_keeps_downstream_pending) {
     REQUIRE(loop.submit_recv(conn));
     REQUIRE(loop.submit_recv_upstream(conn));
     loop.test_defer_recv_rearm(conn);
-    conn.upstream_recv_pause_rearm_pending = true;
+    loop.test_mark_upstream_cache_rearm_pending(conn, true);
     conn.upstream_recv_armed = false;
     const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
     loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;
@@ -41831,8 +41831,9 @@ TEST(iouring_cache_rearm, upstream_budget_one_round_robins_pending_owners) {
     first.conn->is_ws_tunnel = second.conn->is_ws_tunnel = true;
     REQUIRE(loop.submit_recv(*first.conn));
     REQUIRE(loop.submit_recv(*second.conn));
-    first.conn->upstream_recv_pause_rearm_pending = true;
-    second.conn->upstream_recv_pause_rearm_pending = true;
+    loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);
+    loop.test_mark_upstream_cache_rearm_pending(*second.conn, true);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 2u);
     first.conn->upstream_recv_armed = false;
     second.conn->upstream_recv_armed = false;
     const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
@@ -41840,6 +41841,7 @@ TEST(iouring_cache_rearm, upstream_budget_one_round_robins_pending_owners) {
     CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
     CHECK(first.conn->upstream_recv_armed);
     CHECK_FALSE(second.conn->upstream_recv_armed);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
 
     // Return the first owner's slot and repeat the same one-buffer turn. The
     // cursor must advance, otherwise the low-id owner monopolizes every pass.
@@ -41847,7 +41849,32 @@ TEST(iouring_cache_rearm, upstream_budget_one_round_robins_pending_owners) {
     loop.test_rearm_cache_passes_with_budget(1);
     CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 2u);
     CHECK(second.conn->upstream_recv_armed);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
     first.cleanup();
+    second.cleanup();
+}
+
+TEST(iouring_cache_rearm, no_upstream_pending_owner_skips_high_water_scan) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture first;
+    OneShotRecvFixture second;
+    REQUIRE(first.stage(guard.loop, /*plaintext=*/true));
+    REQUIRE(second.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    CHECK_GE(loop.slots_initialized, 2u);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
+
+    // Repeated deferral is idempotent, and close removes the pending owner
+    // before the slot may be reused.
+    loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);
+    loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+    loop.close_conn(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
     second.cleanup();
 }
 
@@ -41863,7 +41890,7 @@ TEST(iouring_cache_rearm, budget_one_alternates_repending_upstream_and_downstrea
     upstream.conn->is_ws_tunnel = downstream.conn->is_ws_tunnel = true;
     REQUIRE(loop.submit_recv(*upstream.conn));
     REQUIRE(loop.submit_recv(*downstream.conn));
-    upstream.conn->upstream_recv_pause_rearm_pending = true;
+    loop.test_mark_upstream_cache_rearm_pending(*upstream.conn, true);
     upstream.conn->upstream_recv_armed = false;
     loop.test_defer_recv_rearm(*downstream.conn);
     downstream.conn->recv_armed = false;
@@ -43014,7 +43041,7 @@ TEST(iouring_retirement, released_upstream_close_purges_lossy_stale_prefix_befor
 
     // Successor connected; its first recv was deferred behind the old drain.
     conn->upstream_fd = successor[0];
-    conn->upstream_recv_pause_rearm_pending = true;
+    loop->test_mark_upstream_cache_rearm_pending(*conn, true);
     conn->set_slots(nullptr, nullptr, &on_upstream_response<IoUringEventLoop>, nullptr);
 
     // wait() copied a prefix of an oversized stale CQE and reported -ENOBUFS.

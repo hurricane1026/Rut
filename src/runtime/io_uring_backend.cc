@@ -7,7 +7,6 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/response_read_deadline.h"
-#include <atomic>
 
 #include <errno.h>
 #include <linux/io_uring.h>
