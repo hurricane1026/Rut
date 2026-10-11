@@ -954,6 +954,24 @@ TEST(epoll_stable, idle_fin_and_unsolicited_bytes_discard_only_the_idle_socket) 
     }
 }
 
+TEST(epoll_stable_edge, idle_half_close_with_unread_data_discards_without_dispatch) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE(f.park(0));
+    REQUIRE_EQ(send(f.peer, "leftover", 8, MSG_NOSIGNAL), 8);
+    REQUIRE_EQ(shutdown(f.peer, SHUT_WR), 0);
+    IoEvent event{};
+    CHECK_EQ(f.backend.wait(&event, 1, f.conns, 2), 0u);
+    CHECK_EQ(f.pool.idle_count.load(), 0u);
+    CHECK_FALSE(f.backend.stable_upstream[fd].registered);
+    CHECK_EQ(f.conns[0].upstream_recv_buf.len(), 0u);
+    CHECK_EQ(f.conns[1].upstream_recv_buf.len(), 0u);
+    CHECK_EQ(f.pool.take_idle(0, 0), -1);
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+}
+
 TEST(epoll_stable, harvested_idle_readiness_and_reload_reject_idle_transport) {
     StableEpollFixture f;
     REQUIRE(f.init());

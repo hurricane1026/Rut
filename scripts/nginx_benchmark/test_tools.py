@@ -360,6 +360,30 @@ class ToolsTest(unittest.TestCase):
         relay_compare.validate_api_mixed_payload("api", 0)
         relay_compare.validate_api_mixed_payload("native", 4096)
 
+    def test_native_origin_reuse_wrappers_delegate_once_without_recursion(self):
+        original = mock.Mock(return_value=7)
+        owner = object()
+        markers = ["native-marker"]
+
+        class FakeHarness:
+            command = mock.Mock()
+            wrk = mock.Mock()
+            nginx = mock.Mock()
+            frontend = mock.Mock()
+            verify_origin_reuse = original
+
+        module = SimpleNamespace(Harness=FakeHarness)
+        module.main = lambda: module.Harness.verify_origin_reuse(owner, markers, True)
+        spec = SimpleNamespace(loader=mock.Mock())
+        with mock.patch.object(sys, "argv", ["relay_compare.py", "--engines", "epoll"]), \
+                mock.patch.object(relay_compare.importlib.util,
+                                  "spec_from_file_location", return_value=spec), \
+                mock.patch.object(relay_compare.importlib.util,
+                                  "module_from_spec", return_value=module), \
+                mock.patch.object(subprocess, "Popen"):
+            self.assertEqual(relay_compare.main(), 7)
+        original.assert_called_once_with(owner, markers, True)
+
     def test_api_mixed_size_rejected_before_output_module_or_process(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "must-not-be-created"
