@@ -114,6 +114,17 @@ def validate_direct_origin_configuration(parser, run_module, engines, remaining)
     return True
 
 
+def validate_mixed_small_concurrency(parser, run_module, options, remaining):
+    if options.mixed_small_bytes <= 0:
+        return
+    config_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    config_parser.add_argument("--concurrency", nargs="+", type=run_module.positive,
+                               default=[1, 32, 128])
+    concurrency, _ = config_parser.parse_known_args(remaining)
+    if any(value <= options.small_connections for value in concurrency.concurrency):
+        parser.error("every --concurrency value must exceed --small-connections for mixed workloads")
+
+
 def valid_api_origin_records(records, expected_markers, fresh_downstream, reuse=True):
     if [row[0] for row in records] != list(expected_markers):
         return False
@@ -166,6 +177,8 @@ def main():
     engines = options.engines.split(",")
     if not engines or any(e not in ("direct-origin", "uring", "baseline-uring", "epoll", "nginx") for e in engines):
         parser.error("--engines must contain direct-origin, uring, baseline-uring, epoll or nginx")
+    if len(set(engines)) != len(engines):
+        parser.error("--engines must not contain duplicates")
     if "baseline-uring" in engines and options.baseline_rut is None:
         parser.error("baseline-uring requires --baseline-rut and its matching rut-compile")
     if options.origin_workers < 1 or options.nginx_buffer_kib < 16:
@@ -190,6 +203,8 @@ def main():
             parser, "baseline-rut", options.baseline_rut)
         module.validate_executable(
             parser, "baseline-rut-compile", options.baseline_rut.with_name("rut-compile"))
+    if "--help" not in remaining:
+        validate_mixed_small_concurrency(parser, module, options, remaining)
     if "--help" not in remaining:
         validate_direct_origin_configuration(parser, module, engines, remaining)
         options.origin_cpus = ",".join(map(str, validate_origin_cpu_configuration(

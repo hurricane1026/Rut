@@ -94,6 +94,22 @@ def validate_benchmark_executables(parser, args):
     args.wrk = benchmark_run.validate_executable(parser, 'wrk', args.wrk)
 
 
+def reusable_case_row(log, destination, label):
+    status_path = destination / 'status.json'
+    try:
+        status = json.loads(status_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError('preserved case lacks valid completion status: ' + label) from error
+    if (not isinstance(status, dict) or status.get('complete') is not True
+            or status.get('valid') is not True):
+        raise RuntimeError('preserved case is incomplete or invalid: ' + label)
+    samples = [json.loads(line) for line in log.read_text().splitlines()
+               if line.startswith('{"requests"')]
+    if len(samples) != 1 or not samples[0].get('valid'):
+        raise RuntimeError('preserved incomplete or failed case: ' + label)
+    return samples[0]
+
+
 def summarize(rows, limit):
     groups = {}
     for row in rows:
@@ -202,11 +218,7 @@ def main():
         log = out / (label + '.log')
         destination = out / label
         if log.exists():
-            samples = [json.loads(line) for line in log.read_text().splitlines()
-                       if line.startswith('{"requests"')]
-            if len(samples) != 1 or not samples[0]['valid']:
-                raise RuntimeError('preserved incomplete or failed case: ' + label)
-            row = samples[0]
+            row = reusable_case_row(log, destination, label)
         else:
             origin_mode = 'api' if workload['mode'] == 'api' else 'native'
             argv = common + ['--engines', engine, '--origin-mode', origin_mode,

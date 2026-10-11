@@ -180,6 +180,48 @@ class ToolsTest(unittest.TestCase):
 
         self.assertEqual(validate(origin_cpus="03,06"), [3, 6])
 
+    def test_relay_rejects_duplicate_engines_before_import_or_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "study"
+            argv = ["relay_compare.py", "--engines", "uring,nginx,uring",
+                    "--output", str(output)]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(relay_compare.importlib.util, "spec_from_file_location") as load, \
+                    mock.patch.object(relay_compare.subprocess, "Popen") as popen, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    relay_compare.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("duplicates", stderr.getvalue())
+            self.assertFalse(output.exists())
+            load.assert_not_called()
+            popen.assert_not_called()
+
+    def test_relay_validates_every_mixed_small_concurrency_before_output(self):
+        parser = argparse.ArgumentParser(add_help=False)
+        options = SimpleNamespace(mixed_small_bytes=4096, small_connections=32)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            relay_compare.validate_mixed_small_concurrency(parser, run, options, [])
+        with self.assertRaises(SystemExit):
+            relay_compare.validate_mixed_small_concurrency(
+                parser, run, options, ["--concurrency", "64", "32", "128"])
+        self.assertIsNone(relay_compare.validate_mixed_small_concurrency(
+            parser, run, options, ["--concurrency", "64", "128"]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "study"
+            argv = ["relay_compare.py", "--engines", "uring", "--mixed-small-bytes", "4096",
+                    "--output", str(output)]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(relay_compare.subprocess, "Popen") as popen, \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    relay_compare.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("small-connections", stderr.getvalue())
+            self.assertFalse(output.exists())
+            popen.assert_not_called()
+
     def test_relay_direct_origin_requires_supported_plaintext_proxy_scenarios(self):
         parser = argparse.ArgumentParser(add_help=False)
         self.assertTrue(relay_compare.validate_direct_origin_configuration(
@@ -447,6 +489,31 @@ class ToolsTest(unittest.TestCase):
                 self.assertEqual(raised.exception.code, 2)
                 self.assertFalse(output.exists())
                 launch.assert_not_called()
+
+    def test_workload_reuses_only_complete_valid_child_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "case.log"
+            destination = root / "case"
+            destination.mkdir()
+            log.write_text(json.dumps({"requests": 1, "valid": True}) + "\n")
+            status = destination / "status.json"
+            status.write_text(json.dumps({"complete": True, "valid": True}))
+            row = workload_strategy.reusable_case_row(log, destination, "case")
+            self.assertTrue(row["valid"])
+
+            for contents in (
+                json.dumps({"complete": False, "valid": True}),
+                json.dumps({"complete": True, "valid": False}),
+                "{malformed",
+            ):
+                with self.subTest(status=contents):
+                    status.write_text(contents)
+                    with self.assertRaisesRegex(RuntimeError, "preserved case"):
+                        workload_strategy.reusable_case_row(log, destination, "case")
+            status.unlink()
+            with self.assertRaisesRegex(RuntimeError, "completion status"):
+                workload_strategy.reusable_case_row(log, destination, "case")
 
     def test_workload_cli_rejects_nonpositive_durations_before_output_or_process(self):
         for flag in ('--screen-seconds', '--confirm-seconds'):
