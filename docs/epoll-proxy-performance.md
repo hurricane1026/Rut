@@ -185,3 +185,14 @@ measurement/warmup errors and zero coalesced responses. Median short RPS was
 was 2,061 -> 2,080 (+0.92%). This validates the large-body fallback under load,
 but establishes neither a large-body throughput gain nor a precise regression
 bound. The individual controls are archived as `large-samples.json`.
+
+After withdrawing automatic batch tuning, five new alternating paired rounds
+compared the current batch-one default against parent `63d8e2da`, with no accept
+batch or coalescing override. The same 4 KiB workload and pins gave short RPS
+24,263 -> 29,573 (+21.89%) and p99 9.744 -> 8.125 ms (-16.62%). Every short pair
+improved (+19.86% to +25.85%). Keep-alive median RPS was 66,639 -> 66,832
+(+0.29%), p99 2.178 -> 2.198 ms; no keep-alive gain is claimed. All 20 samples
+and warmups had zero errors and passed response/reuse preflights. CLI defaults
+and overrides passed on the current binary. This confirms the coalescing
+benefit without selecting a machine-specific accept batch. Evidence is in
+`/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-coalesce-batch1-20261011/`.
