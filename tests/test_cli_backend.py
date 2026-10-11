@@ -103,9 +103,38 @@ def check_study_diagnostics_are_opt_in(binary):
     # runs and are not accidentally removed with the default suppression.
     clean_env = {key: value for key, value in os.environ.items()
                  if not key.startswith('RUT_STUDY_')}
-    for study_env, expected in [({}, None),
-                                ({'RUT_STUDY_HTTP_NODELAY': 'on'},
-                                 b'RUT_STUDY_HTTP_NODELAY mode=on\n')]:
+    cases = [
+        ({}, None),
+        ({'RUT_STUDY_HTTP_NODELAY': 'on'},
+         b'RUT_STUDY_HTTP_NODELAY mode=on\n'),
+        ({'RUT_STUDY_EPOLL_ET': 'on'},
+         (b'RUT_STUDY_EPOLL_ET mode=on\n',
+          b'RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n')),
+        ({'RUT_STUDY_EPOLL_ET': 'on', 'RUT_STUDY_HTTP_COALESCE_CLOSE': 'on',
+          'RUT_STUDY_EPOLL_ACCEPT_BATCH': '16'},
+         (b'RUT_STUDY_EPOLL_ET mode=on\n',
+          b'RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n',
+          b'RUT_STUDY_EPOLL_ACCEPT_BATCH limit=16\n')),
+        ({'RUT_STUDY_EPOLL_ET': 'on', 'RUT_STUDY_HTTP_COALESCE_CLOSE': 'off'},
+         (b'RUT_STUDY_EPOLL_ET mode=on\n',
+          b'RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n')),
+        ({'RUT_STUDY_EPOLL_ET': 'on', 'RUT_STUDY_HTTP_COALESCE_CLOSE': 'unknown'},
+         (b'RUT_STUDY_EPOLL_ET mode=on\n',
+          b'RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n')),
+        ({'RUT_STUDY_EPOLL_ET': 'off'},
+         (b'RUT_STUDY_EPOLL_ET mode=off\n',
+          b'RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n')),
+        ({'RUT_STUDY_EPOLL_ET': 'off', 'RUT_STUDY_HTTP_COALESCE_CLOSE': 'on'},
+         (b'RUT_STUDY_EPOLL_ET mode=off\n',
+          b'RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n')),
+        ({'RUT_STUDY_EPOLL_ET': 'off', 'RUT_STUDY_HTTP_COALESCE_CLOSE': 'off'},
+         (b'RUT_STUDY_EPOLL_ET mode=off\n',
+          b'RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n')),
+        ({'RUT_STUDY_EPOLL_ET': 'off', 'RUT_STUDY_HTTP_COALESCE_CLOSE': 'unknown'},
+         (b'RUT_STUDY_EPOLL_ET mode=off\n',
+          b'RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n')),
+    ]
+    for study_env, expected in cases:
         env = clean_env.copy()
         env.update(study_env)
         proc = subprocess.Popen([binary, '0', '--shards', '1', '--no-pin', '--drain', '0',
@@ -126,6 +155,9 @@ def check_study_diagnostics_are_opt_in(binary):
             assert b'Listening on port ' in output, output.decode(errors='replace')
             if expected is None:
                 assert b'RUT_STUDY_' not in output, output.decode(errors='replace')
+            elif isinstance(expected, tuple):
+                for line in expected:
+                    assert line in output, output.decode(errors='replace')
             else:
                 assert expected in output, output.decode(errors='replace')
             os.killpg(proc.pid, signal.SIGTERM)

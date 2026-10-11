@@ -568,15 +568,6 @@ static bool configure_study_policy(Loop* loop) {
                               ? "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE mode=on\n"
                               : "RUT_STUDY_REQUEST_POLICY_VALIDATION_REUSE mode=off\n");
         }
-        if constexpr (requires { loop->study_http_coalesce_close_response; }) {
-            for (const char* const* item = environ; *item != nullptr; ++item)
-                if (str_eq(*item, "RUT_STUDY_HTTP_COALESCE_CLOSE=on"))
-                    loop->study_http_coalesce_close_response = true;
-            if (report_study)
-                write_str(loop->study_http_coalesce_close_response
-                              ? "RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n"
-                              : "RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n");
-        }
         if constexpr (requires { loop->backend.study_accept_batch_limit; }) {
             for (const char* const* item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_EPOLL_ACCEPT_BATCH=4"))
@@ -600,6 +591,21 @@ static bool configure_study_policy(Loop* loop) {
             if (report_study)
                 write_str(loop->backend.study_edge_trigger ? "RUT_STUDY_EPOLL_ET mode=on\n"
                                                            : "RUT_STUDY_EPOLL_ET mode=off\n");
+        }
+        if constexpr (requires { loop->study_http_coalesce_close_response; }) {
+            // Apply the ET default only after ET initialization succeeds.
+            if constexpr (requires { loop->backend.study_edge_trigger; })
+                loop->study_http_coalesce_close_response = loop->backend.study_edge_trigger;
+            for (const char* const* item = environ; *item != nullptr; ++item) {
+                if (str_eq(*item, "RUT_STUDY_HTTP_COALESCE_CLOSE=on"))
+                    loop->study_http_coalesce_close_response = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_COALESCE_CLOSE=off"))
+                    loop->study_http_coalesce_close_response = false;
+            }
+            if (report_study)
+                write_str(loop->study_http_coalesce_close_response
+                              ? "RUT_STUDY_HTTP_COALESCE_CLOSE mode=on\n"
+                              : "RUT_STUDY_HTTP_COALESCE_CLOSE mode=off\n");
         }
         if constexpr (requires { loop->backend.study_accept_batch_limit; }) {
             if (report_study) {
