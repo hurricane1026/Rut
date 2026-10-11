@@ -19,18 +19,21 @@ struct WsSpliceExperiment {
         i32 read_fd = -1, write_fd = -1;
         u32 buffered = 0;
         bool eof = false, armed = false, writing = false, cancel_owned = false;
+        // A cancel CQE can precede its target poll CQE. Keep the target's
+        // cancellation state until that poll retires, so it is never canceled twice.
+        bool cancel_acknowledged = false;
         bool copying = false, probe_copy = true;
     };
     struct Owner {
         Direction direction[2];
         u32 episode = 0;
         u8 next_direction = 0;
-#ifdef RUT_TESTING
+        // Diagnostic storage is unconditional to keep Owner layout identical
+        // across rut_runtime and RUT_TESTING translation units.
         u64 eof_read_calls[2]{}, eof_forwarded_bytes[2]{};
         u32 eof_opposite_buffered_at_snapshot = 0;
         bool eof_snapshot_taken = false, eof_reverse_write_cancel_attempted = false,
              eof_cancel_retry_deferred = false;
-#endif
         bool requested = false, active = false, closing = false, eof_closing = false,
              queued = false, failed = false, budget_deferred = false, reclaim_pending = false;
     };
@@ -166,8 +169,8 @@ struct WsSpliceExperiment {
         for (u32 index = 0; index < 2; ++index) {
             auto& d = o.direction[index];
             if (!d.eof || d.buffered != 0) return;
-            if (d.armed || d.cancel_owned) {
-                if (d.armed && !d.cancel_owned) {
+            if (d.armed || d.cancel_owned || d.cancel_acknowledged) {
+                if (d.armed && !d.cancel_owned && !d.cancel_acknowledged) {
                     const auto kType = d.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                     const u64 kTarget = encode_upstream_event_token(
                         {c.id, kType, o.episode, static_cast<u8>(32 + index)});
@@ -202,7 +205,7 @@ struct WsSpliceExperiment {
     void pump(Loop& loop, Connection& c, u32 index) {
         auto& o = owners[c.id];
         auto& d = o.direction[index];
-        if (!o.active || o.closing || d.armed) return;
+        if (!o.active || o.closing || d.armed || d.cancel_owned || d.cancel_acknowledged) return;
         if (d.eof && d.buffered == 0) {
             finish_eof_close(loop, c);
             return;
@@ -284,7 +287,7 @@ struct WsSpliceExperiment {
                 // If this was the last call, the opposite direction still needs
                 // one probe before both directions can sleep on readiness.
                 if (turn_budget_remaining == 0 && !other.armed && !other.cancel_owned &&
-                    (!other.eof || other.buffered != 0))
+                    !other.cancel_acknowledged && (!other.eof || other.buffered != 0))
                     set_budget_deferred(c.id, true);
                 o.next_direction = static_cast<u8>(index ^ 1u);
                 enqueue(c.id);
@@ -322,13 +325,15 @@ struct WsSpliceExperiment {
                 other.eof = true;
 #ifdef RUT_TESTING
                 o.eof_opposite_buffered_at_snapshot = other.buffered;
-                o.eof_reverse_write_cancel_attempted =
-                    other.armed && other.writing && !other.cancel_owned;
+                o.eof_reverse_write_cancel_attempted = other.armed && other.writing &&
+                                                       !other.cancel_owned &&
+                                                       !other.cancel_acknowledged;
 #endif
                 // A buffered reverse write is part of the EOF snapshot and
                 // must drain before either endpoint is closed. Only an armed
                 // read can be canceled to stop new bytes entering the pipe.
-                if (other.armed && !other.writing && !other.cancel_owned) {
+                if (other.armed && !other.writing && !other.cancel_owned &&
+                    !other.cancel_acknowledged) {
                     const auto kType =
                         other.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                     const u64 kTarget = encode_upstream_event_token(
@@ -419,7 +424,7 @@ struct WsSpliceExperiment {
         bool pending = false;
         for (u32 index = 0; index < 2; ++index) {
             auto& d = o.direction[index];
-            if (d.armed && !d.cancel_owned) {
+            if (d.armed && !d.cancel_owned && !d.cancel_acknowledged) {
                 const auto kType = d.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                 const u64 kTarget = encode_upstream_event_token(
                     {c.id, kType, o.episode, static_cast<u8>(32 + index)});
@@ -429,7 +434,7 @@ struct WsSpliceExperiment {
                     ++c.pending_ops;
                 }
             }
-            pending = pending || d.armed || d.cancel_owned;
+            pending = pending || d.armed || d.cancel_owned || d.cancel_acknowledged;
         }
         if (!pending) {
             o.closing = false;
@@ -465,10 +470,13 @@ struct WsSpliceExperiment {
             return true;
         }
         --c.pending_ops;
-        if (kCancel)
+        if (kCancel) {
             d.cancel_owned = false;
-        else
+            d.cancel_acknowledged = d.armed;
+        } else {
             d.armed = false;
+            d.cancel_acknowledged = false;
+        }
         if (o.closing) {
             retire(loop, c);
             return true;
@@ -510,7 +518,8 @@ struct WsSpliceExperiment {
                      ++offset) {
                     const u32 direction = (o.next_direction + offset) & 1u;
                     if (o.direction[direction].buffered != 0 && !o.direction[direction].armed &&
-                        !o.direction[direction].cancel_owned)
+                        !o.direction[direction].cancel_owned &&
+                        !o.direction[direction].cancel_acknowledged)
                         pump(loop, c, direction);
                 }
                 o.next_direction ^= 1u;

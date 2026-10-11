@@ -1601,6 +1601,75 @@ TEST(websocket, iouring_splice_eof_close_retires_owner_once) {
     }
 }
 
+TEST(websocket, iouring_splice_cancel_ack_and_target_retire_in_either_order) {
+    for (const bool ack_first : {false, true}) {
+        LoopStorage storage;
+        if (!storage.init()) return;
+        auto& loop = *storage.loop;
+        REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+        int peers[2];
+        REQUIRE_EQ(test::stream_socketpair(peers), 0);
+        Peer peer{peers[1]};
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        const u32 free_before = loop.free_top;
+        conn->fd = peers[0];
+        conn->upstream_episode = 7;
+        auto& owner = loop.ws_splice.owners[conn->id];
+        owner.episode = conn->upstream_episode;
+        owner.active = true;
+        owner.requested = true;
+        ++conn->pending_ops;  // splice owner pin
+        REQUIRE(loop.ws_splice.arm(loop, *conn, 0, false));
+
+        const u32 before_close = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+        loop.close_conn(*conn);
+        CHECK(conn->fd < 0);
+        REQUIRE(owner.direction[0].cancel_owned);
+        CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), before_close + 1u);
+        const u32 after_cancel = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+
+        const IoEvent kCancelAck{
+            conn->id, -EALREADY, 0, 0, IoEventType::RelayRead, 0, 96, owner.episode};
+        const IoEvent kTarget{
+            conn->id, -ECANCELED, 0, 0, IoEventType::RelayRead, 0, 32, owner.episode};
+        if (ack_first) {
+            CHECK(loop.ws_splice.dispatch(loop, kCancelAck));
+            CHECK_FALSE(owner.direction[0].cancel_owned);
+            CHECK(owner.direction[0].cancel_acknowledged);
+            CHECK(owner.direction[0].armed);
+            CHECK_EQ(conn->pending_ops, 2u);  // owner pin + target poll
+            loop.ws_splice.progress(loop);
+            CHECK_FALSE(owner.direction[0].cancel_owned);
+            CHECK(owner.direction[0].cancel_acknowledged);
+            CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), after_cancel);
+            CHECK(loop.ws_splice.dispatch(loop, kTarget));
+        } else {
+            CHECK(loop.ws_splice.dispatch(loop, kTarget));
+            CHECK_FALSE(owner.direction[0].armed);
+            CHECK(owner.direction[0].cancel_owned);
+            CHECK_FALSE(owner.direction[0].cancel_acknowledged);
+            CHECK_EQ(conn->pending_ops, 2u);  // owner pin + cancel CQE
+            loop.ws_splice.progress(loop);
+            CHECK(owner.direction[0].cancel_owned);
+            CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), after_cancel);
+            CHECK(loop.ws_splice.dispatch(loop, kCancelAck));
+        }
+
+        // The slot's owner pin is released from the dispatch path, then the
+        // queued reclaim handoff drains without another readiness event.
+        loop.ws_splice.progress(loop);
+        CHECK_FALSE(owner.direction[0].armed);
+        CHECK_FALSE(owner.direction[0].cancel_owned);
+        CHECK_FALSE(owner.direction[0].cancel_acknowledged);
+        CHECK_EQ(conn->pending_ops, 0u);
+        CHECK_EQ(loop.free_top, free_before + 1u);
+        CHECK_EQ(loop.ws_splice.queued_count, 0u);
+        CHECK_FALSE(owner.closing);
+        CHECK_EQ(loop.backend.failure_code(), 0);
+    }
+}
+
 TEST(websocket, iouring_splice_buffered_prefix_handoff) {
     full_duplex_burst(_tc, false, false, false, true, false, 37);
 }

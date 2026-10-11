@@ -40,10 +40,10 @@ The parent directory retains 27 three-repeat initial copy-first measurements and
 
 ## Validation and provenance
 
-Release runtime/compiler and native WebSocket regression target built successfully. CTest test_ws_tunnel_iouring and test_splice passed after the final change. Added cases cover 64B, exact4096 and4097 byte boundaries, buffered handoff, slow readers, full duplex, half-close reverse reply, and close with pending polls. Affected files passed clang-format22 and git diff whitespace checks. Targeted clang-tidy22 on the WebSocket test and experiment header reported no visible diagnostics. Full CI and sanitizer validation have not run for this experiment. Existing compile warnings in unrelated event-loop expressions remain.
+Release runtime/compiler and native WebSocket regression target built successfully. CTest test_ws_tunnel_iouring and test_splice passed after the final change. Added cases cover 64B, exact4096 and4097 byte boundaries, buffered handoff, slow readers, full duplex, first-EOF drain of the already-buffered opposite-direction snapshot followed by terminal close, and close with pending polls. Affected files passed clang-format22 and git diff whitespace checks. Targeted clang-tidy22 on the WebSocket test and experiment header reported no visible diagnostics. Full CI and sanitizer validation have not run for this experiment. Existing compile warnings in unrelated event-loop expressions remain.
 
 Runtime SHA256: `aefe084463ad9323442b1cf60b6bb3ccb0fc900942d41531382145ab7d7f83ff`.
 Compiler SHA256: `8223eeddbbed631257231726e9984adc015c1e91880ca13097a5605f6ece7952`.
 Client SHA256: `8f9433dd9390a0805d9f6619472f16987258e5784980644386a9b847dfb0f3b4`.
 
-Raw measurements, tcpkali2 CSV files, frontend/origin logs, runner scripts and frozen binaries are retained under this checkpoint directory.
+This checkpoint directory contains `README.md` and `measurements.json`. The raw measurements, tcpkali2 CSV files, frontend/origin logs, runner scripts, and frozen runtime/compiler/client binaries are unavailable in this repository snapshot, so the reported measurements cannot be independently replayed from archived artifacts here.

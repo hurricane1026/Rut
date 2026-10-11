@@ -47,7 +47,7 @@ Release Rut/compiler and relevant native targets rebuilt. WebSocket and splice C
 
 Targeted clang-tidy22 reported no diagnostics in newly changed regions; the existing event-loop header still emits older diagnostics. Full CI and sanitizers have not run. Optional mask helper previously passed36vectors, including unaligned output and1MiB payloads. It is not linked into Rut.
 
-The checkpoint directory retains16 copy/gating screens,24 preparation measurements,32 scan measurements,2 origin probes,4 core probes, manifests, raw client CSVs, logs, runner scripts and frozen binaries.
+This checkpoint directory contains `README.md`, `measurements.json`, and `core-usage.json`. The copy/gating screens, preparation and scan measurements, origin/core probe manifests, raw client CSVs, logs, runner scripts, and frozen binaries described in the original experiment record are unavailable in this repository snapshot.
 
 rut SHA256: 1f385fb3e741177c5ffb862f9fa1af2c55decb333051b4656c6bbb029352f7d1
 
