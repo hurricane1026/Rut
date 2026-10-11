@@ -40,6 +40,15 @@ from summarize import aggregate, render
 from matrix import assess
 
 
+def make_executable_fixtures(directory):
+    paths = {name: Path(directory) / name for name in ("rut", "converter", "wrk")}
+    paths["rut-compile"] = paths["rut"].with_name("rut-compile")
+    for path in paths.values():
+        path.write_text("#!/bin/sh\nexit 0\n")
+        path.chmod(0o755)
+    return paths
+
+
 class FakeSocket:
     def __init__(self, chunks):
         self.chunks = iter(chunks)
@@ -170,6 +179,41 @@ class ToolsTest(unittest.TestCase):
                 validate(**case)
 
         self.assertEqual(validate(origin_cpus="03,06"), [3, 6])
+
+    def test_relay_direct_origin_requires_supported_plaintext_proxy_scenarios(self):
+        parser = argparse.ArgumentParser(add_help=False)
+        self.assertTrue(relay_compare.validate_direct_origin_configuration(
+            parser, run, ["uring"], []))
+        relay_compare.validate_direct_origin_configuration(
+            parser, run, ["direct-origin"], [
+                "--proxy-profile", "native-streaming", "--keepalive-header", "implicit",
+                "--scenarios", "proxy-close"
+            ])
+        for remaining in (
+            [],
+            ["--proxy-profile", "converter-strict", "--scenarios", "proxy-close"],
+            ["--proxy-profile", "native-streaming", "--tls-cert", "unused.pem",
+             "--keepalive-header", "implicit", "--scenarios", "proxy-close"],
+            ["--proxy-profile", "native-streaming", "--scenarios", "static-close"],
+            ["--proxy-profile", "native-streaming", "--scenarios", "proxy-close"],
+        ):
+            with self.subTest(remaining=remaining), self.assertRaises(SystemExit):
+                relay_compare.validate_direct_origin_configuration(
+                    parser, run, ["direct-origin"], remaining)
+
+    def test_relay_direct_origin_defaults_fail_before_output_or_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "study"
+            argv = ["relay_compare.py", "--engines", "direct-origin", "--output", str(output),
+                    "--rut", "/bin/true", "--converter", "/bin/true", "--wrk", "/bin/true"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(relay_compare.subprocess, "Popen") as popen, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    relay_compare.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertFalse(output.exists())
+            popen.assert_not_called()
 
     def test_relay_rejects_unavailable_later_origin_cpu_before_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -392,9 +436,11 @@ class ToolsTest(unittest.TestCase):
             pass
 
         with tempfile.TemporaryDirectory() as directory:
+            tools = make_executable_fixtures(directory)
             argv = ['workload_strategy.py', '--output', str(Path(directory) / 'study'),
                     '--relay-script', str(Path(relay_compare.__file__)),
-                    '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                    '--rut', str(tools['rut']), '--converter', str(tools['converter']),
+                    '--wrk', str(tools['wrk']),
                     '--screen-seconds', '1', '--confirm-seconds', '1']
             with mock.patch.object(sys, 'argv', argv), \
                     mock.patch.object(Path, 'mkdir', side_effect=ReachedOutputSetup), \
@@ -402,6 +448,34 @@ class ToolsTest(unittest.TestCase):
                 with self.assertRaises(ReachedOutputSetup):
                     workload_strategy.main()
             launch.assert_not_called()
+
+    def test_workload_cli_rejects_invalid_executables_before_output_or_process(self):
+        for invalid in ('missing-rut', 'directory-compiler', 'nonexecutable-compiler',
+                        'nonexecutable-converter'):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                tools = make_executable_fixtures(directory)
+                if invalid == 'missing-rut':
+                    tools['rut'].unlink()
+                elif invalid == 'directory-compiler':
+                    tools['rut-compile'].unlink()
+                    tools['rut-compile'].mkdir()
+                elif invalid in ('nonexecutable-compiler', 'nonexecutable-converter'):
+                    target = (tools['rut-compile'] if invalid.endswith('compiler')
+                              else tools['converter'])
+                    target.chmod(0o644)
+                output = Path(directory) / 'study'
+                argv = ['workload_strategy.py', '--output', str(output),
+                        '--relay-script', str(relay_compare.__file__),
+                        '--rut', str(tools['rut']), '--converter', str(tools['converter']),
+                        '--wrk', str(tools['wrk'])]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(workload_strategy.subprocess, 'Popen') as launch, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        workload_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
 
     def test_workload_cli_rejects_invalid_p99_increase_limit_before_output_or_process(self):
         for limit in ('-0.1', 'nan', 'inf', '-inf'):
@@ -424,9 +498,11 @@ class ToolsTest(unittest.TestCase):
             pass
 
         with tempfile.TemporaryDirectory() as directory:
+            tools = make_executable_fixtures(directory)
             argv = ['workload_strategy.py', '--output', str(Path(directory) / 'study'),
                     '--relay-script', str(Path(relay_compare.__file__)),
-                    '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                    '--rut', str(tools['rut']), '--converter', str(tools['converter']),
+                    '--wrk', str(tools['wrk']),
                     '--p99-increase-limit', '0']
             with mock.patch.object(sys, 'argv', argv), \
                     mock.patch.object(Path, 'mkdir', side_effect=ReachedOutputSetup), \

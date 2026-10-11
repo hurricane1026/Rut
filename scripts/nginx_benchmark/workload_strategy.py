@@ -15,6 +15,8 @@ import statistics
 import subprocess
 import sys
 
+import run as benchmark_run
+
 WORKLOADS = [
     dict(name='tiny-512', body=512, mode='static', intent='dispatch overhead'),
     dict(name='api-fast-4k', body=4096, mode='api', intent='small API proxy'),
@@ -82,6 +84,14 @@ def require_matching_manifest(prior, manifest):
     if prior.exists() and json.loads(prior.read_text()) != manifest:
         raise RuntimeError('study manifest changed; use a new output directory')
     prior.write_text(json.dumps(manifest, indent=2) + '\n')
+
+
+def validate_benchmark_executables(parser, args):
+    args.rut = benchmark_run.validate_executable(parser, 'rut', args.rut)
+    benchmark_run.validate_executable(
+        parser, 'rut-compile', args.rut.with_name('rut-compile'))
+    args.converter = benchmark_run.validate_executable(parser, 'converter', args.converter)
+    args.wrk = benchmark_run.validate_executable(parser, 'wrk', args.wrk)
 
 
 def summarize(rows, limit):
@@ -159,6 +169,7 @@ def main():
         p.error('--screen-seconds and --confirm-seconds must be positive')
     if not math.isfinite(args.p99_increase_limit) or args.p99_increase_limit < 0:
         p.error('--p99-increase-limit must be finite and nonnegative')
+    validate_benchmark_executables(p, args)
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     workloads = [w for w in WORKLOADS if not args.workloads or w['name'] in args.workloads]

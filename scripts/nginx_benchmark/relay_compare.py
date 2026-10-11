@@ -85,6 +85,31 @@ def validate_origin_cpu_configuration(parser, run_module, options, remaining):
     return origin_cpus
 
 
+def validate_direct_origin_configuration(parser, run_module, engines, remaining):
+    if "direct-origin" not in engines:
+        return True
+    config_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    config_parser.add_argument("--proxy-profile", choices=(
+        "converter-strict", "converter-bounded", "native-streaming"),
+        default="converter-strict")
+    config_parser.add_argument("--tls-cert", type=Path)
+    config_parser.add_argument("--mode", choices=("benchmark", "diagnose"),
+                                default="benchmark")
+    config_parser.add_argument("--body-size", type=run_module.positive)
+    config_parser.add_argument("--concurrency", nargs="+", type=run_module.positive,
+                               default=[1, 32, 128])
+    config_parser.add_argument("--keepalive-header", choices=("explicit", "implicit"),
+                               default="explicit")
+    config_parser.add_argument("--bounded-origin-reuse", choices=("on", "off"),
+                               default="off")
+    config_parser.add_argument("--scenarios", nargs="+",
+                               choices=run_module.SCENARIOS,
+                               default=list(run_module.SCENARIOS))
+    options, _ = config_parser.parse_known_args(remaining)
+    run_module.validate_direct_origin_configuration(parser, options)
+    return True
+
+
 def valid_api_origin_records(records, expected_markers, fresh_downstream, reuse=True):
     if [row[0] for row in records] != list(expected_markers):
         return False
@@ -157,6 +182,7 @@ def main():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if "--help" not in remaining:
+        validate_direct_origin_configuration(parser, module, engines, remaining)
         options.origin_cpus = ",".join(map(str, validate_origin_cpu_configuration(
             parser, module, options, remaining)))
     sys.argv = [str(source), *remaining]

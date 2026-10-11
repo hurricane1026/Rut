@@ -1045,6 +1045,23 @@ def positive(value):
     return number
 
 
+def validate_executable(parser, name, path):
+    path = Path(path).resolve()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        parser.error(f"{name} must name an executable file")
+    return path
+
+
+def validate_direct_origin_configuration(parser, args):
+    if args.proxy_profile != "native-streaming":
+        parser.error("direct-origin requires --proxy-profile native-streaming")
+    validate_proxy_profile(parser, args)
+    if args.tls_cert:
+        parser.error("direct-origin supports plaintext HTTP only")
+    if args.mode != "benchmark":
+        parser.error("direct-origin supports benchmark mode only")
+
+
 def valid_warmup_result(result, warmup):
     return (bool(result["requests"])
             and result.get("valid", True)
@@ -1241,10 +1258,7 @@ def arguments():
     ) != len(args.scenarios):
         parser.error("duplicate concurrency or scenario")
     for attr in ("rut", "converter", "wrk"):
-        path = getattr(args, attr).resolve()
-        if not path.is_file() or not os.access(path, os.X_OK):
-            parser.error(f"{attr} must name an executable file")
-        setattr(args, attr, path)
+        setattr(args, attr, validate_executable(parser, attr, getattr(args, attr)))
     args.output = args.output.resolve()
     if args.output.exists() and (
         not args.output.is_dir() or any(args.output.iterdir())
