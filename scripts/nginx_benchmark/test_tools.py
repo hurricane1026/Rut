@@ -5,7 +5,9 @@ import argparse
 import io
 import json
 import os
+import re
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,7 +18,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 import run
+import api_origin
 import matrix
+import workload_strategy
+import protocol_workload
+import protocol_strategy
+import relay_compare
 
 from run import (
     Harness,
@@ -45,6 +52,653 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_mixed_result_requires_valid_warmup(self):
+        measured = dict(requests=10, errors={'connect': 0}, valid=True)
+        warmup = dict(requests=10, errors={'connect': 0}, valid=False)
+        self.assertFalse(run.valid_warmup_result(measured, warmup))
+        warmup['valid'] = True
+        self.assertTrue(run.valid_warmup_result(measured, warmup))
+        del warmup['valid']
+        self.assertTrue(run.valid_warmup_result(measured, warmup))
+
+    def test_protocol_workers_share_parent_published_measurement_window(self):
+        context = protocol_workload.multiprocessing.get_context('fork')
+        gate = dict(release=context.Event(), measurement=context.Value('d', 0),
+                    deadline=context.Value('d', 0), failed=context.Value('b', 0))
+
+        async def read_window():
+            waiters = [protocol_workload.await_client_window(gate) for _ in range(2)]
+            pending = protocol_workload.asyncio.ensure_future(
+                protocol_workload.asyncio.gather(*waiters))
+            await protocol_workload.asyncio.sleep(.01)
+            self.assertFalse(pending.done())
+            protocol_workload.publish_client_window(gate, 2, 5, now=100)
+            gate['release'].set()
+            return await pending
+
+        windows = protocol_workload.asyncio.run(read_window())
+        self.assertEqual(windows, [(102, 107), (102, 107)])
+
+    def test_api_origin_command_and_readiness_are_forwarded(self):
+        command = relay_compare.api_origin_command(
+            Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2
+        )
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[command.index("--port") + 1], "8704")
+        self.assertEqual(command[command.index("--cpus") + 1], "3,4")
+        self.assertEqual(command[command.index("--fragment-bytes") + 1], "16384")
+        mixed = relay_compare.api_origin_command(
+            Path("relay_compare.py"), 8704, "3,4", Path("payload.bin"), 1, 16384, .2,
+            Path("small.bin"), "/api4k")
+        self.assertEqual(mixed[mixed.index("--small-payload") + 1], "small.bin")
+        self.assertEqual(mixed[mixed.index("--small-path") + 1], "/api4k")
+        class ReadyProcess:
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "origin.log"
+            log.write_text("noise\nAPI_READY worker=0\nAPI_READY worker=1\n")
+            relay_compare.wait_for_api_origin_ready(log, ReadyProcess(), 2)
+
+    def test_relay_api_delays_must_be_finite_and_nonnegative_before_side_effects(self):
+        invalid = ("-1", "nan", "inf", "-inf")
+        with tempfile.TemporaryDirectory() as directory:
+            for option in ("--api-delay-ms", "--api-fragment-delay-ms"):
+                for value in invalid:
+                    with self.subTest(option=option, value=value):
+                        output = Path(directory) / f"{option[2:]}-{value}"
+                        stderr = io.StringIO()
+                        with mock.patch.object(sys, "argv", [
+                            "relay_compare.py", option, value, "--output", str(output)
+                        ]), mock.patch.object(relay_compare.subprocess, "Popen") as popen, \
+                                contextlib.redirect_stderr(stderr):
+                            with self.assertRaises(SystemExit) as error:
+                                relay_compare.main()
+                        self.assertEqual(error.exception.code, 2)
+                        self.assertFalse(output.exists())
+                        popen.assert_not_called()
+
+        parser = argparse.ArgumentParser()
+        for value in (0.0, 0.25):
+            relay_compare.validate_api_delays(parser, value, value)
+
+    def test_relay_validates_complete_origin_cpu_topology(self):
+        def validate(origin_cpus="3,6", origin_workers=2, origin_cpu="3",
+                     server_cpus="2", workers=1, client_cpus="4,5",
+                     mixed_small_bytes=0, mixed_client_cpus="5,4", siblings=None,
+                     available=None):
+            options = SimpleNamespace(
+                origin_cpus=origin_cpus,
+                origin_workers=origin_workers,
+                mixed_small_bytes=mixed_small_bytes,
+                mixed_client_cpus=mixed_client_cpus,
+            )
+            remaining = ["--server-cpus", server_cpus, "--workers", str(workers),
+                         "--origin-cpu", origin_cpu, "--client-cpus", client_cpus]
+            parser = argparse.ArgumentParser(add_help=False)
+            siblings = siblings or {}
+            available = set(range(2, 16)) if available is None else available
+
+            def topology_text(path, *args, **kwargs):
+                match = re.search(r"cpu(\d+)/topology/(physical_package_id|core_id)$", str(path))
+                if not match:
+                    raise AssertionError(f"unexpected topology path: {path}")
+                cpu, field = int(match.group(1)), match.group(2)
+                return "0\n" if field == "physical_package_id" else f"{siblings.get(cpu, cpu)}\n"
+
+            with mock.patch.object(run.os, "sched_getaffinity", return_value=available), \
+                    mock.patch.object(run.Path, "read_text", topology_text), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                return relay_compare.validate_origin_cpu_configuration(
+                    parser, run, options, remaining
+                )
+
+        invalid = (
+            dict(origin_cpus="3,99"),                         # unavailable later CPU
+            dict(origin_cpus="3,3"),                          # duplicate
+            dict(origin_cpus="3,7", siblings={3: 1, 7: 1}),    # SMT siblings
+            dict(origin_cpus="3,2"),                          # later CPU overlaps frontend
+            dict(origin_cpus="3,4"),                          # later CPU overlaps client
+            dict(origin_workers=1),                            # worker count mismatch
+            dict(origin_cpu="6"),                             # legacy first CPU mismatch
+            dict(mixed_small_bytes=4096, mixed_client_cpus="2,4"),  # frontend overlap
+            dict(mixed_small_bytes=4096, mixed_client_cpus="3,4"),  # origin overlap
+        )
+        for case in invalid:
+            with self.subTest(case=case), self.assertRaises(SystemExit):
+                validate(**case)
+
+        self.assertEqual(validate(origin_cpus="03,06"), [3, 6])
+
+    def test_relay_rejects_unavailable_later_origin_cpu_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "study"
+            stderr = io.StringIO()
+            args = [
+                "relay_compare.py", "--origin-workers", "2", "--origin-cpus", "3,99",
+                "--output", str(output), "--server-cpu", "2", "--origin-cpu", "3",
+                "--client-cpus", "4,5", "--rut", "rut", "--converter", "converter",
+                "--wrk", "wrk",
+            ]
+            with mock.patch.object(sys, "argv", args), \
+                    mock.patch.object(run.os, "sched_getaffinity", return_value={2, 3, 4, 5}), \
+                    mock.patch.object(relay_compare.subprocess, "Popen") as popen, \
+                    contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    relay_compare.main()
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(output.exists())
+            popen.assert_not_called()
+
+    def test_direct_origin_targets_origin_port(self):
+        args = SimpleNamespace(origin_port=8704, front_port=8604)
+        self.assertEqual(relay_compare.direct_origin_port(args), 8704)
+
+    def test_api_origin_fresh_close_accepts_valid_pooled_or_distinct_markers(self):
+        markers = ["close-0", "close-1"]
+        fresh = [(markers[0], 10, 1), (markers[1], 11, 1)]
+        pooled = [(markers[0], 10, 1), (markers[1], 10, 2)]
+        self.assertTrue(relay_compare.valid_api_origin_records(fresh, markers, True))
+        self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, True))
+        self.assertTrue(relay_compare.valid_api_origin_records(pooled, markers, False))
+        self.assertTrue(relay_compare.valid_api_origin_records(fresh, markers, True, reuse=False))
+        self.assertFalse(relay_compare.valid_api_origin_records(pooled, markers, True, reuse=False))
+        self.assertFalse(relay_compare.valid_api_origin_records(pooled, markers, False, reuse=False))
+        self.assertFalse(relay_compare.valid_api_origin_records(fresh, markers, False, reuse=True))
+        self.assertFalse(relay_compare.valid_api_origin_records(pooled[:1], markers, True))
+        self.assertFalse(relay_compare.valid_api_origin_records([pooled[1], pooled[0]], markers, True))
+
+    def test_stream_deadline_allows_inflight_timeout_but_rejects_truncation(self):
+        fixed = bytes((i * 29) & 255 for i in range(16))
+
+        async def consume(raw, chunks, deadline):
+            reader = protocol_workload.asyncio.StreamReader()
+            if raw is not None:
+                reader.feed_data(raw)
+            if deadline == float("inf"):
+                reader.feed_eof()
+            counts = dict(messages=0, bytes=0)
+            values = ([], [], [], [])
+            return await protocol_workload.consume_stream(
+                reader, 16, fixed, chunks, time.monotonic(), 0,
+                deadline, counts, *values
+            )
+
+        complete = b"10\r\n" + struct.pack("!QI", 1, 0) + fixed[12:] + b"\r\n0\r\n\r\n"
+        self.assertFalse(protocol_workload.asyncio.run(consume(complete, 1, float("inf"))))
+        with self.assertRaisesRegex(ValueError, "invalid terminator"):
+            protocol_workload.asyncio.run(consume(b"1\r\na\r\n0\r\n\r\n", 1, float("inf")))
+        self.assertTrue(protocol_workload.asyncio.run(consume(None, 1, time.monotonic() + .01)))
+
+    def test_client_connection_failure_cancels_other_startup_attempts(self):
+        entered = 0
+        cancelled = []
+
+        async def open_connection(_host, _port):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                raise ConnectionError('injected handshake failure')
+            try:
+                while entered < 2:
+                    await protocol_workload.asyncio.sleep(0)
+                await protocol_workload.asyncio.Event().wait()
+            except protocol_workload.asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        class Output:
+            sample = None
+
+            def put(self, value):
+                self.sample = value
+
+        output = Output()
+        args = SimpleNamespace(kind='streaming', size=16, warmup=0, duration=1,
+                               connections=2, port=12345, chunks=1)
+        cpu = min(os.sched_getaffinity(0))
+        with mock.patch.object(protocol_workload.asyncio, 'open_connection', open_connection):
+            protocol_workload.client_worker(cpu, args, output)
+        self.assertEqual(output.sample['counts']['errors'], 1)
+        self.assertEqual(output.sample['counts']['connections'], 0)
+        self.assertEqual(cancelled, [True])
+
+    def test_smoke_engine_filter_rejects_empty_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, str(Path(protocol_strategy.__file__)),
+                 "--output", directory, "--rut", "/bin/true",
+                 "--harness", str(Path(run.__file__)), "--smoke", "--engines", "nginx"],
+                capture_output=True, text=True
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("select no runnable configurations", result.stderr)
+
+    def test_protocol_cli_rejects_incompatible_cases_and_short_non_smoke(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = [sys.executable, str(Path(protocol_strategy.__file__)),
+                    "--output", directory, "--rut", "/bin/true",
+                    "--harness", str(Path(run.__file__))]
+            incompatible = subprocess.run(base + ["--tcpkali2", "/bin/true"], capture_output=True, text=True)
+            short = subprocess.run(base + ["--repeats", "2"], capture_output=True, text=True)
+        self.assertEqual(incompatible.returncode, 2)
+        self.assertIn("WebSocket-only", incompatible.stderr)
+        self.assertEqual(short.returncode, 2)
+        self.assertIn("at least three repeats", short.stderr)
+
+    def test_protocol_cli_rejects_nonpositive_duration_before_output_or_process(self):
+        for duration in ('0', '-1'):
+            with self.subTest(duration=duration), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'study'
+                argv = ['protocol_strategy.py', '--output', str(output), '--rut', '/bin/true',
+                        '--harness', str(Path(run.__file__)), '--duration', duration]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(protocol_strategy.subprocess, 'Popen') as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        protocol_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
+
+    def test_protocol_cli_rejects_nonpositive_nginx_buffer_before_output(self):
+        for size in ('0', '-1'):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'study'
+                argv = ['protocol_strategy.py', '--output', str(output), '--rut', '/bin/true',
+                        '--harness', str(Path(run.__file__)), '--nginx-buffer-kib', size]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(protocol_strategy.subprocess, 'Popen') as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        protocol_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
+
+    def test_protocol_cpu_assignments_validate_full_topology_and_normalize_masks(self):
+        def validate(origin_cpus='03,06', client_cpus='05,07', siblings=None,
+                     available=None):
+            args = SimpleNamespace(origin_cpus=origin_cpus, client_cpus=client_cpus)
+            parser = argparse.ArgumentParser(add_help=False)
+            siblings = siblings or {}
+            available = set(range(2, 16)) if available is None else available
+
+            def topology_text(path, *args, **kwargs):
+                match = re.search(r'cpu(\d+)/topology/(physical_package_id|core_id)$', str(path))
+                if not match:
+                    raise AssertionError(f'unexpected topology path: {path}')
+                cpu, field = int(match.group(1)), match.group(2)
+                return '0\n' if field == 'physical_package_id' else f'{siblings.get(cpu, cpu)}\n'
+
+            with mock.patch.object(run.os, 'sched_getaffinity', return_value=available), \
+                    mock.patch.object(run.Path, 'read_text', topology_text):
+                result = protocol_strategy.validate_cpu_assignments(parser, run, args)
+            return args, result
+
+        args, (origins, clients) = validate()
+        self.assertEqual(origins, [3, 6])
+        self.assertEqual(clients, [5, 7])
+        self.assertEqual(args.origin_cpus, '3,6')
+        self.assertEqual(args.client_cpus, '5,7')
+        invalid = (
+            dict(origin_cpus='3,3'),
+            dict(client_cpus='5,5'),
+            dict(origin_cpus='3,99'),
+            dict(origin_cpus='3,4', client_cpus='4,7'),
+            dict(origin_cpus='2,6'),
+            dict(origin_cpus='3,6', client_cpus='5,7', siblings={3: 1, 5: 1}),
+        )
+        for case in invalid:
+            with self.subTest(case=case), self.assertRaises(SystemExit):
+                validate(**case)
+
+    def test_protocol_mask_threshold_parsing_and_early_rejection(self):
+        parser = argparse.ArgumentParser()
+        self.assertEqual(protocol_strategy.parse_mask_helper_min(parser, '0'), 0)
+        self.assertEqual(protocol_strategy.parse_mask_helper_min(parser, '4096'), 4096)
+        for value in ('-1', 'bad'):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'study'
+                argv = ['protocol_strategy.py', '--output', str(output), '--rut', '/bin/true',
+                        '--harness', str(Path(run.__file__))]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.dict(os.environ, {'RUT_BENCH_WS_MASK_MIN': value}), \
+                        mock.patch.object(protocol_strategy.subprocess, 'Popen') as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        protocol_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
+
+    def test_workload_cli_rejects_nonpositive_durations_before_output_or_process(self):
+        for flag in ('--screen-seconds', '--confirm-seconds'):
+            for duration in ('0', '-1'):
+                with self.subTest(flag=flag, duration=duration), tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / 'study'
+                    argv = ['workload_strategy.py', '--output', str(output),
+                            '--relay-script', str(Path(relay_compare.__file__)),
+                            '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                            flag, duration]
+                    with mock.patch.object(sys, 'argv', argv), \
+                            mock.patch.object(workload_strategy.subprocess, 'Popen') as launch:
+                        with self.assertRaises(SystemExit) as raised:
+                            workload_strategy.main()
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertFalse(output.exists())
+                    launch.assert_not_called()
+
+    def test_workload_cli_keeps_positive_duration_values_valid(self):
+        class ReachedOutputSetup(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            argv = ['workload_strategy.py', '--output', str(Path(directory) / 'study'),
+                    '--relay-script', str(Path(relay_compare.__file__)),
+                    '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                    '--screen-seconds', '1', '--confirm-seconds', '1']
+            with mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(Path, 'mkdir', side_effect=ReachedOutputSetup), \
+                    mock.patch.object(workload_strategy.subprocess, 'Popen') as launch:
+                with self.assertRaises(ReachedOutputSetup):
+                    workload_strategy.main()
+            launch.assert_not_called()
+
+    def test_workload_cli_rejects_invalid_p99_increase_limit_before_output_or_process(self):
+        for limit in ('-0.1', 'nan', 'inf', '-inf'):
+            with self.subTest(limit=limit), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / 'study'
+                argv = ['workload_strategy.py', '--output', str(output),
+                        '--relay-script', str(Path(relay_compare.__file__)),
+                        '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                        '--p99-increase-limit', limit]
+                with mock.patch.object(sys, 'argv', argv), \
+                        mock.patch.object(workload_strategy.subprocess, 'Popen') as launch:
+                    with self.assertRaises(SystemExit) as raised:
+                        workload_strategy.main()
+                self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+                launch.assert_not_called()
+
+    def test_workload_cli_accepts_zero_p99_increase_limit(self):
+        class ReachedOutputSetup(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            argv = ['workload_strategy.py', '--output', str(Path(directory) / 'study'),
+                    '--relay-script', str(Path(relay_compare.__file__)),
+                    '--rut', '/bin/true', '--converter', '/bin/true', '--wrk', '/bin/true',
+                    '--p99-increase-limit', '0']
+            with mock.patch.object(sys, 'argv', argv), \
+                    mock.patch.object(Path, 'mkdir', side_effect=ReachedOutputSetup), \
+                    mock.patch.object(workload_strategy.subprocess, 'Popen') as launch:
+                with self.assertRaises(ReachedOutputSetup):
+                    workload_strategy.main()
+            launch.assert_not_called()
+
+    def test_protocol_manifest_records_selection_filters(self):
+        args = SimpleNamespace(cases=["websocket-bulk-64k", "websocket-interactive-64"],
+                               engines=["nginx"], policies=["current"], smoke=True)
+        self.assertEqual(protocol_strategy.selection_manifest(args), {
+            "cases_filter": ["websocket-bulk-64k", "websocket-interactive-64"],
+            "engines_filter": ["nginx"], "policies_filter": ["current"], "smoke": True,
+        })
+
+    def test_study_environment_clears_all_runtime_knobs(self):
+        clean = workload_strategy.study_environment({
+            "DOCKER_HOST": "tcp://unused", "RUT_STUDY_POLICY": "latency",
+            "RUT_STUDY_DIRECT_BODY_SEND": "on", "RUT_STUDY_SELECTIVE_VECTOR": "on",
+            "PATH": "/bin",
+        })
+        self.assertNotIn("DOCKER_HOST", clean)
+        self.assertFalse(any(key.startswith("RUT_STUDY_") for key in clean))
+        self.assertEqual(clean["PATH"], "/bin")
+
+    def test_protocol_environment_clears_unselected_runtime_knobs(self):
+        env = protocol_strategy.protocol_environment({
+            "RUT_STUDY_WS_RECV": "once", "RUT_STUDY_DIRECT_BODY_SEND": "on",
+            "RUT_STUDY_SELECTIVE_VECTOR": "on", "PATH": "/bin"})
+        self.assertEqual(env["RUT_STUDY_WS_RECV"], "once")
+        self.assertNotIn("RUT_STUDY_DIRECT_BODY_SEND", env)
+        self.assertNotIn("RUT_STUDY_SELECTIVE_VECTOR", env)
+
+    def test_protocol_manifest_hashes_strategy_and_harness(self):
+        with tempfile.NamedTemporaryFile() as harness:
+            harness.write(b"harness-v1")
+            harness.flush()
+            hashes = protocol_strategy.manifest_script_hashes(SimpleNamespace(
+                harness=Path(harness.name)))
+        self.assertEqual(hashes["harness_sha256"],
+                         __import__("hashlib").sha256(b"harness-v1").hexdigest())
+        self.assertEqual(hashes["protocol_strategy_sha256"],
+                         __import__("hashlib").sha256(Path(protocol_strategy.__file__).read_bytes()).hexdigest())
+
+    def test_protocol_manifest_rejects_resume_after_sibling_compiler_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rut = Path(directory) / "rut"
+            compiler = Path(directory) / "rut-compile"
+            prior = Path(directory) / "study.json"
+            rut.write_bytes(b"frontend-v1")
+            compiler.write_bytes(b"compiler-v1")
+            initial = protocol_strategy.manifest_binary_hashes(rut)
+            protocol_strategy.require_matching_manifest(prior, initial)
+
+            compiler.write_bytes(b"compiler-v2")
+            resumed = protocol_strategy.manifest_binary_hashes(rut)
+            self.assertEqual(resumed["rut_sha256"], initial["rut_sha256"])
+            self.assertNotEqual(resumed["rut_compile_sha256"], initial["rut_compile_sha256"])
+            with self.assertRaisesRegex(RuntimeError, "manifest changed"):
+                protocol_strategy.require_matching_manifest(prior, resumed)
+
+    def test_direct_origin_cpu_observation_is_absent(self):
+        self.assertIsNone(protocol_strategy.frontend_cpu_observation("direct-origin", 1, 3, 1))
+        self.assertEqual(protocol_strategy.frontend_cpu_observation("uring", 1, 3, 1), 200)
+        self.assertIsNone(run.server_cpu_observation("direct-origin", 1, 3, 1))
+        self.assertEqual(run.server_cpu_observation("uring", 1, 3, 1), 200)
+        self.assertEqual(workload_strategy.format_cpu(None), "n/a")
+        self.assertEqual(workload_strategy.format_cpu(12.345), "12.3")
+
+    def test_protocol_summary_labels_full_cpu_observation(self):
+        case = protocol_strategy.CASES[0]
+        rows = [dict(case=case, engine="nginx", policy="current", messages_per_second=100,
+                     received_mib_per_second=1, rtt_us=dict(p99_us=10),
+                     origin_cpu_observation_pct=12, frontend_cpu_observation_pct=34)
+                for _ in range(3)]
+        summary = protocol_strategy.summarize(rows)[0]
+        self.assertEqual(summary["origin_cpu_observation_pct"], 12)
+        self.assertEqual(summary["frontend_cpu_observation_pct"], 34)
+        self.assertNotIn("origin_cpu_pct", summary)
+        self.assertNotIn("frontend_cpu_pct", summary)
+        self.assertNotIn("cpu_measurement_seconds", summary)
+
+    def test_protocol_summary_keeps_missing_first_chunk_percentile_out_of_selection(self):
+        case = next(case for case in protocol_strategy.CASES
+                    if case['name'] == 'streaming-live-256')
+        rows = []
+        for policy in ('current', 'latency', 'balanced'):
+            for repeat in range(3):
+                rows.append(dict(case=case, engine='uring', policy=policy,
+                                 messages_per_second=100, received_mib_per_second=1,
+                                 delivery_us=dict(p99_us=100),
+                                 first_us=dict(p99_us=5 if policy == 'current' and repeat != 1 else None),
+                                 source_gap_us=dict(p99_us=20),
+                                 origin_cpu_observation_pct=10))
+        summaries = protocol_strategy.summarize(rows)
+        self.assertTrue(all(row['first_p99_us'] is None for row in summaries))
+        current = next(row for row in summaries if row['policy'] == 'current')
+        self.assertEqual(current['throughput_policy'], 'current')
+
+    def test_protocol_summary_keeps_unavailable_source_gap_out_of_summary(self):
+        case = next(case for case in protocol_strategy.CASES
+                    if case['name'] == 'streaming-live-256')
+
+        def rows_with_source_gaps(values):
+            return [dict(case=case, engine='uring', policy='current',
+                         messages_per_second=100, received_mib_per_second=1,
+                         delivery_us=dict(p99_us=100), first_us=dict(p99_us=5),
+                         source_gap_us=dict(p99_us=value), origin_cpu_observation_pct=10)
+                    for value in values]
+
+        missing = protocol_strategy.summarize(rows_with_source_gaps([None, None, None]))
+        self.assertIsNone(missing[0]['source_gap_p99_us'])
+        partial = protocol_strategy.summarize(rows_with_source_gaps([10, None, float('nan'), 30]))
+        self.assertEqual(partial[0]['source_gap_p99_us'], 20)
+        self.assertEqual(missing[0]['throughput_policy'], 'current')
+
+    def test_resumed_protocol_result_rebuilds_missing_aggregate_files(self):
+        row = dict(case=protocol_strategy.CASES[0], engine='nginx', policy='reference',
+                   repeat=1, valid=True, messages_per_second=100,
+                   received_mib_per_second=1, rtt_us=dict(p99_us=10),
+                   origin_cpu_observation_pct=12, frontend_cpu_observation_pct=34)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            (out / 'measurements.json').write_text('stale')
+            (out / 'summary.json').write_text('stale')
+            rows = []
+            protocol_strategy.append_preserved_result(row, 'saved-case', rows, out)
+            second = row | dict(engine='epoll', policy='latency')
+            protocol_strategy.append_preserved_result(second, 'saved-case-2', rows, out)
+            self.assertEqual(json.loads((out / 'measurements.json').read_text()), [row, second])
+            self.assertEqual(json.loads((out / 'summary.json').read_text()), [])
+            self.assertFalse((out / 'measurements.json.tmp').exists())
+            self.assertFalse((out / 'summary.json.tmp').exists())
+
+    def test_workload_manifest_pinned_nginx_content_rejects_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pin = Path(directory) / 'pinned-nginx-image.txt'
+            prior = Path(directory) / 'study.json'
+            pin.write_text('nginx@sha256:first\n')
+            first_hash = workload_strategy.pinned_nginx_image_sha256(pin)
+            workload_strategy.require_matching_manifest(
+                prior, dict(nginx_image=workload_strategy.pinned_nginx_image(pin),
+                            nginx_image_pin_sha256=first_hash))
+            pin.write_text('nginx@sha256:first \n')
+            self.assertEqual(workload_strategy.pinned_nginx_image(pin), 'nginx@sha256:first')
+            with self.assertRaisesRegex(RuntimeError, 'manifest changed'):
+                workload_strategy.require_matching_manifest(
+                    prior, dict(nginx_image=workload_strategy.pinned_nginx_image(pin),
+                                nginx_image_pin_sha256=workload_strategy.pinned_nginx_image_sha256(pin)))
+
+    def test_run_client_cleans_group_when_wait_is_interrupted(self):
+        class Child:
+            pid = 12345
+
+            def __init__(self):
+                self.waits = [KeyboardInterrupt(), 0, 0]
+
+            def wait(self, timeout=None):
+                result = self.waits.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+
+        child = Child()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(protocol_strategy.subprocess, 'Popen', return_value=child), \
+                mock.patch.object(protocol_strategy.os, 'killpg') as killpg:
+            with self.assertRaises(KeyboardInterrupt):
+                protocol_strategy.run_client(['client'], Path(directory) / 'client.log', 1, {})
+        self.assertEqual([call.args[1] for call in killpg.call_args_list],
+                         [protocol_strategy.signal.SIGTERM, protocol_strategy.signal.SIGKILL])
+
+    def test_strategy_requires_repeats_and_guards_tail_latency(self):
+        rows = []
+        for policy, rate, tail in [('current', 100, 100), ('throughput', 150, 130),
+                                   ('balanced', 120, 105), ('latency', 90, 70)]:
+            for repeat in range(3):
+                rows.append(dict(stage='confirm', workload_profile={'name': 'static-1m'},
+                                 engine='uring', policy=policy, rps=rate, p99_us=tail,
+                                 server_cpu_pct=100, origin_cpu_pct=100))
+        result = workload_strategy.summarize(rows, .10)['decisions'][0]
+        self.assertEqual(result['throughput_policy'], 'balanced')
+        self.assertEqual(result['latency_policy'], 'latency')
+        self.assertEqual(workload_strategy.summarize(rows[:2], .10)['decisions'], [])
+
+    def test_workload_manifest_rejects_resume_after_imported_harness_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = root / 'relay_compare.py'
+            for name in ('relay_compare.py', 'api_origin.py', 'run.py'):
+                (root / name).write_text(name + '-v1')
+            first = dict(scripts=workload_strategy.script_hashes(relay))
+            prior = root / 'study.json'
+            workload_strategy.require_matching_manifest(prior, first)
+            run_script = root / 'run.py'
+            run_script.write_text('run.py-v2')
+            resumed = dict(scripts=workload_strategy.script_hashes(relay))
+            self.assertNotEqual(first, resumed)
+            with self.assertRaisesRegex(RuntimeError, 'manifest changed'):
+                workload_strategy.require_matching_manifest(prior, resumed)
+
+        hashes = workload_strategy.script_hashes(Path(workload_strategy.__file__).with_name('relay_compare.py'))
+        self.assertIn(str(Path(run.__file__).resolve()), hashes)
+        self.assertIn(str(Path(workload_strategy.__file__).resolve()), hashes)
+
+    def test_streaming_latency_policy_bounds_first_chunk_before_delivery_tail(self):
+        case = next(case for case in protocol_strategy.CASES
+                    if case['name'] == 'streaming-live-256')
+        rows = []
+        for policy, delivery, first in (('current', 100, 100),
+                                        ('latency', 60, 200),
+                                        ('balanced', 80, None)):
+            for _ in range(3):
+                rows.append(dict(case=case, engine='uring', policy=policy,
+                                 messages_per_second=100, received_mib_per_second=1,
+                                 delivery_us=dict(p99_us=delivery),
+                                 first_us=dict(p99_us=first),
+                                 source_gap_us=dict(p99_us=20),
+                                 origin_cpu_observation_pct=10))
+        current = next(row for row in protocol_strategy.summarize(rows)
+                       if row['policy'] == 'current')
+        self.assertEqual(current['experimental_latency_candidate'], 'current')
+        self.assertEqual(current['latency_policy'], 'current')
+
+    def test_mixed_throughput_weights_bytes_instead_of_request_count(self):
+        current = dict(rps=10100, large_client={'rps': 100}, small_client={'rps': 10000})
+        more_small = dict(rps=20040, large_client={'rps': 40}, small_client={'rps': 20000})
+        self.assertLess(current['rps'], more_small['rps'])
+        self.assertGreater(workload_strategy.throughput_score(current),
+                           workload_strategy.throughput_score(more_small))
+
+    def test_mixed_strategy_guards_small_client_tail(self):
+        row = {'p99_us': 50000, 'small_client': {'p99_us': 200}}
+        self.assertEqual(workload_strategy.metric(row), 200)
+
+    def test_mixed_measurement_requires_both_clients_with_requests_and_p99(self):
+        valid = dict(requests=100, errors={"connect": 0}, p99_us=20.0)
+        self.assertTrue(relay_compare.mixed_clients_valid(valid, valid))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"requests": 0}))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"p99_us": None}))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"p99_us": float("nan")}))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"errors": {"read": 1}}))
+        self.assertFalse(relay_compare.mixed_clients_valid(valid, valid | {"errors": {}}))
+        self.assertEqual(api_origin.payload_for_path("/proxy", b"large", b"small", "/api4k"), b"large")
+        self.assertEqual(api_origin.payload_for_path("/api4k", b"large", b"small", "/api4k"), b"small")
+        self.assertEqual(api_origin.payload_for_path("/api4k-wrong", b"large", b"small", "/api4k"), b"large")
+
+    def test_stream_records_ignore_http_chunk_boundaries(self):
+        expected = [b'abcdefgh', b'ijklmnop', b'qrstuvwx']
+        for physical in [[b''.join(expected)], [b'ab', b'cdefghijk', b'lmnopqrs', b'tuvwx']]:
+            raw = b''.join(f'{len(part):x}\r\n'.encode() + part + b'\r\n' for part in physical) + b'0\r\n\r\n'
+            async def decode():
+                reader = protocol_workload.asyncio.StreamReader()
+                reader.feed_data(raw)
+                reader.feed_eof()
+                return [record async for record in protocol_workload.stream_records(reader, 8)]
+            self.assertEqual(protocol_workload.asyncio.run(decode()), expected)
+
+    def test_websocket_masking_and_extended_lengths(self):
+        for size in [0, 64, 125, 126, 65535, 65536]:
+            data = bytes((i * 29) & 255 for i in range(size))
+            key = b'\x00\x11\x80\xff'
+            self.assertEqual(protocol_workload.masking(protocol_workload.masking(data, key), key), data)
+            raw = protocol_workload.frame(data, masked=True)
+            async def decode():
+                reader = protocol_workload.asyncio.StreamReader()
+                reader.feed_data(raw)
+                reader.feed_eof()
+                return await protocol_workload.read_frame(reader, True)
+            self.assertEqual(protocol_workload.asyncio.run(decode()), (2, True, data))
+
     def test_native_streaming_payload_and_reuse_evidence_reject_corruption(self):
         wanted = expected_body("proxy", native_streaming=True)
         self.assertEqual(len(wanted), 256 * 1024)
@@ -934,21 +1588,33 @@ class ToolsTest(unittest.TestCase):
             child_file = out / "child.pid"
             harness = Harness(SimpleNamespace(output=out))
             code = (
-                "import subprocess,sys,time; from pathlib import Path; "
+                "import os,subprocess,sys,time; from pathlib import Path; "
                 "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
-                "Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(30)"
+                "fields=Path(f'/proc/{p.pid}/stat').read_text().rsplit(')',1)[1].split(); "
+                "Path(sys.argv[1]).write_text(f'{p.pid} {os.getpgid(p.pid)} {fields[19]}'); "
+                "time.sleep(30)"
             )
             with self.assertRaises(subprocess.TimeoutExpired):
                 harness.command(
                     [sys.executable, "-c", code, str(child_file)], timeout=1
                 )
-            stat = Path(f"/proc/{int(child_file.read_text())}/stat")
-            try:
-                state = stat.read_text().rsplit(")", 1)[1].split()[0]
-            except FileNotFoundError:
-                pass  # Already reaped by init.
-            else:
-                self.assertEqual(state, "Z")
+            child_pid, child_pgid, child_start = map(int, child_file.read_text().split())
+            stat = Path(f"/proc/{child_pid}/stat")
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    fields = stat.read_text().rsplit(")", 1)[1].split()
+                except FileNotFoundError:
+                    break  # Already reaped by init.
+                state, process_group, start_time = fields[0], int(fields[2]), int(fields[19])
+                if start_time != child_start or process_group != child_pgid or state == "Z":
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail(
+                        f"original load child still running: pid={child_pid}, "
+                        f"pgid={process_group}, start={start_time}, state={state}"
+                    )
+                time.sleep(0.01)
             self.assertTrue((out / "command-failure-1.log").exists())
 
     def test_valid_ratio_and_warmup_error_totals(self):

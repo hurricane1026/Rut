@@ -773,6 +773,14 @@ target_include_directories(test_frontend PRIVATE
 add_test(NAME test_frontend COMMAND test_frontend)
 set_tests_properties(test_frontend PROPERTIES LABELS "unit;compiler")
 
+add_executable(test_hir_generated_names_lifetime test_hir_generated_names_lifetime.cc)
+target_include_directories(test_hir_generated_names_lifetime PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/testing
+)
+add_test(NAME test_hir_generated_names_lifetime COMMAND test_hir_generated_names_lifetime)
+set_tests_properties(test_hir_generated_names_lifetime PROPERTIES LABELS "unit;compiler")
+
 add_executable(test_listener test_listener.cc
     ${PROJECT_SOURCE_DIR}/src/runtime/socket.cc
     ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
@@ -3734,4 +3742,17 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 add_test(NAME test_cli_backend
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_cli_backend.py $<TARGET_FILE:rut>)
 set_tests_properties(test_cli_backend PROPERTIES LABELS "cli" RUN_SERIAL TRUE TIMEOUT 45)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
+    add_test(NAME test_workload_handler_epoll
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_workload_handler.py
+                $<TARGET_FILE:rut> epoll)
+    set_tests_properties(test_workload_handler_epoll PROPERTIES
+        LABELS "cli;compiler;runtime" RUN_SERIAL TRUE TIMEOUT 45)
+    add_test(NAME test_workload_handler_iouring
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_workload_handler.py
+                $<TARGET_FILE:rut> io_uring)
+    set_tests_properties(test_workload_handler_iouring PROPERTIES
+        LABELS "cli;compiler;runtime" RUN_SERIAL TRUE TIMEOUT 45)
 endif()

@@ -15,6 +15,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -1749,23 +1750,52 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
             return frontend_error(FrontendError::OutOfMemory, {});
         len += segments[i].len;
     }
+    // Preserve the non-null sentinel used for an explicitly empty response
+    // body without asking mmap for a zero-length mapping.
+    static char empty_generated_name = '\0';
+    if (len == 0) return Str{&empty_generated_name, 0};
     if (store == nullptr) {
-        store = new (std::nothrow) HirGeneratedNames;
-        if (store == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
+        void* owner_region = mmap(nullptr,
+                                  sizeof(HirGeneratedNames),
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS,
+                                  -1,
+                                  0);
+        if (owner_region == MAP_FAILED) return frontend_error(FrontendError::OutOfMemory, {});
+        store = ::new (owner_region) HirGeneratedNames{};
+        store->mapped_owner = true;
     }
-    auto* buf = new (std::nothrow) char[len];
-    if (buf == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
+    bool mapped = false;
+    char* buf = nullptr;
+    {
+        void* region =
+            mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (region == MAP_FAILED) return frontend_error(FrontendError::OutOfMemory, {});
+        buf = static_cast<char*>(region);
+        mapped = true;
+    }
     u32 off = 0;
     for (u32 i = 0; i < segment_count; i++) {
         for (u32 j = 0; j < segments[i].len; j++) buf[off++] = segments[i].ptr[j];
     }
-    auto* node = new (std::nothrow) HirGeneratedName;
+    void* node_region = mmap(nullptr,
+                             sizeof(HirGeneratedName),
+                             PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS,
+                             -1,
+                             0);
+    auto* node = node_region == MAP_FAILED ? nullptr : ::new (node_region) HirGeneratedName{};
     if (node == nullptr) {
-        delete[] buf;
+        if (mapped)
+            munmap(buf, len);
+        else
+            delete[] buf;
         return frontend_error(FrontendError::OutOfMemory, {});
     }
     node->text = buf;
     node->len = len;
+    node->mapped = mapped;
+    node->mapped_node = true;
     node->next = store->head;
     store->head = node;
     return Str{buf, len};
@@ -9757,7 +9787,28 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
         // user wrote `body: ""`; lower_rir de-dupes on content. Copy the
         // bytes into the root owned-strings store so a byte-literal body in an
         // imported file does not outlive that file's temporary AstFile pool.
-        if (stmt.has_response_body) {
+        if (stmt.workload_body_bytes != 0) {
+            const u32 kCount = stmt.workload_body_bytes;
+            if (kCount > 1048576 || g_analyze_owned_buffers == nullptr ||
+                (*g_analyze_owned_buffers != nullptr &&
+                 (*g_analyze_owned_buffers)->workload_bytes > 16777216 - kCount))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            MappedArray<u8> payload;
+            if (!payload.init(kCount))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+            for (u32 i = 0; i < kCount; ++i) {
+                const u32 kBlock = i / 4096;
+                const u32 kOffset = i % 4096;
+                payload[i] =
+                    static_cast<u8>(kOffset < 4 ? (kBlock >> (kOffset * 8)) & 255
+                                                : (kBlock * 17 + (kOffset - 4) * 29) & 255);
+            }
+            auto body =
+                intern_owned_response_body({reinterpret_cast<const char*>(payload.data()), kCount});
+            if (!body) return core::make_unexpected(body.error());
+            (*g_analyze_owned_buffers)->workload_bytes += kCount;
+            term.response_body = body.value();
+        } else if (stmt.has_response_body) {
             auto body = intern_owned_response_body(stmt.response_body);
             if (!body) return core::make_unexpected(body.error());
             term.response_body = body.value();

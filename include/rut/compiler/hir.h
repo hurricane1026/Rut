@@ -16,6 +16,8 @@
 #include <deque>
 #include <string>
 
+#include <sys/mman.h>
+
 namespace rut {
 
 enum class HirProtocolKind : u8 {
@@ -1398,6 +1400,8 @@ struct HirGeneratedName {
     HirGeneratedName* next = nullptr;
     char* text = nullptr;
     u32 len = 0;
+    bool mapped = false;
+    bool mapped_node = false;
 };
 
 // Owns the generated function names of one analysis tree. The root module owns
@@ -1405,8 +1409,10 @@ struct HirGeneratedName {
 // share it, so every merged or copied function keeps a valid name view. The
 // store is reference-counted and freed when the last owner is destroyed.
 struct HirGeneratedNames {
+    u32 workload_bytes = 0;
     u32 refs = 1;
     HirGeneratedName* head = nullptr;
+    bool mapped_owner = false;
 
     HirGeneratedNames() = default;
     HirGeneratedNames(const HirGeneratedNames&) = delete;
@@ -1418,11 +1424,24 @@ struct HirGeneratedNames {
         HirGeneratedName* node = head;
         while (node != nullptr) {
             HirGeneratedName* next = node->next;
-            delete[] node->text;
-            delete node;
+            if (node->mapped)
+                munmap(node->text, node->len);
+            else
+                delete[] node->text;
+            if (node->mapped_node) {
+                node->~HirGeneratedName();
+                munmap(node, sizeof(HirGeneratedName));
+            } else {
+                delete node;
+            }
             node = next;
         }
-        delete this;
+        if (mapped_owner) {
+            this->~HirGeneratedNames();
+            munmap(this, sizeof(HirGeneratedNames));
+        } else {
+            delete this;
+        }
     }
 };
 
