@@ -15,8 +15,10 @@ WebSocket strategy experiments and offline policy overrides remain opt-in.
   Existing unrelated warnings are filtered; this is not a full CI tidy claim.
 - Full remote CI, sanitizer and macOS validation remain pending.
 
-Performance tables describe the archived frozen study binaries, not a new
-measurement of this integration head. No default-path performance win is claimed.
+Performance tables report results from the frozen study binaries used for the
+study; those binaries are not present in this repository snapshot. They are not
+new measurements of this integration head. No default-path performance win is
+claimed.
 
 Default behavior changes versus main: plaintext HTTP/1 WebSocket reads use
 bounded one-shot receives so their paired asynchronous sends cannot race a

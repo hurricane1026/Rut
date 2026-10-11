@@ -36,7 +36,7 @@ Final 64B: throughput +9.9%, p99 -9.4% versus the same binary with copy-first of
 
 ## Earlier stages
 
-The parent directory retains 27 three-repeat initial copy-first measurements and 8 size screens. Those use a different frozen binary without the extra prefix continuation pair and must not be pooled with final results. Initial 256B/1KiB screens improved roughly 10%; the 16KiB screen exposed a p99 regression that motivated the bounded continuation. The failed-build-mismatch directory records an unsuccessful startup before any timed measurement, caused by initially pairing a new runtime with the old compiler.
+The parent directory retains 27 three-repeat initial copy-first measurements and 8 size screens. Those use a different frozen binary without the extra prefix continuation pair and must not be pooled with final results. Initial 256B/1KiB screens improved roughly 10%; the 16KiB screen exposed a p99 regression that motivated the bounded continuation. An unsuccessful startup before timed measurements was attributed to pairing a new runtime with the old compiler; its logs and any failed-build-mismatch directory were not retained in this repository snapshot.
 
 ## Validation and provenance
 
@@ -46,4 +46,4 @@ Runtime SHA256: `aefe084463ad9323442b1cf60b6bb3ccb0fc900942d41531382145ab7d7f83f
 Compiler SHA256: `8223eeddbbed631257231726e9984adc015c1e91880ca13097a5605f6ece7952`.
 Client SHA256: `8f9433dd9390a0805d9f6619472f16987258e5784980644386a9b847dfb0f3b4`.
 
-This checkpoint directory contains `README.md` and `measurements.json`. The raw measurements, tcpkali2 CSV files, frontend/origin logs, runner scripts, and frozen runtime/compiler/client binaries are unavailable in this repository snapshot, so the reported measurements cannot be independently replayed from archived artifacts here.
+This checkpoint directory contains only `README.md` and `measurements.json`. The raw measurements, tcpkali2 CSV files, frontend/origin logs, runner scripts, and frozen runtime/compiler/client binaries are unavailable in this repository snapshot, so the reported measurements cannot be independently replayed from the artifacts present here.
