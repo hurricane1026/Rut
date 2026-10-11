@@ -40798,7 +40798,7 @@ struct OneShotRecvFixture {
             conn->upstream_recv_armed = false;
             conn->upstream_recv_paused_for_send = false;
             conn->upstream_recv_pause_cancel_pending = false;
-            conn->upstream_recv_pause_rearm_pending = false;
+            loop->test_mark_upstream_cache_rearm_pending(*conn, false);
             conn->upstream_recv_cancel_inflight = false;
             conn->upstream_recv_terminal_stale = false;
             if (conn->fd >= 0)
@@ -41557,6 +41557,384 @@ TEST(iouring_upstream_recv, empty_ring_terminal_rearms_one_shot_body_recv) {
     }
 }
 
+#if RUT_ENABLE_WEBSOCKET
+TEST(iouring_upstream_recv, empty_ring_terminal_rearms_default_websocket_recv) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    conn.is_ws_tunnel = true;
+    conn.state = ConnState::Sending;
+    conn.on_upstream_recv = &on_ws_upstream_recv<IoUringEventLoop>;
+    REQUIRE(loop->use_one_shot_websocket_recv(conn));
+    REQUIRE(loop->submit_recv_upstream(conn));
+    REQUIRE_EQ(conn.pending_ops, 1u);
+    const u32 tail_after_first = __atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    IoEvent terminal{
+        conn.id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+    terminal.provided_ring_empty = 1;
+    loop->dispatch(terminal);
+
+    CHECK_GE(conn.fd, 0);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(conn.pending_ops, 1u);
+    CHECK_EQ(__atomic_load_n(loop->backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_first + 1u);
+    fixture.cleanup();
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
+#if RUT_ENABLE_WEBSOCKET
+TEST(iouring_upstream_recv, cache_empty_ring_defers_until_ordinary_buffer_returns) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    auto& conn = *fixture.conn;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    conn.is_ws_tunnel = true;
+    conn.on_upstream_recv = &on_ws_upstream_recv<IoUringEventLoop>;
+    REQUIRE(loop.submit_recv_upstream(conn));
+    const u32 tail_after_terminal = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    IoEvent terminal{
+        conn.id, -ENOBUFS, 0, 0, IoEventType::UpstreamRecv, 0, 0, conn.upstream_episode};
+    terminal.provided_ring_empty = 1;
+    loop.dispatch(terminal);
+    REQUIRE(conn.upstream_recv_pause_rearm_pending);
+
+    // Mark the ordinary ring exhausted. Repeated service attempts must not
+    // submit SQEs until one ordinary cached block is returned.
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount;
+    loop.test_rearm_deferred_ws_cache_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal);
+    CHECK(conn.upstream_recv_pause_rearm_pending);
+    loop.test_rearm_deferred_ws_cache_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal);
+
+    --loop.backend.ws_recv_cache_ordinary_count;
+    loop.test_rearm_deferred_ws_cache_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal + 1u);
+    CHECK(!conn.upstream_recv_pause_rearm_pending);
+    CHECK(conn.upstream_recv_armed);
+    fixture.cleanup();
+}
+
+TEST(iouring_downstream_recv, cache_empty_ring_defers_until_ordinary_buffer_returns) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    auto& conn = *fixture.conn;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    conn.is_ws_tunnel = true;
+    REQUIRE(loop.submit_recv(conn));
+    const u32 tail_after_terminal = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    IoEvent terminal{conn.id, -ENOBUFS, 0, 0, IoEventType::Recv};
+    terminal.provided_ring_empty = 1;
+    loop.dispatch(terminal);
+    REQUIRE_EQ(loop.test_recv_rearm_count(), 1u);
+
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount;
+    loop.test_rearm_deferred_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+    loop.test_rearm_deferred_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal);
+
+    --loop.backend.ws_recv_cache_ordinary_count;
+    loop.test_rearm_deferred_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail_after_terminal + 1u);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    CHECK(conn.recv_armed);
+    fixture.cleanup();
+}
+
+TEST(iouring_upstream_recv, cache_partial_capacity_and_terminate_keep_one_shot) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    auto& conn = *fixture.conn;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    conn.is_ws_tunnel = true;
+    conn.is_ws_terminate = true;
+    CHECK(loop.test_use_one_shot_websocket_recv(conn));
+    conn.is_ws_terminate = false;
+    CHECK(!loop.test_use_one_shot_websocket_recv(conn));
+
+    loop.test_mark_upstream_cache_rearm_pending(conn, true);
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 2u;
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop.test_rearm_deferred_ws_cache_recvs();
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK(conn.upstream_recv_armed);
+    fixture.cleanup();
+}
+
+TEST(iouring_cache_rearm, shared_budget_keeps_downstream_pending) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    auto& conn = *fixture.conn;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    conn.is_ws_tunnel = true;
+    REQUIRE(loop.submit_recv(conn));
+    REQUIRE(loop.submit_recv_upstream(conn));
+    loop.test_defer_recv_rearm(conn);
+    loop.test_mark_upstream_cache_rearm_pending(conn, true);
+    conn.upstream_recv_armed = false;
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;
+    CHECK_EQ(loop.test_cache_rearm_budget(2u), 0u);
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 3u;
+    CHECK_EQ(loop.test_cache_rearm_budget(2u), 1u);
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK(conn.upstream_recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 2u;
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    fixture.cleanup();
+}
+
+TEST(iouring_cache_rearm, timer_forced_pass_uses_current_ordinary_occupancy) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture first;
+    OneShotRecvFixture second;
+    REQUIRE(first.stage(guard.loop, /*plaintext=*/true));
+    REQUIRE(second.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    first.conn->is_ws_tunnel = second.conn->is_ws_tunnel = true;
+    loop.test_defer_recv_rearm(*first.conn);
+    loop.test_defer_recv_rearm(*second.conn);
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    // This is the larger capacity left by the previous batch. The current
+    // wait has since pinned all but one ordinary buffer before Timeout is
+    // dispatched, so the forced pass must refresh occupancy before arming.
+    loop.ws_cache_rearm_budget = kProvidedBufCount;
+    loop.backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;
+    const IoEvent timeout{0, 1, 0, 0, IoEventType::Timeout};
+    loop.dispatch(timeout);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+    CHECK(first.conn->recv_armed);
+    CHECK_FALSE(second.conn->recv_armed);
+
+    // Returning one ordinary block permits the remaining slot on a later
+    // timer pass; the persistent cursor must not strand it.
+    --loop.backend.ws_recv_cache_ordinary_count;
+    loop.dispatch(timeout);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 2u);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    CHECK(second.conn->recv_armed);
+    loop.backend.ws_recv_cache_ordinary_count = 0;
+    first.cleanup();
+    second.cleanup();
+}
+
+TEST(iouring_cache_rearm, unrelated_cqes_do_not_pin_the_last_ordinary_buffer) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    auto& backend = loop.backend;
+    auto& conn = *fixture.conn;
+    REQUIRE(backend.enable_ws_recv_cache());
+    conn.is_ws_tunnel = true;
+    const u32 original_sq_tail = __atomic_load_n(backend.sq_tail, __ATOMIC_ACQUIRE);
+    const u32 original_pending = backend.pending;
+    const u32 original_cq_head = __atomic_load_n(backend.cq_head, __ATOMIC_ACQUIRE);
+    const u32 original_cq_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+
+    auto append_cqe = [&](u32 flags) {
+        const u32 tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+        auto& cqe = backend.cq_entries[tail & *backend.cq_ring_mask];
+        cqe.user_data = encode_non_upstream_user_data({conn.id, IoEventType::Send, 0});
+        cqe.res = 0;
+        cqe.flags = flags;
+        __atomic_store_n(backend.cq_tail, tail + 1u, __ATOMIC_RELEASE);
+    };
+    auto reset_recv = [&] {
+        __atomic_store_n(backend.sq_tail, original_sq_tail, __ATOMIC_RELEASE);
+        backend.pending = original_pending;
+        conn.recv_armed = false;
+        conn.pending_ops = 0;
+    };
+
+    backend.ws_recv_cache_ordinary_count = kProvidedBufCount - 1u;
+    append_cqe(0);  // unrelated Send completion does not own a provided buffer
+    CHECK_EQ(backend.cq_unharvested_ordinary_buffers(), 0u);
+    loop.test_defer_recv_rearm(conn);
+    loop.ws_cache_rearm_budget = loop.test_cache_rearm_budget(0);
+    loop.rearm_deferred_recvs(/*force=*/false);
+    CHECK(conn.recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    reset_recv();
+
+    // The timer-forced pass uses the same selected-buffer count, so a busy CQ
+    // containing unrelated work cannot strand the one physically free buffer.
+    loop.test_defer_recv_rearm(conn);
+    loop.dispatch({0, 1, 0, 0, IoEventType::Timeout});
+    CHECK(conn.recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    reset_recv();
+
+    // A selected ordinary buffer still pins that last slot. Both normal and
+    // timer passes must wait until its CQE is harvested.
+    append_cqe(IORING_CQE_F_BUFFER | (7u << IORING_CQE_BUFFER_SHIFT));
+    CHECK_EQ(backend.cq_unharvested_ordinary_buffers(), 1u);
+    loop.test_defer_recv_rearm(conn);
+    loop.ws_cache_rearm_budget =
+        loop.test_cache_rearm_budget(backend.cq_unharvested_ordinary_buffers());
+    loop.rearm_deferred_recvs(/*force=*/false);
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+    loop.dispatch({0, 1, 0, 0, IoEventType::Timeout});
+    CHECK_FALSE(conn.recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+
+    const u32 harvested_tail = __atomic_load_n(backend.cq_tail, __ATOMIC_ACQUIRE);
+    __atomic_store_n(backend.cq_head, harvested_tail, __ATOMIC_RELEASE);
+    loop.dispatch({0, 1, 0, 0, IoEventType::Timeout});
+    CHECK(conn.recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+
+    reset_recv();
+    __atomic_store_n(backend.cq_head, original_cq_head, __ATOMIC_RELEASE);
+    __atomic_store_n(backend.cq_tail, original_cq_tail, __ATOMIC_RELEASE);
+    backend.ws_recv_cache_ordinary_count = 0;
+    fixture.cleanup();
+}
+
+TEST(iouring_cache_rearm, upstream_budget_one_round_robins_pending_owners) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture first;
+    OneShotRecvFixture second;
+    REQUIRE(first.stage(guard.loop, /*plaintext=*/true));
+    REQUIRE(second.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    first.conn->is_ws_tunnel = second.conn->is_ws_tunnel = true;
+    REQUIRE(loop.submit_recv(*first.conn));
+    REQUIRE(loop.submit_recv(*second.conn));
+    loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);
+    loop.test_mark_upstream_cache_rearm_pending(*second.conn, true);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 2u);
+    first.conn->upstream_recv_armed = false;
+    second.conn->upstream_recv_armed = false;
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK(first.conn->upstream_recv_armed);
+    CHECK_FALSE(second.conn->upstream_recv_armed);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+
+    // Return the first owner's slot and repeat the same one-buffer turn. The
+    // cursor must advance, otherwise the low-id owner monopolizes every pass.
+    first.conn->upstream_recv_armed = false;
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 2u);
+    CHECK(second.conn->upstream_recv_armed);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    first.cleanup();
+    second.cleanup();
+}
+
+TEST(iouring_cache_rearm, no_upstream_pending_owner_skips_high_water_scan) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture first;
+    OneShotRecvFixture second;
+    REQUIRE(first.stage(guard.loop, /*plaintext=*/true));
+    REQUIRE(second.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    CHECK_GE(loop.slots_initialized, 2u);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
+
+    // A generic HTTP rendezvous uses the same pending flag but must not keep
+    // the WebSocket-cache pass scanning the whole initialized prefix.
+    loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
+
+    // A pending pre-tunnel cancellation becomes a counted cache owner only
+    // after the 101 transitions it into an eligible WebSocket tunnel.
+    first.conn->is_ws_tunnel = true;
+    loop.test_refresh_upstream_cache_rearm_owner(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+    loop.test_refresh_upstream_cache_rearm_owner(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+
+    first.conn->is_ws_terminate = true;
+    loop.test_refresh_upstream_cache_rearm_owner(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
+    first.conn->is_ws_terminate = false;
+    loop.test_refresh_upstream_cache_rearm_owner(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+
+    // Repeated deferral is idempotent, and close removes the pending owner
+    // before the slot may be reused.
+    loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);
+    loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+    loop.close_conn(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
+    second.cleanup();
+}
+
+TEST(iouring_cache_rearm, budget_one_alternates_repending_upstream_and_downstream) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    OneShotRecvFixture upstream;
+    OneShotRecvFixture downstream;
+    REQUIRE(upstream.stage(guard.loop, /*plaintext=*/true));
+    REQUIRE(downstream.stage(guard.loop, /*plaintext=*/true));
+    auto& loop = *guard.loop;
+    REQUIRE(loop.backend.enable_ws_recv_cache());
+    upstream.conn->is_ws_tunnel = downstream.conn->is_ws_tunnel = true;
+    REQUIRE(loop.submit_recv(*upstream.conn));
+    REQUIRE(loop.submit_recv(*downstream.conn));
+    loop.test_mark_upstream_cache_rearm_pending(*upstream.conn, true);
+    upstream.conn->upstream_recv_armed = false;
+    loop.test_defer_recv_rearm(*downstream.conn);
+    downstream.conn->recv_armed = false;
+    const u32 tail = __atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE);
+
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 1u);
+    CHECK(upstream.conn->upstream_recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 1u);
+
+    // Upstream remains eligible every turn, but the persistent direction
+    // cursor gives downstream the next single available buffer.
+    upstream.conn->upstream_recv_armed = false;
+    loop.test_rearm_cache_passes_with_budget(1);
+    CHECK_EQ(__atomic_load_n(loop.backend.sq_tail, __ATOMIC_ACQUIRE), tail + 2u);
+    CHECK(downstream.conn->recv_armed);
+    CHECK_EQ(loop.test_recv_rearm_count(), 0u);
+    upstream.cleanup();
+    downstream.cleanup();
+}
+#endif  // RUT_ENABLE_WEBSOCKET
+
 namespace {
 
 // Stage an ordinary native Content-Length body owner whose upstream slice holds
@@ -41697,7 +42075,7 @@ TEST(iouring_upstream_relay, large_body_relays_through_bulk_buffers_and_returns_
     // provided-buffer ring.
     REQUIRE_EQ(conn.upstream_relay_slice, first);
     u8* const bulk_a = conn.upstream_recv_slice;
-    CHECK(pool.is_bulk(bulk_a));
+    REQUIRE(pool.is_bulk(bulk_a));
     CHECK_EQ(conn.upstream_recv_buf.capacity(), kBulk);
     CHECK_EQ(pool.bulk_available(), bulk_before - 1u);
     CHECK(conn.upstream_recv_direct_armed);
@@ -42685,7 +43063,7 @@ TEST(iouring_retirement, released_upstream_close_purges_lossy_stale_prefix_befor
 
     // Successor connected; its first recv was deferred behind the old drain.
     conn->upstream_fd = successor[0];
-    conn->upstream_recv_pause_rearm_pending = true;
+    loop->test_mark_upstream_cache_rearm_pending(*conn, true);
     conn->set_slots(nullptr, nullptr, &on_upstream_response<IoUringEventLoop>, nullptr);
 
     // wait() copied a prefix of an oversized stale CQE and reported -ENOBUFS.

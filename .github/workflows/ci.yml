@@ -757,6 +757,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_http2_conn.profraw ./build/tests/test_http2_conn
           LLVM_PROFILE_FILE=build/test_ws_frame.profraw ./build/tests/test_ws_frame
           LLVM_PROFILE_FILE=build/test_ws_terminate.profraw ./build/tests/test_ws_terminate
+          LLVM_PROFILE_FILE=build/test_ws_tunnel_iouring.profraw ./build/tests/test_ws_tunnel_iouring
 
       - name: Generate coverage report
         run: |
@@ -782,6 +783,9 @@ jobs:
           # types; the union merge would incorrectly count those as
           # real production paths. They still run above for correctness
           # validation.
+          # test_ws_tunnel_iouring uses the real IoUringEventLoop and adds
+          # runtime splice coverage; include it in the union when its
+          # conditional kernel-backed tests are available.
           LLVM_COV="$LLVM_COV" python3 scripts/coverage_report.py \
             --profile build/merged.profdata \
             --threshold 95 \
@@ -797,6 +801,7 @@ jobs:
             build/tests/test_http2_conn \
             build/tests/test_ws_frame \
             build/tests/test_ws_terminate \
+            build/tests/test_ws_tunnel_iouring \
             build/tests/test_expected \
             build/tests/test_drain \
             build/tests/test_access_log \

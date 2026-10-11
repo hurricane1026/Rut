@@ -1618,6 +1618,9 @@ struct ConnectionBase {
     bool upstream_recv_paused_for_send;
     bool upstream_recv_pause_cancel_pending;
     bool upstream_recv_pause_rearm_pending;
+    // The io_uring loop's exact WebSocket-cache deferred-rearm owner count
+    // includes this slot only while the flag and cache eligibility both hold.
+    bool upstream_recv_pause_rearm_cache_counted;
     // True from when a pause cancel is issued until the CANCELLED recv's own terminal
     // CQE (-ECANCELED, or a normal completion that beat the cancel) has drained. Unlike
     // upstream_recv_armed — which proxy_stream_complete clears at the keep-alive
@@ -2106,6 +2109,7 @@ struct ConnectionBase {
         upstream_recv_paused_for_send = false;
         upstream_recv_pause_cancel_pending = false;
         upstream_recv_pause_rearm_pending = false;
+        upstream_recv_pause_rearm_cache_counted = false;
         upstream_recv_cancel_inflight = false;
         upstream_recv_terminal_stale = false;
         // upstream_retiring_episode deliberately persists across reset()/reuse;
