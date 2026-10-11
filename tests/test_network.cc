@@ -30791,7 +30791,7 @@ TEST(epoll_loop, edge_accept_keeps_default_and_bounds_explicit_batch) {
         REQUIRE(events[i].result >= 0);
         accepted[i].fd = events[i].result;
     }
-    CHECK(backend.accept_pending);
+    REQUIRE(backend.accept_pending);
 
     REQUIRE_EQ(backend.wait(events, 32, nullptr, 0), 16u);
     for (u32 i = 0; i < 16; ++i) {
