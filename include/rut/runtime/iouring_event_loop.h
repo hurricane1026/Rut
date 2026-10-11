@@ -319,9 +319,9 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
         --test_fail_ws_splice_cancel_count;
         return true;
     }
-#ifdef RUT_TESTING
+    // Keep the event-loop layout identical in rut_runtime and test translation
+    // units. Only the fault-injection use is test-only; the storage is not.
     bool test_eintr_next_ws_splice_call = false;
-#endif
     // Shared cross-shard limiter for @rateLimit(scope: global) rules. Null ->
     // global rules degrade to per-shard. main.cc points every shard at one
     // shared instance.

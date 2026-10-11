@@ -41951,7 +41951,7 @@ TEST(iouring_upstream_relay, large_body_relays_through_bulk_buffers_and_returns_
     // provided-buffer ring.
     REQUIRE_EQ(conn.upstream_relay_slice, first);
     u8* const bulk_a = conn.upstream_recv_slice;
-    CHECK(pool.is_bulk(bulk_a));
+    REQUIRE(pool.is_bulk(bulk_a));
     CHECK_EQ(conn.upstream_recv_buf.capacity(), kBulk);
     CHECK_EQ(pool.bulk_available(), bulk_before - 1u);
     CHECK(conn.upstream_recv_direct_armed);
