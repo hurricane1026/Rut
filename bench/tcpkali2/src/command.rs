@@ -66,6 +66,11 @@ pub struct Config {
 /// # Returns
 /// * `Arc<Config>` - Shared configuration object
 pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliError> {
+    validate_payload_verification(
+        matches.get_flag("websocket"),
+        matches.get_flag("pipeline"),
+        std::env::var("TCPKALI2_BENCH_VERIFY").as_deref() == Ok("1"),
+    )?;
     let unescape = matches.get_flag("unescape-message-args");
 
     let message_size = *matches.get_one::<usize>("message-size").unwrap();
@@ -146,6 +151,19 @@ pub fn parse_config(matches: &clap::ArgMatches) -> Result<Arc<Config>, TcpKaliEr
     }
 
     Ok(Arc::new(config))
+}
+
+pub(crate) fn validate_payload_verification(
+    use_websocket: bool,
+    pipeline: bool,
+    verify_payload: bool,
+) -> Result<(), TcpKaliError> {
+    if verify_payload && (!use_websocket || pipeline) {
+        return Err(TcpKaliError::Config(
+            "payload verification requires WebSocket ping-pong mode (no --pipeline)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Returns the requested Tokio worker count, or half the logical CPUs when
@@ -373,6 +391,54 @@ pub(crate) fn command() -> Command {
 #[cfg(test)]
 mod tests {
     use crate::error::TcpKaliError;
+
+    #[test]
+    fn payload_verification_requires_websocket_ping_pong_mode() {
+        let tcp = super::command()
+            .try_get_matches_from(["tcpkali2", "127.0.0.1:1234"])
+            .unwrap();
+        let websocket = super::command()
+            .try_get_matches_from(["tcpkali2", "--websocket", "127.0.0.1:1234"])
+            .unwrap();
+        let pipeline = super::command()
+            .try_get_matches_from(["tcpkali2", "--websocket", "--pipeline", "127.0.0.1:1234"])
+            .unwrap();
+
+        assert!(matches!(
+            super::validate_payload_verification(
+                tcp.get_flag("websocket"),
+                tcp.get_flag("pipeline"),
+                true,
+            ),
+            Err(TcpKaliError::Config(message))
+                if message == "payload verification requires WebSocket ping-pong mode (no --pipeline)"
+        ));
+        assert!(
+            super::validate_payload_verification(
+                websocket.get_flag("websocket"),
+                websocket.get_flag("pipeline"),
+                true,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            super::validate_payload_verification(
+                pipeline.get_flag("websocket"),
+                pipeline.get_flag("pipeline"),
+                true,
+            ),
+            Err(TcpKaliError::Config(message))
+                if message == "payload verification requires WebSocket ping-pong mode (no --pipeline)"
+        ));
+        assert!(
+            super::validate_payload_verification(
+                tcp.get_flag("websocket"),
+                tcp.get_flag("pipeline"),
+                false,
+            )
+            .is_ok()
+        );
+    }
 
     fn first_message_config(
         path: &std::path::Path,

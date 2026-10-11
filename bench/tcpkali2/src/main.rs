@@ -25,6 +25,11 @@ fn main() -> Result<(), TcpKaliError> {
         std::env::var("TCPKALI2_BENCH_VERIFY").as_deref() == Ok("1")
     );
     let matches = new_command();
+    crate::command::validate_payload_verification(
+        matches.get_flag("websocket"),
+        matches.get_flag("pipeline"),
+        std::env::var("TCPKALI2_BENCH_VERIFY").as_deref() == Ok("1"),
+    )?;
     let workers = worker_count(&matches);
     if workers == 0 {
         return Err(TcpKaliError::Config(

@@ -39,6 +39,22 @@ def manifest_script_hashes(args):
                 harness_sha256=hashlib.sha256(args.harness.read_bytes()).hexdigest())
 
 
+def manifest_binary_hashes(rut, tcpkali2=None):
+    hashes = {
+        'rut_sha256': hashlib.sha256(rut.read_bytes()).hexdigest(),
+        'rut_compile_sha256': hashlib.sha256(rut.with_name('rut-compile').read_bytes()).hexdigest(),
+    }
+    if tcpkali2:
+        hashes['tcpkali2_sha256'] = hashlib.sha256(tcpkali2.read_bytes()).hexdigest()
+    return hashes
+
+
+def require_matching_manifest(prior, manifest):
+    if prior.exists() and json.loads(prior.read_text()) != manifest:
+        raise RuntimeError('manifest changed; use another output directory')
+    prior.write_text(json.dumps(manifest, indent=2) + '\n')
+
+
 def protocol_environment(source):
     selected = {key: value for key, value in source.items()
                 if key in {'RUT_STUDY_WS_RECV', 'RUT_STUDY_WS_SPLICE', 'RUT_STUDY_WS_SEGMENT',
@@ -348,12 +364,12 @@ def main():
     spec = importlib.util.spec_from_file_location('runtime_benchmark', args.harness)
     harness = importlib.util.module_from_spec(spec); spec.loader.exec_module(harness)
     origin_cpus, client_cpus = validate_cpu_assignments(parser, harness, args)
+    binary_hashes = manifest_binary_hashes(args.rut, args.tcpkali2)
     out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
     image = (harness.ROOT / 'tests/pinned-nginx-image.txt').read_text().strip()
     manifest = dict(cases=CASES, duration=args.duration, frontend_cpus=[2], origin_cpus=origin_cpus,
                     client_cpus=client_cpus, connections=args.connections_per_client * len(client_cpus), client='tcpkali2 verified pingpong' if args.tcpkali2 else 'Python asyncio; direct-origin ceiling required',
-                    tcpkali2_sha256=hashlib.sha256(args.tcpkali2.read_bytes()).hexdigest() if args.tcpkali2 else None,
-                    rut_sha256=hashlib.sha256(args.rut.read_bytes()).hexdigest(), nginx_image=image,
+                    **binary_hashes, nginx_image=image,
                     fixture_sha256=hashlib.sha256(args.fixture.read_bytes()).hexdigest(),
                     **manifest_script_hashes(args),
                     ws_recv_mode=os.environ.get('RUT_STUDY_WS_RECV', 'once'),
@@ -377,9 +393,7 @@ def main():
                     mask_helper=os.environ.get('RUT_BENCH_WS_MASK_HELPER'),
                     mask_helper_sha256=hashlib.sha256(Path(os.environ['RUT_BENCH_WS_MASK_HELPER']).read_bytes()).hexdigest() if os.environ.get('RUT_BENCH_WS_MASK_HELPER') else None)
     prior = out / 'study.json'
-    if prior.exists() and json.loads(prior.read_text()) != manifest:
-        raise RuntimeError('manifest changed; use another output directory')
-    prior.write_text(json.dumps(manifest, indent=2) + '\n')
+    require_matching_manifest(prior, manifest)
     rows = []
     fixture = [sys.executable, str(args.fixture.resolve())]
     origin_port = 8805; front_port = 8804

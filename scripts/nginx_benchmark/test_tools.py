@@ -472,6 +472,23 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(hashes["protocol_strategy_sha256"],
                          __import__("hashlib").sha256(Path(protocol_strategy.__file__).read_bytes()).hexdigest())
 
+    def test_protocol_manifest_rejects_resume_after_sibling_compiler_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rut = Path(directory) / "rut"
+            compiler = Path(directory) / "rut-compile"
+            prior = Path(directory) / "study.json"
+            rut.write_bytes(b"frontend-v1")
+            compiler.write_bytes(b"compiler-v1")
+            initial = protocol_strategy.manifest_binary_hashes(rut)
+            protocol_strategy.require_matching_manifest(prior, initial)
+
+            compiler.write_bytes(b"compiler-v2")
+            resumed = protocol_strategy.manifest_binary_hashes(rut)
+            self.assertEqual(resumed["rut_sha256"], initial["rut_sha256"])
+            self.assertNotEqual(resumed["rut_compile_sha256"], initial["rut_compile_sha256"])
+            with self.assertRaisesRegex(RuntimeError, "manifest changed"):
+                protocol_strategy.require_matching_manifest(prior, resumed)
+
     def test_direct_origin_cpu_observation_is_absent(self):
         self.assertIsNone(protocol_strategy.frontend_cpu_observation("direct-origin", 1, 3, 1))
         self.assertEqual(protocol_strategy.frontend_cpu_observation("uring", 1, 3, 1), 200)
