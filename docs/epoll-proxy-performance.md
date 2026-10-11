@@ -93,14 +93,16 @@ regression checks that the composed native wrappers delegate exactly once;
 all 68 benchmark tool tests pass. This harness fix applies equally to both
 RPS variants and does not skip any preflight.
 
-## Bounded accept batches as the ET default (2026-10-11)
+## Explicit bounded accept batch study (2026-10-11)
 
-Successful full ET initialization now raises the default accept batch from
-one to 16. Explicitly configured batches remain unchanged, repeated enabling
-does not reset the limit, and failed initialization leaves it untouched.
-LT retains its default of one. The existing output-capacity clamp and I/O
-service budget still bound accept work. Startup diagnostics report the limit
-after ET initialization so the recorded setting matches the effective one.
+ET initialization preserves the default accept batch of one and any explicitly
+configured limit. Machine-specific batch tuning is not promoted to a default.
+`RUT_STUDY_EPOLL_ACCEPT_BATCH=16` remains an explicit experiment setting; the
+output-capacity clamp and I/O service budget bound accept work. Diagnostics
+report the effective configured limit after ET initialization.
+
+The following results describe the withdrawn automatic-16 prototype, retained
+as local tuning evidence rather than a portable runtime policy.
 
 The final binary was compared with parent commit `8f2c7fc6` in five paired,
 alternating rounds. Both enabled ET, stable upstream events and stable relay
@@ -124,7 +126,7 @@ These local samples do not cover mixed workloads, TLS or multiple workers.
 
 Default and ET network tests each passed 1,608 cases; splice tests each passed
 49 cases. Real TCP regression coverage queues 19 connections and verifies an
-output cap of two, the default batch cap of 16, and draining the final accept.
+output cap of two, an explicitly configured batch cap of 16, and draining the final accept.
 Additional coverage checks overrides, idempotence and initialization failure.
 Sol review, changed-file formatting and whitespace checks passed.
 

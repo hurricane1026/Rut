@@ -30756,7 +30756,7 @@ TEST(epoll_loop, edge_accept_continuation_preserves_capacity_fairness_and_cancel
     backend.shutdown();
 }
 
-TEST(epoll_loop, edge_accept_defaults_to_bounded_batch_and_respects_output_cap) {
+TEST(epoll_loop, edge_accept_keeps_default_and_bounds_explicit_batch) {
     ScopedListenerTestFd listener(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0));
     REQUIRE(listener.fd >= 0);
     sockaddr_in address = listener_test_ipv4(INADDR_LOOPBACK, 0);
@@ -30769,9 +30769,10 @@ TEST(epoll_loop, edge_accept_defaults_to_bounded_batch_and_respects_output_cap) 
     REQUIRE(backend.init(0, listener.fd, 8).has_value());
     CHECK_EQ(backend.study_accept_batch_limit, 1u);
     REQUIRE(backend.enable_edge_trigger());
-    CHECK_EQ(backend.study_accept_batch_limit, 16u);
+    CHECK_EQ(backend.study_accept_batch_limit, 1u);
     REQUIRE(backend.enable_edge_trigger());
-    CHECK_EQ(backend.study_accept_batch_limit, 16u);
+    CHECK_EQ(backend.study_accept_batch_limit, 1u);
+    backend.study_accept_batch_limit = 16;
     backend.add_accept();
 
     ScopedListenerTestFd clients[19];
