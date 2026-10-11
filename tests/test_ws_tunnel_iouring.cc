@@ -2194,14 +2194,20 @@ TEST(http, newly_dispatched_relay_read_preserves_older_runnable_owner) {
     REQUIRE(loop.start_response_splice(*second));
     CHECK_EQ(loop.relay_written_bytes, 0u);
     CHECK_EQ(loop.deferred_relay_read_count, 2u);
+    const u32 free_top_before_flush = loop.free_top;
     loop.study_inside_cq = false;
     loop.flush_deferred_relay_reads();
     CHECK_EQ(loop.relay_written_bytes, sizeof(payload));
     CHECK_EQ(second->resp_body_remaining, sizeof(payload));
     CHECK_EQ(loop.deferred_relay_read_count, 1u);
     CHECK_EQ(loop.deferred_relay_read_ids[loop.deferred_relay_read_slot(0)], second->id);
-    loop.close_conn(*first);
-    loop.close_conn(*second);
+    CHECK_EQ(loop.free_top, free_top_before_flush + 1u);
+    CHECK_EQ(first->fd, -1);
+    CHECK(second->fd >= 0);
+    // Completing the first response returns its slot during the synchronous
+    // relay flush; only close connections that are still live after it.
+    if (first->fd >= 0) loop.close_conn(*first);
+    if (second->fd >= 0) loop.close_conn(*second);
 }
 
 static void early_submit(test::TestCase* _tc, bool enabled, bool failure = false) {
