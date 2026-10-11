@@ -41867,6 +41867,28 @@ TEST(iouring_cache_rearm, no_upstream_pending_owner_skips_high_water_scan) {
     CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
     CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
 
+    // A generic HTTP rendezvous uses the same pending flag but must not keep
+    // the WebSocket-cache pass scanning the whole initialized prefix.
+    loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
+
+    // A pending pre-tunnel cancellation becomes a counted cache owner only
+    // after the 101 transitions it into an eligible WebSocket tunnel.
+    first.conn->is_ws_tunnel = true;
+    loop.test_refresh_upstream_cache_rearm_owner(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+    loop.test_refresh_upstream_cache_rearm_owner(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+
+    first.conn->is_ws_terminate = true;
+    loop.test_refresh_upstream_cache_rearm_owner(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 0u);
+    CHECK_FALSE(loop.test_rearm_deferred_ws_cache_recvs());
+    first.conn->is_ws_terminate = false;
+    loop.test_refresh_upstream_cache_rearm_owner(*first.conn);
+    CHECK_EQ(loop.test_ws_cache_upstream_rearm_pending_count(), 1u);
+
     // Repeated deferral is idempotent, and close removes the pending owner
     // before the slot may be reused.
     loop.test_mark_upstream_cache_rearm_pending(*first.conn, true);

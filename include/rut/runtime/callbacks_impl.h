@@ -10696,6 +10696,8 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
     (void)::setsockopt(conn.upstream_fd, IPPROTO_TCP, TCP_NODELAY, &kNoDelay, sizeof(kNoDelay));
     errno = kSavedErrno;
     conn.is_ws_tunnel = true;
+    if constexpr (requires(Loop* lp, Connection& c) { lp->refresh_upstream_cache_rearm_owner(c); })
+        loop->refresh_upstream_cache_rearm_owner(conn);
     conn.ws_client_send_pending = false;
     conn.ws_upstream_send_pending = false;
     conn.ws_client_send_len = 0;
@@ -10713,6 +10715,8 @@ void on_ws_101_sent(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 #endif
+    if constexpr (requires(Loop* lp, Connection& c) { lp->refresh_upstream_cache_rearm_owner(c); })
+        loop->refresh_upstream_cache_rearm_owner(conn);
     if (conn.pipeline_stash_len > 0) {
         // Recover the stashed post-upgrade bytes into recv_buf. If they (plus any
         // bytes already read) don't fit, fail closed rather than truncate the

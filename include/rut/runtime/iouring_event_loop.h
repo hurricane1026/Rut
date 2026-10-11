@@ -3586,12 +3586,18 @@ public:
     }
 
     void set_upstream_cache_rearm_pending(Connection& c, bool pending) {
-        if (c.upstream_recv_pause_rearm_pending == pending) return;
-        if (pending)
+        c.upstream_recv_pause_rearm_pending = pending;
+        refresh_upstream_cache_rearm_membership(c);
+    }
+
+    void refresh_upstream_cache_rearm_membership(Connection& c) {
+        const bool should_count = c.upstream_recv_pause_rearm_pending && ws_recv_cache_active(c);
+        if (c.upstream_recv_pause_rearm_cache_counted == should_count) return;
+        if (should_count)
             ++ws_cache_upstream_rearm_pending_count;
         else if (ws_cache_upstream_rearm_pending_count != 0)
             --ws_cache_upstream_rearm_pending_count;
-        c.upstream_recv_pause_rearm_pending = pending;
+        c.upstream_recv_pause_rearm_cache_counted = should_count;
     }
 
     void rearm_deferred_cache_passes(bool force) {
@@ -4165,6 +4171,10 @@ public:
 
     void mark_upstream_cache_rearm_pending(Connection& c, bool pending) {
         set_upstream_cache_rearm_pending(c, pending);
+    }
+
+    void refresh_upstream_cache_rearm_owner(Connection& c) {
+        refresh_upstream_cache_rearm_membership(c);
     }
 
 #ifdef RUT_TESTING
@@ -7413,6 +7423,9 @@ public:
     }
     void test_mark_upstream_cache_rearm_pending(Connection& c, bool pending) {
         set_upstream_cache_rearm_pending(c, pending);
+    }
+    void test_refresh_upstream_cache_rearm_owner(Connection& c) {
+        refresh_upstream_cache_rearm_membership(c);
     }
     u32 test_ws_cache_upstream_rearm_pending_count() const {
         return ws_cache_upstream_rearm_pending_count;
