@@ -1458,6 +1458,13 @@ dispatch_ready:
                 if (stable_pool != nullptr && transport.pool_slot < UpstreamPool::kMaxConns) {
                     const auto& idle = stable_pool->conns[transport.pool_slot];
                     if (idle.allocated && idle.idle && idle.fd == static_cast<i32>(kFd)) {
+                        // An idle upstream cannot serve another request after
+                        // a terminal event, even if unread bytes precede EOF.
+                        // Only ordinary readability needs a socket probe.
+                        if (ep_events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+                            stable_pool->discard_idle(transport.pool_slot, static_cast<i32>(kFd));
+                            continue;
+                        }
                         u8 probe = 0;
                         const ssize_t kResult =
                             ::recv(static_cast<i32>(kFd), &probe, 1, MSG_PEEK | MSG_DONTWAIT);

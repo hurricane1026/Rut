@@ -418,11 +418,11 @@ def main():
             yield pid
 
     module.Harness.nginx = origin
-    original_verify_origin_reuse = module.Harness.verify_origin_reuse
+    original_native_verify_origin_reuse = module.Harness.verify_origin_reuse
 
     def verify_api_origin_reuse(self, expected_markers, fresh_downstream=False):
         if options.origin_mode != "api":
-            return original_verify_origin_reuse(self, expected_markers, fresh_downstream)
+            return original_native_verify_origin_reuse(self, expected_markers, fresh_downstream)
         logs = (self.out / "api-origin.log").read_text()
         (self.out / f"{self.active_label}-origin-reuse.log").write_text(logs)
         records = module.origin_reuse_records(logs, expected_markers)

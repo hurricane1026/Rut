@@ -24,3 +24,71 @@ Whole-core sampling then showed that the single-worker origin consumed nearly an
 Increasing pipe capacity to 128 KiB, increasing callback syscall budget to eight, and coalescing currently readable segments did not improve persistent throughput consistently. Those experiments are excluded from the retained implementation. io_uring progression and SEND_ZC are not changed.
 
 Raw data, binary/compiler pairs and scripts are preserved under /home/hurricane/private/code/rut-performance-checkpoints/. Relevant directories are origin-multiaccept-comparison-20261008 and epoll-keepalive-two-origin-workers-20261008. No PR was published or merged for this candidate.
+
+## Idle upstream terminal-event fast path
+
+On top of the #794 merge (`ac7c0292`), an idle watched upstream receiving
+`EPOLLRDHUP`, `EPOLLHUP`, or `EPOLLERR` is discarded directly. An idle upstream
+with a closed receive side cannot serve a subsequent request, including when
+unread bytes precede EOF. Ordinary readability still uses `MSG_PEEK` to
+distinguish unexpected bytes from exhausted readiness. Active upstreams retain
+their existing data-before-EOF handling and ownership checks.
+
+A focused socket-pair regression parks an upstream, sends eight unsolicited
+bytes, and half-closes the peer. It verifies pool removal, descriptor closure,
+and absence of receive dispatch to either connection. Running this same test
+with an external `recv` counter measured one `MSG_PEEK` call on the baseline
+and zero on the candidate. This establishes the removed syscall for this
+specific close path; this syscall comparison alone does not establish an
+end-to-end throughput or latency gain.
+
+Clang 22 Release verification passed all 1606 network tests in both default
+and ET test modes, all 49 splice tests in both modes, and 62 WebSocket frame
+and termination tests. The network executable requires stderr to remain a
+pollable descriptor: two existing callback tests use `dup(2)` as their test
+fd. Redirecting stderr to a regular log file fails those tests on both the
+baseline and candidate; capturing stderr through a pipe passes them.
+Changed C++ lines pass clang-format and the diff passes whitespace checks.
+Sol's read-only review reported no findings. Raw comparison and test logs,
+the external counter source, and the patch are retained in
+`/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-idle-terminal-20261011/`.
+
+A subsequent isolated event benchmark used the same Release runtime archive
+except for the baseline/candidate epoll object, pinned to CPU 2. Seven samples
+per variant alternated execution order; each sample discarded 1000 warmup
+iterations and timed 30000 already-harvested idle events. Socket setup,
+parking, peer writes, and epoll_wait were outside the timed interval.
+Median terminal-event processing fell from 1404.89 ns to 1097.50 ns (-21.88%).
+The exhausted-readability control rose from 216.53 ns to 228.13 ns (+5.36%),
+so the extra branch has a measured cost in that control. This is a narrow
+event-processing comparison, not evidence of improved HTTP RPS or p99.
+The standalone source, binaries, hashes and individual samples are archived
+alongside the test evidence as `idle_bench.cc` and `idle-benchmark.json`.
+
+The HTTP RPS follow-up used a single Rut worker on CPU 2, four pinned-image
+nginx origin workers on CPUs 3/4/8/9, and wrk on CPUs 5/7. Both variants enabled
+ET, stable upstream events and stable relay events. The workload was a 4 KiB
+native-streaming proxy response at concurrency 128, with upstream reuse on
+and an omit-Connection request policy. Five paired rounds alternated variant
+order; each cell had one second of warmup and five seconds of measurement.
+All 20 measured samples and their warmups had zero errors and passed the
+harness's response and origin-reuse preflights.
+
+| Downstream connection | Baseline median RPS | Candidate median RPS | Change |
+|---|---:|---:|---:|
+| Short | 24,766 | 24,949 | +0.74% |
+| Keep-alive | 65,622 | 66,308 | +1.05% |
+
+These short samples do not establish a repeatable throughput gain: paired
+short-connection changes ranged from -6.25% to +8.51%, and keep-alive changes
+from -1.78% to +3.89%. The workload exercises steady origin reuse rather than
+deliberate asynchronous idle-origin closure. Source, matching compiler and
+converter binaries, binary hashes, commands, preflights, samples and summary
+are archived in `http-rps/` beneath the evidence directory above.
+
+The follow-up also fixed a benchmark wrapper callback binding: the native
+origin verifier and its API wrapper previously captured the same reassigned
+local name, causing recursive verification before any load could run. A
+regression checks that the composed native wrappers delegate exactly once;
+all 68 benchmark tool tests pass. This harness fix applies equally to both
+RPS variants and does not skip any preflight.
