@@ -1762,7 +1762,10 @@ dispatch_ready:
                     if (nr > 0) {
                         buf.commit(static_cast<u32>(nr));
                         result = static_cast<i32>(nr);
-                        if (study_edge_trigger) edge_runnable[recv_slot].read_ready = true;
+                        // Plain stream short reads exhaust the current read space.
+                        // Full reads retain readiness for an unread continuation.
+                        if (study_edge_trigger)
+                            edge_runnable[recv_slot].read_ready = static_cast<u32>(nr) == avail;
                     } else if (nr == 0) {
                         result = 0;
                         if (study_edge_trigger) edge_runnable[recv_slot].read_ready = false;

@@ -564,6 +564,32 @@ TEST(epoll_stable_edge, fin_racing_borrow_rejects_before_new_episode) {
     CHECK_FALSE(f.backend.stable_upstream[fd].registered);
 }
 
+TEST(epoll_stable_edge, short_read_waits_for_new_edge_and_borrow_checks_late_bytes) {
+    StableEpollFixture f;
+    REQUIRE(f.init(true));
+    const i32 fd = f.conns[0].upstream_fd;
+    REQUIRE_EQ(::send(f.peer, "first", 5, MSG_NOSIGNAL), 5);
+    IoEvent event{};
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    REQUIRE_EQ(event.result, 5);
+    REQUIRE_FALSE(f.backend.edge_runnable[1].read_ready);
+    f.conns[0].upstream_recv_buf.reset();
+    REQUIRE(f.backend.add_recv_upstream(fd, 0, f.conns[0].upstream_episode));
+    REQUIRE_EQ(f.backend.edge_count, 0u);
+    REQUIRE_EQ(::send(f.peer, "next", 4, MSG_NOSIGNAL), 4);
+    REQUIRE_EQ(f.backend.wait(&event, 1, f.conns, 2), 1u);
+    REQUIRE_EQ(event.result, 4);
+    CHECK_EQ(memcmp(f.conns[0].upstream_recv_buf.data(), "next", 4), 0);
+    REQUIRE_FALSE(f.backend.edge_runnable[1].read_ready);
+    REQUIRE(f.park(0));
+    CHECK_FALSE(f.backend.stable_upstream[fd].idle_probe_pending);
+    // Exhaustion at the short read does not prove health at a later borrow.
+    REQUIRE_EQ(::send(f.peer, "late", 4, MSG_NOSIGNAL), 4);
+    REQUIRE_EQ(f.borrow(1), -1);
+    CHECK_EQ(fcntl(fd, F_GETFD), -1);
+    CHECK_EQ(errno, EBADF);
+}
+
 TEST(epoll_stable_edge, exhausted_full_read_is_probed_once_when_parked) {
     StableEpollFixture f;
     REQUIRE(f.init(true));
