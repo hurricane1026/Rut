@@ -1,0 +1,20 @@
+[  5%] Built target zstd_compress
+[ 25%] Built target fipsmodule
+[ 84%] Built target crypto
+[ 93%] Built target ssl
+[ 93%] Building CXX object src/CMakeFiles/rut_runtime.dir/runtime/epoll_backend.cc.o
+[ 94%] Linking CXX static library librut_runtime.a
+[100%] Built target rut_runtime
+[100%] Linking CXX executable test_splice
+[100%] Built target test_splice
+Test project /tmp/rut-epoll-stable-asan-20261010
+    Start 27: test_splice
+1/1 Test #27: test_splice ......................   Passed    0.09 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Label Time Summary:
+network    =   0.09 sec*proc (1 test)
+unit       =   0.09 sec*proc (1 test)
+
+Total Test time (real) =   0.09 sec

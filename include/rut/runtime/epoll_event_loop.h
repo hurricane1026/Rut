@@ -539,8 +539,9 @@ public:
     }
 
     // Close/detach one logical upstream transport. A pool caller may request
-    // the descriptor back; it is exposed only after synchronous DEL, map/send
-    // cleanup, and strict episode retirement all succeed.
+    // the descriptor back; it is exposed only after map/send cleanup and strict
+    // episode retirement. Legacy ownership requires DEL; the stable experiment
+    // first transfers its kernel watch to the idle transport owner.
     bool detach_upstream_close(Connection& c) { return backend.detach_upstream(c); }
 
     bool detach_upstream_for_pool(Connection& c, i32& fd) {
@@ -562,9 +563,10 @@ public:
     // backend_idx) from the idle pool, skipping the TCP connect. On a hit, install
     // it as conn.upstream_fd and route this conn's upstream completions to it.
     // Returns false (no live idle socket) → caller connects fresh. epoll is
-    // synchronous, so detach/reattach is a plain EPOLL_CTL_DEL/ADD pair.
+    // synchronous; legacy detach/reattach uses an EPOLL_CTL_DEL/ADD pair.
     bool reuse_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
         if (!upstream) return false;
+        backend.bind_stable_pool(upstream);
         const i32 fd = upstream->take_idle(upstream_id, backend_idx);
         if (fd < 0) return false;
         // Establish a new owner before publishing the borrowed fd in the map.
@@ -574,20 +576,27 @@ public:
         }
         c.upstream_fd = fd;
         if (c.id < connection_capacity) backend.upstream_fd_map[c.id] = fd;
+        backend.claim_stable_upstream(fd, c.id, c.upstream_episode);
         return true;
     }
 
     // Return conn.upstream_fd to the idle pool for a later request to the same
-    // endpoint instead of closing it. Fully detaches the fd from epoll first
-    // (EPOLL_CTL_DEL + clear send state + clear the fd↔conn map) so no stale event
+    // endpoint instead of closing it. Detaches request ownership first
+    // (legacy DEL or stable idle owner + clear send state + clear fd↔conn map) so no stale event
     // can fire on it while it's parked. Closes the fd if the pool is full. The
     // caller has verified both sides are keep-alive and the response framed cleanly.
     bool return_idle_upstream(Connection& c, u16 upstream_id, u8 backend_idx) {
         if (c.upstream_fd < 0 || !upstream) return false;
+        backend.bind_stable_pool(upstream);
         i32 fd = -1;
         if (!detach_upstream_for_pool(c, fd)) return false;
-        if (fd >= 0 && !upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs()))
-            ::close(fd);
+        if (fd >= 0) {
+            u32 slot = UpstreamPool::kNoSlot;
+            if (upstream->put_idle(fd, upstream_id, backend_idx, monotonic_secs(), &slot))
+                backend.park_stable_upstream(fd, slot);
+            else
+                upstream->close_idle_fd(fd);
+        }
         return true;
     }
 
@@ -724,6 +733,11 @@ public:
     u32 study_event_batch_limit = kMaxEventsPerWait;
     u32 study_relay_chunk_size = kResponseSpliceChunkSize;
     u32 study_relay_owner_call_limit = 4;
+    bool study_request_metadata_parse_reuse = false;
+    bool study_request_policy_parse_reuse = false;
+    bool study_request_policy_validation_reuse = false;
+    bool study_http_coalesce_close_response = false;
+    u64 study_http_coalesced_close_responses = 0;
 
     // Admit only the current, fully framed plaintext GET response. No history,
     // route-size inference or body-inspection policy is bypassed.
@@ -1386,8 +1400,12 @@ private:
         c->fd = ev.result;
         struct sockaddr_in peer = {};
         socklen_t peer_len = sizeof(peer);
-        if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) == 0 &&
-            peer.sin_family == AF_INET) {
+        if (ev.accept_peer_valid) {
+            c->peer_addr = ev.accept_peer_addr;
+            c->peer_port = ev.accept_peer_port;
+        } else if (::getpeername(c->fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) ==
+                       0 &&
+                   peer.sin_family == AF_INET) {
             c->peer_addr = peer.sin_addr.s_addr;
             c->peer_port = ntohs(peer.sin_port);
         }

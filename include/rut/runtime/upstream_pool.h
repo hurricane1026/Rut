@@ -50,6 +50,13 @@ struct UpstreamPool {
     // live idle entries — lets take_idle() skip the scan when cold. Atomic only for
     // cross-thread observation; pool slot ownership remains single-threaded.
     std::atomic<u32> idle_count{0};
+    void* idle_close_ctx = nullptr;
+    void (*before_idle_close)(void*, i32) = nullptr;
+
+    void close_idle_fd(i32 fd) {
+        if (before_idle_close != nullptr) before_idle_close(idle_close_ctx, fd);
+        ::close(fd);
+    }
 
     void init() {
         free_top = kMaxConns;
@@ -64,12 +71,26 @@ struct UpstreamPool {
     // Park a connected, idle upstream fd for reuse by a later request to the same
     // (upstream_id, backend_idx) endpoint. Returns false if the pool is full (the
     // caller must close the fd itself). The fd must have no I/O armed on it.
-    bool put_idle(i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec) {
+    bool put_idle(
+        i32 fd, u16 upstream_id, u8 backend_idx, u32 now_sec, u32* parked_slot = nullptr) {
+        if (parked_slot != nullptr) *parked_slot = kNoSlot;
         if (fd < 0 || free_top == 0) return false;
         const u32 idx = free_stack[--free_top];
         conns[idx] = {fd, upstream_id, backend_idx, /*idle=*/true, /*allocated=*/true, now_sec};
         link_idle(idx);
         idle_count.fetch_add(1, std::memory_order_release);
+        if (parked_slot != nullptr) *parked_slot = idx;
+        return true;
+    }
+
+    // An idle watcher must prove the slot still owns this exact descriptor.
+    // A harvested event may outlive borrow, sweep, reload or slot reuse.
+    bool discard_idle(u32 slot, i32 fd) {
+        if (slot >= kMaxConns || !conns[slot].allocated || !conns[slot].idle ||
+            conns[slot].fd != fd)
+            return false;
+        close_idle_fd(fd);
+        release_slot(slot);
         return true;
     }
 
@@ -84,7 +105,7 @@ struct UpstreamPool {
             const u32 next = idle_next[i];
             UpstreamConn& c = conns[i];
             if (now_sec - c.parked_sec >= max_idle_sec) {
-                ::close(c.fd);
+                close_idle_fd(c.fd);
                 release_slot(i);
             }
             i = next;
@@ -113,7 +134,7 @@ struct UpstreamPool {
             char probe;
             const ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return fd;  // healthy
-            ::close(fd);  // EOF / unexpected data / hard error → not reusable
+            close_idle_fd(fd);  // EOF / unexpected data / hard error → not reusable
             i = next;
         }
         return -1;
@@ -126,7 +147,7 @@ struct UpstreamPool {
     void drain() {
         if (idle_count.load(std::memory_order_acquire) == 0) return;
         for (u32 i = 0; i < kMaxConns; i++) {
-            if (conns[i].fd >= 0) ::close(conns[i].fd);
+            if (conns[i].fd >= 0) close_idle_fd(conns[i].fd);
             conns[i] = UpstreamConn{};
         }
         free_top = kMaxConns;
@@ -138,7 +159,7 @@ struct UpstreamPool {
     // Close every parked socket and reset to the initial all-free state.
     void shutdown() {
         for (u32 i = 0; i < kMaxConns; i++) {
-            if (conns[i].fd >= 0) ::close(conns[i].fd);
+            if (conns[i].fd >= 0) close_idle_fd(conns[i].fd);
             conns[i] = UpstreamConn{};
         }
         free_top = kMaxConns;

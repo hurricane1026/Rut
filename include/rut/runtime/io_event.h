@@ -192,6 +192,12 @@ struct IoEvent {
     // consumed. A -ENOBUFS produced after a selected buffer's bytes were
     // dropped leaves this clear.
     u8 provided_ring_empty = 0;
+    // Optional IPv4 peer returned by accept itself, owned by this event.
+    // Other producers leave it neutral; accept consumers can query the fd
+    // when their backend does not provide this payload.
+    u8 accept_peer_valid = 0;
+    u16 accept_peer_port = 0;  // host byte order
+    u32 accept_peer_addr = 0;  // network byte order
 };
 
 // ResponseReadTimer is a transport-only event. Accept only the exact result
@@ -208,7 +214,9 @@ inline constexpr bool valid_response_read_timer_transport_event(const IoEvent& e
            event.more == 0 && event.aux == 0 && event.upstream_episode == 0 &&
            event.copy_witness == IoEventCopyWitness::None && event.copy_deadline_generation == 0 &&
            event.copy_deadline_profile == 0 && event.copy_deadline_method == 0xffu &&
-           event.copy_begin == 0 && event.copy_end == 0 && event.provided_ring_empty == 0;
+           event.copy_begin == 0 && event.copy_end == 0 && event.provided_ring_empty == 0 &&
+           event.accept_peer_valid == 0 && event.accept_peer_port == 0 &&
+           event.accept_peer_addr == 0;
 }
 
 inline constexpr bool io_event_is_tagged_stale(const IoEvent& event, u32 current_episode) {

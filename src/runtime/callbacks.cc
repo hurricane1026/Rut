@@ -187,7 +187,9 @@ static bool connect_authority_target_is_valid(const u8* data, u32 start, u32 end
     return port != 0;
 }
 
-void capture_request_metadata(Connection& conn) {
+static void capture_request_metadata_impl(Connection& conn,
+                                          const ParsedRequest* complete_request,
+                                          u32 complete_header_end) {
     conn.begin_request_metadata_episode();
     conn.req_strict_h1_complete = false;
     conn.req_target_has_fragment = false;
@@ -282,9 +284,12 @@ void capture_request_metadata(Connection& conn) {
     }
 
     HttpParser parser;
-    ParsedRequest req;
+    ParsedRequest local_request;
     parser.reset();
-    const ParseStatus parse_status = parser.parse(data, kLen, &req);
+    const ParseStatus parse_status =
+        complete_request ? ParseStatus::Complete : parser.parse(data, kLen, &local_request);
+    const ParsedRequest& req = complete_request ? *complete_request : local_request;
+    const u32 kHeaderEnd = complete_request ? complete_header_end : parser.header_end;
     conn.req_target_has_fragment |= req.target_has_fragment;
     if (parse_status == ParseStatus::Complete) {
         u32 raw_target_offset = 0;
@@ -297,13 +302,13 @@ void capture_request_metadata(Connection& conn) {
         if (target_address_range_valid) {
             const u64 offset = target_address - base_address;
             const u64 end = offset + req.path.len;
-            if (req.path.len != 0 && end > offset && end < parser.header_end && end <= kLen &&
+            if (req.path.len != 0 && end > offset && end < kHeaderEnd && end <= kLen &&
                 data[offset] == '/' && req.path_canon.ptr != nullptr) {
                 raw_target_offset = static_cast<u32>(offset);
                 raw_target_length = req.path.len;
             }
         }
-        conn.req_header_end = parser.header_end;
+        conn.req_header_end = kHeaderEnd;
         conn.req_http_version = static_cast<u8>(req.version);
         // Require BOTH Connection: upgrade and an Upgrade header — Connection is
         // hop-by-hop, so the token alone is not a valid client upgrade request.
@@ -385,10 +390,10 @@ void capture_request_metadata(Connection& conn) {
             conn.req_body_mode = BodyMode::Chunked;
             conn.req_body_remaining = 0;
             conn.req_chunk_parser.reset();
-            const u32 kBodyInBuf = kLen > parser.header_end ? kLen - parser.header_end : 0;
+            const u32 kBodyInBuf = kLen > kHeaderEnd ? kLen - kHeaderEnd : 0;
             chunk_consumed = kBodyInBuf;
             if (kBodyInBuf > 0) {
-                const u8* body_start = data + parser.header_end;
+                const u8* body_start = data + kHeaderEnd;
                 u32 pos = 0;
                 while (pos < kBodyInBuf) {
                     u32 consumed = 0, out_start = 0, out_len = 0;
@@ -407,23 +412,23 @@ void capture_request_metadata(Connection& conn) {
             if (conn.req_malformed) {
                 conn.req_initial_send_len = 0;
             } else {
-                conn.req_initial_send_len = parser.header_end + chunk_consumed;
+                conn.req_initial_send_len = kHeaderEnd + chunk_consumed;
             }
         } else if (req.has_content_length && req.content_length > 0) {
             conn.req_body_mode = BodyMode::ContentLength;
             conn.req_content_length = req.content_length;
             conn.req_body_remaining = req.content_length;
-            const u32 kBodyInBuf = kLen > parser.header_end ? kLen - parser.header_end : 0;
+            const u32 kBodyInBuf = kLen > kHeaderEnd ? kLen - kHeaderEnd : 0;
             if (kBodyInBuf >= conn.req_body_remaining)
                 conn.req_body_remaining = 0;
             else
                 conn.req_body_remaining -= kBodyInBuf;
         }
         if (conn.req_body_mode == BodyMode::None) {
-            conn.req_initial_send_len = parser.header_end;
+            conn.req_initial_send_len = kHeaderEnd;
         } else if (conn.req_body_mode == BodyMode::ContentLength) {
             const u32 kBodyInInitial = conn.req_content_length - conn.req_body_remaining;
-            conn.req_initial_send_len = parser.header_end + kBodyInInitial;
+            conn.req_initial_send_len = kHeaderEnd + kBodyInInitial;
         }
         if (conn.req_initial_send_len > 0) {
             conn.downstream_req_size = conn.req_initial_send_len;
@@ -481,6 +486,22 @@ void capture_request_metadata(Connection& conn) {
     // request — matches the pre-round-7 behavior where the dispatch
     // site canonicalized conn.req_path on the fly.
     conn.req_path_canon = canonicalize_request(Str{conn.req_path, copy_len});
+}
+
+void capture_request_metadata(Connection& conn) {
+    capture_request_metadata_impl(conn, nullptr, 0);
+}
+
+// Caller holds the complete parser result over unchanged recv_buf bytes.
+// Consume views synchronously; metadata reset never changes that buffer.
+void capture_parsed_request_metadata(Connection& conn,
+                                     const ParsedRequest& request,
+                                     u32 header_end) {
+    if (header_end < 4 || header_end > conn.recv_buf.len() || request.header_count > kMaxHeaders) {
+        capture_request_metadata(conn);
+        return;
+    }
+    capture_request_metadata_impl(conn, &request, header_end);
 }
 
 u32 pipeline_leftover(const Connection& conn) {
