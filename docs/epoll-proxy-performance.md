@@ -153,8 +153,9 @@ paths. It neither waits for more body bytes nor allocates another buffer.
 The final binary was compared with parent `c4213ae7` in five alternating paired
 rounds using the preceding section's 4 KiB native-streaming workload, CPU pins,
 128 connections, warmup and measurement durations. Both used full ET, stable
-upstream and relay events, and default accept batching, with no coalescing
-override. All 20 samples and warmups had zero errors and passed response and
+upstream and relay events, and batch 16 in the withdrawn automatic-batch
+prototype, with no coalescing override. These results are specific to that
+configuration; the current ET default preserves batch one. All 20 samples and warmups had zero errors and passed response and
 origin-reuse preflights.
 
 | Downstream connection | Baseline median RPS | Candidate median RPS | Change | Baseline p99 | Candidate p99 |
