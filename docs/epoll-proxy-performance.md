@@ -196,3 +196,65 @@ and warmups had zero errors and passed response/reuse preflights. CLI defaults
 and overrides passed on the current binary. This confirms the coalescing
 benefit without selecting a machine-specific accept batch. Evidence is in
 `/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-coalesce-batch1-20261011/`.
+
+## Plaintext ET short-read exhaustion (2026-10-11)
+
+The candidate clears retained read readiness when a plaintext stream receive
+returns fewer bytes than the offered capacity. [Linux epoll(7)](https://man7.org/linux/man-pages/man7/epoll.7.html) documents this
+as exhaustion of the current stream read space. Full-capacity reads retain
+userspace continuation; TLS reads keep their existing handling. No batch size,
+allocator, connection ownership or borrow-time health check changes.
+
+This removes speculative reads after a short downstream receive and avoids
+parking-time probes caused solely by a short upstream receive. A future pool
+borrow still probes for EOF or unexpected bytes arriving after that receive.
+Terminal readiness and unconsumed harvested records still require their
+existing handling.
+
+Against `b8fdcb63`, three alternating eBPF pairs used 4 KiB plaintext native
+streaming responses, concurrency 128, one Rut shard, four pinned origin workers,
+and the default accept batch of one. Frontend syscall counts per completed
+request changed as follows:
+
+| Counter | Baseline | Candidate |
+|---|---:|---:|
+| recv calls | 5.003 | 3.002 |
+| recv EAGAIN | 3.001 | 1.000 |
+| all syscalls | 7.132 | 5.131 |
+| send calls | 2.001 | 2.001 |
+| epoll_wait calls | 0.126 | 0.126 |
+
+A separate five-pair comparison without probes measured median RPS of 66,272
+versus 68,752 (+3.74%) and p99 of 2.211 versus 2.178 ms. Instrumented RPS is
+kept separately and is not used for that performance claim. All measured
+samples and warmups had zero request errors and passed harness preflights.
+Raw entry/exit tracepoint maps distinguish frontend, origin and client PIDs;
+counts include client startup and up to three seconds of idle tail, excluding
+preflights and warmup. Timer/control calls contribute a small residual.
+
+The candidate passed default and ET splice suites (50 tests, 99,815 checks
+each) and network suites (1,608 tests, 490,748 checks each). New coverage checks
+short-read exhaustion, a subsequent kernel edge, and rejection of late bytes
+at pool borrow; existing coverage retains full-read continuation and terminal
+ownership checks. Affected formatting and diff checks passed. Full CI,
+sanitizers, real NIC/RTT, multi-shard and TLS performance remain unverified.
+
+Commands, binaries, hashes, raw BPF programs/maps and summaries are preserved
+under `/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-short-read-20261011/`.
+
+A two-pair 1 MiB keep-alive control with eBPF also passed all preflights,
+measurements and warmups without request errors. Total frontend calls per
+request were 42.651 on the baseline and 42.517 on the candidate. This control
+found no syscall increase in the large-body path; its instrumented throughput
+is not a clean large-body performance claim.
+
+The subsequent three-pair 1 MiB control without probes exposed a tail-latency
+regression: median RPS was 1,996 versus 2,144, but median p99 was 81.862 versus
+146.424 ms. Candidate p99 samples were 77.125, 199.636 and 146.424 ms; baseline
+samples were 78.187, 81.862 and 113.110 ms. All request and warmup errors remained
+zero. The user accepted this tradeoff for the large-response download workload,
+where throughput takes priority over tail latency: clean median RPS improved
+by 7.40%, with no syscall increase in the eBPF control. The short-read change
+is retained. The p99 regression remains a measured limitation with an
+unconfirmed cause; these short loopback measurements do not establish a
+latency improvement for other workloads or deployment environments.
