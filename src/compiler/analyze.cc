@@ -1763,39 +1763,22 @@ static FrontendResult<Str> store_generated_name(HirGeneratedNames*& store,
                                   0);
         if (owner_region == MAP_FAILED) return frontend_error(FrontendError::OutOfMemory, {});
         store = ::new (owner_region) HirGeneratedNames{};
-        store->mapped_owner = true;
+        if (!store->arena.init(4096)) {
+            store->~HirGeneratedNames();
+            munmap(owner_region, sizeof(HirGeneratedNames));
+            store = nullptr;
+            return frontend_error(FrontendError::OutOfMemory, {});
+        }
     }
-    bool mapped = false;
-    char* buf = nullptr;
-    {
-        void* region =
-            mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (region == MAP_FAILED) return frontend_error(FrontendError::OutOfMemory, {});
-        buf = static_cast<char*>(region);
-        mapped = true;
-    }
+    char* buf = static_cast<char*>(store->arena.alloc(len));
+    auto* node = store->arena.alloc_t<HirGeneratedName>();
+    if (buf == nullptr || node == nullptr) return frontend_error(FrontendError::OutOfMemory, {});
     u32 off = 0;
     for (u32 i = 0; i < segment_count; i++) {
         for (u32 j = 0; j < segments[i].len; j++) buf[off++] = segments[i].ptr[j];
     }
-    void* node_region = mmap(nullptr,
-                             sizeof(HirGeneratedName),
-                             PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS,
-                             -1,
-                             0);
-    auto* node = node_region == MAP_FAILED ? nullptr : ::new (node_region) HirGeneratedName{};
-    if (node == nullptr) {
-        if (mapped)
-            munmap(buf, len);
-        else
-            delete[] buf;
-        return frontend_error(FrontendError::OutOfMemory, {});
-    }
     node->text = buf;
     node->len = len;
-    node->mapped = mapped;
-    node->mapped_node = true;
     node->next = store->head;
     store->head = node;
     return Str{buf, len};

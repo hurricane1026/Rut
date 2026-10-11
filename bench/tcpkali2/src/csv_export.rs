@@ -46,6 +46,27 @@ const HEADERS: &[&str] = &[
     "verify_payload",
 ];
 
+/// Escape one string field according to RFC 4180.
+fn csv_field(value: &str) -> String {
+    if value
+        .bytes()
+        .any(|byte| matches!(byte, b',' | b'"' | b'\r' | b'\n'))
+    {
+        let mut escaped = String::with_capacity(value.len() + 2);
+        escaped.push('"');
+        for ch in value.chars() {
+            if ch == '"' {
+                escaped.push('"');
+            }
+            escaped.push(ch);
+        }
+        escaped.push('"');
+        escaped
+    } else {
+        value.to_string()
+    }
+}
+
 /// Build the header line from the fixed column list.
 fn header_line() -> String {
     HEADERS.join(",")
@@ -106,7 +127,7 @@ fn build_row(
 
     let values: Vec<String> = vec![
         timestamp,
-        target.to_string(),
+        csv_field(target),
         config.connections.to_string(),
         config.connect_rate.to_string(),
         format!("{:.2}", config.connect_timeout.as_secs_f64()),
@@ -244,6 +265,26 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    fn parse_csv_row(row: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut field = String::new();
+        let mut chars = row.chars().peekable();
+        let mut quoted = false;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' if quoted && chars.peek() == Some(&'"') => {
+                    chars.next();
+                    field.push('"');
+                }
+                '"' => quoted = !quoted,
+                ',' if !quoted => fields.push(std::mem::take(&mut field)),
+                _ => field.push(ch),
+            }
+        }
+        fields.push(field);
+        fields
+    }
+
     #[test]
     fn csv_row_uses_consistent_error_and_rate_units() {
         let payload = Bytes::from_static(b"abc");
@@ -277,16 +318,30 @@ mod tests {
             .store(1_000_000, Ordering::Relaxed);
         stats.total_bytes_sent.store(2_000_000, Ordering::Relaxed);
 
-        let row = build_row(&config, &stats, Duration::from_secs(2), "localhost:1", 1);
-        let values: Vec<_> = row.split(',').collect();
+        let target = "ws://host/a,b\"c\r\n";
+        let row = build_row(&config, &stats, Duration::from_secs(2), target, 1);
+        let values = parse_csv_row(&row);
         assert_eq!(values.len(), HEADERS.len());
 
-        let value = |header: &str| values[HEADERS.iter().position(|item| *item == header).unwrap()];
+        let value = |header: &str| {
+            values[HEADERS.iter().position(|item| *item == header).unwrap()].as_str()
+        };
+        assert_eq!(value("target"), target);
         assert_eq!(value("message_size"), "3");
         assert_eq!(value("connection_errors"), "3");
         assert_eq!(value("connection_error_rate_pct"), "75.00");
         assert_eq!(value("traffic_down_mbps"), "4.00");
         assert_eq!(value("traffic_up_mbps"), "8.00");
+    }
+
+    #[test]
+    fn csv_target_with_delimiters_is_escaped_as_one_field() {
+        let escaped = super::csv_field("ws://host/a,b\"c\r\n");
+        assert_eq!(escaped, "\"ws://host/a,b\"\"c\r\n\"");
+        assert_eq!(
+            parse_csv_row(&format!("{},next", escaped)),
+            ["ws://host/a,b\"c\r\n", "next"]
+        );
     }
 
     #[test]

@@ -19,6 +19,8 @@ import sys
 import time
 import uuid
 
+import run as benchmark_run
+
 CASES = [
     dict(name='websocket-interactive-64', kind='websocket', size=64, chunks=16, delay=0),
     dict(name='websocket-bulk-64k', kind='websocket', size=65536, chunks=16, delay=0),
@@ -40,10 +42,12 @@ def manifest_script_hashes(args):
 
 
 def manifest_binary_hashes(rut, tcpkali2=None):
-    hashes = {
-        'rut_sha256': hashlib.sha256(rut.read_bytes()).hexdigest(),
-        'rut_compile_sha256': hashlib.sha256(rut.with_name('rut-compile').read_bytes()).hexdigest(),
-    }
+    hashes = {}
+    if rut is not None:
+        hashes.update(
+            rut_sha256=hashlib.sha256(rut.read_bytes()).hexdigest(),
+            rut_compile_sha256=hashlib.sha256(rut.with_name('rut-compile').read_bytes()).hexdigest(),
+        )
     if tcpkali2:
         hashes['tcpkali2_sha256'] = hashlib.sha256(tcpkali2.read_bytes()).hexdigest()
     return hashes
@@ -361,10 +365,22 @@ def main():
     }
     mask_helper_min = parse_mask_helper_min(
         parser, os.environ.get('RUT_BENCH_WS_MASK_MIN', '4096'))
+    # Validate executables selected by the filtered study before creating state.
+    selected_engines = {engine for configs in configurations_by_case.values()
+                        for engine, _ in configs}
+    uses_runtime = bool(selected_engines & {'uring', 'epoll'})
+    if uses_runtime:
+        args.rut = benchmark_run.validate_executable(parser, 'rut', args.rut)
+        benchmark_run.validate_executable(
+            parser, 'rut-compile', args.rut.with_name('rut-compile'))
+    if args.tcpkali2:
+        args.tcpkali2 = benchmark_run.validate_executable(
+            parser, 'tcpkali2', args.tcpkali2)
     spec = importlib.util.spec_from_file_location('runtime_benchmark', args.harness)
     harness = importlib.util.module_from_spec(spec); spec.loader.exec_module(harness)
     origin_cpus, client_cpus = validate_cpu_assignments(parser, harness, args)
-    binary_hashes = manifest_binary_hashes(args.rut, args.tcpkali2)
+    binary_hashes = manifest_binary_hashes(
+        args.rut if uses_runtime else None, args.tcpkali2)
     out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
     image = (harness.ROOT / 'tests/pinned-nginx-image.txt').read_text().strip()
     manifest = dict(cases=CASES, duration=args.duration, frontend_cpus=[2], origin_cpus=origin_cpus,

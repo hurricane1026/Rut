@@ -215,6 +215,24 @@ class ToolsTest(unittest.TestCase):
             self.assertFalse(output.exists())
             popen.assert_not_called()
 
+    def test_relay_validates_baseline_executables_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline-rut"
+            baseline.write_text("#!/bin/sh\nexit 0\n")
+            baseline.chmod(0o755)
+            output = root / "study"
+            argv = ["relay_compare.py", "--engines", "baseline-uring",
+                    "--baseline-rut", str(baseline), "--output", str(output),
+                    "--rut", "/bin/true", "--converter", "/bin/true", "--wrk", "/bin/true"]
+            with mock.patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                with self.assertRaises(SystemExit) as raised:
+                    relay_compare.main()
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn("baseline-rut-compile", stderr.getvalue())
+            self.assertFalse(output.exists())
+
     def test_relay_rejects_unavailable_later_origin_cpu_before_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "study"
@@ -318,6 +336,22 @@ class ToolsTest(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 2)
         self.assertIn("select no runnable configurations", result.stderr)
+
+    def test_protocol_cli_validates_selected_executables_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rut = root / "rut"
+            rut.write_text("#!/bin/sh\nexit 0\n")
+            rut.chmod(0o755)
+            output = root / "study"
+            argv = [sys.executable, str(Path(protocol_strategy.__file__)),
+                    "--output", str(output), "--rut", str(rut),
+                    "--harness", str(Path(run.__file__)), "--smoke",
+                    "--engines", "uring"]
+            result = subprocess.run(argv, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("rut-compile", result.stderr)
+            self.assertFalse(output.exists())
 
     def test_protocol_cli_rejects_incompatible_cases_and_short_non_smoke(self):
         with tempfile.TemporaryDirectory() as directory:

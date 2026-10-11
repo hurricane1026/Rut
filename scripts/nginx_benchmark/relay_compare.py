@@ -107,6 +107,10 @@ def validate_direct_origin_configuration(parser, run_module, engines, remaining)
                                default=list(run_module.SCENARIOS))
     options, _ = config_parser.parse_known_args(remaining)
     run_module.validate_direct_origin_configuration(parser, options)
+    if not options.scenarios or any(
+            scenario not in ("proxy-close", "proxy-keepalive")
+            for scenario in options.scenarios):
+        parser.error("direct-origin supports proxy-close and proxy-keepalive scenarios only")
     return True
 
 
@@ -181,6 +185,11 @@ def main():
     spec = importlib.util.spec_from_file_location("relay_bench", source)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if "baseline-uring" in engines:
+        options.baseline_rut = module.validate_executable(
+            parser, "baseline-rut", options.baseline_rut)
+        module.validate_executable(
+            parser, "baseline-rut-compile", options.baseline_rut.with_name("rut-compile"))
     if "--help" not in remaining:
         validate_direct_origin_configuration(parser, module, engines, remaining)
         options.origin_cpus = ",".join(map(str, validate_origin_cpu_configuration(

@@ -223,6 +223,15 @@ pub async fn async_main(matches: clap::ArgMatches) -> Result<(), TcpKaliError> {
             return Err(error);
         }
     }
+    if stats.success_connections.load(Ordering::Relaxed) == 0 {
+        abort_and_reap(&mut tasks).await;
+        if let Some(stats_printer) = stats_printer {
+            stats_printer.abort();
+        }
+        return Err(TcpKaliError::Network(
+            "no connections completed initialization".into(),
+        ));
+    }
     let _ = load_start_tx.send(true);
 
     // Warmup phase
@@ -353,15 +362,14 @@ async fn execute_benchmark(
         _ = tokio::signal::ctrl_c() => {}
     }
 
-    let measurement_end = time::Instant::now();
-    // Mark benchmark as shutting down
+    // Stop and reap every worker before closing the measured interval. This
+    // includes responses already admitted by a worker before it is cancelled.
     stats.set_shutting_down();
     tasks.abort_all();
-
     while let Some(result) = tasks.join_next().await {
         report_task_result(result, config.quiet);
     }
-    measurement_end
+    time::Instant::now()
 }
 
 fn report_task_result(result: Result<Result<(), TcpKaliError>, JoinError>, quiet: bool) {
@@ -394,6 +402,44 @@ mod tests {
         assert!(!initializations_ready(0, 1));
         assert!(initializations_ready(1, 1));
         assert!(!handshakes_ready(1, 0, 2));
+    }
+
+    #[tokio::test]
+    async fn all_refused_connections_fail_before_measurement_output() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let output = std::env::temp_dir().join(format!(
+            "tcpkali2-no-ready-{}-{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let matches = crate::command::command()
+            .try_get_matches_from(vec![
+                "tcpkali2".to_string(),
+                "-q".to_string(),
+                "--output".to_string(),
+                output.to_string_lossy().into_owned(),
+                "--connect-timeout".to_string(),
+                "100ms".to_string(),
+                "--init-timeout".to_string(),
+                "100ms".to_string(),
+                address.to_string(),
+            ])
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), super::async_main(matches))
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, Err(crate::error::TcpKaliError::Network(message))
+            if message == "no connections completed initialization")
+        );
+        assert!(!output.exists());
     }
 
     #[tokio::test]
@@ -568,11 +614,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elapsed_stops_at_measurement_boundary_before_teardown() {
+    async fn elapsed_uses_boundary_after_worker_teardown() {
         let start = Instant::now();
         tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await; // worker reap interval
         let end = Instant::now();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(measurement_elapsed(start, end) < Duration::from_millis(15));
+        assert!(measurement_elapsed(start, end) >= Duration::from_millis(20));
     }
 }
