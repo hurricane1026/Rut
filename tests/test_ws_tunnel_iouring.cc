@@ -266,9 +266,10 @@ static void full_duplex_burst(test::TestCase* _tc,
             REQUIRE_EQ(shutdown(kClient.fd, SHUT_WR), 0);
             fin_sent = true;
         }
-        const auto& eof_owner = loop.ws_splice.owners[conn->id];
-        if (fin_before_drain && eof_owner.eof_closing && eof_owner.direction[1].buffered != 0) {
-            CHECK_FALSE(eof_owner.eof_reverse_write_cancel_attempted);
+        if (fin_before_drain) {
+            const auto& eof_owner = loop.ws_splice.owners[conn->id];
+            if (eof_owner.eof_closing && eof_owner.direction[1].buffered != 0)
+                CHECK_FALSE(eof_owner.eof_reverse_write_cancel_attempted);
         }
         if (!slow_reader || monotonic_ns() - kStart >= 30ull * 1000 * 1000) {
             const bool client_read_ok =
