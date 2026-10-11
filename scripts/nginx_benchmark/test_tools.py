@@ -137,6 +137,20 @@ class ToolsTest(unittest.TestCase):
             ("direct-origin",), ("proxy-keepalive",), [])
         relay_compare.validate_direct_origin_options(
             ("uring",), relay_compare.DEFAULT_SCENARIOS, ["--native-origin-reuse", "off"])
+        with self.assertRaisesRegex(ValueError, "plaintext HTTP only"):
+            relay_compare.validate_direct_origin_options(
+                ("direct-origin",), ("proxy-close",), ["--tls-cert", "unused.pem"])
+
+    def test_mixed_small_requires_proxy_scenarios_and_plaintext(self):
+        relay_compare.validate_mixed_small_scenarios(
+            ("proxy-close", "proxy-keepalive"), True)
+        relay_compare.validate_mixed_small_scenarios(("static-close",), False)
+        relay_compare.validate_mixed_small_tls(True, [])
+        relay_compare.validate_mixed_small_tls(False, ["--tls-cert", "unused.pem"])
+        with self.assertRaisesRegex(ValueError, "proxy-only scenarios"):
+            relay_compare.validate_mixed_small_scenarios(("static-close",), True)
+        with self.assertRaisesRegex(ValueError, "plaintext HTTP only"):
+            relay_compare.validate_mixed_small_tls(True, ["--tls-key", "unused.key"])
 
     def test_paced_tls_preflight_rejects_before_delegation(self):
         for option in ("--tls-cert", "--tls-key"):
@@ -151,6 +165,13 @@ class ToolsTest(unittest.TestCase):
             ("--engines", "direct-origin"),
             ("--engines", "direct-origin", "--scenarios", "proxy-keepalive",
              "--native-origin-reuse", "off"),
+            ("--engines", "direct-origin", "--scenarios", "proxy-close",
+             "--tls-cert", "unused.pem", "--tls-key", "unused.key"),
+            ("--engines", "uring,uring"),
+            ("--engines", "uring", "--mixed-small-bytes", "4096",
+             "--scenarios", "static-close"),
+            ("--engines", "uring", "--mixed-small-bytes", "4096",
+             "--tls-cert", "unused.pem", "--scenarios", "proxy-keepalive"),
             ("--mixed-small-bytes", "4096", "--mixed-small-rate", "5000",
              "--tls-cert", "unused.pem", "--tls-key", "unused.key",
              "--scenarios", "proxy-keepalive"),

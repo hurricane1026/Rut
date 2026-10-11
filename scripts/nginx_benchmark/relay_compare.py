@@ -109,6 +109,13 @@ def validate_mixed_small_rate_scenarios(scenarios, enabled):
                          "proxy-keepalive; paced small probe is a proxy workload")
 
 
+def validate_mixed_small_scenarios(scenarios, enabled):
+    if enabled and any(scenario not in ("proxy-close", "proxy-keepalive")
+                        for scenario in scenarios):
+        raise ValueError("--mixed-small-bytes requires proxy-only scenarios; "
+                         "pass --scenarios proxy-close proxy-keepalive")
+
+
 def delegated_option(remaining, name, default=None):
     for index, argument in enumerate(remaining):
         if argument == name:
@@ -121,6 +128,9 @@ def delegated_option(remaining, name, default=None):
 def validate_direct_origin_options(engines, scenarios, remaining):
     if "direct-origin" not in engines:
         return
+    if (delegated_option(remaining, "--tls-cert") is not None
+            or delegated_option(remaining, "--tls-key") is not None):
+        raise ValueError("direct-origin supports plaintext HTTP only")
     if any(scenario.startswith("static-") for scenario in scenarios):
         raise ValueError("direct-origin supports proxy scenarios only")
     if "proxy-keepalive" in scenarios and delegated_option(
@@ -132,6 +142,12 @@ def validate_paced_tls(enabled, remaining):
     if enabled and (delegated_option(remaining, "--tls-cert") is not None
                     or delegated_option(remaining, "--tls-key") is not None):
         raise ValueError("--mixed-small-rate currently supports plaintext HTTP only")
+
+
+def validate_mixed_small_tls(enabled, remaining):
+    if enabled and (delegated_option(remaining, "--tls-cert") is not None
+                    or delegated_option(remaining, "--tls-key") is not None):
+        raise ValueError("--mixed-small-bytes currently supports plaintext HTTP only")
 
 
 def mixed_client_valid(sample):
@@ -257,6 +273,8 @@ def main():
     engines = options.engines.split(",")
     if not engines or any(e not in ("uring", "baseline-uring", "epoll", "nginx", "direct-origin") for e in engines):
         parser.error("--engines must contain uring, baseline-uring, epoll, nginx or direct-origin")
+    if len(engines) != len(set(engines)):
+        parser.error("--engines must not contain duplicates")
     if "baseline-uring" in engines and options.baseline_rut is None:
         parser.error("baseline-uring requires --baseline-rut and its matching rut-compile")
     if options.origin_workers < 1 or options.nginx_buffer_kib < 16 or options.nginx_small_buffer_kib < 16:
@@ -285,8 +303,10 @@ def main():
         scenarios = distinct_url_scenarios(remaining)
         validate_distinct_url_scenarios(scenarios, options.mixed_distinct_urls)
         validate_mixed_small_rate_scenarios(scenarios, bool(options.mixed_small_rate))
+        validate_mixed_small_scenarios(scenarios, bool(options.mixed_small_bytes))
         validate_direct_origin_options(engines, scenarios, remaining)
         validate_paced_tls(bool(options.mixed_small_rate), remaining)
+        validate_mixed_small_tls(bool(options.mixed_small_bytes), remaining)
     except ValueError as error:
         parser.error(str(error))
     source = Path(__file__).with_name("run.py")
