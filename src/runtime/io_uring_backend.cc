@@ -7,6 +7,7 @@
 #include "rut/runtime/io_event.h"
 #include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/response_read_deadline.h"
+#include <atomic>
 
 #include <errno.h>
 #include <linux/io_uring.h>
@@ -612,6 +613,23 @@ bool IoUringBackend::add_recv(i32 fd, u32 conn_id) {
     return true;
 }
 
+bool IoUringBackend::add_recv_once(i32 fd, u32 conn_id, u32 max_len, bool poll_first) {
+    if (conn_id >= connection_capacity || max_len == 0 || max_len > kProvidedBufSize) return false;
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_RECV;
+    if (poll_first) sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
+    sqe->fd = fd;
+    sqe->len = max_len;
+    sqe->buf_group = kBufGroupId;
+    sqe->flags = IOSQE_BUFFER_SELECT;
+    sqe->user_data = encode_user_data(conn_id, IoEventType::Recv);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
     io_uring_sqe* sqe = get_sqe_flushing();
@@ -632,10 +650,8 @@ bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode
     return true;
 }
 
-bool IoUringBackend::add_recv_upstream_once(i32 fd,
-                                            u32 conn_id,
-                                            u32 upstream_episode,
-                                            u32 max_len) {
+bool IoUringBackend::add_recv_upstream_once(
+    i32 fd, u32 conn_id, u32 upstream_episode, u32 max_len, bool poll_first) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
         max_len == 0 || max_len > upstream_once_max_len())
         return false;
@@ -644,6 +660,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
+    if (poll_first) sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
     sqe->fd = fd;
     sqe->len = max_len;
     sqe->buf_group = large_buf_ring != nullptr ? kLargeBufGroupId : kBufGroupId;
@@ -657,7 +674,7 @@ bool IoUringBackend::add_recv_upstream_once(i32 fd,
 }
 
 bool IoUringBackend::add_recv_upstream_direct(
-    i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len) {
+    i32 fd, u32 conn_id, u32 upstream_episode, u8* dst, u32 len, bool poll_first) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
         dst == nullptr || len == 0)
         return false;
@@ -666,6 +683,7 @@ bool IoUringBackend::add_recv_upstream_direct(
 
     memset(sqe, 0, sizeof(*sqe));
     sqe->opcode = IORING_OP_RECV;
+    if (poll_first) sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
     sqe->fd = fd;
     sqe->addr = reinterpret_cast<u64>(dst);
     sqe->len = len;
@@ -681,8 +699,10 @@ bool IoUringBackend::add_recv_upstream_direct(
     return true;
 }
 
-bool IoUringBackend::add_relay_poll(i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode) {
-    if (fd < 0 || conn_id >= connection_capacity ||
+bool IoUringBackend::add_relay_poll(
+    i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode, u8 auxiliary) {
+    if ((auxiliary != 0 && auxiliary != 32 && auxiliary != 33) || fd < 0 ||
+        conn_id >= connection_capacity ||
         (type != IoEventType::RelayRead && type != IoEventType::RelayWrite) ||
         !valid_upstream_episode(upstream_episode))
         return false;
@@ -692,7 +712,7 @@ bool IoUringBackend::add_relay_poll(i32 fd, u32 conn_id, IoEventType type, u32 u
     sqe->opcode = IORING_OP_POLL_ADD;
     sqe->fd = fd;
     sqe->poll32_events = type == IoEventType::RelayRead ? POLLIN : POLLOUT;
-    sqe->user_data = encode_upstream_user_data(conn_id, type, upstream_episode);
+    sqe->user_data = encode_upstream_user_data(conn_id, type, upstream_episode, auxiliary);
     sqe_advance_tail(sq_tail);
     pending++;
     return true;
@@ -1242,9 +1262,114 @@ u32 IoUringBackend::cancel(i32 /*fd*/,
 
 // --- Wait (submit + harvest) ---
 
+bool IoUringBackend::enable_ws_recv_cache() {
+    if (ws_recv_cache_enabled) return true;
+    if (connection_capacity == 0 || connection_capacity > 0x7fffffffu) return false;
+    if (!ws_recv_cache_nodes.init(kProvidedBufCount + kLargeProvidedBufCount)) return false;
+    if (test_fail_ws_recv_cache_owners_init) {
+        test_fail_ws_recv_cache_owners_init = false;
+        return false;
+    }
+    if (!ws_recv_cache_owners.init(connection_capacity * 2u)) return false;
+    ws_recv_cache_enabled = true;
+    return true;
+}
+
+bool IoUringBackend::has_ws_recv_cache(u32 conn_id) const {
+    return ws_recv_cache_enabled && conn_id < connection_capacity &&
+           (ws_recv_cache_owners[conn_id * 2u].queued != 0 ||
+            ws_recv_cache_owners[conn_id * 2u + 1u].queued != 0);
+}
+
+bool IoUringBackend::cache_ws_recv(Connection& conn, u16 buffer_id, const IoEvent& event) {
+    if (!provided_buffer_id_valid(buffer_id) || ws_recv_cache_nodes[buffer_id].queued) return false;
+    auto& node = ws_recv_cache_nodes[buffer_id];
+    node.event = event;
+    node.next = 0xffffffffu;
+    node.queued = true;
+    if (ws_recv_cache_tail != 0xffffffffu)
+        ws_recv_cache_nodes[ws_recv_cache_tail].next = buffer_id;
+    else
+        ws_recv_cache_head = buffer_id;
+    ws_recv_cache_tail = buffer_id;
+    const u32 kOwner = conn.id * 2u + (event.type == IoEventType::UpstreamRecv ? 1u : 0u);
+    ++ws_recv_cache_owners[kOwner].queued;
+    ++conn.pending_ops;  // pins the numeric slot until this cached completion is delivered
+    ++ws_recv_cache_deferred;
+    ++ws_recv_cache_count;
+    if (buffer_id < kProvidedBufCount) ++ws_recv_cache_ordinary_count;
+    if (ws_recv_cache_count > ws_recv_cache_peak) ws_recv_cache_peak = ws_recv_cache_count;
+    return true;
+}
+
+u32 IoUringBackend::drain_ws_recv_cache(IoEvent* events,
+                                        u32 maximum,
+                                        Connection* conns,
+                                        u32 max_conns) {
+    if (!ws_recv_cache_enabled || conns == nullptr) return 0;
+    if (++ws_recv_cache_generation == 0) {
+        for (u32 i = 0; i < connection_capacity * 2u; ++i)
+            ws_recv_cache_owners[i].scan_generation = 0;
+        ws_recv_cache_generation = 1;
+    }
+    u32 count = 0;
+    u32 previous = 0xffffffffu;
+    u32 current = ws_recv_cache_head;
+    while (current != 0xffffffffu && count < maximum) {
+        auto& node = ws_recv_cache_nodes[current];
+        const IoEvent kEvent = node.event;
+        if (kEvent.conn_id >= max_conns) {
+            fatal_error.store(EPROTO, std::memory_order_release);
+            break;
+        }
+        auto& conn = conns[kEvent.conn_id];
+        const bool kUpstream = kEvent.type == IoEventType::UpstreamRecv;
+        auto& owner = ws_recv_cache_owners[kEvent.conn_id * 2u + (kUpstream ? 1u : 0u)];
+        auto& target = kUpstream ? conn.upstream_recv_buf : conn.recv_buf;
+        const bool kStale =
+            conn.fd < 0 || (kUpstream && kEvent.upstream_episode != conn.upstream_episode);
+        const bool kBusy = kUpstream ? conn.ws_upstream_send_pending : conn.ws_client_send_pending;
+        if (!kStale && (owner.scan_generation == ws_recv_cache_generation || kBusy ||
+                        target.write_avail() < static_cast<u32>(kEvent.result))) {
+            owner.scan_generation = ws_recv_cache_generation;
+            previous = current;
+            current = node.next;
+            continue;
+        }
+        if (!kStale) {
+            __builtin_memcpy(target.write_ptr(),
+                             provided_buffer_data(static_cast<u16>(current)),
+                             static_cast<u32>(kEvent.result));
+            target.commit(static_cast<u32>(kEvent.result));
+        }
+        const u32 kNext = node.next;
+        if (previous == 0xffffffffu)
+            ws_recv_cache_head = kNext;
+        else
+            ws_recv_cache_nodes[previous].next = kNext;
+        if (ws_recv_cache_tail == current) ws_recv_cache_tail = previous;
+        node = {};
+        --owner.queued;
+        --ws_recv_cache_count;
+        if (current < kProvidedBufCount) --ws_recv_cache_ordinary_count;
+        if (conn.pending_ops == 0) {
+            fatal_error.store(EPROTO, std::memory_order_release);
+            break;
+        }
+        --conn.pending_ops;
+        return_buffer(static_cast<u16>(current));
+        events[count++] = kEvent;
+        current = kNext;
+    }
+    return count;
+}
+
 u32 IoUringBackend::wait(
     IoEvent* events, u32 max_events, Connection* conns, u32 max_conns, bool wait_for_event) {
     if (failure_code() != 0) return 0;
+    if (study_io_stats) ++study_wait_calls;
+    const u32 kCachedCount = drain_ws_recv_cache(events, max_events, conns, max_conns);
+    if (kCachedCount != 0) wait_for_event = false;
     // Retry timer read if previous submit_timer_read() failed (SQ was full)
     if (timer_fd >= 0 && !timer_read_armed) submit_timer_read();
 
@@ -1258,9 +1383,13 @@ u32 IoUringBackend::wait(
     u32 flags = IORING_ENTER_GETEVENTS;
     i32 ret;
     while (pending != 0 || (wait_for_event && !ready) || kernel_work) {
+        if (study_io_stats) ++study_wait_enter_calls;
         if (pending > 0) {
             ret = io_uring_enter(ring_fd, pending, wait_for_event ? 1u : 0u, flags);
-            if (ret >= 0) pending -= static_cast<u32>(ret);
+            if (ret >= 0) {
+                if (study_io_stats) study_wait_submitted += static_cast<u32>(ret);
+                pending -= static_cast<u32>(ret);
+            }
         } else {
             ret = io_uring_enter(ring_fd, 0, wait_for_event ? 1u : 0u, flags);
         }
@@ -1274,7 +1403,7 @@ u32 IoUringBackend::wait(
     u32 head = __atomic_load_n(cq_head, __ATOMIC_ACQUIRE);
     u32 tail = __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE);
     u32 mask = *cq_ring_mask;
-    u32 count = 0;
+    u32 count = kCachedCount;
     u64 last_read_owner_token = 0;
     u32 last_read_owner_head = 0;
     bool last_read_owner_valid = false;
@@ -1627,6 +1756,38 @@ u32 IoUringBackend::wait(
                 const u8* src = provided_buffer_data(buf_id);
                 u32 avail = target_buf.write_avail();
                 auto& conn = conns[conn_id];
+                const bool kWsOwner =
+                    ws_recv_cache_enabled && conn.is_ws_tunnel && !conn.is_ws_terminate &&
+                    !conn.tls_active &&
+                    (type == IoEventType::Recv || type == IoEventType::UpstreamRecv);
+                if (kWsOwner) {
+                    const bool kUpstream = type == IoEventType::UpstreamRecv;
+                    const u32 kOwner = conn_id * 2u + (kUpstream ? 1u : 0u);
+                    const bool kSending =
+                        kUpstream ? conn.ws_upstream_send_pending : conn.ws_client_send_pending;
+                    if (nbytes > provided_buffer_size(buf_id)) {
+                        protocol_failure();
+                        break;
+                    }
+                    if (ws_recv_cache_owners[kOwner].queued != 0 || kSending || nbytes > avail) {
+                        IoEvent cached{};
+                        cached.conn_id = conn_id;
+                        cached.type = type;
+                        cached.result = cqe->res;
+                        cached.more = (cqe->flags & IORING_CQE_F_MORE) != 0;
+                        cached.aux = aux;
+                        cached.upstream_episode = upstream_episode;
+                        if (!cache_ws_recv(conn, buf_id, cached)) {
+                            protocol_failure();
+                            break;
+                        }
+                        head++;
+                        if (downstream_recv_target && (cqe->flags & IORING_CQE_F_MORE) == 0 &&
+                            !add_terminal_window(cqe->user_data, tail))
+                            break;
+                        continue;  // retain the selected block; never return it before the copy
+                    }
+                }
                 const bool buffered_overflow =
                     deadline_owner && response_pool != nullptr &&
                     forward_response_buffering_uses_content_length_machinery(
@@ -2237,12 +2398,23 @@ u32 IoUringBackend::wait(
         downstream_recv_progress_head = 0;
         downstream_recv_progress_valid = false;
     }
+    if (study_io_stats) {
+        study_wait_events += count;
+        if (count == 0) ++study_wait_empty;
+        if (count > study_wait_max_events) study_wait_max_events = count;
+    }
     return count;
 }
 
 // --- Shutdown ---
 
 void IoUringBackend::shutdown() {
+    ws_recv_cache_enabled = false;
+    ws_recv_cache_nodes.destroy();
+    ws_recv_cache_owners.destroy();
+    ws_recv_cache_head = ws_recv_cache_tail = 0xffffffffu;
+    ws_recv_cache_count = 0;
+    ws_recv_cache_ordinary_count = 0;
     reset_downstream_recv_wait_state();
     if (timer_fd >= 0) {
         close(timer_fd);

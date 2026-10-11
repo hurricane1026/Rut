@@ -97,6 +97,46 @@ def smoke(binary, backend):
         proc.stdout.close()
 
 
+def check_study_diagnostics_are_opt_in(binary):
+    # The startup contract is exact when no study is requested. Keep the
+    # configured case beside it so diagnostics remain available to benchmark
+    # runs and are not accidentally removed with the default suppression.
+    clean_env = {key: value for key, value in os.environ.items()
+                 if not key.startswith('RUT_STUDY_')}
+    for study_env, expected in [({}, None),
+                                ({'RUT_STUDY_HTTP_NODELAY': 'on'},
+                                 b'RUT_STUDY_HTTP_NODELAY mode=on\n')]:
+        env = clean_env.copy()
+        env.update(study_env)
+        proc = subprocess.Popen([binary, '0', '--shards', '1', '--no-pin', '--drain', '0',
+                                 '--backend', 'epoll'], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        output = bytearray()
+        try:
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([proc.stdout], [], [], 0.1)
+                if ready:
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    if b'Listening on port ' in output:
+                        break
+            assert b'Listening on port ' in output, output.decode(errors='replace')
+            if expected is None:
+                assert b'RUT_STUDY_' not in output, output.decode(errors='replace')
+            else:
+                assert expected in output, output.decode(errors='replace')
+            os.killpg(proc.pid, signal.SIGTERM)
+            assert proc.wait(timeout=5) == 0, output.decode(errors='replace')
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=3)
+            proc.stdout.close()
+
+
 def main():
     check_startup_failure_classifier()
     binary = sys.argv[1]
@@ -106,6 +146,7 @@ def main():
         rejected(binary, options)
     for backend in ['auto', 'epoll', 'io_uring']:
         smoke(binary, backend)
+    check_study_diagnostics_are_opt_in(binary)
     print('backend CLI validation passed')
 
 

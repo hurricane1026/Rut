@@ -409,8 +409,9 @@ public:
         IoEvent events[kMaxEventsPerWait];
 
         while (is_running()) {
-            u32 n = backend.wait(events, kMaxEventsPerWait, conns, connection_capacity);
-            dispatch_batch(events, n);
+            const u32 kN =
+                backend.wait(events, study_event_batch_limit, conns, connection_capacity);
+            dispatch_batch(events, kN);
             poll_command();
             // poll_command may have installed a new config (hot reload); re-arm
             // timers now so a freshly activated `every: D` measures from the reload
@@ -720,6 +721,9 @@ public:
     }
 
     static constexpr u32 kResponseSpliceChunkSize = 64u * 1024u;
+    u32 study_event_batch_limit = kMaxEventsPerWait;
+    u32 study_relay_chunk_size = kResponseSpliceChunkSize;
+    u32 study_relay_owner_call_limit = 4;
 
     // Admit only the current, fully framed plaintext GET response. No history,
     // route-size inference or body-inspection policy is bypassed.
@@ -787,8 +791,7 @@ public:
         if (r.pipe_read < 0 || r.pipe_write < 0) {
             int fds[2];
             if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return false;
-            if (::fcntl(fds[1], F_SETPIPE_SZ, kResponseSpliceChunkSize) <
-                static_cast<i32>(kResponseSpliceChunkSize)) {
+            if (::fcntl(fds[1], F_SETPIPE_SZ, study_relay_chunk_size) < 64 * 1024) {
                 ::close(fds[0]);
                 ::close(fds[1]);
                 return false;
@@ -830,32 +833,32 @@ public:
         r.read_armed = r.write_armed = false;
         // Bound each owner turn to two pipe segments (four syscalls). Other
         // ready connections can run before this owner gets another turn.
-        for (u32 calls = 0; calls < 4; ++calls) {
+        for (u32 calls = 0; calls < study_relay_owner_call_limit; ++calls) {
             const bool writing = r.segment_len != 0;
-            const u32 want = writing ? r.segment_len - r.segment_sent
-                                     : (c.resp_body_remaining < kResponseSpliceChunkSize
-                                            ? c.resp_body_remaining
-                                            : kResponseSpliceChunkSize);
+            const u32 kWant =
+                writing ? r.segment_len - r.segment_sent
+                        : (c.resp_body_remaining < study_relay_chunk_size ? c.resp_body_remaining
+                                                                          : study_relay_chunk_size);
             ssize_t n;
             do {
                 n = writing ? ::splice(r.pipe_read,
                                        nullptr,
                                        c.fd,
                                        nullptr,
-                                       want,
+                                       kWant,
                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK)
                             : ::splice(c.upstream_fd,
                                        nullptr,
                                        r.pipe_write,
                                        nullptr,
-                                       want,
+                                       kWant,
                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
             } while (n < 0 && errno == EINTR);
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (!arm_epoll_splice(c, writing)) this->close_conn(c);
                 return;
             }
-            if (n <= 0 || static_cast<u32>(n) > want) {
+            if (n <= 0 || static_cast<u32>(n) > kWant) {
                 this->close_conn(c);
                 return;
             }
