@@ -247,3 +247,11 @@ measurements and warmups without request errors. Total frontend calls per
 request were 42.651 on the baseline and 42.517 on the candidate. This control
 found no syscall increase in the large-body path; its instrumented throughput
 is not a clean large-body performance claim.
+
+The subsequent three-pair 1 MiB control without probes exposed a tail-latency
+regression: median RPS was 1,996 versus 2,144, but median p99 was 81.862 versus
+146.424 ms. Candidate p99 samples were 77.125, 199.636 and 146.424 ms; baseline
+samples were 78.187, 81.862 and 113.110 ms. All request and warmup errors remained
+zero. The syscall reduction is confirmed, but this candidate is experimental
+and is not ready for a production PR until the large-response tail regression
+is explained and resolved. Smaller syscall counts alone are not acceptance.
