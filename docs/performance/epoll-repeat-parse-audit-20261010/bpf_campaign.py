@@ -19,7 +19,7 @@ def measured(harness, original, args, kwargs):
     seeds = ''.join(f'@role[{p}] = {1 if r == "origin" else 2};' for p,r in roles.items())
     program = f'''BEGIN {{ {seeds} printf("READY\\n"); }}
 uprobe:/tmp/rut-ws-pr-20261010-build/src/rut:_ZN3rut10HttpParser5parseEPKhjPNS_13ParsedRequestE /@role[(int64)pid] == 2/ {{ @calls[probe] = count(); }}
-uprobe:/tmp/rut-ws-pr-20261010-build/src/rut:_ZN3rut27inspect_request_policy_bodyERKNS_14ConnectionBaseEt /@role[(int64)pid] == 2/ {{ @calls[probe] = count(); }}
+uprobe:/tmp/rut-ws-pr-20261010-build/src/rut:_ZN3rut27inspect_request_policy_bodyERKNS_14ConnectionBaseEtPNS_25RequestPolicyParseWitnessE /@role[(int64)pid] == 2/ {{ @calls[probe] = count(); }}
 uprobe:/tmp/rut-ws-pr-20261010-build/src/rut:_ZN3rut20apply_request_policyERNS_14ConnectionBaseERK11sockaddr_int /@role[(int64)pid] == 2/ {{ @calls[probe] = count(); }}
 interval:s:{int(duration)+3} {{ exit(); }}
 END {{ clear(@role); }}
