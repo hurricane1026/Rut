@@ -2998,6 +2998,13 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
                     synthetic.conn_id = conn.id;
                     synthetic.type = IoEventType::Send;
                     synthetic.result = static_cast<i32>(n);
+                    if constexpr (requires(Loop* l, Connection& c, IoEventType type, i32 result) {
+                                      l->defer_sync_send_completion(c, type, result);
+                                  }) {
+                        if (loop->defer_sync_send_completion(
+                                conn, IoEventType::Send, static_cast<i32>(n)))
+                            return;
+                    }
                     // Bound the recursion this synchronous dispatch can cause
                     // (it may complete the whole response and pipeline_dispatch
                     // the next pipelined request, whose handler can reach this
@@ -10266,6 +10273,12 @@ bool ws_try_send_client_to_upstream(Loop* loop, Connection& conn) {
                 completed.type = IoEventType::UpstreamSend;
                 completed.upstream_episode = conn.upstream_episode;
                 completed.result = sent;
+                if constexpr (requires(Loop* l, Connection& c, IoEventType type, i32 result) {
+                                  l->defer_sync_send_completion(c, type, result);
+                              }) {
+                    if (loop->defer_sync_send_completion(conn, completed.type, completed.result))
+                        return true;
+                }
                 on_ws_client_to_upstream_sent<Loop>(loop, conn, completed);
                 return true;
             }
@@ -10368,6 +10381,12 @@ bool ws_try_send_upstream_to_client(Loop* loop, Connection& conn) {
                 completed.conn_id = conn.id;
                 completed.type = IoEventType::Send;
                 completed.result = sent;
+                if constexpr (requires(Loop* l, Connection& c, IoEventType type, i32 result) {
+                                  l->defer_sync_send_completion(c, type, result);
+                              }) {
+                    if (loop->defer_sync_send_completion(conn, completed.type, completed.result))
+                        return true;
+                }
                 on_ws_upstream_to_client_sent<Loop>(loop, conn, completed);
                 return true;
             }

@@ -93,7 +93,8 @@ static void full_duplex_burst(test::TestCase* _tc,
                               u32 direct_recv_limit = 0,
                               bool poll_first = false,
                               bool queued_fin = false,
-                              bool fin_before_drain = false) {
+                              bool fin_before_drain = false,
+                              bool require_dual_positive_batch = false) {
     REQUIRE(!half_close || splice);
     LoopStorage storage;
     if (!storage.init()) return;
@@ -218,14 +219,40 @@ static void full_duplex_burst(test::TestCase* _tc,
     }
     u32 client_bytes = 0, origin_bytes = 0;
     bool fin_sent = false;
+    bool first_batch = true;
+    bool assert_first_batch_rearm = false;
     const u64 kStart = monotonic_ns();
     const u64 kDeadline = kStart + 4ull * 1000 * 1000 * 1000;
     while ((client_bytes < kBytes || origin_bytes < kBytes) && monotonic_ns() < kDeadline) {
         IoEvent events[kMaxEventsPerWait]{};
         u32 const kCount =
             loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        if (first_batch && require_dual_positive_batch) {
+            bool client_recv = false;
+            bool upstream_recv = false;
+            for (u32 i = 0; i < kCount; ++i) {
+                client_recv =
+                    client_recv || (events[i].conn_id == conn->id &&
+                                    events[i].type == IoEventType::Recv && events[i].result > 0);
+                upstream_recv = upstream_recv || (events[i].conn_id == conn->id &&
+                                                  events[i].type == IoEventType::UpstreamRecv &&
+                                                  events[i].result > 0);
+            }
+            REQUIRE(client_recv);
+            REQUIRE(upstream_recv);
+            assert_first_batch_rearm = true;
+        }
+        first_batch = false;
         const u64 calls_before_turn = loop.ws_splice.calls;
         loop.dispatch_batch(events, kCount);
+        if (assert_first_batch_rearm) {
+            CHECK(loop.conns[conn->id].recv_armed);
+            CHECK(loop.conns[conn->id].upstream_recv_armed);
+            CHECK_FALSE(loop.conns[conn->id].ws_client_send_pending);
+            CHECK_FALSE(loop.conns[conn->id].ws_upstream_send_pending);
+            CHECK_EQ(loop.deferred_sync_send_count, 0u);
+            assert_first_batch_rearm = false;
+        }
         if (splice) CHECK(loop.ws_splice.calls - calls_before_turn <= budget);
         REQUIRE_EQ(loop.backend.failure_code(), 0);
         REQUIRE(fin_before_drain || queued_fin || conn->fd >= 0);
@@ -399,6 +426,29 @@ TEST(websocket, iouring_sync_send_full_duplex_small) {
                       false,
                       64,
                       4096,
+                      false,
+                      false,
+                      true);
+}
+TEST(websocket, iouring_sync_send_two_positive_recv_cqes_rearm_after_batch) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64,
+                      64,
+                      false,
+                      false,
+                      true,
+                      64,
+                      false,
                       false,
                       false,
                       true);
@@ -906,6 +956,7 @@ TEST(websocket, iouring_splice_last_budget_eintr_remains_runnable) {
     CHECK_EQ(loop.ws_splice.calls - calls_before, 1u);
     CHECK(loop.ws_splice.owners[connection->id].budget_deferred);
     CHECK(loop.ws_splice.budget_deferred_runnable);
+    CHECK_EQ(loop.ws_splice.budget_deferred_runnable_count, 1u);
     CHECK_FALSE(loop.should_wait_for_event());
 
     u8 received[sizeof(kPayload)]{};
@@ -963,6 +1014,7 @@ TEST(websocket, iouring_splice_budget_deferred_work_skips_blocking_wait) {
     loop.ws_splice.progress(loop);
     CHECK_EQ(loop.ws_splice.calls - calls_before, 1u);
     CHECK(loop.ws_splice.budget_deferred_runnable);
+    CHECK_EQ(loop.ws_splice.budget_deferred_runnable_count, 1u);
     CHECK_FALSE(loop.should_wait_for_event());
 
     loop.close_conn(*connection);
@@ -1010,6 +1062,7 @@ TEST(websocket, iouring_splice_armed_owner_allows_blocking_wait) {
          ++turn)
         loop.ws_splice.progress(loop);
     CHECK_FALSE(loop.ws_splice.budget_deferred_runnable);
+    CHECK_EQ(loop.ws_splice.budget_deferred_runnable_count, 0u);
     CHECK(loop.ws_splice.owners[connection->id].direction[0].armed);
     CHECK(loop.ws_splice.owners[connection->id].direction[1].armed);
     CHECK(loop.should_wait_for_event());

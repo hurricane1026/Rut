@@ -266,6 +266,16 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // completion sees it set and falls back to async, and nothing set it
     // again before that nested call returns.
     SyncSendCompletionGuard in_sync_send_completion{};
+    struct DeferredSyncSend {
+        u32 conn_id = 0;
+        u32 handler_gen = 0;
+        u32 upstream_episode = 0;
+        IoEventType type = IoEventType::Send;
+        i32 result = 0;
+    };
+    static constexpr u32 kDeferredSyncSendLimit = 2u * kMaxEventsPerWait;
+    DeferredSyncSend deferred_sync_sends[kDeferredSyncSendLimit]{};
+    u32 deferred_sync_send_count = 0;
     // Shared fairness budget for synchronous relay progress within one wait turn.
     static constexpr u32 kRelayTurnMaxCalls = 16;
     static constexpr u32 kRelayTurnMaxBytes = 1024 * 1024;
@@ -7444,6 +7454,25 @@ public:
             }
             if (!ws_splice.dispatch(*this, events[i])) dispatch(events[i]);
         }
+        for (u32 i = 0; i < deferred_sync_send_count; ++i) {
+            const auto pending = deferred_sync_sends[i];
+            if (pending.conn_id < slots_initialized) {
+                Connection& conn = conns[pending.conn_id];
+                if (conn.pending_ops != 0) --conn.pending_ops;
+                if (conn.fd < 0 || conn.handler_gen != pending.handler_gen ||
+                    conn.upstream_episode != pending.upstream_episode)
+                    continue;
+                IoEvent synthetic{};
+                synthetic.conn_id = conn.id;
+                synthetic.type = pending.type;
+                synthetic.upstream_episode = pending.upstream_episode;
+                synthetic.result = pending.result;
+                in_sync_send_completion = true;
+                dispatch_event(conn, synthetic);
+                in_sync_send_completion = false;
+            }
+        }
+        deferred_sync_send_count = 0;
         ws_splice.progress(*this);
         study_inside_cq = false;
         study_cq_phase_ns += monotonic_ns() - study_turn_started_ns;
@@ -7480,6 +7509,18 @@ public:
         response_read_batch_events = nullptr;
         response_read_batch_owner_index_active = false;
         reclaim_pending();
+    }
+
+    bool defer_sync_send_completion(Connection& conn, IoEventType type, i32 result) {
+        if (!study_inside_cq) return false;
+        if (deferred_sync_send_count >= kDeferredSyncSendLimit) {
+            backend.fatal_error.store(ENOBUFS);
+            return true;
+        }
+        deferred_sync_sends[deferred_sync_send_count++] = {
+            conn.id, conn.handler_gen, conn.upstream_episode, type, result};
+        ++conn.pending_ops;
+        return true;
     }
 
     bool pause_upstream_recv_impl(Connection& c) {

@@ -37,6 +37,7 @@ struct WsSpliceExperiment {
     MappedArray<Owner> owners;
     MappedArray<u32> queued;
     u32 queued_count = 0, queued_head = 0, turn_budget_remaining = 0;
+    u32 budget_deferred_runnable_count = 0;
     bool turn_budget_active = false;
     bool budget_deferred_runnable = false;
     u32 admission_budget_remaining = 0;
@@ -54,6 +55,8 @@ struct WsSpliceExperiment {
         if (!owners.init(capacity) || !queued.init(capacity)) return false;
         enabled = true;
         queued_head = queued_count = 0;
+        budget_deferred_runnable_count = 0;
+        budget_deferred_runnable = false;
         return true;
     }
     void begin_turn() {
@@ -66,13 +69,27 @@ struct WsSpliceExperiment {
             owners[id].queued = true;
             queued[(queued_head + queued_count) % queued.size()] = id;
             ++queued_count;
+            if (owners[id].budget_deferred) ++budget_deferred_runnable_count;
         }
+    }
+    void set_budget_deferred(u32 id, bool deferred) {
+        auto& owner = owners[id];
+        if (owner.budget_deferred == deferred) return;
+        if (owner.queued) {
+            if (deferred)
+                ++budget_deferred_runnable_count;
+            else if (budget_deferred_runnable_count != 0)
+                --budget_deferred_runnable_count;
+        }
+        owner.budget_deferred = deferred;
     }
     u32 dequeue() {
         const u32 id = queued[queued_head];
         queued_head = (queued_head + 1) % queued.size();
         --queued_count;
         owners[id].queued = false;
+        if (owners[id].budget_deferred && budget_deferred_runnable_count != 0)
+            --budget_deferred_runnable_count;
         return id;
     }
     static void close_pipes(Owner& owner) {
@@ -90,6 +107,8 @@ struct WsSpliceExperiment {
         queued.destroy();
         enabled = false;
         queued_head = queued_count = 0;
+        budget_deferred_runnable_count = 0;
+        budget_deferred_runnable = false;
         turn_budget_active = false;
     }
     template <class Loop>
@@ -166,7 +185,7 @@ struct WsSpliceExperiment {
                         d.cancel_owned = true;
                         ++c.pending_ops;
                     } else {
-                        o.budget_deferred = true;
+                        set_budget_deferred(c.id, true);
                         enqueue(c.id);
                     }
                 }
@@ -266,14 +285,14 @@ struct WsSpliceExperiment {
                 // one probe before both directions can sleep on readiness.
                 if (turn_budget_remaining == 0 && !other.armed && !other.cancel_owned &&
                     (!other.eof || other.buffered != 0))
-                    o.budget_deferred = true;
+                    set_budget_deferred(c.id, true);
                 o.next_direction = static_cast<u8>(index ^ 1u);
                 enqueue(c.id);
                 return;
             }
             if (n < 0 && errno == EINTR && turn_budget_remaining == 0) {
                 o.next_direction = static_cast<u8>(index);
-                o.budget_deferred = true;
+                set_budget_deferred(c.id, true);
                 enqueue(c.id);
                 return;
             }
@@ -331,7 +350,7 @@ struct WsSpliceExperiment {
                         // The owner may have been dequeued before this EOF
                         // arrived. Keep it runnable so cancellation is retried
                         // without waiting for unrelated readiness.
-                        o.budget_deferred = true;
+                        set_budget_deferred(c.id, true);
                         enqueue(c.id);
 #ifdef RUT_TESTING
                         o.eof_cancel_retry_deferred = true;
@@ -367,7 +386,7 @@ struct WsSpliceExperiment {
         }
         if (turn_budget_remaining == 0) {
             o.next_direction = static_cast<u8>(d.buffered != 0 ? index : (index ^ 1u));
-            o.budget_deferred = true;
+            set_budget_deferred(c.id, true);
             enqueue(c.id);
             return;
         }
@@ -478,7 +497,7 @@ struct WsSpliceExperiment {
             const u32 kId = dequeue();
             auto& c = loop.conns[kId];
             auto& o = owners[kId];
-            o.budget_deferred = false;
+            set_budget_deferred(kId, false);
             if (o.reclaim_pending) {
                 o.reclaim_pending = false;
                 loop.reclaim_slot(kId);
@@ -501,7 +520,7 @@ struct WsSpliceExperiment {
             }
             if (o.active) {
                 if (turn_budget_remaining == 0) {
-                    o.budget_deferred = true;
+                    set_budget_deferred(kId, true);
                     enqueue(kId);
                     break;
                 }
@@ -521,7 +540,7 @@ struct WsSpliceExperiment {
                 !c.ws_upstream_send_pending && c.recv_buf.len() == 0 &&
                 c.upstream_recv_buf.len() == 0 && !loop.backend.has_ws_recv_cache(c.id)) {
                 if (admission_budget_remaining == 0) {
-                    o.budget_deferred = true;
+                    set_budget_deferred(kId, true);
                     enqueue(kId);
                     break;
                 }
@@ -582,10 +601,7 @@ struct WsSpliceExperiment {
             }
             if (o.requested || o.closing || o.eof_closing) enqueue(kId);
         }
-        for (u32 i = 0; i < queued_count; ++i)
-            budget_deferred_runnable =
-                budget_deferred_runnable ||
-                owners[queued[(queued_head + i) % queued.size()]].budget_deferred;
+        budget_deferred_runnable = budget_deferred_runnable_count != 0;
         turn_budget_active = false;
     }
 };
