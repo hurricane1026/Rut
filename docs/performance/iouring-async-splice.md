@@ -151,3 +151,15 @@ versus about two on the enabled path. Both had zero transport errors. Normal
 server logs contained no async slow-response or terminal-scan diagnostics.
 The final production-configuration source passes the independent seven-check
 runtime run, including 1,609 network tests and 67 splice tests.
+
+Debug ASan+UBSan builds of `test_splice` and `test_fault_injection` also pass
+with leak detection and halt-on-error enabled; no sanitizer report was emitted.
+This covers the focused real-kernel splice/cancel/fd-reuse tests, not the full
+network suite under sanitizers or GitHub CI.
+
+The same-binary 4 KiB on/off comparison averaged 113,066 versus 117,215
+requests/s (-3.5% enabled), all errors zero, with substantial per-run variation.
+A lazy activation of relay budgets then averaged only +0.3% against the retained
+configuration and won one of two repetitions. That change was reverted; the
+failed/neutral experiment remains in the external checkpoint artifacts. Small
+response profiling remains open rather than treating the regression as resolved.
