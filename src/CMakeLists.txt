@@ -135,6 +135,13 @@ else()
 endif()
 
 # Runtime library
+# IORING_OP_SPLICE is available since Linux 5.7. It is an enum, not a
+# preprocessor macro: test the build headers, then probe the running ring.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("#include <linux/io_uring.h>
+int main() { io_uring_sqe sqe{}; sqe.opcode = IORING_OP_SPLICE;
+sqe.splice_fd_in = -1; sqe.splice_off_in = ~0ULL; sqe.splice_flags = 0; }"
+    RUT_HAVE_IORING_OP_SPLICE)
 add_library(rut_runtime STATIC
     placement_new.cc
     runtime/arena.cc
@@ -164,6 +171,8 @@ add_library(rut_runtime STATIC
     ${SIMD_SOURCE}
 )
 
+target_compile_definitions(rut_runtime PUBLIC
+    RUT_HAVE_IORING_OP_SPLICE=$<BOOL:${RUT_HAVE_IORING_OP_SPLICE}>)
 target_include_directories(rut_runtime PUBLIC
     ${PROJECT_SOURCE_DIR}/include
 )

@@ -50,6 +50,31 @@ struct ScopedIoUringLoop {
     }
 };
 
+bool async_splice_tcp_pair(i32 fds[2]) {
+    fds[0] = fds[1] = -1;
+    const int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0) return false;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof(address);
+    bool ok = bind(listener, reinterpret_cast<sockaddr*>(&address), length) == 0 &&
+              listen(listener, 1) == 0 &&
+              getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0;
+    if (ok) {
+        fds[1] = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        ok = fds[1] >= 0 && connect(fds[1], reinterpret_cast<sockaddr*>(&address), length) == 0;
+    }
+    if (ok) fds[0] = accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
+    close(listener);
+    if (!ok || fds[0] < 0) {
+        if (fds[1] >= 0) close(fds[1]);
+        fds[0] = fds[1] = -1;
+        return false;
+    }
+    return true;
+}
+
 bool set_fd_nonblocking(i32 fd) {
     const i32 flags = fcntl(fd, F_GETFL, 0);
     return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
@@ -112,8 +137,7 @@ bool pump_once(IoUringEventLoop& loop) {
         events, kMaxEventsPerWait, loop.conns, IoUringEventLoop::kMaxConns, !runnable);
     if (loop.backend.failure_code() != 0 || (count == 0 && !runnable)) return false;
     // Match the production run loop's fresh per-wait shared splice budget.
-    loop.relay_budget_calls = IoUringEventLoop::kRelayTurnMaxCalls;
-    loop.relay_budget_bytes = IoUringEventLoop::kRelayTurnMaxBytes;
+    loop.refresh_relay_turn_budget();
     loop.dispatch_batch(events, count);
     return true;
 }
@@ -1873,6 +1897,539 @@ TEST(iouring_splice, eof_and_post_pull_poll_failure_fail_closed) {
         CHECK_EQ(loop.relay_written_bytes, 0u);
         CHECK_EQ(c->fd, -1);
         CHECK_EQ(c->relay_owner.pipe_read, -1);
+        close(upstream[1]);
+        close(downstream[1]);
+    }
+}
+
+TEST(iouring_async_splice, finished_relay_retires_spent_prefix_send_state) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    loop.study_http_async_splice = true;
+    Connection* c = loop.alloc_conn();
+    REQUIRE(c != nullptr);
+    c->on_send = [](void*, Connection&, IoEvent) {};
+    c->on_upstream_recv = [](void*, Connection&, IoEvent) {};
+    c->on_upstream_send = [](void*, Connection&, IoEvent) {};
+    c->send_progress = 167;
+    c->send_armed = false;
+    loop.finish_response_splice(*c);
+    CHECK(c->on_send == nullptr);
+    CHECK_EQ(c->send_progress, 0u);
+    CHECK(c->on_upstream_recv == nullptr);
+    CHECK(c->on_upstream_send == nullptr);
+    loop.free_conn(*c);
+}
+
+TEST(iouring_async_splice, tcp_eagain_then_exact_body_with_real_completions) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+    loop.study_http_async_splice = true;
+    constexpr u32 size = 64 * 1024;
+    static u8 expected[size];
+    static u8 received[size];
+    fill_pattern(expected, size);
+    i32 upstream[2], downstream[2];
+    REQUIRE(async_splice_tcp_pair(upstream));
+    REQUIRE(async_splice_tcp_pair(downstream));
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.test_start_response_splice(*c));
+    REQUIRE_EQ(c->pending_ops, 1u);
+    REQUIRE_GT(loop.relay_async_operation[c->id], 0u);
+    REQUIRE(pump_once(loop));  // Empty TCP receive completes with EAGAIN.
+    CHECK_EQ(loop.relay_async_operation[c->id], 0u);
+    REQUIRE(c->relay_owner.read_armed);  // A real readiness poll now owns progress.
+    REQUIRE(send_all(upstream[1], expected, size));
+    REQUIRE(pump_until(loop, [&] { return !c->relay_owner.active(); }, 64));
+    CHECK_EQ(loop.relay_written_bytes, size);
+    u32 offset = 0;
+    while (offset < size) {
+        const ssize_t n = recv(downstream[1], received + offset, size - offset, MSG_DONTWAIT);
+        REQUIRE_GT(n, 0);
+        offset += static_cast<u32>(n);
+    }
+    CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
+TEST(iouring_async_splice, transfers_exact_body_with_real_completions) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+    loop.study_http_async_splice = true;
+    constexpr u32 size = 64 * 1024;
+    static u8 expected[size];
+    static u8 received[size];
+    fill_pattern(expected, size);
+    i32 upstream[2], downstream[2];
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE(send_all(upstream[1], expected, size));
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.test_start_response_splice(*c));
+    REQUIRE_EQ(c->pending_ops, 1u);
+    REQUIRE_GT(loop.relay_async_operation[c->id], 0u);
+    REQUIRE(pump_until(loop, [&] { return !c->relay_owner.active(); }, 64));
+    CHECK_EQ(loop.relay_written_bytes, size);
+    u32 offset = 0;
+    while (offset < size) {
+        const ssize_t n = recv(downstream[1], received + offset, size - offset, MSG_DONTWAIT);
+        REQUIRE_GT(n, 0);
+        offset += static_cast<u32>(n);
+    }
+    CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
+TEST(iouring_async_splice, linked_short_read_and_eagain_complete_exact_body) {
+    for (u32 hardlink = 0; hardlink < 2; ++hardlink) {
+        ScopedIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto& loop = *guard.loop;
+        if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+        loop.study_http_async_splice = loop.study_http_async_splice_link = true;
+        loop.study_http_async_splice_more = true;
+        loop.study_http_async_splice_hardlink = hardlink != 0;
+        constexpr u32 size = 128 * 1024;
+        constexpr u32 first = 16 * 1024;
+        static u8 expected[size];
+        static u8 received[size];
+        fill_pattern(expected, size);
+        i32 upstream[2], downstream[2];
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        REQUIRE(async_splice_tcp_pair(downstream));
+        const int send_buffer = 1024 * 1024;
+        REQUIRE_EQ(
+            setsockopt(downstream[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)), 0);
+        Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.test_start_response_splice(*c));
+        REQUIRE_EQ(c->pending_ops, 2u);
+        REQUIRE(pump_until(loop, [&] { return loop.study_splice_eagain[0] != 0; }));
+        REQUIRE_EQ(loop.relay_splice_pairs[c->id].length, 0u);
+        REQUIRE_EQ(c->pending_ops, 1u);  // One real POLLIN owns the empty source.
+        REQUIRE(send_all(upstream[1], expected, first));
+        REQUIRE(pump_until(loop, [&] { return loop.relay_written_bytes >= first; }));
+        REQUIRE_GT(loop.study_splice_short[0], 0u);
+        REQUIRE_EQ(loop.relay_written_bytes, first);
+        REQUIRE(send_all(upstream[1], expected + first, size - first));
+        REQUIRE(pump_until(loop, [&] { return !c->relay_owner.active(); }, 64));
+        REQUIRE(read_exact(downstream[1], received, size));
+        CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+        CHECK_EQ(loop.relay_written_bytes, size);
+        close(upstream[1]);
+        close(downstream[1]);
+    }
+}
+
+TEST(iouring_async_splice, slice_threshold_admits_medium_body_and_preserves_fallback) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+    loop.study_http_async_splice = loop.study_http_async_splice_link = true;
+    loop.study_http_async_splice_hardlink = true;
+    constexpr u32 size = 2 * SlicePool::kSliceSize;
+    static u8 expected[size];
+    static u8 received[size];
+    fill_pattern(expected, size);
+    i32 upstream[2], downstream[2];
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE(async_splice_tcp_pair(downstream));
+    REQUIRE(send_all(upstream[1], expected, size));
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+    REQUIRE(c != nullptr);
+    CHECK(!loop.response_splice_eligible(*c));
+    loop.study_http_async_splice_slice_threshold = true;
+    CHECK(loop.response_splice_eligible(*c));
+    loop.backend.splice_supported = false;
+    CHECK(!loop.response_splice_eligible(*c));
+    loop.backend.splice_supported = true;
+    c->resp_body_remaining = SlicePool::kSliceSize - 1;
+    CHECK(!loop.response_splice_eligible(*c));
+    c->resp_body_remaining = size;
+    REQUIRE(loop.test_start_response_splice(*c));
+    REQUIRE(pump_until(loop, [&] { return !c->relay_owner.active(); }, 64));
+    REQUIRE(read_exact(downstream[1], received, size));
+    CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+    CHECK_EQ(loop.relay_written_bytes, size);
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
+TEST(iouring_async_splice, unsupported_opcode_falls_back_to_exact_sync_transfer) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    loop.backend.splice_supported = false;
+    loop.study_http_async_splice = loop.study_http_async_splice_link = true;
+    constexpr u32 size = 64 * 1024;
+    static u8 expected[size];
+    static u8 received[size];
+    fill_pattern(expected, size);
+    i32 upstream[2], downstream[2];
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE(send_all(upstream[1], expected, size));
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.test_start_response_splice(*c));
+    CHECK_EQ(c->pending_ops, 0u);
+    CHECK_EQ(loop.relay_async_operation[c->id], 0u);
+    CHECK_EQ(loop.relay_splice_pairs[c->id].length, 0u);
+    CHECK_EQ(loop.relay_written_bytes, size);
+    REQUIRE(read_exact(downstream[1], received, size));
+    CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
+TEST(iouring_async_splice, linked_read_uses_actual_pipe_capacity) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+    loop.study_http_async_splice = loop.study_http_async_splice_link = true;
+    loop.study_relay_chunk_size = 512 * 1024;
+    constexpr u32 size = 128 * 1024;
+    static u8 expected[size];
+    static u8 received[size];
+    fill_pattern(expected, size);
+    i32 upstream[2], downstream[2], pipe_fds[2];
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC), 0);
+    const i32 capacity = fcntl(pipe_fds[1], F_SETPIPE_SZ, 64 * 1024);
+    REQUIRE_GE(capacity, 64 * 1024);
+    REQUIRE(send_all(upstream[1], expected, size));
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+    REQUIRE(c != nullptr);
+    // Install a real smaller pipe, as retained after a failed growth attempt.
+    c->relay_owner.pipe_read = pipe_fds[0];
+    c->relay_owner.pipe_write = pipe_fds[1];
+    loop.relay_pipe_capacity[c->id] = static_cast<u32>(capacity);
+    REQUIRE(loop.test_start_response_splice(*c));
+    CHECK_EQ(loop.relay_splice_pairs[c->id].length, static_cast<u32>(capacity));
+    REQUIRE(pump_until(loop, [&] { return !c->relay_owner.active(); }, 64));
+    REQUIRE(read_exact(downstream[1], received, size));
+    CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+    CHECK_EQ(loop.relay_written_bytes, size);
+    CHECK_EQ(loop.study_splice_short[0], 0u);
+    CHECK_EQ(loop.relay_pipe_capacity[c->id], 0u);  // Close reclaims cached capacity too.
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
+TEST(iouring_async_splice, adaptive_quantum_obeys_body_budget_and_pipe_capacity) {
+    for (u32 large = 0; large < 2; ++large) {
+        ScopedIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto& loop = *guard.loop;
+        if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+        loop.study_http_async_splice = loop.study_http_async_splice_link = true;
+        loop.study_http_async_splice_adaptive_chunk = true;
+        const u32 size = large ? 1024 * 1024 : 64 * 1024;
+        i32 upstream[2], downstream[2];
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+        Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+        REQUIRE(c != nullptr);
+        const u32 expected = large ? loop.study_relay_turn_byte_limit / 2 : size;
+        CHECK_EQ(loop.response_splice_quantum(*c), expected);
+        REQUIRE(loop.test_start_response_splice(*c));
+        const i32 capacity = fcntl(c->relay_owner.pipe_write, F_GETPIPE_SZ);
+        REQUIRE_GE(capacity, 64 * 1024);
+        CHECK_EQ(loop.relay_pipe_capacity[c->id], static_cast<u32>(capacity));
+        CHECK_EQ(loop.relay_splice_pairs[c->id].length,
+                 std::min(expected, static_cast<u32>(capacity)));
+        CHECK_LE(2 * loop.relay_splice_pairs[c->id].length, loop.study_relay_turn_byte_limit);
+        loop.close_conn(*c);
+        REQUIRE(pump_until(loop, [&] { return loop.pending_free_count == 0; }, 16));
+        CHECK_EQ(loop.relay_pipe_capacity[c->id], 0u);
+        CHECK_EQ(loop.relay_async_retiring_client[c->id], 0u);
+        close(upstream[1]);
+        close(downstream[1]);
+    }
+}
+
+TEST(iouring_async_splice, linked_full_pair_accepts_reverse_completion_dispatch) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+    loop.study_http_async_splice = loop.study_http_async_splice_link = true;
+    constexpr u32 size = 64 * 1024;
+    static u8 expected[size];
+    static u8 received[size];
+    fill_pattern(expected, size);
+    i32 upstream[2], downstream[2];
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE(send_all(upstream[1], expected, size));
+    Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+    REQUIRE(c != nullptr);
+    REQUIRE(loop.test_start_response_splice(*c));
+    IoEvent pair[2]{};
+    u32 found = 0;
+    for (u32 turn = 0; turn < 8 && found != 3; ++turn) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count = loop.backend.wait(
+            events, kMaxEventsPerWait, loop.conns, IoUringEventLoop::kMaxConns, true);
+        REQUIRE_GT(count, 0u);
+        for (u32 i = 0; i < count; ++i) {
+            if (events[i].conn_id == c->id && events[i].aux == 4 &&
+                (events[i].type == IoEventType::RelayRead ||
+                 events[i].type == IoEventType::RelayWrite)) {
+                const u32 side = events[i].type == IoEventType::RelayRead ? 0 : 1;
+                pair[side] = events[i];
+                found |= 1u << side;
+            } else {
+                loop.dispatch(events[i]);
+            }
+        }
+    }
+    REQUIRE_EQ(found, 3u);
+    REQUIRE_EQ(pair[0].result, static_cast<i32>(size));
+    REQUIRE_EQ(pair[1].result, static_cast<i32>(size));
+    loop.dispatch(pair[1]);
+    CHECK_EQ(c->pending_ops, 1u);
+    CHECK_EQ(loop.relay_written_bytes, 0u);
+    loop.dispatch(pair[0]);
+    CHECK(!c->relay_owner.active());
+    REQUIRE(read_exact(downstream[1], received, size));
+    CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+    CHECK_EQ(loop.relay_written_bytes, size);
+    close(upstream[1]);
+    close(downstream[1]);
+}
+
+TEST(iouring_async_splice, queue_budget_admits_multiple_pairs_and_preserves_bytes) {
+    ScopedIoUringLoop guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto& loop = *guard.loop;
+    if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+    loop.study_http_async_splice = loop.study_http_async_splice_link = true;
+    loop.study_http_async_splice_queue_budget = true;
+    loop.study_relay_turn_call_limit = 2;
+    loop.study_relay_turn_byte_limit = 128 * 1024;
+    loop.refresh_relay_turn_budget();
+    constexpr u32 owners = 4;
+    constexpr u32 size = 64 * 1024;
+    static u8 expected[size];
+    static u8 received[size];
+    fill_pattern(expected, size);
+    Connection* conns[owners]{};
+    i32 upstream[owners][2], downstream[owners][2];
+    for (u32 i = 0; i < owners; ++i) {
+        REQUIRE_EQ(test::stream_socketpair(upstream[i]), 0);
+        REQUIRE_EQ(test::stream_socketpair(downstream[i]), 0);
+        REQUIRE(send_all(upstream[i][1], expected, size));
+        conns[i] = make_eligible(loop, upstream[i][0], downstream[i][0], size);
+        REQUIRE(conns[i] != nullptr);
+        REQUIRE(loop.test_start_response_splice(*conns[i]));
+        CHECK_EQ(conns[i]->pending_ops, 2u);
+    }
+    CHECK_EQ(loop.deferred_relay_read_count, 0u);
+    CHECK_EQ(loop.relay_budget_calls, loop.backend.sq_ring_entries - 2 * owners);
+    REQUIRE(pump_until(loop, [&] { return loop.relay_written_bytes == owners * size; }, 64));
+    for (u32 i = 0; i < owners; ++i) {
+        REQUIRE(read_exact(downstream[i][1], received, size));
+        CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+        CHECK(!conns[i]->relay_owner.active());
+        close(upstream[i][1]);
+        close(downstream[i][1]);
+    }
+    loop.backend.splice_supported = false;
+    loop.refresh_relay_turn_budget();
+    CHECK_EQ(loop.relay_budget_calls, loop.study_relay_turn_call_limit);
+    CHECK_EQ(loop.relay_budget_bytes, loop.study_relay_turn_byte_limit);
+}
+
+TEST(iouring_async_splice, write_backpressure_preserves_exact_body) {
+    for (u32 mode = 0; mode < 3; ++mode) {
+        ScopedIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto& loop = *guard.loop;
+        if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+        loop.study_http_async_splice = true;
+        loop.study_http_async_splice_link = mode != 0;
+        loop.study_http_async_splice_hardlink = mode == 2;
+        constexpr u32 size = 64 * 1024;
+        static u8 expected[size];
+        static u8 received[size];
+        fill_pattern(expected, size);
+        i32 upstream[2], downstream[2];
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+        Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+        REQUIRE(c != nullptr);
+        const int send_buffer = 4096;
+        REQUIRE_EQ(setsockopt(c->fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)), 0);
+        // Fill the destination before submission so the first real write CQE
+        // must transfer ownership to POLLOUT without losing the pipe's bytes.
+        u32 prefix = 0;
+        for (;;) {
+            const ssize_t n = send(c->fd, expected, 1024, MSG_NOSIGNAL);
+            if (n < 0) {
+                REQUIRE_EQ(errno, EAGAIN);
+                break;
+            }
+            REQUIRE_GT(n, 0);
+            prefix += static_cast<u32>(n);
+            REQUIRE_LT(prefix, size);
+        }
+        REQUIRE(send_all(upstream[1], expected, size));
+        REQUIRE(loop.test_start_response_splice(*c));
+        REQUIRE(pump_until(loop, [&] { return loop.study_splice_eagain[1] != 0; }));
+        REQUIRE_GT(loop.study_splice_eagain[1], 0u);
+        REQUIRE(c->relay_owner.write_armed);
+        CHECK_EQ(loop.relay_async_operation[c->id], 0u);
+        REQUIRE(read_exact(downstream[1], received, prefix));
+        u32 offset = 0;
+        for (u32 turn = 0; turn < 128 && c->relay_owner.active(); ++turn) {
+            REQUIRE(pump_once(loop));
+            for (;;) {
+                const ssize_t n =
+                    recv(downstream[1], received + offset, size - offset, MSG_DONTWAIT);
+                if (n < 0 && errno == EAGAIN) break;
+                if (n == 0) break;
+                REQUIRE_GT(n, 0);
+                offset += static_cast<u32>(n);
+                if (offset == size) break;
+            }
+        }
+        CHECK(!c->relay_owner.active());
+        CHECK_EQ(offset, size);
+        CHECK_EQ(loop.relay_written_bytes, size);
+        CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+        close(upstream[1]);
+        close(downstream[1]);
+    }
+}
+
+TEST(iouring_async_splice, continuation_respects_turn_budget_with_multiple_owners) {
+    for (u32 exhausted = 0; exhausted < 2; ++exhausted) {
+        ScopedIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto& loop = *guard.loop;
+        if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+        loop.study_http_async_splice = true;
+        loop.study_http_async_splice_continue = true;
+        loop.study_relay_chunk_size = 64 * 1024;
+        constexpr u32 size = 128 * 1024;
+        static u8 expected[size];
+        static u8 received[size];
+        fill_pattern(expected, size);
+        i32 upstream[2], downstream[2];
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+        const int send_buffer = 1024 * 1024;
+        REQUIRE_EQ(
+            setsockopt(downstream[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)), 0);
+        REQUIRE(send_all(upstream[1], expected, size));
+        Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+        REQUIRE(c != nullptr);
+        Connection* other = loop.alloc_conn();
+        REQUIRE(other != nullptr);
+        REQUIRE(loop.test_start_response_splice(*c));
+        // Dispatch real byte completions individually so a batch-end FIFO
+        // flush cannot hide whether the write callback respected its budget.
+        for (u32 kind = 0; kind < 2; ++kind) {
+            IoEvent events[kMaxEventsPerWait]{};
+            const u32 count = loop.backend.wait(
+                events, kMaxEventsPerWait, loop.conns, IoUringEventLoop::kMaxConns, true);
+            REQUIRE_GT(count, 0u);
+            bool found = false;
+            if (kind == 1 && exhausted) loop.relay_budget_calls = 0;
+            loop.study_inside_cq = true;
+            for (u32 i = 0; i < count; ++i) {
+                if (events[i].conn_id == c->id && events[i].aux == 4 &&
+                    events[i].type ==
+                        (kind == 0 ? IoEventType::RelayRead : IoEventType::RelayWrite))
+                    found = true;
+                loop.dispatch(events[i]);
+            }
+            loop.study_inside_cq = false;
+            REQUIRE(found);
+        }
+        REQUIRE_GT(c->resp_body_remaining, 0u);
+        CHECK_EQ(loop.deferred_relay_read_count, exhausted);
+        CHECK_EQ(c->relay_owner.read_armed, exhausted == 0);
+        CHECK_EQ(c->pending_ops, exhausted == 0 ? 1u : 0u);
+        REQUIRE(pump_until(loop, [&] { return !c->relay_owner.active(); }, 64));
+        REQUIRE(read_exact(downstream[1], received, size));
+        CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+        CHECK_EQ(loop.relay_written_bytes, size);
+        loop.free_conn(*other);
+        close(upstream[1]);
+        close(downstream[1]);
+    }
+}
+
+TEST(iouring_async_splice, close_retires_splice_before_pipe_reclaim) {
+    for (u32 linked = 0; linked < 3; ++linked) {
+        ScopedIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto& loop = *guard.loop;
+        if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+        loop.study_http_async_splice = true;
+        loop.study_http_async_splice_link = linked != 0;
+        loop.study_http_async_splice_hardlink = linked == 2;
+        const u32 free_before = loop.free_top;
+        i32 upstream[2] = {-1, -1};
+        i32 downstream[2] = {-1, -1};
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+        static u8 body[64 * 1024];
+        fill_pattern(body, sizeof(body));
+        REQUIRE(send_all(upstream[1], body, sizeof(body)));
+        Connection* c = make_eligible(loop, upstream[0], downstream[0], 64 * 1024);
+        REQUIRE(c != nullptr);
+        upstream[0] = downstream[0] = -1;
+        REQUIRE(loop.test_start_response_splice(*c));
+        REQUIRE(c->relay_owner.read_armed);
+        REQUIRE_EQ(c->pending_ops, linked ? 2u : 1u);
+        const i32 source_fd = c->upstream_fd;
+        const i32 destination_fd = c->fd;
+        loop.close_conn(*c);
+        REQUIRE_EQ(c->upstream_fd, -1);
+        REQUIRE_EQ(loop.relay_async_source_retiring[c->id], 1u);
+        REQUIRE_GE(fcntl(source_fd, F_GETFD), 0);
+        REQUIRE_EQ(c->fd, -1);
+        REQUIRE_EQ(loop.relay_async_retiring_client[c->id], static_cast<u32>(destination_fd) + 1);
+        REQUIRE_GE(fcntl(destination_fd, F_GETFD), 0);
+        // Normal descriptor allocation must not reuse the input number while
+        // the io-wq splice still owns it, even though the logical conn is closed.
+        i32 replacement[2];
+        REQUIRE_EQ(test::stream_socketpair(replacement), 0);
+        CHECK_NE(replacement[0], source_fd);
+        CHECK_NE(replacement[1], source_fd);
+        CHECK_NE(replacement[0], destination_fd);
+        CHECK_NE(replacement[1], destination_fd);
+        for (u32 i = 0; i < 8 && loop.pending_free_count != 0; ++i) REQUIRE(pump_once(loop));
+        CHECK_EQ(loop.pending_free_count, 0u);
+        CHECK_EQ(loop.free_top, free_before);
+        CHECK_EQ(c->relay_owner.pipe_read, -1);
+        CHECK_EQ(c->relay_owner.pipe_write, -1);
+        CHECK_EQ(loop.relay_async_source_retiring[c->id], 0u);
+        CHECK_EQ(fcntl(source_fd, F_GETFD), -1);
+        CHECK_EQ(errno, EBADF);
+        CHECK_EQ(loop.relay_async_retiring_client[c->id], 0u);
+        CHECK_EQ(fcntl(destination_fd, F_GETFD), -1);
+        CHECK_EQ(errno, EBADF);
+        u8 stray = 0;
+        CHECK_EQ(recv(replacement[1], &stray, 1, MSG_DONTWAIT), -1);
+        CHECK_EQ(errno, EAGAIN);
+        close(replacement[0]);
+        close(replacement[1]);
         close(upstream[1]);
         close(downstream[1]);
     }
