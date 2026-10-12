@@ -41479,6 +41479,34 @@ TEST(iouring_upstream_recv, complete_buffered_direct_body_rejects_same_cqe_overr
     }
 }
 
+TEST(iouring_terminal_scan, empty_batch_cache_is_invalidated_by_terminal_publication) {
+    ScopedIoUringLoopForRetirement guard;
+    if (!guard.init()) SKIP("io_uring unavailable");
+    auto* loop = guard.loop;
+    loop->study_http_terminal_scan = true;
+    OneShotRecvFixture fixture;
+    REQUIRE(fixture.stage(loop, /*plaintext=*/true));
+    Connection& conn = *fixture.conn;
+    IoEvent empty[1]{};
+    loop->dispatch_batch(empty, 0);
+    REQUIRE_FALSE(loop->response_read_terminal_scan_needed);
+    const u64 skipped = loop->study_http_terminal_scans_skipped;
+    loop->dispatch_batch(empty, 0);
+    CHECK_EQ(loop->study_http_terminal_scans_skipped, skipped + 1);
+    conn.response_read_deadline_post_commit_phase = ResponseReadDeadlinePostCommitPhase::BodySend;
+    loop->mark_response_read_terminal_pending(conn);
+    REQUIRE(loop->response_read_terminal_scan_needed);
+    loop->dispatch_batch(empty, 0);
+    CHECK(loop->response_read_terminal_scan_needed);
+    CHECK_EQ(loop->study_http_terminal_scans_skipped, skipped + 1);
+    conn.response_read_deadline_post_commit_terminal_pending = false;
+    loop->dispatch_batch(empty, 0);
+    REQUIRE_FALSE(loop->response_read_terminal_scan_needed);
+    loop->dispatch_batch(empty, 0);
+    CHECK_EQ(loop->study_http_terminal_scans_skipped, skipped + 2);
+    fixture.cleanup();
+}
+
 TEST(iouring_upstream_recv, bounded_terminal_discards_late_direct_bytes_without_publication) {
     ScopedIoUringLoopForRetirement guard;
     if (!guard.init()) SKIP("io_uring unavailable");

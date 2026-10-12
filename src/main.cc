@@ -493,6 +493,8 @@ static bool configure_study_policy(Loop* loop) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_TERMINAL_SCAN=on"))
                     loop->study_http_terminal_scan = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_TERMINAL_SCAN=off"))
+                    loop->study_http_terminal_scan = false;
             if (report_study)
                 write_str(loop->study_http_terminal_scan
                               ? "RUT_STUDY_HTTP_TERMINAL_SCAN mode=on\n"
