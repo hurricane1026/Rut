@@ -113,6 +113,7 @@ static void full_duplex_burst(test::TestCase* _tc,
         loop.ws_splice.fast_batch = fast_batch;
         loop.ws_splice.fast_scan = fast_batch;
         if (fast_batch) {
+            loop.study_http_terminal_scan = false;
             loop.backend.study_io_stats = true;
             // Force both sampled syscall paths while exercising real byte
             // transfer, slow-reader backpressure, FIN and cancellation.
@@ -1793,6 +1794,7 @@ TEST(websocket, iouring_splice_fast_scan_invalidates_on_http_terminal_owner) {
     if (!storage.init()) return;
     auto& loop = *storage.loop;
     REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    loop.study_http_terminal_scan = false;
     loop.ws_splice.fast_batch = loop.ws_splice.fast_scan = true;
     int fds[2];
     REQUIRE_EQ(test::stream_socketpair(fds), 0);
@@ -1871,6 +1873,7 @@ TEST(http, iouring_empty_terminal_scan_invalidates_on_real_publisher) {
     if (!storage.init()) return;
     auto& loop = *storage.loop;
     loop.study_http_terminal_scan = true;
+    CHECK_FALSE(loop.report_http_terminal_scan);
     IoEvent event{};
     event.type = IoEventType::UpstreamRecv;
     event.conn_id = loop.connection_capacity;  // stale HTTP identity, not a WS auxiliary

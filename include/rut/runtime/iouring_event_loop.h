@@ -307,9 +307,10 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     // Read-only diagnostics for focused validation and post-run evidence.
     WsSpliceExperiment ws_splice;
     // Conservative negative cache: only the terminal-pending publisher can
-    // introduce an owner. Normal/mixed batches still scan unconditionally.
+    // introduce an owner. Empty terminal sets skip scans in normal/mixed batches too.
     bool response_read_terminal_scan_needed = true;
-    bool study_http_terminal_scan = false;
+    bool study_http_terminal_scan = true;
+    bool report_http_terminal_scan = false;
     u64 study_http_terminal_scans_skipped = 0;
     bool study_ws_poll_first = false;
     u64 study_ws_poll_first_arms = 0;
@@ -966,7 +967,7 @@ public:
             ::close(idle_trim_pidfd);
             idle_trim_pidfd = -1;
         }
-        if (study_http_terminal_scan)
+        if (report_http_terminal_scan)
             ::fprintf(stderr,
                       "RUT_HTTP_TERMINAL_SCAN skipped=%llu pending=%u\n",
                       static_cast<unsigned long long>(study_http_terminal_scans_skipped),
