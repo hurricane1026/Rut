@@ -490,30 +490,53 @@ static bool configure_study_policy(Loop* loop) {
             }
         }
         if constexpr (requires { loop->study_http_async_splice; }) {
+            loop->enable_async_response_splice_defaults();
+            bool explicitly_disabled = false;
             for (const char* const* item = environ; *item != nullptr; ++item) {
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE=on"))
                     loop->study_http_async_splice = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE=off"))
+                    explicitly_disabled = true;
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_NODELAY=on"))
                     loop->study_http_async_splice_nodelay = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_NODELAY=off"))
+                    loop->study_http_async_splice_nodelay = false;
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_CONTINUE=on"))
                     loop->study_http_async_splice_continue = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_CONTINUE=off"))
+                    loop->study_http_async_splice_continue = false;
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_LINK=on")) {
                     loop->study_http_async_splice = true;
                     loop->study_http_async_splice_link = true;
+                } else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_LINK=off")) {
+                    loop->study_http_async_splice_link = false;
                 }
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_MORE=on"))
                     loop->study_http_async_splice_more = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_MORE=off"))
+                    loop->study_http_async_splice_more = false;
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_QUEUE_BUDGET=on"))
                     loop->study_http_async_splice_queue_budget = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_QUEUE_BUDGET=off"))
+                    loop->study_http_async_splice_queue_budget = false;
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_ADAPTIVE_CHUNK=on"))
                     loop->study_http_async_splice_adaptive_chunk = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_ADAPTIVE_CHUNK=off"))
+                    loop->study_http_async_splice_adaptive_chunk = false;
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_HARDLINK=on"))
                     loop->study_http_async_splice_hardlink = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_HARDLINK=off"))
+                    loop->study_http_async_splice_hardlink = false;
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_SLICE_THRESHOLD=on"))
                     loop->study_http_async_splice_slice_threshold = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_SLICE_THRESHOLD=off"))
+                    loop->study_http_async_splice_slice_threshold = false;
                 if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_REPORT=on"))
                     loop->report_http_async_splice = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_REPORT=off"))
+                    loop->report_http_async_splice = false;
             }
+            if (explicitly_disabled) loop->study_http_async_splice = false;
         }
         if constexpr (requires { loop->study_http_terminal_scan; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)

@@ -320,6 +320,15 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     bool study_http_async_splice_hardlink = false;
     bool study_http_async_splice_slice_threshold = false;
     bool report_http_async_splice = false;
+    void enable_async_response_splice_defaults() {
+        study_http_async_splice = true;
+        study_http_async_splice_nodelay = true;
+        study_http_async_splice_link = true;
+        study_http_async_splice_queue_budget = true;
+        study_http_async_splice_adaptive_chunk = true;
+        study_http_async_splice_hardlink = true;
+        study_http_async_splice_slice_threshold = true;
+    }
     struct RelaySplicePair {
         u32 length = 0;
         i32 read_result = 0;
@@ -4355,6 +4364,10 @@ public:
     }
 
     [[nodiscard]] bool response_splice_eligible(const Connection& c) const {
+        // Neither admission policy relays less than one ordinary slice.
+        // Small complete responses need not touch the backend/configuration.
+        if (c.resp_body_remaining < SlicePool::kSliceSize) return false;
+        if (c.resp_body_remaining < response_splice_min_remaining()) return false;
         return c.fd >= 0 && c.upstream_fd >= 0 && !c.tls_active &&
                c.protocol == ConnProtocol::Http11 && c.response_policy_id == 0 &&
                c.resp_body_mode == BodyMode::ContentLength &&
@@ -4363,7 +4376,6 @@ public:
                c.req_body_mode == BodyMode::None && c.req_body_remaining == 0 &&
                !c.request_body_fully_buffered && !c.req_body_streamed &&
                c.request_upload_complete && c.throttle_down_bps == 0 && !c.is_ws_terminate_route &&
-               c.resp_body_remaining >= response_splice_min_remaining() &&
                c.upstream_recv_buf.len() == 0 && c.upstream_recv_armed == false &&
                c.upstream_recv_direct_armed == false && c.upstream_send_armed == false &&
                c.send_armed == false && c.upstream_relay_send_len == 0 && !c.relay_owner.active() &&
@@ -4381,6 +4393,8 @@ public:
     bool start_response_splice_after_header(Connection& c) { return start_response_splice(c); }
 
     bool arm_response_splice_after_prefix(Connection& c, u32 send_len) {
+        if (c.resp_body_remaining < SlicePool::kSliceSize) return false;
+        if (c.resp_body_remaining < response_splice_min_remaining()) return false;
         if (send_len == 0 || c.upstream_recv_buf.len() != send_len || c.fd < 0 ||
             c.upstream_fd < 0 || c.tls_active || c.protocol != ConnProtocol::Http11 ||
             c.response_policy_id != 0 || c.resp_body_mode != BodyMode::ContentLength ||
@@ -4388,8 +4402,7 @@ public:
             c.req_method != static_cast<u8>(LogHttpMethod::Get) ||
             c.req_body_mode != BodyMode::None || c.req_body_remaining != 0 ||
             c.request_body_fully_buffered || c.req_body_streamed || c.throttle_down_bps != 0 ||
-            !c.request_upload_complete || c.is_ws_terminate_route ||
-            c.resp_body_remaining < response_splice_min_remaining() || c.upstream_recv_armed ||
+            !c.request_upload_complete || c.is_ws_terminate_route || c.upstream_recv_armed ||
             c.upstream_recv_direct_armed || c.upstream_send_armed || c.send_armed ||
             c.upstream_relay_send_len != 0 || c.relay_owner.active() ||
             !c.response_read_deadline_owner_is_neutral())
@@ -4730,9 +4743,17 @@ public:
     }
 
     bool start_response_splice(Connection& c) {
+        // Keep the ordinary small-response path outside the larger pipe/SQE
+        // admission function, including its call-frame preparation.
+        if (c.resp_body_remaining < SlicePool::kSliceSize) return false;
+        return start_response_splice_body(c);
+    }
+
+    bool start_response_splice_body(Connection& c) {
         if (!response_splice_eligible(c)) return false;
         if (c.relay_owner.pipe_read < 0 || c.relay_owner.pipe_write < 0) {
-            if (study_http_async_splice_nodelay) {
+            if (study_http_async_splice && backend.splice_supported &&
+                study_http_async_splice_nodelay) {
                 const int enabled = 1;
                 (void)::setsockopt(c.fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
             }

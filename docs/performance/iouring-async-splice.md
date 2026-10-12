@@ -3,8 +3,12 @@
 This experiment submits plaintext HTTP/1.1 Content-Length body relay operations
 through `IORING_OP_SPLICE`. It keeps the existing eligibility rules, including
 the default 64 KiB remaining-body threshold, serialized header/prefix completion, and
-exclusion of TLS, throttled, transformed, and upload responses. All experiment
-switches are off by default. Slow-response reporting has its own explicit
+exclusion of TLS, throttled, transformed, and upload responses. Normal startup enables linked asynchronous relay, hard links, queue-capacity
+admission, adaptive segments, slice-derived admission and relay TCP_NODELAY.
+The loop constructor keeps experiment fields off so isolated fixtures can
+select their own path; main applies `enable_async_response_splice_defaults()`.
+Runtime probe failure retains synchronous relay and its old admission rule.
+Slow-response reporting has its own explicit
 `RUT_STUDY_HTTP_ASYNC_SPLICE_REPORT=on` switch and stays silent otherwise.
 
 ## Compatibility
@@ -74,9 +78,10 @@ three repetitions. This does not establish a robust throughput advantage.
 An eBPF diagnostic comparison counted 2.76 raw syscalls/request with hard links
 versus 3.81 with soft links, and zero canceled output operations versus 1.71
 per request. Instrumented runs are diagnostic evidence, not acceptance
-throughput measurements. Hard links remain opt-in pending further validation.
+throughput measurements. Hard links are included in the production configuration: their throughput
+advantage alone is small, but they reduce canceled operations and raw syscalls.
 
-The focused splice suite passes 66 tests, including real kernel completions,
+The focused splice suite passes 67 tests, including real kernel completions,
 empty-source EAGAIN, positive short reads, three-mode output backpressure,
 reverse completion dispatch, pipe capacity bounds, unsupported-opcode fallback,
 cancellation/descriptor retirement, and slice-threshold admission/fallback. Macro-disabled backend compilation also
@@ -116,3 +121,33 @@ planned arrivals were not issued by the end of warmup or measurement. Nginx
 delivered only about 30% of the planned small load. Zero transport errors do
 not make these incomplete runs pass; the next experiment compares the existing
 byte budget with queue-capacity admission before selecting defaults.
+
+The user accepts some latency increase for substantial throughput gains.
+The production configuration therefore retains the throughput-oriented policy
+instead of adopting the latency study policy, which did not show consistent
+benefit in its paired mixed-load diagnostic. Data integrity, cancellation and
+the two-second transport timeout remain required. The paced completeness
+failures above remain recorded and are not reported as passes.
+
+Every asynchronous splice environment switch accepts `on` and `off`.
+`RUT_STUDY_HTTP_ASYNC_SPLICE=off` overrides a simultaneous LINK=on independent
+of environment order, restoring the legacy relay path. CONTINUE and MORE stay
+off; diagnostic REPORT stays off. The production-configuration splice test
+checks exact medium and large body bytes through the same helper main uses.
+
+Normal-startup screens without study environment measured 53,381 requests/s
+for 64 KiB (26,156 original; 41,128 nginx) and 10,744 for 1 MiB
+(6,945 original; 4,570 nginx), all errors zero. These are single-repeat
+screens, distinct from the earlier longer opt-in comparisons. Normal 4 KiB
+showed a roughly 4.4% regression against the original in a three-repeat
+follow-up, while still beating nginx; small-response admission rejection is
+being evaluated separately and has not yet established a stable improvement.
+
+An eBPF diagnostic of normal 64 KiB startup counted 1.035 raw syscalls/request
+versus 1.074 for the original, about two splice SQEs/request and zero canceled
+output operations. A same-binary comparison with ASYNC_SPLICE=off and LINK=on
+confirmed zero splice opcode submissions on the explicitly disabled path,
+versus about two on the enabled path. Both had zero transport errors. Normal
+server logs contained no async slow-response or terminal-scan diagnostics.
+The final production-configuration source passes the independent seven-check
+runtime run, including 1,609 network tests and 67 splice tests.
