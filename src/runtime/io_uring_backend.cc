@@ -645,6 +645,28 @@ bool IoUringBackend::add_recv_once(i32 fd, u32 conn_id, u32 max_len, bool poll_f
     return true;
 }
 
+bool IoUringBackend::add_idle_upstream_probe(i32 fd,
+                                             u32 conn_id,
+                                             u32 upstream_episode,
+                                             u8* probe_byte) {
+    if (fd < 0 || conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode) ||
+        probe_byte == nullptr)
+        return false;
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_RECV;
+    sqe->fd = fd;
+    sqe->addr = reinterpret_cast<u64>(probe_byte);
+    sqe->len = 1;
+    sqe->msg_flags = MSG_PEEK | MSG_DONTWAIT;
+    sqe->user_data =
+        encode_upstream_user_data(conn_id, IoEventType::UpstreamConnect, upstream_episode);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+}
+
 bool IoUringBackend::add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode) {
     if (conn_id >= connection_capacity || !valid_upstream_episode(upstream_episode)) return false;
     io_uring_sqe* sqe = get_sqe_flushing();
