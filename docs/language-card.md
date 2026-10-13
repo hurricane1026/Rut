@@ -807,6 +807,8 @@ cases, string values, and duplicate `hint` arguments are rejected.
 
 The io_uring `.rps` path selects direct native response receive only for the
 existing admitted plaintext HTTP/1.1 GET response callbacks without a response
-policy. TLS and other paths retain their existing behavior. `.auto` and
-`.throughput` currently retain the default adaptive asynchronous splice policy;
-they are not claims of measured gains or a fixed payload-size contract.
+policy. `.throughput` also selects guarded direct response receive and limits
+only the initial eligible response receive to 1 KiB, leaving more body bytes for
+adaptive asynchronous splice. Later header fragments use the ordinary receive
+capacity. `.auto` keeps the default 8 KiB prefix. TLS and other paths retain their
+existing behavior. Hints do not guarantee gains or specify a payload size.

@@ -7744,6 +7744,9 @@ ForwardHint, while Yield results retain YieldKind in that byte. Runtime dispatch
 rejects unknown hint values. The connection owns the hint for the current
 request and resets it on reuse. Hints never relax protocol or I/O lifetime
 admission and have no required performance guarantee. io_uring `.rps` selects
-the existing guarded direct response receive path; `.throughput` and `.auto`
-initially retain default adaptive splice. Further differences require repeated
-workload benchmarks and syscall measurements.
+the existing guarded direct response receive path. `.throughput` combines this
+path with a 1 KiB initial eligible response prefix so more body bytes remain for
+adaptive asynchronous splice. Later header fragments use the ordinary capacity;
+`.auto` retains the default 8 KiB prefix. Admission, cancellation, and slice
+custody remain unchanged. Performance changes require repeated workload
+benchmarks and syscall measurements.

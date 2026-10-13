@@ -1,0 +1,25 @@
+{
+  "date": "2026-10-13",
+  "scope": "plaintext HTTP/1.1 native streaming GET keepalive; 128 connections; one frontend CPU 2, four reuseport origin workers CPUs 3,4,8,9, three client threads CPUs 5,6,7",
+  "measurement": "3 cyclic repeats; 15 seconds per engine for 64KiB; 10 seconds for larger response regressions; 2 second warmup",
+  "nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "limitations": "Local machine measurements. eBPF is separate one-repeat diagnostic, includes cleanup, not syscall reduction proof. 4KiB rps path unchanged. Larger regressions do not include nginx. No TLS or old-kernel claim. No ASan rerun.",
+  "binaries": {
+    "hint-throughput-prefix-v1": {
+      "path": "/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-nginx-next-20261011/hint-throughput-prefix-v1/hint-throughput/rut",
+      "sha256": "cb7a245d9b8319a55e08fd80183c2fd1aafd9c51c5c26658bea2c3ddc7fb1e28"
+    },
+    "hint-throughput-direct-prefix-v1": {
+      "path": "/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-nginx-next-20261011/hint-throughput-direct-prefix-v1/hint-throughput/rut",
+      "sha256": "6e93f5b3c1892d7f13d997a20c0b85fa736ed68889a8250d130b6c930248fb61"
+    },
+    "hint-throughput-direct-prefix2k-v1": {
+      "path": "/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-nginx-next-20261011/hint-throughput-direct-prefix2k-v1/hint-throughput/rut",
+      "sha256": "2de96c006df603a9a1b013c1c85ad7b8f09d48bc9a90751672cad50d2a4bb7c7"
+    },
+    "hint-throughput-direct-prefix1k-v1": {
+      "path": "/home/hurricane/private/code/rut-performance-checkpoints/epoll-et-nginx-next-20261011/hint-throughput-direct-prefix1k-v1/hint-throughput/rut",
+      "sha256": "2d33f93cc5f3814a79e18a5cfab4678f42606fb5394b8c003a52c74817173033"
+    }
+  }
+}

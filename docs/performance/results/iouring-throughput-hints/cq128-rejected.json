@@ -1,0 +1,342 @@
+{
+  "candidate": "CQ harvest cap 128 versus retained cap 256; response prefix unchanged at 1 KiB",
+  "decision": "rejected",
+  "reason": "64KiB independent confirmation shrank from 1.616% to 0.0616%, no consistent per-repeat advantage; default retained at 256",
+  "timer_semantics": "max_events is a harvest cap, not a completion target; blocking enter requests min_complete=1; timerfd drives periodic and earlier scheduled wakeups",
+  "experiments": [
+    {
+      "experiment": "uring-hint-cq128-4k-v1",
+      "mean_rps": {
+        "uring": 127057.4951606948,
+        "baseline-uring": 124710.98918157497
+      },
+      "gain_control_pct": 1.8815551015343157,
+      "rows": [
+        {
+          "engine": "uring",
+          "rep": 1,
+          "requests": 1265196,
+          "seconds": 10.019798,
+          "rps": 126269.61142330414,
+          "p99_us": 1039.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 1,
+          "requests": 1260029,
+          "seconds": 10.01691,
+          "rps": 125790.18879075484,
+          "p99_us": 1039.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 2,
+          "requests": 1251109,
+          "seconds": 10.019171,
+          "rps": 124871.5088304212,
+          "p99_us": 1057.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "uring",
+          "rep": 2,
+          "requests": 1280530,
+          "seconds": 10.025591,
+          "rps": 127726.1360452466,
+          "p99_us": 1078.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "uring",
+          "rep": 3,
+          "requests": 1273885,
+          "seconds": 10.016651,
+          "rps": 127176.73801353367,
+          "p99_us": 1087.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 3,
+          "requests": 1237909,
+          "seconds": 10.025887,
+          "rps": 123471.2699235489,
+          "p99_us": 1094.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        }
+      ]
+    },
+    {
+      "experiment": "uring-hint-cq128-64k-v1",
+      "mean_rps": {
+        "uring": 65730.4329221837,
+        "baseline-uring": 64685.01437479847
+      },
+      "gain_control_pct": 1.6161680684305901,
+      "rows": [
+        {
+          "engine": "uring",
+          "rep": 1,
+          "requests": 653529,
+          "seconds": 10.008268,
+          "rps": 65298.910860500546,
+          "p99_us": 2931.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 1,
+          "requests": 648144,
+          "seconds": 10.021405,
+          "rps": 64675.9611052542,
+          "p99_us": 2878.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 2,
+          "requests": 645557,
+          "seconds": 10.018717,
+          "rps": 64435.096829264665,
+          "p99_us": 2748.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "uring",
+          "rep": 2,
+          "requests": 656441,
+          "seconds": 10.023573,
+          "rps": 65489.721080496936,
+          "p99_us": 2810.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "uring",
+          "rep": 3,
+          "requests": 665335,
+          "seconds": 10.019703,
+          "rps": 66402.6668255536,
+          "p99_us": 2869.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 3,
+          "requests": 650329,
+          "seconds": 10.013691,
+          "rps": 64943.98518987654,
+          "p99_us": 2793.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        }
+      ]
+    },
+    {
+      "experiment": "uring-hint-cq128-64k-confirm-v1",
+      "mean_rps": {
+        "uring": 65319.117638212585,
+        "baseline-uring": 65278.9127784149
+      },
+      "gain_control_pct": 0.06158935265077048,
+      "rows": [
+        {
+          "engine": "uring",
+          "rep": 1,
+          "requests": 991902,
+          "seconds": 15.020524,
+          "rps": 66036.44453415873,
+          "p99_us": 2820.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 1,
+          "requests": 984487,
+          "seconds": 15.012642,
+          "rps": 65577.19820402031,
+          "p99_us": 2865.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 2,
+          "requests": 976667,
+          "seconds": 15.018384,
+          "rps": 65031.43081173048,
+          "p99_us": 2898.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "uring",
+          "rep": 2,
+          "requests": 976252,
+          "seconds": 15.013543,
+          "rps": 65024.75798017829,
+          "p99_us": 2785.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "uring",
+          "rep": 3,
+          "requests": 974324,
+          "seconds": 15.013587,
+          "rps": 64896.15040030074,
+          "p99_us": 2769.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        },
+        {
+          "engine": "baseline-uring",
+          "rep": 3,
+          "requests": 979820,
+          "seconds": 15.021438,
+          "rps": 65228.10931949392,
+          "p99_us": 2778.0,
+          "valid": true,
+          "errors": {
+            "connect": 0,
+            "read": 0,
+            "write": 0,
+            "status": 0,
+            "timeout": 0
+          }
+        }
+      ]
+    }
+  ],
+  "ebpf_diagnostic": [
+    {
+      "engine": "uring",
+      "requests": 612002,
+      "syscalls_per_request": 1.0404067306969584,
+      "enter_per_request": 0.03813059434446293,
+      "splice_submissions_per_request": 2.000359475949425
+    },
+    {
+      "engine": "baseline-uring",
+      "requests": 608785,
+      "syscalls_per_request": 1.0411639577190634,
+      "enter_per_request": 0.03886101004459702,
+      "splice_submissions_per_request": 2.000390942615209
+    }
+  ]
+}
