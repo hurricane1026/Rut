@@ -234,3 +234,13 @@ not establish a throughput benefit. Both the integration and unused submission
 primitive were removed; the external checkpoint retains the complete patch,
 binary pair, test evidence and traces. Dirty-candidate integration and broader
 network validation were not completed before rejecting this candidate.
+
+The ordinary small-request synchronous-send experiment was also rejected.
+Its same-binary 4 KiB short screen averaged +1.57%, but three cyclic 30-second
+comparisons against the retained source averaged 111,784 versus 113,913
+requests/s (-1.87%); pinned nginx averaged 80,590. All errors were zero. eBPF
+confirmed one fewer Send SQE/request, but total syscalls/request increased from
+1.1148 to 2.0249 because of the added direct send. The 69-test focused suite
+covered exact continuation of a written prefix and deferred full-send closure.
+The candidate was removed; the checkpoint retains its patch, binaries and
+measurements. The short screen does not establish a retained throughput gain.
