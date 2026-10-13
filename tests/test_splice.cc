@@ -2030,6 +2030,33 @@ TEST(iouring_async_splice, linked_short_read_and_eagain_complete_exact_body) {
     }
 }
 
+TEST(iouring_async_splice, production_configuration_transfers_medium_and_large_bodies) {
+    for (const u32 size : {2 * SlicePool::kSliceSize, 128u * 1024u}) {
+        ScopedIoUringLoop guard;
+        if (!guard.init()) SKIP("io_uring unavailable");
+        auto& loop = *guard.loop;
+        if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+        loop.enable_async_response_splice_defaults();
+        static u8 expected[128 * 1024];
+        static u8 received[128 * 1024];
+        fill_pattern(expected, size);
+        i32 upstream[2], downstream[2];
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        REQUIRE(async_splice_tcp_pair(downstream));
+        REQUIRE(send_all(upstream[1], expected, size));
+        Connection* c = make_eligible(loop, upstream[0], downstream[0], size);
+        REQUIRE(c != nullptr);
+        REQUIRE(loop.test_start_response_splice(*c));
+        REQUIRE_EQ(c->pending_ops, 2u);
+        REQUIRE(pump_until(loop, [&] { return !c->relay_owner.active(); }, 64));
+        REQUIRE(read_exact(downstream[1], received, size));
+        CHECK_EQ(__builtin_memcmp(expected, received, size), 0);
+        CHECK_EQ(loop.relay_written_bytes, size);
+        close(upstream[1]);
+        close(downstream[1]);
+    }
+}
+
 TEST(iouring_async_splice, slice_threshold_admits_medium_body_and_preserves_fallback) {
     ScopedIoUringLoop guard;
     if (!guard.init()) SKIP("io_uring unavailable");
