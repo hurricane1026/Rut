@@ -221,3 +221,16 @@ An external raw-syscall TCP experiment confirms one-shot io_uring
 same retained byte, and EOF after consuming that byte and receiving FIN. This
 is API evidence for a possible batched idle-socket authentication experiment;
 it does not validate Rut integration, cancellation ownership or performance.
+
+The subsequent opt-in idle-probe integration was rejected. It used the existing
+connect completion/cancellation identity and deferred request send until an
+EAGAIN probe CQE. Its focused suite passed 69 tests and 100,335 checks, including
+healthy-probe-before-send and close-after-probe coverage. Three cyclic 10-second
+4 KiB same-binary on/off comparisons averaged 109,387 versus 112,411 requests/s
+(-2.69%), all errors zero. The eBPF diagnostic confirmed synchronous recv calls
+fell from about one/request to zero, but enter/request rose from 0.0646 to
+0.2748; total raw syscalls/request fell from 1.0653 to 0.2755. Fewer syscalls did
+not establish a throughput benefit. Both the integration and unused submission
+primitive were removed; the external checkpoint retains the complete patch,
+binary pair, test evidence and traces. Dirty-candidate integration and broader
+network validation were not completed before rejecting this candidate.
