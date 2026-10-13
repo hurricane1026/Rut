@@ -467,3 +467,7 @@ The linked-pair IOSQE_ASYNC option was rejected. Its three 15-second 1 MiB repea
 ### Diagnostic timing bypass
 
 Skipping only diagnostic CQ/flush phase and relay queue/poll timestamps was rejected. Three 15-second repeats on the shared-listener 4 KiB origin averaged 112696.89 versus 117664.45 RPS (−4.22%). Balanced-origin repeats averaged 124228.56/125659.20 at 4 KiB (−1.14%), and 11004.39/11000.77 at 1 MiB (+0.03%). All 27 rows were valid and zero-error. The independent balanced 1 MiB eBPF diagnostic measured 3.166448/4.159913 syscalls and 7.010297/9.138632 splice SQEs per request, with zero errors and empty tracer stderr. A single trace improvement did not demonstrate throughput gain; candidate code was restored and patch/binaries archived under skip-diagnostic-timing-v1. Required fairness and deadline clocks were never changed.
+
+### Existing relay ring toggle
+
+The existing RUT_STUDY_HTTP_RELAY_RING option remained disabled after a same-binary balanced-origin 1 MiB check: three 15-second repeats averaged 10999.66 versus 11097.31 RPS (−0.88%), with all nine rows valid and error-free. Startup logs verified on/off configuration. Its independent eBPF diagnostic measured 3.800974/3.113965 syscalls and 8.136264/6.884445 splice SQEs per request, both zero-error with empty tracer stderr. No production code was changed for this experiment.
