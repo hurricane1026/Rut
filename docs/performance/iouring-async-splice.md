@@ -397,3 +397,45 @@ these single traces did not predict a stable throughput gain.
 The registered-file prototype was removed. Its corrected source patch, failed
 close-test evidence, frozen binaries, all results and traces remain in external
 fixed-splice-out-v1/v2 checkpoint artifacts.
+
+### Origin distribution and final direct-receive matrix
+
+The existing upstream TCP_NODELAY flag, with direct native receive enabled on
+both sides, gave +6.09% in a 4 KiB 3 x 15 s screen but only +1.20% in cyclic
+3 x 30 s (+42.38% against nginx); all errors were zero. No NODELAY default
+was changed. Per-core counters showed skewed origin load under the shared
+listener with multi_accept on. The existing --origin-reuseport on option
+distributed origin load more evenly in a separate diagnostic; it is an origin
+configuration change, not a Rut code optimization.
+
+A fresh four-size cyclic 3 x 30 s matrix used the same frozen 850c1265 binary
+with direct receive on/off, four pinned origin workers on CPUs 3,4,8,9 with
+reuseport, one frontend worker on CPU 2 and three client threads on CPUs 5,6,7.
+The wrk timeout stayed 2 s; all original validity gates remained enabled.
+Live io-wq affinity observations also showed CPU 2. All 36 rows were valid
+with zero measurement/warmup errors.
+
+| Body | Rut direct RPS | Control RPS | nginx RPS | vs nginx | vs control | Rut / nginx p99 mean (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 125899.47 | 120297.81 | 70804.91 | +77.81% | +4.66% | 1.033 / 1.899 |
+| 64 KiB | 59734.14 | 56816.58 | 36269.79 | +64.69% | +5.14% | 2.559 / 3.737 |
+| 256 KiB | 29848.06 | 28842.00 | 15021.38 | +98.70% | +3.49% | 5.418 / 9.376 |
+| 1 MiB | 10901.91 | 10567.29 | 4634.67 | +135.22% | +3.17% | 14.777 / 30.183 |
+
+These results meet the per-size +50% target in the balanced-origin configuration.
+They do not establish that target for the original shared-listener origin:
+its 4 KiB result remains about +42%. The original-origin and balanced-origin
+results are preserved separately and must not be combined as one code gain.
+Direct receive remains opt-in via RUT_STUDY_HTTP_DIRECT_NATIVE_RECV=on; the
+async splice defaults and kernel/header capability fallback remain unchanged.
+
+Final Release validation passed 7/7 (network, splice, drain, fault injection,
+shard control, idle trim, runtime state model), ASan+UBSan passed 2/2 (splice
+and fault injection), and the affected-file clang-format check passed. Runtime
+source remains equivalent to 850c1265. Separate four-size eBPF diagnostics were
+valid with zero errors. Syscalls/request (direct / control) were 1.032558 /
+1.032794, 1.038961 / 1.038985, 1.078594 / 1.077243 and 3.698562 / 3.092159.
+The 1 MiB single trace increased about 19.6%, mainly io_uring_enter; the study
+does not claim universal syscall reduction. CSV, exact commands, source/binary
+provenance and validation logs are in the external origin-balanced-matrix-v1
+and origin-balanced-final-validation checkpoint artifacts.
