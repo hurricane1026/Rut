@@ -308,3 +308,14 @@ were 1.060854 / 1.086435, 1.052332 / 1.039113, 1.081786 / 1.077513, and
 syscall reduction or identify the cause of bulk throughput variation. Frozen
 binaries, final patch, wire results, full matrix and trace summaries remain in
 the external `adaptive-native-v1` checkpoint artifacts.
+
+### Raw idle probe follow-up (rejected)
+
+A Linux-only opt-in replaced libc recv with the existing syscall interface for
+the same one-byte MSG_PEEK | MSG_DONTWAIT idle borrow check. Both modes passed
+healthy, unexpected-data, EOF and EBADF checks. Same-binary cyclic 3 x 15 s
+4 KiB throughput was 112,907.49 versus 116,439.50 requests/s (-3.03%);
+p99 means were 1,496.33 versus 1,424.33 us, with zero measurement/warmup errors.
+Separate eBPF confirmed approximately one recvfrom syscall per request in both
+modes. The experiment was removed; its patch, binaries, validation source,
+benchmark and trace evidence remain in the external raw-idle-probe-v1 artifacts.
