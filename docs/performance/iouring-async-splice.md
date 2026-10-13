@@ -244,3 +244,34 @@ confirmed one fewer Send SQE/request, but total syscalls/request increased from
 covered exact continuation of a written prefix and deferred full-send closure.
 The candidate was removed; the checkpoint retains its patch, binaries and
 measurements. The short screen does not establish a retained throughput gain.
+
+### Ordinary native direct receive
+
+`RUT_STUDY_HTTP_DIRECT_NATIVE_RECV=on` makes eligible ordinary plaintext native
+GET one-shot receives target their existing connection-owned slice directly.
+It preserves receive-length limits, including the 8 KiB first-response limit,
+and uses the existing direct-receive pinning and cancellation ownership. TLS,
+WebSocket and transformed responses retain their previous selection. The
+ordinary provided-buffer-ring-to-slice copy and buffer return are avoided.
+This remains opt-in while larger-size comparisons are outstanding.
+
+Three cyclic 30-second comparisons against retained source and pinned nginx:
+
+| Body size | Candidate requests/s | Retained requests/s | nginx requests/s | Candidate over retained | Candidate over nginx |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 KiB | 114,682 | 105,588 | 80,985 | +8.6% | +41.6% |
+| 64 KiB | 61,886 | 59,358 | 41,992 | +4.3% | +47.4% |
+
+All measurements and warmups are valid with zero errors. These sizes still
+do not meet the requested +50% over nginx. An eBPF on/off diagnostic confirms
+about one direct upstream completion/request instead of a selected-buffer
+completion, with unchanged recv SQE counts. Raw syscalls/request were 1.0621
+versus 1.1199 at 4 KiB and 1.0358 versus 1.0368 at 64 KiB; these single traces
+do not establish a repeatable batching/syscall reduction.
+
+The independent seven runtime CTest checks pass. The focused splice suite now
+passes 69 tests and 100,303 checks, including ordinary-slice append integrity
+and close/cancel pinning before slot reuse. ASan+UBSan splice and fault-injection
+checks pass with leak detection; the full network suite was not run under
+sanitizers. Real-service validation preserves fragmented 9–12 KiB headers and
+exact 4 KiB, 64 KiB and 1 MiB bodies over one downstream keep-alive connection.

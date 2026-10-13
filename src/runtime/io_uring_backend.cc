@@ -2162,7 +2162,7 @@ u32 IoUringBackend::wait(
             // Mirrors the #4 provided-buffer branch's staleness/deadline
             // accounting exactly (same fields, same formulas) minus the copy:
             // the bytes are already resident, and a direct recv's SQE length
-            // is always write_avail() at arm time, so a non-stale positive
+            // is at most write_avail() at arm time, so a non-stale positive
             // completion is always a full, exact commit — no partial-copy or
             // buffered-overflow case is possible.
             const bool deadline_active =
