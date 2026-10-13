@@ -275,3 +275,14 @@ and close/cancel pinning before slot reuse. ASan+UBSan splice and fault-injectio
 checks pass with leak detection; the full network suite was not run under
 sanitizers. Real-service validation preserves fragmented 9–12 KiB headers and
 exact 4 KiB, 64 KiB and 1 MiB bodies over one downstream keep-alive connection.
+
+Larger-size follow-up comparisons do not justify a global default change:
+three cyclic 30-second repetitions averaged 30,722 versus 32,072 requests/s
+at 256 KiB (-4.21%), and 10,453 versus 10,584 at 1 MiB (-1.23%). Both remain
+over twice pinned nginx (+110.9% and +125.1%), with all measurements valid and
+errors zero, but small-response improvements do not erase the larger-size
+regression evidence. The feature remains opt-in. An additional same-binary
+1 MiB eBPF diagnostic records exactly 8,192 bytes for every positive upstream
+receive in both modes: unselected completions when direct, selected-buffer
+completions otherwise. Different first-receive lengths do not explain the
+observed throughput difference; its cause is not yet established.
