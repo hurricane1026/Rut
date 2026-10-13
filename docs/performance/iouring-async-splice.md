@@ -331,3 +331,30 @@ versus 1,517.33 us. All measurement/warmup error counters were zero. Separate
 eBPF diagnostics completed without transport errors. The experiment was removed;
 its patch, frozen binaries and evidence remain in external send-poll-first-v1
 checkpoint artifacts.
+
+### Native response prefetch follow-up (archived prototype)
+
+An opt-in ordinary bodyless plaintext GET path queued the first bounded response
+recv with the request send. Positive early bytes waited for the normal upload
+completion callback. The initial 4 KiB 3 x 15 s screen was +4.99%, but the
+cyclic 3 x 30 s four-size comparison was -2.57%, -2.41%, +4.88%, +0.59%
+against disabled prefetch (4 KiB, 64 KiB, 256 KiB, 1 MiB respectively). All 36
+rows and warmups had zero errors. Only 256 KiB showed a clear throughput gain.
+
+Full network/splice CTest passed 2/2 on v1. A newly added early-EOF test then
+exposed premature close over a request-send owner; v2 preserved that owner so
+the ordinary post-send recv/retry path could observe EOF. Its 74 focused tests
+and 100,345 checks passed. A v3 combined prefetch with direct owned-slice recv;
+74 tests / 100,346 checks and exact fragmented 4 KiB, 64 KiB, 1 MiB responses
+passed, including both same-batch callback orders and close/cancel draining.
+The v3 same-binary 4 KiB 3 x 15 s screen, with direct receive enabled on both
+sides, was neutral (-0.07% throughput), with zero errors. Separate eBPF traces
+were preserved; single enter-rate samples are not stable performance proof.
+
+The prefetch prototype is archived rather than added to production source.
+The 256 KiB observation remains available for future experiments; it does not
+justify global activation given small-response regressions. Frozen v1/v2/v3
+binaries, source patches, the failing EOF regression and corrected test results
+remain in external prefetch-response-v1/v2 and prefetch-direct-v3 artifacts.
+Full network and sanitizer checks were not rerun on v3; this prototype is not
+claimed as a validated production feature.
