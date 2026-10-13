@@ -104,7 +104,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 "selector": {"key": "benchmark-role", "value": "worker"},
                 "configmaps": {"native": "pb-test-native", "linkerd": "pb-test-linkerd"},
                 "images": {"nginx": "nginx@sha256:abc", "envoy": "envoy@sha256:def", "client": "client:test"},
-                "cpus": {"proxy": 2, "origin": "3,4,8,9", "client": "5,7", "helpers": "6,14"},
+                # prepare.py stores origin CPUs in canonical range form.
+                "cpus": {"proxy": 2, "origin": "3-4,8-9", "client": "5,7", "helpers": "6,14"},
                 "paths": {"rut_rps": str(binaries), "rut_throughput": str(binaries),
                           "runtime_libs": str(root / "libs"), "clang": str(root / "clang"),
                           "ld": str(root / "ld"), "rut_config_dir": str(root / "config")},
@@ -115,6 +116,11 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(len(linkerd["spec"]["containers"]), 1)
             self.assertIn("linkerd.io/inject", linkerd["metadata"]["annotations"])
             self.assertNotIn("limits", linkerd["spec"]["containers"][0].get("resources", {}))
+            native_origin = prepare.nginx_origin(
+                8081, sorted(common.cpu_set(config["cpus"]["origin"])), "/data/proxy")
+            self.assertIn("worker_cpu_affinity", native_origin)
+            for cpu in (3, 4, 8, 9):
+                self.assertIn(prepare.mask(cpu), native_origin)
             rut = common.pod_spec(config, "rut-rps", "4k", "pb-test-rut")
             frontend = rut["spec"]["containers"][0]
             self.assertEqual(frontend["args"][-2:], ["--backend", "io_uring"])

@@ -124,7 +124,7 @@ def pod_spec(config: dict, engine: str, body: str, name: str) -> dict:
     node_root = Path(config["node_mount"])
     cpus = config["cpus"]
     proxy_cpu = int(cpus["proxy"])
-    origin_cpus = [int(cpu) for cpu in cpus["origin"].split(",")]
+    origin_cpus = sorted(cpu_set(cpus["origin"]))
     selector = config["selector"]
     if engine == "linkerd":
         return {
