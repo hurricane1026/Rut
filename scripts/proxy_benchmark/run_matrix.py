@@ -95,6 +95,20 @@ class Matrix:
         (outdir / f"linkerd-metrics-{phase}.txt").write_text(result.stdout)
         return result.stdout
 
+    def wait_frontend(self, pod_ip: str) -> None:
+        """Wait until the application socket accepts an HTTP request."""
+        deadline = time.monotonic() + 180
+        argv = [self.docker, "run", "--rm", "--network", f"container:{self.c['worker_container']}",
+                "--cpuset-cpus", self.c["cpus"]["client"], "--entrypoint", "curl",
+                self.c["images"]["client"], "--http1.1", "--fail", "--silent", "--show-error",
+                "--output", "/dev/null", f"http://{pod_ip}:8080/proxy"]
+        while time.monotonic() < deadline:
+            result = invoke(argv, check=False, timeout=10)
+            if result.returncode == 0:
+                return
+            time.sleep(1)
+        raise RuntimeError(f"frontend at {pod_ip}:8080 did not become ready")
+
     @staticmethod
     def inbound_requests(text: str, target: str) -> float:
         values = []
@@ -132,6 +146,8 @@ class Matrix:
             cg = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"/proc/{pid}/cgroup"]).stdout.strip().splitlines()[-1]
             cgroot = "/sys/fs/cgroup" + cg.split(":", 2)[2]
             procs = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"{cgroot}/cgroup.procs"]).stdout.split()
+            for process in procs:
+                invoke([self.docker, "exec", self.c["worker_container"], "taskset", "-apc", cpus, process])
             cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"{cgroot}/cpu.max"]).stdout.strip()
             if cpu_max != "max 100000":
                 raise RuntimeError(f"{name} has unexpected CPU quota {cpu_max}")
@@ -263,6 +279,7 @@ class Matrix:
         (outdir / "response.sha256").write_text(self.file_sha(response) + "\n")
 
     def run_cell(self, body: str, engine: str, rep: int) -> Path:
+        verify_artifacts(self.c)
         label = f"{body}-{engine}-r{rep}"
         pod_name = f"proxybench-{self.c['run_id']}-{body}-{rep}-{engine}"
         outdir = self.samples / body / label
@@ -279,6 +296,7 @@ class Matrix:
         pod = json.loads(fetched.stdout)
         pod_ip = pod["status"]["podIP"]
         (outdir / "pod-ip.txt").write_text(pod_ip + "\n")
+        self.wait_frontend(pod_ip)
         resource_pids = self.inspect_runtime(engine, outdir)
         resource_records = [self.capture_resources(outdir, "idle", resource_pids)]
 
@@ -344,7 +362,8 @@ class Matrix:
                     next_state_check = now + 0.5
                 if kind == "measurement" and measure_start is not None:
                     elapsed = now - measure_start
-                    if client_running and elapsed < measurement_duration and elapsed >= next_snapshot:
+                    if (client_running and elapsed < measurement_duration and elapsed >= next_snapshot and
+                            len([r for r in resource_records if r["phase"].startswith("under-load")]) < 3):
                         sample_no = len([r for r in resource_records if r["phase"].startswith("under-load")]) + 1
                         snapshot_start = time.monotonic()
                         running_before = self.client_is_running(target)
@@ -399,15 +418,28 @@ class Matrix:
         return outdir
 
 
-def plan() -> list[dict]:
+def plan(repeats: int = 3) -> list[dict]:
     schedules = {
         "4k": [["linkerd", "rut-rps", "nginx", "envoy"], ["envoy", "nginx", "rut-rps", "linkerd"], ["nginx", "linkerd", "envoy", "rut-rps"]],
         "64k": [["linkerd", "rut-throughput", "nginx", "envoy"], ["envoy", "nginx", "rut-throughput", "linkerd"], ["nginx", "linkerd", "envoy", "rut-throughput"]],
         "256k": [["linkerd", "rut-throughput", "nginx", "envoy"], ["envoy", "nginx", "rut-throughput", "linkerd"], ["nginx", "linkerd", "envoy", "rut-throughput"]],
         "1m": [["linkerd", "rut-throughput", "nginx", "envoy"], ["envoy", "nginx", "rut-throughput", "linkerd"], ["nginx", "linkerd", "envoy", "rut-throughput"]],
     }
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
     return [{"body": body, "engine": engine, "rep": rep}
-            for body, rounds in schedules.items() for rep, engines in enumerate(rounds, 1) for engine in engines]
+            for body, rounds in schedules.items() for rep in range(1, repeats + 1)
+            for engine in rounds[(rep - 1) % len(rounds)]]
+
+
+def verify_artifacts(config: dict) -> None:
+    for name, artifact in config["artifacts"].items():
+        path = Path(artifact["path"])
+        if not path.is_file():
+            raise RuntimeError(f"recorded artifact is missing: {name}: {path}")
+        actual = Matrix.file_sha(path)
+        if actual != artifact["sha256"]:
+            raise RuntimeError(f"recorded artifact hash mismatch for {name}: expected {artifact['sha256']}, got {actual}")
 
 
 def main() -> int:
@@ -418,10 +450,11 @@ def main() -> int:
     config = load_config(args.config)
     if not config.get("verified_cluster_checks") or not config.get("configmaps_applied"):
         parser.error("run prepare.py --verify-cluster --apply-configmaps before measurement")
+    verify_artifacts(config)
     matrix = Matrix(config)
     matrix.samples.mkdir(parents=True, exist_ok=True)
     plan_path = matrix.samples / "schedule.json"
-    work = plan()
+    work = plan(int(config["repeats"]))
     if plan_path.exists() and json.loads(plan_path.read_text()) != work:
         raise RuntimeError("existing run schedule does not match the selected benchmark")
     write_json(plan_path, work)
@@ -455,7 +488,7 @@ def main() -> int:
         keys.add(key); completed += 1
         write_json(index_path, index)
         print(f"DONE {i}/{len(work)} {result}", flush=True)
-    write_json(matrix.samples / "completed.json", {"count": len(index), "complete": len(index) == 48})
+    write_json(matrix.samples / "completed.json", {"count": len(index), "complete": len(index) == len(work)})
     return 0
 
 

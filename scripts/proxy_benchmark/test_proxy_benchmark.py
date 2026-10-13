@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import common
 import prepare
@@ -96,6 +97,57 @@ class ProxyBenchmarkTests(unittest.TestCase):
                          {"linkerd", "rut-rps", "nginx", "envoy"})
         self.assertEqual({x["engine"] for x in cells if x["body"] == "1m"},
                          {"linkerd", "rut-throughput", "nginx", "envoy"})
+
+    def test_matrix_repeat_count_controls_cells_and_reuses_balanced_interleave(self):
+        once = run_matrix.plan(1)
+        four = run_matrix.plan(4)
+        self.assertEqual(len(once), 16)
+        self.assertEqual(len(four), 64)
+        self.assertEqual({cell["rep"] for cell in four}, {1, 2, 3, 4})
+        self.assertEqual([cell["engine"] for cell in four[:4]], ["linkerd", "rut-rps", "nginx", "envoy"])
+        with self.assertRaises(ValueError):
+            run_matrix.plan(0)
+
+    def test_run_id_matches_kubernetes_name_and_label_rules(self):
+        for accepted in ("a", "run-123", "proxy-bench-9"):
+            self.assertTrue(prepare.valid_run_id(accepted))
+        for rejected in ("ABC", "测试", "-start", "end-", "two--ok?", "a" * 21):
+            self.assertFalse(prepare.valid_run_id(rejected))
+
+    def test_prepare_defines_default_tool_commands_in_benchmark_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            for name in ("rps", "throughput", "runtime-libs", "runtime-tools"):
+                (checkpoint / name).mkdir()
+            for directory in ("rps", "throughput"):
+                for filename in ("rut", "rut-compile"):
+                    (checkpoint / directory / filename).write_bytes(filename.encode())
+            for filename in ("clang", "ld"):
+                (checkpoint / "runtime-tools" / filename).write_bytes(filename.encode())
+            output = root / "output"
+            argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                    "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
+                    "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                    "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
+                    "--runtime-libs", str(checkpoint / "runtime-libs"),
+                    "--clang", str(checkpoint / "runtime-tools" / "clang"), "--ld", str(checkpoint / "runtime-tools" / "ld"),
+                    "--client-image", "client:test"]
+            with mock.patch("sys.argv", argv):
+                self.assertEqual(prepare.main(), 0)
+            config = json.loads((output / "benchmark.json").read_text())
+            self.assertEqual(config["tools"], {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"})
+
+    def test_run_rechecks_every_recorded_artifact_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rut"
+            path.write_bytes(b"original")
+            config = {"artifacts": {"rut": {"path": str(path), "sha256": common.sha256(path)}}}
+            run_matrix.verify_artifacts(config)
+            path.write_bytes(b"changed")
+            with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                run_matrix.verify_artifacts(config)
 
     def test_resource_snapshot_requires_complete_unique_rows_and_successful_command(self):
         output = "101 120 80\n102 320 240\n"

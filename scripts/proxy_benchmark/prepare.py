@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,10 @@ def cpus(value: str, count: int, name: str) -> list[int]:
 
 def mask(cpu: int) -> str:
     return f"{1 << cpu:064b}"
+
+
+def valid_run_id(value: str) -> bool:
+    return len(value) <= 20 and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", value) is not None
 
 
 def native_body(size: int) -> bytes:
@@ -166,6 +171,9 @@ def main() -> int:
     p.add_argument("--nginx-image", default=IMAGES["nginx"])
     p.add_argument("--envoy-image", default=IMAGES["envoy"])
     p.add_argument("--client-image", required=True, help="locally built, explicitly selected client image")
+    p.add_argument("--docker-bin", default="docker")
+    p.add_argument("--kubectl-bin", default="kubectl")
+    p.add_argument("--linkerd-bin", default="linkerd")
     p.add_argument("--duration", default="10s")
     p.add_argument("--warmup", default="2s")
     p.add_argument("--concurrency", type=int, default=128)
@@ -182,8 +190,10 @@ def main() -> int:
         p.error("--output must be new or empty")
     output.mkdir(parents=True, exist_ok=True)
     run_id = a.run_id or uuid.uuid4().hex[:10]
-    if not run_id.replace("-", "").isalnum() or len(run_id) > 20:
-        p.error("--run-id must be 1..20 ASCII letters, digits, or hyphens")
+    if not valid_run_id(run_id):
+        p.error("--run-id must be 1..20 lowercase DNS-compatible letters, digits, or interior hyphens")
+    if a.repeats < 1:
+        p.error("--repeats must be positive")
     if a.worker_node != f"{a.cluster_name}-worker":
         p.error("--worker-node must be <cluster-name>-worker")
     if a.worker_container != a.worker_node:
