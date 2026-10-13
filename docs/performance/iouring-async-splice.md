@@ -187,3 +187,13 @@ Independent Release network and splice CTest targets pass. A real socket
 validation sends 9–12 KiB headers in 3,000-byte fragments and verifies exact
 4 KiB, 64 KiB and 1 MiB bodies on one persistent downstream connection. These
 follow-up changes have not yet been checked under sanitizers or GitHub CI.
+
+A two-repeat, order-rotated eBPF check of the same 8 KiB-prefix binary at 4 KiB
+does not reproduce an enabled-splice enter regression. Enabled enter/request
+was 0.0382 and 0.1173, versus 0.0534 and 0.2677 when explicitly disabled. The
+disabled path itself changed from 56.1 to 11.2 submitted SQEs/enter between
+repetitions; enabled batches averaged 78.5 and 25.6. Neither mode submitted a
+splice operation, and all transport errors were zero. The earlier single-trace
+enter difference therefore cannot establish configuration as its cause. These
+instrumented runs identify batching variability for further investigation,
+not a new throughput acceptance result.
