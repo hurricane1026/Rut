@@ -1,0 +1,217 @@
+{
+  "diagnostic_only": true,
+  "complete": true,
+  "cells": [
+    {
+      "size": 4096,
+      "engine": "uring",
+      "requests": 1126918,
+      "valid": true,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "trace_stderr": "",
+      "syscalls_per_request": 1.032557825857782,
+      "enter_per_request": 0.03186922207294586,
+      "native_recv_per_request": {
+        "0": 1.0001091472494006
+      },
+      "opcode_per_request": {
+        "14": 8.87376011386809e-07,
+        "22": 8.87376011386809e-06,
+        "27": 1.0002218440028467,
+        "26": 2.000218294498801
+      }
+    },
+    {
+      "size": 4096,
+      "engine": "baseline-uring",
+      "requests": 1099920,
+      "valid": true,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "trace_stderr": "",
+      "syscalls_per_request": 1.0327942032147792,
+      "enter_per_request": 0.032089606516837586,
+      "native_recv_per_request": {
+        "1": 1.0001118263146411
+      },
+      "opcode_per_request": {
+        "14": 9.091570296021529e-07,
+        "22": 9.09157029602153e-06,
+        "27": 1.0002272892574005,
+        "26": 2.0002236526292823
+      }
+    },
+    {
+      "size": 65536,
+      "engine": "uring",
+      "requests": 561559,
+      "valid": true,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "trace_stderr": "",
+      "syscalls_per_request": 1.038961177721308,
+      "enter_per_request": 0.03645565292337938,
+      "native_recv_per_request": {
+        "0": 1.0002208138414663
+      },
+      "opcode_per_request": {
+        "22": 1.9588324646208146e-05,
+        "14": 6.944951465473797e-05,
+        "27": 1.0004469699532907,
+        "30": 2.0004416276829327,
+        "26": 2.0004416276829327
+      }
+    },
+    {
+      "size": 65536,
+      "engine": "baseline-uring",
+      "requests": 524506,
+      "valid": true,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "trace_stderr": "",
+      "syscalls_per_request": 1.0389852546968004,
+      "enter_per_request": 0.036302730569335716,
+      "native_recv_per_request": {
+        "1": 1.0002364129294994
+      },
+      "opcode_per_request": {
+        "14": 1.9065558830594884e-06,
+        "6": 3.813111766118977e-06,
+        "22": 1.9065558830594885e-05,
+        "27": 1.0004785455266478,
+        "26": 2.0004728258589988,
+        "30": 2.0004880783060632
+      }
+    },
+    {
+      "size": 262144,
+      "engine": "uring",
+      "requests": 274233,
+      "valid": true,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "trace_stderr": "",
+      "syscalls_per_request": 1.078593750569771,
+      "enter_per_request": 0.07349589582581235,
+      "native_recv_per_request": {
+        "0": 1.0004229979615875
+      },
+      "opcode_per_request": {
+        "14": 3.646534151615597e-06,
+        "22": 3.646534151615597e-05,
+        "27": 1.0008861077988427,
+        "26": 2.000845995923175,
+        "30": 2.000853288991478
+      }
+    },
+    {
+      "size": 262144,
+      "engine": "baseline-uring",
+      "requests": 273657,
+      "valid": true,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "trace_stderr": "",
+      "syscalls_per_request": 1.077242679704886,
+      "enter_per_request": 0.07216332854631893,
+      "native_recv_per_request": {
+        "1": 1.0003910004129257
+      },
+      "opcode_per_request": {
+        "6": 2.1925256799570264e-05,
+        "14": 2.557946626616531e-05,
+        "22": 3.654209466595044e-05,
+        "27": 1.0008550850151832,
+        "26": 2.0007820008258514,
+        "30": 2.0010231786506467
+      }
+    },
+    {
+      "size": 1048576,
+      "engine": "uring",
+      "requests": 105607,
+      "valid": true,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "trace_stderr": "",
+      "syscalls_per_request": 3.698561648375581,
+      "enter_per_request": 2.685721590424877,
+      "native_recv_per_request": {
+        "0": 1.0006912420578182
+      },
+      "opcode_per_request": {
+        "14": 9.46906928517996e-06,
+        "16": 5.681441571107976e-05,
+        "22": 9.469069285179959e-05,
+        "6": 0.03861486454496388,
+        "27": 1.001893813857036,
+        "26": 2.0013824841156365,
+        "30": 8.27259556658176
+      }
+    },
+    {
+      "size": 1048576,
+      "engine": "baseline-uring",
+      "requests": 105861,
+      "valid": true,
+      "errors": {
+        "connect": 0,
+        "read": 0,
+        "write": 0,
+        "status": 0,
+        "timeout": 0
+      },
+      "trace_stderr": "",
+      "syscalls_per_request": 3.092158585314705,
+      "enter_per_request": 2.079519369739564,
+      "native_recv_per_request": {
+        "1": 1.000519549220204
+      },
+      "opcode_per_request": {
+        "14": 9.446349458251859e-06,
+        "22": 9.446349458251858e-05,
+        "6": 0.029349807766788524,
+        "27": 1.0017192356014017,
+        "26": 2.001039098440408,
+        "30": 7.020810307856529
+      }
+    }
+  ]
+}

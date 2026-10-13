@@ -1,0 +1,13 @@
+Test project /home/hurricane/private/code/Rut-iouring-async-splice/build-async-sanitize
+    Start 27: test_splice
+1/2 Test #27: test_splice ......................   Passed    1.27 sec
+    Start 71: test_fault_injection
+2/2 Test #71: test_fault_injection .............   Passed    0.03 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Label Time Summary:
+network    =   1.27 sec*proc (1 test)
+unit       =   1.30 sec*proc (2 tests)
+
+Total Test time (real) =   1.30 sec

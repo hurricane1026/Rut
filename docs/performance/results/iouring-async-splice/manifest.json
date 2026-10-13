@@ -1,0 +1,28 @@
+{
+  "source_archive_branch": "benchmarks/iouring-splice-20261013",
+  "fetch_command": "git fetch origin benchmarks/iouring-splice-20261013",
+  "baseline_source": "3c2b4ecbbd70a8826c75fd8934ddccf44ea92c5a",
+  "baseline_published_equivalent": "807b3a84cd780e33d8ba2f3dd95d8c3efb963366",
+  "shared_listener_candidate": "70568fe868a4713744e5c830219d18f295e7bbb6",
+  "balanced_candidate": "850c12656e8afcaebeee84af39d97c87359fe85a",
+  "balanced_published_equivalent": "f18608ea09d95b383da939d5dfb765ccd2ceae8b",
+  "balanced_candidate_flag": "RUT_STUDY_HTTP_DIRECT_NATIVE_RECV=on",
+  "balanced_control_flag": "RUT_STUDY_HTTP_DIRECT_NATIVE_RECV=off",
+  "origin_workers": 4,
+  "origin_cpus": "3,4,8,9",
+  "frontend_workers": 1,
+  "frontend_cpu": "2",
+  "client_cpus": "5,6,7",
+  "client_threads": 3,
+  "connections": 128,
+  "seconds": 30,
+  "warmup_seconds": 2,
+  "repeats": 3,
+  "timeout_seconds": 2,
+  "origin_reuseport": {
+    "balanced": "on",
+    "shared-listener": "off"
+  },
+  "nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "row_export": "Measured and warmup validity/errors plus request counts, elapsed time, rates and percentiles; host-wide CPU telemetry omitted. This is an export of completed runs, not newly repeated measurements."
+}

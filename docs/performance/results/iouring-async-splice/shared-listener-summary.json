@@ -1,0 +1,74 @@
+{
+  "complete": true,
+  "all_targets_pass": false,
+  "cells": [
+    {
+      "size": 4096,
+      "complete": true,
+      "counts": {
+        "uring": 3,
+        "baseline-uring": 3,
+        "nginx": 3
+      },
+      "means": {
+        "uring": 108205.5991488838,
+        "baseline-uring": 110839.52724910181,
+        "nginx": 79838.05787300102
+      },
+      "all_valid": true,
+      "gain_nginx_pct": 35.531351878583074,
+      "target_pass": false
+    },
+    {
+      "size": 65536,
+      "complete": true,
+      "counts": {
+        "uring": 3,
+        "baseline-uring": 3,
+        "nginx": 3
+      },
+      "means": {
+        "uring": 56405.83376309528,
+        "baseline-uring": 25822.52853606996,
+        "nginx": 40451.302290504136
+      },
+      "all_valid": true,
+      "gain_nginx_pct": 39.441329621509965,
+      "target_pass": false
+    },
+    {
+      "size": 262144,
+      "complete": true,
+      "counts": {
+        "uring": 3,
+        "baseline-uring": 3,
+        "nginx": 3
+      },
+      "means": {
+        "uring": 31493.234484584806,
+        "baseline-uring": 22736.967898261064,
+        "nginx": 13786.377058098518
+      },
+      "all_valid": true,
+      "gain_nginx_pct": 128.43735052266516,
+      "target_pass": true
+    },
+    {
+      "size": 1048576,
+      "complete": true,
+      "counts": {
+        "uring": 3,
+        "baseline-uring": 3,
+        "nginx": 3
+      },
+      "means": {
+        "uring": 10482.726925336781,
+        "baseline-uring": 7012.59884005184,
+        "nginx": 4621.762629597659
+      },
+      "all_valid": true,
+      "gain_nginx_pct": 126.81231740906912,
+      "target_pass": true
+    }
+  ]
+}
