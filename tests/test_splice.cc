@@ -1902,54 +1902,6 @@ TEST(iouring_splice, eof_and_post_pull_poll_failure_fail_closed) {
     }
 }
 
-TEST(iouring_idle_probe, real_tcp_peek_retains_bytes_and_reports_empty_and_eof) {
-    struct TcpPair {
-        i32 fds[2] = {-1, -1};
-        ~TcpPair() {
-            for (i32 fd : fds)
-                if (fd >= 0) close(fd);
-        }
-    } pair;
-    ScopedIoUringLoop guard;
-    if (!guard.init()) SKIP("io_uring unavailable");
-    auto& loop = *guard.loop;
-    REQUIRE(async_splice_tcp_pair(pair.fds));
-    Connection* c = loop.alloc_conn();
-    REQUIRE(c != nullptr);
-    c->fd = dup(STDERR_FILENO);
-    REQUIRE_GE(c->fd, 0);
-    c->upstream_fd = dup(pair.fds[0]);
-    REQUIRE_GE(c->upstream_fd, 0);
-    c->upstream_episode = 1;
-    u8 byte = 0;
-    CHECK_FALSE(loop.backend.add_idle_upstream_probe(c->upstream_fd, c->id, 0, &byte));
-    CHECK_FALSE(loop.backend.add_idle_upstream_probe(c->upstream_fd, c->id, 1, nullptr));
-    const i32 expected[] = {-EAGAIN, 1, 1, 0};
-    for (u32 step = 0; step < 4; ++step) {
-        if (step == 1) REQUIRE_EQ(send(pair.fds[1], "x", 1, MSG_NOSIGNAL), 1);
-        if (step == 3) {
-            u8 consumed = 0;
-            REQUIRE_EQ(recv(pair.fds[0], &consumed, 1, MSG_DONTWAIT), 1);
-            CHECK_EQ(consumed, 'x');
-            REQUIRE_EQ(shutdown(pair.fds[1], SHUT_WR), 0);
-        }
-        if (step == 1 || step == 3) {
-            pollfd ready{pair.fds[0], POLLIN, 0};
-            REQUIRE_EQ(poll(&ready, 1, 2000), 1);
-        }
-        REQUIRE(loop.backend.add_idle_upstream_probe(c->upstream_fd, c->id, 1, &byte));
-        IoEvent event{};
-        REQUIRE_EQ(loop.backend.wait(&event, 1, loop.conns, loop.slots_initialized), 1u);
-        CHECK_EQ(event.type, IoEventType::UpstreamConnect);
-        CHECK_EQ(event.conn_id, c->id);
-        CHECK_EQ(event.upstream_episode, 1u);
-        CHECK_EQ(event.aux, 0u);
-        CHECK_EQ(event.result, expected[step]);
-        CHECK_FALSE(event.has_buf);
-        if (step == 1 || step == 2) CHECK_EQ(byte, 'x');
-    }
-}
-
 TEST(iouring_async_splice, finished_relay_retires_spent_prefix_send_state) {
     ScopedIoUringLoop guard;
     if (!guard.init()) SKIP("io_uring unavailable");

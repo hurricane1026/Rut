@@ -277,12 +277,6 @@ struct IoUringBackend {
     // identity, bounded size and cancellation ownership stay unchanged.
     bool add_recv_once(i32 fd, u32 conn_id, u32 max_len, bool poll_first = false);
 
-    // Authenticate an idle upstream before sending a request. The caller pins
-    // probe_byte until the terminal CQE (and cancellation) retires. Completion
-    // uses the ordinary UpstreamConnect token so its existing lifetime ledger
-    // can be reused; only EAGAIN is a healthy probe, not connect success yet.
-    bool add_idle_upstream_probe(i32 fd, u32 conn_id, u32 upstream_episode, u8* probe_byte);
-
     // Same as add_recv but encodes UpstreamRecv in user_data so dispatch
     // can distinguish upstream vs client recv CQEs.
     bool add_recv_upstream(i32 fd, u32 conn_id, u32 upstream_episode = 1);
