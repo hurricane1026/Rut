@@ -1,0 +1,102 @@
+{
+  "complete": true,
+  "all_targets_pass": true,
+  "cells": [
+    {
+      "size": 4096,
+      "complete": true,
+      "counts": {
+        "uring": 3,
+        "baseline-uring": 3,
+        "nginx": 3
+      },
+      "means": {
+        "uring": 125899.46514871626,
+        "baseline-uring": 120297.80843554798,
+        "nginx": 70804.90970590943
+      },
+      "all_valid": true,
+      "gain_nginx_pct": 77.81177275932404,
+      "target_pass": true,
+      "gain_baseline_pct": 4.656491074955449,
+      "p99_us_mean": {
+        "uring": 1033.0,
+        "baseline-uring": 1085.6666666666667,
+        "nginx": 1899.3333333333333
+      },
+      "errors_total": 0
+    },
+    {
+      "size": 65536,
+      "complete": true,
+      "counts": {
+        "uring": 3,
+        "baseline-uring": 3,
+        "nginx": 3
+      },
+      "means": {
+        "uring": 59734.14150896287,
+        "baseline-uring": 56816.577857762684,
+        "nginx": 36269.785326270525
+      },
+      "all_valid": true,
+      "gain_nginx_pct": 64.69394834189137,
+      "target_pass": true,
+      "gain_baseline_pct": 5.135056987247899,
+      "p99_us_mean": {
+        "uring": 2558.6666666666665,
+        "baseline-uring": 2676.3333333333335,
+        "nginx": 3737.3333333333335
+      },
+      "errors_total": 0
+    },
+    {
+      "size": 262144,
+      "complete": true,
+      "counts": {
+        "uring": 3,
+        "baseline-uring": 3,
+        "nginx": 3
+      },
+      "means": {
+        "uring": 29848.057624518464,
+        "baseline-uring": 28841.995141444935,
+        "nginx": 15021.381898871905
+      },
+      "all_valid": true,
+      "gain_nginx_pct": 98.70380651702912,
+      "target_pass": true,
+      "gain_baseline_pct": 3.488186160976947,
+      "p99_us_mean": {
+        "uring": 5418.0,
+        "baseline-uring": 5570.0,
+        "nginx": 9376.0
+      },
+      "errors_total": 0
+    },
+    {
+      "size": 1048576,
+      "complete": true,
+      "counts": {
+        "uring": 3,
+        "baseline-uring": 3,
+        "nginx": 3
+      },
+      "means": {
+        "uring": 10901.906546015041,
+        "baseline-uring": 10567.285820794623,
+        "nginx": 4634.6724834093775
+      },
+      "all_valid": true,
+      "gain_nginx_pct": 135.2249610957479,
+      "target_pass": true,
+      "gain_baseline_pct": 3.166572106547383,
+      "p99_us_mean": {
+        "uring": 14776.666666666666,
+        "baseline-uring": 16774.333333333332,
+        "nginx": 30183.333333333332
+      },
+      "errors_total": 0
+    }
+  ]
+}

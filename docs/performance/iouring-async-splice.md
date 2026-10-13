@@ -43,19 +43,23 @@ descriptor number after logical connection closure.
 
 ## Experiment switches
 
-- `RUT_STUDY_HTTP_ASYNC_SPLICE=on`: submit individual asynchronous operations.
+- `RUT_STUDY_HTTP_ASYNC_SPLICE=on`: enable asynchronous relay. Normal startup
+  already selects linked hard-linked pairs. To select individual submissions,
+  also set `RUT_STUDY_HTTP_ASYNC_SPLICE_LINK=off`.
 - `RUT_STUDY_HTTP_ASYNC_SPLICE_LINK=on`: enable asynchronous relay and paired SQEs.
 - `RUT_STUDY_HTTP_ASYNC_SPLICE_HARDLINK=on`: use hard links for those pairs.
 - `RUT_STUDY_HTTP_ASYNC_SPLICE_QUEUE_BUDGET=on`: derive call admission from SQ
-  capacity, retaining the FIFO time guard and older-owner admission rule.
+  capacity in linked mode, retaining the FIFO time guard and older-owner
+  admission rule. It has no effect with `ASYNC_SPLICE_LINK=off`.
 - `RUT_STUDY_HTTP_ASYNC_SPLICE_ADAPTIVE_CHUNK=on`: bound the segment by remaining
-  body bytes, actual pipe capacity, and half the existing relay byte budget
+  body bytes and half the existing relay byte budget; linked mode additionally
+  bounds it by actual pipe capacity
   (the budget accounts for both input and output). No machine-specific batch
   size is selected.
 - `RUT_STUDY_HTTP_ASYNC_SPLICE_SLICE_THRESHOLD=on`: experimentally admit a
   remaining body of at least one ordinary receive slice (16 KiB), only when
   asynchronous splice and runtime opcode support are both enabled. This targets
-  medium responses excluded by the default remaining-byte rule.
+  medium responses excluded by the legacy remaining-byte rule.
 - `RUT_STUDY_HTTP_ASYNC_SPLICE_NODELAY=on`: enable TCP_NODELAY at relay admission.
 
 The separate CONTINUE and MORE switches remain experimental; existing trials
@@ -63,6 +67,18 @@ did not establish a throughput improvement. No FIONREAD availability probe is
 retained: it increased syscall count and reduced throughput in its comparison.
 
 ## Evidence and limits
+
+The original measured source history is available on
+[`benchmarks/iouring-splice-20261013`](https://github.com/hurricane1026/Rut/tree/benchmarks/iouring-splice-20261013).
+Fetch that branch to resolve the original commit identifiers below. The
+[manifest](results/iouring-async-splice/manifest.json) maps source versions and
+records the workload. Published exports contain the 36
+[balanced-origin rows](results/iouring-async-splice/balanced-rows.json), 36
+[shared-listener rows](results/iouring-async-splice/shared-listener-rows.json),
+[eBPF summary](results/iouring-async-splice/balanced-ebpf-summary.json), and
+[regression](results/iouring-async-splice/release-ctest.log)/
+[sanitizer](results/iouring-async-splice/sanitize-ctest.log) results. These exports
+do not include every rejected experiment trace; those remain local archives.
 
 On an isolated loopback network without the host's generic XDP program, the
 adaptive asynchronous soft-link candidate averaged 10,072 requests/s for
