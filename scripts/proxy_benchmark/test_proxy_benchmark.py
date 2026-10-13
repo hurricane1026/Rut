@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -148,6 +149,33 @@ class ProxyBenchmarkTests(unittest.TestCase):
             path.write_bytes(b"changed")
             with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
                 run_matrix.verify_artifacts(config)
+
+    def test_frontend_readiness_retries_probe_timeouts_and_connection_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                                        "kubeconfig": "", "worker_container": "worker",
+                                        "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
+            success = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch("run_matrix.time.monotonic", return_value=0), \
+                    mock.patch("run_matrix.time.sleep") as sleep, \
+                    mock.patch("run_matrix.invoke", side_effect=[subprocess.TimeoutExpired("curl", 5),
+                                                                    subprocess.CompletedProcess([], 7, "", "refused"),
+                                                                    success]) as invoke:
+                matrix.wait_frontend("10.0.0.2")
+            self.assertEqual(invoke.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+
+    def test_frontend_readiness_fails_after_bounded_retry_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                                        "kubeconfig": "", "worker_container": "worker",
+                                        "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
+            with mock.patch("run_matrix.time.monotonic", side_effect=[0, 0, 181]), \
+                    mock.patch("run_matrix.time.sleep"), \
+                    mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 7, "", "refused")) as invoke:
+                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                    matrix.wait_frontend("10.0.0.2")
+            self.assertEqual(invoke.call_count, 1)
 
     def test_resource_snapshot_requires_complete_unique_rows_and_successful_command(self):
         output = "101 120 80\n102 320 240\n"

@@ -103,7 +103,11 @@ class Matrix:
                 self.c["images"]["client"], "--http1.1", "--fail", "--silent", "--show-error",
                 "--output", "/dev/null", f"http://{pod_ip}:8080/proxy"]
         while time.monotonic() < deadline:
-            result = invoke(argv, check=False, timeout=10)
+            try:
+                result = invoke(argv, check=False, timeout=5)
+            except subprocess.TimeoutExpired:
+                time.sleep(1)
+                continue
             if result.returncode == 0:
                 return
             time.sleep(1)
