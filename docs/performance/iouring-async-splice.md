@@ -439,3 +439,9 @@ The 1 MiB single trace increased about 19.6%, mainly io_uring_enter; the study
 does not claim universal syscall reduction. CSV, exact commands, source/binary
 provenance and validation logs are in the external origin-balanced-matrix-v1
 and origin-balanced-final-validation checkpoint artifacts.
+
+### Follow-up: idle FIFO and repeated 1 MiB trace
+
+The shared-listener origin FIFO experiment was rejected: three 15-second repeats averaged 114134.40 RPS versus 124279.82 for default idle reuse (−8.16%). All nine Rut/control/nginx rows were valid with zero errors. The patch and binaries remain archived externally; production source was restored. A separate three-repeat, 30-second default-reuse confirmation averaged 113995.17 RPS versus nginx 82205.75 (+38.67%), so the original-origin 4 KiB 50% target remains unmet.
+
+A second balanced-origin 1 MiB eBPF diagnostic reproduced direct-receive overhead: direct/control syscall counts per request were 3.728943/2.868672; enters were 2.716240/1.855747, and SPLICE SQEs were 7.898395/6.320663. Both rows were valid with zero errors and empty tracer stderr. These short diagnostic rates do not replace the untraced throughput matrix. More splice operations are consistent with timing-dependent shorter transfers; causality still requires a controlled experiment. Direct native receive remains opt-in.
