@@ -442,8 +442,12 @@ These results meet the per-size +50% target in the balanced-origin configuration
 They do not establish that target for the original shared-listener origin:
 its 4 KiB result remains about +42%. The original-origin and balanced-origin
 results are preserved separately and must not be combined as one code gain.
-Direct receive remains opt-in via RUT_STUDY_HTTP_DIRECT_NATIVE_RECV=on; the
-async splice defaults and kernel/header capability fallback remain unchanged.
+At the time of this experiment, direct receive was opt-in via
+`RUT_STUDY_HTTP_DIRECT_NATIVE_RECV=on`. The subsequent performance-hint work also
+enables eligible direct receives through `forward(..., hint: .rps)` and
+`forward(..., hint: .throughput)`; omitted hints retain `.auto`. See the
+[hint measurements](results/iouring-throughput-hints/summary.json) for the later
+throughput-prefix results. The kernel/header capability fallback remains in place.
 
 Final Release validation passed 7/7 (network, splice, drain, fault injection,
 shard control, idle trim, runtime state model), ASan+UBSan passed 2/2 (splice

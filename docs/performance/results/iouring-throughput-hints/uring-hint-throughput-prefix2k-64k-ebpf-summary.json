@@ -1,0 +1,16 @@
+[
+  {
+    "engine": "uring",
+    "requests": 610841,
+    "syscalls_per_request": 1.0411285424521275,
+    "enter_per_request": 0.03882843489549654,
+    "splice_submissions_per_request": 2.000399449283856
+  },
+  {
+    "engine": "baseline-uring",
+    "requests": 577188,
+    "syscalls_per_request": 1.0407752759932638,
+    "enter_per_request": 0.038337595376203244,
+    "splice_submissions_per_request": 2.000429669362495
+  }
+]

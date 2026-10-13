@@ -5282,11 +5282,16 @@ public:
                     c.response_policy_id == 0 && c.throttle_down_bps == 0 &&
                     c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
                     c.on_upstream_recv == &on_upstream_response<Self> &&
-                    c.upstream_recv_buf.len() == 0 && max_len > 2 * kProvidedBufSize)
-                    max_len = 2 * kProvidedBufSize;
+                    c.upstream_recv_buf.len() == 0) {
+                    const u32 prefix_limit = c.forward_hint == ForwardHint::Throughput
+                                                 ? kProvidedBufSize / 4
+                                                 : 2 * kProvidedBufSize;
+                    if (max_len > prefix_limit) max_len = prefix_limit;
+                }
                 const u32 recv_len = available < max_len ? available : max_len;
                 const bool native_direct =
-                    (study_http_direct_native_recv || c.forward_hint == ForwardHint::Rps) &&
+                    (study_http_direct_native_recv || c.forward_hint == ForwardHint::Rps ||
+                     c.forward_hint == ForwardHint::Throughput) &&
                     !c.tls_active && c.response_policy_id == 0 &&
                     c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
                     (c.on_upstream_recv == &on_upstream_response<Self> ||

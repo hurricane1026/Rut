@@ -1,0 +1,182 @@
+[
+  {
+    "engine": "uring",
+    "rep": 1,
+    "body_size": 262144,
+    "requests": 314762,
+    "seconds": 10.023074,
+    "rps": 31403.739012602324,
+    "p50_us": 3926.0,
+    "p95_us": 4680.0,
+    "p99_us": 5030.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 67.5441486314478,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "baseline-uring",
+    "rep": 1,
+    "body_size": 262144,
+    "requests": 308165,
+    "seconds": 10.011602,
+    "rps": 30780.788129612025,
+    "p50_us": 4076.0,
+    "p95_us": 4889.0,
+    "p99_us": 5292.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 67.52166136848028,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "baseline-uring",
+    "rep": 2,
+    "body_size": 262144,
+    "requests": 309882,
+    "seconds": 10.015221,
+    "rps": 30941.1045447724,
+    "p50_us": 4059.0,
+    "p95_us": 4831.0,
+    "p99_us": 5193.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 67.59711043820201,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "uring",
+    "rep": 2,
+    "body_size": 262144,
+    "requests": 320215,
+    "seconds": 10.019728,
+    "rps": 31958.452365173984,
+    "p50_us": 3869.0,
+    "p95_us": 4538.0,
+    "p99_us": 4866.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 67.56670440554873,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "uring",
+    "rep": 3,
+    "body_size": 262144,
+    "requests": 321365,
+    "seconds": 10.016649,
+    "rps": 32083.084871996616,
+    "p50_us": 3862.0,
+    "p95_us": 4576.0,
+    "p99_us": 4929.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 67.5874736151781,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "baseline-uring",
+    "rep": 3,
+    "body_size": 262144,
+    "requests": 304827,
+    "seconds": 10.017049,
+    "rps": 30430.818497543536,
+    "p50_us": 4130.0,
+    "p95_us": 4891.0,
+    "p99_us": 5256.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 67.38511511723662,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  }
+]

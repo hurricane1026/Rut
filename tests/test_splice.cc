@@ -1970,11 +1970,43 @@ TEST(iouring_native_direct_recv, ordinary_slice_receives_and_appends_exact_bytes
     }
 }
 
+TEST(iouring_native_direct_recv, throughput_hint_caps_only_initial_response_prefix) {
+    NativeDirectRecvFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto& loop = *f.guard.loop;
+    if (!loop.backend.splice_supported) SKIP("kernel lacks IORING_OP_SPLICE");
+    loop.study_http_direct_native_recv = false;
+    loop.enable_async_response_splice_defaults();
+    Connection& c = *f.conn;
+    c.forward_hint = ForwardHint::Throughput;
+    constexpr u32 size = 3 * kProvidedBufSize;
+    u8 expected[size];
+    fill_pattern(expected, size);
+    REQUIRE(send_all(f.peer, expected, size));
+    for (u32 part = 0; part < 2; ++part) {
+        REQUIRE(loop.submit_recv_upstream(c));
+        CHECK(c.upstream_recv_direct_armed);
+        IoEvent event{};
+        REQUIRE_EQ(loop.backend.wait(&event, 1, loop.conns, loop.slots_initialized), 1u);
+        CHECK_EQ(event.type, IoEventType::UpstreamRecv);
+        CHECK_EQ(event.result,
+                 static_cast<i32>(part == 0 ? kProvidedBufSize / 4 : size - kProvidedBufSize / 4));
+        CHECK_FALSE(event.has_buf);
+        CHECK_EQ(c.upstream_recv_buf.len(), part == 0 ? kProvidedBufSize / 4 : size);
+        c.on_upstream_recv = nullptr;
+        loop.dispatch_batch(&event, 1);
+        c.on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+    }
+    CHECK_EQ(__builtin_memcmp(c.upstream_recv_buf.data(), expected, size), 0);
+}
+
 TEST(iouring_native_direct_recv, close_pins_ordinary_slice_until_target_and_cancel_drain) {
     NativeDirectRecvFixture f;
     if (!f.init()) SKIP("io_uring unavailable");
     auto& loop = *f.guard.loop;
     Connection& c = *f.conn;
+    loop.study_http_direct_native_recv = false;
+    c.forward_hint = ForwardHint::Throughput;
     const u32 id = c.id;
     u8* slice = c.upstream_recv_slice;
     REQUIRE(loop.submit_recv_upstream(c));

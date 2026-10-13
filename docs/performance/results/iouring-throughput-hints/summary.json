@@ -1,0 +1,71 @@
+[
+  {
+    "experiment": "uring-hint-throughput-direct-64k-v1",
+    "mean_rps": {
+      "uring": 63653.610122104896,
+      "baseline-uring": 61455.36332323141,
+      "nginx": 36115.05289664877
+    },
+    "gain_control_pct": 3.576981210430019,
+    "zero_errors": true,
+    "gain_nginx_pct": 76.25229652650327
+  },
+  {
+    "experiment": "uring-hint-throughput-direct-prefix2k-64k-v1",
+    "mean_rps": {
+      "uring": 65257.397269417124,
+      "baseline-uring": 62896.61753284106,
+      "nginx": 36056.61226504139
+    },
+    "gain_control_pct": 3.7534287679991563,
+    "zero_errors": true,
+    "gain_nginx_pct": 80.9859361986908
+  },
+  {
+    "experiment": "uring-hint-throughput-prefix2k-regression-256k-v1",
+    "mean_rps": {
+      "uring": 31296.98910816743,
+      "baseline-uring": 30417.471453399994
+    },
+    "gain_control_pct": 2.8914883872410924,
+    "zero_errors": true
+  },
+  {
+    "experiment": "uring-hint-throughput-prefix2k-regression-1m-v1",
+    "mean_rps": {
+      "uring": 10971.485733755257,
+      "baseline-uring": 10951.687923541489
+    },
+    "gain_control_pct": 0.18077405375303002,
+    "zero_errors": true
+  },
+  {
+    "experiment": "uring-hint-throughput-direct-prefix1k-64k-v1",
+    "mean_rps": {
+      "baseline-uring": 65109.92206489924,
+      "uring": 67011.25102848363,
+      "nginx": 36432.30883164067
+    },
+    "gain_control_pct": 2.9201831353587115,
+    "zero_errors": true,
+    "gain_nginx_pct": 83.93358306813047
+  },
+  {
+    "experiment": "uring-hint-throughput-prefix1k-regression-256k-v1",
+    "mean_rps": {
+      "baseline-uring": 30717.570390642653,
+      "uring": 31815.09208325764
+    },
+    "gain_control_pct": 3.5729443398600402,
+    "zero_errors": true
+  },
+  {
+    "experiment": "uring-hint-throughput-prefix1k-regression-1m-v1",
+    "mean_rps": {
+      "baseline-uring": 10983.750574388325,
+      "uring": 10930.187226378543
+    },
+    "gain_control_pct": -0.4876599085805955,
+    "zero_errors": true
+  }
+]
