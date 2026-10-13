@@ -471,3 +471,7 @@ Skipping only diagnostic CQ/flush phase and relay queue/poll timestamps was reje
 ### Existing relay ring toggle
 
 The existing RUT_STUDY_HTTP_RELAY_RING option remained disabled after a same-binary balanced-origin 1 MiB check: three 15-second repeats averaged 10999.66 versus 11097.31 RPS (−0.88%), with all nine rows valid and error-free. Startup logs verified on/off configuration. Its independent eBPF diagnostic measured 3.800974/3.113965 syscalls and 8.136264/6.884445 splice SQEs per request, both zero-error with empty tracer stderr. No production code was changed for this experiment.
+
+### Relay membership index
+
+The opt-in per-connection upstream-episode queue index was rejected. Default and enabled splice suites each passed all 70 tests, including new old-episode/new-owner deduplication coverage. Three 15-second 1 MiB repeats showed +0.60%, but three 30-second repeats averaged 11041.31 versus 11076.19 RPS (−0.31%), with nginx 4656.75 RPS. All nine long rows were valid and zero-error. The separate eBPF diagnostic measured 4.143396/3.385912 syscalls and 9.315742/7.721721 splice SQEs per request (on/off), zero errors and empty tracer stderr. Candidate source and tests were restored; patch and binaries are archived externally under relay-queue-index-v1.
