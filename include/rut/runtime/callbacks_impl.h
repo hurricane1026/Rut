@@ -2915,6 +2915,7 @@ void on_request_policy_body_recvd(void* lp, Connection& conn, IoEvent ev) {
 
     JitDispatchOutcome outcome{};
     outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.forward_hint = conn.forward_hint;
     outcome.upstream_id = conn.pending_forward_upstream_id;
     outcome.request_policy_id = conn.pending_forward_request_policy_id;
     outcome.response_policy_id = conn.pending_forward_response_policy_id;
@@ -3896,6 +3897,7 @@ void handle_jit_outcome(Loop* loop,
             return;
         }
         case JitDispatchOutcome::Kind::Forward: {
+            conn.forward_hint = outcome.forward_hint;
             conn.pending_handler_fn = nullptr;
             // Resolve upstream by id against the config pinned at
             // on_header_received. Reading loop->config_ptr here would

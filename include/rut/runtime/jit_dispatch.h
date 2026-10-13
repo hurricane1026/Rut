@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/forward_hint.h"
 #include "rut/common/types.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/io_event.h"
@@ -46,6 +47,7 @@ struct JitDispatchOutcome {
     // Compact immutable response-policy id carried in HandlerResult.next_state
     // for Forward outcomes; zero preserves transparent forwarding.
     u16 response_policy_id = 0;
+    ForwardHint forward_hint = ForwardHint::Auto;
     // 1-based RouteConfig::policy_bundles index for ForwardBundle outcomes.
     u16 policy_bundle_id = 0;
     // 1-based RouteConfig::redirect_policies index for Redirect outcomes.
@@ -185,6 +187,8 @@ inline JitDispatchOutcome invoke_jit_handler(jit::HandlerFn fn,
             return out;
         case jit::HandlerAction::Forward:
         case jit::HandlerAction::ForwardBundle:
+            if (!forward_hint_valid(static_cast<ForwardHint>(r.yield_kind))) return out;
+            out.forward_hint = static_cast<ForwardHint>(r.yield_kind);
             out.kind = JitDispatchOutcome::Kind::Forward;
             out.upstream_id = r.upstream_id;
             out.request_policy_id = r.status_code;

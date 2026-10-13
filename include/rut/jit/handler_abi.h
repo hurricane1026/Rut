@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/common/forward_hint.h"
 #include "rut/common/types.h"
 #include "rut/runtime/route_params.h"
 
@@ -43,7 +44,7 @@ enum class YieldKind : u8 {
 //   byte 1-2: status_code  (u16, for ReturnStatus)
 //   byte 3-4: upstream_id  (u16, for Forward / body-index on ReturnStatus)
 //   byte 5-6: next_state   (u16, for Yield)
-//   byte 7:   yield_kind   (YieldKind)
+//   byte 7:   yield_kind (Yield); Forward/ForwardBundle use ForwardHint instead
 //
 // Slot reuse by action:
 //   - Yield:        status_code + upstream_id carry a packed u32
@@ -94,8 +95,8 @@ struct HandlerResult {
         return {HandlerAction::ReturnStatus, code, 0, 0, YieldKind::HttpGet};
     }
 
-    static HandlerResult make_forward(u16 upstream) {
-        return {HandlerAction::Forward, 0, upstream, 0, YieldKind::HttpGet};
+    static HandlerResult make_forward(u16 upstream, ForwardHint hint = ForwardHint::Auto) {
+        return {HandlerAction::Forward, 0, upstream, 0, static_cast<YieldKind>(hint)};
     }
 
     static HandlerResult make_forward_with_policies(u16 upstream,

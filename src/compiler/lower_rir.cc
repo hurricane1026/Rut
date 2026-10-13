@@ -3251,8 +3251,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
                     return frontend_error(FrontendError::UnsupportedSyntax, term.span);
                 fn->preflight_forward_policy_bundle_id = bundle_id;
             }
-            if (!b.emit_ret_forward_bundle(
-                    upstream.value(), policy, bundle.value(), {term.span.line, term.span.col}))
+            if (!b.emit_ret_forward_bundle(upstream.value(),
+                                           policy,
+                                           bundle.value(),
+                                           {term.span.line, term.span.col},
+                                           term.forward_hint))
                 return frontend_error(FrontendError::OutOfMemory, term.span);
             return {};
         }
@@ -3281,8 +3284,11 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         if (target_transform_id != 0 &&
             !b.emit_req_set_target_transform(target_transform_id, {term.span.line, term.span.col}))
             return frontend_error(FrontendError::OutOfMemory, term.span);
-        if (!b.emit_ret_forward(
-                upstream.value(), policy, response_policy, {term.span.line, term.span.col}))
+        if (!b.emit_ret_forward(upstream.value(),
+                                policy,
+                                response_policy,
+                                {term.span.line, term.span.col},
+                                term.forward_hint))
             return frontend_error(FrontendError::OutOfMemory, term.span);
         return {};
     }
@@ -3433,6 +3439,7 @@ static bool mir_forward_preflight_lowering_shape_valid(const MirModule& module,
                                              RequestPolicyId::Http11FixedTrimSpPreserveHtab,
                                              ForwardResponseBufferingMode::CompleteContentLength);
         return (exact_head || exact_get) && after_host.upstream_index == legacy.upstream_index &&
+               after_host.forward_hint == legacy.forward_hint &&
                after_host.forward_response_policy_id == legacy.forward_response_policy_id &&
                after_host.forward_failure_policy_id == legacy.forward_failure_policy_id &&
                after_host.forward_timeout_failure_policy_id ==

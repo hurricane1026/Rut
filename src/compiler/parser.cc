@@ -2106,7 +2106,24 @@ struct Parser {
                     const Str kw_text = kw.value()->text;
                     auto colon = expect(TokenType::Colon);
                     if (!colon) return core::make_unexpected(colon.error());
-                    if (kw_text.eq({"response_read_timeout", 21})) {
+                    if (kw_text.eq({"hint", 4})) {
+                        if (stmt.has_forward_hint)
+                            return frontend_error(
+                                FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);
+                        auto value = expect_policy_case(lit_str(".auto .rps .throughput"));
+                        if (!value) return core::make_unexpected(value.error());
+                        const Str name = value.value()->text;
+                        if (name.eq({"auto", 4}))
+                            stmt.forward_hint = ForwardHint::Auto;
+                        else if (name.eq({"rps", 3}))
+                            stmt.forward_hint = ForwardHint::Rps;
+                        else if (name.eq({"throughput", 10}))
+                            stmt.forward_hint = ForwardHint::Throughput;
+                        else
+                            return frontend_error(
+                                FrontendError::UnsupportedSyntax, span_from(*value.value()), name);
+                        stmt.has_forward_hint = true;
+                    } else if (kw_text.eq({"response_read_timeout", 21})) {
                         if (stmt.has_forward_response_read_timeout)
                             return frontend_error(
                                 FrontendError::UnexpectedToken, span_from(*kw.value()), kw_text);

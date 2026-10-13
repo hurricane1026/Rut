@@ -190,6 +190,7 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
                                              RequestPolicyId::Http11FixedTrimSpPreserveHtab,
                                              ForwardResponseBufferingMode::CompleteContentLength);
         return (exact_head || exact_get) && after_host.upstream_index == legacy.upstream_index &&
+               after_host.forward_hint == legacy.forward_hint &&
                after_host.forward_response_policy_id == legacy.forward_response_policy_id &&
                after_host.forward_failure_policy_id == legacy.forward_failure_policy_id &&
                after_host.forward_timeout_failure_policy_id ==
@@ -1405,6 +1406,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             out->response_body = term.response_body;
             out->forward_set_path = term.forward_set_path;
             out->forward_request_policy_id = term.forward_request_policy_id;
+            out->forward_hint = term.forward_hint;
             out->forward_response_policy_id = term.forward_response_policy_id;
             out->forward_failure_policy_id = term.forward_failure_policy_id;
             out->forward_timeout_failure_policy_id = term.forward_timeout_failure_policy_id;

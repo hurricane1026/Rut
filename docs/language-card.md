@@ -370,6 +370,9 @@ do not enable a protocol or policy combination absent from this card.
 ```swift
 // Proxy — the transparent forms plus the explicit header-only policy form
 return forward(users)                          // zero-copy, terminal
+return forward(users, hint: .auto)              // default performance intent
+return forward(users, hint: .rps)               // prioritize requests/second
+return forward(users, hint: .throughput)        // prioritize byte throughput
 return forward(users, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
@@ -793,3 +796,17 @@ starting at zero after the index. The final block may be partial. Bodies are
 owned by the compiled program; generation performs no per-request allocation.
 Use existing `wait` for application delay. Timed response fragments are not
 provided by this builder.
+
+### Forward performance hints
+
+`forward(upstream, hint: .auto/.rps/.throughput)` accepts one optional closed
+enum argument. Omitting it is equivalent to `.auto`. Hints express performance
+intent and do not change HTTP framing, header policies, cancellation, or buffer
+ownership. They may coexist with admitted forward policy arguments. Unknown
+cases, string values, and duplicate `hint` arguments are rejected.
+
+The io_uring `.rps` path selects direct native response receive only for the
+existing admitted plaintext HTTP/1.1 GET response callbacks without a response
+policy. TLS and other paths retain their existing behavior. `.auto` and
+`.throughput` currently retain the default adaptive asynchronous splice policy;
+they are not claims of measured gains or a fixed payload-size contract.

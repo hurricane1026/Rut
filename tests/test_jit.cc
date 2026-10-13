@@ -21760,3 +21760,61 @@ TEST(jit, literal_boundary_overlap_keeps_art_dispatch) {
     REQUIRE(configure_route_dispatch(*config, rir.module));
     CHECK(config->dispatch_kind() == RouteConfig::DispatchKind::ArtJit);
 }
+
+TEST(jit, forward_hint_is_encoded_in_compiled_handler) {
+    const char* sources[] = {
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { return forward(api) }",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { return forward(api, hint: .rps) }",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { return forward(api, hint: "
+        ".throughput) }",
+    };
+    for (u32 i = 0; i < 3; ++i) {
+        auto tokens = lex(lit(sources[i]));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+        const auto result = HandlerResult::unpack(handler(nullptr, nullptr, nullptr, 0, nullptr));
+        CHECK_EQ(result.action, HandlerAction::Forward);
+        CHECK_EQ(static_cast<u8>(result.yield_kind), i);
+        HandlerCtx ctx{};
+        const auto outcome = invoke_jit_handler(handler, nullptr, ctx, nullptr, 0, nullptr);
+        CHECK_EQ(outcome.forward_hint, static_cast<ForwardHint>(i));
+        engine.shutdown();
+        rir.destroy();
+    }
+}
+
+static u64 test_rps_hint_handler(void*, HandlerCtx*, const u8*, u32, void*) {
+    return HandlerResult::make_forward(7, ForwardHint::Rps).pack();
+}
+static u64 test_invalid_hint_handler(void*, HandlerCtx*, const u8*, u32, void*) {
+    return HandlerResult::make_forward(7, static_cast<ForwardHint>(255)).pack();
+}
+TEST(jit_dispatch, forward_hint_admits_only_known_values) {
+    HandlerCtx ctx{};
+    auto out = invoke_jit_handler(&test_rps_hint_handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK_EQ(out.kind, JitDispatchOutcome::Kind::Forward);
+    CHECK_EQ(out.forward_hint, ForwardHint::Rps);
+    out = invoke_jit_handler(&test_invalid_hint_handler, nullptr, ctx, nullptr, 0, nullptr);
+    CHECK_EQ(out.kind, JitDispatchOutcome::Kind::Error);
+}
+
+TEST(jit_dispatch, forward_hint_resets_on_connection_reuse) {
+    Connection conn{};
+    conn.forward_hint = ForwardHint::Rps;
+    conn.reset();
+    CHECK_EQ(conn.forward_hint, ForwardHint::Auto);
+}

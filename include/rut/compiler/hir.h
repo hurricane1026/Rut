@@ -2,6 +2,7 @@
 
 #include "rut/common/access_log_sink.h"
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_hint.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/listener_address.h"
@@ -822,6 +823,7 @@ struct HirTerminator {
     // means none; lowering emits one ReqSetHeader per entry before RetForward.
     FixedVec<HirHeaderKV, kMaxHeaders> forward_set_headers;
     u16 forward_request_policy_id = 0;
+    ForwardHint forward_hint = ForwardHint::Auto;
     u16 forward_response_policy_id = 0;
     u16 forward_failure_policy_id = 0;
     u16 forward_timeout_failure_policy_id = 0;

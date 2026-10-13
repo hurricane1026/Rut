@@ -2,6 +2,7 @@
 
 #include "rut/common/access_log_sink.h"
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_hint.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/listener_address.h"
 #include "rut/common/rate_limit_key_spec.h"
@@ -303,8 +304,10 @@ struct AstStatement {
     // `forward(response_policy: {...})`: non-zero immutable policy id. The
     // policy remains a foundation only; runtime rejects it before connect
     // until a response serializer is implemented.
+    ForwardHint forward_hint = ForwardHint::Auto;
     u16 forward_response_policy_id = 0;
     bool has_forward_response_policy = false;
+    bool has_forward_hint = false;
     u16 forward_failure_policy_id = 0;
     bool has_forward_failure_policy = false;
     u16 forward_timeout_failure_policy_id = 0;

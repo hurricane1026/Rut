@@ -1134,7 +1134,9 @@ struct Builder {
     VoidResult emit_ret_forward(ValueId upstream,
                                 ValueId request_policy = kNoValue,
                                 ValueId response_policy = kNoValue,
-                                SourceLoc loc = {}) {
+                                SourceLoc loc = {},
+                                ForwardHint hint = ForwardHint::Auto) {
+        if (!forward_hint_valid(hint)) return err(RirError::InvalidState);
         // A response operand is slot 2 in RIR and the ABI next_state field;
         // callers must pass request_policy explicitly (zero is the transparent
         // request-policy value) when carrying response_policy. Reject the
@@ -1158,6 +1160,7 @@ struct Builder {
                                              !val_has_type(response_policy, TypeKind::U64))))
             return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetForward, nullptr, loc));
+        r.inst->forward_hint = hint;
         r.inst->operands[0] = upstream;
         r.inst->operand_count = 1;
         if (request_policy != kNoValue) {
@@ -1174,7 +1177,9 @@ struct Builder {
     VoidResult emit_ret_forward_bundle(ValueId upstream,
                                        ValueId request_policy,
                                        ValueId bundle,
-                                       SourceLoc loc = {}) {
+                                       SourceLoc loc = {},
+                                       ForwardHint hint = ForwardHint::Auto) {
+        if (!forward_hint_valid(hint)) return err(RirError::InvalidState);
         if (!valid_val(upstream) || !valid_val(request_policy) || !valid_val(bundle))
             return err(RirError::InvalidState);
         if ((!val_has_type(upstream, TypeKind::I32) && !val_has_type(upstream, TypeKind::U32)) ||
@@ -1186,6 +1191,7 @@ struct Builder {
              !val_has_type(bundle, TypeKind::I64) && !val_has_type(bundle, TypeKind::U64)))
             return err(RirError::InvalidState);
         auto r = TRY(emit(Opcode::RetForwardBundle, nullptr, loc));
+        r.inst->forward_hint = hint;
         r.inst->operands[0] = upstream;
         r.inst->operands[1] = request_policy;
         r.inst->operands[2] = bundle;

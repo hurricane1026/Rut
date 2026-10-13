@@ -865,6 +865,9 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::RetForwardBundle:
             buf.put(' ');
             print_value_ref(buf, inst.operands[0]);
+            if (inst.forward_hint != ForwardHint::Auto)
+                buf.put_cstr(inst.forward_hint == ForwardHint::Rps ? ", hint: .rps"
+                                                                   : ", hint: .throughput");
             break;
         case Opcode::RetRedirect:
             buf.put(' ');
