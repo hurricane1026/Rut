@@ -5273,7 +5273,16 @@ public:
                     kPollFirst);
                 if (submitted && kDirectWs) ++study_ws_direct_recv_arms;
             } else {
-                const u32 max_len = backend.upstream_once_max_len();
+                u32 max_len = backend.upstream_once_max_len();
+                // Leave most of a native response body in the socket for
+                // splice, while fitting a small response plus its headers in
+                // one receive. Later header fragments use the full slice.
+                if (study_http_async_splice && backend.splice_supported && !c.tls_active &&
+                    c.response_policy_id == 0 && c.throttle_down_bps == 0 &&
+                    c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+                    c.on_upstream_recv == &on_upstream_response<Self> &&
+                    c.upstream_recv_buf.len() == 0 && max_len > 2 * kProvidedBufSize)
+                    max_len = 2 * kProvidedBufSize;
                 const u32 recv_len = available < max_len ? available : max_len;
                 submitted = backend.add_recv_upstream_once(
                     c.upstream_fd, c.id, c.upstream_episode, recv_len, kPollFirst);

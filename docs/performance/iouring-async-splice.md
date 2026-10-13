@@ -163,3 +163,27 @@ A lazy activation of relay budgets then averaged only +0.3% against the retained
 configuration and won one of two repetitions. That change was reverted; the
 failed/neutral experiment remains in the external checkpoint artifacts. Small
 response profiling remains open rather than treating the regression as resolved.
+
+### First native response receive
+
+With asynchronous splice available, the first ordinary plaintext GET response
+receive is capped at two ordinary provided buffers (8 KiB). Subsequent header
+fragments retain the full available receive capacity. TLS, transformed and
+throttled responses, unsupported kernels and an explicitly disabled splice path
+retain their previous receive sizing. This leaves more body bytes in the socket
+for splice without splitting a typical 4 KiB response and its headers.
+
+In three cyclic 10-second private-network repetitions at 64 KiB, this candidate
+averaged 57,636 requests/s versus 51,464 for the retained 16 KiB prefix and 38,914
+for pinned nginx: +12.0% and +48.1%, respectively. All repetitions were valid and
+had zero errors. The corresponding 4 KiB comparison averaged +0.7%, with two
+wins and one loss; that is not evidence of a stable small-response improvement.
+The per-size target of at least +50% over nginx remains unfulfilled.
+
+The 64 KiB eBPF diagnostic measured 1.0381 raw syscalls/request versus 1.0352
+with the prior prefix (+0.28%), approximately two splice submissions/request,
+and no canceled writes. Diagnostic throughput is not acceptance evidence.
+Independent Release network and splice CTest targets pass. A real socket
+validation sends 9–12 KiB headers in 3,000-byte fragments and verifies exact
+4 KiB, 64 KiB and 1 MiB bodies on one persistent downstream connection. These
+follow-up changes have not yet been checked under sanitizers or GitHub CI.
