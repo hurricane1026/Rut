@@ -294,9 +294,9 @@ struct IoUringBackend {
     // Direct one-shot recv: IORING_OP_RECV straight into a caller-owned
     // buffer region (sqe->addr/len), with no IOSQE_BUFFER_SELECT and no
     // provided-buffer ring involved — the kernel writes the bytes exactly
-    // where dst points, so wait() commits them with no copy. Used only when
-    // the destination is a bulk relay buffer (SlicePool::kBulkSliceSize);
-    // ordinary slice-sized targets keep using the provided-buffer rings.
+    // where dst points, so wait() commits them with no copy. Bulk relay buffers
+    // use this path; an opt-in native HTTP receive can also target its existing
+    // ordinary owned slice with the same pinning contract.
     //
     // Ownership contract: once this returns true, [dst, dst+len) is pinned —
     // the caller must not free or rebind that memory (e.g. trade the bulk
