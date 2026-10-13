@@ -2348,6 +2348,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     conn.pending_forward_response_policy_id = 0;
     conn.pending_forward_failure_policy_id = 0;
     conn.pending_forward_timeout_failure_policy_id = 0;
+    conn.forward_hint = ForwardHint::Auto;
     if constexpr (requires(Loop* candidate, Connection& c) {
                       candidate->disarm_response_read_deadline(c);
                   }) {

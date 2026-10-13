@@ -21656,6 +21656,48 @@ static Connection* dispatch_unmatched_request(SmallLoop& loop,
     return conn;
 }
 
+TEST(forward_hint, keepalive_header_clears_prior_jit_hint_before_direct_proxy) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(config.add_proxy("/direct", kRouteMethodGet, 0));
+    const RouteConfig* active = &config;
+    loop.config_ptr = &active;
+
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    const auto dispatch_recv = [&](i32 result) {
+        loop.backend.inject(make_ev(conn->id, IoEventType::Recv, result));
+        IoEvent events[8];
+        const u32 count = loop.backend.wait(events, 8);
+        for (u32 i = 0; i < count; ++i) loop.dispatch(events[i]);
+    };
+
+    // A completed prior JIT Forward publishes its hint on the connection.
+    // Fragmented headers must preserve that request's state until this new
+    // request is complete and reaches the canonical per-request reset.
+    conn->forward_hint = ForwardHint::Throughput;
+    static constexpr char kPrefix[] = "GET /direct HTTP/1.1\r\nHost:";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1),
+               sizeof(kPrefix) - 1);
+    dispatch_recv(static_cast<i32>(sizeof(kPrefix) - 1));
+    CHECK_EQ(conn->forward_hint, ForwardHint::Throughput);
+
+    static constexpr char kSuffix[] = " client.example\r\nConnection: keep-alive\r\n\r\n";
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(kSuffix), sizeof(kSuffix) - 1),
+               sizeof(kSuffix) - 1);
+    loop.backend.clear_ops();
+    dispatch_recv(static_cast<i32>(sizeof(kSuffix) - 1));
+
+    CHECK_EQ(conn->forward_hint, ForwardHint::Auto);
+    CHECK_EQ(conn->upstream_idx, 0u);
+    CHECK_GE(conn->upstream_fd, 0);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    loop.close_conn(*conn);
+}
+
 TEST(request_admission, origin_connect_rejected_before_handler_or_upstream) {
     SmallLoop loop;
     loop.setup();
