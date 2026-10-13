@@ -370,6 +370,9 @@ do not enable a protocol or policy combination absent from this card.
 ```swift
 // Proxy — the transparent forms plus the explicit header-only policy form
 return forward(users)                          // zero-copy, terminal
+return forward(users, hint: .auto)              // default performance intent
+return forward(users, hint: .rps)               // prioritize requests/second
+return forward(users, hint: .throughput)        // prioritize byte throughput
 return forward(users, request_policy: {
     version: .http11, host: .upstream, connection: .omit,
     strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
@@ -793,3 +796,19 @@ starting at zero after the index. The final block may be partial. Bodies are
 owned by the compiled program; generation performs no per-request allocation.
 Use existing `wait` for application delay. Timed response fragments are not
 provided by this builder.
+
+### Forward performance hints
+
+`forward(upstream, hint: .auto/.rps/.throughput)` accepts one optional closed
+enum argument. Omitting it is equivalent to `.auto`. Hints express performance
+intent and do not change HTTP framing, header policies, cancellation, or buffer
+ownership. They may coexist with admitted forward policy arguments. Unknown
+cases, string values, and duplicate `hint` arguments are rejected.
+
+The io_uring `.rps` path selects direct native response receive only for the
+existing admitted plaintext HTTP/1.1 GET response callbacks without a response
+policy. `.throughput` also selects guarded direct response receive and limits
+only the initial eligible response receive to 1 KiB, leaving more body bytes for
+adaptive asynchronous splice. Later header fragments use the ordinary receive
+capacity. `.auto` keeps the default 8 KiB prefix. TLS and other paths retain their
+existing behavior. Hints do not guarantee gains or specify a payload size.

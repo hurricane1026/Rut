@@ -1929,6 +1929,11 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                     c.builder, safe_response, LLVMConstInt(c.i64_ty, 40, 0), "response_policy.shl");
                 result = LLVMBuildOr(c.builder, result, response_shifted, "result.response_policy");
             }
+            result =
+                LLVMBuildOr(c.builder,
+                            result,
+                            LLVMConstInt(c.i64_ty, static_cast<u64>(inst.forward_hint) << 56, 0),
+                            "result.forward_hint");
             c.emit_parse_unprime();
             LLVMBuildRet(c.builder, result);
             break;

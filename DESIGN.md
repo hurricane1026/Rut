@@ -7734,3 +7734,19 @@ starting at zero after the index. The final block may be partial. Bodies are
 owned by the compiled program; generation performs no per-request allocation.
 Use existing `wait` for application delay. Timed response fragments are not
 provided by this builder.
+
+## Forward performance intent
+
+`forward(upstream, hint: .auto/.rps/.throughput)` carries a closed, optional
+performance intent from AST through HIR/MIR/RIR to the compiled handler result.
+The default is `.auto`; the last byte of a Forward/ForwardBundle result carries
+ForwardHint, while Yield results retain YieldKind in that byte. Runtime dispatch
+rejects unknown hint values. The connection owns the hint for the current
+request and resets it on reuse. Hints never relax protocol or I/O lifetime
+admission and have no required performance guarantee. io_uring `.rps` selects
+the existing guarded direct response receive path. `.throughput` combines this
+path with a 1 KiB initial eligible response prefix so more body bytes remain for
+adaptive asynchronous splice. Later header fragments use the ordinary capacity;
+`.auto` retains the default 8 KiB prefix. Admission, cancellation, and slice
+custody remain unchanged. Performance changes require repeated workload
+benchmarks and syscall measurements.

@@ -2,6 +2,7 @@
 
 #include "rut/common/buffer.h"
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_hint.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/request_policy.h"
@@ -1349,6 +1350,7 @@ struct ConnectionBase {
     bool request_upload_complete;
     // Non-zero selects the strict H1 response serializer for this request.
     u16 response_policy_id;
+    ForwardHint forward_hint;
     // Strict HEAD responses preserve the upstream representation length in the
     // downstream headers but never forward representation bytes.
     bool response_policy_suppress_body;
@@ -2061,6 +2063,7 @@ struct ConnectionBase {
         request_body_fully_buffered = false;
         request_upload_complete = false;
         response_policy_id = 0;
+        forward_hint = ForwardHint::Auto;
         response_policy_suppress_body = false;
         failure_policy_id = 0;
         timeout_failure_policy_id = 0;

@@ -1200,6 +1200,11 @@ inline VerifyResult verify_module_impl(const Module& mod,
             if (block.insts == nullptr) continue;
             for (u32 ii = 0; ii < block.inst_count; ii++) {
                 const Instruction& inst = block.insts[ii];
+                if (!forward_hint_valid(inst.forward_hint) ||
+                    (inst.forward_hint != ForwardHint::Auto && inst.op != Opcode::RetForward &&
+                     inst.op != Opcode::RetForwardBundle))
+                    return verify_fail(
+                        summary, VerifyIssueCode::InvalidForwardPreflight, fi, bi, ii);
                 if (inst.op != Opcode::RetForwardBundle) continue;
                 if (inst.operand_count != 3)
                     return verify_fail(

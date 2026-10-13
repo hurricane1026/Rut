@@ -2,6 +2,7 @@
 
 #include "core/expected.h"
 #include "rut/common/failure_policy.h"
+#include "rut/common/forward_hint.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
 #include "rut/common/rate_limit_key_spec.h"
@@ -324,6 +325,8 @@ struct Instruction {
             const Type* type;
         } struct_ref;  // StructCreate, BodyParse, StructField
     } imm;
+
+    ForwardHint forward_hint = ForwardHint::Auto;
 
     // Access operand by index, handling inline vs overflow.
     ValueId operand(u32 i) const {

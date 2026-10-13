@@ -39814,3 +39814,53 @@ TEST(frontend, workload_rejects_invalid_sizes_and_labels) {
         CHECK(!parse_file_heap(tokens.value()));
     }
 }
+
+TEST(frontend, forward_hint_survives_lowering) {
+    const char* sources[] = {
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { return forward(api) }",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { return forward(api, hint: .auto) }",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { return forward(api, hint: .rps) }",
+        "upstream api at \"127.0.0.1:9000\"\nroute GET \"/x\" { return forward(api, hint: "
+        ".throughput) }",
+    };
+    const ForwardHint expected[] = {
+        ForwardHint::Auto, ForwardHint::Auto, ForwardHint::Rps, ForwardHint::Throughput};
+    for (u32 i = 0; i < 4; ++i) {
+        auto tokens = lex(lit(sources[i]));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        REQUIRE(hir);
+        CHECK_EQ(hir->routes[0].control.direct_term.forward_hint, expected[i]);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        bool found = false;
+        for (u32 f = 0; f < rir.module.func_count; ++f)
+            for (u32 b = 0; b < rir.module.functions[f].block_count; ++b) {
+                const auto& block = rir.module.functions[f].blocks[b];
+                for (u32 j = 0; j < block.inst_count; ++j)
+                    if (block.insts[j].op == rir::Opcode::RetForward) {
+                        CHECK_EQ(block.insts[j].forward_hint, expected[i]);
+                        found = true;
+                    }
+            }
+        CHECK(found);
+        rir.destroy();
+    }
+}
+
+TEST(frontend, forward_hint_rejects_invalid_or_duplicate_cases) {
+    const char* sources[] = {
+        "route GET \"/x\" { return forward(api, hint: .mix) }",
+        "route GET \"/x\" { return forward(api, hint: \"rps\") }",
+        "route GET \"/x\" { return forward(api, hint: .auto, hint: .rps) }",
+    };
+    for (const char* source : sources) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK(!parse_file_heap(tokens.value()));
+    }
+}

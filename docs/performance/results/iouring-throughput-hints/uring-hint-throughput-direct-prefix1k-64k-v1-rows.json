@@ -1,0 +1,272 @@
+[
+  {
+    "engine": "uring",
+    "rep": 1,
+    "body_size": 65536,
+    "requests": 1038742,
+    "seconds": 15.02287,
+    "rps": 69144.04504598655,
+    "p50_us": 1764.0,
+    "p95_us": 2268.0,
+    "p99_us": 2616.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 70.1596965160452,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "baseline-uring",
+    "rep": 1,
+    "body_size": 65536,
+    "requests": 988208,
+    "seconds": 15.021811,
+    "rps": 65784.87773544747,
+    "p50_us": 1872.0,
+    "p95_us": 2423.0,
+    "p99_us": 2650.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 70.29778233796178,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "nginx",
+    "rep": 1,
+    "body_size": 65536,
+    "requests": 552732,
+    "seconds": 15.02197,
+    "rps": 36794.9077251519,
+    "p50_us": 3439.0,
+    "p95_us": 3552.0,
+    "p99_us": 3648.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 80.08270553063281,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "baseline-uring",
+    "rep": 2,
+    "body_size": 65536,
+    "requests": 995443,
+    "seconds": 15.018628,
+    "rps": 66280.55505469607,
+    "p50_us": 1817.0,
+    "p95_us": 2405.0,
+    "p99_us": 2729.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 70.51243295992151,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "nginx",
+    "rep": 2,
+    "body_size": 65536,
+    "requests": 552135,
+    "seconds": 15.016895,
+    "rps": 36767.587440679315,
+    "p50_us": 3463.0,
+    "p95_us": 3616.0,
+    "p99_us": 3713.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 79.77681138477695,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "uring",
+    "rep": 2,
+    "body_size": 65536,
+    "requests": 1012285,
+    "seconds": 15.023677,
+    "rps": 67379.31067074991,
+    "p50_us": 1809.0,
+    "p95_us": 2322.0,
+    "p99_us": 2686.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 70.4887358800379,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "nginx",
+    "rep": 3,
+    "body_size": 65536,
+    "requests": 536830,
+    "seconds": 15.022766,
+    "rps": 35734.431329090796,
+    "p50_us": 3538.0,
+    "p95_us": 3648.0,
+    "p99_us": 3710.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 79.67906842188715,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "uring",
+    "rep": 3,
+    "body_size": 65536,
+    "requests": 968664,
+    "seconds": 15.015626,
+    "rps": 64510.39736871443,
+    "p50_us": 1885.0,
+    "p95_us": 2495.0,
+    "p99_us": 2863.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 70.19354371239668,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  },
+  {
+    "engine": "baseline-uring",
+    "rep": 3,
+    "body_size": 65536,
+    "requests": 950760,
+    "seconds": 15.028373,
+    "rps": 63264.33340455417,
+    "p50_us": 1912.0,
+    "p95_us": 2531.0,
+    "p99_us": 2863.0,
+    "errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "warmup_errors": {
+      "connect": 0,
+      "read": 0,
+      "write": 0,
+      "status": 0,
+      "timeout": 0
+    },
+    "valid": true,
+    "server_cpu_pct": 70.20054665930903,
+    "workers": 1,
+    "server_cpus": "2",
+    "concurrency": 128
+  }
+]

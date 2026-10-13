@@ -9993,6 +9993,7 @@ static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, cons
     term.kind = HirTerminatorKind::ForwardUpstream;
     term.upstream_index = upstream_index.value();
     if (stmt.has_forward_set_path) term.forward_set_path = stmt.forward_set_path;
+    term.forward_hint = stmt.forward_hint;
     if (stmt.has_forward_request_policy)
         term.forward_request_policy_id = stmt.forward_request_policy_id;
     if (stmt.has_forward_response_policy)
@@ -19582,6 +19583,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
             };
             auto same_framing_bundle = [](const HirTerminator& lhs, const HirTerminator& rhs) {
                 return lhs.upstream_index == rhs.upstream_index &&
+                       lhs.forward_hint == rhs.forward_hint &&
                        lhs.forward_response_policy_id == rhs.forward_response_policy_id &&
                        lhs.forward_failure_policy_id == rhs.forward_failure_policy_id &&
                        lhs.forward_timeout_failure_policy_id ==
