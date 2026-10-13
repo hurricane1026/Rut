@@ -319,3 +319,15 @@ p99 means were 1,496.33 versus 1,424.33 us, with zero measurement/warmup errors.
 Separate eBPF confirmed approximately one recvfrom syscall per request in both
 modes. The experiment was removed; its patch, binaries, validation source,
 benchmark and trace evidence remain in the external raw-idle-probe-v1 artifacts.
+
+### Send POLL_FIRST follow-up (rejected)
+
+An opt-in IORING_RECVSEND_POLL_FIRST flag covered ordinary upstream/downstream
+sends and partial-send resubmissions, preserving existing completion ownership.
+Real-service fragmented large-header responses at 4 KiB, 64 KiB and 1 MiB
+passed exact-byte checks. Same-binary cyclic 3 x 15 s 4 KiB throughput was
+103,945.03 versus 110,337.47 requests/s (-5.79%); p99 means were 1,546.67
+versus 1,517.33 us. All measurement/warmup error counters were zero. Separate
+eBPF diagnostics completed without transport errors. The experiment was removed;
+its patch, frozen binaries and evidence remain in external send-poll-first-v1
+checkpoint artifacts.
