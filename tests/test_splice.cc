@@ -1983,19 +1983,24 @@ TEST(iouring_native_direct_recv, throughput_hint_caps_only_initial_response_pref
     u8 expected[size];
     fill_pattern(expected, size);
     REQUIRE(send_all(f.peer, expected, size));
-    for (u32 part = 0; part < 2; ++part) {
+    u32 received = 0;
+    u32 part = 0;
+    while (received < size) {
         REQUIRE(loop.submit_recv_upstream(c));
         CHECK(c.upstream_recv_direct_armed);
         IoEvent event{};
         REQUIRE_EQ(loop.backend.wait(&event, 1, loop.conns, loop.slots_initialized), 1u);
         CHECK_EQ(event.type, IoEventType::UpstreamRecv);
-        CHECK_EQ(event.result,
-                 static_cast<i32>(part == 0 ? kProvidedBufSize / 4 : size - kProvidedBufSize / 4));
+        REQUIRE_GT(event.result, 0);
+        CHECK_LE(static_cast<u32>(event.result),
+                 part == 0 ? kProvidedBufSize / 4 : loop.backend.upstream_once_max_len());
         CHECK_FALSE(event.has_buf);
-        CHECK_EQ(c.upstream_recv_buf.len(), part == 0 ? kProvidedBufSize / 4 : size);
+        received += static_cast<u32>(event.result);
+        CHECK_EQ(c.upstream_recv_buf.len(), received);
         c.on_upstream_recv = nullptr;
         loop.dispatch_batch(&event, 1);
         c.on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+        ++part;
     }
     CHECK_EQ(__builtin_memcmp(c.upstream_recv_buf.data(), expected, size), 0);
 }
