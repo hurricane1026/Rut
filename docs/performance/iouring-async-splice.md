@@ -286,3 +286,25 @@ regression evidence. The feature remains opt-in. An additional same-binary
 receive in both modes: unselected completions when direct, selected-buffer
 completions otherwise. Different first-receive lengths do not explain the
 observed throughput difference; its cause is not yet established.
+
+### Adaptive native receive follow-up (rejected)
+
+An opt-in per-connection hint selected direct owned-slice receive after a parsed
+non-bulk response and buffer selection after a bulk response. Unknown responses
+used buffer selection; framing always used the current parsed response. Focused
+validation passed 70 tests / 100,344 checks, and alternating 4 KiB, 64 KiB, 1 MiB,
+64 KiB, 4 KiB responses with fragmented large headers preserved exact bytes.
+
+A same-binary cyclic 3 x 15 s private-network comparison against disabled hints
+and pinned nginx completed all 36 rows with zero measurement/warmup errors.
+Relative to disabled hints: 4 KiB +0.19%, 64 KiB +4.34%, 256 KiB +0.09%,
+1 MiB -2.77%. Relative to nginx: +39.43%, +49.64%, +99.18%, +123.59%.
+The implementation was rejected rather than enabled globally.
+
+Separate eBPF diagnostics confirmed direct receive for steady small responses
+and buffer selection for bulk responses. Syscalls/request (enabled / disabled)
+were 1.060854 / 1.086435, 1.052332 / 1.039113, 1.081786 / 1.077513, and
+3.468852 / 3.752502 respectively. These single traces do not prove a stable
+syscall reduction or identify the cause of bulk throughput variation. Frozen
+binaries, final patch, wire results, full matrix and trace summaries remain in
+the external `adaptive-native-v1` checkpoint artifacts.
