@@ -375,3 +375,25 @@ updates were amortized, not per request. Ordinary SEND activation was rejected;
 the patch, binaries, tests and results remain in fixed-downstream-v2 artifacts.
 A separate registered splice destination experiment is not covered by this
 result and needs its own ownership and performance validation.
+
+### Registered splice destination follow-up (rejected)
+
+The registered table was separately tested only for IORING_OP_SPLICE output
+using IOSQE_FIXED_FILE; input pipe/source descriptors remained normal fds.
+The close test exposed a missing table release in reclaim_pending, which was
+fixed before benchmarking. Exact medium/large transfers, all three link modes
+on close, quarantined-index fallback, failed registration and out-of-range
+indices passed: 73 tests / 100,471 checks. Real fragmented 4 KiB, 64 KiB, 1 MiB
+responses also preserved exact bytes. Full network/sanitizer were not run for
+this rejected prototype.
+
+Same-binary cyclic 3 x 15 s comparisons were -3.37% at 256 KiB and +4.41% at
+1 MiB. A cyclic 3 x 30 s 1 MiB repeat with pinned nginx did not reproduce the
+gain: 10,446.56 vs 10,515.30 requests/s (-0.65%); nginx was 4,644.56 (+124.92%).
+All measured and warmup error counters were zero. Separate eBPF recorded only
+252 file updates per case and a lower splice/enter count in one 1 MiB trace;
+these single traces did not predict a stable throughput gain.
+
+The registered-file prototype was removed. Its corrected source patch, failed
+close-test evidence, frozen binaries, all results and traces remain in external
+fixed-splice-out-v1/v2 checkpoint artifacts.
