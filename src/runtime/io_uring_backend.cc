@@ -9,6 +9,7 @@
 #include "rut/runtime/response_read_deadline.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/io_uring.h>
 #include <poll.h>
 #include <string.h>  // memset
@@ -383,6 +384,21 @@ core::Expected<void, Error> IoUringBackend::init(u32 /*shard_id*/, i32 lfd, u32 
 
     // Setup provided buffer ring for zero-copy recv
     TRY_VOID(setup_buf_ring());
+    splice_supported = false;
+#if RUT_HAVE_IORING_OP_SPLICE
+    // io_uring_probe ends in a flexible array; embedding it before another
+    // member is a Clang extension rejected by GCC. Keep aligned byte storage
+    // for the header and the requested operation records instead.
+    alignas(io_uring_probe)
+        u8 opcode_probe_bytes[sizeof(io_uring_probe) + 256 * sizeof(io_uring_probe_op)]{};
+    auto* opcode_probe = reinterpret_cast<io_uring_probe*>(opcode_probe_bytes);
+    if (syscall(__NR_io_uring_register, ring_fd, IORING_REGISTER_PROBE, opcode_probe, 256) == 0) {
+        for (u32 i = 0; i < opcode_probe->ops_len; ++i)
+            if (opcode_probe->ops[i].op == IORING_OP_SPLICE &&
+                (opcode_probe->ops[i].flags & IO_URING_OP_SUPPORTED) != 0)
+                splice_supported = true;
+    }
+#endif
     probe_nop_inject_result();
 
     // Create timerfd for 1-second ticks (drives timer wheel)
@@ -698,6 +714,118 @@ bool IoUringBackend::add_recv_upstream_direct(
     return true;
 }
 
+bool IoUringBackend::add_relay_splice(i32 source_fd,
+                                      i32 destination_fd,
+                                      u32 conn_id,
+                                      IoEventType type,
+                                      u32 upstream_episode,
+                                      u32 length,
+                                      bool more) {
+#if !RUT_HAVE_IORING_OP_SPLICE
+    (void)source_fd;
+    (void)destination_fd;
+    (void)conn_id;
+    (void)type;
+    (void)upstream_episode;
+    (void)length;
+    (void)more;
+    return false;
+#else
+    if (!splice_supported) return false;
+    if (source_fd < 0 || destination_fd < 0 || length == 0 || conn_id >= connection_capacity ||
+        !valid_upstream_episode(upstream_episode) ||
+        (type != IoEventType::RelayRead && type != IoEventType::RelayWrite))
+        return false;
+    io_uring_sqe* sqe = get_sqe_flushing();
+    if (!sqe) return false;
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->opcode = IORING_OP_SPLICE;
+    sqe->fd = destination_fd;
+    sqe->splice_fd_in = source_fd;
+    sqe->off = static_cast<u64>(-1);
+    sqe->splice_off_in = static_cast<u64>(-1);
+    sqe->len = length;
+    sqe->splice_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK;
+    if (more && type == IoEventType::RelayWrite) sqe->splice_flags |= SPLICE_F_MORE;
+    sqe->user_data = encode_upstream_user_data(conn_id, type, upstream_episode, 4);
+    sqe_advance_tail(sq_tail);
+    pending++;
+    return true;
+#endif
+}
+
+bool IoUringBackend::add_relay_splice_pair(i32 source_fd,
+                                           i32 pipe_write_fd,
+                                           i32 pipe_read_fd,
+                                           i32 destination_fd,
+                                           u32 conn_id,
+                                           u32 upstream_episode,
+                                           u32 length,
+                                           bool more,
+                                           bool hardlink) {
+#if !RUT_HAVE_IORING_OP_SPLICE
+    (void)source_fd;
+    (void)pipe_write_fd;
+    (void)pipe_read_fd;
+    (void)destination_fd;
+    (void)conn_id;
+    (void)upstream_episode;
+    (void)length;
+    (void)more;
+    (void)hardlink;
+    return false;
+#else
+    if (!splice_supported || source_fd < 0 || pipe_write_fd < 0 || pipe_read_fd < 0 ||
+        destination_fd < 0 || conn_id >= connection_capacity || length == 0 ||
+        !valid_upstream_episode(upstream_episode) || sq_ring_entries < 2)
+        return false;
+    // Reserve both entries before publishing the linked read. A half-pair
+    // must never be flushed as a link to an unrelated operation.
+    auto room = [&] {
+        return __atomic_load_n(sq_tail, __ATOMIC_RELAXED) -
+                   __atomic_load_n(sq_head, __ATOMIC_ACQUIRE) <=
+               sq_ring_entries - 2;
+    };
+    if (!room() && !disable_full_sq_flush && ring_fd >= 0 && pending > 0) {
+        for (;;) {
+            const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
+            if (flushed >= 0) {
+                pending -= static_cast<u32>(flushed);
+                break;
+            }
+            if (flushed == -EINTR) continue;
+            record_enter_error(flushed);
+            return false;
+        }
+    }
+    if (!room()) return false;
+    const u32 tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
+    const u32 mask = *sq_ring_mask;
+    for (u32 side = 0; side < 2; ++side) {
+        const u32 index = (tail + side) & mask;
+        io_uring_sqe& sqe = sq_entries[index];
+        memset(&sqe, 0, sizeof(sqe));
+        sq_array[index] = index;
+        sqe.opcode = IORING_OP_SPLICE;
+        sqe.flags = side == 0 ? (hardlink ? IOSQE_IO_HARDLINK : IOSQE_IO_LINK) : 0;
+        sqe.fd = side == 0 ? pipe_write_fd : destination_fd;
+        sqe.splice_fd_in = side == 0 ? source_fd : pipe_read_fd;
+        sqe.off = sqe.splice_off_in = static_cast<u64>(-1);
+        sqe.len = length;
+        sqe.splice_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK;
+        if (side == 1 && more) sqe.splice_flags |= SPLICE_F_MORE;
+        sqe.user_data =
+            encode_upstream_user_data(conn_id,
+                                      side == 0 ? IoEventType::RelayRead : IoEventType::RelayWrite,
+                                      upstream_episode,
+                                      4);
+    }
+    __atomic_store_n(sq_tail, tail + 2, __ATOMIC_RELEASE);
+    pending += 2;
+    return true;
+#endif
+}
+
 bool IoUringBackend::add_relay_poll(
     i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode, u8 auxiliary) {
     if ((auxiliary != 0 && auxiliary != 32 && auxiliary != 33) || fd < 0 ||
@@ -763,15 +891,19 @@ bool IoUringBackend::pause_upstream_recv(i32 fd, u32 conn_id, u32 upstream_episo
         upstream_episode);
 }
 
-bool IoUringBackend::cancel_retiring_upstream(u32 conn_id, IoEventType type, u32 upstream_episode) {
+bool IoUringBackend::cancel_retiring_upstream(u32 conn_id,
+                                              IoEventType type,
+                                              u32 upstream_episode,
+                                              u8 target_aux) {
     if (conn_id >= connection_capacity || !io_event_uses_upstream_episode(type) ||
         !valid_upstream_episode(upstream_episode))
         return false;
-    return cancel_by_user_data(encode_upstream_user_data(conn_id, type, upstream_episode),
-                               conn_id,
-                               type,
-                               kUpstreamRetirementCancelAux,
-                               upstream_episode);
+    return cancel_by_user_data(
+        encode_upstream_user_data(conn_id, type, upstream_episode, target_aux),
+        conn_id,
+        type,
+        kUpstreamRetirementCancelAux,
+        upstream_episode);
 }
 
 bool IoUringBackend::add_send(i32 fd,

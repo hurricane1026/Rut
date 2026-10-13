@@ -16,6 +16,10 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#ifndef RUT_HAVE_IORING_OP_SPLICE
+#define RUT_HAVE_IORING_OP_SPLICE 0
+#endif
+
 namespace rut {
 
 struct SlicePool;
@@ -92,6 +96,7 @@ struct IoUringBackend {
     void* sqes_ptr = nullptr;
     u64 sqes_sz = 0;
 
+    bool splice_supported = false;  // Runtime opcode probe; Linux >= 5.7.
     // Kernel supports IORING_NOP_INJECT_RESULT (probed at init); required to
     // complete a send that was written directly in full.
     bool nop_inject_result = false;
@@ -321,6 +326,22 @@ struct IoUringBackend {
             return false;
         return cancel_by_user_data(target, conn_id, type, auxiliary, episode);
     }
+    bool add_relay_splice(i32 source_fd,
+                          i32 destination_fd,
+                          u32 conn_id,
+                          IoEventType type,
+                          u32 upstream_episode,
+                          u32 length,
+                          bool more = false);
+    bool add_relay_splice_pair(i32 source_fd,
+                               i32 pipe_write_fd,
+                               i32 pipe_read_fd,
+                               i32 destination_fd,
+                               u32 conn_id,
+                               u32 upstream_episode,
+                               u32 length,
+                               bool more = false,
+                               bool hardlink = false);
     bool add_relay_poll(
         i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode, u8 auxiliary = 0);
     // Dedicated single submission point for the bounded explicit
@@ -342,7 +363,10 @@ struct IoUringBackend {
     // cancel's own CQE retains the selected operation type and is tagged
     // separately from pause/rearm cancellation. Returns true only after the
     // cancel SQE has actually been queued.
-    bool cancel_retiring_upstream(u32 conn_id, IoEventType type, u32 upstream_episode);
+    bool cancel_retiring_upstream(u32 conn_id,
+                                  IoEventType type,
+                                  u32 upstream_episode,
+                                  u8 target_aux = 0);
     bool cancel_retiring_upstream_recv(u32 conn_id, u32 upstream_episode) {
         return cancel_retiring_upstream(conn_id, IoEventType::UpstreamRecv, upstream_episode);
     }
