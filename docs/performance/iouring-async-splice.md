@@ -197,3 +197,27 @@ splice operation, and all transport errors were zero. The earlier single-trace
 enter difference therefore cannot establish configuration as its cause. These
 instrumented runs identify batching variability for further investigation,
 not a new throughput acceptance result.
+
+### Retained-source long matrix
+
+Three cyclic 30-second repetitions per engine and size, with the same private
+network and resource configuration, give the following retained-source results:
+
+| Body size | Rut requests/s | Original Rut requests/s | Pinned nginx requests/s | Rut over nginx |
+| --- | ---: | ---: | ---: | ---: |
+| 4 KiB | 108,206 | 110,840 | 79,838 | +35.5% |
+| 64 KiB | 56,406 | 25,823 | 40,451 | +39.4% |
+| 256 KiB | 31,493 | 22,737 | 13,786 | +128.4% |
+| 1 MiB | 10,483 | 7,013 | 4,622 | +126.8% |
+
+All 36 measurements and their warmups pass the existing validity/error gates.
+Both smaller sizes remain below the requested +50% target; the 64 KiB short
+screen's +48.1% must not substitute for this longer matrix. Large-response
+advantages do not prove that every size meets the objective. Full mixed-load
+acceptance and GitHub CI also remain outstanding.
+
+An external raw-syscall TCP experiment confirms one-shot io_uring
+`MSG_PEEK | MSG_DONTWAIT` results for an empty stream (EAGAIN), two peeks of the
+same retained byte, and EOF after consuming that byte and receiving FIN. This
+is API evidence for a possible batched idle-socket authentication experiment;
+it does not validate Rut integration, cancellation ownership or performance.
