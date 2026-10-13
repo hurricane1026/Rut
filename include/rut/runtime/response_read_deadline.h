@@ -66,7 +66,8 @@ inline bool response_read_deadline_http_date_is_normalized(Str value) {
         }
     }
     if (!weekday || !month) return false;
-    for (u32 i : {5u, 6u, 12u, 13u, 14u, 15u, 17u, 18u, 20u, 21u, 23u, 24u}) {
+    constexpr u32 kDigitOffsets[] = {5, 6, 12, 13, 14, 15, 17, 18, 20, 21, 23, 24};
+    for (u32 i : kDigitOffsets) {
         if (value.ptr[i] < '0' || value.ptr[i] > '9') return false;
     }
     return true;

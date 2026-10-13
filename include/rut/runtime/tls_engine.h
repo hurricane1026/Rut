@@ -5,14 +5,14 @@
 #include "rut/runtime/error.h"
 #include "rut/runtime/tls.h"
 
-#include <openssl/base.h>
+#include <openssl/types.h>
 
 namespace rut {
 
-// TlsEngine bridges BoringSSL to caller-owned ciphertext buffers for a
+// TlsEngine bridges OpenSSL to caller-owned ciphertext buffers for a
 // completion-model backend (io_uring), where SSL must NEVER touch the fd.
 //
-// The epoll backend uses a socket BIO (BIO_new_socket): SSL_read/SSL_write do
+// The epoll backend uses a context-owned socket BIO: SSL_read/SSL_write do
 // their own recv()/send() at the moment epoll signals readiness. io_uring hands
 // us bytes that already arrived in a kernel-chosen buffer, so SSL must instead
 // pull ciphertext from memory we fill and push ciphertext to memory we drain.
@@ -45,6 +45,9 @@ struct TlsEngine {
     u32 out_cap = 0;
     u32 out_len = 0;
     bool handshake_done = false;
+    // Queue TLS 1.3 tickets with the first application write, so a ticket-only
+    // flight cannot park request decryption behind an asynchronous raw send.
+    u64 deferred_session_tickets = 0;
 };
 
 // Create the SSL object in server-accept state, wired to the custom BIO with

@@ -2,41 +2,8 @@
 set(SIMD_ARCH "auto" CACHE STRING "SIMD architecture: auto, scalar, sse2, avx2, avx512, neon, sve")
 set_property(CACHE SIMD_ARCH PROPERTY STRINGS auto scalar sse2 avx2 avx512 neon sve)
 
-# Temporarily disable testing while configuring BoringSSL so its internal
-# test targets do not affect the rest of the project.
-if(DEFINED BUILD_TESTING)
-    set(_BORINGSSL_PREV_BUILD_TESTING_DEFINED TRUE)
-    set(_BORINGSSL_PREV_BUILD_TESTING "${BUILD_TESTING}")
-else()
-    set(_BORINGSSL_PREV_BUILD_TESTING_DEFINED FALSE)
-endif()
-set(BUILD_TESTING OFF)
-add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/boringssl
-    ${CMAKE_CURRENT_BINARY_DIR}/third_party/boringssl
-    EXCLUDE_FROM_ALL
-)
-if(_BORINGSSL_PREV_BUILD_TESTING_DEFINED)
-    set(BUILD_TESTING "${_BORINGSSL_PREV_BUILD_TESTING}")
-else()
-    unset(BUILD_TESTING)
-endif()
-unset(_BORINGSSL_PREV_BUILD_TESTING_DEFINED)
-unset(_BORINGSSL_PREV_BUILD_TESTING)
-foreach(BORINGSSL_TARGET fipsmodule crypto ssl decrepit pki)
-    if(TARGET ${BORINGSSL_TARGET})
-        # BoringSSL is third-party; silence its warning noise entirely
-        # rather than just demoting from error to warning. Earlier we
-        # only had -Wno-error=... which still printed thousands of
-        # -Wunused-parameter lines on every build (4000+ in CI logs,
-        # mostly from internal.h macro expansions). The full -Wno-...
-        # form suppresses the warning, not just the error promotion.
-        target_compile_options(${BORINGSSL_TARGET} PRIVATE
-            -Wno-error
-            -Wno-pedantic
-            -Wno-unused-parameter
-        )
-    endif()
-endforeach()
+# Pinned static TLS/crypto libraries; never use the host OpenSSL installation.
+include(${PROJECT_SOURCE_DIR}/cmake/RutOpenSSL.cmake)
 
 if(SIMD_ARCH STREQUAL "auto")
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
@@ -506,6 +473,26 @@ add_executable(rut main.cc)
 target_link_libraries(rut
     rut_runtime
 )
+
+# Keep the shipped server independent of the C++ standard/ABI runtime.
+# LLVM tools and test executables keep their normal C++ link environment.
+# Sanitizer runtimes are development instrumentation with their own ABI needs.
+if(NOT RUT_SANITIZE)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_link_options(rut PRIVATE -nostdlib++)
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        # GCC has no -nostdlib++ option. Its C driver supplies the C/compiler
+        # runtime at the end of the link without injecting libstdc++. Prevent
+        # CMake from reintroducing it for the C++ archives linked by rut.
+        set_target_properties(rut PROPERTIES LINKER_LANGUAGE C)
+        list(REMOVE_ITEM CMAKE_CXX_IMPLICIT_LINK_LIBRARIES stdc++ supc++)
+    else()
+        message(FATAL_ERROR "The runtime's no-C++-library link requires Clang or GCC")
+    endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(rut PRIVATE -Wl,--as-needed)
+    endif()
+endif()
 
 # Source loading executes the sibling compiler and loads its native artifact.
 # Only rut-compile (and offline compiler tools/tests) link LLVM.

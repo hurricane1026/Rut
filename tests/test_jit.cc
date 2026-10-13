@@ -34,6 +34,7 @@ using namespace rut::rir;
 using namespace rut::jit;
 
 extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test();
+extern "C" u32 rut_helper_regex_scratch_cache_count_for_test();
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -8144,6 +8145,32 @@ TEST(helpers, str_regex_scratch_cache_grows_and_reuses_entries) {
         rut_helper_regex_free(dbs[i]);
     }
     CHECK(rut_helper_regex_scratch_cache_entry_count_for_test() == before_count);
+}
+
+struct RegexScratchExitThreadState {
+    void* db = nullptr;
+    u8 matched = 0;
+};
+
+static void* regex_scratch_exit_thread(void* arg) {
+    auto* state = static_cast<RegexScratchExitThreadState*>(arg);
+    state->matched = rut_helper_str_regex_match("/worker", 7, state->db);
+    return nullptr;
+}
+
+TEST(helpers, str_regex_scratch_cache_is_reclaimed_on_thread_exit) {
+    if (!rut_helper_regex_backend_available()) SKIP("vectorscan backend not available");
+
+    void* db = rut_helper_regex_compile("^/worker$", 9);
+    REQUIRE(db != nullptr);
+    const u32 cache_count_before = rut_helper_regex_scratch_cache_count_for_test();
+    RegexScratchExitThreadState state{db};
+    pthread_t thread{};
+    REQUIRE(pthread_create(&thread, nullptr, regex_scratch_exit_thread, &state) == 0);
+    REQUIRE(pthread_join(thread, nullptr) == 0);
+    CHECK(state.matched == 1);
+    CHECK(rut_helper_regex_scratch_cache_count_for_test() == cache_count_before);
+    rut_helper_regex_free(db);
 }
 
 struct RegexScratchPruneThreadState {

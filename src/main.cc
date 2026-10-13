@@ -18,6 +18,7 @@
 
 #ifdef RUT_ENABLE_JIT
 #include "rut/native_program.h"
+#include "rut/runtime/mapped_array.h"
 #endif
 
 #include <errno.h>
@@ -1217,7 +1218,14 @@ int main(int argc, char** argv) {
     // 1.28 MB RouteConfig off the stack.
     const RouteConfig* route_config = nullptr;
 #ifdef RUT_ENABLE_JIT
-    static NativeProgram program;
+    MappedArray<NativeProgram> program_storage;
+    auto program_allocation = program_storage.init(1);
+    if (!program_allocation) {
+        write_error("Failed to allocate native program", program_allocation.error());
+        destroy_tls_server_context(tls_server);
+        return 1;
+    }
+    NativeProgram& program = program_storage[0];
     if (config_path) {
         char msg[512];
         if (!load_native_program(
@@ -1383,6 +1391,10 @@ int main(int argc, char** argv) {
             write_str(" but only ");
             write_u32(shard_count);
             write_str(" shard(s) are configured\n");
+            destroy_tls_server_context(tls_server);
+#ifdef RUT_ENABLE_JIT
+            program.destroy();
+#endif
             return 1;
         }
     }

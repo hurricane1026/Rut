@@ -349,16 +349,25 @@ struct Shard {
         // Pin to CPU if requested. Use sched_getaffinity to check allowed CPUs
         // (respects cpuset/cgroup restrictions). Fall back to unpinned on failure.
 #ifdef __linux__
-        if (pin_cpu >= 0) {
+#ifndef __GLIBC__
+        start_cpu = -1;
+#endif
+        if (pin_cpu >= 0 && pin_cpu < CPU_SETSIZE) {
             cpu_set_t allowed;
             CPU_ZERO(&allowed);
             if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0 &&
                 CPU_ISSET(pin_cpu, &allowed)) {
+#ifdef __GLIBC__
                 cpu_set_t cpuset;
                 CPU_ZERO(&cpuset);
                 CPU_SET(pin_cpu, &cpuset);
                 // Best-effort: if setaffinity fails, continue unpinned
                 (void)pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset);
+#else
+                // musl has no affinity attribute; pin inside the new thread
+                // before it enters the event loop instead.
+                start_cpu = pin_cpu;
+#endif
             }
             // If CPU not in allowed set or getaffinity failed, spawn unpinned
         }
@@ -507,8 +516,20 @@ struct Shard {
     }
 
 private:
+#if defined(__linux__) && !defined(__GLIBC__)
+    i32 start_cpu = -1;
+#endif
     static void* thread_entry(void* arg) {
         auto* self = static_cast<Shard*>(arg);
+#if defined(__linux__) && !defined(__GLIBC__)
+        if (self->start_cpu >= 0) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(self->start_cpu, &cpuset);
+            // Like the glibc attribute path, affinity is best-effort.
+            (void)sched_setaffinity(0, sizeof(cpuset), &cpuset);
+        }
+#endif
         self->loop->run();
         return nullptr;
     }

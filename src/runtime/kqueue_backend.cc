@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -300,6 +301,7 @@ i32 KqueueBackend::flush_send(SendState& state, SSL* ssl) {
         errno = 0;
         if (state.tls) {
             if (!ssl) return -EINVAL;
+            ERR_clear_error();
             written = SSL_write(ssl, state.src + state.offset, static_cast<int>(state.remaining));
             if (written <= 0) {
                 const int error = SSL_get_error(ssl, static_cast<int>(written));
@@ -436,6 +438,7 @@ bool KqueueBackend::receive(Connection& conn, bool upstream, IoEvent& event) {
         };
         if (!conn.tls_handshake_complete) {
             errno = 0;
+            ERR_clear_error();
             const int rc = SSL_accept(ssl);
             if (rc != 1) {
                 if (retry(rc)) return false;
@@ -448,6 +451,7 @@ bool KqueueBackend::receive(Connection& conn, bool upstream, IoEvent& event) {
         }
         if (buf.write_avail()) {
             errno = 0;
+            ERR_clear_error();
             result = SSL_read(ssl, buf.write_ptr(), static_cast<int>(buf.write_avail()));
             if (result <= 0) {
                 if (retry(result)) return false;

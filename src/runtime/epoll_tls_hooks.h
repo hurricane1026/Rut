@@ -3,12 +3,12 @@
 #include "rut/common/types.h"
 #include "rut/runtime/tls.h"
 
-#include <openssl/base.h>
+#include <openssl/types.h>
 
 namespace rut {
 
 // Runtime-private seam for forcing specific TLS state-machine transitions in
-// epoll tests. Production code always uses the default OpenSSL/BoringSSL hooks.
+// epoll tests. Production code always uses the default OpenSSL hooks.
 struct EpollTlsHooks {
     i32 (*ssl_accept)(SSL* ssl);
     i32 (*ssl_read)(SSL* ssl, void* buf, i32 len);
