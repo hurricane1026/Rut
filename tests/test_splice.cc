@@ -160,6 +160,48 @@ bool exact_pattern(const u8* buf, u32 len) {
     }
     return true;
 }
+
+struct NativeDirectRecvFixture {
+    RouteConfig config;
+    ScopedIoUringLoop guard;
+    Connection* conn = nullptr;
+    i32 peer = -1;
+
+    bool init() {
+        if (!guard.init()) return false;
+        auto& loop = *guard.loop;
+        i32 pair[2];
+        if (!async_splice_tcp_pair(pair)) return false;
+        conn = loop.alloc_conn();
+        if (!conn) {
+            close(pair[0]);
+            close(pair[1]);
+            return false;
+        }
+        conn->upstream_fd = pair[0];
+        peer = pair[1];
+        conn->fd = dup(STDERR_FILENO);
+        if (conn->fd < 0) return false;
+        config.upstream_count = 1;
+        config.upstreams[0].addr_count = 1;
+        conn->request_config = &config;
+        conn->state = ConnState::Proxying;
+        conn->protocol = ConnProtocol::Http11;
+        conn->req_method = static_cast<u8>(LogHttpMethod::Get);
+        conn->req_body_mode = BodyMode::None;
+        conn->req_start_us = monotonic_us();
+        conn->upstream_attempts = 1;
+        conn->upstream_episode = 1;
+        conn->request_upload_complete = true;
+        conn->on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+        loop.study_http_direct_native_recv = true;
+        return loop.alloc_upstream_buf(*conn);
+    }
+
+    ~NativeDirectRecvFixture() {
+        if (peer >= 0) close(peer);
+    }
+};
 #endif
 
 }  // namespace
@@ -1900,6 +1942,56 @@ TEST(iouring_splice, eof_and_post_pull_poll_failure_fail_closed) {
         close(upstream[1]);
         close(downstream[1]);
     }
+}
+
+TEST(iouring_native_direct_recv, ordinary_slice_receives_and_appends_exact_bytes) {
+    NativeDirectRecvFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto& loop = *f.guard.loop;
+    Connection& c = *f.conn;
+    CHECK_FALSE(loop.pool.is_bulk(c.upstream_recv_slice));
+    u8 expected[64];
+    fill_pattern(expected, sizeof(expected));
+    for (u32 offset : {0u, 32u}) {
+        REQUIRE(send_all(f.peer, expected + offset, 32));
+        REQUIRE(loop.submit_recv_upstream(c));
+        CHECK(c.upstream_recv_direct_armed);
+        IoEvent event{};
+        REQUIRE_EQ(loop.backend.wait(&event, 1, loop.conns, loop.slots_initialized), 1u);
+        CHECK_EQ(event.type, IoEventType::UpstreamRecv);
+        CHECK_EQ(event.result, 32);
+        CHECK_FALSE(event.has_buf);
+        CHECK_FALSE(c.upstream_recv_direct_armed);
+        CHECK_EQ(c.upstream_recv_buf.len(), offset + 32);
+        CHECK_EQ(__builtin_memcmp(c.upstream_recv_buf.data(), expected, offset + 32), 0);
+        c.on_upstream_recv = nullptr;
+        loop.dispatch_batch(&event, 1);
+        c.on_upstream_recv = &on_upstream_response<IoUringEventLoop>;
+    }
+}
+
+TEST(iouring_native_direct_recv, close_pins_ordinary_slice_until_target_and_cancel_drain) {
+    NativeDirectRecvFixture f;
+    if (!f.init()) SKIP("io_uring unavailable");
+    auto& loop = *f.guard.loop;
+    Connection& c = *f.conn;
+    const u32 id = c.id;
+    u8* slice = c.upstream_recv_slice;
+    REQUIRE(loop.submit_recv_upstream(c));
+    REQUIRE(c.upstream_recv_direct_armed);
+    REQUIRE(loop.backend.flush_pending_nonblocking());
+    loop.close_conn(c);
+    CHECK_EQ(c.upstream_recv_slice, slice);
+    CHECK_GT(c.pending_ops, 0u);
+    Connection* other = loop.alloc_conn();
+    REQUIRE(other != nullptr);
+    CHECK_NE(other->id, id);
+    REQUIRE(pump_until(loop, [&] { return c.pending_ops == 0; }, 16));
+    CHECK_EQ(c.upstream_recv_slice, nullptr);
+    CHECK_FALSE(c.upstream_recv_direct_armed);
+    Connection* reused = loop.alloc_conn();
+    REQUIRE(reused != nullptr);
+    CHECK_EQ(reused->id, id);
 }
 
 TEST(iouring_async_splice, finished_relay_retires_spent_prefix_send_state) {

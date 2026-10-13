@@ -535,6 +535,10 @@ static bool configure_study_policy(Loop* loop) {
                     loop->report_http_async_splice = true;
                 else if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_REPORT=off"))
                     loop->report_http_async_splice = false;
+                if (str_eq(*item, "RUT_STUDY_HTTP_DIRECT_NATIVE_RECV=on"))
+                    loop->study_http_direct_native_recv = true;
+                else if (str_eq(*item, "RUT_STUDY_HTTP_DIRECT_NATIVE_RECV=off"))
+                    loop->study_http_direct_native_recv = false;
             }
             if (explicitly_disabled) loop->study_http_async_splice = false;
         }

@@ -320,6 +320,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     bool study_http_async_splice_hardlink = false;
     bool study_http_async_splice_slice_threshold = false;
     bool report_http_async_splice = false;
+    bool study_http_direct_native_recv = false;
     void enable_async_response_splice_defaults() {
         study_http_async_splice = true;
         study_http_async_splice_nodelay = true;
@@ -5284,8 +5285,23 @@ public:
                     c.upstream_recv_buf.len() == 0 && max_len > 2 * kProvidedBufSize)
                     max_len = 2 * kProvidedBufSize;
                 const u32 recv_len = available < max_len ? available : max_len;
-                submitted = backend.add_recv_upstream_once(
-                    c.upstream_fd, c.id, c.upstream_episode, recv_len, kPollFirst);
+                const bool native_direct = study_http_direct_native_recv && !c.tls_active &&
+                                           c.response_policy_id == 0 &&
+                                           c.req_method == static_cast<u8>(LogHttpMethod::Get) &&
+                                           (c.on_upstream_recv == &on_upstream_response<Self> ||
+                                            c.on_upstream_recv == &on_response_body_recvd<Self>);
+                if (native_direct) {
+                    direct = true;
+                    submitted = backend.add_recv_upstream_direct(c.upstream_fd,
+                                                                 c.id,
+                                                                 c.upstream_episode,
+                                                                 c.upstream_recv_buf.write_ptr(),
+                                                                 recv_len,
+                                                                 kPollFirst);
+                } else {
+                    submitted = backend.add_recv_upstream_once(
+                        c.upstream_fd, c.id, c.upstream_episode, recv_len, kPollFirst);
+                }
             }
         } else {
             submitted = backend.add_recv_upstream(c.upstream_fd, c.id, c.upstream_episode);
