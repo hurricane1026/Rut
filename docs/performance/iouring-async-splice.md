@@ -463,3 +463,7 @@ API ownership reference: https://www.man7.org/linux/man-pages/man3/io_uring_prep
 ### Explicit io-wq splice execution
 
 The linked-pair IOSQE_ASYNC option was rejected. Its three 15-second 1 MiB repeats showed +0.81%, but three 30-second confirmation repeats averaged 10820.99 RPS versus 10912.16 control (−0.84%), with p99 means 15.081/14.936 ms. All nine long rows were valid with zero errors; nginx averaged 4627.59 RPS. The independent eBPF diagnostic measured 3.400233/3.479969 syscalls and 7.774304/7.658784 splice SQEs per request (on/off), with empty tracer stderr and zero errors. Observed Rut/io-wq threads remained restricted to CPU 2. Small short-run differences did not reproduce as a throughput gain; candidate source was restored and its patch/binaries archived externally under splice-worker-v1.
+
+### Diagnostic timing bypass
+
+Skipping only diagnostic CQ/flush phase and relay queue/poll timestamps was rejected. Three 15-second repeats on the shared-listener 4 KiB origin averaged 112696.89 versus 117664.45 RPS (−4.22%). Balanced-origin repeats averaged 124228.56/125659.20 at 4 KiB (−1.14%), and 11004.39/11000.77 at 1 MiB (+0.03%). All 27 rows were valid and zero-error. The independent balanced 1 MiB eBPF diagnostic measured 3.166448/4.159913 syscalls and 7.010297/9.138632 splice SQEs per request, with zero errors and empty tracer stderr. A single trace improvement did not demonstrate throughput gain; candidate code was restored and patch/binaries archived under skip-diagnostic-timing-v1. Required fairness and deadline clocks were never changed.
