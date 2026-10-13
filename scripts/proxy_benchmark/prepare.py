@@ -12,7 +12,7 @@ import subprocess
 import sys
 import uuid
 
-from common import write_json
+from common import canonical_cpu_list, cpu_set, image_reference_matches, snapshot_inputs, write_json
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 IMAGES = {
@@ -31,12 +31,50 @@ def sha(path: Path) -> str:
 
 def cpus(value: str, count: int, name: str) -> list[int]:
     try:
-        values = [int(x) for x in value.split(",")]
+        values = sorted(cpu_set(value))
     except ValueError as error:
-        raise ValueError(f"{name} must be comma-separated CPU IDs") from error
-    if len(values) != count or len(set(values)) != count or any(x < 0 or x > 63 for x in values):
+        raise ValueError(f"{name} must be a comma-separated CPU list or ranges") from error
+    if len(values) != count or any(x < 0 or x > 63 for x in values):
         raise ValueError(f"{name} must contain {count} unique CPU IDs in 0..63")
     return values
+
+
+def docker_image_identity(docker: str, reference: str) -> dict:
+    raw = run([docker, "image", "inspect", "--format", "{{json .}}", reference])
+    image = json.loads(raw)
+    if not image.get("Id", "").startswith("sha256:"):
+        raise RuntimeError(f"Docker did not return an immutable image ID for {reference}")
+    return {"reference": reference, "docker_id": image["Id"],
+            "repo_digests": sorted(image.get("RepoDigests") or [])}
+
+
+def worker_image_identities(docker: str, worker: str, identities: dict) -> dict:
+    raw = run([docker, "exec", worker, "crictl", "images", "-o", "json"])
+    inventory = json.loads(raw).get("images", [])
+    resolved = {}
+    for name, identity in identities.items():
+        reference = identity["reference"]
+        matches = [image for image in inventory
+                   if any(image_reference_matches(reference, candidate)
+                          for candidate in (image.get("repoTags") or []) + (image.get("repoDigests") or []))]
+        ids = {image.get("id") for image in matches if image.get("id")}
+        if len(ids) != 1:
+            raise RuntimeError(f"kind worker must have exactly one resolved image for {reference}; found {len(ids)}")
+        image = next(image for image in matches if image.get("id") in ids)
+        resolved[name] = {**identity, "worker_id": image["id"],
+                          "worker_repo_digests": sorted(image.get("repoDigests") or [])}
+    return resolved
+
+
+def helper_verify_script(helpers: list[int], pin: bool) -> str:
+    helper_cpus = canonical_cpu_list(set(helpers))
+    pin_prefix = (f'for p in /proc/[0-9]*; do pid=${{p##*/}}; taskset -apc {helper_cpus} "$pid" >/dev/null 2>&1 || :; done; '
+                  if pin else "")
+    return (pin_prefix + f"expected='{helper_cpus}'; bad=0; "
+            'for f in /proc/[0-9]*/task/[0-9]*/status; do '
+            'allowed=$(awk "/^Cpus_allowed_list:/{print \\$2}" "$f"); '
+            'if [ -n "$allowed" ] && [ "$allowed" != "$expected" ]; then echo "$f: $allowed"; bad=1; fi; '
+            'done; [ "$bad" -eq 0 ] || exit 1; echo "all worker threads allowed only on $expected"')
 
 
 def mask(cpu: int) -> str:
@@ -224,6 +262,10 @@ def main() -> int:
     if not paths["clang"].is_file() or not paths["ld"].is_file():
         p.error("clang and ld must be files")
 
+    image_refs = {"nginx": a.nginx_image, "envoy": a.envoy_image, "client": a.client_image}
+    image_identities = {name: {"reference": reference} for name, reference in image_refs.items()}
+    image_identities["client"] = docker_image_identity(a.docker_bin, a.client_image)
+
     config_dir = checkpoint / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "proxy-rps.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .rps, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
@@ -249,15 +291,19 @@ def main() -> int:
                "data": {"linkerd-origin.conf": linkerd_origin}}
     write_json(output / "native-configmap.json", native)
     write_json(output / "linkerd-configmap.json", linkerd)
+    input_paths = {"client_dir": client_dir, "rut_config_dir": config_dir,
+                   "runtime_libs": paths["runtime_libs"], "clang": paths["clang"], "ld": paths["ld"]}
+    input_snapshot = snapshot_inputs(input_paths)
 
     config = {"schema": 1, "run_id": run_id, "checkpoint": str(checkpoint), "output": str(output), "kubeconfig": str(a.kubeconfig.resolve()),
               "cluster_name": a.cluster_name, "namespace": a.namespace, "worker_container": a.worker_container, "worker_node": a.worker_node,
               "node_mount": a.node_mount, "selector": {"key": a.selector_key, "value": a.selector_value},
               "configmaps": {"native": native["metadata"]["name"], "linkerd": linkerd["metadata"]["name"]},
-              "images": {"nginx": a.nginx_image, "envoy": a.envoy_image, "client": a.client_image},
-              "cpus": {"proxy": a.proxy_cpu, "origin": ",".join(map(str, origins)), "client": ",".join(map(str, clients)), "helpers": ",".join(map(str, helpers))},
+              "images": image_refs, "image_identities": image_identities,
+              "cpus": {"proxy": a.proxy_cpu, "origin": canonical_cpu_list(set(origins)),
+                       "client": canonical_cpu_list(set(clients)), "helpers": canonical_cpu_list(set(helpers))},
               "paths": {**{key: str(value) for key, value in paths.items()}, "rut_config_dir": str(config_dir)},
-              "client_dir": str(client_dir),
+              "client_dir": str(client_dir), "input_snapshot": input_snapshot,
               "tools": {"docker": a.docker_bin, "kubectl": a.kubectl_bin, "linkerd": a.linkerd_bin},
               "artifacts": {
                   "rut_rps": {"path": str(paths["rut_rps"] / "rut"), "sha256": sha(paths["rut_rps"] / "rut")},
@@ -284,19 +330,15 @@ def main() -> int:
             p.error("worker node does not have the requested selector label")
         run(kube + ["get", "namespace", a.namespace])
         (output / "linkerd-check.txt").write_text(run([a.linkerd_bin, "--kubeconfig", str(a.kubeconfig.resolve()), "check"]))
-        helper_cpus = ",".join(map(str, helpers))
-        pin_prefix = (f'for p in /proc/[0-9]*; do pid=${{p##*/}}; taskset -apc {helper_cpus} "$pid" >/dev/null 2>&1 || :; done; '
-                      if a.pin_worker_helpers else "")
-        verify_script = (pin_prefix + f"expected='{helper_cpus}'; bad=0; "
-                         'for f in /proc/[0-9]*/task/[0-9]*/status; do '
-                         'allowed=$(awk "/^Cpus_allowed_list:/{print \\$2}" "$f"); '
-                         'if [ -n "$allowed" ] && [ "$allowed" != "$expected" ]; then echo "$f: $allowed"; bad=1; fi; '
-                         'done; [ "$bad" -eq 0 ] || exit 1; echo "all worker threads allowed only on $expected"')
+        resolved_images = worker_image_identities(a.docker_bin, a.worker_container, image_identities)
+        helper_cpus = canonical_cpu_list(set(helpers))
+        verify_script = helper_verify_script(helpers, a.pin_worker_helpers)
         pin_result = run([a.docker_bin, "exec", a.worker_container, "taskset", "-c", helper_cpus,
                           "sh", "-eu", "-c", verify_script])
         (output / "worker-helper-pin.txt").write_text(pin_result)
         helpers_check = "worker helper thread affinity verified"
         checks = ["kind worker identity", "worker mount", "kubeconfig context", "node selector", "namespace", "linkerd check", helpers_check]
+        config["image_identities"] = resolved_images
     config["verified_cluster_checks"] = checks
     write_json(output / "benchmark.json", config)
     write_json(output / "payloads.json", payloads)

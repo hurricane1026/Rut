@@ -37,6 +37,7 @@ def main() -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     name = f"proxybench-{config['run_id']}-{args.label}".replace("_", "-")
+    client_image = config["image_identities"]["client"]["docker_id"]
     argv = [
         config["tools"]["docker"], "create", "--name", name,
         "--security-opt", "label=disable",
@@ -44,12 +45,13 @@ def main() -> int:
         "--cpuset-cpus", config["cpus"]["client"],
         "--mount", f"type=bind,src={config['client_dir']},dst=/benchmark,readonly",
         "--entrypoint", "/usr/local/bin/wrk",
-        config["images"]["client"], "-t2", f"-c{config['concurrency']}", f"-d{args.duration}",
+        client_image, "-t2", f"-c{config['concurrency']}", f"-d{args.duration}",
         "--latency", "--timeout", "2s", "-s", f"/benchmark/{args.lua}",
         f"http://{args.pod_ip}:8080/proxy",
     ]
     (output / "command.json").write_text(json.dumps(argv, indent=2) + "\n")
-    (output / "image.json").write_text(json.dumps({"image": config["images"]["client"]}, indent=2) + "\n")
+    (output / "image.json").write_text(json.dumps({"reference": config["images"]["client"],
+                                                    "image_id": client_image}, indent=2) + "\n")
     created = None
     try:
         p = subprocess.run(argv, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

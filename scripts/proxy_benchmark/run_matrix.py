@@ -11,7 +11,8 @@ import sys
 import time
 from pathlib import Path
 
-from common import load_config, pod_spec, write_json
+from common import (cpu_set, image_reference_matches, load_config, pod_spec,
+                    provenance_fingerprint, snapshot_inputs, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 ENGINES = {"4k": ("linkerd", "rut-rps", "nginx", "envoy"),
@@ -131,6 +132,13 @@ class Matrix:
         if {item["name"] for item in statuses} != expected:
             raise RuntimeError(f"container set mismatch: expected {expected}, got {[x.get('name') for x in statuses]}")
         spec_containers = pod["spec"].get("containers", []) + pod["spec"].get("initContainers", [])
+        spec_by_name = {item.get("name"): item for item in spec_containers}
+        for status in statuses:
+            spec = spec_by_name.get(status["name"], {})
+            identity = next((value for value in self.c.get("image_identities", {}).values()
+                             if value["reference"] == spec.get("image")), None)
+            if identity and not image_identity_matches(status.get("imageID", ""), identity):
+                raise RuntimeError(f"{status['name']} image identity changed: {status.get('imageID')}")
         if engine == "linkerd" and not any(item.get("name") == "linkerd-proxy" for item in spec_containers):
             raise RuntimeError("Linkerd did not inject the stock sidecar")
         if engine != "linkerd" and any(item.get("name", "").startswith("linkerd-") for item in spec_containers):
@@ -168,7 +176,7 @@ class Matrix:
                         raise RuntimeError(f"cannot read thread affinity for process {process}: {line!r}")
                     row = {"pid": process, "name": fields[0], "allowed": fields[1]}
                     affinity.append(row)
-                    if fields[1] != cpus:
+                    if cpu_set(fields[1]) != cpu_set(cpus):
                         raise RuntimeError(f"{name} thread in process {process} affinity {fields[1]} != {cpus}")
                 exe = invoke([self.docker, "exec", self.c["worker_container"], "readlink", f"/proc/{process}/exe"]).stdout.strip()
                 size = int(invoke([self.docker, "exec", self.c["worker_container"], "stat", "-Lc", "%s", f"/proc/{process}/exe"]).stdout.strip())
@@ -251,7 +259,7 @@ class Matrix:
 
     def curl(self, pod_ip: str, outdir: Path, body: str, *, marker: str | None = None, many: bool = False) -> None:
         client_cpus = self.c["cpus"]["client"]
-        image = self.c["images"]["client"]
+        image = self.c["image_identities"]["client"]["docker_id"]
         argv = [self.docker, "run", "--rm", "--security-opt", "label=disable", "--network",
                 f"container:{self.c['worker_container']}", "--cpuset-cpus", client_cpus,
                 "--mount", f"type=bind,src={outdir},dst=/out", "--entrypoint", "curl", image,
@@ -285,6 +293,7 @@ class Matrix:
     def run_cell(self, body: str, engine: str, rep: int) -> Path:
         verify_artifacts(self.c)
         verify_payloads(self.c)
+        verify_provenance(self.c)
         label = f"{body}-{engine}-r{rep}"
         pod_name = f"proxybench-{self.c['run_id']}-{body}-{rep}-{engine}"
         outdir = self.samples / body / label
@@ -344,7 +353,8 @@ class Matrix:
         write_json(outdir / "cell.json", {"body": body, "engine": engine, "rep": rep, "pod_ip": pod_ip,
                    "duration": self.c["duration"], "warmup": self.c["warmup"], "concurrency": self.c["concurrency"],
                    "proxy_cpu": self.c["cpus"]["proxy"], "origin_cpus": self.c["cpus"]["origin"],
-                   "client_cpus": self.c["cpus"]["client"], "route_config": "proxy-rps.rut" if engine == "rut-rps" else "proxy-throughput.rut" if engine == "rut-throughput" else None})
+                   "client_cpus": self.c["cpus"]["client"], "route_config": "proxy-rps.rut" if engine == "rut-rps" else "proxy-throughput.rut" if engine == "rut-throughput" else None,
+                   "provenance_fingerprint": provenance_fingerprint(self.c)})
         client = Path(__file__).with_name("run_client.py")
         for kind, duration, lua, target in (("warmup", self.c["warmup"], "warmup.lua", outdir / "warmup"),
                                             ("measurement", self.c["duration"], "request.lua", outdir / "measurement")):
@@ -405,6 +415,9 @@ class Matrix:
                 raise RuntimeError(f"invalid wrk result in {target}")
             if any(int(value) != 0 for value in records[0][6:11]):
                 raise RuntimeError(f"wrk errors in {target}: {' '.join(records[0])}")
+        verify_artifacts(self.c)
+        verify_payloads(self.c)
+        verify_provenance(self.c)
         (outdir / "valid.txt").write_text("warmup and measurement valid; error counters 0\n")
         under_load = [row for row in resource_records if row["phase"].startswith("under-load")]
         write_json(outdir / "resources-summary.json", {
@@ -470,6 +483,48 @@ def verify_payloads(config: dict) -> None:
                 raise RuntimeError(f"prepared payload hash mismatch for {body}/{filename}")
 
 
+def image_identity_matches(actual: str, expected: dict) -> bool:
+    actual_id = actual.rsplit("://", 1)[-1]
+    expected_id = expected.get("worker_id", "")
+    if expected_id and (actual_id == expected_id or actual_id.endswith(expected_id)):
+        return True
+    if "@" in actual_id:
+        actual_digest = actual_id.rsplit("@", 1)[-1]
+        return any("@" in candidate and candidate.rsplit("@", 1)[-1] == actual_digest
+                   for candidate in expected.get("worker_repo_digests", []))
+    return False
+
+
+def verify_provenance(config: dict) -> None:
+    if "input_snapshot" not in config or "image_identities" not in config:
+        raise RuntimeError("benchmark config lacks input/image provenance; rerun prepare.py")
+    try:
+        current_snapshot = snapshot_inputs({name: entry["path"]
+                                            for name, entry in config["input_snapshot"].items()})
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"cannot validate mounted benchmark inputs: {error}") from error
+    if current_snapshot != config["input_snapshot"]:
+        raise RuntimeError("mounted benchmark inputs changed since prepare.py")
+    docker = config["tools"]["docker"]
+    for name, identity in config["image_identities"].items():
+        if identity.get("docker_id"):
+            actual = invoke([docker, "image", "inspect", "--format", "{{.Id}}", identity["reference"]]).stdout.strip()
+            if actual != identity["docker_id"]:
+                raise RuntimeError(f"Docker image identity changed for {name}: expected {identity['docker_id']}, got {actual}")
+    inventory = json.loads(invoke([docker, "exec", config["worker_container"], "crictl", "images", "-o", "json"]).stdout)
+    images = inventory.get("images", [])
+    for name, identity in config["image_identities"].items():
+        expected_id = identity.get("worker_id")
+        if not expected_id:
+            raise RuntimeError(f"prepared worker image identity missing for {name}")
+        matches = [image for image in images
+                   if any(image_reference_matches(identity["reference"], candidate)
+                          for candidate in (image.get("repoTags") or []) + (image.get("repoDigests") or []))]
+        ids = {image.get("id") for image in matches if image.get("id")}
+        if ids != {expected_id}:
+            raise RuntimeError(f"kind worker image identity changed for {name}: expected {expected_id}, got {sorted(ids)}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="benchmark.json from prepare.py")
@@ -480,6 +535,7 @@ def main() -> int:
         parser.error("run prepare.py --verify-cluster --apply-configmaps before measurement")
     verify_artifacts(config)
     verify_payloads(config)
+    verify_provenance(config)
     matrix = Matrix(config)
     matrix.samples.mkdir(parents=True, exist_ok=True)
     plan_path = matrix.samples / "schedule.json"

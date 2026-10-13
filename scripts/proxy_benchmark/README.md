@@ -122,7 +122,7 @@ kind load docker-image --name "$CLUSTER" proxy-benchmark-client:local
 
 ## Configure and run
 
-Use fresh directories. `--output` must be empty. Both Rut directories need sibling `rut` and `rut-compile` files; each binary/compiler pair is hashed in `benchmark.json`. `prepare.py` verifies the explicit kubeconfig context, kind worker identity/mount, node label, namespace, Linkerd readiness, and helper affinity. The two generated ConfigMaps use a random run prefix and `kubectl create`, so an existing resource is never overwritten.
+Use fresh directories. `--output` must be empty. Both Rut directories need sibling `rut` and `rut-compile` files; each binary/compiler pair is hashed in `benchmark.json`. Preparation snapshots the recursive contents of `client_dir`, generated `rut_config_dir`, runtime libraries, `clang`, and `ld`; symlinks inside mounted inputs are rejected. Before resume and each cell, the runner checks those manifests, payload hashes, Docker and worker image identities, and the Rut artifact hashes. Keep the prepared paths and image contents unchanged for the full run; create a new output directory and prepare again after changing any input. `prepare.py` verifies the explicit kubeconfig context, kind worker identity/mount, node label, namespace, Linkerd readiness, and helper affinity. The two generated ConfigMaps use a random run prefix and `kubectl create`, so an existing resource is never overwritten.
 
 ```sh
 python3 scripts/proxy_benchmark/prepare.py \

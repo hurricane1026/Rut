@@ -35,6 +35,38 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(mask[-1 - cpu], "1")
             self.assertTrue(set(mask) <= {"0", "1"})
 
+    def test_cpu_affinity_lists_compare_as_sets_and_canonicalize_adjacent_helpers(self):
+        self.assertEqual(common.cpu_set("3,4,8,9"), common.cpu_set("3-4,8-9"))
+        self.assertNotEqual(common.cpu_set("3-4,8-9"), common.cpu_set("3-4,8-10"))
+        self.assertEqual(prepare.cpus("3-4,8-9", 4, "--origin-cpus"), [3, 4, 8, 9])
+        self.assertEqual(common.canonical_cpu_list({6, 7, 14}), "6-7,14")
+        helper_script = prepare.helper_verify_script([6, 7, 14], False)
+        self.assertIn("expected='6-7,14'", helper_script)
+        self.assertIn('"$allowed" != "$expected"', helper_script)
+
+    def test_image_reference_normalization_handles_docker_and_kubernetes_names(self):
+        self.assertTrue(common.image_reference_matches("nginx@sha256:abc", "docker.io/library/nginx@sha256:abc"))
+        self.assertTrue(common.image_reference_matches("client:local", "docker.io/library/client:local"))
+        self.assertFalse(common.image_reference_matches("client:local", "client:other"))
+        self.assertTrue(run_matrix.image_identity_matches(
+            "docker-pullable://docker.io/library/nginx@sha256:manifest",
+            {"worker_id": "sha256:config", "worker_repo_digests": ["nginx@sha256:manifest"]}))
+
+    def test_prepare_resolves_worker_images_through_cri_with_mocked_inventory(self):
+        identities = {
+            "nginx": {"reference": "nginx@sha256:abc"},
+            "client": {"reference": "client:local", "docker_id": "sha256:client"},
+        }
+        inventory = {"images": [
+            {"id": "sha256:nginx", "repoTags": [], "repoDigests": ["docker.io/library/nginx@sha256:abc"]},
+            {"id": "sha256:client", "repoTags": ["docker.io/library/client:local"], "repoDigests": []},
+        ]}
+        with mock.patch("prepare.run", return_value=json.dumps(inventory)) as run:
+            result = prepare.worker_image_identities("docker", "worker", identities)
+        self.assertEqual(result["nginx"]["worker_id"], "sha256:nginx")
+        self.assertEqual(result["client"]["worker_id"], "sha256:client")
+        self.assertEqual(run.call_args.args[0], ["docker", "exec", "worker", "crictl", "images", "-o", "json"])
+
     def test_nginx_origin_modes_match_the_two_topologies(self):
         native = prepare.nginx_origin(8081, [3, 4, 8, 9], "/data/proxy")
         linkerd = prepare.nginx_origin(8080, [3, 4, 8, 9], "/data/body.bin", "0.0.0.0")
@@ -135,11 +167,87 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
                     "--runtime-libs", str(checkpoint / "runtime-libs"),
                     "--clang", str(checkpoint / "runtime-tools" / "clang"), "--ld", str(checkpoint / "runtime-tools" / "ld"),
-                    "--client-image", "client:test"]
-            with mock.patch("sys.argv", argv):
+                    "--client-image", "client:test", "--helper-cpus", "15,16"]
+            docker_image = {"Id": "sha256:" + "a" * 64, "RepoDigests": []}
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run", return_value=json.dumps(docker_image)):
                 self.assertEqual(prepare.main(), 0)
             config = json.loads((output / "benchmark.json").read_text())
             self.assertEqual(config["tools"], {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"})
+            self.assertEqual(config["cpus"]["helpers"], "15-16")
+            self.assertEqual(config["image_identities"]["client"]["docker_id"], docker_image["Id"])
+            self.assertEqual(set(config["input_snapshot"]), {"client_dir", "rut_config_dir", "runtime_libs", "clang", "ld"})
+
+    def test_input_snapshot_detects_contents_membership_renames_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = root / "inputs"
+            tree.mkdir()
+            (tree / "a.txt").write_text("one")
+            baseline = common.snapshot_inputs({"bundle": tree})
+            (tree / "a.txt").write_text("two")
+            self.assertNotEqual(common.snapshot_inputs({"bundle": tree}), baseline)
+            (tree / "a.txt").write_text("one")
+            (tree / "b.txt").write_text("new")
+            self.assertNotEqual(common.snapshot_inputs({"bundle": tree}), baseline)
+            (tree / "b.txt").unlink()
+            (tree / "a.txt").rename(tree / "renamed.txt")
+            self.assertNotEqual(common.snapshot_inputs({"bundle": tree}), baseline)
+            (tree / "renamed.txt").unlink()
+            (tree / "link").symlink_to(root / "outside")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                common.snapshot_inputs({"bundle": tree})
+
+    def test_provenance_check_detects_image_retag_and_worker_image_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            (inputs / "request.lua").write_text("return true")
+            host_id = "sha256:" + "a" * 64
+            worker_id = "sha256:" + "b" * 64
+            config = {
+                "input_snapshot": common.snapshot_inputs({"client_dir": inputs}),
+                "tools": {"docker": "docker"}, "worker_container": "bench-worker",
+                "image_identities": {"client": {"reference": "client:local", "docker_id": host_id,
+                                                    "worker_id": worker_id}},
+            }
+            inventory = {"images": [{"id": worker_id, "repoTags": ["client:local"], "repoDigests": []}]}
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, host_id + "\n", ""),
+                    subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
+                run_matrix.verify_provenance(config)
+            (inputs / "request.lua").write_text("changed")
+            with mock.patch("run_matrix.invoke") as invoke:
+                with self.assertRaisesRegex(RuntimeError, "mounted benchmark inputs changed"):
+                    run_matrix.verify_provenance(config)
+                invoke.assert_not_called()
+            (inputs / "request.lua").write_text("return true")
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, "sha256:retagged\n", "")):
+                with self.assertRaisesRegex(RuntimeError, "Docker image identity changed"):
+                    run_matrix.verify_provenance(config)
+            inventory["images"][0]["id"] = "sha256:changed"
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, host_id + "\n", ""),
+                    subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
+                with self.assertRaisesRegex(RuntimeError, "kind worker image identity changed"):
+                    run_matrix.verify_provenance(config)
+
+    def test_summary_rejects_sample_from_different_input_or_image_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            validation = output / "samples" / "one" / "valid.txt"
+            validation.parent.mkdir(parents=True)
+            validation.write_text("valid\n")
+            row = {"validation_path": str(validation.relative_to(output))}
+            config = {"images": {"client": "client:local"},
+                      "image_identities": {"client": {"docker_id": "sha256:client", "worker_id": "sha256:node"}},
+                      "input_snapshot": {"client_dir": {"entries": {"request.lua": {"sha256": "abc"}}}}}
+            fingerprint = common.provenance_fingerprint(config)
+            (validation.parent / "cell.json").write_text(json.dumps({"provenance_fingerprint": fingerprint}))
+            summarize.validate_sample_provenance(output, row, fingerprint)
+            changed = common.provenance_fingerprint({**config, "images": {"client": "client:new"}})
+            with self.assertRaisesRegex(ValueError, "provenance does not match"):
+                summarize.validate_sample_provenance(output, row, changed)
 
     def test_run_rechecks_every_recorded_artifact_hash(self):
         with tempfile.TemporaryDirectory() as tmp:

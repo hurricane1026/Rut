@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 from pathlib import Path
+import stat
+import subprocess
 
 
 def load_config(path: str | Path) -> dict:
@@ -29,6 +30,85 @@ def sha256(path: str | Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def cpu_set(value: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in value.split(","):
+        if not part:
+            raise ValueError(f"invalid CPU list: {value!r}")
+        bounds = part.split("-")
+        if len(bounds) == 1 and bounds[0].isdigit():
+            start = end = int(bounds[0])
+        elif len(bounds) == 2 and all(bound.isdigit() for bound in bounds):
+            start, end = map(int, bounds)
+            if start > end:
+                raise ValueError(f"invalid CPU range: {part!r}")
+        else:
+            raise ValueError(f"invalid CPU list: {value!r}")
+        selected = set(range(start, end + 1))
+        if cpus & selected:
+            raise ValueError(f"overlapping CPU list entries: {value!r}")
+        cpus.update(selected)
+    return cpus
+
+
+def canonical_cpu_list(cpus: set[int]) -> str:
+    if not cpus:
+        raise ValueError("CPU list cannot be empty")
+    ordered = sorted(cpus)
+    ranges = []
+    start = previous = ordered[0]
+    for cpu in ordered[1:]:
+        if cpu == previous + 1:
+            previous = cpu
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = cpu
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def canonical_image_reference(reference: str) -> str:
+    name, separator, digest = reference.partition("@")
+    components = name.split("/")
+    if len(components) == 1:
+        name = f"docker.io/library/{name}"
+    elif "." not in components[0] and ":" not in components[0] and components[0] != "localhost":
+        name = f"docker.io/{name}"
+    return f"{name}@{digest}" if separator else name
+
+
+def image_reference_matches(reference: str, candidate: str) -> bool:
+    return canonical_image_reference(reference) == canonical_image_reference(candidate)
+
+
+def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
+    snapshot = {}
+    for name, raw_path in sorted(paths.items()):
+        root = Path(raw_path).resolve(strict=True)
+        entries = {}
+        selected = [root, *sorted(root.rglob("*"))] if root.is_dir() else [root]
+        for path in selected:
+            relative = "." if path == root else path.relative_to(root).as_posix()
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            if path.is_symlink():
+                raise ValueError(f"mounted input contains a symlink: {path}")
+            if path.is_dir():
+                entries[relative] = {"type": "directory", "mode": mode}
+            elif path.is_file():
+                entries[relative] = {"type": "file", "mode": mode, "size": path.stat().st_size,
+                                     "sha256": sha256(path)}
+            else:
+                raise ValueError(f"mounted input contains an unsupported file: {path}")
+        snapshot[name] = {"path": str(root), "entries": entries}
+    return snapshot
+
+
+def provenance_fingerprint(config: dict) -> str:
+    evidence = {key: config[key] for key in ("images", "image_identities", "input_snapshot")}
+    encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def host_path(config: dict, relative: str) -> Path:

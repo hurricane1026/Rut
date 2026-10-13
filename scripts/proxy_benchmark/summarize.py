@@ -7,7 +7,7 @@ from pathlib import Path
 import statistics
 import sys
 
-from common import load_config, write_json
+from common import load_config, provenance_fingerprint, write_json
 
 
 def sample_metrics(output: Path, relative: str) -> dict:
@@ -77,6 +77,15 @@ def resource_metrics(output: Path, row: dict) -> dict:
     return fields
 
 
+def validate_sample_provenance(output: Path, row: dict, expected: str) -> None:
+    cell_path = (output / row["validation_path"]).parent / "cell.json"
+    if not cell_path.is_file():
+        raise ValueError(f"sample has no provenance record: {row.get('validation_path')}")
+    cell = json.loads(cell_path.read_text())
+    if cell.get("provenance_fingerprint") != expected:
+        raise ValueError(f"sample provenance does not match prepared inputs: {row.get('validation_path')}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -88,6 +97,7 @@ def main() -> int:
     index = json.loads((sample_root / "index.json").read_text())
     samples = []
     seen = set()
+    expected_provenance = provenance_fingerprint(config)
     for row in index:
         key = (row["body_size"], row["engine"], row["rep"])
         if key in seen:
@@ -96,6 +106,7 @@ def main() -> int:
         valid = output / row["validation_path"]
         if not row.get("valid") or not valid.is_file():
             raise ValueError(f"sample lacks a valid marker: {key}")
+        validate_sample_provenance(output, row, expected_provenance)
         warm = sample_metrics(output, row["warmup_dir"])
         measurement = sample_metrics(output, row["measure_dir"])
         samples.append({**row, **measurement, **resource_metrics(output, row), "warmup": warm})
