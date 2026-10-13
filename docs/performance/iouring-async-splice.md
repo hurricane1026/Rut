@@ -358,3 +358,20 @@ binaries, source patches, the failing EOF regression and corrected test results
 remain in external prefetch-response-v1/v2 and prefetch-direct-v3 artifacts.
 Full network and sanitizer checks were not rerun on v3; this prototype is not
 claimed as a validated production feature.
+
+### Registered downstream SEND follow-up (rejected)
+
+An opt-in registered table bounded by min(connection capacity, RLIMIT_NOFILE)
+registered downstream sockets once and released slots after their operation
+ledger drained. Tests covered real repeated sends, queued close/slot reuse,
+forced partial sends and quarantined-index normal-fd fallback: 73 tests /
+100,376 checks passed. Fragmented 4 KiB, 64 KiB, 1 MiB responses preserved bytes.
+
+A same-binary 4 KiB 3 x 15 s screen was +3.38%, but cyclic 3 x 30 s with nginx
+was -4.68% against disabled registration (110,999.69 vs 116,453.03 requests/s),
++38.92% against nginx (79,899.91). All measurement/warmup errors were zero.
+Separate eBPF recorded 252 file updates / about one million requests, confirming
+updates were amortized, not per request. Ordinary SEND activation was rejected;
+the patch, binaries, tests and results remain in fixed-downstream-v2 artifacts.
+A separate registered splice destination experiment is not covered by this
+result and needs its own ownership and performance validation.
