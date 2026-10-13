@@ -489,6 +489,32 @@ static bool configure_study_policy(Loop* loop) {
                                                   : "RUT_STUDY_WS_SPLICE mode=off\n");
             }
         }
+        if constexpr (requires { loop->study_http_async_splice; }) {
+            for (const char* const* item = environ; *item != nullptr; ++item) {
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE=on"))
+                    loop->study_http_async_splice = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_NODELAY=on"))
+                    loop->study_http_async_splice_nodelay = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_CONTINUE=on"))
+                    loop->study_http_async_splice_continue = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_LINK=on")) {
+                    loop->study_http_async_splice = true;
+                    loop->study_http_async_splice_link = true;
+                }
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_MORE=on"))
+                    loop->study_http_async_splice_more = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_QUEUE_BUDGET=on"))
+                    loop->study_http_async_splice_queue_budget = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_ADAPTIVE_CHUNK=on"))
+                    loop->study_http_async_splice_adaptive_chunk = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_HARDLINK=on"))
+                    loop->study_http_async_splice_hardlink = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_SLICE_THRESHOLD=on"))
+                    loop->study_http_async_splice_slice_threshold = true;
+                if (str_eq(*item, "RUT_STUDY_HTTP_ASYNC_SPLICE_REPORT=on"))
+                    loop->report_http_async_splice = true;
+            }
+        }
         if constexpr (requires { loop->study_http_terminal_scan; }) {
             for (const char* const* item = environ; *item != nullptr; ++item)
                 if (str_eq(*item, "RUT_STUDY_HTTP_TERMINAL_SCAN=on")) {

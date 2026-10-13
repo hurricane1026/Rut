@@ -1193,7 +1193,8 @@ __attribute__((visibility("hidden"))) long rut_gate_io_uring_syscall(long number
             return libc_result(result);
         }
     }
-    if (number == __NR_io_uring_register && (int)arg1 == ring_view.fd) {
+    if (number == __NR_io_uring_register && (int)arg1 == ring_view.fd &&
+        arg2 == IORING_REGISTER_PBUF_RING) {
         const struct io_uring_buf_reg* registration = (const struct io_uring_buf_reg*)arg3;
         struct io_uring_buf_reg registration_copy;
         memset(&registration_copy, 0, sizeof(registration_copy));
