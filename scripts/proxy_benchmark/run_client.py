@@ -10,6 +10,20 @@ import time
 from common import load_config
 
 
+def start_and_stamp(docker: str, container: str, stamp: Path, *, timeout: float = 30.0) -> None:
+    subprocess.run([docker, "start", container], check=True, text=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = subprocess.run([docker, "inspect", "--format", "{{.State.Running}}", container],
+                               check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if state.stdout.strip() == "true":
+            stamp.write_text(f"{time.monotonic():.9f}\n")
+            return
+        time.sleep(0.02)
+    raise RuntimeError(f"client container {container} did not start within {timeout}s")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -45,14 +59,21 @@ def main() -> int:
                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         (output / "client-container-inspect.json").write_text(inspect.stdout)
         if args.lua == "request.lua":
-            (output / "measurement-start-monotonic.txt").write_text(f"{time.monotonic():.9f}\n")
-        sample = subprocess.run([config["tools"]["docker"], "start", "--attach", created],
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            start_and_stamp(config["tools"]["docker"], created, output / "measurement-start-monotonic.txt")
+            waited = subprocess.run([config["tools"]["docker"], "wait", created], check=True,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            sample = subprocess.run([config["tools"]["docker"], "logs", created], check=True,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            sample_returncode = int(waited.stdout.strip())
+        else:
+            sample = subprocess.run([config["tools"]["docker"], "start", "--attach", created],
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            sample_returncode = sample.returncode
         (output / "wrk.log").write_text(sample.stdout)
-        if sample.returncode or "cannot open /benchmark/" in sample.stdout or "METRICS " not in sample.stdout:
-            (output / "returncode.txt").write_text(f"{sample.returncode or 125}\n")
+        if sample_returncode or "cannot open /benchmark/" in sample.stdout or "METRICS " not in sample.stdout:
+            (output / "returncode.txt").write_text(f"{sample_returncode or 125}\n")
             (output / "invalid-reason.txt").write_text("wrk exit failure, Lua access failure, or missing METRICS line\n")
-            return sample.returncode or 125
+            return sample_returncode or 125
         (output / "returncode.txt").write_text("0\n")
         return 0
     except subprocess.CalledProcessError as error:

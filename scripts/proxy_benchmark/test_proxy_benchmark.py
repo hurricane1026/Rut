@@ -8,6 +8,7 @@ from unittest import mock
 
 import common
 import prepare
+import run_client
 import run_matrix
 import summarize
 
@@ -149,6 +150,49 @@ class ProxyBenchmarkTests(unittest.TestCase):
             path.write_bytes(b"changed")
             with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
                 run_matrix.verify_artifacts(config)
+
+    def test_prepared_payload_verification_detects_mutation_and_truncation_in_both_mount_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            payload_dir = checkpoint / "payloads" / "4k"
+            payload_dir.mkdir(parents=True)
+            content = b"prepared-payload"
+            for filename in ("proxy", "body.bin"):
+                (payload_dir / filename).write_bytes(content)
+            output = root / "output"
+            output.mkdir()
+            metadata = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+            (output / "payloads.json").write_text(json.dumps({"4k": metadata}))
+            config = {"output": str(output), "checkpoint": str(checkpoint), "bodies": {"4k": len(content)}}
+            run_matrix.verify_payloads(config)
+            for filename in ("proxy", "body.bin"):
+                path = payload_dir / filename
+                path.write_bytes(b"modified-payload")
+                with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                    run_matrix.verify_payloads(config)
+                path.write_bytes(content[:-1])
+                with self.assertRaisesRegex(RuntimeError, "size mismatch"):
+                    run_matrix.verify_payloads(config)
+                path.write_bytes(content)
+            run_matrix.verify_payloads(config)
+
+    def test_measurement_start_stamp_follows_delayed_docker_start_and_running_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stamp = Path(tmp) / "measurement-start-monotonic.txt"
+            state = [subprocess.CompletedProcess([], 0, "", ""),
+                     subprocess.CompletedProcess([], 0, "false\n", ""),
+                     subprocess.CompletedProcess([], 0, "true\n", "")]
+            with mock.patch("run_client.subprocess.run", side_effect=state) as docker_run, \
+                    mock.patch("run_client.time.sleep"), \
+                    mock.patch("run_client.time.monotonic", side_effect=[100.0, 100.1, 100.3, 100.8]):
+                run_client.start_and_stamp("docker", "wrk-container", stamp)
+            self.assertEqual(stamp.read_text(), "100.800000000\n")
+            self.assertEqual(docker_run.call_args_list[0].args[0], ["docker", "start", "wrk-container"])
+            self.assertEqual(docker_run.call_args_list[1].args[0],
+                             ["docker", "inspect", "--format", "{{.State.Running}}", "wrk-container"])
+            self.assertEqual(docker_run.call_args_list[2].args[0],
+                             ["docker", "inspect", "--format", "{{.State.Running}}", "wrk-container"])
 
     def test_frontend_readiness_retries_probe_timeouts_and_connection_failures(self):
         with tempfile.TemporaryDirectory() as tmp:

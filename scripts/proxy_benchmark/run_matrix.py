@@ -284,6 +284,7 @@ class Matrix:
 
     def run_cell(self, body: str, engine: str, rep: int) -> Path:
         verify_artifacts(self.c)
+        verify_payloads(self.c)
         label = f"{body}-{engine}-r{rep}"
         pod_name = f"proxybench-{self.c['run_id']}-{body}-{rep}-{engine}"
         outdir = self.samples / body / label
@@ -446,6 +447,29 @@ def verify_artifacts(config: dict) -> None:
             raise RuntimeError(f"recorded artifact hash mismatch for {name}: expected {artifact['sha256']}, got {actual}")
 
 
+def verify_payloads(config: dict) -> None:
+    prepared = json.loads((Path(config["output"]) / "payloads.json").read_text())
+    bodies = config["bodies"]
+    if set(prepared) != set(bodies):
+        raise RuntimeError("prepared payload metadata does not match configured bodies")
+    for body, configured_size in bodies.items():
+        metadata = prepared[body]
+        expected_size = int(configured_size)
+        if metadata.get("bytes") != expected_size:
+            raise RuntimeError(f"prepared payload size metadata mismatch for {body}")
+        for filename in ("proxy", "body.bin"):
+            path = Path(config["checkpoint"]) / "payloads" / body / filename
+            if not path.is_file():
+                raise RuntimeError(f"prepared payload is missing: {path}")
+            actual_size = path.stat().st_size
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"prepared payload size mismatch for {body}/{filename}: expected {expected_size}, got {actual_size}"
+                )
+            if Matrix.file_sha(path) != metadata["sha256"]:
+                raise RuntimeError(f"prepared payload hash mismatch for {body}/{filename}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="benchmark.json from prepare.py")
@@ -455,6 +479,7 @@ def main() -> int:
     if not config.get("verified_cluster_checks") or not config.get("configmaps_applied"):
         parser.error("run prepare.py --verify-cluster --apply-configmaps before measurement")
     verify_artifacts(config)
+    verify_payloads(config)
     matrix = Matrix(config)
     matrix.samples.mkdir(parents=True, exist_ok=True)
     plan_path = matrix.samples / "schedule.json"
