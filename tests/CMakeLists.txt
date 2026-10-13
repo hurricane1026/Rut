@@ -472,6 +472,11 @@ find_package(Threads REQUIRED)
 target_link_libraries(test_fixture_bounded_http_exchange PRIVATE Threads::Threads)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME test_proxy_benchmark_tools
+         COMMAND ${Python3_EXECUTABLE} -m unittest discover
+                 -s ${PROJECT_SOURCE_DIR}/scripts/proxy_benchmark -p "test_*.py")
+set_tests_properties(test_proxy_benchmark_tools PROPERTIES LABELS "unit;benchmark" TIMEOUT 120)
+
 add_test(NAME test_routing_corpus
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py)
 set_tests_properties(test_routing_corpus PROPERTIES LABELS "unit;routing" TIMEOUT 120)

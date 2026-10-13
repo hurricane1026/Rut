@@ -1,0 +1,353 @@
+[
+  {
+    "engine": "nginx",
+    "image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+    "path": "/usr/sbin/nginx",
+    "bytes": 1660648,
+    "sha256": "d19a66b9e5eedf2611b0f5cf03a1569989bf472a7d2f3bae5b3a92a45829a8e9",
+    "stripped_bytes": 1660648,
+    "file_description": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=bd1f749764f46f3fd768ec55e4ccd36626053b7a, for GNU/Linux 3.2.0, stripped",
+    "needed_shared_libraries": [
+      "libcrypt.so.1",
+      "libpcre2-8.so.0",
+      "libssl.so.3",
+      "libcrypto.so.3",
+      "libz.so.1",
+      "libc.so.6"
+    ],
+    "runtime_shared_files": [
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libcrypt.so.1"
+        ],
+        "bytes": 206776,
+        "sha256": "436788729ab71d794a66954d62e930c723e624587f39beb2f4f86ff1000b1d29"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libpcre2-8.so.0"
+        ],
+        "bytes": 711216,
+        "sha256": "8ee551e7f9645d6212c017df0938062ba046608a5378aab7d7c01c47b81a9f50"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libssl.so.3"
+        ],
+        "bytes": 1101760,
+        "sha256": "6c390dafadc5179f764f316ff03c788866d9d79124c3ff48bd1957b330917a89"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libcrypto.so.3"
+        ],
+        "bytes": 6513216,
+        "sha256": "cdc5fc45400dc2e1c0f993ef56794bb3b3b75e57da2bd0b6e345e0e5f7e44406"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libz.so.1"
+        ],
+        "bytes": 125376,
+        "sha256": "85590dd58edf5445e18bc7193e5ebc01ac5841f1ae187e97705a662e90c6421e"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libc.so.6"
+        ],
+        "bytes": 1995216,
+        "sha256": "adeedbc69ac402b762a3bd94759441e0546c33972cb2c0f5bc6869a2d32efed6"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libzstd.so.1"
+        ],
+        "bytes": 825336,
+        "sha256": "27f07c9a49c2c956bcfb64cd4712976586a66facbf15fc7f09bc37413b5f2b21"
+      },
+      {
+        "paths": [
+          "/lib64/ld-linux-x86-64.so.2"
+        ],
+        "bytes": 225672,
+        "sha256": "8c1cf687490f3f7858528ceb4e651b979f625e43396431bec65e5bb89cb63860"
+      }
+    ],
+    "runtime_shared_bytes": 11704568,
+    "stripped_executable_plus_shared_bytes": 13365216
+  },
+  {
+    "engine": "envoy",
+    "image": "envoyproxy/envoy@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4",
+    "path": "/usr/local/bin/envoy",
+    "bytes": 105039832,
+    "sha256": "002c6e1c69ed0fa0ea381887247cadadfaec9481375fa8d8d2b1731eeabf40b8",
+    "stripped_bytes": 105039832,
+    "file_description": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=b579d07d3ad7ee11d32b105e91a5a39ad24718d7, stripped",
+    "needed_shared_libraries": [
+      "libm.so.6",
+      "librt.so.1",
+      "libdl.so.2",
+      "libpthread.so.0",
+      "libc.so.6",
+      "ld-linux-x86-64.so.2"
+    ],
+    "runtime_shared_files": [
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libm.so.6"
+        ],
+        "bytes": 940560,
+        "sha256": "df621c68dbfed7e843434ef2faedb9f4d4b0543ad161e9a55eaf4d4ce2443176"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/librt.so.1"
+        ],
+        "bytes": 14664,
+        "sha256": "83eda8758c8697323bedf48bc0186c006cca2205441a988cb0f5072b96262100"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libdl.so.2"
+        ],
+        "bytes": 14432,
+        "sha256": "d255ba9c9e3a7c35115e578c898147edaba1a2bcf742cc3a76995ceed9d5ac4f"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libpthread.so.0"
+        ],
+        "bytes": 21448,
+        "sha256": "fbed9505adacada2abb37c6b43be2df6de81e742712c6025694ba48de62c7e78"
+      },
+      {
+        "paths": [
+          "/lib/x86_64-linux-gnu/libc.so.6"
+        ],
+        "bytes": 2220400,
+        "sha256": "e01b1ce7be2987f3b8560e26d0df2623f9dd5cec17be923ae28a785bc0d32d50"
+      },
+      {
+        "paths": [
+          "/lib64/ld-linux-x86-64.so.2"
+        ],
+        "bytes": 240936,
+        "sha256": "8d06f393f4a93bcf9b81145a259524d66a95522a646bf8d7e05b6ffdf2e63dcc"
+      }
+    ],
+    "runtime_shared_bytes": 3452440,
+    "stripped_executable_plus_shared_bytes": 108492272
+  },
+  {
+    "engine": "rut",
+    "path": "rut",
+    "source_revision": "9543573a0afab74810d8562efe3e2117a4afc19d",
+    "bytes": 13282752,
+    "sha256": "12107117dbbcffd15bcf324f2213635b6bb1e5f4e8afd499c4afeb9199fa4af7",
+    "stripped_bytes": 3514688,
+    "file_description": "ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=f2b3024c5a6bf6d1a8aa18b657e0f07da532259a, for GNU/Linux 3.2.0, with debug_info, not stripped",
+    "needed_shared_libraries": [
+      "libstdc++.so.6",
+      "libm.so.6",
+      "libgcc_s.so.1",
+      "libc.so.6"
+    ],
+    "runtime_shared_files": [
+      {
+        "paths": [
+          "/lib64/libstdc++.so.6"
+        ],
+        "bytes": 2884696,
+        "sha256": "fc224ee3cc56b9b3e58453bfb9a0cac3a696e60fd33ba48b6a30eb22b76cc867"
+      },
+      {
+        "paths": [
+          "/lib64/libm.so.6"
+        ],
+        "bytes": 1153848,
+        "sha256": "16a03ce6d24c8a46742206d4a9c1d35bb6577ae2384f153dc6ef4a4b62b5357f"
+      },
+      {
+        "paths": [
+          "/lib64/libgcc_s.so.1"
+        ],
+        "bytes": 186512,
+        "sha256": "c71a62b5ef442ab8cf4470874dee6f2383d73a744f0006b6d287412f131c2e09"
+      },
+      {
+        "paths": [
+          "/lib64/libc.so.6"
+        ],
+        "bytes": 2482096,
+        "sha256": "a5c5ad9d59d3c69eda93aa8f82930ba06cc4e893a113e66c85ad6e96243d53c8"
+      },
+      {
+        "paths": [
+          "/lib64/ld-linux-x86-64.so.2"
+        ],
+        "bytes": 1002600,
+        "sha256": "4e5d39355699e90fa29313d3100e82af4a23290028c58c364d6a249ef6a78e5e"
+      }
+    ],
+    "runtime_shared_bytes": 7709752,
+    "stripped_executable_plus_shared_bytes": 11224440
+  },
+  {
+    "engine": "rut-compile",
+    "path": "rut-compile",
+    "source_revision": "9543573a0afab74810d8562efe3e2117a4afc19d",
+    "bytes": 7420872,
+    "sha256": "311a22a9bd531007a05682293dd82eb20d68a3ee6ba7eeeb2527a5b9b074d4ea",
+    "stripped_bytes": 6386640,
+    "file_description": "ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, BuildID[sha1]=a9c499da16254e4959e0d6e29c1ff43812d9e6ef, for GNU/Linux 3.2.0, not stripped",
+    "needed_shared_libraries": [
+      "libLLVM.so.22.1",
+      "libstdc++.so.6",
+      "libm.so.6",
+      "libgcc_s.so.1",
+      "libc.so.6"
+    ],
+    "runtime_shared_files": [
+      {
+        "paths": [
+          "/lib64/libLLVM.so.22.1"
+        ],
+        "bytes": 147082848,
+        "sha256": "aec1ccf02e5cc4d161920d76dce31dbbb22efebf62da71ec3180b70ff15d77bb"
+      },
+      {
+        "paths": [
+          "/lib64/libstdc++.so.6"
+        ],
+        "bytes": 2884696,
+        "sha256": "fc224ee3cc56b9b3e58453bfb9a0cac3a696e60fd33ba48b6a30eb22b76cc867"
+      },
+      {
+        "paths": [
+          "/lib64/libm.so.6"
+        ],
+        "bytes": 1153848,
+        "sha256": "16a03ce6d24c8a46742206d4a9c1d35bb6577ae2384f153dc6ef4a4b62b5357f"
+      },
+      {
+        "paths": [
+          "/lib64/libgcc_s.so.1"
+        ],
+        "bytes": 186512,
+        "sha256": "c71a62b5ef442ab8cf4470874dee6f2383d73a744f0006b6d287412f131c2e09"
+      },
+      {
+        "paths": [
+          "/lib64/libc.so.6"
+        ],
+        "bytes": 2482096,
+        "sha256": "a5c5ad9d59d3c69eda93aa8f82930ba06cc4e893a113e66c85ad6e96243d53c8"
+      },
+      {
+        "paths": [
+          "/lib64/libffi.so.8"
+        ],
+        "bytes": 65584,
+        "sha256": "05bf4048cc0fd016140d7d880c4a4ec402096732f60463c8fb87b98d877d3628"
+      },
+      {
+        "paths": [
+          "/lib64/libedit.so.0"
+        ],
+        "bytes": 236720,
+        "sha256": "6207e9f03bc88695e2a0ac23d01751cca6f7eaf2a845d60efce635726fac5cc4"
+      },
+      {
+        "paths": [
+          "/lib64/libz.so.1"
+        ],
+        "bytes": 169544,
+        "sha256": "bbde8faec092a7c67b8bd76bbba4a826e61b05c171b97004ce6b308c5a090351"
+      },
+      {
+        "paths": [
+          "/lib64/libzstd.so.1"
+        ],
+        "bytes": 959384,
+        "sha256": "70ec54d150f4052f28fb1e8f8a1c6ca35e1a499e4744c6f6d9d783537618f80b"
+      },
+      {
+        "paths": [
+          "/lib64/libxml2.so.2"
+        ],
+        "bytes": 1523128,
+        "sha256": "8473a76caaed1e702f5c4f2dfac69b4aa92d2f18217edcf23c73214ea7750ab5"
+      },
+      {
+        "paths": [
+          "/lib64/ld-linux-x86-64.so.2"
+        ],
+        "bytes": 1002600,
+        "sha256": "4e5d39355699e90fa29313d3100e82af4a23290028c58c364d6a249ef6a78e5e"
+      },
+      {
+        "paths": [
+          "/lib64/libtinfo.so.6"
+        ],
+        "bytes": 187232,
+        "sha256": "b053da6b12bebc6e239835fbb646d46f26c97942b3098ac7b01604f8ce827679"
+      },
+      {
+        "paths": [
+          "/lib64/liblzma.so.5"
+        ],
+        "bytes": 219768,
+        "sha256": "18b4994cd29a3e39f35ad719702925740703e76057fb2ce8c0eb7c7ce7a3acef"
+      }
+    ],
+    "runtime_shared_bytes": 158153960,
+    "stripped_executable_plus_shared_bytes": 164540600
+  },
+  {
+    "engine": "linkerd",
+    "image": "cr.l5d.io/linkerd/proxy@sha256:f2add36071cfca33754d2930800860785aaed672590bc0207be2f4da9889eb11",
+    "path": "/usr/lib/linkerd/linkerd2-proxy",
+    "bytes": 23005488,
+    "sha256": "66392f6fc9e19a9ca5b77a4d3566a3fabb3d288a559d86f0fe31cc447d1fb92f",
+    "stripped_bytes": 23005488,
+    "file_description": "ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=9600a678bd360622fcce8e8a623235f1ed35839d, stripped",
+    "needed_shared_libraries": [
+      "libgcc_s.so.1",
+      "libm.so.6",
+      "libc.so.6"
+    ],
+    "runtime_shared_files": [
+      {
+        "paths": [
+          "/usr/lib/libgcc_s.so.1"
+        ],
+        "bytes": 202104,
+        "sha256": "03337136f58b3f335f6e172e3c386b4b8fdc0fc66cde7a00d9e06326c8eb8877"
+      },
+      {
+        "paths": [
+          "/lib/libm.so.6"
+        ],
+        "bytes": 1248896,
+        "sha256": "c23b4b6198244b13bb3b3091599ae2e310ac15a47019c408bbf8c0912aab9fda"
+      },
+      {
+        "paths": [
+          "/usr/lib/libc.so.6"
+        ],
+        "bytes": 2428944,
+        "sha256": "c8d2dad428a7b6ef6f82677070218af5b29e26aaba45d94e078243e0d386ac5d"
+      },
+      {
+        "paths": [
+          "/lib64/ld-linux-x86-64.so.2"
+        ],
+        "bytes": 272328,
+        "sha256": "33ba0aa95dc9b16cf50fafec43e65fd871b645e69e5ddb9aab785111cedc92b6"
+      }
+    ],
+    "runtime_shared_bytes": 4152272,
+    "stripped_executable_plus_shared_bytes": 27157760
+  }
+]

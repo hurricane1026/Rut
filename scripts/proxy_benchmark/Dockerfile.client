@@ -1,0 +1,29 @@
+# Optional benchmark client image. This is not a Rut build/runtime dependency.
+ARG BASE_IMAGE=nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40
+ARG WRK_COMMIT=a211dd5a7050b1f9e8a9870b95513060e72ac4a0
+
+FROM ${BASE_IMAGE} AS wrk-build
+ARG WRK_COMMIT
+COPY third_party/boringssl /tmp/boringssl-src
+COPY --from=wrk-source / /tmp/wrk
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates build-essential cmake ninja-build unzip \
+    && rm -rf /var/lib/apt/lists/*
+RUN test "$(cat /tmp/wrk/.benchmark-source-revision)" = "${WRK_COMMIT}"
+RUN cmake -S /tmp/boringssl-src -B /tmp/boringssl-build -GNinja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+    && cmake --build /tmp/boringssl-build --target ssl crypto \
+    && mkdir -p /tmp/boringssl/include /tmp/boringssl/lib \
+    && cp -a /tmp/boringssl-src/include/openssl /tmp/boringssl/include/ \
+    && find /tmp/boringssl-build -name libssl.a -exec cp {} /tmp/boringssl/lib/ \; \
+    && find /tmp/boringssl-build -name libcrypto.a -exec cp {} /tmp/boringssl/lib/ \; \
+    && test -s /tmp/boringssl/lib/libssl.a \
+    && test -s /tmp/boringssl/lib/libcrypto.a
+RUN sed -i '/^LIBS := -lluajit-5.1 /a LIBS += -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic' /tmp/wrk/Makefile \
+    && make -C /tmp/wrk WITH_OPENSSL=/tmp/boringssl VER="${WRK_COMMIT}"
+
+FROM ${BASE_IMAGE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=wrk-build /tmp/wrk/wrk /usr/local/bin/wrk
+ENTRYPOINT ["/usr/local/bin/wrk"]
