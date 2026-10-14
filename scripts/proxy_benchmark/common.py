@@ -102,12 +102,22 @@ def verify_client_image_config_identity(identity: dict) -> None:
 
 def normalized_linkerd_injection_spec(pod: dict) -> dict:
     spec = pod.get("spec", {})
+    injected = [item for item in spec.get("containers", []) + spec.get("initContainers", [])
+                if item.get("name", "").startswith("linkerd-")]
+    service_account_volume_names = {
+        mount["name"] for item in injected for mount in item.get("volumeMounts", [])
+        if (mount.get("name", "").startswith("kube-api-access-") and
+            mount.get("mountPath") == "/var/run/secrets/kubernetes.io/serviceaccount")}
+
+    def normalized_volume_name(name: str) -> str:
+        return "kube-api-access" if name in service_account_volume_names else name
+
     def normalize_container(item: dict) -> dict:
         normalized = copy.deepcopy(item)
         for mount in normalized.get("volumeMounts", []):
             if (mount.get("name", "").startswith("kube-api-access-") and
                     mount.get("mountPath") == "/var/run/secrets/kubernetes.io/serviceaccount"):
-                mount["name"] = "kube-api-access"
+                mount["name"] = normalized_volume_name(mount["name"])
         return normalized
 
     containers = sorted((normalize_container(item) for item in spec.get("containers", [])
@@ -119,7 +129,17 @@ def normalized_linkerd_injection_spec(pod: dict) -> dict:
     proxies = [item for item in containers + init_containers if item.get("name") == "linkerd-proxy"]
     if len(proxies) != 1:
         raise ValueError(f"Linkerd admission must inject exactly one linkerd-proxy; found {len(proxies)}")
-    return {"containers": containers, "initContainers": init_containers}
+    mounted_names = {normalized_volume_name(mount["name"]) for item in containers + init_containers
+                     for mount in item.get("volumeMounts", []) if mount.get("name")}
+    volumes = []
+    for item in spec.get("volumes", []):
+        if normalized_volume_name(item.get("name", "")) not in mounted_names:
+            continue
+        normalized = copy.deepcopy(item)
+        normalized["name"] = normalized_volume_name(normalized["name"])
+        volumes.append(normalized)
+    volumes.sort(key=lambda item: item.get("name", ""))
+    return {"containers": containers, "initContainers": init_containers, "volumes": volumes}
 
 
 def snapshot_inputs(paths: dict[str, str | Path]) -> dict:

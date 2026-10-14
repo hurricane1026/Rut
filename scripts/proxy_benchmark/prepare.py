@@ -155,22 +155,24 @@ def applied_configmap_identity(actual: dict, expected_data: dict) -> dict:
     return {"uid": actual["metadata"]["uid"], "data": actual["data"]}
 
 
-def configmap_is_owned_by_run(actual: dict, name: str, namespace: str, run_id: str) -> bool:
+def configmap_is_owned_by_run(actual: dict, name: str, namespace: str,
+                              run_id: str, attempt_id: str) -> bool:
     metadata = actual.get("metadata", {})
     labels = metadata.get("labels", {})
     return (metadata.get("name") == name and metadata.get("namespace") == namespace and
             labels.get("app.kubernetes.io/managed-by") == "rut-proxy-benchmark" and
-            labels.get("benchmark-run-id") == run_id)
+            labels.get("benchmark-run-id") == run_id and
+            labels.get("benchmark-create-attempt") == attempt_id)
 
 
-def cleanup_owned_configmaps(kubectl: list[str], namespace: str, run_id: str,
+def cleanup_owned_configmaps(kubectl: list[str], namespace: str, run_id: str, attempt_id: str,
                              manifests: dict[str, dict]) -> None:
     for manifest in manifests.values():
         metadata = manifest["metadata"]
         name = metadata["name"]
         try:
             actual = json.loads(run(kubectl + ["get", "configmap", name, "-n", namespace, "-o", "json"]))
-            if not configmap_is_owned_by_run(actual, name, namespace, run_id):
+            if not configmap_is_owned_by_run(actual, name, namespace, run_id, attempt_id):
                 continue
             run(kubectl + ["delete", "configmap", name, "-n", namespace,
                            "--ignore-not-found=true", "--wait=true"])
@@ -179,7 +181,7 @@ def cleanup_owned_configmaps(kubectl: list[str], namespace: str, run_id: str,
             continue
 
 
-def apply_configmaps(kubectl: list[str], namespace: str, run_id: str,
+def apply_configmaps(kubectl: list[str], namespace: str, run_id: str, attempt_id: str,
                      manifests: dict[str, dict], paths: dict[str, Path]) -> dict:
     try:
         run(kubectl + ["create", "-f", str(paths["native"]), "-f", str(paths["linkerd"])])
@@ -189,12 +191,12 @@ def apply_configmaps(kubectl: list[str], namespace: str, run_id: str,
             cm_name = expected["metadata"]["name"]
             actual = json.loads(run(kubectl + ["get", "configmap", cm_name,
                                                "-n", namespace, "-o", "json"]))
-            if not configmap_is_owned_by_run(actual, cm_name, namespace, run_id):
+            if not configmap_is_owned_by_run(actual, cm_name, namespace, run_id, attempt_id):
                 raise RuntimeError(f"ConfigMap {cm_name} ownership differs from this benchmark run")
             identities[name] = applied_configmap_identity(actual, expected["data"])
         return identities
     except BaseException:
-        cleanup_owned_configmaps(kubectl, namespace, run_id, manifests)
+        cleanup_owned_configmaps(kubectl, namespace, run_id, attempt_id, manifests)
         raise
 
 
@@ -482,7 +484,9 @@ def main() -> int:
     front = f'''worker_processes 1;\nworker_cpu_affinity {mask(a.proxy_cpu)};\nerror_log /dev/stderr crit;\npid /tmp/nginx-front.pid;\nevents {{ worker_connections 4096; }}\nhttp {{ access_log off;\nupstream origin {{ server 127.0.0.1:8081; keepalive 4096; keepalive_timeout 60s; keepalive_requests 1000000000; }}\nserver {{ listen 0.0.0.0:8080; server_name _; keepalive_requests 1000000000;\nlocation = /proxy {{ proxy_pass http://origin; proxy_http_version 1.1; proxy_set_header Host $http_host; proxy_set_header Connection ""; proxy_buffering off; proxy_buffer_size 1024k; proxy_buffers 8 1024k; proxy_busy_buffers_size 1024k; proxy_max_temp_file_size 0; }} }}\n}}\n'''
     native_origin = nginx_origin(8081, origin_cpus, "/data/proxy")
     linkerd_origin = nginx_origin(8080, origin_cpus, "/data/body.bin", "0.0.0.0")
-    owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark", "benchmark-run-id": run_id}
+    create_attempt_id = uuid.uuid4().hex
+    owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark", "benchmark-run-id": run_id,
+                    "benchmark-create-attempt": create_attempt_id}
     native = {"apiVersion": "v1", "kind": "ConfigMap", "immutable": True, "metadata": {"name": f"pb-{run_id}-native", "namespace": a.namespace, "labels": owner_labels},
               "data": {"front-nginx.conf": front, "origin-nginx.conf": native_origin, "envoy-bootstrap.json": json.dumps(envoy_config(), separators=(",", ":"))}}
     linkerd = {"apiVersion": "v1", "kind": "ConfigMap", "immutable": True, "metadata": {"name": f"pb-{run_id}-linkerd", "namespace": a.namespace, "labels": owner_labels},
@@ -556,7 +560,7 @@ def main() -> int:
                      for name in ("native", "linkerd")}
         config["configmap_identities"] = apply_configmaps(
             [a.kubectl_bin, "--kubeconfig", str(a.kubeconfig.resolve())],
-            a.namespace, run_id, manifests,
+            a.namespace, run_id, create_attempt_id, manifests,
             {name: output / f"{name}-configmap.json" for name in manifests})
         config["configmaps_applied"] = True
     else:

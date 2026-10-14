@@ -2,6 +2,7 @@
 """Run one wrk sample from the kind worker network namespace."""
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -18,7 +19,15 @@ def start_and_stamp(docker: str, container: str, stamp: Path, *, timeout: float 
         state = subprocess.run([docker, "inspect", "--format", "{{.State.Running}}", container],
                                check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if state.stdout.strip() == "true":
-            stamp.write_text(f"{time.monotonic():.9f}\n")
+            temporary = stamp.with_name(f".{stamp.name}.{os.getpid()}.tmp")
+            try:
+                temporary.write_text(f"{time.monotonic():.9f}\n")
+                os.replace(temporary, stamp)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
             return
         time.sleep(0.02)
     raise RuntimeError(f"client container {container} did not start within {timeout}s")

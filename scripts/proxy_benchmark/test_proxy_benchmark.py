@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -327,46 +328,51 @@ class ProxyBenchmarkTests(unittest.TestCase):
 
     def test_configmap_apply_failure_cleans_only_resources_confirmed_owned_by_run(self):
         run_id = "run123"
+        attempt_id = "attempt-current"
         namespace = "bench"
         manifests = {}
         paths = {}
         for name in ("native", "linkerd"):
             manifests[name] = {"metadata": {"name": f"pb-{run_id}-{name}", "namespace": namespace,
                 "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
-                           "benchmark-run-id": run_id}}, "data": {"config": name}}
+                           "benchmark-run-id": run_id, "benchmark-create-attempt": attempt_id}},
+                "data": {"config": name}}
             paths[name] = Path(f"/{name}.json")
         owned = {"metadata": {**manifests["native"]["metadata"], "uid": "native-uid"},
                  "data": manifests["native"]["data"], "immutable": True}
         unrelated = {"metadata": {**manifests["linkerd"]["metadata"], "uid": "other-uid",
-                                   "labels": {"app.kubernetes.io/managed-by": "someone-else",
-                                               "benchmark-run-id": run_id}},
+                                   "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                                               "benchmark-run-id": run_id,
+                                               "benchmark-create-attempt": "attempt-old"}},
                      "data": manifests["linkerd"]["data"], "immutable": True}
         with mock.patch("prepare.run", side_effect=[
                 RuntimeError("create response lost after partial success"),
                 json.dumps(owned), "", json.dumps(unrelated)]
                 ) as run:
             with self.assertRaisesRegex(RuntimeError, "create response lost"):
-                prepare.apply_configmaps(["kubectl"], namespace, run_id, manifests, paths)
+                prepare.apply_configmaps(["kubectl"], namespace, run_id, attempt_id, manifests, paths)
         deletes = [call.args[0] for call in run.call_args_list if "delete" in call.args[0]]
         self.assertEqual(deletes, [["kubectl", "delete", "configmap", "pb-run123-native", "-n", namespace,
                                     "--ignore-not-found=true", "--wait=true"]])
 
     def test_configmap_identity_failure_rolls_back_and_preserves_original_error(self):
         run_id = "run456"
+        attempt_id = "attempt-current"
         namespace = "bench"
         manifests = {}
         paths = {}
         for name in ("native", "linkerd"):
             manifests[name] = {"metadata": {"name": f"pb-{run_id}-{name}", "namespace": namespace,
                 "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
-                           "benchmark-run-id": run_id}}, "data": {"config": name}}
+                           "benchmark-run-id": run_id, "benchmark-create-attempt": attempt_id}},
+                "data": {"config": name}}
             paths[name] = Path(f"/{name}.json")
         mismatched = {"metadata": {**manifests["native"]["metadata"], "uid": "native-uid"},
                       "data": {"config": "stale"}, "immutable": True}
         with mock.patch("prepare.run", side_effect=["created", json.dumps(mismatched),
                 json.dumps(mismatched), RuntimeError("delete unavailable"), RuntimeError("not found")]) as run:
             with self.assertRaisesRegex(RuntimeError, "data differs"):
-                prepare.apply_configmaps(["kubectl"], namespace, run_id, manifests, paths)
+                prepare.apply_configmaps(["kubectl"], namespace, run_id, attempt_id, manifests, paths)
         self.assertTrue(any("delete" in call.args[0] for call in run.call_args_list))
 
     def test_linkerd_probe_waits_for_pull_records_identity_and_deletes_probe(self):
@@ -494,6 +500,34 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertNotEqual(common.provenance_fingerprint({"linkerd_injected_spec": left_normalized}),
                             common.provenance_fingerprint(changed_config))
 
+    def test_linkerd_injection_spec_binds_referenced_volume_definitions(self):
+        def pod(token_suffix, audience="linkerd", medium="Memory", app_value="before"):
+            return {"spec": {
+                "containers": [
+                    {"name": "origin", "volumeMounts": [{"name": "app-data", "mountPath": "/app"}]},
+                    {"name": "linkerd-proxy", "volumeMounts": [
+                        {"name": f"kube-api-access-{token_suffix}",
+                         "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount"},
+                        {"name": "linkerd-identity", "mountPath": "/var/run/linkerd/identity"}]},
+                ],
+                "initContainers": [{"name": "linkerd-init", "volumeMounts": [
+                    {"name": "linkerd-init-state", "mountPath": "/run/linkerd"}]}],
+                "volumes": [
+                    {"name": "kube-api-access-" + token_suffix,
+                     "projected": {"sources": [{"serviceAccountToken": {
+                         "audience": audience, "expirationSeconds": 86400}}]}},
+                    {"name": "linkerd-identity", "emptyDir": {"medium": medium}},
+                    {"name": "linkerd-init-state", "emptyDir": {}},
+                    {"name": "app-data", "configMap": {"name": app_value}},
+                ]}}
+        baseline = common.normalized_linkerd_injection_spec(pod("random-a"))
+        self.assertEqual(baseline, common.normalized_linkerd_injection_spec(pod("random-b")))
+        self.assertEqual([volume["name"] for volume in baseline["volumes"]],
+                         ["kube-api-access", "linkerd-identity", "linkerd-init-state"])
+        for changed in (pod("random-c", audience="other"), pod("random-d", medium="")):
+            self.assertNotEqual(baseline, common.normalized_linkerd_injection_spec(changed))
+        self.assertEqual(baseline, common.normalized_linkerd_injection_spec(pod("random-e", app_value="changed")))
+
     def test_client_create_timeout_still_removes_deterministic_container_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "measurement"
@@ -575,7 +609,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 elif argv[-1].endswith("cpu.max"):
                     result = "max 100000\n"
                 elif len(argv) > 1 and argv[-2] == "-c":
-                    result = "origin 2\n" if "100" in argv[-1] else "linkerd-proxy 3\n"
+                    result = "100 origin 2\n" if "100" in argv[-1] else "200 linkerd-proxy 3\n"
                 elif "readlink" in argv:
                     result = "/usr/bin/nginx\n"
                 elif "stat" in argv:
@@ -600,16 +634,31 @@ class ProxyBenchmarkTests(unittest.TestCase):
                   "kubeconfig": "/tmp/kube"}
         matrix = run_matrix.Matrix(config)
         runtime = [{"name": "origin", "container_id": "abc", "pid": 5,
-                    "processes": [{"pid": "5", "name": "origin", "allowed": "2"}]}]
-        outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", "origin 2\n"]
+                    "processes": [{"pid": "5", "tid": 5, "name": "origin", "allowed": "2"}]}]
+        outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", "5 origin 2\n"]
         with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
                         subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
             matrix.verify_live_runtime(runtime)
-        outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", "origin 3\n"]
+        outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", "5 origin 3\n"]
         with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
                         subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
             with self.assertRaisesRegex(RuntimeError, "affinity changed"):
                 matrix.verify_live_runtime(runtime)
+
+    def test_live_runtime_validation_preserves_duplicate_thread_multiplicity(self):
+        config = {"output": "/tmp/out", "worker_container": "worker",
+                  "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                  "kubeconfig": "/tmp/kube"}
+        matrix = run_matrix.Matrix(config)
+        runtime = [{"name": "origin", "container_id": "abc", "pid": 5,
+                    "processes": [{"pid": "5", "tid": 11, "name": "origin", "allowed": "2"},
+                                  {"pid": "5", "tid": 12, "name": "origin", "allowed": "2"}]}]
+        for observed in ("11 origin 2\n", "11 origin 2\n99 origin 2\n"):
+            outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", observed]
+            with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
+                            subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
+                with self.assertRaisesRegex(RuntimeError, "process/affinity changed"):
+                    matrix.verify_live_runtime(runtime)
 
     def test_configmap_identity_verification_detects_recreate_and_data_change(self):
         config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
@@ -1047,9 +1096,12 @@ class ProxyBenchmarkTests(unittest.TestCase):
                      subprocess.CompletedProcess([], 0, "true\n", "")]
             with mock.patch("run_client.subprocess.run", side_effect=state) as docker_run, \
                     mock.patch("run_client.time.sleep"), \
-                    mock.patch("run_client.time.monotonic", side_effect=[100.0, 100.1, 100.3, 100.8]):
+                    mock.patch("run_client.time.monotonic", side_effect=[100.0, 100.1, 100.3, 100.8]), \
+                    mock.patch("run_client.os.replace", wraps=os.replace) as atomic_replace:
                 run_client.start_and_stamp("docker", "wrk-container", stamp)
             self.assertEqual(stamp.read_text(), "100.800000000\n")
+            atomic_replace.assert_called_once()
+            self.assertEqual(list(Path(tmp).iterdir()), [stamp])
             self.assertEqual(docker_run.call_args_list[0].args[0], ["docker", "start", "wrk-container"])
             self.assertEqual(docker_run.call_args_list[1].args[0],
                              ["docker", "inspect", "--format", "{{.State.Running}}", "wrk-container"])

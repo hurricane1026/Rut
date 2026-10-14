@@ -237,19 +237,20 @@ class Matrix:
             process_libraries = set()
             for process in procs:
                 command = (f"for f in /proc/{process}/task/*/status; do "
-                           "awk '/^Name:/{n=$2}/^Cpus_allowed_list:/{print n, $2}' \"$f\"; done")
+                           "tid=${f%/status}; tid=${tid##*/}; "
+                           "awk -v t=\"$tid\" '/^Name:/{n=$2}/^Cpus_allowed_list:/{print t, n, $2}' \"$f\"; done")
                 lines = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-c", command]).stdout.splitlines()
                 for line in lines:
                     fields = line.split()
-                    if len(fields) != 2:
+                    if len(fields) != 3 or not fields[0].isdigit():
                         raise RuntimeError(f"cannot read thread affinity for process {process}: {line!r}")
-                    row = {"pid": process, "name": fields[0], "allowed": fields[1]}
+                    row = {"pid": process, "tid": int(fields[0]), "name": fields[1], "allowed": fields[2]}
                     affinity.append(row)
                     if name == "origin":
-                        if not cpu_set(fields[1]) or not cpu_set(fields[1]) <= cpu_set(cpus):
-                            raise RuntimeError(f"{name} thread in process {process} affinity {fields[1]} escapes {cpus}")
-                    elif cpu_set(fields[1]) != cpu_set(cpus):
-                        raise RuntimeError(f"{name} thread in process {process} affinity {fields[1]} != {cpus}")
+                        if not cpu_set(fields[2]) or not cpu_set(fields[2]) <= cpu_set(cpus):
+                            raise RuntimeError(f"{name} thread in process {process} affinity {fields[2]} escapes {cpus}")
+                    elif cpu_set(fields[2]) != cpu_set(cpus):
+                        raise RuntimeError(f"{name} thread in process {process} affinity {fields[2]} != {cpus}")
                 exe = invoke([self.docker, "exec", self.c["worker_container"], "readlink", f"/proc/{process}/exe"]).stdout.strip()
                 size = int(invoke([self.docker, "exec", self.c["worker_container"], "stat", "-Lc", "%s", f"/proc/{process}/exe"]).stdout.strip())
                 digest = invoke([self.docker, "exec", self.c["worker_container"], "sha256sum", f"/proc/{process}/exe"]).stdout.split()[0]
@@ -310,14 +311,16 @@ class Matrix:
             observed = []
             for pid in sorted(pids):
                 cmd = (f"for f in /proc/{pid}/task/*/status; do "
-                       "awk '/^Name:/{n=$2}/^Cpus_allowed_list:/{print n, $2}' \"$f\"; done")
+                       "tid=${f%/status}; tid=${tid##*/}; "
+                       "awk -v t=\"$tid\" '/^Name:/{n=$2}/^Cpus_allowed_list:/{print t, n, $2}' \"$f\"; done")
                 lines = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-c", cmd]).stdout.splitlines()
                 for line in lines:
                     fields = line.split()
-                    if len(fields) != 2:
+                    if len(fields) != 3 or not fields[0].isdigit():
                         raise RuntimeError(f"cannot verify live thread affinity for {record['name']}")
-                    observed.append((int(pid), fields[0], fields[1]))
-            expected = {(int(row["pid"]), row["name"], row["allowed"]) for row in record["processes"]}
+                    observed.append((int(pid), int(fields[0]), fields[1], fields[2]))
+            expected = {(int(row["pid"]), int(row["tid"]), row["name"], row["allowed"])
+                        for row in record["processes"]}
             if set(observed) != expected:
                 raise RuntimeError(f"container {record['name']} process/affinity changed during measurement")
 
