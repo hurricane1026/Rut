@@ -8950,9 +8950,9 @@ void pump_response_read_deadline_body(Loop* loop, Connection& conn) {
     u32 front = conn.buffered_response_front_size();
     // Study: combine complete already-published nodes up to a byte budget.
     // Never wait for a node or clip the next one just to fill a vector.
-    static const bool study_gather = [] {
-        if constexpr (requires { Loop::supports_buffered_send_vector(); })
-            return ::getenv("RUT_STUDY_SELECTIVE_VECTOR") != nullptr;
+    const bool study_gather = [loop] {
+        if constexpr (requires { loop->study_selective_vector; })
+            return loop->study_selective_vector;
         return false;
     }();
     if (study_gather && !conn.tls_active && conn.response_body_tail.head &&

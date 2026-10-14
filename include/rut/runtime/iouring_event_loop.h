@@ -123,6 +123,8 @@ struct SyncSendCompletionGuard {
 // have been harvested. Includes armed flag management, cancel SQE tracking,
 // deferred accepts, and reclaim_pending/reclaim_slot machinery.
 struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
+    bool study_direct_body = false;
+    bool study_selective_vector = false;
     u64 study_direct_body_attempts = 0;
     u64 study_direct_body_progress = 0;
     u64 study_direct_body_full = 0;
@@ -657,6 +659,8 @@ public:
         auto slots = init_slot_storage(capacity);
         if (!slots) return core::make_unexpected(slots.error());
         shard_id = id;
+        study_direct_body = ::getenv("RUT_STUDY_DIRECT_BODY_SEND") != nullptr;
+        study_selective_vector = ::getenv("RUT_STUDY_SELECTIVE_VECTOR") != nullptr;
         listen_fd = lfd;
         this->listener_context = {};
         running_.store(true, std::memory_order_relaxed);
@@ -1727,7 +1731,8 @@ private:
             return true;
         }
 
-        for (u8 op : {kUpstreamOpConnect, kUpstreamOpSend, kUpstreamOpRecv}) {
+        constexpr u8 kRetirementOps[] = {kUpstreamOpConnect, kUpstreamOpSend, kUpstreamOpRecv};
+        for (u8 op : kRetirementOps) {
             if ((selected_targets & op) == 0) continue;
             if (backend.cancel_retiring_upstream(
                     c.id, upstream_event_for_op(op), retiring_episode)) {
@@ -2608,7 +2613,8 @@ public:
                 running_.store(false, std::memory_order_release);
                 return;
             }
-            for (u8 op : {kUpstreamOpConnect, kUpstreamOpSend, kUpstreamOpRecv}) {
+            constexpr u8 kRetirementOps[] = {kUpstreamOpConnect, kUpstreamOpSend, kUpstreamOpRecv};
+            for (u8 op : kRetirementOps) {
                 if ((c.upstream_retirement_cancel_retry & op) == 0) continue;
                 if (!backend.cancel_retiring_upstream(
                         c.id, upstream_event_for_op(op), c.upstream_retiring_episode))
@@ -3697,7 +3703,6 @@ public:
                 buf, first, ResponseBodyChain::payload(next) + next->offset, len - first);
             vector = &c.response_send_vector;
         }
-        static const bool study_direct_body = ::getenv("RUT_STUDY_DIRECT_BODY_SEND") != nullptr;
         if (study_direct_body && c.response_read_deadline_upload.downstream_close &&
             c.req_client_connection_close_exact && !c.req_client_keep_alive && deadline_send &&
             !c.tls_active &&
@@ -4029,12 +4034,13 @@ public:
             return true;
         // Peek only; wait() retains sole ownership of CQ consumption and all
         // cancellation/proactor accounting. Bound the scheduler hint's cost.
-        const u32 count = std::min<u32>(tail - head, 32);
+        const u32 count = tail - head < 32u ? tail - head : 32u;
         for (u32 i = 0; i < count; ++i) {
             const auto& cqe = backend.cq_entries[(head + i) & *backend.cq_ring_mask];
             ++study_cq_entries;
             const u32 tag = static_cast<u32>(cqe.user_data & 0xFFu);
-            const u32 type = std::min<u32>(tag, static_cast<u32>(IoEventType::Count));
+            const u32 type_count = static_cast<u32>(IoEventType::Count);
+            const u32 type = tag < type_count ? tag : type_count;
             UpstreamEventToken token{};
             if (!decode_upstream_event_token(cqe.user_data, &token) ||
                 (token.type != IoEventType::RelayRead && token.type != IoEventType::RelayWrite) ||
@@ -4261,9 +4267,10 @@ public:
                 return;
             }
             --relay_budget_calls;
-            const u32 want =
-                std::min<u32>(std::min<u32>(c.resp_body_remaining, kResponseSpliceChunkSize),
-                              relay_budget_bytes / 2);
+            const u32 chunk = c.resp_body_remaining < kResponseSpliceChunkSize
+                                  ? c.resp_body_remaining
+                                  : kResponseSpliceChunkSize;
+            const u32 want = chunk < relay_budget_bytes / 2 ? chunk : relay_budget_bytes / 2;
             if (study_inside_cq) ++study_cq_splice_calls;
             const bool sampled = (++study_splice_calls[0] & 63u) == 0;
             const u64 syscall_start = sampled ? monotonic_ns() : 0;
@@ -4312,7 +4319,8 @@ public:
             return;
         }
         --relay_budget_calls;
-        const u32 write_want = std::min<u32>(r.segment_len - r.segment_sent, relay_budget_bytes);
+        const u32 remaining = r.segment_len - r.segment_sent;
+        const u32 write_want = remaining < relay_budget_bytes ? remaining : relay_budget_bytes;
         if (study_inside_cq) ++study_cq_splice_calls;
         const bool sampled = (++study_splice_calls[1] & 63u) == 0;
         const u64 syscall_start = sampled ? monotonic_ns() : 0;

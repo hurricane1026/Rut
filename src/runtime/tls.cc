@@ -1,7 +1,7 @@
 #include "rut/runtime/tls.h"
 
 #include "rut/platform/socket.h"
-#include <mutex>
+#include "tls_internal.h"
 
 #include <errno.h>
 #include <openssl/bio.h>
@@ -13,7 +13,7 @@ namespace rut {
 
 namespace {
 
-// BoringSSL's socket BIO writes with write(2), which raises SIGPIPE when the
+// The standard socket BIO writes with write(2), which raises SIGPIPE when the
 // peer has already closed. This BIO sends with platform::kSendFlags
 // (MSG_NOSIGNAL; macOS sockets set SO_NOSIGPIPE instead), so a disconnect
 // surfaces as EPIPE on its own connection. It never owns the descriptor.
@@ -39,15 +39,16 @@ int nosigpipe_socket_read(BIO* bio, char* out, int len) {
     if (len <= 0) return 0;
     const ssize_t n = ::recv(nosigpipe_socket_fd(bio), out, static_cast<size_t>(len), 0);
     if (n < 0 && nosigpipe_socket_should_retry()) BIO_set_retry_read(bio);
+    if (n == 0) BIO_set_flags(bio, BIO_FLAGS_IN_EOF);
     return static_cast<int>(n);
 }
 
-long nosigpipe_socket_ctrl(BIO* /*bio*/, int cmd, long /*num*/, void* /*ptr*/) {
+long nosigpipe_socket_ctrl(BIO* bio, int cmd, long /*num*/, void* /*ptr*/) {
+    // OpenSSL distinguishes a transport EOF from other BIO failures through
+    // this control operation. A missing close_notify must remain a TLS error.
+    if (cmd == BIO_CTRL_EOF) return BIO_test_flags(bio, BIO_FLAGS_IN_EOF) != 0;
     return cmd == BIO_CTRL_FLUSH ? 1 : 0;
 }
-
-// Created once by tls_init_once() and immutable afterwards.
-BIO_METHOD* g_nosigpipe_socket_method = nullptr;
 
 BIO_METHOD* make_nosigpipe_socket_method() {
     BIO_METHOD* m = BIO_meth_new(BIO_TYPE_SOCKET, "rut socket (no SIGPIPE)");
@@ -61,9 +62,9 @@ BIO_METHOD* make_nosigpipe_socket_method() {
     return m;
 }
 
-BIO* new_nosigpipe_socket_bio(i32 fd) {
-    if (g_nosigpipe_socket_method == nullptr || fd < 0) return nullptr;
-    BIO* bio = BIO_new(g_nosigpipe_socket_method);
+BIO* new_nosigpipe_socket_bio(BIO_METHOD* method, i32 fd) {
+    if (method == nullptr || fd < 0) return nullptr;
+    BIO* bio = BIO_new(method);
     if (bio == nullptr) return nullptr;
     // The descriptor lives in BIO's opaque data pointer; it is never dereferenced.
     BIO_set_data(bio,
@@ -71,20 +72,6 @@ BIO* new_nosigpipe_socket_bio(i32 fd) {
                      static_cast<intptr_t>(fd)));
     BIO_set_init(bio, 1);
     return bio;
-}
-
-core::Expected<void, Error> tls_init_once() {
-    static std::once_flag init_once;
-    static bool init_ok = false;
-
-    std::call_once(init_once, []() {
-        if (OPENSSL_init_ssl(0, nullptr) != 1) return;
-        g_nosigpipe_socket_method = make_nosigpipe_socket_method();
-        init_ok = g_nosigpipe_socket_method != nullptr;
-    });
-
-    if (init_ok) return {};
-    return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
 }
 
 // Wire-format ALPN protocol names (1-byte length prefix per RFC 7301).
@@ -147,33 +134,57 @@ AlpnProtocol tls_negotiated_protocol(SSL* ssl) {
 core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* cert_path,
                                                                    const char* key_path,
                                                                    bool offer_h2) {
-    TRY_VOID(tls_init_once());
+    if (OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1)
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+
+    BIO_METHOD* socket_bio_method = make_nosigpipe_socket_method();
+    if (socket_bio_method == nullptr)
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    BIO_METHOD* bridge_bio_method = make_tls_engine_bridge_method();
+    if (bridge_bio_method == nullptr) {
+        BIO_meth_free(socket_bio_method);
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    }
 
     SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_server_method());
-    if (!ssl_ctx) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    if (!ssl_ctx) {
+        BIO_meth_free(bridge_bio_method);
+        BIO_meth_free(socket_bio_method);
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    }
 
     SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
 
     if (SSL_CTX_use_certificate_chain_file(ssl_ctx, cert_path) != 1) {
         SSL_CTX_free(ssl_ctx);
+        BIO_meth_free(bridge_bio_method);
+        BIO_meth_free(socket_bio_method);
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     }
     if (SSL_CTX_use_PrivateKey_file(ssl_ctx, key_path, SSL_FILETYPE_PEM) != 1) {
         SSL_CTX_free(ssl_ctx);
+        BIO_meth_free(bridge_bio_method);
+        BIO_meth_free(socket_bio_method);
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     }
     if (SSL_CTX_check_private_key(ssl_ctx) != 1) {
         SSL_CTX_free(ssl_ctx);
+        BIO_meth_free(bridge_bio_method);
+        BIO_meth_free(socket_bio_method);
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
     }
 
     auto* ctx = static_cast<TlsServerContext*>(malloc(sizeof(TlsServerContext)));
     if (!ctx) {
         SSL_CTX_free(ssl_ctx);
+        BIO_meth_free(bridge_bio_method);
+        BIO_meth_free(socket_bio_method);
         return core::make_unexpected(Error::make(ENOMEM, Error::Source::Socket));
     }
     ctx->ssl_ctx = ssl_ctx;
+    ctx->socket_bio_method = socket_bio_method;
+    ctx->bridge_bio_method = bridge_bio_method;
     ctx->offer_h2 = offer_h2;
     // Register ALPN negotiation. arg = ctx so the callback can read offer_h2.
     // ctx outlives ssl_ctx (freed together in destroy_tls_server_context).
@@ -184,18 +195,18 @@ core::Expected<TlsServerContext*, Error> create_tls_server_context(const char* c
 void destroy_tls_server_context(TlsServerContext* ctx) {
     if (!ctx) return;
     if (ctx->ssl_ctx) SSL_CTX_free(ctx->ssl_ctx);
+    if (ctx->bridge_bio_method) BIO_meth_free(ctx->bridge_bio_method);
+    if (ctx->socket_bio_method) BIO_meth_free(ctx->socket_bio_method);
     free(ctx);
 }
 
 core::Expected<SSL*, Error> create_tls_server_ssl(TlsServerContext* ctx, i32 fd) {
     if (!ctx || !ctx->ssl_ctx)
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
-    if (!tls_init_once()) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
-
     SSL* ssl = SSL_new(ctx->ssl_ctx);
     if (!ssl) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
 
-    BIO* bio = new_nosigpipe_socket_bio(fd);
+    BIO* bio = new_nosigpipe_socket_bio(ctx->socket_bio_method, fd);
     if (!bio) {
         SSL_free(ssl);
         return core::make_unexpected(Error::make(EIO, Error::Source::Socket));

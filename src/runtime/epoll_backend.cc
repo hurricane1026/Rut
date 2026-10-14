@@ -5,6 +5,7 @@
 #include "rut/runtime/error.h"
 
 #include <errno.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <string.h>  // memset
 #include <sys/epoll.h>
@@ -23,12 +24,15 @@ const EpollTlsHooks* get_epoll_tls_hooks_for_test() __attribute__((weak));
 namespace {
 
 i32 default_ssl_accept(SSL* ssl) {
+    ERR_clear_error();
     return SSL_accept(ssl);
 }
 i32 default_ssl_read(SSL* ssl, void* buf, i32 len) {
+    ERR_clear_error();
     return SSL_read(ssl, buf, len);
 }
 i32 default_ssl_write(SSL* ssl, const void* buf, i32 len) {
+    ERR_clear_error();
     return SSL_write(ssl, buf, len);
 }
 i32 default_ssl_get_error(SSL* ssl, i32 rc) {

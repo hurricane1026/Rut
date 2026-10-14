@@ -18,6 +18,10 @@ set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
 add_test(NAME test_framework_sharding COMMAND test_framework --sharding-self-test)
 set_tests_properties(test_framework_sharding PROPERTIES LABELS "unit" TIMEOUT 30)
 
+add_test(NAME test_rut_openssl_compiler
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/test_rut_openssl_compiler.cmake)
+set_tests_properties(test_rut_openssl_compiler PROPERTIES LABELS "unit" TIMEOUT 30)
+
 # Pure #358 Stage 2a1 fixture-worker protocol self-check.  This deliberately
 # has no Docker/network label and runs in ordinary CI on an unprivileged host.
 add_library(fixture_worker_protocol STATIC fixture_worker_protocol.cc)
@@ -480,6 +484,16 @@ set_tests_properties(test_proxy_benchmark_tools PROPERTIES LABELS "unit;benchmar
 add_test(NAME test_routing_corpus
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py)
 set_tests_properties(test_routing_corpus PROPERTIES LABELS "unit;routing" TIMEOUT 120)
+
+# Verify the shipped runtime does not import a C++ standard/ABI library.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT RUT_SANITIZE)
+    add_test(NAME test_runtime_no_cxx_dependencies
+        COMMAND ${CMAKE_COMMAND}
+            -DREADELF=${CMAKE_READELF}
+            -DRUT_BINARY=$<TARGET_FILE:rut>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/check_runtime_cxx_deps.cmake)
+    set_tests_properties(test_runtime_no_cxx_dependencies PROPERTIES LABELS "unit;cli")
+endif()
 
 # /proc-based check that the process ignores SIGPIPE (Linux only).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

@@ -23,7 +23,7 @@
 #else
 #include <time.h>
 #endif
-#include <openssl/base.h>
+#include <openssl/types.h>
 
 namespace rut {
 

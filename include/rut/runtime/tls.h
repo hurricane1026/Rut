@@ -4,7 +4,8 @@
 #include "rut/common/types.h"
 #include "rut/runtime/error.h"
 
-#include <openssl/base.h>
+#include <openssl/bio.h>
+#include <openssl/types.h>
 
 namespace rut {
 
@@ -17,7 +18,11 @@ enum class AlpnProtocol : u8 {
 };
 
 struct TlsServerContext {
+    // Owns the BIO methods used by SSL objects created from this context.
+    // Keep the context alive until every SSL/TlsEngine using it is freed.
     SSL_CTX* ssl_ctx;
+    BIO_METHOD* socket_bio_method;
+    BIO_METHOD* bridge_bio_method;
     // Whether the ALPN select callback advertises "h2". When false the server
     // only ever selects "http/1.1", so an h2-capable client downgrades.
     bool offer_h2;

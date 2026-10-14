@@ -1,12 +1,12 @@
 #include "rut/jit/runtime_helpers.h"
 
+#include "core/placement_new.h"
 #include "rut/common/shard_limits.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/arena.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
-#include <new>
-#include <unordered_map>
 
 #include <hs.h>
 #include <pthread.h>
@@ -594,6 +594,8 @@ u64 rut_helper_req_content_length(const u8* req_data, u32 req_len) {
 // the mmaps on shard stop/join/restart flows.
 namespace rut {
 struct CacheLocalState {
+    u64 mapped_size = 0;
+
     struct ShardTables {
         CacheTable tables[CacheRegistry::kMaxInstances];
         u64 identities[CacheRegistry::kMaxInstances] = {};
@@ -618,16 +620,104 @@ struct CacheLocalState {
 
 namespace {
 
-thread_local rut::CacheLocalState t_default_cache_state;
-thread_local rut::CacheLocalState* t_active_cache_state = &t_default_cache_state;
+thread_local rut::CacheLocalState* t_default_cache_state = nullptr;
+thread_local rut::CacheLocalState* t_active_cache_state = nullptr;
 thread_local rut::u32 t_active_cache_shard = 0;
+alignas(rut::CacheLocalState) thread_local unsigned char t_default_cache_storage[sizeof(
+    rut::CacheLocalState)];
 
-rut::CacheLocalState::ShardTables& shard_cache_tables() {
-    return t_active_cache_state->shards[t_active_cache_shard];
+pthread_key_t g_default_cache_state_key;
+pthread_once_t g_default_cache_state_key_once = PTHREAD_ONCE_INIT;
+int g_default_cache_state_key_status = -1;
+pthread_once_t g_thread_exit_cleanup_once = PTHREAD_ONCE_INIT;
+bool g_cache_state_error_logged = false;
+int g_thread_exit_cleanup_status = -1;
+
+void cleanup_thread_state_at_exit();
+
+void initialize_thread_exit_cleanup() {
+    __atomic_store_n(
+        &g_thread_exit_cleanup_status, atexit(cleanup_thread_state_at_exit), __ATOMIC_RELEASE);
+}
+
+bool register_thread_exit_cleanup() {
+    return pthread_once(&g_thread_exit_cleanup_once, initialize_thread_exit_cleanup) == 0 &&
+           __atomic_load_n(&g_thread_exit_cleanup_status, __ATOMIC_ACQUIRE) == 0;
+}
+
+void log_cache_state_error_once() {
+    if (!__atomic_exchange_n(&g_cache_state_error_logged, true, __ATOMIC_RELAXED)) {
+        fprintf(stderr,
+                "rut: unable to install cache thread cleanup; cache-backed operations "
+                "will miss on this thread\n");
+    }
+}
+
+void destroy_cache_local_state(rut::CacheLocalState* state) {
+    if (state == nullptr) return;
+    const rut::u64 mapped_size = state->mapped_size;
+    state->~CacheLocalState();
+    if (mapped_size != 0) {
+        rut::MmapBackend backend;
+        backend.release(reinterpret_cast<rut::u8*>(state), mapped_size);
+    }
+}
+
+void default_cache_state_thread_exit(void* value) {
+    auto* state = static_cast<rut::CacheLocalState*>(value);
+    t_default_cache_state = nullptr;
+    if (t_active_cache_state == state) t_active_cache_state = nullptr;
+    destroy_cache_local_state(state);
+}
+
+void cleanup_default_cache_state_at_exit() {
+    if (__atomic_load_n(&g_default_cache_state_key_status, __ATOMIC_ACQUIRE) != 0) return;
+    auto* state =
+        static_cast<rut::CacheLocalState*>(pthread_getspecific(g_default_cache_state_key));
+    if (state == nullptr) return;
+    pthread_setspecific(g_default_cache_state_key, nullptr);
+    default_cache_state_thread_exit(state);
+}
+
+void initialize_default_cache_state_key() {
+    __atomic_store_n(
+        &g_default_cache_state_key_status,
+        pthread_key_create(&g_default_cache_state_key, default_cache_state_thread_exit),
+        __ATOMIC_RELEASE);
+}
+
+rut::CacheLocalState* default_cache_state() {
+    if (t_default_cache_state != nullptr) return t_default_cache_state;
+    if (!register_thread_exit_cleanup() ||
+        pthread_once(&g_default_cache_state_key_once, initialize_default_cache_state_key) != 0 ||
+        __atomic_load_n(&g_default_cache_state_key_status, __ATOMIC_ACQUIRE) != 0) {
+        log_cache_state_error_once();
+        return nullptr;
+    }
+    auto* state = ::new (t_default_cache_storage) rut::CacheLocalState{};
+    if (pthread_setspecific(g_default_cache_state_key, state) != 0) {
+        state->~CacheLocalState();
+        log_cache_state_error_once();
+        return nullptr;
+    }
+    t_default_cache_state = state;
+    return state;
+}
+
+rut::CacheLocalState::ShardTables* shard_cache_tables() {
+    rut::CacheLocalState* state =
+        t_active_cache_state != nullptr ? t_active_cache_state : default_cache_state();
+    if (state == nullptr) return nullptr;
+    return &state->shards[t_active_cache_shard];
 }
 
 rut::CacheTable* cache_table_for(rut::u32 instance) {
-    rut::CacheLocalState::ShardTables& t_state = shard_cache_tables();
+    rut::CacheLocalState::ShardTables* t_state_ptr = shard_cache_tables();
+    if (t_state_ptr == nullptr) {
+        log_cache_state_error_once();
+        return nullptr;
+    }
+    rut::CacheLocalState::ShardTables& t_state = *t_state_ptr;
     auto* t_tables = t_state.tables;
     auto* t_identities = t_state.identities;
     auto* t_birth_generations = t_state.birth_generations;
@@ -745,20 +835,30 @@ u32 rut_helper_cache_select_local_shard(u32 shard_id) {
 }
 
 rut::CacheLocalState* rut_helper_cache_select_local_state(rut::CacheLocalState* state) {
-    rut::CacheLocalState* previous =
-        t_active_cache_state == &t_default_cache_state ? nullptr : t_active_cache_state;
-    t_active_cache_state = state != nullptr ? state : &t_default_cache_state;
+    rut::CacheLocalState* previous = t_active_cache_state;
+    t_active_cache_state = state;
     return previous;
 }
 
 rut::CacheLocalState* rut_helper_cache_create_local_state() {
-    return new (std::nothrow) rut::CacheLocalState{};
+    rut::MmapBackend backend;
+    rut::u64 mapped_size = 0;
+    auto* memory = backend.acquire(sizeof(rut::CacheLocalState), &mapped_size);
+    if (memory == nullptr) return nullptr;
+    auto* state = ::new (memory) rut::CacheLocalState{};
+    state->mapped_size = mapped_size;
+    return state;
 }
 
 void rut_helper_cache_destroy_local_state(rut::CacheLocalState* state) {
     if (state == nullptr) return;
-    if (t_active_cache_state == state) t_active_cache_state = &t_default_cache_state;
-    delete state;
+    if (t_active_cache_state == state) t_active_cache_state = nullptr;
+    if (t_default_cache_state == state) {
+        t_default_cache_state = nullptr;
+        if (__atomic_load_n(&g_default_cache_state_key_status, __ATOMIC_ACQUIRE) == 0)
+            pthread_setspecific(g_default_cache_state_key, nullptr);
+    }
+    destroy_cache_local_state(state);
 }
 
 void rut_helper_cache_reset_state(rut::CacheLocalState* state) {
@@ -767,7 +867,10 @@ void rut_helper_cache_reset_state(rut::CacheLocalState* state) {
 }
 
 void rut_helper_cache_reset_local_state() {
-    for (auto& state : t_active_cache_state->shards) state.reset();
+    rut::CacheLocalState* state =
+        t_active_cache_state != nullptr ? t_active_cache_state : t_default_cache_state;
+    if (state == nullptr) return;
+    for (auto& shard : state->shards) shard.reset();
 }
 
 // ── String Operations ──────────────────────────────────────────────
@@ -823,37 +926,142 @@ struct RegexScratchSlot {
     hs_scratch_t* scratch = nullptr;
 };
 
+struct RegexScratchIndexEntry {
+    u64 generation = 0;  // zero means empty; live handles never use generation zero
+    u32 slot_index = 0;
+};
+
+u64 regex_generation_hash(u64 generation) {
+    generation ^= generation >> 30;
+    generation *= 0xBF58476D1CE4E5B9ull;
+    generation ^= generation >> 27;
+    generation *= 0x94D049BB133111EBull;
+    generation ^= generation >> 31;
+    return generation;
+}
+
 struct RegexScratchCache {
     RegexScratchSlot* slots = nullptr;
     u32 count = 0;
     u32 cap = 0;
-    std::unordered_map<u64, u32> generation_to_index;
+    u64 slots_mapped_size = 0;
+    RegexScratchIndexEntry* index = nullptr;
+    u32 index_cap = 0;
+    u64 index_mapped_size = 0;
+    u64 mapped_size = 0;
     RegexScratchCache* next = nullptr;
     RegexScratchCache* prev = nullptr;
-    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mutex = {};
 
-    RegexScratchCache();
-
-    ~RegexScratchCache() {
-        unregister_cache();
-        for (u32 i = 0; i < count; i++) {
-            if (slots[i].scratch) hs_free_scratch(slots[i].scratch);
+    u32 find_index(u64 generation, u32* bucket = nullptr) const {
+        if (generation == 0 || index_cap == 0) return UINT32_MAX;
+        const u64 hash = regex_generation_hash(generation);
+        const u32 start = static_cast<u32>(hash) & (index_cap - 1);
+        for (u32 probe = 0; probe < index_cap; probe++) {
+            const u32 at = (start + probe) & (index_cap - 1);
+            if (index[at].generation == 0) {
+                if (bucket != nullptr) *bucket = at;
+                return UINT32_MAX;
+            }
+            if (index[at].generation == generation) {
+                if (bucket != nullptr) *bucket = at;
+                return index[at].slot_index;
+            }
         }
-        free(slots);
-        pthread_mutex_destroy(&mutex);
+        if (bucket != nullptr) *bucket = UINT32_MAX;
+        return UINT32_MAX;
+    }
+
+    bool insert_index(u64 generation, u32 slot_index) {
+        u32 bucket = UINT32_MAX;
+        const u32 existing = find_index(generation, &bucket);
+        if (existing != UINT32_MAX) {
+            index[bucket].slot_index = slot_index;
+            return true;
+        }
+        if (bucket == UINT32_MAX) return false;
+        index[bucket] = {generation, slot_index};
+        return true;
+    }
+
+    void remove_index(u64 generation) {
+        u32 hole = UINT32_MAX;
+        if (find_index(generation, &hole) == UINT32_MAX || hole == UINT32_MAX) return;
+        index[hole] = {};
+        const u32 mask = index_cap - 1;
+        u32 scan = (hole + 1) & mask;
+        while (index[scan].generation != 0) {
+            const RegexScratchIndexEntry entry = index[scan];
+            index[scan] = {};
+            // Removing the hole temporarily can break the probe chain. Reinsert
+            // each following entry; the table stays below 50% load and bounded.
+            insert_index(entry.generation, entry.slot_index);
+            scan = (scan + 1) & mask;
+        }
     }
 
     bool reserve(u32 min_cap) {
-        if (cap >= min_cap) return true;
-        u32 new_cap = cap ? cap * 2 : 32;
-        while (new_cap < min_cap) new_cap *= 2;
-        void* p = realloc(slots, sizeof(RegexScratchSlot) * new_cap);
-        if (!p) return false;
-        slots = static_cast<RegexScratchSlot*>(p);
-        for (u32 i = cap; i < new_cap; i++) {
-            slots[i] = {};
+        if (cap >= min_cap && index_cap / 2 >= cap) return true;
+        u32 new_cap = cap ? cap : 32;
+        while (new_cap < min_cap) {
+            if (new_cap >= (1u << 30)) return false;
+            new_cap *= 2;
+        }
+        if (new_cap > (1u << 30)) return false;
+        const u32 new_index_cap = new_cap * 2;
+
+        rut::MmapBackend backend;
+        u64 new_slots_size = 0;
+        auto* new_slots = reinterpret_cast<RegexScratchSlot*>(
+            backend.acquire(static_cast<u64>(new_cap) * sizeof(RegexScratchSlot), &new_slots_size));
+        if (new_slots == nullptr) return false;
+        u64 new_index_size = 0;
+        auto* new_index = reinterpret_cast<RegexScratchIndexEntry*>(backend.acquire(
+            static_cast<u64>(new_index_cap) * sizeof(RegexScratchIndexEntry), &new_index_size));
+        if (new_index == nullptr) {
+            backend.release(reinterpret_cast<u8*>(new_slots), new_slots_size);
+            return false;
+        }
+
+        for (u32 i = 0; i < new_cap; i++) ::new (&new_slots[i]) RegexScratchSlot{};
+        for (u32 i = 0; i < new_index_cap; i++) ::new (&new_index[i]) RegexScratchIndexEntry{};
+
+        for (u32 i = 0; i < count; i++) {
+            new_slots[i] = slots[i];
+            const u64 hash = regex_generation_hash(new_slots[i].generation);
+            u32 at = static_cast<u32>(hash) & (new_index_cap - 1);
+            bool inserted = false;
+            for (u32 probe = 0; probe < new_index_cap; probe++) {
+                if (new_index[at].generation == 0) {
+                    new_index[at] = {new_slots[i].generation, i};
+                    inserted = true;
+                    break;
+                }
+                at = (at + 1) & (new_index_cap - 1);
+            }
+            if (!inserted) {
+                for (u32 j = 0; j < new_cap; j++) new_slots[j].~RegexScratchSlot();
+                for (u32 j = 0; j < new_index_cap; j++) new_index[j].~RegexScratchIndexEntry();
+                backend.release(reinterpret_cast<u8*>(new_slots), new_slots_size);
+                backend.release(reinterpret_cast<u8*>(new_index), new_index_size);
+                return false;
+            }
+        }
+
+        if (slots != nullptr) {
+            for (u32 i = 0; i < cap; i++) slots[i].~RegexScratchSlot();
+            backend.release(reinterpret_cast<u8*>(slots), slots_mapped_size);
+        }
+        if (index != nullptr) {
+            for (u32 i = 0; i < index_cap; i++) index[i].~RegexScratchIndexEntry();
+            backend.release(reinterpret_cast<u8*>(index), index_mapped_size);
         }
         cap = new_cap;
+        slots = new_slots;
+        slots_mapped_size = new_slots_size;
+        index = new_index;
+        index_cap = new_index_cap;
+        index_mapped_size = new_index_size;
         return true;
     }
 
@@ -861,19 +1069,22 @@ struct RegexScratchCache {
         if (idx >= count) return;
         const u64 generation = slots[idx].generation;
         if (slots[idx].scratch) hs_free_scratch(slots[idx].scratch);
-        generation_to_index.erase(generation);
+        remove_index(generation);
         count--;
         if (idx != count) {
             slots[idx] = slots[count];
-            generation_to_index[slots[idx].generation] = idx;
+            insert_index(slots[idx].generation, idx);
         }
         slots[count] = {};
     }
 
     hs_scratch_t* get(const RegexHandle* handle) {
-        const auto iter = generation_to_index.find(handle->generation);
-        if (iter != generation_to_index.end()) {
-            return slots[iter->second].scratch;
+        const u32 existing = find_index(handle->generation);
+        if (existing != UINT32_MAX) {
+            if (existing < count && slots[existing].handle == handle &&
+                slots[existing].generation == handle->generation)
+                return slots[existing].scratch;
+            return nullptr;
         }
         hs_scratch_t* scratch = nullptr;
         if (hs_alloc_scratch(handle->db, &scratch) != HS_SUCCESS || !scratch) return nullptr;
@@ -882,13 +1093,16 @@ struct RegexScratchCache {
             return nullptr;
         }
         slots[count] = {handle, handle->generation, scratch};
-        generation_to_index[handle->generation] = count;
+        if (!insert_index(handle->generation, count)) {
+            slots[count] = {};
+            hs_free_scratch(scratch);
+            return nullptr;
+        }
         count++;
         return scratch;
     }
 
     void prune_handle(const RegexHandle* handle);
-    void unregister_cache();
 };
 
 struct LiveRegexHandle {
@@ -896,7 +1110,7 @@ struct LiveRegexHandle {
     u64 generation = 0;
 };
 
-thread_local RegexScratchCache t_regex_scratch_cache;
+thread_local RegexScratchCache* t_regex_scratch_cache = nullptr;
 u64 g_regex_generation = 1;
 
 LiveRegexHandle* g_regex_live_handles = nullptr;
@@ -907,17 +1121,130 @@ pthread_mutex_t g_regex_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 RegexScratchCache* g_regex_caches = nullptr;
 pthread_mutex_t g_regex_cache_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-RegexScratchCache::RegexScratchCache() {
+pthread_key_t g_regex_cache_key;
+pthread_once_t g_regex_cache_key_once = PTHREAD_ONCE_INIT;
+int g_regex_cache_key_status = -1;
+
+void register_cache(RegexScratchCache* cache) {
     pthread_mutex_lock(&g_regex_cache_list_mutex);
-    next = g_regex_caches;
-    if (next) next->prev = this;
-    g_regex_caches = this;
+    cache->prev = nullptr;
+    cache->next = g_regex_caches;
+    if (cache->next != nullptr) cache->next->prev = cache;
+    g_regex_caches = cache;
     pthread_mutex_unlock(&g_regex_cache_list_mutex);
+}
+
+void unregister_cache(RegexScratchCache* cache) {
+    pthread_mutex_lock(&g_regex_cache_list_mutex);
+    if (cache->prev != nullptr) {
+        cache->prev->next = cache->next;
+    } else if (g_regex_caches == cache) {
+        g_regex_caches = cache->next;
+    }
+    if (cache->next != nullptr) cache->next->prev = cache->prev;
+    cache->next = nullptr;
+    cache->prev = nullptr;
+    pthread_mutex_unlock(&g_regex_cache_list_mutex);
+}
+
+void destroy_regex_scratch_cache(RegexScratchCache* cache) {
+    if (cache == nullptr) return;
+    unregister_cache(cache);
+    for (u32 i = 0; i < cache->count; i++) {
+        if (cache->slots[i].scratch != nullptr) hs_free_scratch(cache->slots[i].scratch);
+    }
+    rut::MmapBackend backend;
+    if (cache->slots != nullptr) {
+        for (u32 i = 0; i < cache->cap; i++) cache->slots[i].~RegexScratchSlot();
+        backend.release(reinterpret_cast<u8*>(cache->slots), cache->slots_mapped_size);
+    }
+    if (cache->index != nullptr) {
+        for (u32 i = 0; i < cache->index_cap; i++) cache->index[i].~RegexScratchIndexEntry();
+        backend.release(reinterpret_cast<u8*>(cache->index), cache->index_mapped_size);
+    }
+    pthread_mutex_destroy(&cache->mutex);
+    const u64 mapped_size = cache->mapped_size;
+    cache->~RegexScratchCache();
+    backend.release(reinterpret_cast<u8*>(cache), mapped_size);
+}
+
+void regex_cache_thread_exit(void* value) {
+    auto* cache = static_cast<RegexScratchCache*>(value);
+    t_regex_scratch_cache = nullptr;
+    destroy_regex_scratch_cache(cache);
+}
+
+void cleanup_thread_state_at_exit() {
+    if (__atomic_load_n(&g_regex_cache_key_status, __ATOMIC_ACQUIRE) == 0) {
+        auto* cache = static_cast<RegexScratchCache*>(pthread_getspecific(g_regex_cache_key));
+        if (cache != nullptr) {
+            pthread_setspecific(g_regex_cache_key, nullptr);
+            regex_cache_thread_exit(cache);
+        }
+    }
+    cleanup_default_cache_state_at_exit();
+}
+
+void initialize_regex_cache_key() {
+    __atomic_store_n(&g_regex_cache_key_status,
+                     pthread_key_create(&g_regex_cache_key, regex_cache_thread_exit),
+                     __ATOMIC_RELEASE);
+}
+
+RegexScratchCache* get_regex_scratch_cache() {
+    if (t_regex_scratch_cache != nullptr) return t_regex_scratch_cache;
+    if (pthread_once(&g_regex_cache_key_once, initialize_regex_cache_key) != 0 ||
+        __atomic_load_n(&g_regex_cache_key_status, __ATOMIC_ACQUIRE) != 0 ||
+        !register_thread_exit_cleanup())
+        return nullptr;
+
+    auto* cache = static_cast<RegexScratchCache*>(pthread_getspecific(g_regex_cache_key));
+    if (cache == nullptr) {
+        rut::MmapBackend backend;
+        u64 mapped_size = 0;
+        auto* memory = backend.acquire(sizeof(RegexScratchCache), &mapped_size);
+        if (memory == nullptr) return nullptr;
+        cache = ::new (memory) RegexScratchCache{};
+        cache->mapped_size = mapped_size;
+        if (pthread_mutex_init(&cache->mutex, nullptr) != 0) {
+            cache->~RegexScratchCache();
+            backend.release(memory, mapped_size);
+            return nullptr;
+        }
+        if (pthread_setspecific(g_regex_cache_key, cache) != 0) {
+            pthread_mutex_destroy(&cache->mutex);
+            cache->~RegexScratchCache();
+            backend.release(memory, mapped_size);
+            return nullptr;
+        }
+        register_cache(cache);
+    }
+    t_regex_scratch_cache = cache;
+    return cache;
 }
 
 static bool register_regex_handle(RegexHandle* handle) {
     pthread_mutex_lock(&g_regex_registry_mutex);
-    handle->generation = g_regex_generation++;
+    bool generation_available = false;
+    for (u64 attempt = 0; attempt <= g_regex_live_count; attempt++) {
+        u64 candidate = g_regex_generation++;
+        if (candidate == 0) candidate = g_regex_generation++;
+        generation_available = true;
+        for (u32 i = 0; i < g_regex_live_count; i++) {
+            if (g_regex_live_handles[i].generation == candidate) {
+                generation_available = false;
+                break;
+            }
+        }
+        if (generation_available) {
+            handle->generation = candidate;
+            break;
+        }
+    }
+    if (!generation_available) {
+        pthread_mutex_unlock(&g_regex_registry_mutex);
+        return false;
+    }
     if (g_regex_live_count == g_regex_live_cap) {
         u32 next_cap = g_regex_live_cap ? g_regex_live_cap * 2 : 32;
         void* p = realloc(g_regex_live_handles, sizeof(LiveRegexHandle) * next_cap);
@@ -979,24 +1306,11 @@ static void unregister_regex_handle(const RegexHandle* handle) {
 }
 
 void RegexScratchCache::prune_handle(const RegexHandle* handle) {
-    const auto iter = generation_to_index.find(handle->generation);
-    if (iter != generation_to_index.end() && iter->second < count &&
-        slots[iter->second].handle == handle) {
-        remove_at(iter->second);
+    const u32 slot_index = find_index(handle->generation);
+    if (slot_index != UINT32_MAX && slot_index < count && slots[slot_index].handle == handle &&
+        slots[slot_index].generation == handle->generation) {
+        remove_at(slot_index);
     }
-}
-
-void RegexScratchCache::unregister_cache() {
-    pthread_mutex_lock(&g_regex_cache_list_mutex);
-    if (prev) {
-        prev->next = next;
-    } else if (g_regex_caches == this) {
-        g_regex_caches = next;
-    }
-    if (next) next->prev = prev;
-    next = nullptr;
-    prev = nullptr;
-    pthread_mutex_unlock(&g_regex_cache_list_mutex);
 }
 
 static int on_full_regex_match(
@@ -1087,10 +1401,16 @@ u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
     auto* handle = static_cast<RegexHandle*>(db);
     hs_database_t* regex_db = nullptr;
     if (!begin_regex_scan(handle, &regex_db)) return 0;
-    pthread_mutex_lock(&t_regex_scratch_cache.mutex);
-    hs_scratch_t* scratch = t_regex_scratch_cache.get(handle);
+    RegexScratchCache* cache = get_regex_scratch_cache();
+    if (cache == nullptr) {
+        end_regex_scan(handle);
+        regex_runtime_error("unable to create thread-local scratch cache");
+        return 0;
+    }
+    pthread_mutex_lock(&cache->mutex);
+    hs_scratch_t* scratch = cache->get(handle);
     if (!scratch) {
-        pthread_mutex_unlock(&t_regex_scratch_cache.mutex);
+        pthread_mutex_unlock(&cache->mutex);
         end_regex_scan(handle);
         regex_runtime_error("scratch allocation failed");
         return 0;
@@ -1099,7 +1419,7 @@ u8 rut_helper_str_regex_match(const char* s, u32 s_len, void* db) {
     RegexMatchCtx ctx{};
     ctx.len = s_len;
     hs_error_t rc = hs_scan(regex_db, s, s_len, 0, scratch, on_full_regex_match, &ctx);
-    pthread_mutex_unlock(&t_regex_scratch_cache.mutex);
+    pthread_mutex_unlock(&cache->mutex);
     end_regex_scan(handle);
     return (rc == HS_SUCCESS || rc == HS_SCAN_TERMINATED) && ctx.matched ? 1 : 0;
 }
@@ -1109,9 +1429,19 @@ u8 rut_helper_regex_backend_available() {
 }
 
 extern "C" u32 rut_helper_regex_scratch_cache_entry_count_for_test() {
-    pthread_mutex_lock(&t_regex_scratch_cache.mutex);
-    const u32 count = t_regex_scratch_cache.count;
-    pthread_mutex_unlock(&t_regex_scratch_cache.mutex);
+    RegexScratchCache* cache = t_regex_scratch_cache;
+    if (cache == nullptr) return 0;
+    pthread_mutex_lock(&cache->mutex);
+    const u32 count = cache->count;
+    pthread_mutex_unlock(&cache->mutex);
+    return count;
+}
+
+extern "C" u32 rut_helper_regex_scratch_cache_count_for_test() {
+    pthread_mutex_lock(&g_regex_cache_list_mutex);
+    u32 count = 0;
+    for (RegexScratchCache* cache = g_regex_caches; cache != nullptr; cache = cache->next) count++;
+    pthread_mutex_unlock(&g_regex_cache_list_mutex);
     return count;
 }
 

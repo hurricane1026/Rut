@@ -1,9 +1,10 @@
 #include "rut/runtime/tls_engine.h"
 
-#include <mutex>
+#include "tls_internal.h"
 
 #include <errno.h>
 #include <openssl/bio.h>
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 
 namespace rut {
@@ -72,23 +73,20 @@ int bridge_bio_destroy(BIO* bio) {
     return 1;
 }
 
-// The custom BIO_METHOD is process-wide and immutable once built.
-BIO_METHOD* g_bridge_method = nullptr;
-
-BIO_METHOD* bridge_method() {
-    static std::once_flag once;
-    std::call_once(once, []() {
-        const int kType = BIO_get_new_index() | BIO_TYPE_SOURCE_SINK;
-        BIO_METHOD* m = BIO_meth_new(kType, "rut-tls-bridge");
-        if (!m) return;
-        BIO_meth_set_write(m, bridge_bio_write);
-        BIO_meth_set_read(m, bridge_bio_read);
-        BIO_meth_set_ctrl(m, bridge_bio_ctrl);
-        BIO_meth_set_create(m, bridge_bio_create);
-        BIO_meth_set_destroy(m, bridge_bio_destroy);
-        g_bridge_method = m;
-    });
-    return g_bridge_method;
+BIO_METHOD* make_tls_engine_bridge_method_impl() {
+    // The bridge is only used through its BIO callbacks, so it needs no
+    // process-global custom type index. A fixed source/sink type is sufficient.
+    BIO_METHOD* method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "rut-tls-bridge");
+    if (method == nullptr) return nullptr;
+    if (!BIO_meth_set_write(method, bridge_bio_write) ||
+        !BIO_meth_set_read(method, bridge_bio_read) ||
+        !BIO_meth_set_ctrl(method, bridge_bio_ctrl) ||
+        !BIO_meth_set_create(method, bridge_bio_create) ||
+        !BIO_meth_set_destroy(method, bridge_bio_destroy)) {
+        BIO_meth_free(method);
+        return nullptr;
+    }
+    return method;
 }
 
 TlsOp classify(SSL* ssl, int rc) {
@@ -106,14 +104,23 @@ TlsOp classify(SSL* ssl, int rc) {
 
 }  // namespace
 
+BIO_METHOD* make_tls_engine_bridge_method() {
+    return make_tls_engine_bridge_method_impl();
+}
+
 core::Expected<void, Error> tls_engine_init(TlsEngine& eng, TlsServerContext* ctx) {
     if (!ctx || !ctx->ssl_ctx)
         return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
-    BIO_METHOD* method = bridge_method();
+    BIO_METHOD* method = ctx->bridge_bio_method;
     if (!method) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
 
     SSL* ssl = SSL_new(ctx->ssl_ctx);
     if (!ssl) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    const u64 session_tickets = SSL_get_num_tickets(ssl);
+    if (SSL_set_num_tickets(ssl, 0) != 1) {
+        SSL_free(ssl);
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    }
 
     BIO* bio = BIO_new(method);
     if (!bio) {
@@ -130,6 +137,7 @@ core::Expected<void, Error> tls_engine_init(TlsEngine& eng, TlsServerContext* ct
 
     eng.ssl = ssl;
     eng.handshake_done = false;
+    eng.deferred_session_tickets = session_tickets;
     return {};
 }
 
@@ -138,10 +146,12 @@ void tls_engine_free(TlsEngine& eng) {
         SSL_free(eng.ssl);  // frees the attached BIO too
         eng.ssl = nullptr;
     }
+    eng.deferred_session_tickets = 0;
 }
 
 TlsOp tls_engine_handshake(TlsEngine& eng) {
     if (!eng.ssl) return TlsOp::Error;
+    ERR_clear_error();
     const int kRc = SSL_do_handshake(eng.ssl);
     if (kRc == 1) {
         eng.handshake_done = true;
@@ -155,6 +165,7 @@ i32 tls_engine_read(TlsEngine& eng, u8* dst, u32 cap, TlsOp& st) {
         st = TlsOp::Error;
         return 0;
     }
+    ERR_clear_error();
     const int kN = SSL_read(eng.ssl, dst, static_cast<int>(cap));
     if (kN > 0) {
         st = TlsOp::Ok;
@@ -168,6 +179,23 @@ i32 tls_engine_write(TlsEngine& eng, const u8* src, u32 n, TlsOp& st) {
     if (!eng.ssl) {
         st = TlsOp::Error;
         return 0;
+    }
+    ERR_clear_error();
+    if (eng.handshake_done && eng.deferred_session_tickets != 0) {
+        const u64 requested = eng.deferred_session_tickets;
+        eng.deferred_session_tickets = 0;
+        if (SSL_version(eng.ssl) == TLS1_3_VERSION) {
+            // Match the configured full-handshake count and OpenSSL's one-ticket
+            // limit for a resumed session. Queue once, before SSL_write can
+            // return WANT_WRITE; retries must not request duplicate tickets.
+            const u64 count = SSL_session_reused(eng.ssl) ? 1 : requested;
+            for (u64 i = 0; i < count; ++i) {
+                if (SSL_new_session_ticket(eng.ssl) != 1) {
+                    st = TlsOp::Error;
+                    return 0;
+                }
+            }
+        }
     }
     const int kW = SSL_write(eng.ssl, src, static_cast<int>(n));
     if (kW > 0) {
