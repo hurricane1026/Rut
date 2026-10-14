@@ -8,6 +8,7 @@
 #include "rut/runtime/route_method.h"
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
+#include <memory>
 
 #include <errno.h>
 #include <poll.h>

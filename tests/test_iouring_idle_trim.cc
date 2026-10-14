@@ -596,7 +596,14 @@ TEST(iouring_idle_trim, burst_larger_than_budget_is_trimmed_exactly_once_over_la
         REQUIRE(c != nullptr);
         if (i == 0) sample = c;
     }
+    // The burst can let the kernel reclaim the first touched slice before the
+    // baseline is measured. Re-fault both sample pages so the test observes the
+    // trim transition, rather than the residency of a page from earlier in the
+    // burst.
+    sample->recv_slice[0] = 1;
+    sample->send_slice[0] = 1;
     CHECK_EQ(resident_pages(sample->recv_slice, SlicePool::kSliceSize), 1u);
+    CHECK_EQ(resident_pages(sample->send_slice, SlicePool::kSliceSize), 1u);
 
     u64 max_examined = 0;
     u64 max_trimmed = 0;
@@ -1106,7 +1113,9 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // RelayOwner and BufferedSendVector are part of the hot connection slot.
     // Keep the slot-size assertion explicit so future owner fields cannot grow
     // the layout unnoticed.
-    CHECK_EQ(sizeof(Connection), 3824u);
+    // tls_recv_overflow_prefix_len was added after the original 3824-byte
+    // budget assertion; keep checking the current hot-slot layout explicitly.
+    CHECK_EQ(sizeof(Connection), 3832u);
 }
 
 TEST(iouring_idle_trim,
