@@ -19,11 +19,11 @@ def load_config(path: str | Path) -> dict:
 
 
 def duration_seconds(value: str) -> float:
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)(ms|s|m)", value)
+    match = re.fullmatch(r"([1-9]\d*)(s|m|h)", value)
     if not match:
-        raise ValueError(f"unsupported wrk duration {value!r}; use a number followed by ms, s, or m")
-    amount = float(match.group(1))
-    return amount / 1000 if match.group(2) == "ms" else amount * (60 if match.group(2) == "m" else 1)
+        raise ValueError(f"unsupported wrk duration {value!r}; use a positive integer followed by s, m, or h")
+    amount = int(match.group(1))
+    return amount * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
 
 
 def run(argv: list[str], *, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:

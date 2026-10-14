@@ -48,8 +48,23 @@ def validate_runtime_libs(path: Path) -> None:
 
 
 def require_executable(path: Path, label: str) -> None:
-    if not path.is_file() or not os.access(path, os.X_OK):
+    if path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
         raise ValueError(f"{label} must be an executable file: {path}")
+
+
+def verify_worker_cpu_set(docker: str, worker: str, assigned_cpus: set[int]) -> set[int]:
+    raw = run([docker, "exec", worker, "sh", "-eu", "-c",
+               "cat /sys/fs/cgroup/cpuset.cpus.effective"]).strip()
+    try:
+        available = cpu_set(raw)
+    except ValueError as error:
+        raise RuntimeError(f"worker returned an invalid effective cpuset {raw!r}") from error
+    if not available:
+        raise RuntimeError("worker effective cpuset is empty")
+    unavailable = assigned_cpus - available
+    if unavailable:
+        raise RuntimeError(f"assigned benchmark CPUs {sorted(unavailable)} are outside worker effective cpuset {raw!r}")
+    return available
 
 
 def docker_image_identity(docker: str, reference: str) -> dict:
@@ -405,6 +420,8 @@ def main() -> int:
             duration_seconds(value)
         except ValueError as error:
             p.error(f"{name}: {error}")
+    if a.concurrency < 2:
+        p.error("--concurrency must be at least 2 because the client uses two threads")
 
     checkpoint = a.checkpoint.resolve(strict=True)
     output = a.output.resolve()
@@ -531,6 +548,7 @@ def main() -> int:
         mounts = json.loads(run([a.docker_bin, "inspect", a.worker_container, "--format", "{{json .Mounts}}"]))
         if not any(Path(m["Source"]).resolve() == checkpoint and m["Destination"] == a.node_mount for m in mounts):
             p.error("worker container must bind-mount checkpoint at --node-mount")
+        verify_worker_cpu_set(a.docker_bin, a.worker_container, set(all_cpus))
         kube = [a.kubectl_bin, "--kubeconfig", str(a.kubeconfig.resolve())]
         context = run(kube + ["config", "current-context"]).strip()
         if context != f"kind-{a.cluster_name}":

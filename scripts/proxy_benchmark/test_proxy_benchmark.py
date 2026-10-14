@@ -46,6 +46,25 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertIn("expected='6-7,14'", helper_script)
         self.assertIn('"$allowed" != "$expected"', helper_script)
 
+    def test_wrk_duration_parser_matches_positive_integer_s_m_h_syntax(self):
+        for value, seconds in (("1s", 1), ("2m", 120), ("1h", 3600), ("12s", 12)):
+            with self.subTest(value=value):
+                self.assertEqual(common.duration_seconds(value), seconds)
+        for value in ("0s", "0m", "1.5s", "500ms", "1d", "-1s"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                common.duration_seconds(value)
+
+    def test_worker_effective_cpuset_must_contain_all_assigned_benchmark_cpus(self):
+        with mock.patch("prepare.run", return_value="2-9,14\n") as run:
+            self.assertEqual(prepare.verify_worker_cpu_set("docker", "worker", {2, 3, 5, 9}),
+                             set(range(2, 10)) | {14})
+        self.assertEqual(run.call_args.args[0], ["docker", "exec", "worker", "sh", "-eu", "-c",
+                                                  "cat /sys/fs/cgroup/cpuset.cpus.effective"])
+        for value, assigned in (("2-8", {2, 9}), ("", {2}), ("bogus", {2})):
+            with mock.patch("prepare.run", return_value=value), self.subTest(value=value):
+                with self.assertRaises(RuntimeError):
+                    prepare.verify_worker_cpu_set("docker", "worker", assigned)
+
     def test_image_reference_normalization_handles_docker_and_kubernetes_names(self):
         self.assertTrue(common.image_reference_matches("nginx@sha256:abc", "docker.io/library/nginx@sha256:abc"))
         self.assertTrue(common.image_reference_matches("client:local", "docker.io/library/client:local"))
@@ -224,22 +243,44 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(json.loads((output / "native-configmap.json").read_text())["immutable"], True)
 
     def test_prepare_rejects_invalid_duration_before_creating_output_or_running_tools(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            checkpoint = root / "checkpoint"
-            checkpoint.mkdir()
-            output = root / "output"
-            argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
-                    "--kubeconfig", str(root / "kubeconfig"), "--cluster-name", "bench",
-                    "--worker-container", "bench-worker", "--worker-node", "bench-worker",
-                    "--rut-rps-dir", str(root / "rps"), "--rut-throughput-dir", str(root / "throughput"),
-                    "--runtime-libs", str(root / "libs"), "--clang", str(root / "clang"),
-                    "--ld", str(root / "ld"), "--client-image", "client:test", "--duration", "10"]
-            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
-                with self.assertRaises(SystemExit):
-                    prepare.main()
-            self.assertFalse(output.exists())
-            run.assert_not_called()
+        for option, value in (("--duration", "10"), ("--duration", "0s"),
+                              ("--warmup", "500ms"), ("--warmup", "1.5s")):
+            with self.subTest(option=option, value=value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint = root / "checkpoint"
+                checkpoint.mkdir()
+                output = root / "output"
+                argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                        "--kubeconfig", str(root / "kubeconfig"), "--cluster-name", "bench",
+                        "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                        "--rut-rps-dir", str(root / "rps"), "--rut-throughput-dir", str(root / "throughput"),
+                        "--runtime-libs", str(root / "libs"), "--clang", str(root / "clang"),
+                        "--ld", str(root / "ld"), "--client-image", "client:test", option, value]
+                with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                    with self.assertRaises(SystemExit):
+                        prepare.main()
+                self.assertFalse(output.exists())
+                run.assert_not_called()
+
+    def test_prepare_rejects_client_concurrency_below_two_before_side_effects(self):
+        for concurrency in (0, 1):
+            with self.subTest(concurrency=concurrency), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint = root / "checkpoint"
+                checkpoint.mkdir()
+                output = root / "output"
+                argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                        "--kubeconfig", str(root / "kubeconfig"), "--cluster-name", "bench",
+                        "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                        "--rut-rps-dir", str(root / "rps"), "--rut-throughput-dir", str(root / "throughput"),
+                        "--runtime-libs", str(root / "libs"), "--clang", str(root / "clang"),
+                        "--ld", str(root / "ld"), "--client-image", "client:test",
+                        "--concurrency", str(concurrency)]
+                with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                    with self.assertRaises(SystemExit):
+                        prepare.main()
+                self.assertFalse(output.exists())
+                run.assert_not_called()
 
     def test_prepare_checks_only_compiler_nul_strings_and_rejects_mismatched_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -267,6 +308,23 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 with self.subTest(path=path), self.assertRaisesRegex(ValueError, "executable file"):
                     prepare.require_executable(path, path.name)
                 path.chmod(0o755)
+
+    def test_prepare_rejects_symlinked_benchmark_executables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            external = root / "external-rut"
+            external.write_text("executable")
+            external.chmod(0o755)
+            link = root / "rut"
+            link.symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "executable file"):
+                prepare.require_executable(link, "rut-rps/rut")
+            nested = root / "checkpoint" / "rps"
+            nested.mkdir(parents=True)
+            relative_link = nested / "rut-compile"
+            relative_link.symlink_to("../../external-rut")
+            with self.assertRaisesRegex(ValueError, "executable file"):
+                prepare.require_executable(relative_link, "rut-rps/rut-compile")
 
     def test_origin_affinity_preserves_one_cpu_per_nginx_worker(self):
         rows = [{"pid": "100", "allowed": "3-4,8-9"},
