@@ -68,6 +68,26 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["client"]["worker_id"], "sha256:client")
         self.assertEqual(run.call_args.args[0], ["docker", "exec", "worker", "crictl", "images", "-o", "json"])
 
+    def test_prepare_requires_matching_client_config_ids_not_repo_digests(self):
+        host_id = "sha256:" + "a" * 64
+        worker_id = " SHA256:" + "A" * 64 + " "
+        identities = {"client": {"reference": "client:local", "docker_id": host_id,
+                                  "repo_digests": ["client@sha256:host-manifest"]}}
+        inventory = {"images": [{"id": worker_id, "repoTags": ["client:local"],
+                                  "repoDigests": ["client@sha256:different-manifest"]}]}
+        with mock.patch("prepare.run", return_value=json.dumps(inventory)):
+            resolved = prepare.resolve_worker_image_identities("docker", "worker", identities)
+        self.assertEqual(resolved["client"]["worker_id"], worker_id)
+
+        inventory["images"][0]["id"] = "sha256:" + "b" * 64
+        with mock.patch("prepare.run", return_value=json.dumps(inventory)):
+            with self.assertRaisesRegex(RuntimeError, "config IDs differ"):
+                prepare.resolve_worker_image_identities("docker", "worker", identities)
+        for missing in ({"docker_id": "", "worker_id": "sha256:x"},
+                        {"docker_id": "sha256:x", "worker_id": None}):
+            with self.subTest(missing=missing), self.assertRaisesRegex(RuntimeError, "identity missing"):
+                common.verify_client_image_config_identity(missing)
+
     def test_nginx_origin_modes_match_the_two_topologies(self):
         native = prepare.nginx_origin(8081, [3, 4, 8, 9], "/data/proxy")
         linkerd = prepare.nginx_origin(8080, [3, 4, 8, 9], "/data/body.bin", "0.0.0.0")
@@ -604,7 +624,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 path.write_text(name)
                 artifacts[name] = {"path": str(path), "sha256": common.sha256(path)}
             host_id = "sha256:" + "a" * 64
-            worker_id = "sha256:" + "b" * 64
+            worker_id = host_id
             checkpoint = root / "checkpoint"
             checkpoint.mkdir()
             config = {
@@ -626,6 +646,17 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     subprocess.CompletedProcess([], 0, host_id + "\n", ""),
                     subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
                 run_matrix.verify_provenance(config)
+            split_worker_id = "sha256:" + "b" * 64
+            config["image_identities"]["client"]["worker_id"] = split_worker_id
+            inventory["images"][0]["id"] = split_worker_id
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(worker), ""),
+                    subprocess.CompletedProcess([], 0, host_id + "\n", ""),
+                    subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
+                with self.assertRaisesRegex(RuntimeError, "client Docker and kind worker image config IDs differ"):
+                    run_matrix.verify_provenance(config)
+            config["image_identities"]["client"]["worker_id"] = worker_id
+            inventory["images"][0]["id"] = worker_id
             (inputs / "request.lua").write_text("changed")
             with mock.patch("run_matrix.invoke") as invoke:
                 with self.assertRaisesRegex(RuntimeError, "mounted benchmark inputs changed"):

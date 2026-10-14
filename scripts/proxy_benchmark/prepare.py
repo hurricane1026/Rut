@@ -14,7 +14,8 @@ import sys
 import uuid
 
 from common import (canonical_cpu_list, cpu_set, image_reference_matches,
-                    normalized_linkerd_injection_spec, snapshot_inputs, write_json)
+                    normalized_linkerd_injection_spec, snapshot_inputs,
+                    verify_client_image_config_identity, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 IMAGES = {
@@ -75,6 +76,12 @@ def worker_image_identities(docker: str, worker: str, identities: dict) -> dict:
         image = next(image for image in matches if image.get("id") in ids)
         resolved[name] = {**identity, "worker_id": image["id"],
                           "worker_repo_digests": sorted(image.get("repoDigests") or [])}
+    return resolved
+
+
+def resolve_worker_image_identities(docker: str, worker: str, identities: dict) -> dict:
+    resolved = worker_image_identities(docker, worker, identities)
+    verify_client_image_config_identity(resolved.get("client", {}))
     return resolved
 
 
@@ -487,7 +494,7 @@ def main() -> int:
                                                     probe_path, probe_name, a.namespace)
         image_identities.update(injection["identities"])
         config["linkerd_injected_spec"] = injection["injected_spec"]
-        resolved_images = worker_image_identities(a.docker_bin, a.worker_container, image_identities)
+        resolved_images = resolve_worker_image_identities(a.docker_bin, a.worker_container, image_identities)
         helper_cpus = canonical_cpu_list(set(helpers))
         verify_script = helper_verify_script(helpers, a.pin_worker_helpers)
         pin_result = run([a.docker_bin, "exec", a.worker_container, "taskset", "-c", helper_cpus,

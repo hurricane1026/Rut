@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 
 from common import (cpu_set, image_reference_matches, load_config, normalized_linkerd_injection_spec, pod_spec,
-                    provenance_fingerprint, snapshot_inputs, write_json)
+                    provenance_fingerprint, snapshot_inputs,
+                    verify_client_image_config_identity, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 ENGINES = {"4k": ("linkerd", "rut-rps", "nginx", "envoy"),
@@ -709,6 +710,7 @@ def verify_provenance(config: dict) -> None:
         ids = {image.get("id") for image in matches if image.get("id")}
         if ids != {expected_id}:
             raise RuntimeError(f"kind worker image identity changed for {name}: expected {expected_id}, got {sorted(ids)}")
+    verify_client_image_config_identity(config["image_identities"].get("client", {}))
 
 
 def verify_configmaps(config: dict) -> None:

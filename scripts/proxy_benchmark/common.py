@@ -84,6 +84,22 @@ def image_reference_matches(reference: str, candidate: str) -> bool:
     return canonical_image_reference(reference) == canonical_image_reference(candidate)
 
 
+def verify_client_image_config_identity(identity: dict) -> None:
+    """Require Docker and the kind worker to use the same image config ID.
+
+    RepoDigests identify registry manifests and are intentionally not used here:
+    Docker's image ID and CRI's image ID both identify the image config.
+    """
+    docker_id = identity.get("docker_id")
+    worker_id = identity.get("worker_id")
+    docker_id = docker_id.strip().lower() if isinstance(docker_id, str) else ""
+    worker_id = worker_id.strip().lower() if isinstance(worker_id, str) else ""
+    if not docker_id or not worker_id:
+        raise RuntimeError("client image config identity missing from Docker or kind worker")
+    if docker_id != worker_id:
+        raise RuntimeError(f"client Docker and kind worker image config IDs differ: {docker_id} != {worker_id}")
+
+
 def normalized_linkerd_injection_spec(pod: dict) -> dict:
     spec = pod.get("spec", {})
     def normalize_container(item: dict) -> dict:
