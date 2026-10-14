@@ -108,7 +108,7 @@ def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
 def provenance_fingerprint(config: dict) -> str:
     evidence = {key: config[key] for key in (
         "images", "image_identities", "input_snapshot", "artifacts", "cpus",
-        "duration", "warmup", "concurrency", "repeats", "bodies",
+        "duration", "warmup", "concurrency", "repeats", "bodies", "payloads",
         "worker_node", "selector",
     ) if key in config}
     evidence["schedule"] = {"algorithm": "balanced-interleave-v1",

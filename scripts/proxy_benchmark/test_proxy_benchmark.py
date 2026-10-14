@@ -189,6 +189,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(config["cpus"]["helpers"], "15-16")
             self.assertEqual(config["image_identities"]["client"]["docker_id"], docker_image["Id"])
             self.assertEqual(set(config["input_snapshot"]), {"client_dir", "rut_config_dir", "runtime_libs", "clang", "ld"})
+            self.assertEqual(config["payloads"]["4k"], json.loads((output / "payloads.json").read_text())["4k"])
             self.assertEqual(json.loads((output / "native-configmap.json").read_text())["immutable"], True)
 
     def test_prepare_checks_only_compiler_nul_strings_and_rejects_mismatched_paths(self):
@@ -419,7 +420,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
             output.mkdir()
             metadata = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
             (output / "payloads.json").write_text(json.dumps({"4k": metadata}))
-            config = {"output": str(output), "checkpoint": str(checkpoint), "bodies": {"4k": len(content)}}
+            config = {"output": str(output), "checkpoint": str(checkpoint), "bodies": {"4k": len(content)},
+                      "payloads": {"4k": metadata}}
             run_matrix.verify_payloads(config)
             for filename in ("proxy", "body.bin"):
                 path = payload_dir / filename
@@ -431,6 +433,50 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     run_matrix.verify_payloads(config)
                 path.write_bytes(content)
             run_matrix.verify_payloads(config)
+
+    def test_same_size_payload_and_metadata_replacement_is_rejected_and_changes_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            payload_dir = checkpoint / "payloads" / "4k"
+            payload_dir.mkdir(parents=True)
+            original = b"original payload bytes"
+            replacement = b"replaced payload bytes"
+            self.assertEqual(len(replacement), len(original))
+            for filename in ("proxy", "body.bin"):
+                (payload_dir / filename).write_bytes(original)
+            output = root / "output"
+            output.mkdir()
+            original_metadata = {"bytes": len(original), "sha256": hashlib.sha256(original).hexdigest()}
+            replacement_metadata = {"bytes": len(replacement),
+                                    "sha256": hashlib.sha256(replacement).hexdigest()}
+            (output / "payloads.json").write_text(json.dumps({"4k": original_metadata}))
+            config = {"schema": 1, "output": str(output), "checkpoint": str(checkpoint),
+                      "bodies": {"4k": len(original)},
+                      "payloads": {"4k": original_metadata}}
+            original_fingerprint = common.provenance_fingerprint(config)
+            validation = output / "samples" / "one" / "valid.txt"
+            validation.parent.mkdir(parents=True)
+            validation.write_text("valid\n")
+            row = {"validation_path": str(validation.relative_to(output))}
+            (validation.parent / "cell.json").write_text(json.dumps({
+                "provenance_fingerprint": original_fingerprint}))
+            run_matrix.verify_payloads(config)
+            for filename in ("proxy", "body.bin"):
+                (payload_dir / filename).write_bytes(replacement)
+            (output / "payloads.json").write_text(json.dumps({"4k": replacement_metadata}))
+            with self.assertRaisesRegex(RuntimeError, "differs from benchmark config"):
+                run_matrix.verify_payloads(config)
+            config_path = output / "benchmark.json"
+            config_path.write_text(json.dumps(config))
+            with mock.patch("sys.argv", ["summarize.py", "--config", str(config_path)]):
+                with self.assertRaisesRegex(RuntimeError, "differs from benchmark config"):
+                    summarize.main()
+            mutated_config = {**config, "payloads": {"4k": replacement_metadata}}
+            self.assertNotEqual(common.provenance_fingerprint(mutated_config), original_fingerprint)
+            with self.assertRaisesRegex(ValueError, "provenance does not match"):
+                summarize.validate_sample_provenance(output, row,
+                    common.provenance_fingerprint(mutated_config))
 
     def test_measurement_start_stamp_follows_delayed_docker_start_and_running_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:

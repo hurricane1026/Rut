@@ -461,6 +461,11 @@ def verify_artifacts(config: dict) -> None:
 def verify_payloads(config: dict) -> None:
     prepared = json.loads((Path(config["output"]) / "payloads.json").read_text())
     bodies = config["bodies"]
+    expected_payloads = config.get("payloads")
+    if not isinstance(expected_payloads, dict):
+        raise RuntimeError("benchmark config has no bound payload metadata")
+    if prepared != expected_payloads:
+        raise RuntimeError("prepared payload metadata differs from benchmark config")
     if set(prepared) != set(bodies):
         raise RuntimeError("prepared payload metadata does not match configured bodies")
     for body, configured_size in bodies.items():

@@ -8,6 +8,7 @@ import statistics
 import sys
 
 from common import load_config, provenance_fingerprint, write_json
+from run_matrix import verify_payloads
 
 
 def sample_metrics(output: Path, relative: str) -> dict:
@@ -99,6 +100,7 @@ def main() -> int:
     parser.add_argument("--allow-partial", action="store_true", help="summarize a smoke or interrupted run")
     args = parser.parse_args()
     config = load_config(args.config)
+    verify_payloads(config)
     output = Path(config["output"])
     sample_root = output / "samples"
     index = json.loads((sample_root / "index.json").read_text())

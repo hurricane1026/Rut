@@ -407,6 +407,7 @@ def main() -> int:
                   "rut_throughput_compiler": {"path": str(paths["rut_throughput"] / "rut-compile"), "sha256": sha(paths["rut_throughput"] / "rut-compile")},
               },
               "duration": a.duration, "warmup": a.warmup, "concurrency": a.concurrency, "repeats": a.repeats, "bodies": SIZES}
+    config["payloads"] = payloads
     checks = []
     if a.verify_cluster:
         inspect = json.loads(run([a.docker_bin, "inspect", a.worker_container]))[0]
