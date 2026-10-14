@@ -70,14 +70,20 @@ def mapped_shared_object_paths(maps_text: str) -> list[str]:
 
 
 class Matrix:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, config_path: Path | None = None):
         self.c = config
         self.out = Path(config["output"])
+        self.config_path = config_path or (self.out / "benchmark.json")
         self.samples = self.out / "samples"
         self.kubectl = config["tools"]["kubectl"]
         self.docker = config["tools"]["docker"]
         self.linkerd = config["tools"]["linkerd"]
         self.kubeconfig = config["kubeconfig"]
+
+    def client_argv(self, client: Path, label: str, pod_ip: str, duration: str,
+                    lua: str, target: Path) -> list[str]:
+        return [sys.executable, str(client), "--config", str(self.config_path), "--label", label,
+                "--pod-ip", pod_ip, "--duration", duration, "--lua", lua, "--output", str(target)]
 
     def kube(self, *args: str, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:
         return invoke([self.kubectl, "--kubeconfig", self.kubeconfig, *args], check=check, timeout=timeout)
@@ -356,8 +362,7 @@ class Matrix:
         client = Path(__file__).with_name("run_client.py")
         for kind, duration, lua, target in (("warmup", self.c["warmup"], "warmup.lua", outdir / "warmup"),
                                             ("measurement", self.c["duration"], "request.lua", outdir / "measurement")):
-            argv = [sys.executable, str(client), "--config", str(self.out / "benchmark.json"), "--label", f"{label}-{kind}",
-                    "--pod-ip", pod_ip, "--duration", duration, "--lua", lua, "--output", str(target)]
+            argv = self.client_argv(client, f"{label}-{kind}", pod_ip, duration, lua, target)
             (outdir / f"{kind}-driver-command.json").write_text(json.dumps(argv, indent=2) + "\n")
             child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             measure_start = None
@@ -624,7 +629,7 @@ def main() -> int:
     verify_artifacts(config)
     verify_payloads(config)
     verify_provenance(config)
-    matrix = Matrix(config)
+    matrix = Matrix(config, args.config.resolve())
     matrix.samples.mkdir(parents=True, exist_ok=True)
     plan_path = matrix.samples / "schedule.json"
     work = plan(int(config["repeats"]))

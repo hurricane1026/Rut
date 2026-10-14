@@ -203,6 +203,17 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang-22", "/usr/bin/"))
             self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang", "/opt/llvm/bin/"))
 
+    def test_runtime_library_bundle_must_be_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            libraries = root / "libs"
+            libraries.mkdir()
+            prepare.validate_runtime_libs(libraries)
+            file_path = root / "libs-file"
+            file_path.write_text("not a directory")
+            with self.assertRaisesRegex(ValueError, "runtime-libs must be a directory"):
+                prepare.validate_runtime_libs(file_path)
+
     def test_compiler_string_scan_ignores_non_ascii_binary_chunks(self):
         real_binary = Path(sys.executable).read_bytes()
         self.assertTrue(real_binary)
@@ -263,6 +274,30 @@ class ProxyBenchmarkTests(unittest.TestCase):
             probe.write_text("{}")
             with mock.patch("prepare.run", side_effect=["", RuntimeError("not ready"), ""]) as run:
                 with self.assertRaisesRegex(RuntimeError, "not ready"):
+                    prepare.discover_linkerd_proxy_identity(
+                        ["kubectl"], "docker", "worker", probe, "probe", "bench")
+        self.assertIn("delete", run.call_args_list[-1].args[0])
+
+    def test_linkerd_probe_cleanup_attempts_delete_after_ambiguous_create_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            probe.write_text("{}")
+            create_timeout = subprocess.TimeoutExpired(["kubectl", "create"], 90)
+            with mock.patch("prepare.run", side_effect=[create_timeout, ""]) as run:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    prepare.discover_linkerd_proxy_identity(
+                        ["kubectl"], "docker", "worker", probe, "probe", "bench")
+        cleanup = run.call_args_list[-1]
+        self.assertIn("delete", cleanup.args[0])
+        self.assertIn("--ignore-not-found=true", cleanup.args[0])
+        self.assertEqual(cleanup.kwargs["timeout"], 90)
+
+    def test_linkerd_probe_cleanup_failure_does_not_mask_create_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            probe.write_text("{}")
+            with mock.patch("prepare.run", side_effect=[RuntimeError("create timed out"), OSError("delete unavailable")]) as run:
+                with self.assertRaisesRegex(RuntimeError, "create timed out"):
                     prepare.discover_linkerd_proxy_identity(
                         ["kubectl"], "docker", "worker", probe, "probe", "bench")
         self.assertIn("delete", run.call_args_list[-1].args[0])
@@ -450,6 +485,20 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertFalse((output / "samples/4k/4k-nginx-r1/pod-create.txt").exists())
             self.assertEqual(result, "deleted\n")
             self.assertIn("create timed out", (output / "samples/last-failure.json").read_text())
+
+    def test_client_drivers_receive_the_selected_config_path_and_workload_values(self):
+        config = {"output": "/benchmark/output",
+                  "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                  "kubeconfig": "/tmp/kube"}
+        selected = Path("/tmp/selected/benchmark.json")
+        matrix = run_matrix.Matrix(config, selected)
+        for kind, duration, lua in (("warmup", "2s", "warmup.lua"),
+                                    ("measurement", "10s", "request.lua")):
+            argv = matrix.client_argv(Path("run_client.py"), f"cell-{kind}", "10.0.0.2",
+                                      duration, lua, Path("results") / kind)
+            self.assertEqual(argv[argv.index("--config") + 1], str(selected))
+            self.assertEqual(argv[argv.index("--duration") + 1], duration)
+            self.assertEqual(argv[argv.index("--lua") + 1], lua)
 
     def test_effective_runtime_paths_must_match_prepared_snapshot_and_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -39,6 +39,11 @@ def cpus(value: str, count: int, name: str) -> list[int]:
     return values
 
 
+def validate_runtime_libs(path: Path) -> None:
+    if not path.is_dir():
+        raise ValueError("--runtime-libs must be a directory")
+
+
 def docker_image_identity(docker: str, reference: str) -> dict:
     raw = run([docker, "image", "inspect", "--format", "{{json .}}", reference])
     image = json.loads(raw)
@@ -121,10 +126,8 @@ def applied_configmap_identity(actual: dict, expected_data: dict) -> dict:
 
 def discover_linkerd_proxy_identity(kube: list[str], docker: str, worker: str,
                                     probe_path: Path, pod_name: str, namespace: str) -> dict:
-    created = False
     try:
         run(kube + ["create", "-f", str(probe_path)])
-        created = True
         run(kube + ["wait", "--for=condition=Ready", f"pod/{pod_name}", "-n", namespace,
                     "--timeout=180s"], timeout=190)
         actual = json.loads(run(kube + ["get", "pod", pod_name, "-n", namespace, "-o", "json"]))
@@ -138,9 +141,13 @@ def discover_linkerd_proxy_identity(kube: list[str], docker: str, worker: str,
             raise RuntimeError(f"Linkerd probe imageID differs from resolved worker identity: {status['imageID']}")
         return identity
     finally:
-        if created:
+        active_error = sys.exc_info()[0] is not None
+        try:
             run(kube + ["delete", "pod", pod_name, "-n", namespace, "--ignore-not-found=true",
-                        "--wait=true", "--grace-period=1"])
+                        "--wait=true", "--grace-period=1"], timeout=90)
+        except Exception:
+            if not active_error:
+                raise
 
 
 def helper_verify_script(helpers: list[int], pin: bool) -> str:
@@ -332,6 +339,10 @@ def main() -> int:
 
     paths = {"rut_rps": a.rut_rps_dir.resolve(strict=True), "rut_throughput": a.rut_throughput_dir.resolve(strict=True),
              "runtime_libs": a.runtime_libs.resolve(strict=True), "clang": a.clang.resolve(strict=True), "ld": a.ld.resolve(strict=True)}
+    try:
+        validate_runtime_libs(paths["runtime_libs"])
+    except ValueError as error:
+        p.error(str(error))
     for key, path in paths.items():
         if not path.is_relative_to(checkpoint):
             p.error(f"{key} must be under --checkpoint so the kind worker can access it")
