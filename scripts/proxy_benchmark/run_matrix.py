@@ -153,8 +153,14 @@ class Matrix:
         deadline = time.monotonic() + 180
         safe_ip = re.sub(r"[^A-Za-z0-9_.-]", "-", pod_ip)
         name = f"proxybench-ready-{self.c.get('run_id', 'run')}-{safe_ip}"
+        attempt_id = uuid.uuid4().hex
+        owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                        "benchmark-run-id": self.c.get("run_id", "run"),
+                        "benchmark-create-attempt": attempt_id}
         while time.monotonic() < deadline:
             argv = [self.docker, "run", "--rm", "--name", name,
+                    *[part for key, value in owner_labels.items()
+                      for part in ("--label", f"{key}={value}")],
                     "--network", f"container:{self.c['worker_container']}",
                     "--cpuset-cpus", self.c["cpus"]["client"], "--entrypoint", "curl",
                     self.c["images"]["client"], "--http1.1", "--fail", "--silent", "--show-error",
@@ -166,8 +172,22 @@ class Matrix:
                 result = None
             finally:
                 try:
-                    invoke([self.docker, "rm", "-f", name], check=False, timeout=5)
+                    inspected = invoke([self.docker, "inspect", name], check=False, timeout=5)
+                    if inspected.returncode == 0:
+                        containers = json.loads(inspected.stdout)
+                        if len(containers) == 1:
+                            container = containers[0]
+                            labels = container.get("Config", {}).get("Labels") or {}
+                            actual_name = (container.get("Name") or "").lstrip("/")
+                            if (actual_name == name and all(labels.get(key) == value
+                                                             for key, value in owner_labels.items())):
+                                container_id = container.get("Id")
+                                if container_id:
+                                    invoke([self.docker, "rm", "-f", container_id],
+                                           check=False, timeout=5)
                 except (OSError, subprocess.SubprocessError):
+                    pass
+                except (ValueError, TypeError):
                     pass
             if result is not None and result.returncode == 0:
                 return

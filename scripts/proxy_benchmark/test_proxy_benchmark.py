@@ -407,45 +407,55 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertFalse((checkpoint / "config").exists())
             run.assert_not_called()
 
-    def test_prepare_rejects_symlinked_generated_config_root_before_any_writes(self):
-        for target_kind in ("absolute", "relative"):
-            with self.subTest(target_kind=target_kind), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                checkpoint = root / "checkpoint"
-                checkpoint.mkdir()
-                target = root / "outside-config"
-                target.mkdir()
-                for name in ("rps", "throughput", "libs", "tools", "client"):
-                    (checkpoint / name).mkdir()
-                for dirname in ("rps", "throughput"):
-                    for filename, contents in (("rut", b"runtime"),
-                                               ("rut-compile", b"compiler\0/usr/bin/clang\0/usr/bin/\0")):
-                        program = checkpoint / dirname / filename
-                        program.write_bytes(contents)
+    def test_prepare_rejects_symlinked_generated_config_paths_before_any_writes(self):
+        for destination in ("config-root", "proxy-rps.rut", "proxy-throughput.rut"):
+            for target_kind in ("absolute", "relative"):
+                with self.subTest(destination=destination, target_kind=target_kind), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    checkpoint = root / "checkpoint"
+                    checkpoint.mkdir()
+                    target = root / "outside-config"
+                    target.mkdir()
+                    for filename in ("proxy-rps.rut", "proxy-throughput.rut"):
+                        (target / filename).write_text("preserve me")
+                    for name in ("rps", "throughput", "libs", "tools", "client"):
+                        (checkpoint / name).mkdir()
+                    for dirname in ("rps", "throughput"):
+                        for filename, contents in (("rut", b"runtime"),
+                                                   ("rut-compile", b"compiler\0/usr/bin/clang\0/usr/bin/\0")):
+                            program = checkpoint / dirname / filename
+                            program.write_bytes(contents)
+                            program.chmod(0o755)
+                    for filename in ("clang", "ld"):
+                        program = checkpoint / "tools" / filename
+                        program.write_text(filename)
                         program.chmod(0o755)
-                for filename in ("clang", "ld"):
-                    program = checkpoint / "tools" / filename
-                    program.write_text(filename)
-                    program.chmod(0o755)
-                for filename in ("request.lua", "warmup.lua"):
-                    (checkpoint / "client" / filename).write_text("return true")
-                config_root = checkpoint / "config"
-                target_path = target if target_kind == "absolute" else Path("../outside-config")
-                config_root.symlink_to(target_path, target_is_directory=True)
-                output = root / "results"
-                argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
-                        "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
-                        "--worker-container", "bench-worker", "--worker-node", "bench-worker",
-                        "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
-                        "--runtime-libs", str(checkpoint / "libs"), "--clang", str(checkpoint / "tools" / "clang"),
-                        "--ld", str(checkpoint / "tools" / "ld"), "--client-dir", str(checkpoint / "client"),
-                        "--client-image", "client:test"]
-                with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
-                    with self.assertRaises(SystemExit):
-                        prepare.main()
-                self.assertFalse(output.exists())
-                self.assertFalse(any(target.iterdir()))
-                run.assert_not_called()
+                    for filename in ("request.lua", "warmup.lua"):
+                        (checkpoint / "client" / filename).write_text("return true")
+                    config_root = checkpoint / "config"
+                    if destination == "config-root":
+                        target_path = target if target_kind == "absolute" else Path("../outside-config")
+                        config_root.symlink_to(target_path, target_is_directory=True)
+                    else:
+                        config_root.mkdir()
+                        filename = destination
+                        target_path = target / filename if target_kind == "absolute" else Path("../../outside-config") / filename
+                        (config_root / filename).symlink_to(target_path)
+                    output = root / "results"
+                    argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                            "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
+                            "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                            "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
+                            "--runtime-libs", str(checkpoint / "libs"), "--clang", str(checkpoint / "tools" / "clang"),
+                            "--ld", str(checkpoint / "tools" / "ld"), "--client-dir", str(checkpoint / "client"),
+                            "--client-image", "client:test"]
+                    with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                        with self.assertRaises(SystemExit):
+                            prepare.main()
+                    self.assertFalse(output.exists())
+                    self.assertEqual({path.name: path.read_text() for path in target.iterdir()},
+                                     {"proxy-rps.rut": "preserve me", "proxy-throughput.rut": "preserve me"})
+                    run.assert_not_called()
 
     def test_prepare_checks_only_compiler_nul_strings_and_rejects_mismatched_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1738,17 +1748,32 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     if attempt == 1:
                         raise subprocess.TimeoutExpired("curl", 5)
                     return subprocess.CompletedProcess([], 7, "", "refused") if attempt == 2 else success
+                if argv[1] == "inspect":
+                    run = next(row for row in events if row[1] == "run")
+                    labels = {}
+                    for index, item in enumerate(run):
+                        if item == "--label":
+                            key, value = run[index + 1].split("=", 1)
+                            labels[key] = value
+                    return subprocess.CompletedProcess([], 0, json.dumps([{
+                        "Id": "owned-id", "Name": "/" + argv[-1], "Config": {"Labels": labels}}]), "")
                 return subprocess.CompletedProcess([], 0, "", "")
             with mock.patch("run_matrix.time.monotonic", return_value=0), \
                     mock.patch("run_matrix.time.sleep") as sleep, \
                     mock.patch("run_matrix.invoke", side_effect=invoke) as invoke_mock:
                 matrix.wait_frontend("10.0.0.2")
-            self.assertEqual(invoke_mock.call_count, 6)
-            self.assertEqual([event[1] for event in events], ["run", "rm", "run", "rm", "run", "rm"])
+            self.assertEqual(invoke_mock.call_count, 9)
+            self.assertEqual([event[1] for event in events],
+                             ["run", "inspect", "rm", "run", "inspect", "rm", "run", "inspect", "rm"])
             self.assertEqual(sleep.call_count, 2)
             self.assertIn("--connect-timeout", events[0])
             self.assertIn("--max-time", events[0])
             self.assertIn("--name", events[0])
+            self.assertEqual(events[2][1:], ["rm", "-f", "owned-id"])
+            label_args = [events[0][index + 1] for index, item in enumerate(events[0]) if item == "--label"]
+            self.assertEqual(len(label_args), 3)
+            self.assertIn("app.kubernetes.io/managed-by=rut-proxy-benchmark", label_args)
+            self.assertIn("benchmark-run-id=run", label_args)
 
     def test_frontend_cleanup_failure_reuses_same_name_and_cannot_spawn_another_probe(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1763,7 +1788,13 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     if sum(1 for row in events if row[1] == "run") == 1:
                         raise subprocess.TimeoutExpired(argv, 5)
                     return subprocess.CompletedProcess(argv, 125, "container name already in use", "")
-                if sum(1 for row in events if row[1] == "rm") == 1:
+                if argv[1] == "inspect":
+                    run = next(row for row in events if row[1] == "run")
+                    labels = {run[index + 1].split("=", 1)[0]: run[index + 1].split("=", 1)[1]
+                              for index, item in enumerate(run) if item == "--label"}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{
+                        "Id": "owned-id", "Name": "/" + argv[-1], "Config": {"Labels": labels}}]), "")
+                if argv[1] == "rm" and sum(1 for row in events if row[1] == "rm") == 1:
                     raise OSError("Docker daemon did not remove the timed out probe")
                 return subprocess.CompletedProcess(argv, 0, "", "")
             with mock.patch("run_matrix.time.monotonic", side_effect=[0, 0, 0, 181]), \
@@ -1775,7 +1806,29 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(len(run_events), 2)
             self.assertEqual(run_events[0][run_events[0].index("--name") + 1],
                              run_events[1][run_events[1].index("--name") + 1])
-            self.assertEqual([row[1] for row in events], ["run", "rm", "run", "rm"])
+            self.assertEqual([row[1] for row in events], ["run", "inspect", "rm", "run", "inspect", "rm"])
+
+    def test_frontend_name_collision_never_removes_unowned_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                                        "kubeconfig": "", "worker_container": "worker", "run_id": "r1",
+                                        "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
+            events = []
+            def invoke(argv, **_kwargs):
+                argv = [str(item) for item in argv]
+                events.append(argv)
+                if argv[1] == "run":
+                    return subprocess.CompletedProcess(argv, 125, "name already in use", "")
+                if argv[1] == "inspect":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{
+                        "Id": "unowned-id", "Name": "/" + argv[-1],
+                        "Config": {"Labels": {"app.kubernetes.io/managed-by": "other"}}}]), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with mock.patch("run_matrix.time.monotonic", side_effect=[0, 0, 181]), \
+                    mock.patch("run_matrix.time.sleep"), mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                    matrix.wait_frontend("10.0.0.2")
+            self.assertEqual([row[1] for row in events], ["run", "inspect"])
 
     def test_frontend_readiness_fails_after_bounded_retry_window(self):
         with tempfile.TemporaryDirectory() as tmp:

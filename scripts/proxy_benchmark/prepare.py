@@ -130,6 +130,24 @@ def validate_payload_paths(checkpoint: Path) -> None:
             raise ValueError(f"{label} has an unexpected file type: {path}")
 
 
+def validate_generated_config_paths(checkpoint: Path) -> None:
+    config_dir = checkpoint / "config"
+    try:
+        mode = config_dir.lstat().st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and (stat.S_ISLNK(mode) or not stat.S_ISDIR(mode)):
+        raise ValueError(f"generated config directory must be a real directory: {config_dir}")
+    for name in ("proxy-rps.rut", "proxy-throughput.rut"):
+        path = config_dir / name
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise ValueError(f"generated config destination must be a regular file: {path}")
+
+
 def validate_output_disjoint(output: Path, input_roots: list[Path]) -> None:
     for root in input_roots:
         if output == root or output.is_relative_to(root) or root.is_relative_to(output):
@@ -569,8 +587,7 @@ def main() -> int:
         p.error(str(error))
     config_dir = checkpoint / "config"
     try:
-        if config_dir.is_symlink():
-            raise ValueError(f"mounted input root is a symlink: {config_dir}")
+        validate_generated_config_paths(checkpoint)
         validate_output_disjoint(output, [client_dir, paths["rut_rps"], paths["rut_throughput"],
                                           paths["runtime_libs"], paths["clang"], paths["ld"],
                                           config_dir.resolve()])
@@ -621,6 +638,10 @@ def main() -> int:
     image_identities = {name: {"reference": reference} for name, reference in image_refs.items()}
     image_identities["client"] = docker_image_identity(a.docker_bin, a.client_image)
 
+    try:
+        validate_generated_config_paths(checkpoint)
+    except ValueError as error:
+        p.error(str(error))
     output.mkdir(parents=True, exist_ok=True)
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "proxy-rps.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .rps, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
