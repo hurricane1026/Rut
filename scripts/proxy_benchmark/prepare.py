@@ -14,7 +14,7 @@ import subprocess
 import sys
 import uuid
 
-from common import (canonical_cpu_list, cpu_set, image_reference_matches,
+from common import (canonical_cpu_list, cpu_set, image_reference_matches, ipv4_pod_cidr,
                     duration_seconds, normalized_linkerd_injection_spec, snapshot_inputs,
                     validate_docker_mount_source, verify_client_image_config_identity, write_json)
 
@@ -718,6 +718,9 @@ def main() -> int:
         if context != f"kind-{a.cluster_name}":
             p.error(f"kubeconfig current-context must be kind-{a.cluster_name}; got {context!r}")
         node = json.loads(run(kube + ["get", "node", a.worker_node, "-o", "json"]))
+        ipv4_cidr = ipv4_pod_cidr(node)
+        if ipv4_cidr is None:
+            p.error("worker node has no IPv4 PodCIDR; benchmark listeners are IPv4-only")
         if node["metadata"].get("labels", {}).get(a.selector_key) != a.selector_value:
             p.error("worker node does not have the requested selector label")
         run(kube + ["get", "namespace", a.namespace])
@@ -736,7 +739,8 @@ def main() -> int:
                           "sh", "-eu", "-c", verify_script])
         (output / "worker-helper-pin.txt").write_text(pin_result)
         helpers_check = "worker helper thread affinity verified"
-        checks = ["kind worker identity", "worker mount", "kubeconfig context", "node selector", "namespace", "linkerd check", helpers_check]
+        checks = ["kind worker identity", "worker mount", "kubeconfig context", "IPv4 PodCIDR",
+                  "node selector", "namespace", "linkerd check", helpers_check]
         config["image_identities"] = resolved_images
     config["verified_cluster_checks"] = checks
     write_json(output / "benchmark.json", config)

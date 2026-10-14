@@ -15,7 +15,8 @@ import time
 import uuid
 from pathlib import Path
 
-from common import (cpu_set, duration_seconds, image_reference_matches, ip_authority, ip_url, load_config,
+from common import (cpu_set, duration_seconds, image_reference_matches, ip_authority, ip_url,
+                    load_config, parse_wrk_metrics, select_ipv4_pod_ip,
                     normalized_linkerd_injection_spec, pod_spec,
                     provenance_fingerprint, snapshot_inputs, verify_payload_path, verify_payloads,
                     validate_docker_mount_source, verify_client_image_config_identity, write_json)
@@ -23,6 +24,16 @@ from common import (cpu_set, duration_seconds, image_reference_matches, ip_autho
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 ENGINES = {"4k": ("linkerd", "rut-rps", "nginx", "envoy"),
            "large": ("linkerd", "rut-throughput", "nginx", "envoy")}
+
+
+class TerminatedBySignal(KeyboardInterrupt):
+    def __init__(self, signum: int):
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
+
+
+def handle_sigterm(signum, _frame):
+    raise TerminatedBySignal(signum)
 
 
 def invoke(argv: list[str], *, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:
@@ -637,16 +648,18 @@ class Matrix:
         pod_path.write_text(fetched.stdout)
         pod = json.loads(fetched.stdout)
         pod_ip = pod["status"]["podIP"]
+        client_ip = select_ipv4_pod_ip(pod["status"])
         (outdir / "pod-ip.txt").write_text(pod_ip + "\n")
-        self.wait_frontend(pod_ip)
+        (outdir / "client-ip.txt").write_text(client_ip + "\n")
+        self.wait_frontend(client_ip)
         resource_pids = self.inspect_runtime(engine, outdir)
         resource_records = [self.capture_resources(outdir, "idle", resource_pids)]
 
         before = self.metric(pod_name, outdir, "before") if engine == "linkerd" else None
-        self.curl(pod_ip, outdir, body)
+        self.curl(client_ip, outdir, body)
         marker = origin_preflight_marker(body, engine, rep)
         if marker:
-            self.curl(pod_ip, outdir, body, marker=marker, many=True)
+            self.curl(client_ip, outdir, body, marker=marker, many=True)
             origin_log = self.kube("logs", pod_name, "-n", self.c["namespace"], "-c", "origin").stdout
             (outdir / "origin-100-request-preflight.log").write_text(origin_log)
             tagged = [line for line in origin_log.splitlines() if f"marker={marker}" in line]
@@ -663,7 +676,7 @@ class Matrix:
                        {"requests_logged": len(tagged), "connections": sorted(connections), "protocols": sorted(protocols)})
         if engine == "linkerd":
             after = self.metric(pod_name, outdir, "after")
-            target = ip_authority(pod_ip, 8080)
+            target = ip_authority(client_ip, 8080)
             if self.inbound_requests(after, target) <= self.inbound_requests(before, target):
                 raise RuntimeError(f"Linkerd inbound request_total did not increase for {target}")
 
@@ -679,6 +692,7 @@ class Matrix:
                 (outdir / f"{container}-server.log").write_text(logs.stdout)
 
         write_json(outdir / "cell.json", {"body": body, "engine": engine, "rep": rep, "pod_ip": pod_ip,
+                   "client_ip": client_ip,
                    "duration": self.c["duration"], "warmup": self.c["warmup"], "concurrency": self.c["concurrency"],
                    "proxy_cpu": self.c["cpus"]["proxy"], "origin_cpus": self.c["cpus"]["origin"],
                    "client_cpus": self.c["cpus"]["client"], "route_config": "proxy-rps.rut" if engine == "rut-rps" else "proxy-throughput.rut" if engine == "rut-throughput" else None,
@@ -686,7 +700,7 @@ class Matrix:
         client = Path(__file__).with_name("run_client.py")
         for kind, duration, lua, target in (("warmup", self.c["warmup"], "warmup.lua", outdir / "warmup"),
                                             ("measurement", self.c["duration"], "request.lua", outdir / "measurement")):
-            argv = self.client_argv(client, f"{label}-{kind}", pod_ip, duration, lua, target)
+            argv = self.client_argv(client, f"{label}-{kind}", client_ip, duration, lua, target)
             (outdir / f"{kind}-driver-command.json").write_text(json.dumps(argv, indent=2) + "\n")
             child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             measure_start = None
@@ -746,11 +760,12 @@ class Matrix:
             if kind == "warmup":
                 resource_records.append(self.capture_resources(outdir, "after-warmup", resource_pids))
             log = (target / "wrk.log").read_text()
-            records = [line.split() for line in log.splitlines() if line.startswith("METRICS ")]
-            if (target / "returncode.txt").read_text().strip() != "0" or len(records) != 1 or len(records[0]) != 11:
-                raise RuntimeError(f"invalid wrk result in {target}")
-            if any(int(value) != 0 for value in records[0][6:11]):
-                raise RuntimeError(f"wrk errors in {target}: {' '.join(records[0])}")
+            if (target / "returncode.txt").read_text().strip() != "0":
+                raise RuntimeError(f"invalid wrk return code in {target}")
+            try:
+                parse_wrk_metrics(log)
+            except ValueError as error:
+                raise RuntimeError(f"invalid wrk metrics in {target}: {error}") from error
         verify_artifacts(self.c)
         verify_payloads(self.c)
         verify_provenance(self.c)
@@ -1014,6 +1029,58 @@ def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: BaseExc
     return details
 
 
+def archive_interrupted_cell_output(matrix: Matrix, cell: dict) -> Path | None:
+    label = f"{cell['body']}-{cell['engine']}-r{cell['rep']}"
+    partial = matrix.samples / cell["body"] / label
+    if not partial.exists():
+        return None
+    archive_dir = matrix.samples / "interrupted"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived = archive_dir / f"{label}-{uuid.uuid4().hex}"
+    os.replace(partial, archived)
+    failure_path = matrix.samples / "last-failure.json"
+    if failure_path.is_file():
+        details = json.loads(failure_path.read_text())
+        details["interrupted_output"] = str(archived.relative_to(matrix.out))
+        write_json(failure_path, details)
+    return archived
+
+
+def write_index_atomic(path: Path, index: list[dict]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(index, indent=2) + "\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def run_cell_and_index(matrix: Matrix, config: dict, cell: dict,
+                       index_path: Path, index: list[dict]) -> Path:
+    try:
+        result = run_cell_with_cleanup(matrix, config, cell)
+        rel = lambda path: str(path.relative_to(matrix.out))
+        index.append({"body_size": cell["body"], "engine": cell["engine"], "rep": cell["rep"],
+                      "warmup_dir": rel(result / "warmup"), "measure_dir": rel(result / "measurement"),
+                      "valid": True, "validation_path": rel(result / "valid.txt")})
+        write_index_atomic(index_path, index)
+        return result
+    except TerminatedBySignal as error:
+        on_disk = json.loads(index_path.read_text()) if index_path.is_file() else []
+        key = (cell["body"], cell["engine"], cell["rep"])
+        indexed = any((row.get("body_size"), row.get("engine"), row.get("rep")) == key for row in on_disk)
+        if not indexed:
+            archived = archive_interrupted_cell_output(matrix, cell)
+            if not (matrix.samples / "last-failure.json").is_file():
+                write_json(matrix.samples / "last-failure.json",
+                           {"cell": cell, "error": str(error), "cleanup": "cell interrupted after Pod cleanup",
+                            "interrupted_output": (str(archived.relative_to(matrix.out)) if archived else None)})
+        raise
+
+
 def run_cell_with_cleanup(matrix: Matrix, config: dict, cell: dict) -> Path:
     try:
         return matrix.run_cell(cell["body"], cell["engine"], cell["rep"])
@@ -1059,21 +1126,20 @@ def main() -> int:
         if expected.exists():
             raise RuntimeError(f"partial output already exists; inspect and move it before resuming: {expected}")
         print(f"START {i}/{len(work)} {label}", flush=True)
-        result = run_cell_with_cleanup(matrix, config, cell)
-        rel = lambda path: str(path.relative_to(matrix.out))
-        index.append({"body_size": cell["body"], "engine": cell["engine"], "rep": cell["rep"],
-                      "warmup_dir": rel(result / "warmup"), "measure_dir": rel(result / "measurement"),
-                      "valid": True, "validation_path": rel(result / "valid.txt")})
+        result = run_cell_and_index(matrix, config, cell, index_path, index)
         keys.add(key); completed += 1
-        write_json(index_path, index)
         print(f"DONE {i}/{len(work)} {result}", flush=True)
     write_json(matrix.samples / "completed.json", {"count": len(index), "complete": len(index) == len(work)})
     return 0
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, handle_sigterm)
     try:
         raise SystemExit(main())
+    except TerminatedBySignal as error:
+        print(f"run_matrix: {error}", file=sys.stderr)
+        raise SystemExit(128 + error.signum)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         print(f"run_matrix: {error}", file=sys.stderr)
         raise SystemExit(2)

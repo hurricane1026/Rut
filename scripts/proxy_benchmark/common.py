@@ -38,6 +38,59 @@ def ip_url(host: str, port: int | str, path: str) -> str:
     return f"http://{ip_authority(host, port)}{path}"
 
 
+def parse_wrk_metrics(log: str) -> dict[str, int]:
+    records = [line.split() for line in log.splitlines() if line.startswith("METRICS ")]
+    if len(records) != 1 or len(records[0]) != 11:
+        raise ValueError("missing or malformed METRICS line")
+    try:
+        values = [int(value) for value in records[0][1:]]
+    except ValueError as error:
+        raise ValueError("METRICS fields must be integers") from error
+    if any(value < 0 for value in values):
+        raise ValueError("METRICS fields cannot be negative")
+    requests, duration_us, p50, p95, p99, connect, read, write, status, timeout = values
+    if requests <= 0 or duration_us <= 0:
+        raise ValueError("METRICS requests and elapsed duration must be positive")
+    if any((connect, read, write, status, timeout)):
+        raise ValueError("METRICS error counters must be zero")
+    return {"requests": requests, "duration_us": duration_us,
+            "p50_us": p50, "p95_us": p95, "p99_us": p99,
+            "connect_errors": connect, "read_errors": read,
+            "write_errors": write, "status_errors": status,
+            "timeout_errors": timeout}
+
+
+def ipv4_pod_cidr(node: dict) -> str | None:
+    spec = node.get("spec", {})
+    raw_candidates = spec.get("podCIDRs") or []
+    candidates = list(raw_candidates) if isinstance(raw_candidates, list) else [raw_candidates]
+    if spec.get("podCIDR"):
+        candidates.append(spec["podCIDR"])
+    for candidate in candidates:
+        try:
+            if ipaddress.ip_network(candidate, strict=False).version == 4:
+                return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def select_ipv4_pod_ip(status: dict) -> str:
+    candidates = [item.get("ip") for item in (status.get("podIPs") or []) if isinstance(item, dict)]
+    if status.get("podIP"):
+        candidates.append(status["podIP"])
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if address.version == 4:
+            return str(address)
+    raise ValueError("Pod has no IPv4 address for the IPv4-only benchmark listeners")
+
+
 def run(argv: list[str], *, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, timeout=timeout)

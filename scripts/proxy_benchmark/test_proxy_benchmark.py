@@ -77,6 +77,25 @@ class ProxyBenchmarkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             common.ip_authority("not-an-ip", 8080)
 
+    def test_benchmark_requires_ipv4_pod_cidr_and_selects_ipv4_from_dual_stack_pod(self):
+        self.assertIsNone(common.ipv4_pod_cidr({"spec": {"podCIDRs": ["fd00::/64"]}}))
+        self.assertEqual(common.ipv4_pod_cidr({"spec": {"podCIDRs": ["fd00::/64", "10.244.0.0/16"]}}),
+                         "10.244.0.0/16")
+        status = {"podIP": "fd00::12", "podIPs": [{"ip": "fd00::12"}, {"ip": "10.244.1.12"}]}
+        self.assertEqual(common.select_ipv4_pod_ip(status), "10.244.1.12")
+        self.assertEqual(common.select_ipv4_pod_ip({"podIP": "10.244.1.12"}), "10.244.1.12")
+        with self.assertRaisesRegex(ValueError, "no IPv4 address"):
+            common.select_ipv4_pod_ip({"podIP": "fd00::12", "podIPs": [{"ip": "fd00::12"}]})
+
+    def test_wrk_metrics_reject_zero_requests_elapsed_and_errors(self):
+        self.assertEqual(common.parse_wrk_metrics("METRICS 2 100 1 2 3 0 0 0 0 0\n")["requests"], 2)
+        for line in ("METRICS 0 100 1 2 3 0 0 0 0 0",
+                     "METRICS 2 0 1 2 3 0 0 0 0 0",
+                     "METRICS 2 100 1 2 3 0 0 0 1 0",
+                     "METRICS 2 nope 1 2 3 0 0 0 0 0"):
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                common.parse_wrk_metrics(line)
+
     def test_worker_effective_cpuset_must_contain_all_assigned_benchmark_cpus(self):
         with mock.patch("prepare.run", return_value="2-9,14\n") as run:
             self.assertEqual(prepare.verify_worker_cpu_set("docker", "worker", {2, 3, 5, 9}),
@@ -568,6 +587,70 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertIn(f"benchmark-create-attempt={matrix.pod_create_attempt}",
                           " ".join(kube.call_args_list[1].args))
             self.assertIn(f"metadata.name={name}", kube.call_args_list[1].args)
+
+    def test_sigterm_reaps_driver_before_pod_cleanup_and_archives_partial_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            matrix.samples.mkdir(parents=True)
+            cell = {"body": "4k", "engine": "linkerd", "rep": 1}
+            label = "4k-linkerd-r1"
+            partial = matrix.samples / "4k" / label
+            events = []
+            pod_name = "proxybench-run123-4k-1-linkerd"
+            pod = {"metadata": {"name": pod_name, "namespace": "bench", "uid": "uid-term",
+                    "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                               "benchmark-run-id": "run123",
+                               "benchmark-create-attempt": matrix.pod_create_attempt}}}
+
+            class Child:
+                returncode = None
+
+                def poll(self):
+                    return None
+
+                def send_signal(self, _signum):
+                    events.append("driver-signalled")
+
+                def communicate(self, timeout=None):
+                    events.append("driver-reaped")
+                    return "driver stopped", None
+
+            child = Child()
+
+            def interrupted_run_cell(*_args):
+                partial.mkdir(parents=True)
+                (partial / "pod.json").write_text(json.dumps(pod))
+                with matrix.client_driver_guard(child, partial):
+                    raise run_matrix.TerminatedBySignal(run_matrix.signal.SIGTERM)
+
+            def kube(*args, **_kwargs):
+                if args[0] == "get":
+                    events.append("pod-looked-up")
+                    return subprocess.CompletedProcess([], 0, json.dumps(pod), "")
+                events.append("pod-deleted")
+                return subprocess.CompletedProcess([], 0, "deleted\n", "")
+
+            with mock.patch.object(matrix, "run_cell", side_effect=interrupted_run_cell), \
+                    mock.patch.object(matrix, "verify_wrk_container_cleanup",
+                                      side_effect=lambda _target: events.append("container-cleaned")), \
+                    mock.patch.object(matrix, "kube", side_effect=kube):
+                with self.assertRaises(run_matrix.TerminatedBySignal):
+                    run_matrix.run_cell_and_index(matrix, config, cell,
+                                                  matrix.samples / "index.json", [])
+
+            self.assertEqual(events, ["driver-signalled", "driver-reaped", "container-cleaned",
+                                      "pod-looked-up", "pod-deleted"])
+            self.assertFalse(partial.exists())
+            archived = list((matrix.samples / "interrupted").glob("4k-linkerd-r1-*"))
+            self.assertEqual(len(archived), 1)
+            self.assertTrue((archived[0] / "pod.json").is_file())
+            self.assertFalse((matrix.samples / "index.json").exists())
+            with self.assertRaises(run_matrix.TerminatedBySignal) as caught:
+                run_matrix.handle_sigterm(run_matrix.signal.SIGTERM, None)
+            self.assertEqual(caught.exception.signum, run_matrix.signal.SIGTERM)
 
     def test_runtime_library_collector_binds_six_sources_and_duplicate_dependencies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2189,6 +2272,11 @@ class ProxyBenchmarkTests(unittest.TestCase):
             (sample / "wrk.log").write_text("METRICS 100 2000000 10 20 30 0 0 0 1 0\n")
             with self.assertRaises(ValueError):
                 summarize.sample_metrics(out, "samples/one")
+            for metrics in ("METRICS 0 2000000 10 20 30 0 0 0 0 0\n",
+                            "METRICS 100 0 10 20 30 0 0 0 0 0\n"):
+                (sample / "wrk.log").write_text(metrics)
+                with self.subTest(metrics=metrics), self.assertRaisesRegex(ValueError, "positive"):
+                    summarize.sample_metrics(out, "samples/one")
 
     def test_resource_summary_keeps_proxy_and_origin_separate_and_nulls_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

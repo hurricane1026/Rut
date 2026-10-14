@@ -16,19 +16,17 @@ def sample_metrics(output: Path, relative: str) -> dict:
     log = (directory / "wrk.log").read_text()
     if (directory / "returncode.txt").read_text().strip() != "0":
         raise ValueError(f"nonzero wrk return code: {directory}")
-    records = [line.split() for line in log.splitlines() if line.startswith("METRICS ")]
-    if len(records) != 1 or len(records[0]) != 11:
-        raise ValueError(f"missing/invalid METRICS line: {directory}")
-    fields = [int(x) for x in records[0][1:]]
-    requests, duration_us, p50, p95, p99, *errors = fields
-    if requests <= 0 or duration_us <= 0 or any(errors):
-        raise ValueError(f"empty or errorful sample {directory}: {records[0]}")
+    try:
+        metrics = common.parse_wrk_metrics(log)
+    except ValueError as error:
+        raise ValueError(f"invalid METRICS sample {directory}: {error}") from error
     if "Permission denied" in log or "cannot open /benchmark/" in log:
         raise ValueError(f"wrk script was not readable: {directory}")
-    return {"requests": requests, "duration_us": duration_us,
-            "rps": requests * 1_000_000 / duration_us,
-            "p50_us": p50, "p95_us": p95, "p99_us": p99,
-            "errors": {name: value for name, value in zip(("connect", "read", "write", "status", "timeout"), errors)}}
+    return {"requests": metrics["requests"], "duration_us": metrics["duration_us"],
+            "rps": metrics["requests"] * 1_000_000 / metrics["duration_us"],
+            "p50_us": metrics["p50_us"], "p95_us": metrics["p95_us"], "p99_us": metrics["p99_us"],
+            "errors": {name: metrics[f"{name}_errors"]
+                       for name in ("connect", "read", "write", "status", "timeout")}}
 
 
 def resource_metrics(output: Path, row: dict) -> dict:
