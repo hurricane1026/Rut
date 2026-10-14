@@ -180,6 +180,48 @@ def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
     return snapshot
 
 
+def verify_payload_path(path: Path, expected_type) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise RuntimeError(f"prepared payload path is unavailable: {path}") from error
+    if stat.S_ISLNK(mode):
+        raise RuntimeError(f"prepared payload path is a symlink: {path}")
+    if not expected_type(mode):
+        raise RuntimeError(f"prepared payload path has an unexpected file type: {path}")
+
+
+def verify_payloads(config: dict) -> None:
+    prepared = json.loads((Path(config["output"]) / "payloads.json").read_text())
+    bodies = config["bodies"]
+    expected_payloads = config.get("payloads")
+    if not isinstance(expected_payloads, dict):
+        raise RuntimeError("benchmark config has no bound payload metadata")
+    if prepared != expected_payloads:
+        raise RuntimeError("prepared payload metadata differs from benchmark config")
+    if set(prepared) != set(bodies):
+        raise RuntimeError("prepared payload metadata does not match configured bodies")
+    root = Path(config["checkpoint"]) / "payloads"
+    verify_payload_path(root, stat.S_ISDIR)
+    for body, configured_size in bodies.items():
+        metadata = prepared[body]
+        expected_size = int(configured_size)
+        if metadata.get("bytes") != expected_size:
+            raise RuntimeError(f"prepared payload size metadata mismatch for {body}")
+        directory = root / body
+        verify_payload_path(directory, stat.S_ISDIR)
+        for filename in ("proxy", "body.bin"):
+            path = directory / filename
+            verify_payload_path(path, stat.S_ISREG)
+            actual_size = path.stat().st_size
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"prepared payload size mismatch for {body}/{filename}: expected {expected_size}, got {actual_size}"
+                )
+            if sha256(path) != metadata["sha256"]:
+                raise RuntimeError(f"prepared payload hash mismatch for {body}/{filename}")
+
+
 def validate_docker_mount_source(path: str | Path, label: str) -> None:
     if "," in str(path):
         raise ValueError(f"{label} path cannot contain a comma because Docker --mount uses comma-separated options: {path}")
@@ -317,10 +359,13 @@ def pod_spec(config: dict, engine: str, body: str, name: str) -> dict:
     else:
         raise ValueError(f"unknown engine: {engine}")
 
+    metadata = {"name": name, "namespace": config["namespace"],
+                "labels": pod_labels(config, engine, body, name)}
+    if engine != "linkerd":
+        metadata["annotations"] = {"linkerd.io/inject": "disabled"}
     return {
         "apiVersion": "v1", "kind": "Pod",
-        "metadata": {"name": name, "namespace": config["namespace"],
-            "labels": pod_labels(config, engine, body, name)},
+        "metadata": metadata,
         "spec": {"nodeName": config["worker_node"],
                  "nodeSelector": {selector["key"]: selector["value"]},
                  "terminationGracePeriodSeconds": 1,

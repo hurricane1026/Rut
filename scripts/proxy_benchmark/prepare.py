@@ -539,6 +539,8 @@ def main() -> int:
                    help="pin existing kind-worker threads to --helper-cpus before verification")
     p.add_argument("--apply-configmaps", action="store_true")
     a = p.parse_args()
+    if a.apply_configmaps and not a.verify_cluster:
+        p.error("--apply-configmaps requires --verify-cluster")
 
     for value, name in ((a.duration, "--duration"), (a.warmup, "--warmup")):
         try:
@@ -678,7 +680,8 @@ def main() -> int:
                    "runtime_libs": paths["runtime_libs"], "clang": paths["clang"], "ld": paths["ld"],
                    "benchmark_common": driver_dir / "common.py",
                    "benchmark_driver": driver_dir / "run_client.py",
-                   "benchmark_matrix": driver_dir / "run_matrix.py"}
+                   "benchmark_matrix": driver_dir / "run_matrix.py",
+                   "benchmark_summarize": driver_dir / "summarize.py"}
     input_snapshot = snapshot_inputs(input_paths)
 
     config = {"schema": 1, "run_id": run_id, "checkpoint": str(checkpoint), "output": str(output), "kubeconfig": str(a.kubeconfig.resolve()),
@@ -739,8 +742,6 @@ def main() -> int:
     write_json(output / "benchmark.json", config)
     write_json(output / "payloads.json", payloads)
     if a.apply_configmaps:
-        if not a.verify_cluster:
-            p.error("--apply-configmaps requires --verify-cluster")
         manifests = {name: json.loads((output / f"{name}-configmap.json").read_text())
                      for name in ("native", "linkerd")}
         config["configmap_identities"] = apply_configmaps(

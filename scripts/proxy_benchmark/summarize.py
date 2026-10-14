@@ -7,8 +7,8 @@ from pathlib import Path
 import statistics
 import sys
 
-from common import load_config, provenance_fingerprint, write_json
-from run_matrix import verify_payloads
+import common
+from common import load_config, provenance_fingerprint, snapshot_inputs, verify_payloads, write_json
 
 
 def sample_metrics(output: Path, relative: str) -> dict:
@@ -107,12 +107,33 @@ def aggregate_resource_values(rows: list[dict], key: str) -> list[int | float]:
             if row.get(key) is not None and (not resource_measure or row.get("resource_sampling_complete"))]
 
 
+def verify_summarizer_provenance(config: dict) -> None:
+    snapshot = config.get("input_snapshot")
+    if not isinstance(snapshot, dict):
+        raise ValueError("benchmark config lacks input provenance; rerun prepare.py")
+    executing_sources = {
+        "benchmark_common": Path(common.__file__).resolve(),
+        "benchmark_summarize": Path(__file__).resolve(),
+    }
+    for name, path in executing_sources.items():
+        entry = snapshot.get(name)
+        if not entry or Path(entry.get("path", "")).resolve() != path:
+            raise ValueError(f"current {name} differs from prepared benchmark source")
+    try:
+        current = snapshot_inputs({name: entry["path"] for name, entry in snapshot.items()})
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(f"cannot validate benchmark input snapshot: {error}") from error
+    if current != snapshot:
+        raise ValueError("prepared benchmark inputs changed before summarization")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--allow-partial", action="store_true", help="summarize a smoke or interrupted run")
     args = parser.parse_args()
     config = load_config(args.config)
+    verify_summarizer_provenance(config)
     verify_payloads(config)
     output = Path(config["output"])
     sample_root = output / "samples"

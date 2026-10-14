@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 import re
-import stat
+import signal
 import subprocess
 import sys
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from common import (cpu_set, duration_seconds, image_reference_matches, load_config,
                     normalized_linkerd_injection_spec, pod_spec,
-                    provenance_fingerprint, snapshot_inputs,
+                    provenance_fingerprint, snapshot_inputs, verify_payload_path, verify_payloads,
                     validate_docker_mount_source, verify_client_image_config_identity, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
@@ -148,6 +149,55 @@ class Matrix:
         (outdir / f"linkerd-metrics-{phase}.txt").write_text(result.stdout)
         return result.stdout
 
+    def cleanup_owned_docker_container(self, name: str, owner_labels: dict[str, str], *, strict: bool = False) -> bool:
+        inspected = invoke([self.docker, "inspect", name], check=False, timeout=5)
+        if inspected.returncode:
+            if strict and not any(text in inspected.stdout.lower()
+                                  for text in ("no such object", "no such container")):
+                raise RuntimeError(f"cannot verify cleanup for Docker container {name}: {inspected.stdout}")
+            return False
+        try:
+            containers = json.loads(inspected.stdout)
+        except (ValueError, TypeError) as error:
+            if strict:
+                raise RuntimeError(f"cannot parse Docker ownership for {name}: {error}") from error
+            return False
+        if not isinstance(containers, list) or len(containers) != 1 or not isinstance(containers[0], dict):
+            return False
+        container = containers[0]
+        config = container.get("Config")
+        if not isinstance(config, dict):
+            if strict:
+                raise RuntimeError(f"Docker inspect lacks ownership labels for {name}")
+            return False
+        labels = config.get("Labels") or {}
+        if not isinstance(labels, dict):
+            if strict:
+                raise RuntimeError(f"Docker inspect has malformed ownership labels for {name}")
+            return False
+        container_id = container.get("Id")
+        if ((container.get("Name") or "").lstrip("/") != name or
+                not isinstance(container_id, str) or not container_id or
+                any(labels.get(key) != value for key, value in owner_labels.items())):
+            return False
+        removed = invoke([self.docker, "rm", "-f", container_id], check=False, timeout=5)
+        if strict and removed.returncode:
+            raise RuntimeError(f"cannot remove owned Docker container {name}: {removed.stdout}")
+        return removed.returncode == 0
+
+    def run_owned_probe(self, argv: list[str], name: str, owner_labels: dict[str, str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+        try:
+            result = invoke(argv, timeout=timeout)
+        except BaseException as error:
+            try:
+                self.cleanup_owned_docker_container(name, owner_labels, strict=True)
+            except Exception as cleanup_error:
+                if hasattr(error, "add_note"):
+                    error.add_note(f"owned probe cleanup also failed: {cleanup_error}")
+            raise
+        self.cleanup_owned_docker_container(name, owner_labels, strict=True)
+        return result
+
     def wait_frontend(self, pod_ip: str) -> None:
         """Wait until the application socket accepts an HTTP request."""
         deadline = time.monotonic() + 180
@@ -172,22 +222,10 @@ class Matrix:
                 result = None
             finally:
                 try:
-                    inspected = invoke([self.docker, "inspect", name], check=False, timeout=5)
-                    if inspected.returncode == 0:
-                        containers = json.loads(inspected.stdout)
-                        if len(containers) == 1:
-                            container = containers[0]
-                            labels = container.get("Config", {}).get("Labels") or {}
-                            actual_name = (container.get("Name") or "").lstrip("/")
-                            if (actual_name == name and all(labels.get(key) == value
-                                                             for key, value in owner_labels.items())):
-                                container_id = container.get("Id")
-                                if container_id:
-                                    invoke([self.docker, "rm", "-f", container_id],
-                                           check=False, timeout=5)
+                    self.cleanup_owned_docker_container(name, owner_labels)
                 except (OSError, subprocess.SubprocessError):
                     pass
-                except (ValueError, TypeError):
+                except (RuntimeError, ValueError, TypeError):
                     pass
             if result is not None and result.returncode == 0:
                 return
@@ -385,15 +423,96 @@ class Matrix:
         running = invoke([self.docker, "inspect", "--format", "{{.State.Running}}", client_id], check=False)
         return running.returncode == 0 and running.stdout.strip() == "true"
 
+    def verify_wrk_container_cleanup(self, target: Path) -> None:
+        identity_path = target / "container-id.txt"
+        if not identity_path.is_file():
+            return
+        container_id = identity_path.read_text().strip()
+        if not container_id:
+            raise RuntimeError(f"wrk driver recorded an empty container ID in {target}")
+        inspected = invoke([self.docker, "inspect", container_id], check=False, timeout=5)
+        if inspected.returncode:
+            if any(text in inspected.stdout.lower() for text in ("no such object", "no such container")):
+                return
+            raise RuntimeError(f"cannot verify wrk container cleanup for {container_id}: {inspected.stdout}")
+        try:
+            items = json.loads(inspected.stdout)
+        except (ValueError, TypeError) as error:
+            raise RuntimeError(f"cannot parse wrk container identity for {container_id}: {error}") from error
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+            raise RuntimeError(f"cannot parse wrk container identity for {container_id}")
+        container = items[0]
+        if not isinstance(container.get("Config"), dict):
+            raise RuntimeError(f"wrk container has malformed labels for {container_id}")
+        labels = container.get("Config", {}).get("Labels") or {}
+        if not isinstance(labels, dict):
+            raise RuntimeError(f"wrk container has malformed labels for {container_id}")
+        if (container.get("Id") != container_id or
+                labels.get("app.kubernetes.io/managed-by") != "rut-proxy-benchmark" or
+                labels.get("benchmark-run-id") != self.c["run_id"] or
+                not labels.get("benchmark-create-attempt")):
+            raise RuntimeError(f"wrk container identity is not owned by this run: {container_id}")
+        removed = invoke([self.docker, "rm", "-f", container_id], check=False, timeout=5)
+        if removed.returncode and not any(text in removed.stdout.lower()
+                                          for text in ("no such object", "no such container")):
+            raise RuntimeError(f"cannot remove owned wrk container {container_id}: {removed.stdout}")
+        confirmed = invoke([self.docker, "inspect", container_id], check=False, timeout=5)
+        if confirmed.returncode == 0:
+            raise RuntimeError(f"owned wrk container remains after cleanup: {container_id}")
+        if not any(text in confirmed.stdout.lower() for text in ("no such object", "no such container")):
+            raise RuntimeError(f"cannot confirm wrk container removal {container_id}: {confirmed.stdout}")
+
+    def cancel_client_driver(self, child: subprocess.Popen, target: Path) -> None:
+        if child.poll() is None:
+            try:
+                child.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                output = child.communicate(timeout=10)[0]
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                try:
+                    output = child.communicate(timeout=5)[0]
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    output = child.communicate(timeout=5)[0]
+        else:
+            output = child.communicate()[0]
+        (target / "driver-cancel.log").write_text(output or "")
+        self.verify_wrk_container_cleanup(target)
+
+    @contextmanager
+    def client_driver_guard(self, child: subprocess.Popen, target: Path):
+        try:
+            yield
+        except BaseException as error:
+            try:
+                self.cancel_client_driver(child, target)
+            except Exception as cleanup_error:
+                if hasattr(error, "add_note"):
+                    error.add_note(f"client driver cleanup also failed: {cleanup_error}")
+            raise
+        else:
+            self.verify_wrk_container_cleanup(target)
+
     def curl(self, pod_ip: str, outdir: Path, body: str, *, marker: str | None = None, many: bool = False) -> None:
         validate_docker_mount_source(outdir.resolve(), "cell output")
         client_cpus = self.c["cpus"]["client"]
         image = self.c["image_identities"]["client"]["docker_id"]
-        argv = [self.docker, "run", "--rm", "--security-opt", "label=disable", "--network",
+        attempt_id = uuid.uuid4().hex
+        run_id = self.c.get("run_id", "run")
+        owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                        "benchmark-run-id": run_id,
+                        "benchmark-create-attempt": attempt_id}
+        name = f"proxybench-preflight-{run_id}-{attempt_id[:12]}"
+        argv = [self.docker, "run", "--rm", "--name", name,
+                *[part for key, value in owner_labels.items() for part in ("--label", f"{key}={value}")],
+                "--security-opt", "label=disable", "--network",
                 f"container:{self.c['worker_container']}", "--cpuset-cpus", client_cpus,
                 "--mount", f"type=bind,src={outdir},dst=/out", "--entrypoint", "curl", image,
                 "--http1.1", "--fail", "--silent", "--show-error", "-H", "Host: client.example",
-                "-H", "Connection: keep-alive"]
+                "--connect-timeout", "2", "--max-time", "5", "-H", "Connection: keep-alive"]
         url = f"http://{pod_ip}:8080/proxy"
         if marker:
             argv += ["-H", f"X-Rut-Benchmark-Preflight: {marker}"]
@@ -401,7 +520,7 @@ class Matrix:
             for _ in range(100):
                 argv += ["--output", "/dev/null", "--write-out", "%{http_version} %{http_code} %{size_download} %{num_connects}\\n", url]
             (outdir / "keepalive-preflight-command.json").write_text(json.dumps(argv, indent=2) + "\n")
-            result = invoke(argv)
+            result = self.run_owned_probe(argv, name, owner_labels, timeout=180)
             (outdir / "keepalive-preflight.log").write_text(result.stdout)
             lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
             if len(lines) != 100 or any(len(line) != 4 or line[:2] != ["1.1", "200"] or int(line[2]) != SIZES[body] for line in lines):
@@ -411,7 +530,7 @@ class Matrix:
             return
         argv += ["-D", "/out/response.headers", "-o", "/out/response.bin", "-w", "%{http_version} %{http_code} %{size_download}\\n", url]
         (outdir / "byte-preflight-command.json").write_text(json.dumps(argv, indent=2) + "\n")
-        result = invoke(argv)
+        result = self.run_owned_probe(argv, name, owner_labels, timeout=30)
         (outdir / "byte-preflight-status.txt").write_text(result.stdout)
         expected = Path(self.c["checkpoint"]) / "payloads" / body / "proxy"
         response = outdir / "response.bin"
@@ -495,43 +614,44 @@ class Matrix:
             next_state_check = time.monotonic()
             next_snapshot = 2.0
             measurement_duration = duration_seconds(self.c["duration"])
-            while child.poll() is None:
-                now = time.monotonic()
-                if kind == "measurement" and now >= next_state_check:
-                    client_running = self.client_is_running(target)
-                    stamp = target / "measurement-start-monotonic.txt"
-                    if client_running and measure_start is None and stamp.is_file():
-                        measure_start = float(stamp.read_text().strip())
-                    next_state_check = now + 0.5
-                if kind == "measurement" and measure_start is not None:
-                    elapsed = now - measure_start
-                    if (client_running and elapsed < measurement_duration and elapsed >= next_snapshot and
-                            len([r for r in resource_records if r["phase"].startswith("under-load")]) < 3):
-                        sample_no = len([r for r in resource_records if r["phase"].startswith("under-load")]) + 1
-                        snapshot_start = time.monotonic()
-                        running_before = self.client_is_running(target)
-                        resource = self.capture_resources(outdir, f"under-load-{sample_no}", resource_pids)
-                        snapshot_end = time.monotonic()
-                        running_after = self.client_is_running(target)
-                        start_elapsed = snapshot_start - measure_start
-                        end_elapsed = snapshot_end - measure_start
-                        in_window = (running_before and running_after and start_elapsed >= 0 and
-                                     end_elapsed <= measurement_duration)
-                        resource["measurement_window_start_elapsed_sec"] = round(start_elapsed, 3)
-                        resource["measurement_window_end_elapsed_sec"] = round(end_elapsed, 3)
-                        resource["client_state_running_before"] = running_before
-                        resource["client_state_running_after"] = running_after
-                        resource["snapshot_valid"] = in_window and all(resource[role]["complete"] for role in ("proxy", "origin"))
-                        if not resource["snapshot_valid"]:
-                            for role in ("proxy", "origin"):
-                                resource[role]["complete"] = False
-                                resource[role]["rss_kb"] = None
-                                resource[role]["pss_kb"] = None
-                        write_json(outdir / f"resources-under-load-{sample_no}.json", resource)
-                        resource_records.append(resource)
-                        next_snapshot += 3.0
-                time.sleep(0.2)
-            driver_output = child.communicate()[0]
+            with self.client_driver_guard(child, target):
+                while child.poll() is None:
+                    now = time.monotonic()
+                    if kind == "measurement" and now >= next_state_check:
+                        client_running = self.client_is_running(target)
+                        stamp = target / "measurement-start-monotonic.txt"
+                        if client_running and measure_start is None and stamp.is_file():
+                            measure_start = float(stamp.read_text().strip())
+                        next_state_check = now + 0.5
+                    if kind == "measurement" and measure_start is not None:
+                        elapsed = now - measure_start
+                        if (client_running and elapsed < measurement_duration and elapsed >= next_snapshot and
+                                len([r for r in resource_records if r["phase"].startswith("under-load")]) < 3):
+                            sample_no = len([r for r in resource_records if r["phase"].startswith("under-load")]) + 1
+                            snapshot_start = time.monotonic()
+                            running_before = self.client_is_running(target)
+                            resource = self.capture_resources(outdir, f"under-load-{sample_no}", resource_pids)
+                            snapshot_end = time.monotonic()
+                            running_after = self.client_is_running(target)
+                            start_elapsed = snapshot_start - measure_start
+                            end_elapsed = snapshot_end - measure_start
+                            in_window = (running_before and running_after and start_elapsed >= 0 and
+                                         end_elapsed <= measurement_duration)
+                            resource["measurement_window_start_elapsed_sec"] = round(start_elapsed, 3)
+                            resource["measurement_window_end_elapsed_sec"] = round(end_elapsed, 3)
+                            resource["client_state_running_before"] = running_before
+                            resource["client_state_running_after"] = running_after
+                            resource["snapshot_valid"] = in_window and all(resource[role]["complete"] for role in ("proxy", "origin"))
+                            if not resource["snapshot_valid"]:
+                                for role in ("proxy", "origin"):
+                                    resource[role]["complete"] = False
+                                    resource[role]["rss_kb"] = None
+                                    resource[role]["pss_kb"] = None
+                            write_json(outdir / f"resources-under-load-{sample_no}.json", resource)
+                            resource_records.append(resource)
+                            next_snapshot += 3.0
+                    time.sleep(0.2)
+                driver_output = child.communicate()[0]
             (outdir / f"{kind}-driver.log").write_text(driver_output)
             if child.returncode:
                 raise RuntimeError(f"{kind} wrk returned {child.returncode}; see {target}")
@@ -603,48 +723,6 @@ def verify_artifacts(config: dict) -> None:
         actual = Matrix.file_sha(path)
         if actual != artifact["sha256"]:
             raise RuntimeError(f"recorded artifact hash mismatch for {name}: expected {artifact['sha256']}, got {actual}")
-
-
-def verify_payloads(config: dict) -> None:
-    prepared = json.loads((Path(config["output"]) / "payloads.json").read_text())
-    bodies = config["bodies"]
-    expected_payloads = config.get("payloads")
-    if not isinstance(expected_payloads, dict):
-        raise RuntimeError("benchmark config has no bound payload metadata")
-    if prepared != expected_payloads:
-        raise RuntimeError("prepared payload metadata differs from benchmark config")
-    if set(prepared) != set(bodies):
-        raise RuntimeError("prepared payload metadata does not match configured bodies")
-    root = Path(config["checkpoint"]) / "payloads"
-    verify_payload_path(root, stat.S_ISDIR)
-    for body, configured_size in bodies.items():
-        metadata = prepared[body]
-        expected_size = int(configured_size)
-        if metadata.get("bytes") != expected_size:
-            raise RuntimeError(f"prepared payload size metadata mismatch for {body}")
-        directory = root / body
-        verify_payload_path(directory, stat.S_ISDIR)
-        for filename in ("proxy", "body.bin"):
-            path = directory / filename
-            verify_payload_path(path, stat.S_ISREG)
-            actual_size = path.stat().st_size
-            if actual_size != expected_size:
-                raise RuntimeError(
-                    f"prepared payload size mismatch for {body}/{filename}: expected {expected_size}, got {actual_size}"
-                )
-            if Matrix.file_sha(path) != metadata["sha256"]:
-                raise RuntimeError(f"prepared payload hash mismatch for {body}/{filename}")
-
-
-def verify_payload_path(path: Path, expected_type) -> None:
-    try:
-        mode = path.lstat().st_mode
-    except OSError as error:
-        raise RuntimeError(f"prepared payload path is unavailable: {path}") from error
-    if stat.S_ISLNK(mode):
-        raise RuntimeError(f"prepared payload path is a symlink: {path}")
-    if not expected_type(mode):
-        raise RuntimeError(f"prepared payload path has an unexpected file type: {path}")
 
 
 def image_identity_matches(actual: str, expected: dict) -> bool:

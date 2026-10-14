@@ -171,6 +171,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(linkerd["spec"]["nodeSelector"], {"benchmark-role": "worker"})
             self.assertEqual(len(linkerd["spec"]["containers"]), 1)
             self.assertIn("linkerd.io/inject", linkerd["metadata"]["annotations"])
+            for engine in ("rut-rps", "nginx", "envoy"):
+                control = common.pod_spec(config, engine, "4k", f"pb-test-{engine}")
+                self.assertEqual(control["metadata"]["annotations"], {"linkerd.io/inject": "disabled"})
             self.assertNotIn("limits", linkerd["spec"]["containers"][0].get("resources", {}))
             native_origin = prepare.nginx_origin(
                 8081, sorted(common.cpu_set(config["cpus"]["origin"])), "/data/proxy")
@@ -319,9 +322,27 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(config["image_identities"]["client"]["docker_id"], docker_image["Id"])
             self.assertEqual(set(config["input_snapshot"]), {
                 "client_dir", "rut_config_dir", "runtime_libs", "clang", "ld",
-                "benchmark_common", "benchmark_driver", "benchmark_matrix"})
+                "benchmark_common", "benchmark_driver", "benchmark_matrix", "benchmark_summarize"})
             self.assertEqual(config["payloads"]["4k"], json.loads((output / "payloads.json").read_text())["4k"])
             self.assertEqual(json.loads((output / "native-configmap.json").read_text())["immutable"], True)
+
+    def test_prepare_rejects_configmap_apply_without_cluster_verification_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            output = root / "output"
+            argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                    "--kubeconfig", str(root / "kubeconfig"), "--cluster-name", "bench",
+                    "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                    "--rut-rps-dir", str(root / "rps"), "--rut-throughput-dir", str(root / "throughput"),
+                    "--runtime-libs", str(root / "libs"), "--clang", str(root / "clang"),
+                    "--ld", str(root / "ld"), "--client-image", "client:test", "--apply-configmaps"]
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            run.assert_not_called()
 
     def test_prepare_rejects_invalid_duration_before_creating_output_or_running_tools(self):
         for option, value in (("--duration", "10"), ("--duration", "0s"),
@@ -934,6 +955,70 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "comma"):
                     matrix.curl("127.0.0.1", outdir, "4k")
                 invoke.assert_not_called()
+
+    def test_curl_preflight_has_transfer_deadlines_and_owned_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            output.mkdir()
+            payload_dir = root / "payloads" / "4k"
+            payload_dir.mkdir(parents=True)
+            payload = payload_dir / "proxy"
+            payload.write_bytes(b"body")
+            outdir = output / "cell"
+            outdir.mkdir()
+            matrix = run_matrix.Matrix({"output": str(output), "checkpoint": str(root), "run_id": "run1",
+                "kubeconfig": "/tmp/kube",
+                "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                "worker_container": "worker", "cpus": {"client": "5,7"},
+                "image_identities": {"client": {"docker_id": "sha256:client"}}})
+            commands = []
+            def invoke(argv, **kwargs):
+                argv = [str(value) for value in argv]
+                commands.append((argv, kwargs))
+                if argv[1] == "run":
+                    (outdir / "response.bin").write_bytes(payload.read_bytes())
+                    return subprocess.CompletedProcess(argv, 0, "1.1 200 4\n", "")
+                if argv[1] == "inspect":
+                    run = commands[0][0]
+                    labels = {run[index + 1].split("=", 1)[0]: run[index + 1].split("=", 1)[1]
+                              for index, arg in enumerate(run) if arg == "--label"}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{
+                        "Id": "owned-probe", "Name": "/" + argv[-1],
+                        "Config": {"Labels": labels}}]), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                matrix.curl("127.0.0.1", outdir, "4k")
+            run, run_kwargs = commands[0]
+            self.assertIn("--connect-timeout", run)
+            self.assertIn("--max-time", run)
+            self.assertIn("benchmark-create-attempt", " ".join(run))
+            self.assertEqual(run_kwargs["timeout"], 30)
+            self.assertEqual(commands[1][0][1], "inspect")
+            self.assertEqual(commands[2][0], ["docker", "rm", "-f", "owned-probe"])
+
+    def test_timed_out_curl_probe_cleans_only_its_owned_container_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "run_id": "run1", "kubeconfig": "/tmp/kube",
+                "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            name = "probe-run1-attempt"
+            labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                      "benchmark-run-id": "run1", "benchmark-create-attempt": "token"}
+            events = []
+            def invoke(argv, **kwargs):
+                argv = [str(value) for value in argv]
+                events.append(argv)
+                if argv[1] == "run":
+                    raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+                if argv[1] == "inspect":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{
+                        "Id": "owned-id", "Name": "/" + name, "Config": {"Labels": labels}}]), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    matrix.run_owned_probe(["docker", "run", "--name", name], name, labels, timeout=20)
+            self.assertEqual([row[1] for row in events], ["run", "inspect", "rm"])
+            self.assertEqual(events[-1], ["docker", "rm", "-f", "owned-id"])
 
     def test_client_measurement_docker_wait_timeout_tracks_requested_duration_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1658,7 +1743,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
             (output / "payloads.json").write_text(json.dumps({"4k": original_metadata}))
             config = {"schema": 1, "output": str(output), "checkpoint": str(checkpoint),
                       "bodies": {"4k": len(original)},
-                      "payloads": {"4k": original_metadata}}
+                      "payloads": {"4k": original_metadata},
+                      "input_snapshot": common.snapshot_inputs({
+                          "benchmark_common": common.__file__, "benchmark_summarize": summarize.__file__})}
             original_fingerprint = common.provenance_fingerprint(config)
             sample_dir = Path("samples") / "4k" / "4k-nginx-r1"
             validation = output / sample_dir / "valid.txt"
@@ -1687,6 +1774,44 @@ class ProxyBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "provenance does not match"):
                 summarize.validate_sample_provenance(output, row,
                     common.provenance_fingerprint(mutated_config))
+
+    def test_summarizer_provenance_binds_active_checkout_and_source_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout_a, checkout_b = root / "checkout-a", root / "checkout-b"
+            checkout_a.mkdir(); checkout_b.mkdir()
+            common_a, summarize_a = checkout_a / "common.py", checkout_a / "summarize.py"
+            common_b, summarize_b = checkout_b / "common.py", checkout_b / "summarize.py"
+            common_a.write_text("common A")
+            summarize_a.write_text("summarize A")
+            common_b.write_text("common B")
+            summarize_b.write_text("summarize B")
+            snapshot = common.snapshot_inputs({"benchmark_common": common_a,
+                                               "benchmark_summarize": summarize_a})
+            config = {"input_snapshot": snapshot}
+            with mock.patch.object(common, "__file__", str(common_a)), \
+                    mock.patch.object(summarize, "__file__", str(summarize_a)):
+                summarize.verify_summarizer_provenance(config)
+            with mock.patch.object(common, "__file__", str(common_b)), \
+                    mock.patch.object(summarize, "__file__", str(summarize_b)):
+                with self.assertRaisesRegex(ValueError, "differs from prepared"):
+                    summarize.verify_summarizer_provenance(config)
+            summarize_a.write_text("modified summarize A")
+            with mock.patch.object(common, "__file__", str(common_a)), \
+                    mock.patch.object(summarize, "__file__", str(summarize_a)):
+                with self.assertRaisesRegex(ValueError, "inputs changed"):
+                    summarize.verify_summarizer_provenance(config)
+
+    def test_summary_checks_active_provenance_before_opening_sample_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "benchmark.json"
+            config_path.write_text(json.dumps({"schema": 1, "output": tmp}))
+            with mock.patch("sys.argv", ["summarize.py", "--config", str(config_path)]), \
+                    mock.patch("summarize.verify_summarizer_provenance",
+                               side_effect=ValueError("provenance gate")) as verify:
+                with self.assertRaisesRegex(ValueError, "provenance gate"):
+                    summarize.main()
+            verify.assert_called_once()
 
     def test_measurement_start_stamp_follows_delayed_docker_start_and_running_confirmation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1829,6 +1954,95 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "did not become ready"):
                     matrix.wait_frontend("10.0.0.2")
             self.assertEqual([row[1] for row in events], ["run", "inspect"])
+
+    def test_monitor_failure_cancels_driver_and_confirms_owned_wrk_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "container-id.txt").write_text("wrk-owned\n")
+            matrix = run_matrix.Matrix({"output": tmp, "run_id": "run1",
+                                        "kubeconfig": "/tmp/kube",
+                                        "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            events = []
+            class Child:
+                returncode = None
+                def poll(self):
+                    return self.returncode
+                def send_signal(self, value):
+                    events.append(("signal", value))
+                def communicate(self, timeout=None):
+                    events.append(("communicate", timeout))
+                    self.returncode = -2
+                    return ("cancelled\n", None)
+                def terminate(self):
+                    events.append(("terminate",))
+                def kill(self):
+                    events.append(("kill",))
+            child = Child()
+            owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                            "benchmark-run-id": "run1", "benchmark-create-attempt": "attempt"}
+            inspect = {"Id": "wrk-owned", "Name": "/proxybench-run1-cell",
+                       "Config": {"Labels": owner_labels}}
+            def invoke(argv, **kwargs):
+                argv = [str(value) for value in argv]
+                events.append(("docker", argv[1], argv[-1]))
+                if argv[1] == "inspect" and len(argv) > 2 and argv[2] == "wrk-owned":
+                    if sum(1 for event in events if event[:2] == ("docker", "inspect")) == 1:
+                        return subprocess.CompletedProcess(argv, 0, json.dumps([inspect]), "")
+                    return subprocess.CompletedProcess(argv, 1, "Error: No such object: wrk-owned", "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            monitoring_error = RuntimeError("monitor failed")
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaises(RuntimeError) as caught:
+                    with matrix.client_driver_guard(child, target):
+                        raise monitoring_error
+            self.assertIs(caught.exception, monitoring_error)
+            self.assertEqual(events[0], ("signal", run_matrix.signal.SIGINT))
+            self.assertIn(("communicate", 10), events)
+            self.assertIn(("docker", "rm", "wrk-owned"), events)
+            self.assertEqual((target / "driver-cancel.log").read_text(), "cancelled\n")
+
+    def test_wrk_cleanup_refuses_to_remove_unowned_container_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "container-id.txt").write_text("other-id\n")
+            matrix = run_matrix.Matrix({"output": tmp, "run_id": "run1",
+                                        "kubeconfig": "/tmp/kube",
+                                        "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            inspected = {"Id": "other-id", "Config": {"Labels": {"benchmark-run-id": "someone-else"}}}
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps([inspected]), "")) as invoke:
+                with self.assertRaisesRegex(RuntimeError, "not owned"):
+                    matrix.verify_wrk_container_cleanup(target)
+            self.assertEqual(invoke.call_count, 1)
+
+    def test_driver_cancellation_escalates_and_reaps_with_bounded_waits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "run_id": "run1", "kubeconfig": "/tmp/kube",
+                                        "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            events = []
+            class Child:
+                returncode = None
+                def poll(self):
+                    return self.returncode
+                def send_signal(self, value):
+                    events.append(("signal", value))
+                def communicate(self, timeout=None):
+                    events.append(("communicate", timeout))
+                    if len([event for event in events if event[0] == "communicate"]) == 1:
+                        raise subprocess.TimeoutExpired("driver", timeout)
+                    self.returncode = -15
+                    return ("terminated\n", None)
+                def terminate(self):
+                    events.append(("terminate",))
+                def kill(self):
+                    events.append(("kill",))
+            child = Child()
+            with mock.patch("run_matrix.invoke") as invoke:
+                matrix.cancel_client_driver(child, Path(tmp))
+            self.assertEqual(events, [("signal", run_matrix.signal.SIGINT), ("communicate", 10),
+                                      ("terminate",), ("communicate", 5)])
+            invoke.assert_not_called()
+            self.assertEqual((Path(tmp) / "driver-cancel.log").read_text(), "terminated\n")
 
     def test_frontend_readiness_fails_after_bounded_retry_window(self):
         with tempfile.TemporaryDirectory() as tmp:
