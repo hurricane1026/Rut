@@ -23,7 +23,7 @@ shard、io_uring / epoll 和 LLVM ORC JIT。
 - 连接推进使用函数指针回调，后端选择使用模板；保持 io_uring / epoll 的
   `IoEvent` 语义一致，不引入协程或虚函数分派。
 - `rut_runtime` 保持不依赖 LLVM，LLVM 集成集中在 `rut_jit`。
-- TLS 使用仓库中的 BoringSSL；构建和测试不新增系统 OpenSSL 包、库或 CLI 依赖。
+- TLS 使用 CMake 固定版本和校验和构建的静态 OpenSSL；不链接系统 OpenSSL，测试不依赖系统 OpenSSL CLI。
 - Rutlang 遵循 **Swift-exact or absent**，不凭 Swift 经验发明语法；
   语言语义变更同步更新 `DESIGN.md`、语言卡和相关测试。
 

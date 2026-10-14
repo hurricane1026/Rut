@@ -16,7 +16,7 @@ from pathlib import Path
 from common import (cpu_set, duration_seconds, image_reference_matches, load_config,
                     normalized_linkerd_injection_spec, pod_spec,
                     provenance_fingerprint, snapshot_inputs,
-                    verify_client_image_config_identity, write_json)
+                    validate_docker_mount_source, verify_client_image_config_identity, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 ENGINES = {"4k": ("linkerd", "rut-rps", "nginx", "envoy"),
@@ -365,6 +365,7 @@ class Matrix:
         return running.returncode == 0 and running.stdout.strip() == "true"
 
     def curl(self, pod_ip: str, outdir: Path, body: str, *, marker: str | None = None, many: bool = False) -> None:
+        validate_docker_mount_source(outdir.resolve(), "cell output")
         client_cpus = self.c["cpus"]["client"]
         image = self.c["image_identities"]["client"]["docker_id"]
         argv = [self.docker, "run", "--rm", "--security-opt", "label=disable", "--network",

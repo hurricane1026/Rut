@@ -9,10 +9,23 @@ import unittest
 from unittest import mock
 
 import common
+import collect_runtime_libs
 import prepare
 import run_client
 import run_matrix
 import summarize
+
+
+def test_runtime_manifest(library_dir: Path, binaries: list[Path], libraries: list[Path] | None = None) -> None:
+    libraries = libraries or []
+    manifest = {
+        "schema": 1,
+        "binaries": [{"path": str(path.resolve()), "bytes": path.stat().st_size,
+                      "sha256": common.sha256(path), "dependencies": []} for path in binaries],
+        "libraries": [{"soname": path.name, "bytes": path.stat().st_size,
+                       "sha256": common.sha256(path)} for path in libraries],
+    }
+    (library_dir / "runtime-libs.json").write_text(json.dumps(manifest))
 
 
 class ProxyBenchmarkTests(unittest.TestCase):
@@ -240,6 +253,34 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     prepare.main()
             run.assert_not_called()
             (checkpoint / "rps" / "rut").chmod(0o755)
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            run.assert_not_called()
+            test_runtime_manifest(checkpoint / "runtime-libs", [
+                checkpoint / directory / filename
+                for directory in ("rps", "throughput")
+                for filename in ("rut", "rut-compile")
+            ] + [checkpoint / "runtime-tools" / name for name in ("clang", "ld")])
+            comma_output = root / "out,put"
+            comma_argv = list(argv)
+            comma_argv[comma_argv.index("--output") + 1] = str(comma_output)
+            with mock.patch("sys.argv", comma_argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(comma_output.exists())
+            run.assert_not_called()
+            comma_client = checkpoint / "client,inputs"
+            comma_client.mkdir()
+            for name in ("request.lua", "warmup.lua"):
+                (comma_client / name).write_text("return true")
+            comma_argv = list(argv) + ["--client-dir", str(comma_client)]
+            with mock.patch("sys.argv", comma_argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            run.assert_not_called()
             docker_image = {"Id": "sha256:" + "a" * 64, "RepoDigests": []}
             with mock.patch("sys.argv", argv), mock.patch("prepare.run", return_value=json.dumps(docker_image)):
                 self.assertEqual(prepare.main(), 0)
@@ -458,16 +499,48 @@ class ProxyBenchmarkTests(unittest.TestCase):
                           " ".join(kube.call_args_list[1].args))
             self.assertIn(f"metadata.name={name}", kube.call_args_list[1].args)
 
-    def test_runtime_library_bundle_must_be_a_directory(self):
+    def test_runtime_library_collector_binds_six_sources_and_duplicate_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "libs"
+            source_dir = root / "source"
+            source_dir.mkdir()
+            binaries = []
+            for index in range(6):
+                binary = source_dir / f"binary-{index}"
+                binary.write_bytes(f"binary {index}".encode())
+                binaries.append(binary)
+            library = source_dir / "libshared.so.1"
+            library.write_bytes(b"same library bytes")
+            argv = ["collect_runtime_libs.py", "--output", str(output), *map(str, binaries)]
+            with mock.patch("sys.argv", argv), mock.patch.object(
+                    collect_runtime_libs, "dependencies", return_value=[(library.name, library)]):
+                self.assertEqual(collect_runtime_libs.main(), 0)
+            manifest = json.loads((output / "runtime-libs.json").read_text())
+            self.assertEqual(len(manifest["binaries"]), 6)
+            self.assertEqual(sum(len(row["dependencies"]) for row in manifest["binaries"]), 6)
+            self.assertEqual(len(manifest["libraries"]), 1)
+            expected = {f"source_{index}": binary for index, binary in enumerate(binaries)}
+            prepare.validate_runtime_libs(output, expected)
+            (output / library.name).write_bytes(b"other library bytes")
+            with self.assertRaisesRegex(ValueError, "missing or changed"):
+                prepare.validate_runtime_libs(output, expected)
+            (output / library.name).write_bytes(library.read_bytes())
+            binaries[0].write_bytes(b"altered!")
+            with self.assertRaisesRegex(ValueError, "stale for"):
+                prepare.validate_runtime_libs(output, expected)
+
+    def test_runtime_library_bundle_must_be_a_directory_and_have_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             libraries = root / "libs"
             libraries.mkdir()
-            prepare.validate_runtime_libs(libraries)
+            with self.assertRaisesRegex(ValueError, "runtime-libs.json"):
+                prepare.validate_runtime_libs(libraries, {})
             file_path = root / "libs-file"
             file_path.write_text("not a directory")
             with self.assertRaisesRegex(ValueError, "runtime-libs must be a directory"):
-                prepare.validate_runtime_libs(file_path)
+                prepare.validate_runtime_libs(file_path, {})
 
     def test_compiler_string_scan_ignores_non_ascii_binary_chunks(self):
         real_binary = Path(sys.executable).read_bytes()
@@ -556,7 +629,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertTrue(any("delete" in call.args[0] for call in run.call_args_list))
 
     def test_linkerd_probe_waits_for_pull_records_identity_and_deletes_probe(self):
-        pod = {"spec": {"containers": [], "initContainers": [{"name": "linkerd-proxy", "image": "proxy:edge",
+        pod = {"metadata": {"name": "probe", "namespace": "bench", "uid": "probe-uid"},
+               "spec": {"containers": [], "initContainers": [{"name": "linkerd-proxy", "image": "proxy:edge",
                                                                   "restartPolicy": "Always",
                                                                   "args": ["--log-level=error"],
                                                                   "env": [{"name": "A", "value": "B"}],
@@ -565,8 +639,11 @@ class ProxyBenchmarkTests(unittest.TestCase):
         inventory = {"images": [{"id": "sha256:cfg", "repoTags": ["proxy:edge"], "repoDigests": []}]}
         with tempfile.TemporaryDirectory() as tmp:
             probe = Path(tmp) / "probe.json"
-            probe.write_text("{}")
-            with mock.patch("prepare.run", side_effect=["", "", json.dumps(pod), json.dumps(inventory), ""]) as run:
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-1")
+            probe.write_text(json.dumps(spec))
+            pod["metadata"]["labels"] = spec["metadata"]["labels"]
+            with mock.patch("prepare.run", side_effect=["", "", json.dumps(pod), json.dumps(inventory),
+                                                         json.dumps(pod), ""]) as run:
                 identity = prepare.discover_linkerd_proxy_identity(
                     ["kubectl", "--kubeconfig", "/kube"], "docker", "worker", probe, "probe", "bench")
         self.assertEqual(identity["identities"]["linkerd_proxy"]["worker_id"], "sha256:cfg")
@@ -574,14 +651,18 @@ class ProxyBenchmarkTests(unittest.TestCase):
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn("wait", commands[1])
         self.assertIn("create", commands[0])
-        self.assertEqual(commands[-1][3:6], ["delete", "pod", "probe"])
+        self.assertEqual(commands[-1][3:6], ["delete", "pod", "-n"])
+        self.assertIn("metadata.name=probe", commands[-1])
+        self.assertTrue(any("benchmark-create-attempt=attempt-1" in item for item in commands[-1]))
         self.assertEqual(run.call_args_list[1].kwargs["timeout"], 190)
 
     def test_linkerd_probe_deletes_pod_when_readiness_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             probe = Path(tmp) / "probe.json"
-            probe.write_text("{}")
-            with mock.patch("prepare.run", side_effect=["", RuntimeError("not ready"), ""]) as run:
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-ready")
+            probe.write_text(json.dumps(spec))
+            pod = {"metadata": {**spec["metadata"], "uid": "probe-uid"}}
+            with mock.patch("prepare.run", side_effect=["", RuntimeError("not ready"), json.dumps(pod), ""]) as run:
                 with self.assertRaisesRegex(RuntimeError, "not ready"):
                     prepare.discover_linkerd_proxy_identity(
                         ["kubectl"], "docker", "worker", probe, "probe", "bench")
@@ -590,9 +671,11 @@ class ProxyBenchmarkTests(unittest.TestCase):
     def test_linkerd_probe_cleanup_attempts_delete_after_ambiguous_create_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             probe = Path(tmp) / "probe.json"
-            probe.write_text("{}")
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-ambiguous")
+            probe.write_text(json.dumps(spec))
+            owned = {"metadata": {**spec["metadata"], "uid": "created-after-timeout"}}
             create_timeout = subprocess.TimeoutExpired(["kubectl", "create"], 90)
-            with mock.patch("prepare.run", side_effect=[create_timeout, ""]) as run:
+            with mock.patch("prepare.run", side_effect=[create_timeout, json.dumps(owned), ""]) as run:
                 with self.assertRaises(subprocess.TimeoutExpired):
                     prepare.discover_linkerd_proxy_identity(
                         ["kubectl"], "docker", "worker", probe, "probe", "bench")
@@ -601,15 +684,31 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertIn("--ignore-not-found=true", cleanup.args[0])
         self.assertEqual(cleanup.kwargs["timeout"], 90)
 
+    def test_linkerd_probe_cleanup_skips_preexisting_name_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-current")
+            probe.write_text(json.dumps(spec))
+            preexisting = {"metadata": {"name": "probe", "namespace": "bench", "uid": "old",
+                                         "labels": {"benchmark-create-attempt": "attempt-old"}}}
+            create_error = RuntimeError("already exists")
+            with mock.patch("prepare.run", side_effect=[create_error, json.dumps(preexisting)]) as run:
+                with self.assertRaisesRegex(RuntimeError, "already exists"):
+                    prepare.discover_linkerd_proxy_identity(
+                        ["kubectl"], "docker", "worker", probe, "probe", "bench")
+            self.assertEqual(len(run.call_args_list), 2)
+            self.assertIn("get", run.call_args_list[-1].args[0])
+
     def test_linkerd_probe_cleanup_failure_does_not_mask_create_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             probe = Path(tmp) / "probe.json"
-            probe.write_text("{}")
-            with mock.patch("prepare.run", side_effect=[RuntimeError("create timed out"), OSError("delete unavailable")]) as run:
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-error")
+            probe.write_text(json.dumps(spec))
+            with mock.patch("prepare.run", side_effect=[RuntimeError("create timed out"), OSError("get unavailable")]) as run:
                 with self.assertRaisesRegex(RuntimeError, "create timed out"):
                     prepare.discover_linkerd_proxy_identity(
                         ["kubectl"], "docker", "worker", probe, "probe", "bench")
-        self.assertIn("delete", run.call_args_list[-1].args[0])
+        self.assertIn("get", run.call_args_list[-1].args[0])
 
     def test_linkerd_injected_proxy_image_is_taken_from_admitted_pod(self):
         admitted = {"spec": {"containers": [{"name": "origin", "image": "nginx@sha256:abc"}],
@@ -727,6 +826,34 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(run.call_args_list[1].kwargs["timeout"], run_client.DOCKER_CLEANUP_TIMEOUT)
             self.assertTrue((out / "error.log").is_file())
             self.assertEqual((out / "returncode.txt").read_text(), "124\n")
+
+    def test_client_rejects_comma_mount_sources_before_creating_output(self):
+        for config_dir, output_suffix in (("/tmp/client,inputs", "measurement"),
+                                          ("/benchmark", "measurement,one")):
+            with self.subTest(client_dir=config_dir, output=output_suffix), tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / output_suffix
+                config = {"client_dir": config_dir}
+                argv = ["run_client.py", "--config", "unused", "--label", "cell",
+                        "--pod-ip", "10.0.0.1", "--duration", "2s", "--lua", "warmup.lua",
+                        "--output", str(out)]
+                with mock.patch("run_client.load_config", return_value=config), \
+                        mock.patch("sys.argv", argv), mock.patch("run_client.subprocess.run") as run:
+                    with self.assertRaises(SystemExit):
+                        run_client.main()
+                self.assertFalse(out.exists())
+                run.assert_not_called()
+
+    def test_matrix_rejects_comma_cell_output_before_docker_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp) / "cell,one"
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl",
+                                                                    "linkerd": "linkerd"},
+                                        "cpus": {"client": "5,7"}, "image_identities": {"client": {"docker_id": "id"}},
+                                        "worker_container": "worker", "kubeconfig": "/kube"})
+            with mock.patch("run_matrix.invoke") as invoke:
+                with self.assertRaisesRegex(ValueError, "comma"):
+                    matrix.curl("127.0.0.1", outdir, "4k")
+                invoke.assert_not_called()
 
     def test_client_measurement_docker_wait_timeout_tracks_requested_duration_and_cleans_up(self):
         with tempfile.TemporaryDirectory() as tmp:

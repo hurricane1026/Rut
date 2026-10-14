@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """Copy resolved ELF shared libraries for supplied local executables."""
 import argparse
+import hashlib
+import json
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def dependencies(binary: Path) -> list[Path]:
@@ -37,17 +47,26 @@ def main() -> int:
         parser.error("--output must be new or empty")
     output.mkdir(parents=True, exist_ok=True)
     copied = {}
+    binary_records = []
     for raw in args.binaries:
         binary = raw.resolve(strict=True)
+        dependency_records = []
         for soname, library in dependencies(binary):
+            dependency_records.append({"soname": soname, "source": str(library),
+                                       "bytes": library.stat().st_size, "sha256": sha256(library)})
             destination = output / soname
             if destination.exists():
                 if destination.read_bytes() != library.read_bytes():
                     raise RuntimeError(f"library basename collision: {library} and {destination}")
-                continue
-            shutil.copy2(library, destination)
-            copied[soname] = str(library)
-    print("\n".join(f"{name}\t{path}" for name, path in sorted(copied.items())))
+            else:
+                shutil.copy2(library, destination)
+            copied[soname] = {"bytes": destination.stat().st_size, "sha256": sha256(destination)}
+        binary_records.append({"path": str(binary), "bytes": binary.stat().st_size,
+                               "sha256": sha256(binary), "dependencies": dependency_records})
+    manifest = {"schema": 1, "binaries": binary_records,
+                "libraries": [{"soname": name, **copied[name]} for name in sorted(copied)]}
+    (output / "runtime-libs.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    print("\n".join(f"{name}\t{record['sha256']}" for name, record in sorted(copied.items())))
     return 0
 
 

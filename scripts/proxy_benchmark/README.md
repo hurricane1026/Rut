@@ -35,17 +35,17 @@ docker buildx build --load \
   -t proxy-benchmark-client:local .
 ```
 
-The kind worker image supplies `taskset`; `run_matrix.py` uses it through `docker exec`. The client itself is constrained with Docker `--cpuset-cpus`. The Rut Pod needs its runtime shared libraries and the exact `clang` and `ld` executables used by the selected Rut toolchain, because the runtime's native-artifact compiler launches those absolute paths. Preparation detects the embedded compiler path in the `rut-compile` artifacts and checks the compiler path and linker directory as complete binary strings; pass `--native-linker-path` and `--native-linker-dir` when the directory cannot be inferred from the compiler path. Collect shared objects with the included standard-library-only helper; it uses the host `ldd` command and adds no package/build dependency:
+The kind worker image supplies `taskset`; `run_matrix.py` uses it through `docker exec`. The client itself is constrained with Docker `--cpuset-cpus`. The Rut Pod needs its runtime shared libraries and the exact `clang` and `ld` executables used by the selected Rut toolchain, because the runtime's native-artifact compiler launches those absolute paths. Preparation detects the embedded compiler path in the `rut-compile` artifacts and checks the compiler path and linker directory as complete binary strings; pass `--native-linker-path` and `--native-linker-dir` when the directory cannot be inferred from the compiler path. Collect shared objects with the included standard-library-only helper; it uses the host `ldd` command, writes a `runtime-libs.json` inventory binding all six binaries and their dependency sonames/hashes, and adds no package/build dependency:
 
 ```sh
+mkdir -p "$CHECKPOINT/runtime-tools"
+cp "$(readlink -f "$(command -v clang)")" "$CHECKPOINT/runtime-tools/clang"
+cp "$(readlink -f "$(command -v ld)")" "$CHECKPOINT/runtime-tools/ld"
 python3 scripts/proxy_benchmark/collect_runtime_libs.py \
   --output "$CHECKPOINT/runtime-libs" \
   "$RUT_RPS_DIR/rut" "$RUT_RPS_DIR/rut-compile" \
   "$RUT_THROUGHPUT_DIR/rut" "$RUT_THROUGHPUT_DIR/rut-compile" \
-  "$(readlink -f "$(command -v clang)")" "$(readlink -f "$(command -v ld)")"
-mkdir -p "$CHECKPOINT/runtime-tools"
-cp "$(readlink -f "$(command -v clang)")" "$CHECKPOINT/runtime-tools/clang"
-cp "$(readlink -f "$(command -v ld)")" "$CHECKPOINT/runtime-tools/ld"
+  "$CHECKPOINT/runtime-tools/clang" "$CHECKPOINT/runtime-tools/ld"
 ```
 
 Pass those paths to `prepare.py`. Keep all binaries and the library bundle under the checkpoint so the kind worker can mount and read them. Do not use libraries from an unrelated compiler installation.
@@ -121,7 +121,7 @@ kind load docker-image --name "$CLUSTER" proxy-benchmark-client:local
 
 ## Configure and run
 
-Use fresh directories. `--output` must be empty. Both Rut directories need sibling `rut` and `rut-compile` files; each binary/compiler pair is hashed in `benchmark.json`. Preparation snapshots the recursive contents of `client_dir`, generated `rut_config_dir`, runtime libraries, `clang`, and `ld`; symlinks inside mounted inputs are rejected. Before resume and each cell, the runner checks those manifests, payload hashes, Docker and worker image identities (including the server-side-dry-run-discovered Linkerd proxy), immutable ConfigMap UID/data, and Rut artifact hashes. Keep the prepared paths and image contents unchanged for the full run; create a new output directory and prepare again after changing any input. `prepare.py` verifies the explicit kubeconfig context, kind worker identity/mount, node label, namespace, Linkerd readiness, and helper affinity. The two generated ConfigMaps use a random run prefix and `kubectl create`, so an existing resource is never overwritten.
+Use fresh directories. `--output` must be empty. Both Rut directories need sibling `rut` and `rut-compile` files; each binary/compiler pair is hashed in `benchmark.json`. Preparation validates the runtime-library inventory against those four Rut binaries and the selected `clang` and `ld` before Docker or cluster calls. The resolved `--output` and `--client-dir` paths must not contain commas because Docker's `--mount` syntax uses commas as option separators. Preparation snapshots the recursive contents of `client_dir`, generated `rut_config_dir`, runtime libraries, `clang`, and `ld`; symlinks inside mounted inputs are rejected. Before resume and each cell, the runner checks those manifests, payload hashes, Docker and worker image identities (including the server-side-dry-run-discovered Linkerd proxy), immutable ConfigMap UID/data, and Rut artifact hashes. Keep the prepared paths and image contents unchanged for the full run; create a new output directory and prepare again after changing any input. `prepare.py` verifies the explicit kubeconfig context, kind worker identity/mount, node label, namespace, Linkerd readiness, and helper affinity. The two generated ConfigMaps use a random run prefix and `kubectl create`, so an existing resource is never overwritten.
 
 ```sh
 python3 scripts/proxy_benchmark/prepare.py \

@@ -15,7 +15,7 @@ import uuid
 
 from common import (canonical_cpu_list, cpu_set, image_reference_matches,
                     duration_seconds, normalized_linkerd_injection_spec, snapshot_inputs,
-                    verify_client_image_config_identity, write_json)
+                    validate_docker_mount_source, verify_client_image_config_identity, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 IMAGES = {
@@ -42,9 +42,72 @@ def cpus(value: str, count: int, name: str) -> list[int]:
     return values
 
 
-def validate_runtime_libs(path: Path) -> None:
+def validate_runtime_libs(path: Path, expected_binaries: dict[str, Path]) -> None:
     if not path.is_dir():
         raise ValueError("--runtime-libs must be a directory")
+    manifest_path = path / "runtime-libs.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("--runtime-libs must contain runtime-libs.json from collect_runtime_libs.py") from error
+    if not isinstance(manifest, dict):
+        raise ValueError("runtime library manifest must be a JSON object")
+    if manifest.get("schema") != 1:
+        raise ValueError("runtime library manifest has unsupported schema")
+    binaries = manifest.get("binaries")
+    if not isinstance(binaries, list):
+        raise ValueError("runtime library manifest has no binary inventory")
+    observed = {}
+    for item in binaries:
+        if not isinstance(item, dict):
+            raise ValueError("runtime library manifest has an invalid binary record")
+        source_path = item.get("path")
+        if not isinstance(source_path, str) or not source_path:
+            raise ValueError("runtime library manifest has an invalid binary path")
+        binary_path = str(Path(source_path).resolve())
+        if binary_path in observed:
+            raise ValueError(f"runtime library manifest repeats binary {binary_path}")
+        observed[binary_path] = item
+    expected = {str(binary.resolve(strict=True)): binary for binary in expected_binaries.values()}
+    if len(expected) != 6 or set(observed) != set(expected):
+        raise ValueError("runtime library manifest does not cover exactly the four Rut and two tool binaries")
+    for binary_path, binary in expected.items():
+        record = observed[binary_path]
+        if (record.get("bytes") != binary.stat().st_size or record.get("sha256") != sha(binary)):
+            raise ValueError(f"runtime library manifest is stale for {binary_path}")
+
+    libraries = manifest.get("libraries")
+    if not isinstance(libraries, list):
+        raise ValueError("runtime library manifest has no library inventory")
+    expected_libraries = {}
+    for item in libraries:
+        if not isinstance(item, dict):
+            raise ValueError("runtime library manifest has an invalid library record")
+        name = item.get("soname")
+        if not isinstance(name, str) or not name or Path(name).name != name or name in expected_libraries:
+            raise ValueError(f"runtime library manifest has invalid or duplicate soname {name!r}")
+        expected_libraries[name] = item
+    for record in binaries:
+        deps = record.get("dependencies")
+        if not isinstance(deps, list):
+            raise ValueError("runtime library manifest has invalid dependency list")
+        for dependency in deps:
+            if not isinstance(dependency, dict):
+                raise ValueError("runtime library manifest has an invalid dependency record")
+            name = dependency.get("soname")
+            if not isinstance(name, str):
+                raise ValueError("runtime library manifest has an invalid dependency soname")
+            library = expected_libraries.get(name)
+            if not library or (dependency.get("bytes"), dependency.get("sha256")) != (library.get("bytes"), library.get("sha256")):
+                raise ValueError(f"runtime library manifest dependency is absent or inconsistent: {name!r}")
+    disk_libraries = {item.name for item in path.iterdir() if item.name != manifest_path.name}
+    if disk_libraries != set(expected_libraries):
+        raise ValueError("runtime library bundle files differ from its manifest")
+    for name, record in expected_libraries.items():
+        library_path = path / name
+        if (library_path.is_symlink() or not library_path.is_file() or
+                library_path.stat().st_size != record.get("bytes") or sha(library_path) != record.get("sha256")):
+            raise ValueError(f"runtime library bundle is missing or changed: {name}")
 
 
 def validate_output_disjoint(output: Path, input_roots: list[Path]) -> None:
@@ -142,10 +205,14 @@ def injected_linkerd_proxy_image(pod: dict) -> str:
     return proxy["image"]
 
 
-def linkerd_probe_spec(name: str, namespace: str, worker_node: str, nginx_image: str) -> dict:
+def linkerd_probe_spec(name: str, namespace: str, worker_node: str, nginx_image: str,
+                       create_attempt_id: str | None = None) -> dict:
     """Use the same application injection inputs as the benchmark origin Pod."""
+    create_attempt_id = create_attempt_id or uuid.uuid4().hex
     return {"apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": name, "namespace": namespace,
+                         "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                                    "benchmark-create-attempt": create_attempt_id},
                          "annotations": {
                              "linkerd.io/inject": "enabled",
                              "config.linkerd.io/default-inbound-policy": "all-unauthenticated",
@@ -223,11 +290,15 @@ def apply_configmaps(kubectl: list[str], namespace: str, run_id: str, attempt_id
 
 def discover_linkerd_proxy_identity(kube: list[str], docker: str, worker: str,
                                     probe_path: Path, pod_name: str, namespace: str) -> dict:
+    requested = json.loads(probe_path.read_text())
+    expected_labels = requested.get("metadata", {}).get("labels", {})
+    observed_uid = None
     try:
         run(kube + ["create", "-f", str(probe_path)])
         run(kube + ["wait", "--for=condition=Ready", f"pod/{pod_name}", "-n", namespace,
                     "--timeout=180s"], timeout=190)
         actual = json.loads(run(kube + ["get", "pod", pod_name, "-n", namespace, "-o", "json"]))
+        observed_uid = actual.get("metadata", {}).get("uid")
         injected_spec = normalized_linkerd_injection_spec(actual)
         references = {}
         for item in injected_spec["containers"] + injected_spec["initContainers"]:
@@ -253,8 +324,17 @@ def discover_linkerd_proxy_identity(kube: list[str], docker: str, worker: str,
     finally:
         active_error = sys.exc_info()[0] is not None
         try:
-            run(kube + ["delete", "pod", pod_name, "-n", namespace, "--ignore-not-found=true",
-                        "--wait=true", "--grace-period=1"], timeout=90)
+            actual = json.loads(run(kube + ["get", "pod", pod_name, "-n", namespace, "-o", "json"]))
+            metadata = actual.get("metadata", {})
+            labels = metadata.get("labels", {})
+            is_owned = (metadata.get("name") == pod_name and metadata.get("namespace") == namespace and
+                        all(labels.get(key) == value for key, value in expected_labels.items()) and
+                        bool(expected_labels))
+            if is_owned and (not observed_uid or metadata.get("uid") == observed_uid):
+                selector = ",".join(f"{key}={value}" for key, value in sorted(expected_labels.items()))
+                run(kube + ["delete", "pod", "-n", namespace, "-l", selector,
+                            "--field-selector", f"metadata.name={pod_name}",
+                            "--ignore-not-found=true", "--wait=true", "--grace-period=1"], timeout=90)
         except Exception:
             if not active_error:
                 raise
@@ -458,6 +538,11 @@ def main() -> int:
     paths = {"rut_rps": a.rut_rps_dir.resolve(strict=True), "rut_throughput": a.rut_throughput_dir.resolve(strict=True),
              "runtime_libs": a.runtime_libs.resolve(strict=True), "clang": a.clang.resolve(strict=True), "ld": a.ld.resolve(strict=True)}
     client_dir = a.client_dir.resolve(strict=True)
+    try:
+        validate_docker_mount_source(output, "--output")
+        validate_docker_mount_source(client_dir, "--client-dir")
+    except ValueError as error:
+        p.error(str(error))
     config_dir = checkpoint / "config"
     try:
         if config_dir.is_symlink():
@@ -465,11 +550,6 @@ def main() -> int:
         validate_output_disjoint(output, [client_dir, paths["rut_rps"], paths["rut_throughput"],
                                           paths["runtime_libs"], paths["clang"], paths["ld"],
                                           config_dir.resolve()])
-    except ValueError as error:
-        p.error(str(error))
-    output.mkdir(parents=True, exist_ok=True)
-    try:
-        validate_runtime_libs(paths["runtime_libs"])
     except ValueError as error:
         p.error(str(error))
     for key, path in paths.items():
@@ -501,10 +581,23 @@ def main() -> int:
         except ValueError as error:
             p.error(str(error))
 
+    expected_runtime_binaries = {
+        "rut_rps": paths["rut_rps"] / "rut",
+        "rut_rps_compiler": paths["rut_rps"] / "rut-compile",
+        "rut_throughput": paths["rut_throughput"] / "rut",
+        "rut_throughput_compiler": paths["rut_throughput"] / "rut-compile",
+        "clang": paths["clang"], "ld": paths["ld"],
+    }
+    try:
+        validate_runtime_libs(paths["runtime_libs"], expected_runtime_binaries)
+    except ValueError as error:
+        p.error(str(error))
+
     image_refs = {"nginx": a.nginx_image, "envoy": a.envoy_image, "client": a.client_image}
     image_identities = {name: {"reference": reference} for name, reference in image_refs.items()}
     image_identities["client"] = docker_image_identity(a.docker_bin, a.client_image)
 
+    output.mkdir(parents=True, exist_ok=True)
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "proxy-rps.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .rps, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
     (config_dir / "proxy-throughput.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .throughput, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')

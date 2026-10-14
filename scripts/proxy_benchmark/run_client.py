@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from common import duration_seconds, load_config
+from common import duration_seconds, load_config, validate_docker_mount_source
 
 DOCKER_CONTROL_TIMEOUT = 30
 DOCKER_CLEANUP_TIMEOUT = 15
@@ -54,6 +54,11 @@ def main() -> int:
     args = parser.parse_args()
     config = load_config(args.config)
     output = args.output.resolve()
+    try:
+        validate_docker_mount_source(config["client_dir"], "client_dir")
+        validate_docker_mount_source(output, "client output")
+    except ValueError as error:
+        parser.error(str(error))
     output.mkdir(parents=True, exist_ok=False)
     name = f"proxybench-{config['run_id']}-{args.label}".replace("_", "-")
     client_image = config["image_identities"]["client"]["docker_id"]

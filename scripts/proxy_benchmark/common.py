@@ -180,6 +180,11 @@ def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
     return snapshot
 
 
+def validate_docker_mount_source(path: str | Path, label: str) -> None:
+    if "," in str(path):
+        raise ValueError(f"{label} path cannot contain a comma because Docker --mount uses comma-separated options: {path}")
+
+
 def provenance_fingerprint(config: dict) -> str:
     evidence = {key: config[key] for key in (
         "images", "image_identities", "input_snapshot", "artifacts", "cpus",
