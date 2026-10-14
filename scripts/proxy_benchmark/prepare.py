@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -43,6 +44,11 @@ def cpus(value: str, count: int, name: str) -> list[int]:
 def validate_runtime_libs(path: Path) -> None:
     if not path.is_dir():
         raise ValueError("--runtime-libs must be a directory")
+
+
+def require_executable(path: Path, label: str) -> None:
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ValueError(f"{label} must be an executable file: {path}")
 
 
 def docker_image_identity(docker: str, reference: str) -> dict:
@@ -378,8 +384,11 @@ def main() -> int:
         if not path.is_relative_to(checkpoint):
             p.error(f"{key} must be under --checkpoint so the kind worker can access it")
     for key in ("rut_rps", "rut_throughput"):
-        if not all((paths[key] / name).is_file() for name in ("rut", "rut-compile")):
-            p.error(f"{key} directory must contain rut and sibling rut-compile")
+        for name in ("rut", "rut-compile"):
+            try:
+                require_executable(paths[key] / name, f"{key}/{name}")
+            except ValueError as error:
+                p.error(str(error))
     if not a.native_linker_path:
         try:
             a.native_linker_path = embedded_clang_path(paths["rut_rps"] / "rut-compile")
@@ -395,8 +404,11 @@ def main() -> int:
     client_dir = a.client_dir.resolve(strict=True)
     if not (client_dir / "request.lua").is_file() or not (client_dir / "warmup.lua").is_file():
         p.error("--client-dir must contain request.lua and warmup.lua")
-    if not paths["clang"].is_file() or not paths["ld"].is_file():
-        p.error("clang and ld must be files")
+    for key in ("clang", "ld"):
+        try:
+            require_executable(paths[key], key)
+        except ValueError as error:
+            p.error(str(error))
 
     image_refs = {"nginx": a.nginx_image, "envoy": a.envoy_image, "client": a.client_image}
     image_identities = {name: {"reference": reference} for name, reference in image_refs.items()}

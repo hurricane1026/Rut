@@ -69,6 +69,36 @@ def mapped_shared_object_paths(maps_text: str) -> list[str]:
     return sorted(paths)
 
 
+def verify_origin_affinity(master_pid: int, cpus: str, rows: list[dict]) -> None:
+    expected = cpu_set(cpus)
+    by_process: dict[int, set[frozenset[int]]] = {}
+    for row in rows:
+        pid = int(row["pid"])
+        allowed = cpu_set(row["allowed"])
+        if not allowed or not allowed <= expected:
+            raise RuntimeError(f"origin process {pid} affinity {row['allowed']} escapes {cpus}")
+        by_process.setdefault(pid, set()).add(frozenset(allowed))
+    master_masks = by_process.pop(master_pid, set())
+    if master_masks != {frozenset(expected)}:
+        raise RuntimeError(f"nginx master affinity does not match origin CPU set {cpus}")
+    workers = list(by_process.values())
+    if len(expected) == 1 and not workers:
+        return
+    worker_cpus = set()
+    for masks in workers:
+        if len(masks) != 1:
+            raise RuntimeError("nginx worker threads have inconsistent CPU affinity")
+        mask = next(iter(masks))
+        if len(mask) != 1:
+            raise RuntimeError("nginx worker affinity must remain pinned to one origin CPU")
+        cpu = next(iter(mask))
+        if cpu in worker_cpus:
+            raise RuntimeError(f"multiple nginx workers share origin CPU {cpu}")
+        worker_cpus.add(cpu)
+    if worker_cpus != expected:
+        raise RuntimeError(f"nginx worker CPU assignment {sorted(worker_cpus)} does not cover {cpus}")
+
+
 class Matrix:
     def __init__(self, config: dict, config_path: Path | None = None):
         self.c = config
@@ -194,8 +224,9 @@ class Matrix:
             cg = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"/proc/{pid}/cgroup"]).stdout.strip().splitlines()[-1]
             cgroot = "/sys/fs/cgroup" + cg.split(":", 2)[2]
             procs = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"{cgroot}/cgroup.procs"]).stdout.split()
-            for process in procs:
-                invoke([self.docker, "exec", self.c["worker_container"], "taskset", "-apc", cpus, process])
+            if name != "origin":
+                for process in procs:
+                    invoke([self.docker, "exec", self.c["worker_container"], "taskset", "-apc", cpus, process])
             cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"{cgroot}/cpu.max"]).stdout.strip()
             if cpu_max != "max 100000":
                 raise RuntimeError(f"{name} has unexpected CPU quota {cpu_max}")
@@ -212,7 +243,10 @@ class Matrix:
                         raise RuntimeError(f"cannot read thread affinity for process {process}: {line!r}")
                     row = {"pid": process, "name": fields[0], "allowed": fields[1]}
                     affinity.append(row)
-                    if cpu_set(fields[1]) != cpu_set(cpus):
+                    if name == "origin":
+                        if not cpu_set(fields[1]) or not cpu_set(fields[1]) <= cpu_set(cpus):
+                            raise RuntimeError(f"{name} thread in process {process} affinity {fields[1]} escapes {cpus}")
+                    elif cpu_set(fields[1]) != cpu_set(cpus):
                         raise RuntimeError(f"{name} thread in process {process} affinity {fields[1]} != {cpus}")
                 exe = invoke([self.docker, "exec", self.c["worker_container"], "readlink", f"/proc/{process}/exe"]).stdout.strip()
                 size = int(invoke([self.docker, "exec", self.c["worker_container"], "stat", "-Lc", "%s", f"/proc/{process}/exe"]).stdout.strip())
@@ -220,6 +254,8 @@ class Matrix:
                 process_binaries.append({"pid": process, "path": exe, "size_bytes": size, "sha256": digest})
                 maps = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"/proc/{process}/maps"]).stdout
                 process_libraries.update(mapped_shared_object_paths(maps))
+            if name == "origin":
+                verify_origin_affinity(pid, cpus, affinity)
             if name != "origin":
                 resource_pids["proxy"].extend(int(process) for process in procs)
                 role = "proxy"
@@ -688,7 +724,7 @@ def verify_configmaps(config: dict) -> None:
             raise RuntimeError(f"ConfigMap identity or data changed for {name}")
 
 
-def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: Exception) -> str:
+def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: BaseException) -> str:
     pod_name = f"proxybench-{config['run_id']}-{cell['body']}-{cell['rep']}-{cell['engine']}"
     try:
         cleanup = matrix.kube("delete", "pod", pod_name, "-n", config["namespace"],
@@ -700,6 +736,17 @@ def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: Excepti
     write_json(matrix.samples / "last-failure.json",
                {"cell": cell, "error": str(error), "cleanup": details})
     return details
+
+
+def run_cell_with_cleanup(matrix: Matrix, config: dict, cell: dict) -> Path:
+    try:
+        return matrix.run_cell(cell["body"], cell["engine"], cell["rep"])
+    except KeyboardInterrupt as error:
+        cleanup_failed_cell(matrix, config, cell, error)
+        raise
+    except Exception as error:
+        cleanup_failed_cell(matrix, config, cell, error)
+        raise
 
 
 def main() -> int:
@@ -736,11 +783,7 @@ def main() -> int:
         if expected.exists():
             raise RuntimeError(f"partial output already exists; inspect and move it before resuming: {expected}")
         print(f"START {i}/{len(work)} {label}", flush=True)
-        try:
-            result = matrix.run_cell(cell["body"], cell["engine"], cell["rep"])
-        except Exception as error:
-            cleanup_failed_cell(matrix, config, cell, error)
-            raise
+        result = run_cell_with_cleanup(matrix, config, cell)
         rel = lambda path: str(path.relative_to(matrix.out))
         index.append({"body_size": cell["body"], "engine": cell["engine"], "rep": cell["rep"],
                       "warmup_dir": rel(result / "warmup"), "measure_dir": rel(result / "measurement"),

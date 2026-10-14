@@ -170,9 +170,13 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 for filename in ("rut", "rut-compile"):
                     data = (filename.encode() if filename == "rut" else
                             b"compiler\0/usr/bin/clang\0/usr/bin/\0")
-                    (checkpoint / directory / filename).write_bytes(data)
+                    path = checkpoint / directory / filename
+                    path.write_bytes(data)
+                    path.chmod(0o755)
             for filename in ("clang", "ld"):
-                (checkpoint / "runtime-tools" / filename).write_bytes(filename.encode())
+                path = checkpoint / "runtime-tools" / filename
+                path.write_bytes(filename.encode())
+                path.chmod(0o755)
             output = root / "output"
             argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
                     "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
@@ -181,6 +185,12 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     "--runtime-libs", str(checkpoint / "runtime-libs"),
                     "--clang", str(checkpoint / "runtime-tools" / "clang"), "--ld", str(checkpoint / "runtime-tools" / "ld"),
                     "--client-image", "client:test", "--helper-cpus", "15,16"]
+            (checkpoint / "rps" / "rut").chmod(0o644)
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            run.assert_not_called()
+            (checkpoint / "rps" / "rut").chmod(0o755)
             docker_image = {"Id": "sha256:" + "a" * 64, "RepoDigests": []}
             with mock.patch("sys.argv", argv), mock.patch("prepare.run", return_value=json.dumps(docker_image)):
                 self.assertEqual(prepare.main(), 0)
@@ -202,6 +212,50 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertFalse(prepare.linker_paths_match(compiler, "/usr/bin/clang", "/usr/bin/"))
             self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang-22", "/usr/bin/"))
             self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang", "/opt/llvm/bin/"))
+
+    def test_prepare_requires_execute_permission_for_every_benchmark_program(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [root / "rut-rps" / "rut", root / "rut-rps" / "rut-compile",
+                     root / "rut-throughput" / "rut", root / "rut-throughput" / "rut-compile",
+                     root / "clang", root / "ld"]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("executable placeholder")
+                path.chmod(0o755)
+                prepare.require_executable(path, path.name)
+                path.chmod(0o644)
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "executable file"):
+                    prepare.require_executable(path, path.name)
+                path.chmod(0o755)
+
+    def test_origin_affinity_preserves_one_cpu_per_nginx_worker(self):
+        rows = [{"pid": "100", "allowed": "3-4,8-9"},
+                {"pid": "101", "allowed": "3"}, {"pid": "102", "allowed": "4"},
+                {"pid": "103", "allowed": "8"}, {"pid": "104", "allowed": "9"}]
+        run_matrix.verify_origin_affinity(100, "3-4,8-9", rows)
+        for changed in (
+                [{**row, "allowed": "3-4,8-9"} if row["pid"] == "101" else row for row in rows],
+                rows[:-1],
+                [{**row, "allowed": "10"} if row["pid"] == "104" else row for row in rows]):
+            with self.assertRaises(RuntimeError):
+                run_matrix.verify_origin_affinity(100, "3-4,8-9", changed)
+
+    def test_interrupted_cell_runs_pod_cleanup_and_reraises_keyboard_interrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"output": tmp, "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            matrix.samples.mkdir(parents=True)
+            interruption = KeyboardInterrupt()
+            cell = {"body": "4k", "engine": "linkerd", "rep": 1}
+            with mock.patch.object(matrix, "run_cell", side_effect=interruption), \
+                    mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess([], 0, "deleted\n", "")) as kube:
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    run_matrix.run_cell_with_cleanup(matrix, config, cell)
+            self.assertIs(caught.exception, interruption)
+            self.assertEqual(kube.call_args.args[:3], ("delete", "pod", "proxybench-run123-4k-1-linkerd"))
+            self.assertIn("--ignore-not-found=true", kube.call_args.args)
 
     def test_runtime_library_bundle_must_be_a_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
