@@ -720,7 +720,8 @@ bool IoUringBackend::add_relay_splice(i32 source_fd,
                                       IoEventType type,
                                       u32 upstream_episode,
                                       u32 length,
-                                      bool more) {
+                                      bool more,
+                                      u8 auxiliary) {
 #if !RUT_HAVE_IORING_OP_SPLICE
     (void)source_fd;
     (void)destination_fd;
@@ -729,9 +730,10 @@ bool IoUringBackend::add_relay_splice(i32 source_fd,
     (void)upstream_episode;
     (void)length;
     (void)more;
+    (void)auxiliary;
     return false;
 #else
-    if (!splice_supported) return false;
+    if (!splice_supported || (auxiliary != 4 && auxiliary != 32 && auxiliary != 33)) return false;
     if (source_fd < 0 || destination_fd < 0 || length == 0 || conn_id >= connection_capacity ||
         !valid_upstream_episode(upstream_episode) ||
         (type != IoEventType::RelayRead && type != IoEventType::RelayWrite))
@@ -747,7 +749,7 @@ bool IoUringBackend::add_relay_splice(i32 source_fd,
     sqe->len = length;
     sqe->splice_flags = SPLICE_F_MOVE | SPLICE_F_NONBLOCK;
     if (more && type == IoEventType::RelayWrite) sqe->splice_flags |= SPLICE_F_MORE;
-    sqe->user_data = encode_upstream_user_data(conn_id, type, upstream_episode, 4);
+    sqe->user_data = encode_upstream_user_data(conn_id, type, upstream_episode, auxiliary);
     sqe_advance_tail(sq_tail);
     pending++;
     return true;
@@ -762,7 +764,8 @@ bool IoUringBackend::add_relay_splice_pair(i32 source_fd,
                                            u32 upstream_episode,
                                            u32 length,
                                            bool more,
-                                           bool hardlink) {
+                                           bool hardlink,
+                                           u8 auxiliary) {
 #if !RUT_HAVE_IORING_OP_SPLICE
     (void)source_fd;
     (void)pipe_write_fd;
@@ -773,10 +776,12 @@ bool IoUringBackend::add_relay_splice_pair(i32 source_fd,
     (void)length;
     (void)more;
     (void)hardlink;
+    (void)auxiliary;
     return false;
 #else
-    if (!splice_supported || source_fd < 0 || pipe_write_fd < 0 || pipe_read_fd < 0 ||
-        destination_fd < 0 || conn_id >= connection_capacity || length == 0 ||
+    if ((auxiliary != 4 && auxiliary != 32 && auxiliary != 33) || !splice_supported ||
+        source_fd < 0 || pipe_write_fd < 0 || pipe_read_fd < 0 || destination_fd < 0 ||
+        conn_id >= connection_capacity || length == 0 ||
         !valid_upstream_episode(upstream_episode) || sq_ring_entries < 2)
         return false;
     // Reserve both entries before publishing the linked read. A half-pair
@@ -818,7 +823,7 @@ bool IoUringBackend::add_relay_splice_pair(i32 source_fd,
             encode_upstream_user_data(conn_id,
                                       side == 0 ? IoEventType::RelayRead : IoEventType::RelayWrite,
                                       upstream_episode,
-                                      4);
+                                      auxiliary);
     }
     __atomic_store_n(sq_tail, tail + 2, __ATOMIC_RELEASE);
     pending += 2;

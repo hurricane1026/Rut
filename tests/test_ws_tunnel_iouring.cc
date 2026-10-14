@@ -94,7 +94,11 @@ static void full_duplex_burst(test::TestCase* _tc,
                               bool poll_first = false,
                               bool queued_fin = false,
                               bool fin_before_drain = false,
-                              bool require_dual_positive_batch = false) {
+                              bool require_dual_positive_batch = false,
+                              bool asynchronous = false,
+                              bool cancel_retry = false,
+                              bool linked = false,
+                              bool poll_next_read = false) {
     REQUIRE(!half_close || splice);
     LoopStorage storage;
     if (!storage.init()) return;
@@ -105,6 +109,10 @@ static void full_duplex_burst(test::TestCase* _tc,
     if (cache) REQUIRE(loop.backend.enable_ws_recv_cache());
     if (splice) {
         REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+        loop.ws_splice.asynchronous = asynchronous;
+        loop.ws_splice.linked = linked;
+        loop.ws_splice.poll_next_read = poll_next_read;
+        if (asynchronous) REQUIRE(loop.backend.splice_supported);
         loop.ws_splice.chunk_size = segment;
         loop.ws_splice.call_budget = budget;
         loop.ws_splice.copy_first = copy_first;
@@ -193,7 +201,16 @@ static void full_duplex_burst(test::TestCase* _tc,
         REQUIRE(splice  ? loop.ws_splice.admissions > 0
                 : cache ? loop.backend.ws_recv_cache_count > 0
                         : (conn->send_armed || conn->upstream_send_armed));
+        if (cancel_retry) loop.test_fail_ws_splice_cancel_count = 2;
+        const int closing_client = conn->fd;
+        const int closing_upstream = conn->upstream_fd;
         loop.close_conn(*conn);
+        if (asynchronous) {
+            REQUIRE_EQ(loop.ws_splice.owners[conn->id].retiring_client, closing_client);
+            REQUIRE_EQ(loop.ws_splice.owners[conn->id].retiring_upstream, closing_upstream);
+            REQUIRE(fcntl(closing_client, F_GETFD) >= 0);
+            REQUIRE(fcntl(closing_upstream, F_GETFD) >= 0);
+        }
         for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
             IoEvent events[kMaxEventsPerWait]{};
             const u32 kCount = loop.backend.wait(
@@ -204,6 +221,12 @@ static void full_duplex_burst(test::TestCase* _tc,
         CHECK_EQ(loop.backend.failure_code(), 0);
         CHECK_EQ(loop.backend.ws_recv_cache_count, 0u);
         CHECK_EQ(conn->pending_ops, 0u);
+        if (asynchronous) {
+            CHECK_EQ(fcntl(closing_client, F_GETFD), -1);
+            CHECK_EQ(errno, EBADF);
+            CHECK_EQ(fcntl(closing_upstream, F_GETFD), -1);
+            CHECK_EQ(errno, EBADF);
+        }
         return;
     }
     if (queued_fin) {
@@ -244,6 +267,14 @@ static void full_duplex_burst(test::TestCase* _tc,
             assert_first_batch_rearm = true;
         }
         first_batch = false;
+        if (linked) {
+            // Completion order must not determine the accounting of a pair.
+            for (u32 i = 0; i < kCount / 2; ++i) {
+                const auto saved = events[i];
+                events[i] = events[kCount - i - 1];
+                events[kCount - i - 1] = saved;
+            }
+        }
         const u64 calls_before_turn = loop.ws_splice.calls;
         loop.dispatch_batch(events, kCount);
         if (assert_first_batch_rearm) {
@@ -365,6 +396,33 @@ static void full_duplex_burst(test::TestCase* _tc,
             if (kCount == 0) usleep(1000);
         }
         REQUIRE(conn->fd < 0);
+    } else if (half_close && asynchronous) {
+        REQUIRE_EQ(shutdown(kClient.fd, SHUT_WR), 0);
+        for (u32 i = 0; i < 1000 && !loop.ws_splice.owners[conn->id].direction[0].eof; ++i) {
+            IoEvent events[kMaxEventsPerWait]{};
+            const u32 count = loop.backend.wait(
+                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+            loop.dispatch_batch(events, count);
+            if (count == 0) usleep(1000);
+        }
+        REQUIRE(loop.ws_splice.owners[conn->id].direction[0].eof);
+        REQUIRE(conn->fd >= 0);
+        const u8 reply[] = {9, 8, 7, 6};
+        REQUIRE(write_burst(kOrigin.fd, reply, sizeof(reply)));
+        REQUIRE_EQ(shutdown(kOrigin.fd, SHUT_WR), 0);
+        u8 received[4]{};
+        u32 offset = 0;
+        for (u32 i = 0; i < 1000 && (conn->pending_ops != 0 || offset != sizeof(reply)); ++i) {
+            IoEvent events[kMaxEventsPerWait]{};
+            const u32 count = loop.backend.wait(
+                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+            loop.dispatch_batch(events, count);
+            REQUIRE(read_available(kClient.fd, received, &offset, sizeof(reply)));
+            if (count == 0) usleep(1000);
+        }
+        CHECK_EQ(offset, sizeof(reply));
+        CHECK(__builtin_memcmp(received, reply, sizeof(reply)) == 0);
+        CHECK(conn->fd < 0);
     } else if (half_close) {
         REQUIRE_EQ(shutdown(kClient.fd, SHUT_WR), 0);
         for (u32 i = 0; i < 1000 && !loop.ws_splice.owners[conn->id].direction[0].eof; ++i) {
@@ -2433,6 +2491,583 @@ TEST(http, initial_receive_default_retains_multishot_owner) {
 }
 TEST(http, later_request_receive_retains_multishot_owner) {
     initial_http_receive_owner(_tc, true, true);
+}
+
+TEST(ws, asynchronous_splice_full_duplex_backpressure) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true);
+}
+TEST(ws, asynchronous_splice_close_with_operations_inflight) {
+    full_duplex_burst(_tc,
+                      false,
+                      true,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true);
+}
+
+TEST(ws, asynchronous_splice_half_close_preserves_reverse_reply) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      true,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true);
+}
+TEST(ws, asynchronous_splice_tiny_budget_preserves_progress) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      16384,
+                      2,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true);
+}
+
+TEST(ws, asynchronous_splice_close_retries_cancel_submission) {
+    full_duplex_burst(_tc,
+                      false,
+                      true,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      true);
+}
+
+TEST(ws, linked_splice_duplex_backpressure) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      65609,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      false,
+                      true);
+}
+TEST(ws, linked_splice_half_close_reply) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      true,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      65609,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      false,
+                      true);
+}
+TEST(ws, linked_splice_cancel_retry) {
+    full_duplex_burst(_tc,
+                      false,
+                      true,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      65609,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      true,
+                      true);
+}
+TEST(ws, linked_splice_short_read) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      false,
+                      true);
+}
+TEST(ws, linked_splice_tiny_budget) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      2,
+                      false,
+                      65609,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      false,
+                      true);
+}
+TEST(ws, linked_splice_poll_next_half_close) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      true,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      65609,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      false,
+                      true,
+                      true);
+}
+TEST(ws, linked_splice_poll_next_short_read) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      8,
+                      false,
+                      64,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      false,
+                      true,
+                      true);
+}
+TEST(ws, linked_splice_128k_fast_batch_half_close) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      true,
+                      0,
+                      false,
+                      131072,
+                      16,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      true,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      false,
+                      true,
+                      true);
+}
+TEST(ws, linked_splice_one_operation_budget_progresses_both_directions) {
+    full_duplex_burst(_tc,
+                      false,
+                      false,
+                      true,
+                      true,
+                      false,
+                      0,
+                      false,
+                      65536,
+                      1,
+                      false,
+                      64 * 1024 + 73,
+                      4096,
+                      false,
+                      false,
+                      false,
+                      0,
+                      false,
+                      false,
+                      false,
+                      false,
+                      true,
+                      false,
+                      true,
+                      true);
+}
+
+TEST(ws, async_splice_queue_budget_is_opt_in_and_resolves_sq_capacity) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    auto& splice = loop.ws_splice;
+    splice.asynchronous = true;
+    splice.call_budget = 1;
+    splice.begin_turn(loop);
+    CHECK_EQ(splice.turn_call_limit, 1u);
+
+    const bool supported = loop.backend.splice_supported;
+    loop.backend.splice_supported = false;
+    splice.async_queue_budget = true;
+    splice.begin_turn(loop);
+    CHECK_EQ(splice.turn_call_limit, 1u);
+    loop.backend.splice_supported = supported;
+    if (!supported) return;
+
+    splice.begin_turn(loop);
+    CHECK_EQ(splice.turn_call_limit, loop.backend.sq_ring_entries);
+    CHECK(splice.turn_call_limit > 8u);
+
+    Connection* reclaim[10]{};
+    for (u32 i = 0; i < 10; ++i) {
+        reclaim[i] = loop.alloc_conn();
+        REQUIRE(reclaim[i] != nullptr);
+        reclaim[i]->pending_ops = 1;
+        loop.free_conn(*reclaim[i]);
+        reclaim[i]->pending_ops = 0;
+        splice.owners[reclaim[i]->id].reclaim_pending = true;
+        splice.enqueue(reclaim[i]->id);
+    }
+    const u32 free_before = loop.free_top;
+    splice.progress(loop);
+    CHECK_EQ(loop.free_top, free_before + 10u);
+
+    splice.asynchronous = false;
+    splice.begin_turn(loop);
+    CHECK_EQ(splice.turn_call_limit, 1u);
+}
+
+TEST(ws, async_splice_ordinary_cq_budget_yield_keeps_owner_runnable) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    if (!loop.backend.splice_supported) return;
+    int downstream[2], upstream[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+    Peer client{downstream[1]}, origin{upstream[1]};
+    auto* connection = loop.alloc_conn();
+    REQUIRE(connection != nullptr);
+    connection->fd = downstream[0];
+    connection->upstream_fd = upstream[0];
+    connection->upstream_episode = 1;
+    REQUIRE(set_nonblocking(connection->fd));
+    REQUIRE(set_nonblocking(connection->upstream_fd));
+    auto& splice = loop.ws_splice;
+    splice.asynchronous = true;
+    splice.async_queue_budget = true;
+    splice.call_budget = 1;
+    auto& owner = splice.owners[connection->id];
+    owner.active = true;
+    owner.episode = connection->upstream_episode;
+    ++connection->pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner.direction[direction].read_fd = fds[0];
+        owner.direction[direction].write_fd = fds[1];
+    }
+    splice.enqueue(connection->id);
+
+    u32 head = 0, tail = 1, flags = IORING_SQ_TASKRUN;
+    auto* saved_head = loop.backend.cq_head;
+    auto* saved_tail = loop.backend.cq_tail;
+    auto* saved_flags = loop.backend.sq_flags;
+    loop.backend.cq_head = &head;
+    loop.backend.cq_tail = &tail;
+    loop.backend.sq_flags = &flags;
+    loop.study_http_taskrun_yield = true;
+    loop.ordinary_cq_wait_limit_ns = 0;
+    int downstream2[2], upstream2[2];
+    REQUIRE_EQ(test::stream_socketpair(downstream2), 0);
+    REQUIRE_EQ(test::stream_socketpair(upstream2), 0);
+    Peer client2{downstream2[1]}, origin2{upstream2[1]};
+    auto* connection2 = loop.alloc_conn();
+    REQUIRE(connection2 != nullptr);
+    connection2->fd = downstream2[0];
+    connection2->upstream_fd = upstream2[0];
+    connection2->upstream_episode = 1;
+    REQUIRE(set_nonblocking(connection2->fd));
+    REQUIRE(set_nonblocking(connection2->upstream_fd));
+    auto& owner2 = splice.owners[connection2->id];
+    owner2.active = true;
+    owner2.episode = connection2->upstream_episode;
+    ++connection2->pending_ops;
+    for (u32 direction = 0; direction < 2; ++direction) {
+        int fds[2];
+        REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+        owner2.direction[direction].read_fd = fds[0];
+        owner2.direction[direction].write_fd = fds[1];
+    }
+    splice.enqueue(connection2->id);
+    splice.begin_turn(loop);
+    const u64 before = splice.calls;
+    splice.pump_async(loop, *connection, 0);
+    CHECK_EQ(splice.calls, before);
+    CHECK(splice.queue_budget_yielded);
+    CHECK(splice.owners[connection->id].budget_deferred);
+    CHECK_FALSE(loop.should_wait_for_event());
+    splice.progress(loop);
+    CHECK_EQ(splice.queued_count, 2u);
+    CHECK(splice.owners[connection->id].budget_deferred);
+    CHECK(splice.owners[connection2->id].budget_deferred);
+    CHECK_FALSE(loop.should_wait_for_event());
+
+    flags = 0;
+    tail = head;
+    splice.begin_turn(loop);
+    splice.progress(loop);
+    CHECK(splice.calls >= before + 2);
+    CHECK(splice.owners[connection->id].direction[0].splice_inflight);
+    CHECK(splice.owners[connection2->id].direction[0].splice_inflight);
+    loop.backend.cq_head = saved_head;
+    loop.backend.cq_tail = saved_tail;
+    loop.backend.sq_flags = saved_flags;
+    loop.study_http_taskrun_yield = false;
+    loop.close_conn(*connection);
+    loop.close_conn(*connection2);
+    for (u32 i = 0; i < 1000 && (connection->pending_ops != 0 || connection2->pending_ops != 0);
+         ++i) {
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    CHECK_EQ(connection->pending_ops, 0u);
+    CHECK_EQ(connection2->pending_ops, 0u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
+}
+
+TEST(ws, async_splice_queue_budget_submits_linked_work_for_more_than_eight_owners) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+    if (!loop.backend.splice_supported) return;
+    auto& splice = loop.ws_splice;
+    splice.asynchronous = true;
+    splice.linked = true;
+    splice.async_queue_budget = true;
+    splice.call_budget = 1;
+    constexpr u32 kOwners = 10;
+    Connection* connections[kOwners]{};
+    Peer clients[kOwners], origins[kOwners];
+    for (u32 i = 0; i < kOwners; ++i) {
+        int downstream[2], upstream[2];
+        REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        clients[i].fd = downstream[1];
+        origins[i].fd = upstream[1];
+        connections[i] = loop.alloc_conn();
+        REQUIRE(connections[i] != nullptr);
+        auto& connection = *connections[i];
+        connection.fd = downstream[0];
+        connection.upstream_fd = upstream[0];
+        connection.upstream_episode = 1;
+        REQUIRE(set_nonblocking(connection.fd));
+        REQUIRE(set_nonblocking(connection.upstream_fd));
+        auto& owner = splice.owners[connection.id];
+        owner.active = true;
+        owner.episode = connection.upstream_episode;
+        ++connection.pending_ops;
+        for (u32 direction = 0; direction < 2; ++direction) {
+            int fds[2];
+            REQUIRE_EQ(pipe2(fds, O_NONBLOCK | O_CLOEXEC), 0);
+            owner.direction[direction].read_fd = fds[0];
+            owner.direction[direction].write_fd = fds[1];
+        }
+        splice.enqueue(connection.id);
+    }
+
+    splice.begin_turn(loop);
+    REQUIRE(splice.turn_call_limit >= 2u * kOwners * 2u);
+    const u64 calls_before = splice.calls;
+    splice.progress(loop);
+    CHECK_EQ(splice.calls - calls_before, 4u * kOwners);
+    CHECK(splice.calls - calls_before <= splice.turn_call_limit);
+    for (u32 i = 0; i < kOwners; ++i) {
+        const auto& owner = splice.owners[connections[i]->id];
+        CHECK(owner.direction[0].pair_active);
+        CHECK(owner.direction[1].pair_active);
+    }
+
+    for (u32 i = 0; i < kOwners; ++i) loop.close_conn(*connections[i]);
+    bool pending = true;
+    for (u32 i = 0; i < 1000 && pending; ++i) {
+        pending = false;
+        for (u32 j = 0; j < kOwners; ++j) pending = pending || connections[j]->pending_ops != 0;
+        if (!pending) break;
+        IoEvent events[kMaxEventsPerWait]{};
+        const u32 count =
+            loop.backend.wait(events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+        loop.dispatch_batch(events, count);
+        if (count == 0) usleep(1000);
+    }
+    for (u32 i = 0; i < kOwners; ++i) CHECK_EQ(connections[i]->pending_ops, 0u);
+    CHECK_EQ(loop.backend.failure_code(), 0);
 }
 
 int main(int argc, char** argv) {

@@ -1049,6 +1049,16 @@ public:
                       static_cast<unsigned long long>(backend.ws_recv_cache_deferred),
                       static_cast<unsigned long long>(backend.ws_recv_cache_peak),
                       backend.ws_recv_cache_count);
+        if (ws_splice.enabled) {
+            const bool queue_budget_effective =
+                ws_splice.async_queue_budget && ws_splice.asynchronous && backend.splice_supported;
+            ::fprintf(stderr,
+                      "RUT_WS_QUEUE_BUDGET mode=%s sq_entries=%u effective_calls=%u yields=%llu\n",
+                      queue_budget_effective ? "on" : "off",
+                      backend.sq_ring_entries,
+                      queue_budget_effective ? backend.sq_ring_entries : ws_splice.call_budget,
+                      static_cast<unsigned long long>(ws_splice.queue_budget_yields));
+        }
         backend.shutdown();
         if (ws_splice.enabled)
             ::fprintf(stderr,
@@ -7952,7 +7962,7 @@ public:
     // same-batch arbitration tests.
     void dispatch_batch(const IoEvent* events, u32 count) {
         study_turn_started_ns = monotonic_ns();
-        if (ws_splice.enabled) ws_splice.begin_turn();
+        if (ws_splice.enabled) ws_splice.begin_turn(*this);
         study_inside_cq = true;
         if (count > kMaxEventsPerWait) count = kMaxEventsPerWait;
         prepare_response_read_deadline_batch(events, count);
@@ -8383,7 +8393,7 @@ public:
             // complete conn ledger drains, independently of pipe retirement.
             if (c.relay_owner.close_pending && relay_async_operation[c.id] != 0)
                 relay_async_retiring_client[c.id] = static_cast<u32>(c.fd) + 1;
-            else
+            else if (!ws_splice.enabled || ws_splice.owners[c.id].retiring_client != c.fd)
                 ::close(c.fd);
             c.fd = -1;
         }
@@ -8391,7 +8401,8 @@ public:
             if (c.relay_owner.close_pending && c.relay_owner.read_armed &&
                 relay_async_operation[c.id] != 0 && c.upstream_fd == c.relay_owner.source_fd)
                 relay_async_source_retiring[c.id] = 1;
-            else
+            else if (!ws_splice.enabled ||
+                     ws_splice.owners[c.id].retiring_upstream != c.upstream_fd)
                 ::close(c.upstream_fd);
             c.upstream_fd = -1;
         }

@@ -27,6 +27,75 @@ CASES = [
 ]
 
 
+def positive_nofile_limit(value):
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def add_nofile_argument(parser):
+    parser.add_argument(
+        "--nofile",
+        type=positive_nofile_limit,
+        default=None,
+        metavar="SOFT_LIMIT",
+        help="set RLIMIT_NOFILE soft limit for Rut frontend children only",
+    )
+
+
+def set_child_nofile_soft_limit(soft_limit):
+    current_soft, current_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit < 1 or (current_hard != resource.RLIM_INFINITY and soft_limit > current_hard):
+        raise ValueError("requested nofile soft limit exceeds the inherited hard limit")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, current_hard))
+
+
+def inherited_nofile_limits():
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    return {"soft": "unlimited" if soft == resource.RLIM_INFINITY else soft,
+            "hard": "unlimited" if hard == resource.RLIM_INFINITY else hard}
+
+
+def process_nofile_limits(pid):
+    def parse_limit(value):
+        return "unlimited" if value == "unlimited" else int(value)
+
+    try:
+        for line in Path(f"/proc/{pid}/limits").read_text().splitlines():
+            if line.startswith("Max open files"):
+                fields = line.split()
+                return {"soft": parse_limit(fields[3]), "hard": parse_limit(fields[4])}
+    except (OSError, IndexError, ValueError):
+        pass
+    return None
+
+
+def ws_splice_diagnostics(log_path):
+    records = []
+    try:
+        lines = log_path.read_text().splitlines()
+    except OSError:
+        return records
+    for line in lines:
+        if not line.startswith("RUT_WS_SPLICE "):
+            continue
+        record = {}
+        for field in line.split()[1:]:
+            key, separator, value = field.partition("=")
+            if not separator:
+                continue
+            try:
+                record[key] = int(value)
+            except ValueError:
+                record[key] = value
+        records.append(record)
+    return records
+
+
 def ready(port, process, log, workers=0):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -44,9 +113,13 @@ def ready(port, process, log, workers=0):
 
 
 @contextlib.contextmanager
-def process(argv, log, env=None):
+def process(argv, log, env=None, nofile_soft_limit=None):
     with log.open('w') as handle:
-        child = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT, env=env)
+        preexec_fn = None
+        if nofile_soft_limit is not None:
+            preexec_fn = lambda: set_child_nofile_soft_limit(nofile_soft_limit)
+        child = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT, env=env,
+                                 preexec_fn=preexec_fn)
         try:
             yield child
         finally:
@@ -176,9 +249,15 @@ def main():
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--policies', nargs='+', choices=['latency', 'balanced', 'current'])
     parser.add_argument('--engines', nargs='+', choices=['direct-origin', 'uring', 'epoll', 'nginx'])
+    add_nofile_argument(parser)
     args = parser.parse_args()
     if args.connections_per_client < 1 or args.repeats < 1:
         parser.error('connections and repeats must be positive')
+    inherited_limits = inherited_nofile_limits()
+    if args.nofile is not None:
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        if hard != resource.RLIM_INFINITY and args.nofile > hard:
+            parser.error('--nofile cannot exceed the inherited hard limit')
     out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
     spec = importlib.util.spec_from_file_location('runtime_benchmark', args.harness)
     harness = importlib.util.module_from_spec(spec); spec.loader.exec_module(harness)
@@ -188,6 +267,9 @@ def main():
                     tcpkali2_sha256=hashlib.sha256(args.tcpkali2.read_bytes()).hexdigest() if args.tcpkali2 else None,
                     rut_sha256=hashlib.sha256(args.rut.read_bytes()).hexdigest(), nginx_image=image,
                     fixture_sha256=hashlib.sha256(args.fixture.read_bytes()).hexdigest(),
+                    frontend_nofile_requested_soft=args.nofile,
+                    frontend_nofile_inherited_limits=inherited_limits,
+                    frontend_nofile_scope='Rut frontend subprocess only; None means inherited unchanged',
                     ws_recv_mode=os.environ.get('RUT_STUDY_WS_RECV', 'once'),
                     nginx_keepalive_requests=1000000, nginx_buffer_kib=args.nginx_buffer_kib,
                     ws_splice_mode=os.environ.get('RUT_STUDY_WS_SPLICE', 'off'),
@@ -253,6 +335,12 @@ def main():
                     row = json.loads(result_file.read_text())
                     if not row['valid'] or not all(key in row for key in ['case', 'engine', 'policy', 'repeat']):
                         raise RuntimeError('preserved invalid or incomplete case: ' + label)
+                    if engine in ('uring', 'epoll') and not all(
+                            key in row for key in ('frontend_nofile_limits',
+                                                   'ws_splice_diagnostics',
+                                                   'ws_splice_admissions_total',
+                                                   'ws_splice_calls_total')):
+                        raise RuntimeError('preserved case lacks frontend limit or shutdown diagnostics: ' + label)
                     rows.append(row)
                     continue
                 if directory.exists():
@@ -309,9 +397,18 @@ def main():
                             command = ['taskset', '-c', '2', str(args.rut.resolve()), str(program),
                                        '--backend', backend, '--shards', '1', '--no-pin', '--drain', '0']
                             frontend_log = directory / 'frontend.log'
-                            frontend = stack.enter_context(process(command, frontend_log,
-                                                                   dict(env, RUT_STUDY_POLICY=policy)))
+                            frontend = stack.enter_context(process(
+                                command, frontend_log, dict(env, RUT_STUDY_POLICY=policy),
+                                nofile_soft_limit=args.nofile))
                             ready(front_port, frontend, frontend_log)
+                            frontend_nofile = process_nofile_limits(frontend.pid)
+                            if args.nofile is not None and (
+                                    frontend_nofile is None or
+                                    frontend_nofile['soft'] != args.nofile):
+                                raise RuntimeError(
+                                    f'Rut frontend nofile soft limit mismatch: requested {args.nofile}, '
+                                    f'observed {frontend_nofile}'
+                                )
                             startup_deadline = time.monotonic() + 30
                             log = frontend_log.read_text()
                             while 'Listening on port' not in log:
@@ -358,6 +455,7 @@ def main():
                         origin_after, _ = harness.proc_usage(origin.pid)
                         usage_seconds = time.monotonic() - usage_started
                         row = json.loads(result_file.read_text())
+                        result_file.unlink()
                         row.update(case=case, engine=engine, policy=policy, repeat=repeat,
                                    ws_recv_mode=manifest['ws_recv_mode'] if engine == 'uring' else None,
                                    ws_splice_mode=manifest['ws_splice_mode'] if engine == 'uring' else None,
@@ -366,8 +464,25 @@ def main():
                                    cpu_observation_seconds=usage_seconds,
                                    frontend_cpu_pct=100 * (after - before) / usage_seconds,
                                    origin_cpu_pct=100 * (origin_after - origin_before) / usage_seconds)
-                        result_file.write_text(json.dumps(row, indent=2) + '\n')
-                rows.append(row)
+                    if engine in ('uring', 'epoll'):
+                        diagnostics = ws_splice_diagnostics(frontend_log)
+                        row['frontend_nofile_limits'] = frontend_nofile
+                        row['ws_splice_diagnostics'] = diagnostics
+                        row['ws_splice_admissions_total'] = (
+                            sum(item.get('admissions', 0) for item in diagnostics)
+                            if diagnostics else None
+                        )
+                        row['ws_splice_calls_total'] = (
+                            sum(item.get('calls', 0) for item in diagnostics)
+                            if diagnostics else None
+                        )
+                        row['ws_splice_admission_scope'] = (
+                            'cumulative successful splice-owner admissions since process startup '
+                            '(includes preflight/setup); not simultaneous active tunnels or a '
+                            'direct fallback counter'
+                        )
+                    result_file.write_text(json.dumps(row, indent=2) + '\n')
+                    rows.append(row)
                 (out / 'measurements.json').write_text(json.dumps(rows, indent=2) + '\n')
                 (out / 'summary.json').write_text(json.dumps(summarize(rows), indent=2) + '\n')
                 print(f'END {label}: {row["messages_per_second"]:.0f} messages/chunks per second, '

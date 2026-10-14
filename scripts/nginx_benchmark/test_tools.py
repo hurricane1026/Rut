@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import resource
 import signal
 import socket
 import subprocess
@@ -22,6 +23,7 @@ import run
 import matrix
 import workload_strategy
 import protocol_workload
+import protocol_strategy
 import relay_compare
 import paced_http_client
 
@@ -52,6 +54,58 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_protocol_strategy_nofile_cli_and_child_limit_preserve_hard_limit(self):
+        parser = argparse.ArgumentParser()
+        protocol_strategy.add_nofile_argument(parser)
+        self.assertIsNone(parser.parse_args([]).nofile)
+        self.assertEqual(parser.parse_args(["--nofile", "8192"]).nofile, 8192)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--nofile", "0"])
+
+        with mock.patch.object(protocol_strategy.resource, "getrlimit",
+                                return_value=(1024, 524288)), \
+                mock.patch.object(protocol_strategy.resource, "setrlimit") as setrlimit:
+            protocol_strategy.set_child_nofile_soft_limit(8192)
+        setrlimit.assert_called_once_with(protocol_strategy.resource.RLIMIT_NOFILE,
+                                          (8192, 524288))
+
+        with mock.patch.object(protocol_strategy.resource, "getrlimit",
+                               return_value=(1024, 4096)), \
+                mock.patch.object(protocol_strategy.resource, "setrlimit") as setrlimit:
+            with self.assertRaisesRegex(ValueError, "hard limit"):
+                protocol_strategy.set_child_nofile_soft_limit(8192)
+        setrlimit.assert_not_called()
+
+    def test_protocol_strategy_nofile_limit_is_confined_to_child(self):
+        parent_limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+        requested = 256
+        if (parent_limits[0] != resource.RLIM_INFINITY and parent_limits[0] < requested) or \
+                (parent_limits[1] != resource.RLIM_INFINITY and parent_limits[1] < requested):
+            self.skipTest("inherited nofile limit is below the child test value")
+        with tempfile.TemporaryDirectory() as directory:
+            with protocol_strategy.process(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    Path(directory) / "child.log", nofile_soft_limit=requested) as child:
+                child_limits = protocol_strategy.process_nofile_limits(child.pid)
+                self.assertEqual(child_limits, {"soft": requested, "hard": (
+                    "unlimited" if parent_limits[1] == resource.RLIM_INFINITY else parent_limits[1])})
+        self.assertEqual(resource.getrlimit(resource.RLIMIT_NOFILE), parent_limits)
+
+    def test_protocol_strategy_parses_shutdown_ws_admission_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "frontend.log"
+            log.write_text("RUT_WS_SPLICE admissions=159 client_bytes=8 upstream_bytes=9 "
+                           "calls=42 polls=3 pipe_grow_failures=1 min_pipe_capacity=65536\n")
+            self.assertEqual(protocol_strategy.ws_splice_diagnostics(log), [{
+                "admissions": 159,
+                "client_bytes": 8,
+                "upstream_bytes": 9,
+                "calls": 42,
+                "polls": 3,
+                "pipe_grow_failures": 1,
+                "min_pipe_capacity": 65536,
+            }])
+
     def test_api_origin_smoke_and_reuse_policy(self):
         cpu = str(min(os.sched_getaffinity(0)))
         with tempfile.TemporaryDirectory() as directory:

@@ -332,7 +332,8 @@ struct IoUringBackend {
                           IoEventType type,
                           u32 upstream_episode,
                           u32 length,
-                          bool more = false);
+                          bool more = false,
+                          u8 auxiliary = 4);
     bool add_relay_splice_pair(i32 source_fd,
                                i32 pipe_write_fd,
                                i32 pipe_read_fd,
@@ -341,7 +342,8 @@ struct IoUringBackend {
                                u32 upstream_episode,
                                u32 length,
                                bool more = false,
-                               bool hardlink = false);
+                               bool hardlink = false,
+                               u8 auxiliary = 4);
     bool add_relay_poll(
         i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode, u8 auxiliary = 0);
     // Dedicated single submission point for the bounded explicit

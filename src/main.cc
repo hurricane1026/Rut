@@ -453,6 +453,13 @@ static bool configure_study_policy(Loop* loop) {
                     loop->study_ws_direct_recv_limit = 4096;
                 if (str_eq(*item, "RUT_STUDY_WS_DIRECT_RECV=16k"))
                     loop->study_ws_direct_recv_limit = 16384;
+                if (str_eq(*item, "RUT_STUDY_WS_ASYNC_SPLICE=on"))
+                    loop->ws_splice.asynchronous = true;
+                if (str_eq(*item, "RUT_STUDY_WS_POLL_NEXT_READ=on"))
+                    loop->ws_splice.poll_next_read = true;
+                if (str_eq(*item, "RUT_STUDY_WS_LINKED_SPLICE=on")) loop->ws_splice.linked = true;
+                if (str_eq(*item, "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET=on"))
+                    loop->ws_splice.async_queue_budget = true;
                 if (str_eq(*item, "RUT_STUDY_WS_FAST_BATCH=on")) loop->ws_splice.fast_batch = true;
                 if (str_eq(*item, "RUT_STUDY_WS_FAST_SCAN=on")) loop->ws_splice.fast_scan = true;
                 if (str_eq(*item, "RUT_STUDY_WS_AVAILABLE=on"))
@@ -463,8 +470,23 @@ static bool configure_study_policy(Loop* loop) {
                 if (str_eq(*item, "RUT_STUDY_WS_SEGMENT=128k")) loop->ws_splice.chunk_size = 131072;
                 if (str_eq(*item, "RUT_STUDY_WS_CALLS=2")) loop->ws_splice.call_budget = 2;
                 if (str_eq(*item, "RUT_STUDY_WS_CALLS=16")) loop->ws_splice.call_budget = 16;
+                if (str_eq(*item, "RUT_STUDY_WS_CALLS=64")) loop->ws_splice.call_budget = 64;
             }
             if (report_study) {
+                write_str(loop->ws_splice.asynchronous && loop->backend.splice_supported
+                              ? "RUT_STUDY_WS_ASYNC_SPLICE mode=on\n"
+                              : "RUT_STUDY_WS_ASYNC_SPLICE mode=off\n");
+                const bool ws_queue_budget_effective = loop->ws_splice.async_queue_budget &&
+                                                       loop->ws_splice.asynchronous &&
+                                                       loop->backend.splice_supported;
+                write_str(ws_queue_budget_effective
+                              ? "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET mode=on sq_entries="
+                              : "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET mode=off sq_entries=");
+                write_u32(loop->backend.sq_ring_entries);
+                write_str(" effective_calls=");
+                write_u32(ws_queue_budget_effective ? loop->backend.sq_ring_entries
+                                                    : loop->ws_splice.call_budget);
+                write_str("\n");
                 write_str(loop->ws_splice.copy_first ? "RUT_STUDY_WS_COPY mode=on\n"
                                                      : "RUT_STUDY_WS_COPY mode=off\n");
                 write_str(loop->ws_splice.check_available ? "RUT_STUDY_WS_AVAILABLE mode=on\n"

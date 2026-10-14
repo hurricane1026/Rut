@@ -23,9 +23,14 @@ struct WsSpliceExperiment {
         // cancellation state until that poll retires, so it is never canceled twice.
         bool cancel_acknowledged = false;
         bool copying = false, probe_copy = true;
+        bool splice_inflight = false;
+        bool pair_active = false;
+        u8 pair_pending = 0, pair_cancel_owned = 0, pair_cancel_acknowledged = 0;
+        i32 pair_read_result = 0, pair_write_result = 0;
     };
     struct Owner {
         Direction direction[2];
+        i32 retiring_client = -1, retiring_upstream = -1;
         u32 episode = 0;
         u8 next_direction = 0;
         // Diagnostic storage is unconditional to keep Owner layout identical
@@ -44,6 +49,12 @@ struct WsSpliceExperiment {
     bool turn_budget_active = false;
     bool budget_deferred_runnable = false;
     u32 admission_budget_remaining = 0;
+    bool asynchronous = false, linked = false, poll_next_read = false;
+    bool async_queue_budget = false;
+    u32 turn_call_limit = 8;
+    u64 ordinary_since_ns = 0;
+    u64 queue_budget_yields = 0;
+    bool queue_budget_yielded = false;
     bool enabled = false, copy_first = false, check_available = false, fast_batch = false;
     bool fast_scan = false, last_batch_ws_only = false;
     u64 deadline_batches_skipped = 0, terminal_scans_skipped = 0;
@@ -62,10 +73,42 @@ struct WsSpliceExperiment {
         budget_deferred_runnable = false;
         return true;
     }
-    void begin_turn() {
-        turn_budget_remaining = call_budget;
+    template <class Loop>
+    void begin_turn(Loop& loop) {
+        turn_call_limit = async_queue_budget && asynchronous && loop.backend.splice_supported
+                              ? loop.backend.sq_ring_entries
+                              : call_budget;
+        turn_budget_remaining = turn_call_limit;
         admission_budget_remaining = 1;
         turn_budget_active = true;
+        ordinary_since_ns = async_queue_budget && asynchronous && loop.backend.splice_supported &&
+                                    loop.has_ordinary_cq_work()
+                                ? monotonic_ns()
+                                : 0;
+        queue_budget_yielded = false;
+    }
+
+    template <class Loop>
+    bool yield_for_ordinary_cq(Loop& loop, u32 id) {
+        if (!async_queue_budget || !asynchronous || !loop.backend.splice_supported) return false;
+        if (queue_budget_yielded) {
+            set_budget_deferred(id, true);
+            enqueue(id);
+            return true;
+        }
+        if (!loop.has_ordinary_cq_work()) {
+            ordinary_since_ns = 0;
+            return false;
+        }
+        const u64 now = monotonic_ns();
+        if (ordinary_since_ns == 0) ordinary_since_ns = now;
+        if (now - ordinary_since_ns < loop.ordinary_cq_wait_limit_ns) return false;
+        queue_budget_yielded = true;
+        ++queue_budget_yields;
+        turn_budget_remaining = 0;
+        set_budget_deferred(id, true);
+        enqueue(id);
+        return true;
     }
     void enqueue(u32 id) {
         if (!owners[id].queued) {
@@ -99,6 +142,9 @@ struct WsSpliceExperiment {
         return id;
     }
     static void close_pipes(Owner& owner) {
+        if (owner.retiring_client >= 0) ::close(owner.retiring_client);
+        if (owner.retiring_upstream >= 0) ::close(owner.retiring_upstream);
+        owner.retiring_client = owner.retiring_upstream = -1;
         for (auto& d : owner.direction) {
             if (d.read_fd >= 0) ::close(d.read_fd);
             if (d.write_fd >= 0) ::close(d.write_fd);
@@ -204,8 +250,88 @@ struct WsSpliceExperiment {
         o.eof_closing = false;
         loop.close_conn(c);
     }
+    // One outstanding splice, linked pair, or readiness poll per direction. A pipe is kept
+    // alive until both its target CQE and any cancel CQE have retired.
+    template <class Loop>
+    void pump_async(Loop& loop, Connection& c, u32 index) {
+        auto& o = owners[c.id];
+        auto& d = o.direction[index];
+        if (!o.active || o.closing || d.armed || d.cancel_owned || d.cancel_acknowledged ||
+            d.pair_active)
+            return;
+        if (d.eof && d.buffered == 0) {
+            if (o.direction[index ^ 1u].eof && o.direction[index ^ 1u].buffered == 0)
+                loop.close_conn(c);
+            return;
+        }
+        if (yield_for_ordinary_cq(loop, c.id)) return;
+        if (turn_budget_remaining == 0) {
+            set_budget_deferred(c.id, true);
+            enqueue(c.id);
+            return;
+        }
+        const bool writing = d.buffered != 0;
+        const i32 source = index == 0 ? c.fd : c.upstream_fd;
+        const i32 destination = index == 0 ? c.upstream_fd : c.fd;
+        if (linked && !writing && turn_budget_remaining >= 2) {
+            // A hard link preserves the write after a short read. Each direction
+            // owns an empty private pipe, so the write cannot consume more than
+            // this read actually produced. Account only after both CQEs arrive.
+            if (!loop.backend.add_relay_splice_pair(source,
+                                                    d.write_fd,
+                                                    d.read_fd,
+                                                    destination,
+                                                    c.id,
+                                                    o.episode,
+                                                    chunk_size,
+                                                    false,
+                                                    true,
+                                                    static_cast<u8>(32 + index))) {
+                loop.close_conn(c);
+                return;
+            }
+            turn_budget_remaining -= 2;
+            calls += 2;
+            ++read_calls[index];
+            d.pair_active = true;
+            d.pair_pending = 3;
+            d.pair_read_result = d.pair_write_result = 0;
+            c.pending_ops += 2;
+            if (turn_budget_remaining == 0) {
+                set_budget_deferred(c.id, true);
+                enqueue(c.id);
+            }
+            return;
+        }
+        if (!loop.backend.add_relay_splice(
+                writing ? d.read_fd : source,
+                writing ? destination : d.write_fd,
+                c.id,
+                writing ? IoEventType::RelayWrite : IoEventType::RelayRead,
+                o.episode,
+                writing ? d.buffered : chunk_size,
+                false,
+                static_cast<u8>(32 + index))) {
+            loop.close_conn(c);
+            return;
+        }
+        --turn_budget_remaining;
+        ++calls;
+        if (!writing) ++read_calls[index];
+        d.writing = writing;
+        d.splice_inflight = d.armed = true;
+        ++c.pending_ops;
+        if (turn_budget_remaining == 0) {
+            set_budget_deferred(c.id, true);
+            enqueue(c.id);
+        }
+    }
     template <class Loop>
     void pump(Loop& loop, Connection& c, u32 index) {
+        if (asynchronous && loop.backend.splice_supported) {
+            pump_async(loop, c, index);
+            return;
+        }
         auto& o = owners[c.id];
         auto& d = o.direction[index];
         if (!o.active || o.closing || d.armed || d.cancel_owned || d.cancel_acknowledged) return;
@@ -416,7 +542,12 @@ struct WsSpliceExperiment {
         o.closing = true;
         o.requested = false;
         o.active = false;
-        close_pipes(o);
+        if (asynchronous && (o.direction[0].armed || o.direction[1].armed ||
+                             o.direction[0].pair_active || o.direction[1].pair_active)) {
+            o.retiring_client = c.fd;
+            o.retiring_upstream = c.upstream_fd;
+        }
+        if (!asynchronous) close_pipes(o);
         enqueue(c.id);
         retire(loop, c);
     }
@@ -427,6 +558,34 @@ struct WsSpliceExperiment {
         bool pending = false;
         for (u32 index = 0; index < 2; ++index) {
             auto& d = o.direction[index];
+            if (d.pair_active) {
+                for (u8 side = 0; side < 2; ++side) {
+                    const u8 bit = static_cast<u8>(1u << side);
+                    if (!(d.pair_pending & bit) || (d.pair_cancel_owned & bit) ||
+                        (d.pair_cancel_acknowledged & bit))
+                        continue;
+                    const auto type = side == 0 ? IoEventType::RelayRead : IoEventType::RelayWrite;
+                    const u64 target = encode_upstream_event_token(
+                        {c.id, type, o.episode, static_cast<u8>(32 + index)});
+                    bool submitted = false;
+#ifdef RUT_TESTING
+                    if (!loop.test_consume_ws_splice_cancel_failure())
+#endif
+                        submitted = loop.backend.cancel_ws_splice_poll(
+                            target, c.id, type, static_cast<u8>(96 + index), o.episode);
+                    if (submitted) {
+                        d.pair_cancel_owned |= bit;
+                        ++c.pending_ops;
+                    } else {
+                        set_budget_deferred(c.id, true);
+                        enqueue(c.id);
+                    }
+                }
+                const bool pair_pending =
+                    d.pair_pending || d.pair_cancel_owned || d.pair_cancel_acknowledged;
+                pending = pending || pair_pending;
+                if (!pair_pending) d.pair_active = false;
+            }
             if (d.armed && !d.cancel_owned && !d.cancel_acknowledged) {
                 const auto kType = d.writing ? IoEventType::RelayWrite : IoEventType::RelayRead;
                 const u64 kTarget = encode_upstream_event_token(
@@ -448,6 +607,7 @@ struct WsSpliceExperiment {
             pending = pending || d.armed || d.cancel_owned || d.cancel_acknowledged;
         }
         if (!pending) {
+            close_pipes(o);
             o.closing = false;
             if (c.pending_ops == 0)
                 loop.backend.fatal_error.store(EPROTO);
@@ -463,6 +623,68 @@ struct WsSpliceExperiment {
         }
     }
     template <class Loop>
+    void dispatch_pair(Loop& loop, Connection& c, const IoEvent& ev, u32 index, bool cancel) {
+        auto& o = owners[c.id];
+        auto& d = o.direction[index];
+        const u8 bit = ev.type == IoEventType::RelayRead ? 1 : 2;
+        if (!((cancel ? d.pair_cancel_owned : d.pair_pending) & bit)) return;
+        if (c.pending_ops == 0 || ev.more || ev.has_buf) {
+            loop.backend.fatal_error.store(EPROTO);
+            return;
+        }
+        --c.pending_ops;
+        if (cancel) {
+            d.pair_cancel_owned &= static_cast<u8>(~bit);
+            if (d.pair_pending & bit) d.pair_cancel_acknowledged |= bit;
+        } else {
+            d.pair_pending &= static_cast<u8>(~bit);
+            d.pair_cancel_acknowledged &= static_cast<u8>(~bit);
+            if (bit == 1)
+                d.pair_read_result = ev.result;
+            else
+                d.pair_write_result = ev.result;
+        }
+        if (o.closing) {
+            retire(loop, c);
+            return;
+        }
+        if (d.pair_pending || d.pair_cancel_owned || d.pair_cancel_acknowledged) return;
+        d.pair_active = false;
+        const i32 read = d.pair_read_result, written = d.pair_write_result;
+        const bool write_empty = written == -EAGAIN || written == -EWOULDBLOCK || written == 0;
+        if (read < 0) {
+            if ((read == -EAGAIN || read == -EWOULDBLOCK || read == -EINTR) && write_empty) {
+                if (!arm(loop, c, index, false)) loop.close_conn(c);
+            } else
+                loop.close_conn(c);
+            return;
+        }
+        if (read == 0) {
+            if (!write_empty) {
+                loop.close_conn(c);
+                return;
+            }
+            d.eof = true;
+            (void)::shutdown(index == 0 ? c.upstream_fd : c.fd, SHUT_WR);
+            pump(loop, c, index);
+            return;
+        }
+        if (static_cast<u32>(read) > chunk_size || written > read || written == 0 ||
+            (written < 0 && written != -EAGAIN && written != -EWOULDBLOCK && written != -EINTR)) {
+            loop.close_conn(c);
+            return;
+        }
+        const u32 sent = written > 0 ? static_cast<u32>(written) : 0;
+        d.buffered = static_cast<u32>(read) - sent;
+        transferred[index] += sent;
+        if (written == -EAGAIN || written == -EWOULDBLOCK) {
+            if (!arm(loop, c, index, true)) loop.close_conn(c);
+        } else if (poll_next_read && d.buffered == 0) {
+            if (!arm(loop, c, index, false)) loop.close_conn(c);
+        } else
+            pump(loop, c, index);
+    }
+    template <class Loop>
     bool dispatch(Loop& loop, const IoEvent& ev) {
         if ((ev.type != IoEventType::RelayRead && ev.type != IoEventType::RelayWrite) ||
             (ev.aux != 32 && ev.aux != 33 && ev.aux != 96 && ev.aux != 97))
@@ -473,6 +695,11 @@ struct WsSpliceExperiment {
         const bool kCancel = ev.aux >= 96;
         const u32 kIndex = ev.aux - (kCancel ? 96 : 32);
         auto& d = o.direction[kIndex];
+        if (ev.upstream_episode != o.episode) return true;
+        if (d.pair_active) {
+            dispatch_pair(loop, c, ev, kIndex, kCancel);
+            return true;
+        }
         if (ev.upstream_episode != o.episode || (ev.type == IoEventType::RelayWrite) != d.writing ||
             !(kCancel ? d.cancel_owned : d.armed))
             return true;
@@ -480,6 +707,8 @@ struct WsSpliceExperiment {
             loop.backend.fatal_error.store(EPROTO);
             return true;
         }
+        const bool completed_splice = !kCancel && d.splice_inflight;
+        if (!kCancel) d.splice_inflight = false;
         --c.pending_ops;
         if (kCancel) {
             d.cancel_owned = false;
@@ -500,18 +729,49 @@ struct WsSpliceExperiment {
             return true;
         }
         if (c.fd < 0) return true;
-        if (ev.result < 0) {
+        if (completed_splice) {
+            if (ev.result == -EAGAIN || ev.result == -EWOULDBLOCK) {
+                ++eagain[d.writing ? 1 : 0];
+                if (!arm(loop, c, kIndex, d.writing)) loop.close_conn(c);
+                return true;
+            }
+            if (ev.result == -EINTR) {
+                pump(loop, c, kIndex);
+                return true;
+            }
+            if (ev.result < 0 || (d.writing && ev.result == 0)) {
+                loop.close_conn(c);
+                return true;
+            }
+            if (d.writing) {
+                if (static_cast<u32>(ev.result) > d.buffered) {
+                    loop.backend.fatal_error.store(EPROTO);
+                    loop.close_conn(c);
+                    return true;
+                }
+                d.buffered -= static_cast<u32>(ev.result);
+                transferred[kIndex] += static_cast<u32>(ev.result);
+            } else if (ev.result == 0) {
+                d.eof = true;
+                (void)::shutdown(kIndex == 0 ? c.upstream_fd : c.fd, SHUT_WR);
+            } else {
+                d.buffered = static_cast<u32>(ev.result);
+            }
+        } else if (ev.result < 0) {
             loop.close_conn(c);
             return true;
         }
-        pump(loop, c, kIndex);
+        if (completed_splice && d.writing && d.buffered == 0 && !d.eof && poll_next_read) {
+            if (!arm(loop, c, kIndex, false)) loop.close_conn(c);
+        } else
+            pump(loop, c, kIndex);
         return true;
     }
     template <class Loop>
     void progress(Loop& loop) {
         budget_deferred_runnable = false;
-        if (!turn_budget_active) begin_turn();
-        const u32 kOwnersToVisit = queued_count < call_budget ? queued_count : call_budget;
+        if (!turn_budget_active) begin_turn(loop);
+        const u32 kOwnersToVisit = queued_count < turn_call_limit ? queued_count : turn_call_limit;
         for (u32 i = 0; i < kOwnersToVisit; ++i) {
             const u32 kId = dequeue();
             auto& c = loop.conns[kId];
@@ -539,6 +799,7 @@ struct WsSpliceExperiment {
                 continue;
             }
             if (o.active) {
+                if (yield_for_ordinary_cq(loop, kId)) continue;
                 if (turn_budget_remaining == 0) {
                     set_budget_deferred(kId, true);
                     enqueue(kId);
