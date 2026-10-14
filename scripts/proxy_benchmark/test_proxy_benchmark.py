@@ -96,8 +96,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
             root = Path(tmp)
             binaries = root / "rps"
             binaries.mkdir()
-            (binaries / "rut").write_bytes(b"runtime /usr/bin/clang /usr/bin/")
-            (binaries / "rut-compile").write_bytes(b"compiler /usr/bin/clang /usr/bin/")
+            (binaries / "rut").write_bytes(b"runtime has no embedded compiler path")
+            (binaries / "rut-compile").write_bytes(b"compiler\0/usr/bin/clang\0/usr/bin/\0")
             config = {
                 "run_id": "test123", "checkpoint": tmp, "node_mount": "/benchmark",
                 "worker_node": "bench-worker", "namespace": "bench",
@@ -167,7 +167,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 (checkpoint / name).mkdir()
             for directory in ("rps", "throughput"):
                 for filename in ("rut", "rut-compile"):
-                    (checkpoint / directory / filename).write_bytes(filename.encode() + b" /usr/bin/clang /usr/bin/")
+                    data = (filename.encode() if filename == "rut" else
+                            b"compiler\0/usr/bin/clang\0/usr/bin/\0")
+                    (checkpoint / directory / filename).write_bytes(data)
             for filename in ("clang", "ld"):
                 (checkpoint / "runtime-tools" / filename).write_bytes(filename.encode())
             output = root / "output"
@@ -188,17 +190,60 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(set(config["input_snapshot"]), {"client_dir", "rut_config_dir", "runtime_libs", "clang", "ld"})
             self.assertEqual(json.loads((output / "native-configmap.json").read_text())["immutable"], True)
 
-    def test_prepare_rejects_a_rut_pair_with_mismatched_embedded_linker_path(self):
+    def test_prepare_checks_only_compiler_nul_strings_and_rejects_mismatched_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, compiler = Path(tmp) / "rut", Path(tmp) / "rut-compile"
-            runtime.write_bytes(b"/opt/llvm/bin/clang-22 /opt/llvm/bin/")
-            compiler.write_bytes(b"/usr/bin/clang /usr/bin/")
-            self.assertFalse(prepare.linker_paths_match(runtime, compiler,
-                                                        "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
-            compiler.write_bytes(runtime.read_bytes())
-            self.assertTrue(prepare.linker_paths_match(runtime, compiler,
-                                                       "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
-            self.assertEqual(prepare.embedded_clang_path(runtime), "/opt/llvm/bin/clang-22")
+            runtime.write_bytes(b"no linker strings in rut")
+            compiler.write_bytes(b"/opt/llvm/bin/clang-22\0/opt/llvm/bin/\0")
+            self.assertTrue(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
+            self.assertEqual(prepare.embedded_clang_path(compiler), "/opt/llvm/bin/clang-22")
+            self.assertFalse(prepare.linker_paths_match(compiler, "/usr/bin/clang", "/usr/bin/"))
+            self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang-22", "/usr/bin/"))
+            self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang", "/opt/llvm/bin/"))
+
+    def test_configmap_immutable_uses_top_level_api_field(self):
+        config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
+                  "kubeconfig": "/tmp/kube", "namespace": "bench",
+                  "configmap_identities": {"native": {"uid": "uid1", "data": {"x": "one"}}}}
+        api_object = {"metadata": {"uid": "uid1"}, "data": {"x": "one"}, "immutable": True}
+        with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(api_object), "")):
+            run_matrix.verify_configmaps(config)
+        api_object["immutable"] = False
+        with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(api_object), "")):
+            with self.assertRaisesRegex(RuntimeError, "ConfigMap identity or data changed"):
+                run_matrix.verify_configmaps(config)
+        self.assertEqual(prepare.applied_configmap_identity(
+            {"metadata": {"uid": "uid2"}, "data": {"x": "one"}, "immutable": True}, {"x": "one"}),
+            {"uid": "uid2", "data": {"x": "one"}})
+        with self.assertRaisesRegex(RuntimeError, "not immutable"):
+            prepare.applied_configmap_identity(
+                {"metadata": {"uid": "uid2", "immutable": True}, "data": {"x": "one"}}, {"x": "one"})
+
+    def test_linkerd_probe_waits_for_pull_records_identity_and_deletes_probe(self):
+        pod = {"spec": {"containers": [{"name": "linkerd-proxy", "image": "proxy:edge"}]},
+               "status": {"containerStatuses": [{"name": "linkerd-proxy", "imageID": "containerd://sha256:cfg"}]}}
+        inventory = {"images": [{"id": "sha256:cfg", "repoTags": ["proxy:edge"], "repoDigests": []}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            probe.write_text("{}")
+            with mock.patch("prepare.run", side_effect=["", "", json.dumps(pod), json.dumps(inventory), ""]) as run:
+                identity = prepare.discover_linkerd_proxy_identity(
+                    ["kubectl", "--kubeconfig", "/kube"], "docker", "worker", probe, "probe", "bench")
+        self.assertEqual(identity["worker_id"], "sha256:cfg")
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn("wait", commands[1])
+        self.assertIn("create", commands[0])
+        self.assertEqual(commands[-1][3:6], ["delete", "pod", "probe"])
+
+    def test_linkerd_probe_deletes_pod_when_readiness_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            probe.write_text("{}")
+            with mock.patch("prepare.run", side_effect=["", RuntimeError("not ready"), ""]) as run:
+                with self.assertRaisesRegex(RuntimeError, "not ready"):
+                    prepare.discover_linkerd_proxy_identity(
+                        ["kubectl"], "docker", "worker", probe, "probe", "bench")
+        self.assertIn("delete", run.call_args_list[-1].args[0])
 
     def test_linkerd_injected_proxy_image_is_taken_from_admitted_pod(self):
         admitted = {"spec": {"containers": [{"name": "origin", "image": "nginx@sha256:abc"},
@@ -221,11 +266,11 @@ class ProxyBenchmarkTests(unittest.TestCase):
         config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
                   "kubeconfig": "/tmp/kube", "namespace": "bench",
                   "configmap_identities": {"native": {"uid": "uid1", "data": {"x": "one"}}}}
-        matching = {"metadata": {"uid": "uid1"}, "data": {"x": "one"}}
+        matching = {"metadata": {"uid": "uid1"}, "data": {"x": "one"}, "immutable": True}
         with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(matching), "")):
             run_matrix.verify_configmaps(config)
-        for changed in ({"metadata": {"uid": "uid2"}, "data": {"x": "one"}},
-                        {"metadata": {"uid": "uid1"}, "data": {"x": "two"}}):
+        for changed in ({"metadata": {"uid": "uid2"}, "data": {"x": "one"}, "immutable": True},
+                        {"metadata": {"uid": "uid1"}, "data": {"x": "two"}, "immutable": True}):
             with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(changed), "")):
                 with self.assertRaisesRegex(RuntimeError, "ConfigMap identity or data changed"):
                     run_matrix.verify_configmaps(config)

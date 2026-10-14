@@ -546,7 +546,8 @@ def verify_configmaps(config: dict) -> None:
         result = invoke([config["tools"]["kubectl"], "--kubeconfig", config["kubeconfig"],
                          "get", "configmap", config["configmaps"][name], "-n", config["namespace"], "-o", "json"])
         actual = json.loads(result.stdout)
-        if actual.get("metadata", {}).get("uid") != identity.get("uid") or actual.get("data") != identity.get("data"):
+        if (actual.get("metadata", {}).get("uid") != identity.get("uid") or
+                actual.get("data") != identity.get("data") or actual.get("immutable") is not True):
             raise RuntimeError(f"ConfigMap identity or data changed for {name}")
 
 

@@ -66,17 +66,20 @@ def worker_image_identities(docker: str, worker: str, identities: dict) -> dict:
     return resolved
 
 
-def linker_paths_match(runtime: Path, compiler: Path, linker_path: str, linker_dir: str) -> bool:
-    expected = (linker_path.encode(), linker_dir.encode())
-    return all(all(token in binary.read_bytes() for token in expected)
-               for binary in (runtime, compiler))
+def nul_strings(path: Path) -> set[str]:
+    return {item.decode("ascii") for item in path.read_bytes().split(b"\0") if item}
 
 
-def embedded_clang_path(runtime: Path) -> str:
-    candidates = sorted({item.decode("ascii") for item in re.findall(
-        rb"/(?:[A-Za-z0-9_.+-]+/)*clang(?:-[0-9]+(?:\.[0-9]+)*)?", runtime.read_bytes())})
+def linker_paths_match(compiler: Path, linker_path: str, linker_dir: str) -> bool:
+    strings = nul_strings(compiler)
+    return linker_path in strings and linker_dir in strings
+
+
+def embedded_clang_path(compiler: Path) -> str:
+    candidates = sorted(item for item in nul_strings(compiler)
+                        if re.fullmatch(r"/(?:[A-Za-z0-9_.+-]+/)*clang(?:-[0-9]+(?:\.[0-9]+)*)?", item))
     if len(candidates) != 1:
-        raise ValueError(f"cannot determine one embedded clang path from {runtime}: {candidates}")
+        raise ValueError(f"cannot determine one embedded clang path from {compiler}: {candidates}")
     return candidates[0]
 
 
@@ -86,6 +89,48 @@ def injected_linkerd_proxy_image(pod: dict) -> str:
     if not proxy or not proxy.get("image"):
         raise ValueError("Linkerd admission did not inject a proxy in the server-side dry run")
     return proxy["image"]
+
+
+def worker_image_status_matches(actual: str, identity: dict) -> bool:
+    actual_id = actual.rsplit("://", 1)[-1]
+    worker_id = identity.get("worker_id", "")
+    if worker_id and (actual_id == worker_id or actual_id.endswith(worker_id)):
+        return True
+    if "@" in actual_id:
+        digest = actual_id.rsplit("@", 1)[-1]
+        return any("@" in reference and reference.rsplit("@", 1)[-1] == digest
+                   for reference in identity.get("worker_repo_digests", []))
+    return False
+
+
+def applied_configmap_identity(actual: dict, expected_data: dict) -> dict:
+    if actual.get("data") != expected_data or actual.get("immutable") is not True:
+        raise RuntimeError("applied ConfigMap is not immutable or its data differs")
+    return {"uid": actual["metadata"]["uid"], "data": actual["data"]}
+
+
+def discover_linkerd_proxy_identity(kube: list[str], docker: str, worker: str,
+                                    probe_path: Path, pod_name: str, namespace: str) -> dict:
+    created = False
+    try:
+        run(kube + ["create", "-f", str(probe_path)])
+        created = True
+        run(kube + ["wait", "--for=condition=Ready", f"pod/{pod_name}", "-n", namespace,
+                    "--timeout=180s"])
+        actual = json.loads(run(kube + ["get", "pod", pod_name, "-n", namespace, "-o", "json"]))
+        proxy = injected_linkerd_proxy_image(actual)
+        status = next((item for item in actual.get("status", {}).get("containerStatuses", [])
+                       if item.get("name") == "linkerd-proxy"), None)
+        if not status or not status.get("imageID"):
+            raise RuntimeError("Linkerd probe Pod has no proxy imageID")
+        identity = worker_image_identities(docker, worker, {"linkerd_proxy": {"reference": proxy}})["linkerd_proxy"]
+        if not worker_image_status_matches(status["imageID"], identity):
+            raise RuntimeError(f"Linkerd probe imageID differs from resolved worker identity: {status['imageID']}")
+        return identity
+    finally:
+        if created:
+            run(kube + ["delete", "pod", pod_name, "-n", namespace, "--ignore-not-found=true",
+                        "--wait=true", "--grace-period=1"])
 
 
 def helper_verify_script(helpers: list[int], pin: bool) -> str:
@@ -284,7 +329,7 @@ def main() -> int:
             p.error(f"{key} directory must contain rut and sibling rut-compile")
     if not a.native_linker_path:
         try:
-            a.native_linker_path = embedded_clang_path(paths["rut_rps"] / "rut")
+            a.native_linker_path = embedded_clang_path(paths["rut_rps"] / "rut-compile")
         except ValueError as error:
             p.error(str(error))
     if not a.native_linker_dir:
@@ -292,9 +337,8 @@ def main() -> int:
     if not Path(a.native_linker_path).is_absolute() or not a.native_linker_dir.startswith("/"):
         p.error("native linker path and directory must be absolute")
     for key in ("rut_rps", "rut_throughput"):
-        if not linker_paths_match(paths[key] / "rut", paths[key] / "rut-compile",
-                                  a.native_linker_path, a.native_linker_dir):
-            p.error(f"{key} rut/rut-compile pair does not embed the configured native linker path/directory")
+        if not linker_paths_match(paths[key] / "rut-compile", a.native_linker_path, a.native_linker_dir):
+            p.error(f"{key}/rut-compile does not embed the configured native linker path/directory")
     client_dir = a.client_dir.resolve(strict=True)
     if not (client_dir / "request.lua").is_file() or not (client_dir / "warmup.lua").is_file():
         p.error("--client-dir must contain request.lua and warmup.lua")
@@ -370,17 +414,16 @@ def main() -> int:
             p.error("worker node does not have the requested selector label")
         run(kube + ["get", "namespace", a.namespace])
         (output / "linkerd-check.txt").write_text(run([a.linkerd_bin, "--kubeconfig", str(a.kubeconfig.resolve()), "check"]))
+        probe_name = f"pb-{run_id}-linkerd-image-probe"
         probe_path = output / "linkerd-image-probe.json"
         write_json(probe_path, {"apiVersion": "v1", "kind": "Pod",
-                                "metadata": {"name": f"pb-{run_id}-linkerd-image-probe", "namespace": a.namespace,
+                                "metadata": {"name": probe_name, "namespace": a.namespace,
                                              "annotations": {"linkerd.io/inject": "enabled"}},
-                                "spec": {"containers": [{"name": "probe", "image": a.nginx_image}]}})
-        injected = json.loads(run(kube + ["create", "--dry-run=server", "-f", str(probe_path), "-o", "json"]))
-        try:
-            proxy_image = injected_linkerd_proxy_image(injected)
-        except ValueError as error:
-            p.error(str(error))
-        image_identities["linkerd_proxy"] = {"reference": proxy_image}
+                                "spec": {"nodeName": a.worker_node,
+                                         "containers": [{"name": "probe", "image": a.nginx_image}]}})
+        proxy_identity = discover_linkerd_proxy_identity(kube, a.docker_bin, a.worker_container,
+                                                         probe_path, probe_name, a.namespace)
+        image_identities["linkerd_proxy"] = proxy_identity
         resolved_images = worker_image_identities(a.docker_bin, a.worker_container, image_identities)
         helper_cpus = canonical_cpu_list(set(helpers))
         verify_script = helper_verify_script(helpers, a.pin_worker_helpers)
@@ -404,9 +447,10 @@ def main() -> int:
             actual = json.loads(run([a.kubectl_bin, "--kubeconfig", str(a.kubeconfig.resolve()),
                                      "get", "configmap", cm_name, "-n", a.namespace, "-o", "json"]))
             expected = json.loads((output / f"{name}-configmap.json").read_text())
-            if actual.get("data") != expected["data"] or actual["metadata"].get("immutable") is not True:
-                p.error(f"applied ConfigMap {cm_name} is not immutable or its data differs")
-            config["configmap_identities"][name] = {"uid": actual["metadata"]["uid"], "data": actual["data"]}
+            try:
+                config["configmap_identities"][name] = applied_configmap_identity(actual, expected["data"])
+            except RuntimeError as error:
+                p.error(f"{cm_name}: {error}")
     else:
         config["configmaps_applied"] = False
     write_json(output / "benchmark.json", config)

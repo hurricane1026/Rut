@@ -36,7 +36,7 @@ docker buildx build --load \
   -t proxy-benchmark-client:local .
 ```
 
-The kind worker image supplies `taskset`; `run_matrix.py` uses it through `docker exec`. The client itself is constrained with Docker `--cpuset-cpus`. The Rut Pod needs its runtime shared libraries and the exact `clang` and `ld` executables used by the selected Rut toolchain, because the runtime's native-artifact compiler launches those absolute paths. Preparation detects the embedded compiler path and checks both Rut binaries against the compiler path and linker directory; pass `--native-linker-path` and `--native-linker-dir` when the directory cannot be inferred from the compiler path. Collect shared objects with the included standard-library-only helper; it uses the host `ldd` command and adds no package/build dependency:
+The kind worker image supplies `taskset`; `run_matrix.py` uses it through `docker exec`. The client itself is constrained with Docker `--cpuset-cpus`. The Rut Pod needs its runtime shared libraries and the exact `clang` and `ld` executables used by the selected Rut toolchain, because the runtime's native-artifact compiler launches those absolute paths. Preparation detects the embedded compiler path in the `rut-compile` artifacts and checks the compiler path and linker directory as complete binary strings; pass `--native-linker-path` and `--native-linker-dir` when the directory cannot be inferred from the compiler path. Collect shared objects with the included standard-library-only helper; it uses the host `ldd` command and adds no package/build dependency:
 
 ```sh
 python3 scripts/proxy_benchmark/collect_runtime_libs.py \
