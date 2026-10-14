@@ -109,7 +109,7 @@ def provenance_fingerprint(config: dict) -> str:
     evidence = {key: config[key] for key in (
         "images", "image_identities", "input_snapshot", "artifacts", "cpus",
         "duration", "warmup", "concurrency", "repeats", "bodies", "payloads",
-        "worker_node", "selector",
+        "worker_node", "selector", "client_dir", "paths", "node_mount",
     ) if key in config}
     evidence["schedule"] = {"algorithm": "balanced-interleave-v1",
                             "repeats": config.get("repeats")}

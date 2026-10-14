@@ -512,9 +512,51 @@ def verify_status_image_identity(name: str, image: str, actual: str, identities:
         raise RuntimeError(f"{name} image identity changed: {actual}")
 
 
+def verify_effective_paths(config: dict) -> None:
+    snapshot_paths = {name: Path(entry["path"]).resolve(strict=True)
+                      for name, entry in config["input_snapshot"].items()}
+    path_snapshots = {
+        "client_dir": "client_dir",
+        "rut_config_dir": "rut_config_dir",
+        "runtime_libs": "runtime_libs",
+        "clang": "clang",
+        "ld": "ld",
+    }
+    for path_key, snapshot_name in path_snapshots.items():
+        actual = config.get("client_dir") if path_key == "client_dir" else config.get("paths", {}).get(path_key)
+        if actual is None or snapshot_name not in snapshot_paths or Path(actual).resolve(strict=True) != snapshot_paths[snapshot_name]:
+            raise RuntimeError(f"effective benchmark path {path_key} differs from its prepared input snapshot")
+    artifacts = config.get("artifacts", {})
+    for path_key, artifact_key in (("rut_rps", "rut_rps"),
+                                   ("rut_throughput", "rut_throughput")):
+        binary_dir = config.get("paths", {}).get(path_key)
+        artifact = artifacts.get(artifact_key, {})
+        artifact_path = artifact.get("path")
+        if (binary_dir is None or artifact_path is None or
+                (Path(binary_dir) / "rut").resolve(strict=True) != Path(artifact_path).resolve(strict=True)):
+            raise RuntimeError(f"effective benchmark path {path_key} differs from its prepared artifact")
+    compiler_artifacts = (("rut_rps", "rut_rps_compiler"),
+                          ("rut_throughput", "rut_throughput_compiler"))
+    for path_key, artifact_key in compiler_artifacts:
+        binary_dir = config["paths"][path_key]
+        artifact_path = artifacts[artifact_key]["path"]
+        if (Path(binary_dir) / "rut-compile").resolve(strict=True) != Path(artifact_path).resolve(strict=True):
+            raise RuntimeError(f"effective benchmark path {path_key}/rut-compile differs from its prepared artifact")
+
+
+def verify_worker_mount(config: dict, docker: str) -> None:
+    worker = json.loads(invoke([docker, "inspect", config["worker_container"]]).stdout)[0]
+    checkpoint = Path(config["checkpoint"]).resolve(strict=True)
+    if not any(Path(mount["Source"]).resolve() == checkpoint and
+               mount.get("Destination") == config["node_mount"]
+               for mount in worker.get("Mounts", [])):
+        raise RuntimeError("kind worker checkpoint mount differs from prepared node_mount")
+
+
 def verify_provenance(config: dict) -> None:
     if "input_snapshot" not in config or "image_identities" not in config:
         raise RuntimeError("benchmark config lacks input/image provenance; rerun prepare.py")
+    verify_effective_paths(config)
     try:
         current_snapshot = snapshot_inputs({name: entry["path"]
                                             for name, entry in config["input_snapshot"].items()})
@@ -524,6 +566,7 @@ def verify_provenance(config: dict) -> None:
         raise RuntimeError("mounted benchmark inputs changed since prepare.py")
     verify_configmaps(config)
     docker = config["tools"]["docker"]
+    verify_worker_mount(config, docker)
     for name, identity in config["image_identities"].items():
         if identity.get("docker_id"):
             actual = invoke([docker, "image", "inspect", "--format", "{{.Id}}", identity["reference"]]).stdout.strip()
@@ -554,6 +597,20 @@ def verify_configmaps(config: dict) -> None:
         if (actual.get("metadata", {}).get("uid") != identity.get("uid") or
                 actual.get("data") != identity.get("data") or actual.get("immutable") is not True):
             raise RuntimeError(f"ConfigMap identity or data changed for {name}")
+
+
+def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: Exception) -> str:
+    pod_name = f"proxybench-{config['run_id']}-{cell['body']}-{cell['rep']}-{cell['engine']}"
+    try:
+        cleanup = matrix.kube("delete", "pod", pod_name, "-n", config["namespace"],
+                              "--ignore-not-found=true", "--grace-period=1", "--wait=true",
+                              check=False, timeout=90)
+        details = cleanup.stdout
+    except Exception as cleanup_error:
+        details = f"cleanup command failed: {cleanup_error}"
+    write_json(matrix.samples / "last-failure.json",
+               {"cell": cell, "error": str(error), "cleanup": details})
+    return details
 
 
 def main() -> int:
@@ -592,10 +649,7 @@ def main() -> int:
         try:
             result = matrix.run_cell(cell["body"], cell["engine"], cell["rep"])
         except Exception as error:
-            pod_name = f"proxybench-{config['run_id']}-{cell['body']}-{cell['rep']}-{cell['engine']}"
-            created_marker = matrix.samples / cell["body"] / f"{cell['body']}-{cell['engine']}-r{cell['rep']}" / "pod-create.txt"
-            cleanup = matrix.kube("delete", "pod", pod_name, "-n", config["namespace"], "--grace-period=1", "--wait=true", check=False, timeout=90) if created_marker.is_file() else None
-            write_json(matrix.samples / "last-failure.json", {"cell": cell, "error": str(error), "cleanup": cleanup.stdout if cleanup else "not deleted because kubectl create did not succeed"})
+            cleanup_failed_cell(matrix, config, cell, error)
             raise
         rel = lambda path: str(path.relative_to(matrix.out))
         index.append({"body_size": cell["body"], "engine": cell["engine"], "rep": cell["rep"],

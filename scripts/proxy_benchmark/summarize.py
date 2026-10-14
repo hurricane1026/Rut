@@ -84,6 +84,19 @@ def validate_sample_provenance(output: Path, row: dict, expected: str) -> None:
     if not cell_path.is_file():
         raise ValueError(f"sample has no provenance record: {row.get('validation_path')}")
     cell = json.loads(cell_path.read_text())
+    if (row.get("body_size") != cell.get("body") or row.get("engine") != cell.get("engine") or
+            row.get("rep") != cell.get("rep")):
+        raise ValueError(f"sample index identity does not match cell record: {row.get('validation_path')}")
+    label = f"{cell['body']}-{cell['engine']}-r{cell['rep']}"
+    sample_dir = Path("samples") / cell["body"] / label
+    expected_paths = {
+        "validation_path": sample_dir / "valid.txt",
+        "warmup_dir": sample_dir / "warmup",
+        "measure_dir": sample_dir / "measurement",
+    }
+    for field, expected_path in expected_paths.items():
+        if Path(row.get(field, "")) != expected_path:
+            raise ValueError(f"sample index {field} does not match cell record: {row.get('validation_path')}")
     if cell.get("provenance_fingerprint") != expected:
         raise ValueError(f"sample provenance does not match prepared inputs: {row.get('validation_path')}")
 

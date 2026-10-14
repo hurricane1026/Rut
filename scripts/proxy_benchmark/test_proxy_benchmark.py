@@ -203,11 +203,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang-22", "/usr/bin/"))
             self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang", "/opt/llvm/bin/"))
 
-    def test_compiler_string_scan_ignores_non_ascii_elf_chunks(self):
+    def test_compiler_string_scan_ignores_non_ascii_binary_chunks(self):
         real_binary = Path(sys.executable).read_bytes()
-        self.assertEqual(real_binary[:4], b"\x7fELF")
-        self.assertTrue(any(any(byte > 0x7f for byte in chunk)
-                            for chunk in real_binary.split(b"\0")))
+        self.assertTrue(real_binary)
         prepare.nul_strings(Path(sys.executable))
         with tempfile.TemporaryDirectory() as tmp:
             compiler = Path(tmp) / "rut-compile"
@@ -325,16 +323,43 @@ class ProxyBenchmarkTests(unittest.TestCase):
             inputs = root / "inputs"
             inputs.mkdir()
             (inputs / "request.lua").write_text("return true")
+            config_dir = root / "config"
+            libs = root / "libs"
+            clang = root / "clang"
+            ld = root / "ld"
+            rps = root / "rps"
+            throughput = root / "throughput"
+            for directory in (config_dir, libs, rps, throughput):
+                directory.mkdir()
+            for path in (clang, ld):
+                path.write_text(path.name)
+            artifacts = {}
+            for directory, name in ((rps, "rut_rps"), (rps, "rut_rps_compiler"),
+                                    (throughput, "rut_throughput"), (throughput, "rut_throughput_compiler")):
+                file_name = "rut-compile" if name.endswith("compiler") else "rut"
+                path = directory / file_name
+                path.write_text(name)
+                artifacts[name] = {"path": str(path), "sha256": common.sha256(path)}
             host_id = "sha256:" + "a" * 64
             worker_id = "sha256:" + "b" * 64
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
             config = {
-                "input_snapshot": common.snapshot_inputs({"client_dir": inputs}),
+                "input_snapshot": common.snapshot_inputs({"client_dir": inputs, "rut_config_dir": config_dir,
+                    "runtime_libs": libs, "clang": clang, "ld": ld}),
+                "client_dir": str(inputs),
+                "paths": {"rut_config_dir": str(config_dir), "runtime_libs": str(libs),
+                          "clang": str(clang), "ld": str(ld), "rut_rps": str(rps),
+                          "rut_throughput": str(throughput)},
+                "artifacts": artifacts, "checkpoint": str(checkpoint), "node_mount": "/benchmark",
                 "tools": {"docker": "docker"}, "worker_container": "bench-worker",
                 "image_identities": {"client": {"reference": "client:local", "docker_id": host_id,
                                                     "worker_id": worker_id}},
             }
             inventory = {"images": [{"id": worker_id, "repoTags": ["client:local"], "repoDigests": []}]}
+            worker = [{"Mounts": [{"Source": str(checkpoint), "Destination": "/benchmark"}]}]
             with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(worker), ""),
                     subprocess.CompletedProcess([], 0, host_id + "\n", ""),
                     subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
                 run_matrix.verify_provenance(config)
@@ -344,28 +369,175 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     run_matrix.verify_provenance(config)
                 invoke.assert_not_called()
             (inputs / "request.lua").write_text("return true")
-            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, "sha256:retagged\n", "")):
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(worker), ""),
+                    subprocess.CompletedProcess([], 0, "sha256:retagged\n", "")]):
                 with self.assertRaisesRegex(RuntimeError, "Docker image identity changed"):
                     run_matrix.verify_provenance(config)
             inventory["images"][0]["id"] = "sha256:changed"
             with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(worker), ""),
                     subprocess.CompletedProcess([], 0, host_id + "\n", ""),
                     subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
                 with self.assertRaisesRegex(RuntimeError, "kind worker image identity changed"):
                     run_matrix.verify_provenance(config)
 
+    def test_effective_runtime_paths_must_match_prepared_snapshot_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = {}
+            for key in ("client_dir", "rut_config_dir", "runtime_libs", "clang", "ld", "rut_rps", "rut_throughput"):
+                path = root / key
+                if key in ("clang", "ld"):
+                    path.write_text(key)
+                else:
+                    path.mkdir()
+                paths[key] = path
+            artifacts = {}
+            for binary_key, binary_name in (("rut_rps", "rut_rps"), ("rut_throughput", "rut_throughput")):
+                for artifact_key, file_name in ((binary_name, "rut"), (f"{binary_name}_compiler", "rut-compile")):
+                    file = paths[binary_key] / file_name
+                    file.write_text(artifact_key)
+                    artifacts[artifact_key] = {"path": str(file), "sha256": common.sha256(file)}
+            config = {"client_dir": str(paths["client_dir"]),
+                      "paths": {key: str(value) for key, value in paths.items() if key != "client_dir"},
+                      "input_snapshot": common.snapshot_inputs({key: paths[key] for key in
+                          ("client_dir", "rut_config_dir", "runtime_libs", "clang", "ld")}),
+                      "artifacts": artifacts, "node_mount": "/benchmark"}
+            run_matrix.verify_effective_paths(config)
+            for mutation in (
+                {**config, "client_dir": str(paths["rut_config_dir"])},
+                {**config, "paths": {**config["paths"], "rut_config_dir": str(paths["client_dir"])}},
+                {**config, "paths": {**config["paths"], "rut_rps": str(paths["rut_throughput"])}},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "effective benchmark path"):
+                    run_matrix.verify_effective_paths(mutation)
+            for key, value in (("client_dir", str(paths["rut_config_dir"])),
+                               ("paths", {**config["paths"], "rut_config_dir": "/other/config"}),
+                               ("node_mount", "/other/mount")):
+                self.assertNotEqual(common.provenance_fingerprint({**config, key: value}),
+                                    common.provenance_fingerprint(config))
+
+    def test_worker_node_mount_mapping_is_rechecked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp)
+            config = {"worker_container": "worker", "checkpoint": str(checkpoint),
+                      "node_mount": "/benchmark"}
+            worker = [{"Mounts": [{"Source": str(checkpoint), "Destination": "/benchmark"}]}]
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(worker), "")) as invoke:
+                run_matrix.verify_worker_mount(config, "docker")
+            self.assertEqual(invoke.call_args.args[0], ["docker", "inspect", "worker"])
+            config["node_mount"] = "/changed"
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(worker), "")):
+                with self.assertRaisesRegex(RuntimeError, "checkpoint mount differs"):
+                    run_matrix.verify_worker_mount(config, "docker")
+
+    def test_failed_cell_cleanup_attempts_unconditional_not_found_tolerant_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            (output / "samples").mkdir(parents=True)
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess([], 0, "deleted\n", "")) as kube:
+                result = run_matrix.cleanup_failed_cell(matrix, config,
+                    {"body": "4k", "engine": "nginx", "rep": 1}, RuntimeError("create timed out"))
+            args = kube.call_args.args
+            self.assertEqual(args[:3], ("delete", "pod", "proxybench-run123-4k-1-nginx"))
+            self.assertIn("--ignore-not-found=true", args)
+            self.assertFalse((output / "samples/4k/4k-nginx-r1/pod-create.txt").exists())
+            self.assertEqual(result, "deleted\n")
+            self.assertIn("create timed out", (output / "samples/last-failure.json").read_text())
+
+    def test_effective_runtime_paths_must_match_prepared_snapshot_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = {}
+            for key in ("client_dir", "rut_config_dir", "runtime_libs", "clang", "ld", "rut_rps", "rut_throughput"):
+                path = root / key
+                if key in ("clang", "ld"):
+                    path.write_text(key)
+                else:
+                    path.mkdir()
+                paths[key] = path
+            artifacts = {}
+            for binary_key, binary_name in (("rut_rps", "rut_rps"), ("rut_throughput", "rut_throughput")):
+                for artifact_key, file_name in ((binary_name, "rut"), (f"{binary_name}_compiler", "rut-compile")):
+                    file = paths[binary_key] / file_name
+                    file.write_text(artifact_key)
+                    artifacts[artifact_key] = {"path": str(file), "sha256": common.sha256(file)}
+            config = {"client_dir": str(paths["client_dir"]),
+                      "paths": {key: str(value) for key, value in paths.items() if key != "client_dir"},
+                      "input_snapshot": common.snapshot_inputs({key: paths[key] for key in
+                          ("client_dir", "rut_config_dir", "runtime_libs", "clang", "ld")}),
+                      "artifacts": artifacts, "node_mount": "/benchmark"}
+            run_matrix.verify_effective_paths(config)
+            for mutation in (
+                {**config, "client_dir": str(paths["rut_config_dir"])},
+                {**config, "paths": {**config["paths"], "rut_config_dir": str(paths["client_dir"])}},
+                {**config, "paths": {**config["paths"], "rut_rps": str(paths["rut_throughput"])}},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "effective benchmark path"):
+                    run_matrix.verify_effective_paths(mutation)
+            for key, value in (("client_dir", str(paths["rut_config_dir"])),
+                               ("paths", {**config["paths"], "rut_config_dir": "/other/config"}),
+                               ("node_mount", "/other/mount")):
+                self.assertNotEqual(common.provenance_fingerprint({**config, key: value}),
+                                    common.provenance_fingerprint(config))
+
+    def test_worker_node_mount_mapping_is_rechecked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp)
+            config = {"worker_container": "worker", "checkpoint": str(checkpoint),
+                      "node_mount": "/benchmark"}
+            worker = [{"Mounts": [{"Source": str(checkpoint), "Destination": "/benchmark"}]}]
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(worker), "")) as invoke:
+                run_matrix.verify_worker_mount(config, "docker")
+            self.assertEqual(invoke.call_args.args[0], ["docker", "inspect", "worker"])
+            config["node_mount"] = "/changed"
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(worker), "")):
+                with self.assertRaisesRegex(RuntimeError, "checkpoint mount differs"):
+                    run_matrix.verify_worker_mount(config, "docker")
+
+    def test_failed_cell_cleanup_attempts_unconditional_not_found_tolerant_delete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            (output / "samples").mkdir(parents=True)
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess([], 0, "deleted\n", "")) as kube:
+                result = run_matrix.cleanup_failed_cell(matrix, config,
+                    {"body": "4k", "engine": "nginx", "rep": 1}, RuntimeError("create timed out"))
+            args = kube.call_args.args
+            self.assertEqual(args[:3], ("delete", "pod", "proxybench-run123-4k-1-nginx"))
+            self.assertIn("--ignore-not-found=true", args)
+            self.assertFalse((output / "samples/4k/4k-nginx-r1/pod-create.txt").exists())
+            self.assertEqual(result, "deleted\n")
+            self.assertIn("create timed out", (output / "samples/last-failure.json").read_text())
+
     def test_summary_rejects_sample_from_different_input_or_image_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
-            validation = output / "samples" / "one" / "valid.txt"
+            sample_dir = Path("samples") / "4k" / "4k-nginx-r1"
+            validation = output / sample_dir / "valid.txt"
             validation.parent.mkdir(parents=True)
             validation.write_text("valid\n")
-            row = {"validation_path": str(validation.relative_to(output))}
+            row = {"body_size": "4k", "engine": "nginx", "rep": 1,
+                   "validation_path": (sample_dir / "valid.txt").as_posix(),
+                   "warmup_dir": (sample_dir / "warmup").as_posix(),
+                   "measure_dir": (sample_dir / "measurement").as_posix()}
             config = {"images": {"client": "client:local"},
                       "image_identities": {"client": {"docker_id": "sha256:client", "worker_id": "sha256:node"}},
                       "input_snapshot": {"client_dir": {"entries": {"request.lua": {"sha256": "abc"}}}}}
             fingerprint = common.provenance_fingerprint(config)
-            (validation.parent / "cell.json").write_text(json.dumps({"provenance_fingerprint": fingerprint}))
+            (validation.parent / "cell.json").write_text(json.dumps({
+                "body": "4k", "engine": "nginx", "rep": 1,
+                "provenance_fingerprint": fingerprint}))
             summarize.validate_sample_provenance(output, row, fingerprint)
             changed = common.provenance_fingerprint({**config, "images": {"client": "client:new"}})
             with self.assertRaisesRegex(ValueError, "provenance does not match"):
@@ -378,7 +550,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
                           "cpus": {"proxy": 2, "origin": "3-4", "client": "5,7"},
                           "artifacts": {"rut": {"sha256": "before"}}}
             baseline = common.provenance_fingerprint(configured)
-            (validation.parent / "cell.json").write_text(json.dumps({"provenance_fingerprint": baseline}))
+            (validation.parent / "cell.json").write_text(json.dumps({"body": "4k", "engine": "nginx", "rep": 1,
+                                                                      "provenance_fingerprint": baseline}))
             mutations = [
                 {**configured, "concurrency": 256},
                 {**configured, "duration": "20s"},
@@ -387,6 +560,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 {**configured, "bodies": {"4k": 4096, "64k": 65536}},
                 {**configured, "cpus": {"proxy": 3, "origin": "3-4", "client": "5,7"}},
                 {**configured, "artifacts": {"rut": {"sha256": "after"}}},
+                {**configured, "client_dir": "/different/client"},
+                {**configured, "paths": {"rut_config_dir": "/different/config"}},
+                {**configured, "node_mount": "/different/mount"},
             ]
             for mutated in mutations:
                 changed_settings = common.provenance_fingerprint(mutated)
@@ -394,8 +570,30 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "provenance does not match"):
                     summarize.validate_sample_provenance(output, row, changed_settings)
             self.assertEqual(common.provenance_fingerprint({**configured,
-                "output": "/different/location", "checkpoint": "/other/checkpoint",
-                "paths": {"rut": "/path/only"}}), baseline)
+                "output": "/different/location", "checkpoint": "/other/checkpoint"}), baseline)
+
+    def test_summary_rejects_index_identity_or_result_path_swaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            sample_dir = Path("samples") / "4k" / "4k-nginx-r1"
+            cell_dir = output / sample_dir
+            cell_dir.mkdir(parents=True)
+            row = {"body_size": "4k", "engine": "nginx", "rep": 1,
+                   "validation_path": (sample_dir / "valid.txt").as_posix(),
+                   "warmup_dir": (sample_dir / "warmup").as_posix(),
+                   "measure_dir": (sample_dir / "measurement").as_posix()}
+            fingerprint = common.provenance_fingerprint({})
+            (cell_dir / "cell.json").write_text(json.dumps({
+                "body": "4k", "engine": "nginx", "rep": 1,
+                "provenance_fingerprint": fingerprint}))
+            summarize.validate_sample_provenance(output, row, fingerprint)
+            for mutated in ({**row, "engine": "envoy"},
+                            {**row, "body_size": "64k"},
+                            {**row, "rep": 2},
+                            {**row, "warmup_dir": "samples/4k/4k-envoy-r1/warmup"},
+                            {**row, "measure_dir": "samples/4k/4k-envoy-r1/measurement"}):
+                with self.assertRaisesRegex(ValueError, "index"):
+                    summarize.validate_sample_provenance(output, mutated, fingerprint)
 
     def test_run_rechecks_every_recorded_artifact_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -455,11 +653,16 @@ class ProxyBenchmarkTests(unittest.TestCase):
                       "bodies": {"4k": len(original)},
                       "payloads": {"4k": original_metadata}}
             original_fingerprint = common.provenance_fingerprint(config)
-            validation = output / "samples" / "one" / "valid.txt"
+            sample_dir = Path("samples") / "4k" / "4k-nginx-r1"
+            validation = output / sample_dir / "valid.txt"
             validation.parent.mkdir(parents=True)
             validation.write_text("valid\n")
-            row = {"validation_path": str(validation.relative_to(output))}
+            row = {"body_size": "4k", "engine": "nginx", "rep": 1,
+                   "validation_path": (sample_dir / "valid.txt").as_posix(),
+                   "warmup_dir": (sample_dir / "warmup").as_posix(),
+                   "measure_dir": (sample_dir / "measurement").as_posix()}
             (validation.parent / "cell.json").write_text(json.dumps({
+                "body": "4k", "engine": "nginx", "rep": 1,
                 "provenance_fingerprint": original_fingerprint}))
             run_matrix.verify_payloads(config)
             for filename in ("proxy", "body.bin"):
