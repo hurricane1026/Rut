@@ -102,6 +102,19 @@ u32 resident_pages(const u8* p, u32 len) {
     return n;
 }
 
+u32 slice_page_count() {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || static_cast<u64>(page_size) > SlicePool::kSliceSize ||
+        SlicePool::kSliceSize % static_cast<u32>(page_size) != 0)
+        return 0;
+    return SlicePool::kSliceSize / static_cast<u32>(page_size);
+}
+
+void touch_slice_pages(u8* slice, u32 page_size) {
+    for (u32 offset = 0; offset < SlicePool::kSliceSize; offset += page_size)
+        *reinterpret_cast<volatile u8*>(slice + offset) = 1;
+}
+
 bool slice_pages_are_independent() {
     const long page_size = sysconf(_SC_PAGESIZE);
     return page_size > 0 && SlicePool::kSliceSize % static_cast<u32>(page_size) == 0;
@@ -587,6 +600,8 @@ TEST(iouring_idle_trim, burst_larger_than_budget_is_trimmed_exactly_once_over_la
     constexpr u32 kLive = 3000;
     static_assert(kLive > IoUringEventLoop::kIdleTrimMaxTrims);
     static_assert(kLive > IoUringEventLoop::kIdleTrimMaxExamined);
+    const u32 expected_resident_pages = slice_page_count();
+    if (expected_resident_pages == 0) SKIP("host pages exceed or do not divide SlicePool slices");
     TrimRig r;
     if (!r.init(kLive + 8, false)) SKIP("io_uring or process_madvise unavailable");
     r.loop->idle_trim_budget_ns = ~0ull >> 1;  // only the count caps apply
@@ -596,12 +611,23 @@ TEST(iouring_idle_trim, burst_larger_than_budget_is_trimmed_exactly_once_over_la
         REQUIRE(c != nullptr);
         if (i == 0) sample = c;
     }
-    // mincore observes page residency, not byte values, so make these touches
-    // volatile to prevent the optimizer discarding them as overwritten stores.
-    *reinterpret_cast<volatile u8*>(sample->recv_slice) = 1;
-    *reinterpret_cast<volatile u8*>(sample->send_slice) = 1;
-    CHECK_EQ(resident_pages(sample->recv_slice, SlicePool::kSliceSize), 1u);
-    CHECK_EQ(resident_pages(sample->send_slice, SlicePool::kSliceSize), 1u);
+    // Fault in every host page of both slices. mincore reports all pages that
+    // back the range (including any huge-page-backed pages), not only byte zero.
+    const u32 page_size = SlicePool::kSliceSize / expected_resident_pages;
+    touch_slice_pages(sample->recv_slice, page_size);
+    touch_slice_pages(sample->send_slice, page_size);
+    const u32 recv_resident_pages = resident_pages(sample->recv_slice, SlicePool::kSliceSize);
+    const u32 send_resident_pages = resident_pages(sample->send_slice, SlicePool::kSliceSize);
+    if (recv_resident_pages != expected_resident_pages ||
+        send_resident_pages != expected_resident_pages) {
+        std::cerr << "idle-trim baseline residency: page_size=" << page_size
+                  << " expected=" << expected_resident_pages << " recv=" << recv_resident_pages
+                  << " send=" << send_resident_pages
+                  << " recv_ptr=" << static_cast<const void*>(sample->recv_slice)
+                  << " send_ptr=" << static_cast<const void*>(sample->send_slice) << '\n';
+    }
+    CHECK_EQ(recv_resident_pages, expected_resident_pages);
+    CHECK_EQ(send_resident_pages, expected_resident_pages);
 
     u64 max_examined = 0;
     u64 max_trimmed = 0;
