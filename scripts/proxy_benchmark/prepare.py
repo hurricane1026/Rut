@@ -66,6 +66,28 @@ def worker_image_identities(docker: str, worker: str, identities: dict) -> dict:
     return resolved
 
 
+def linker_paths_match(runtime: Path, compiler: Path, linker_path: str, linker_dir: str) -> bool:
+    expected = (linker_path.encode(), linker_dir.encode())
+    return all(all(token in binary.read_bytes() for token in expected)
+               for binary in (runtime, compiler))
+
+
+def embedded_clang_path(runtime: Path) -> str:
+    candidates = sorted({item.decode("ascii") for item in re.findall(
+        rb"/(?:[A-Za-z0-9_.+-]+/)*clang(?:-[0-9]+(?:\.[0-9]+)*)?", runtime.read_bytes())})
+    if len(candidates) != 1:
+        raise ValueError(f"cannot determine one embedded clang path from {runtime}: {candidates}")
+    return candidates[0]
+
+
+def injected_linkerd_proxy_image(pod: dict) -> str:
+    proxy = next((item for item in pod.get("spec", {}).get("containers", [])
+                  if item.get("name") == "linkerd-proxy"), None)
+    if not proxy or not proxy.get("image"):
+        raise ValueError("Linkerd admission did not inject a proxy in the server-side dry run")
+    return proxy["image"]
+
+
 def helper_verify_script(helpers: list[int], pin: bool) -> str:
     helper_cpus = canonical_cpu_list(set(helpers))
     pin_prefix = (f'for p in /proc/[0-9]*; do pid=${{p##*/}}; taskset -apc {helper_cpus} "$pid" >/dev/null 2>&1 || :; done; '
@@ -200,6 +222,10 @@ def main() -> int:
     p.add_argument("--runtime-libs", type=Path, required=True)
     p.add_argument("--clang", type=Path, required=True)
     p.add_argument("--ld", type=Path, required=True)
+    p.add_argument("--native-linker-path",
+                   help="absolute CMAKE_C_COMPILER path embedded in both Rut binaries")
+    p.add_argument("--native-linker-dir",
+                   help="absolute CMAKE_LINKER directory embedded in both Rut binaries")
     p.add_argument("--client-dir", type=Path, default=Path(__file__).with_name("client"),
                    help="directory containing request.lua and warmup.lua")
     p.add_argument("--proxy-cpu", type=int, default=2)
@@ -256,6 +282,19 @@ def main() -> int:
     for key in ("rut_rps", "rut_throughput"):
         if not all((paths[key] / name).is_file() for name in ("rut", "rut-compile")):
             p.error(f"{key} directory must contain rut and sibling rut-compile")
+    if not a.native_linker_path:
+        try:
+            a.native_linker_path = embedded_clang_path(paths["rut_rps"] / "rut")
+        except ValueError as error:
+            p.error(str(error))
+    if not a.native_linker_dir:
+        a.native_linker_dir = str(Path(a.native_linker_path).parent) + "/"
+    if not Path(a.native_linker_path).is_absolute() or not a.native_linker_dir.startswith("/"):
+        p.error("native linker path and directory must be absolute")
+    for key in ("rut_rps", "rut_throughput"):
+        if not linker_paths_match(paths[key] / "rut", paths[key] / "rut-compile",
+                                  a.native_linker_path, a.native_linker_dir):
+            p.error(f"{key} rut/rut-compile pair does not embed the configured native linker path/directory")
     client_dir = a.client_dir.resolve(strict=True)
     if not (client_dir / "request.lua").is_file() or not (client_dir / "warmup.lua").is_file():
         p.error("--client-dir must contain request.lua and warmup.lua")
@@ -285,9 +324,9 @@ def main() -> int:
     native_origin = nginx_origin(8081, origin_cpus, "/data/proxy")
     linkerd_origin = nginx_origin(8080, origin_cpus, "/data/body.bin", "0.0.0.0")
     owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark", "benchmark-run-id": run_id}
-    native = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": f"pb-{run_id}-native", "namespace": a.namespace, "labels": owner_labels},
+    native = {"apiVersion": "v1", "kind": "ConfigMap", "immutable": True, "metadata": {"name": f"pb-{run_id}-native", "namespace": a.namespace, "labels": owner_labels},
               "data": {"front-nginx.conf": front, "origin-nginx.conf": native_origin, "envoy-bootstrap.json": json.dumps(envoy_config(), separators=(",", ":"))}}
-    linkerd = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": f"pb-{run_id}-linkerd", "namespace": a.namespace, "labels": owner_labels},
+    linkerd = {"apiVersion": "v1", "kind": "ConfigMap", "immutable": True, "metadata": {"name": f"pb-{run_id}-linkerd", "namespace": a.namespace, "labels": owner_labels},
                "data": {"linkerd-origin.conf": linkerd_origin}}
     write_json(output / "native-configmap.json", native)
     write_json(output / "linkerd-configmap.json", linkerd)
@@ -303,6 +342,7 @@ def main() -> int:
               "cpus": {"proxy": a.proxy_cpu, "origin": canonical_cpu_list(set(origins)),
                        "client": canonical_cpu_list(set(clients)), "helpers": canonical_cpu_list(set(helpers))},
               "paths": {**{key: str(value) for key, value in paths.items()}, "rut_config_dir": str(config_dir)},
+              "native_linker_path": a.native_linker_path, "native_linker_dir": a.native_linker_dir,
               "client_dir": str(client_dir), "input_snapshot": input_snapshot,
               "tools": {"docker": a.docker_bin, "kubectl": a.kubectl_bin, "linkerd": a.linkerd_bin},
               "artifacts": {
@@ -330,6 +370,17 @@ def main() -> int:
             p.error("worker node does not have the requested selector label")
         run(kube + ["get", "namespace", a.namespace])
         (output / "linkerd-check.txt").write_text(run([a.linkerd_bin, "--kubeconfig", str(a.kubeconfig.resolve()), "check"]))
+        probe_path = output / "linkerd-image-probe.json"
+        write_json(probe_path, {"apiVersion": "v1", "kind": "Pod",
+                                "metadata": {"name": f"pb-{run_id}-linkerd-image-probe", "namespace": a.namespace,
+                                             "annotations": {"linkerd.io/inject": "enabled"}},
+                                "spec": {"containers": [{"name": "probe", "image": a.nginx_image}]}})
+        injected = json.loads(run(kube + ["create", "--dry-run=server", "-f", str(probe_path), "-o", "json"]))
+        try:
+            proxy_image = injected_linkerd_proxy_image(injected)
+        except ValueError as error:
+            p.error(str(error))
+        image_identities["linkerd_proxy"] = {"reference": proxy_image}
         resolved_images = worker_image_identities(a.docker_bin, a.worker_container, image_identities)
         helper_cpus = canonical_cpu_list(set(helpers))
         verify_script = helper_verify_script(helpers, a.pin_worker_helpers)
@@ -347,6 +398,15 @@ def main() -> int:
             p.error("--apply-configmaps requires --verify-cluster")
         run([a.kubectl_bin, "--kubeconfig", str(a.kubeconfig.resolve()), "create", "-f", str(output / "native-configmap.json"), "-f", str(output / "linkerd-configmap.json")])
         config["configmaps_applied"] = True
+        config["configmap_identities"] = {}
+        for name in ("native", "linkerd"):
+            cm_name = config["configmaps"][name]
+            actual = json.loads(run([a.kubectl_bin, "--kubeconfig", str(a.kubeconfig.resolve()),
+                                     "get", "configmap", cm_name, "-n", a.namespace, "-o", "json"]))
+            expected = json.loads((output / f"{name}-configmap.json").read_text())
+            if actual.get("data") != expected["data"] or actual["metadata"].get("immutable") is not True:
+                p.error(f"applied ConfigMap {cm_name} is not immutable or its data differs")
+            config["configmap_identities"][name] = {"uid": actual["metadata"]["uid"], "data": actual["data"]}
     else:
         config["configmaps_applied"] = False
     write_json(output / "benchmark.json", config)

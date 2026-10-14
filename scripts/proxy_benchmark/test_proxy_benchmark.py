@@ -96,8 +96,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
             root = Path(tmp)
             binaries = root / "rps"
             binaries.mkdir()
-            (binaries / "rut").write_bytes(b"runtime")
-            (binaries / "rut-compile").write_bytes(b"compiler")
+            (binaries / "rut").write_bytes(b"runtime /usr/bin/clang /usr/bin/")
+            (binaries / "rut-compile").write_bytes(b"compiler /usr/bin/clang /usr/bin/")
             config = {
                 "run_id": "test123", "checkpoint": tmp, "node_mount": "/benchmark",
                 "worker_node": "bench-worker", "namespace": "bench",
@@ -106,6 +106,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 "images": {"nginx": "nginx@sha256:abc", "envoy": "envoy@sha256:def", "client": "client:test"},
                 # prepare.py stores origin CPUs in canonical range form.
                 "cpus": {"proxy": 2, "origin": "3-4,8-9", "client": "5,7", "helpers": "6,14"},
+                "native_linker_path": "/opt/llvm/bin/clang-22", "native_linker_dir": "/opt/llvm/bin/",
                 "paths": {"rut_rps": str(binaries), "rut_throughput": str(binaries),
                           "runtime_libs": str(root / "libs"), "clang": str(root / "clang"),
                           "ld": str(root / "ld"), "rut_config_dir": str(root / "config")},
@@ -126,6 +127,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(frontend["args"][-2:], ["--backend", "io_uring"])
             self.assertEqual(frontend["command"], ["/runtime/rut"])
             self.assertEqual(frontend["image"], config["images"]["client"])
+            mounts = {item["name"]: item["mountPath"] for item in frontend["volumeMounts"]}
+            self.assertEqual(mounts["runtime-clang"], "/opt/llvm/bin/clang-22")
+            self.assertEqual(mounts["runtime-ld"], "/opt/llvm/bin/ld")
             self.assertEqual(rut["metadata"]["labels"]["benchmark-run-id"], "test123")
 
     def test_matrix_has_all_interleaved_unique_cells(self):
@@ -163,7 +167,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 (checkpoint / name).mkdir()
             for directory in ("rps", "throughput"):
                 for filename in ("rut", "rut-compile"):
-                    (checkpoint / directory / filename).write_bytes(filename.encode())
+                    (checkpoint / directory / filename).write_bytes(filename.encode() + b" /usr/bin/clang /usr/bin/")
             for filename in ("clang", "ld"):
                 (checkpoint / "runtime-tools" / filename).write_bytes(filename.encode())
             output = root / "output"
@@ -182,6 +186,49 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(config["cpus"]["helpers"], "15-16")
             self.assertEqual(config["image_identities"]["client"]["docker_id"], docker_image["Id"])
             self.assertEqual(set(config["input_snapshot"]), {"client_dir", "rut_config_dir", "runtime_libs", "clang", "ld"})
+            self.assertEqual(json.loads((output / "native-configmap.json").read_text())["immutable"], True)
+
+    def test_prepare_rejects_a_rut_pair_with_mismatched_embedded_linker_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, compiler = Path(tmp) / "rut", Path(tmp) / "rut-compile"
+            runtime.write_bytes(b"/opt/llvm/bin/clang-22 /opt/llvm/bin/")
+            compiler.write_bytes(b"/usr/bin/clang /usr/bin/")
+            self.assertFalse(prepare.linker_paths_match(runtime, compiler,
+                                                        "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
+            compiler.write_bytes(runtime.read_bytes())
+            self.assertTrue(prepare.linker_paths_match(runtime, compiler,
+                                                       "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
+            self.assertEqual(prepare.embedded_clang_path(runtime), "/opt/llvm/bin/clang-22")
+
+    def test_linkerd_injected_proxy_image_is_taken_from_admitted_pod(self):
+        admitted = {"spec": {"containers": [{"name": "origin", "image": "nginx@sha256:abc"},
+                                             {"name": "linkerd-proxy", "image": "cr.l5d.io/linkerd/proxy:edge"}]}}
+        self.assertEqual(prepare.injected_linkerd_proxy_image(admitted), "cr.l5d.io/linkerd/proxy:edge")
+        with self.assertRaisesRegex(ValueError, "did not inject"):
+            prepare.injected_linkerd_proxy_image({"spec": {"containers": []}})
+
+    def test_linkerd_proxy_container_requires_prepared_image_identity(self):
+        identities = {"linkerd_proxy": {"reference": "linkerd/proxy@sha256:abc", "worker_id": "sha256:cfg"}}
+        identity = run_matrix.expected_container_identity("linkerd-proxy", "linkerd/proxy:edge", identities)
+        self.assertIsNotNone(identity)
+        run_matrix.verify_status_image_identity("linkerd-proxy", "linkerd/proxy:edge", "containerd://sha256:cfg", identities)
+        with self.assertRaisesRegex(RuntimeError, "linkerd-proxy image identity changed"):
+            run_matrix.verify_status_image_identity("linkerd-proxy", "linkerd/proxy:edge", "containerd://sha256:changed", identities)
+        with self.assertRaisesRegex(RuntimeError, "identity missing"):
+            run_matrix.verify_status_image_identity("linkerd-proxy", "", "containerd://sha256:cfg", {})
+
+    def test_configmap_identity_verification_detects_recreate_and_data_change(self):
+        config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
+                  "kubeconfig": "/tmp/kube", "namespace": "bench",
+                  "configmap_identities": {"native": {"uid": "uid1", "data": {"x": "one"}}}}
+        matching = {"metadata": {"uid": "uid1"}, "data": {"x": "one"}}
+        with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(matching), "")):
+            run_matrix.verify_configmaps(config)
+        for changed in ({"metadata": {"uid": "uid2"}, "data": {"x": "one"}},
+                        {"metadata": {"uid": "uid1"}, "data": {"x": "two"}}):
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(changed), "")):
+                with self.assertRaisesRegex(RuntimeError, "ConfigMap identity or data changed"):
+                    run_matrix.verify_configmaps(config)
 
     def test_input_snapshot_detects_contents_membership_renames_and_symlinks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,6 +301,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
             changed = common.provenance_fingerprint({**config, "images": {"client": "client:new"}})
             with self.assertRaisesRegex(ValueError, "provenance does not match"):
                 summarize.validate_sample_provenance(output, row, changed)
+            changed_configmap = common.provenance_fingerprint({**config,
+                "configmap_identities": {"native": {"uid": "new", "data": {"x": "changed"}}}})
+            self.assertNotEqual(changed_configmap, fingerprint)
 
     def test_run_rechecks_every_recorded_artifact_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -398,9 +448,20 @@ class ProxyBenchmarkTests(unittest.TestCase):
             found = summarize.resource_metrics(out, row)
             self.assertEqual(found["proxy_executable_bytes"], 123)
             self.assertEqual(found["proxy_dynamic_dependency_bytes"], 1000)
-            self.assertEqual(found["proxy_under_load_pss_kb"], 90)
-            self.assertEqual(found["origin_under_load_pss_kb"], 250)
+            self.assertIsNone(found["proxy_under_load_pss_kb"])
+            self.assertIsNone(found["origin_under_load_pss_kb"])
+            self.assertEqual(found["proxy_under_load_observations"], 0)
+            self.assertEqual(found["origin_under_load_observations"], 0)
             self.assertFalse(found["resource_sampling_complete"])
+            summary["sampling_complete"] = True
+            (cell / "resources-summary.json").write_text(json.dumps(summary))
+            complete = summarize.resource_metrics(out, row)
+            self.assertEqual(complete["proxy_under_load_pss_kb"], 90)
+            self.assertEqual(complete["origin_under_load_pss_kb"], 250)
+            self.assertEqual(summarize.aggregate_resource_values(
+                [{**found, "resource_sampling_complete": False}, complete], "proxy_under_load_pss_kb"), [90])
+            self.assertEqual(summarize.aggregate_resource_values(
+                [{**found, "resource_sampling_complete": False}, complete], "proxy_executable_bytes"), [123, 123])
 
     def test_client_image_has_no_private_default(self):
         source = Path(prepare.__file__).read_text()

@@ -59,15 +59,16 @@ def resource_metrics(output: Path, row: dict) -> dict:
             rss, pss = phase(role, source)
             fields[f"{role}_{stage}_rss_kb"] = rss
             fields[f"{role}_{stage}_pss_kb"] = pss
+    complete = bool(data.get("sampling_complete"))
     samples = data.get("under_load_samples", [])
-    valid_samples = [item for item in samples if item.get("snapshot_valid")]
+    valid_samples = [item for item in samples if complete and item.get("snapshot_valid")]
     for role in ("proxy", "origin"):
         role_samples = [item.get(role, {}) for item in valid_samples]
         for measure in ("rss_kb", "pss_kb"):
             values = [item[measure] for item in role_samples if item.get("complete") and item.get(measure) is not None]
             fields[f"{role}_under_load_{measure}"] = statistics.median(values) if values else None
-        fields[f"{role}_under_load_observations"] = sum(1 for item in role_samples if item.get("complete"))
-    fields["resource_sampling_complete"] = bool(data.get("sampling_complete"))
+        fields[f"{role}_under_load_observations"] = sum(1 for item in role_samples if complete and item.get("complete"))
+    fields["resource_sampling_complete"] = complete
     fields["proxy_executable_bytes"] = sum(item["size_bytes"] for item in executables) if executables else None
     fields["proxy_executables"] = executables
     for role in ("proxy", "origin"):
@@ -84,6 +85,12 @@ def validate_sample_provenance(output: Path, row: dict, expected: str) -> None:
     cell = json.loads(cell_path.read_text())
     if cell.get("provenance_fingerprint") != expected:
         raise ValueError(f"sample provenance does not match prepared inputs: {row.get('validation_path')}")
+
+
+def aggregate_resource_values(rows: list[dict], key: str) -> list[int | float]:
+    resource_measure = "_idle_" in key or "_after_warmup_" in key or "_under_load_" in key
+    return [row[key] for row in rows
+            if row.get(key) is not None and (not resource_measure or row.get("resource_sampling_complete"))]
 
 
 def main() -> int:
@@ -137,10 +144,12 @@ def main() -> int:
                                "origin_under_load_rss_kb", "origin_under_load_pss_kb")
             resources = {}
             for key in resource_fields:
-                values = [row[key] for row in rows if row.get(key) is not None]
+                values = aggregate_resource_values(rows, key)
                 resources[f"median_{key}"] = statistics.median(values) if values else None
                 resources[f"{key}_observations"] = len(values)
             groups.append({"body": body, "bytes": size, "engine": engine, "count": len(rows),
+                           "resource_sampling_complete_cells": sum(bool(row.get("resource_sampling_complete")) for row in rows),
+                           "resource_sampling_incomplete_cells": sum(not row.get("resource_sampling_complete", False) for row in rows),
                            "median_rps": statistics.median(rps), "min_rps": min(rps), "max_rps": max(rps),
                            "median_payload_gbps": statistics.median(rps) * size * 8 / 1_000_000_000,
                            "median_p99_ms": statistics.median(p99), "min_p99_ms": min(p99), "max_p99_ms": max(p99),
@@ -153,7 +162,7 @@ def main() -> int:
                            "proxy_idle_rss_kb", "proxy_idle_pss_kb", "proxy_after_warmup_rss_kb", "proxy_after_warmup_pss_kb",
                            "proxy_under_load_rss_kb", "proxy_under_load_pss_kb", "origin_idle_rss_kb", "origin_idle_pss_kb",
                            "origin_after_warmup_rss_kb", "origin_after_warmup_pss_kb", "origin_under_load_rss_kb", "origin_under_load_pss_kb")
-        writer = csv.DictWriter(stream, fieldnames=("body", "bytes", "engine", "count", "median_rps", "min_rps", "max_rps", "median_payload_gbps", "median_p99_ms", "min_p99_ms", "max_p99_ms", *[f"median_{name}" for name in resource_fields], *[f"{name}_observations" for name in resource_fields]))
+        writer = csv.DictWriter(stream, fieldnames=("body", "bytes", "engine", "count", "resource_sampling_complete_cells", "resource_sampling_incomplete_cells", "median_rps", "min_rps", "max_rps", "median_payload_gbps", "median_p99_ms", "min_p99_ms", "max_p99_ms", *[f"median_{name}" for name in resource_fields], *[f"{name}_observations" for name in resource_fields]))
         writer.writeheader(); writer.writerows(groups)
     print(json.dumps({"complete": complete, "sample_count": len(samples), "groups": groups}, indent=2))
     return 0

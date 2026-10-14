@@ -135,10 +135,8 @@ class Matrix:
         spec_by_name = {item.get("name"): item for item in spec_containers}
         for status in statuses:
             spec = spec_by_name.get(status["name"], {})
-            identity = next((value for value in self.c.get("image_identities", {}).values()
-                             if value["reference"] == spec.get("image")), None)
-            if identity and not image_identity_matches(status.get("imageID", ""), identity):
-                raise RuntimeError(f"{status['name']} image identity changed: {status.get('imageID')}")
+            verify_status_image_identity(status["name"], spec.get("image"), status.get("imageID", ""),
+                                         self.c.get("image_identities", {}))
         if engine == "linkerd" and not any(item.get("name") == "linkerd-proxy" for item in spec_containers):
             raise RuntimeError("Linkerd did not inject the stock sidecar")
         if engine != "linkerd" and any(item.get("name", "").startswith("linkerd-") for item in spec_containers):
@@ -495,6 +493,20 @@ def image_identity_matches(actual: str, expected: dict) -> bool:
     return False
 
 
+def expected_container_identity(name: str, image: str, identities: dict) -> dict | None:
+    if name == "linkerd-proxy":
+        return identities.get("linkerd_proxy")
+    return next((value for value in identities.values() if value["reference"] == image), None)
+
+
+def verify_status_image_identity(name: str, image: str, actual: str, identities: dict) -> None:
+    identity = expected_container_identity(name, image, identities)
+    if name == "linkerd-proxy" and not identity:
+        raise RuntimeError("prepared Linkerd proxy image identity missing")
+    if identity and not image_identity_matches(actual, identity):
+        raise RuntimeError(f"{name} image identity changed: {actual}")
+
+
 def verify_provenance(config: dict) -> None:
     if "input_snapshot" not in config or "image_identities" not in config:
         raise RuntimeError("benchmark config lacks input/image provenance; rerun prepare.py")
@@ -505,6 +517,7 @@ def verify_provenance(config: dict) -> None:
         raise RuntimeError(f"cannot validate mounted benchmark inputs: {error}") from error
     if current_snapshot != config["input_snapshot"]:
         raise RuntimeError("mounted benchmark inputs changed since prepare.py")
+    verify_configmaps(config)
     docker = config["tools"]["docker"]
     for name, identity in config["image_identities"].items():
         if identity.get("docker_id"):
@@ -523,6 +536,18 @@ def verify_provenance(config: dict) -> None:
         ids = {image.get("id") for image in matches if image.get("id")}
         if ids != {expected_id}:
             raise RuntimeError(f"kind worker image identity changed for {name}: expected {expected_id}, got {sorted(ids)}")
+
+
+def verify_configmaps(config: dict) -> None:
+    expected = config.get("configmap_identities")
+    if not expected:
+        return
+    for name, identity in expected.items():
+        result = invoke([config["tools"]["kubectl"], "--kubeconfig", config["kubeconfig"],
+                         "get", "configmap", config["configmaps"][name], "-n", config["namespace"], "-o", "json"])
+        actual = json.loads(result.stdout)
+        if actual.get("metadata", {}).get("uid") != identity.get("uid") or actual.get("data") != identity.get("data"):
+            raise RuntimeError(f"ConfigMap identity or data changed for {name}")
 
 
 def main() -> int:

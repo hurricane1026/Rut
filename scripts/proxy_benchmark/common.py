@@ -107,6 +107,9 @@ def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
 
 def provenance_fingerprint(config: dict) -> str:
     evidence = {key: config[key] for key in ("images", "image_identities", "input_snapshot")}
+    evidence["native_linker_path"] = config.get("native_linker_path")
+    evidence["native_linker_dir"] = config.get("native_linker_dir")
+    evidence["configmap_identities"] = config.get("configmap_identities")
     encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -197,8 +200,8 @@ def pod_spec(config: dict, engine: str, body: str, name: str) -> dict:
                 {"name": "rut-binaries", "mountPath": "/runtime", "readOnly": True},
                 {"name": "rut-config", "mountPath": "/benchmark", "readOnly": True},
                 {"name": "runtime-libs", "mountPath": "/lib64", "readOnly": True},
-                {"name": "runtime-clang", "mountPath": "/usr/bin/clang", "readOnly": True},
-                {"name": "runtime-ld", "mountPath": "/usr/bin/ld", "readOnly": True},
+                {"name": "runtime-clang", "mountPath": config["native_linker_path"], "readOnly": True},
+                {"name": "runtime-ld", "mountPath": str(Path(config["native_linker_dir"]) / "ld"), "readOnly": True},
             ],
         })
         volumes.extend([
