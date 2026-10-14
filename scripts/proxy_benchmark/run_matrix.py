@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -529,7 +530,6 @@ class Matrix:
         runtime = json.loads((outdir / "container-runtime.json").read_text())
         verify_pod_runtime_stable(pod, json.loads(final.stdout), runtime)
         self.verify_live_runtime(runtime)
-        (outdir / "valid.txt").write_text("warmup and measurement valid; error counters 0\n")
         under_load = [row for row in resource_records if row["phase"].startswith("under-load")]
         write_json(outdir / "resources-summary.json", {
             "frontend_executables": json.loads((outdir / "frontend-executables.json").read_text()),
@@ -542,8 +542,12 @@ class Matrix:
             "expected_under_load_samples": 3,
             "observed_under_load_samples": len(under_load),
         })
-        delete = self.kube("delete", "pod", pod_name, "-n", self.c["namespace"], "--grace-period=1", "--wait=true", timeout=90)
-        (outdir / "pod-delete.txt").write_text(delete.stdout)
+        delete_details = cleanup_cell_pod(self, self.c,
+                                          {"body": body, "engine": engine, "rep": rep},
+                                          expected_uid=pod.get("metadata", {}).get("uid"),
+                                          require_owned=True)
+        (outdir / "pod-delete.txt").write_text(delete_details)
+        (outdir / "valid.txt").write_text("warmup and measurement valid; error counters 0\n")
         return outdir
 
 
@@ -591,15 +595,18 @@ def verify_payloads(config: dict) -> None:
         raise RuntimeError("prepared payload metadata differs from benchmark config")
     if set(prepared) != set(bodies):
         raise RuntimeError("prepared payload metadata does not match configured bodies")
+    root = Path(config["checkpoint"]) / "payloads"
+    verify_payload_path(root, stat.S_ISDIR)
     for body, configured_size in bodies.items():
         metadata = prepared[body]
         expected_size = int(configured_size)
         if metadata.get("bytes") != expected_size:
             raise RuntimeError(f"prepared payload size metadata mismatch for {body}")
+        directory = root / body
+        verify_payload_path(directory, stat.S_ISDIR)
         for filename in ("proxy", "body.bin"):
-            path = Path(config["checkpoint"]) / "payloads" / body / filename
-            if not path.is_file():
-                raise RuntimeError(f"prepared payload is missing: {path}")
+            path = directory / filename
+            verify_payload_path(path, stat.S_ISREG)
             actual_size = path.stat().st_size
             if actual_size != expected_size:
                 raise RuntimeError(
@@ -607,6 +614,17 @@ def verify_payloads(config: dict) -> None:
                 )
             if Matrix.file_sha(path) != metadata["sha256"]:
                 raise RuntimeError(f"prepared payload hash mismatch for {body}/{filename}")
+
+
+def verify_payload_path(path: Path, expected_type) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise RuntimeError(f"prepared payload path is unavailable: {path}") from error
+    if stat.S_ISLNK(mode):
+        raise RuntimeError(f"prepared payload path is a symlink: {path}")
+    if not expected_type(mode):
+        raise RuntimeError(f"prepared payload path has an unexpected file type: {path}")
 
 
 def image_identity_matches(actual: str, expected: dict) -> bool:
@@ -757,39 +775,52 @@ def verify_configmaps(config: dict) -> None:
             raise RuntimeError(f"ConfigMap identity or data changed for {name}")
 
 
-def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: BaseException) -> str:
+def cleanup_cell_pod(matrix: Matrix, config: dict, cell: dict, *,
+                     expected_uid: str | None = None, require_owned: bool = False) -> str:
     pod_name = f"proxybench-{config['run_id']}-{cell['body']}-{cell['rep']}-{cell['engine']}"
+    fetched = matrix.kube("get", "pod", pod_name, "-n", config["namespace"], "-o", "json", check=False)
+    if fetched.returncode:
+        details = f"ownership lookup failed ({fetched.returncode}): {fetched.stdout}"
+        if require_owned:
+            raise RuntimeError(details)
+        return details
+    pod = json.loads(fetched.stdout)
+    metadata = pod.get("metadata", {})
+    labels = metadata.get("labels", {})
+    owned = (metadata.get("name") == pod_name and metadata.get("namespace") == config["namespace"] and
+             labels.get("app.kubernetes.io/managed-by") == "rut-proxy-benchmark" and
+             labels.get("benchmark-run-id") == config["run_id"] and
+             labels.get("benchmark-create-attempt") == matrix.pod_create_attempt)
+    outdir = matrix.samples / cell["body"] / f"{cell['body']}-{cell['engine']}-r{cell['rep']}"
+    pod_path = outdir / "pod.json"
+    if expected_uid is None and pod_path.is_file():
+        expected_uid = json.loads(pod_path.read_text()).get("metadata", {}).get("uid")
+    actual_uid = metadata.get("uid")
+    if expected_uid and actual_uid != expected_uid:
+        owned = False
+    if not owned or not actual_uid:
+        details = f"pod not deleted: ownership or UID mismatch (uid={actual_uid!r})"
+        if require_owned:
+            raise RuntimeError(details)
+        return details
+    selector = (f"app.kubernetes.io/managed-by=rut-proxy-benchmark,"
+                f"benchmark-run-id={config['run_id']},"
+                f"benchmark-create-attempt={matrix.pod_create_attempt}")
+    cleanup = matrix.kube("delete", "pod", "-n", config["namespace"], "-l", selector,
+                          "--field-selector", f"metadata.name={pod_name}",
+                          "--grace-period=1", "--wait=true",
+                          check=require_owned, timeout=90)
+    if cleanup.returncode:
+        details = f"delete failed ({cleanup.returncode}): {cleanup.stdout}"
+        if require_owned:
+            raise RuntimeError(details)
+        return details
+    return cleanup.stdout
+
+
+def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: BaseException) -> str:
     try:
-        fetched = matrix.kube("get", "pod", pod_name, "-n", config["namespace"], "-o", "json", check=False)
-        if fetched.returncode:
-            details = f"ownership lookup failed ({fetched.returncode}): {fetched.stdout}"
-        else:
-            pod = json.loads(fetched.stdout)
-            metadata = pod.get("metadata", {})
-            labels = metadata.get("labels", {})
-            owned = (metadata.get("name") == pod_name and metadata.get("namespace") == config["namespace"] and
-                     labels.get("app.kubernetes.io/managed-by") == "rut-proxy-benchmark" and
-                     labels.get("benchmark-run-id") == config["run_id"] and
-                     labels.get("benchmark-create-attempt") == matrix.pod_create_attempt)
-            outdir = matrix.samples / cell["body"] / f"{cell['body']}-{cell['engine']}-r{cell['rep']}"
-            recorded_uid = None
-            pod_path = outdir / "pod.json"
-            if pod_path.is_file():
-                recorded_uid = json.loads(pod_path.read_text()).get("metadata", {}).get("uid")
-            actual_uid = metadata.get("uid")
-            if recorded_uid and actual_uid != recorded_uid:
-                owned = False
-            if not owned or not actual_uid:
-                details = f"pod not deleted: ownership or UID mismatch (uid={actual_uid!r})"
-            else:
-                selector = (f"app.kubernetes.io/managed-by=rut-proxy-benchmark,"
-                            f"benchmark-run-id={config['run_id']},"
-                            f"benchmark-create-attempt={matrix.pod_create_attempt}")
-                cleanup = matrix.kube("delete", "pod", "-n", config["namespace"], "-l", selector,
-                                      "--field-selector", f"metadata.name={pod_name}",
-                                      "--grace-period=1", "--wait=true",
-                                      check=False, timeout=90)
-                details = cleanup.stdout
+        details = cleanup_cell_pod(matrix, config, cell)
     except Exception as cleanup_error:
         details = f"cleanup command failed: {cleanup_error}"
     write_json(matrix.samples / "last-failure.json",

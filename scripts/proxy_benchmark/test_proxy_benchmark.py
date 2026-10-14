@@ -263,6 +263,35 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 for directory in ("rps", "throughput")
                 for filename in ("rut", "rut-compile")
             ] + [checkpoint / "runtime-tools" / name for name in ("clang", "ld")])
+            outside = root / "outside-payload"
+            outside.mkdir()
+            (outside / "sentinel").write_text("preserve me")
+            for case in ("payload-root", "body-directory", "payload-file"):
+                with self.subTest(payload_case=case):
+                    payload_root = checkpoint / "payloads"
+                    if case == "payload-root":
+                        payload_root.symlink_to(outside, target_is_directory=True)
+                    elif case == "body-directory":
+                        payload_root.mkdir()
+                        (payload_root / "4k").symlink_to(outside, target_is_directory=True)
+                    else:
+                        (payload_root / "4k").mkdir(parents=True)
+                        (payload_root / "4k" / "proxy").symlink_to(outside / "sentinel")
+                    with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                        with self.assertRaises(SystemExit):
+                            prepare.main()
+                    self.assertFalse(output.exists())
+                    self.assertEqual((outside / "sentinel").read_text(), "preserve me")
+                    run.assert_not_called()
+                    if case == "payload-root":
+                        payload_root.unlink()
+                    elif case == "body-directory":
+                        (payload_root / "4k").unlink()
+                        payload_root.rmdir()
+                    else:
+                        (payload_root / "4k" / "proxy").unlink()
+                        (payload_root / "4k").rmdir()
+                        payload_root.rmdir()
             comma_output = root / "out,put"
             comma_argv = list(argv)
             comma_argv[comma_argv.index("--output") + 1] = str(comma_output)
@@ -807,25 +836,66 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertNotEqual(baseline, common.normalized_linkerd_injection_spec(changed))
         self.assertEqual(baseline, common.normalized_linkerd_injection_spec(pod("random-e", app_value="changed")))
 
-    def test_client_create_timeout_still_removes_deterministic_container_name(self):
+    def test_client_ambiguous_create_removes_only_matching_owned_container_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "measurement"
             config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
                       "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
                       "concurrency": 4, "client_dir": "/benchmark",
                       "tools": {"docker": "docker"}, "worker_container": "worker"}
+            expected = {}
+            def docker_run(argv, **kwargs):
+                if argv[1] == "create":
+                    for index, part in enumerate(argv[:-1]):
+                        if part == "--label":
+                            key, value = argv[index + 1].split("=", 1)
+                            expected[key] = value
+                    raise subprocess.TimeoutExpired(argv, 30)
+                if argv[1] == "inspect":
+                    pod = {"Id": "owned-container-id", "Name": "/" + argv[-1],
+                           "Config": {"Labels": expected}}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([pod]), "")
+                if argv[1] == "rm":
+                    raise OSError("daemon unavailable")
+                self.fail(f"unexpected Docker command: {argv}")
             with mock.patch("run_client.load_config", return_value=config), \
                     mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "4k-nginx-r1",
                                              "--pod-ip", "10.0.0.2", "--duration", "2s", "--lua", "warmup.lua",
                                              "--output", str(out)]), \
-                    mock.patch("run_client.subprocess.run", side_effect=[
-                        subprocess.TimeoutExpired(["docker", "create"], 30), OSError("daemon unavailable")]) as run:
+                    mock.patch("run_client.subprocess.run", side_effect=docker_run) as run:
                 self.assertEqual(run_client.main(), 124)
-            self.assertEqual(run.call_args_list[1].args[0], ["docker", "rm", "-f", "proxybench-run123-4k-nginx-r1"])
+            self.assertEqual(run.call_args_list[0].args[0][1], "create")
+            self.assertIn("benchmark-create-attempt", expected)
+            self.assertEqual(run.call_args_list[1].args[0], ["docker", "inspect", "proxybench-run123-4k-nginx-r1"])
+            self.assertEqual(run.call_args_list[2].args[0], ["docker", "rm", "-f", "owned-container-id"])
             self.assertEqual(run.call_args_list[0].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
             self.assertEqual(run.call_args_list[1].kwargs["timeout"], run_client.DOCKER_CLEANUP_TIMEOUT)
             self.assertTrue((out / "error.log").is_file())
             self.assertEqual((out / "returncode.txt").read_text(), "124\n")
+
+    def test_client_create_name_collision_does_not_remove_unowned_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "measurement"
+            config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
+                      "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
+                      "concurrency": 4, "client_dir": "/benchmark",
+                      "tools": {"docker": "docker"}, "worker_container": "worker"}
+            def docker_run(argv, **kwargs):
+                if argv[1] == "create":
+                    raise subprocess.CalledProcessError(1, argv, output="name already in use")
+                if argv[1] == "inspect":
+                    existing = {"Id": "unrelated-id", "Name": "/" + argv[-1],
+                                "Config": {"Labels": {"app.kubernetes.io/managed-by": "other"}}}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([existing]), "")
+                self.fail(f"unexpected Docker command: {argv}")
+            with mock.patch("run_client.load_config", return_value=config), \
+                    mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "4k-nginx-r1",
+                                             "--pod-ip", "10.0.0.2", "--duration", "2s", "--lua", "warmup.lua",
+                                             "--output", str(out)]), \
+                    mock.patch("run_client.subprocess.run", side_effect=docker_run) as run:
+                self.assertEqual(run_client.main(), 1)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[1].args[0][1], "inspect")
 
     def test_client_rejects_comma_mount_sources_before_creating_output(self):
         for config_dir, output_suffix in (("/tmp/client,inputs", "measurement"),
@@ -876,7 +946,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(run.call_args_list[0].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
             self.assertEqual(run.call_args_list[1].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
             self.assertEqual(run.call_args_list[2].kwargs["timeout"], 180)
-            self.assertEqual(run.call_args_list[3].args[0], ["docker", "rm", "-f", "proxybench-run123-cell-measurement"])
+            self.assertEqual(run.call_args_list[3].args[0], ["docker", "rm", "-f", "container123"])
             self.assertIn("timed out", (out / "error.log").read_text())
             self.assertEqual((out / "returncode.txt").read_text(), "124\n")
 
@@ -1370,6 +1440,38 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(kube.call_count, 1)
             self.assertEqual(kube.call_args.args[:3], ("get", "pod", name))
 
+    def test_successful_cell_cleanup_checks_invocation_labels_and_initial_uid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            (output / "samples").mkdir(parents=True)
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            name = "proxybench-run123-4k-1-nginx"
+            pod = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-original",
+                    "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                               "benchmark-run-id": "run123",
+                               "benchmark-create-attempt": matrix.pod_create_attempt}}}
+            cell = {"body": "4k", "engine": "nginx", "rep": 1}
+            with mock.patch.object(matrix, "kube", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(pod), ""),
+                    subprocess.CompletedProcess([], 0, "deleted\n", "")]) as kube:
+                result = run_matrix.cleanup_cell_pod(matrix, config, cell,
+                                                     expected_uid="uid-original", require_owned=True)
+            self.assertEqual(result, "deleted\n")
+            self.assertEqual(kube.call_args_list[0].args[:3], ("get", "pod", name))
+            delete_args = kube.call_args_list[1].args
+            self.assertEqual(delete_args[:3], ("delete", "pod", "-n"))
+            self.assertIn(f"benchmark-create-attempt={matrix.pod_create_attempt}", " ".join(delete_args))
+            self.assertIn(f"metadata.name={name}", " ".join(delete_args))
+            replacement = {**pod, "metadata": {**pod["metadata"], "uid": "uid-replacement"}}
+            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(replacement), "")) as kube:
+                with self.assertRaisesRegex(RuntimeError, "ownership or UID mismatch"):
+                    run_matrix.cleanup_cell_pod(matrix, config, cell,
+                                                expected_uid="uid-original", require_owned=True)
+            self.assertEqual(kube.call_count, 1)
+
     def test_summary_rejects_sample_from_different_input_or_image_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
@@ -1494,6 +1596,39 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 path.write_bytes(content)
             run_matrix.verify_payloads(config)
 
+    def test_payload_provenance_rejects_symlink_root_directories_and_files(self):
+        for component in ("root", "directory", "file"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint = root / "checkpoint"
+                payload_dir = checkpoint / "payloads" / "4k"
+                payload_dir.mkdir(parents=True)
+                content = b"prepared-payload"
+                for name in ("proxy", "body.bin"):
+                    (payload_dir / name).write_bytes(content)
+                output = root / "output"
+                output.mkdir()
+                metadata = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+                (output / "payloads.json").write_text(json.dumps({"4k": metadata}))
+                config = {"output": str(output), "checkpoint": str(checkpoint),
+                          "bodies": {"4k": len(content)}, "payloads": {"4k": metadata}}
+                run_matrix.verify_payloads(config)
+                outside = root / "outside"
+                outside.mkdir()
+                (outside / "proxy").write_bytes(content)
+                (outside / "body.bin").write_bytes(content)
+                if component == "root":
+                    (checkpoint / "payloads").rename(checkpoint / "payloads-original")
+                    (checkpoint / "payloads").symlink_to(outside, target_is_directory=True)
+                elif component == "directory":
+                    (payload_dir).rename(checkpoint / "payloads" / "4k-original")
+                    payload_dir.symlink_to(outside, target_is_directory=True)
+                else:
+                    (payload_dir / "proxy").unlink()
+                    (payload_dir / "proxy").symlink_to(outside / "proxy")
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    run_matrix.verify_payloads(config)
+
     def test_same_size_payload_and_metadata_replacement_is_rejected_and_changes_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1587,6 +1722,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                               run_client.DOCKER_CONTROL_TIMEOUT,
                               run_client.wrk_timeout("2s"),
                               run_client.DOCKER_CLEANUP_TIMEOUT])
+            self.assertEqual(run.call_args_list[3].args[0], ["docker", "rm", "-f", "container123"])
 
     def test_frontend_readiness_retries_probe_timeouts_and_connection_failures(self):
         with tempfile.TemporaryDirectory() as tmp:

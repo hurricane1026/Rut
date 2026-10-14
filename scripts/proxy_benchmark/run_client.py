@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import uuid
 
 from common import duration_seconds, load_config, validate_docker_mount_source
 
@@ -61,10 +62,15 @@ def main() -> int:
         parser.error(str(error))
     output.mkdir(parents=True, exist_ok=False)
     name = f"proxybench-{config['run_id']}-{args.label}".replace("_", "-")
+    attempt_id = uuid.uuid4().hex
+    owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                    "benchmark-run-id": config["run_id"],
+                    "benchmark-create-attempt": attempt_id}
     client_image = config["image_identities"]["client"]["docker_id"]
     command_timeout = wrk_timeout(args.duration)
     argv = [
         config["tools"]["docker"], "create", "--name", name,
+        *[part for key, value in owner_labels.items() for part in ("--label", f"{key}={value}")],
         "--security-opt", "label=disable",
         "--network", f"container:{config['worker_container']}",
         "--cpuset-cpus", config["cpus"]["client"],
@@ -122,13 +128,37 @@ def main() -> int:
         return 124
     finally:
         try:
-            subprocess.run([config["tools"]["docker"], "rm", "-f", name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=DOCKER_CLEANUP_TIMEOUT)
+            cleanup_id = created or owned_container_id(config["tools"]["docker"], name, owner_labels)
+            if cleanup_id:
+                subprocess.run([config["tools"]["docker"], "rm", "-f", cleanup_id],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=DOCKER_CLEANUP_TIMEOUT)
         except (OSError, subprocess.SubprocessError):
             # The create response may be lost even after Docker created `name`;
             # cleanup is best effort and must not hide the original failure.
             pass
+
+
+def owned_container_id(docker: str, name: str, expected_labels: dict[str, str]) -> str | None:
+    result = subprocess.run([docker, "inspect", name], check=False, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            timeout=DOCKER_CLEANUP_TIMEOUT)
+    if result.returncode:
+        return None
+    try:
+        items = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        return None
+    item = items[0]
+    labels = item.get("Config", {}).get("Labels") or {}
+    inspected_name = str(item.get("Name", "")).removeprefix("/")
+    container_id = item.get("Id")
+    if (inspected_name == name and isinstance(container_id, str) and container_id and
+            all(labels.get(key) == value for key, value in expected_labels.items())):
+        return container_id
+    return None
 
 
 if __name__ == "__main__":

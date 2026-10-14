@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -108,6 +109,25 @@ def validate_runtime_libs(path: Path, expected_binaries: dict[str, Path]) -> Non
         if (library_path.is_symlink() or not library_path.is_file() or
                 library_path.stat().st_size != record.get("bytes") or sha(library_path) != record.get("sha256")):
             raise ValueError(f"runtime library bundle is missing or changed: {name}")
+
+
+def validate_payload_paths(checkpoint: Path) -> None:
+    root = checkpoint / "payloads"
+    paths = [(root, stat.S_ISDIR, "payload root")]
+    for body in SIZES:
+        directory = root / body
+        paths.append((directory, stat.S_ISDIR, f"payload directory {body}"))
+        paths.extend((directory / filename, stat.S_ISREG, f"payload file {body}/{filename}")
+                     for filename in ("proxy", "body.bin"))
+    for path, expected_type, label in paths:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            raise ValueError(f"{label} must not be a symlink: {path}")
+        if not expected_type(mode):
+            raise ValueError(f"{label} has an unexpected file type: {path}")
 
 
 def validate_output_disjoint(output: Path, input_roots: list[Path]) -> None:
@@ -511,6 +531,10 @@ def main() -> int:
         p.error("--concurrency must be at least 2 because the client uses two threads")
 
     checkpoint = a.checkpoint.resolve(strict=True)
+    try:
+        validate_payload_paths(checkpoint)
+    except ValueError as error:
+        p.error(str(error))
     output = a.output.resolve()
     if output.exists() and any(output.iterdir()):
         p.error("--output must be new or empty")
@@ -603,6 +627,10 @@ def main() -> int:
     (config_dir / "proxy-throughput.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .throughput, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
 
     payloads = {}
+    try:
+        validate_payload_paths(checkpoint)
+    except ValueError as error:
+        p.error(str(error))
     for label, size in SIZES.items():
         directory = checkpoint / "payloads" / label
         directory.mkdir(parents=True, exist_ok=True)
