@@ -1,0 +1,443 @@
+"""Shared helpers for the optional kind-based proxy comparison benchmark."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import ipaddress
+import json
+from pathlib import Path
+import re
+import stat
+import subprocess
+
+
+def load_config(path: str | Path) -> dict:
+    config = json.loads(Path(path).read_text())
+    if config.get("schema") != 1:
+        raise ValueError("unsupported benchmark config schema")
+    return config
+
+
+def duration_seconds(value: str) -> float:
+    match = re.fullmatch(r"([1-9]\d*)(s|m|h)", value)
+    if not match:
+        raise ValueError(f"unsupported wrk duration {value!r}; use a positive integer followed by s, m, or h")
+    amount = int(match.group(1))
+    return amount * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+
+
+def ip_authority(host: str, port: int | str) -> str:
+    """Format an IP literal as an HTTP authority, retaining IPv4 spelling."""
+    address = ipaddress.ip_address(host)
+    rendered = f"[{address.compressed}]" if address.version == 6 else str(address)
+    return f"{rendered}:{port}"
+
+
+def ip_url(host: str, port: int | str, path: str) -> str:
+    return f"http://{ip_authority(host, port)}{path}"
+
+
+def parse_wrk_metrics(log: str) -> dict[str, int]:
+    records = [line.split() for line in log.splitlines() if line.startswith("METRICS ")]
+    if len(records) != 1 or len(records[0]) != 11:
+        raise ValueError("missing or malformed METRICS line")
+    try:
+        values = [int(value) for value in records[0][1:]]
+    except ValueError as error:
+        raise ValueError("METRICS fields must be integers") from error
+    if any(value < 0 for value in values):
+        raise ValueError("METRICS fields cannot be negative")
+    requests, duration_us, p50, p95, p99, connect, read, write, status, timeout = values
+    if requests <= 0 or duration_us <= 0:
+        raise ValueError("METRICS requests and elapsed duration must be positive")
+    if any((connect, read, write, status, timeout)):
+        raise ValueError("METRICS error counters must be zero")
+    return {"requests": requests, "duration_us": duration_us,
+            "p50_us": p50, "p95_us": p95, "p99_us": p99,
+            "connect_errors": connect, "read_errors": read,
+            "write_errors": write, "status_errors": status,
+            "timeout_errors": timeout}
+
+
+def ipv4_pod_cidr(node: dict) -> str | None:
+    spec = node.get("spec", {})
+    raw_candidates = spec.get("podCIDRs") or []
+    candidates = list(raw_candidates) if isinstance(raw_candidates, list) else [raw_candidates]
+    if spec.get("podCIDR"):
+        candidates.append(spec["podCIDR"])
+    for candidate in candidates:
+        try:
+            if ipaddress.ip_network(candidate, strict=False).version == 4:
+                return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def select_ipv4_pod_ip(status: dict) -> str:
+    candidates = [item.get("ip") for item in (status.get("podIPs") or []) if isinstance(item, dict)]
+    if status.get("podIP"):
+        candidates.append(status["podIP"])
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if address.version == 4:
+            return str(address)
+    raise ValueError("Pod has no IPv4 address for the IPv4-only benchmark listeners")
+
+
+def run(argv: list[str], *, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=timeout)
+    if check and result.returncode:
+        raise RuntimeError(f"command failed ({result.returncode}): {argv}\n{result.stdout}")
+    return result
+
+
+def sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cpu_set(value: str) -> set[int]:
+    cpus: set[int] = set()
+    for part in value.split(","):
+        if not part:
+            raise ValueError(f"invalid CPU list: {value!r}")
+        bounds = part.split("-")
+        if len(bounds) == 1 and bounds[0].isdigit():
+            start = end = int(bounds[0])
+        elif len(bounds) == 2 and all(bound.isdigit() for bound in bounds):
+            start, end = map(int, bounds)
+            if start > end:
+                raise ValueError(f"invalid CPU range: {part!r}")
+        else:
+            raise ValueError(f"invalid CPU list: {value!r}")
+        selected = set(range(start, end + 1))
+        if cpus & selected:
+            raise ValueError(f"overlapping CPU list entries: {value!r}")
+        cpus.update(selected)
+    return cpus
+
+
+def canonical_cpu_list(cpus: set[int]) -> str:
+    if not cpus:
+        raise ValueError("CPU list cannot be empty")
+    ordered = sorted(cpus)
+    ranges = []
+    start = previous = ordered[0]
+    for cpu in ordered[1:]:
+        if cpu == previous + 1:
+            previous = cpu
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = cpu
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def canonical_image_reference(reference: str) -> str:
+    name, separator, digest = reference.partition("@")
+    components = name.split("/")
+    if len(components) == 1:
+        name = f"docker.io/library/{name}"
+    elif "." not in components[0] and ":" not in components[0] and components[0] != "localhost":
+        name = f"docker.io/{name}"
+    return f"{name}@{digest}" if separator else name
+
+
+def image_reference_matches(reference: str, candidate: str) -> bool:
+    return canonical_image_reference(reference) == canonical_image_reference(candidate)
+
+
+def verify_client_image_config_identity(identity: dict) -> None:
+    """Require Docker and the kind worker to use the same image config ID.
+
+    RepoDigests identify registry manifests and are intentionally not used here:
+    Docker's image ID and CRI's image ID both identify the image config.
+    """
+    docker_id = identity.get("docker_id")
+    worker_id = identity.get("worker_id")
+    docker_id = docker_id.strip().lower() if isinstance(docker_id, str) else ""
+    worker_id = worker_id.strip().lower() if isinstance(worker_id, str) else ""
+    if not docker_id or not worker_id:
+        raise RuntimeError("client image config identity missing from Docker or kind worker")
+    if docker_id != worker_id:
+        raise RuntimeError(f"client Docker and kind worker image config IDs differ: {docker_id} != {worker_id}")
+
+
+def normalized_linkerd_injection_spec(pod: dict) -> dict:
+    spec = pod.get("spec", {})
+    injected = [item for item in spec.get("containers", []) + spec.get("initContainers", [])
+                if item.get("name", "").startswith("linkerd-")]
+    service_account_volume_names = {
+        mount["name"] for item in injected for mount in item.get("volumeMounts", [])
+        if (mount.get("name", "").startswith("kube-api-access-") and
+            mount.get("mountPath") == "/var/run/secrets/kubernetes.io/serviceaccount")}
+
+    def normalized_volume_name(name: str) -> str:
+        return "kube-api-access" if name in service_account_volume_names else name
+
+    def normalize_container(item: dict) -> dict:
+        normalized = copy.deepcopy(item)
+        for mount in normalized.get("volumeMounts", []):
+            if (mount.get("name", "").startswith("kube-api-access-") and
+                    mount.get("mountPath") == "/var/run/secrets/kubernetes.io/serviceaccount"):
+                mount["name"] = normalized_volume_name(mount["name"])
+        return normalized
+
+    containers = sorted((normalize_container(item) for item in spec.get("containers", [])
+                         if item.get("name", "").startswith("linkerd-")),
+                        key=lambda item: item.get("name", ""))
+    init_containers = sorted((normalize_container(item) for item in spec.get("initContainers", [])
+                              if item.get("name", "").startswith("linkerd-")),
+                             key=lambda item: item.get("name", ""))
+    proxies = [item for item in containers + init_containers if item.get("name") == "linkerd-proxy"]
+    if len(proxies) != 1:
+        raise ValueError(f"Linkerd admission must inject exactly one linkerd-proxy; found {len(proxies)}")
+    mounted_names = {normalized_volume_name(mount["name"]) for item in containers + init_containers
+                     for mount in item.get("volumeMounts", []) if mount.get("name")}
+    volumes = []
+    for item in spec.get("volumes", []):
+        if normalized_volume_name(item.get("name", "")) not in mounted_names:
+            continue
+        normalized = copy.deepcopy(item)
+        normalized["name"] = normalized_volume_name(normalized["name"])
+        volumes.append(normalized)
+    volumes.sort(key=lambda item: item.get("name", ""))
+    return {"containers": containers, "initContainers": init_containers, "volumes": volumes}
+
+
+def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
+    snapshot = {}
+    for name, raw_path in sorted(paths.items()):
+        supplied_root = Path(raw_path)
+        try:
+            root_mode = supplied_root.lstat().st_mode
+        except OSError as error:
+            raise ValueError(f"mounted input root is unavailable: {supplied_root}") from error
+        if stat.S_ISLNK(root_mode):
+            raise ValueError(f"mounted input root is a symlink: {supplied_root}")
+        root = supplied_root.resolve(strict=True)
+        entries = {}
+        selected = [root, *sorted(root.rglob("*"))] if root.is_dir() else [root]
+        for path in selected:
+            relative = "." if path == root else path.relative_to(root).as_posix()
+            mode = stat.S_IMODE(path.lstat().st_mode)
+            if path.is_symlink():
+                raise ValueError(f"mounted input contains a symlink: {path}")
+            if path.is_dir():
+                entries[relative] = {"type": "directory", "mode": mode}
+            elif path.is_file():
+                entries[relative] = {"type": "file", "mode": mode, "size": path.stat().st_size,
+                                     "sha256": sha256(path)}
+            else:
+                raise ValueError(f"mounted input contains an unsupported file: {path}")
+        snapshot[name] = {"path": str(root), "entries": entries}
+    return snapshot
+
+
+def verify_payload_path(path: Path, expected_type) -> None:
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        raise RuntimeError(f"prepared payload path is unavailable: {path}") from error
+    if stat.S_ISLNK(mode):
+        raise RuntimeError(f"prepared payload path is a symlink: {path}")
+    if not expected_type(mode):
+        raise RuntimeError(f"prepared payload path has an unexpected file type: {path}")
+
+
+def verify_payloads(config: dict) -> None:
+    prepared = json.loads((Path(config["output"]) / "payloads.json").read_text())
+    bodies = config["bodies"]
+    expected_payloads = config.get("payloads")
+    if not isinstance(expected_payloads, dict):
+        raise RuntimeError("benchmark config has no bound payload metadata")
+    if prepared != expected_payloads:
+        raise RuntimeError("prepared payload metadata differs from benchmark config")
+    if set(prepared) != set(bodies):
+        raise RuntimeError("prepared payload metadata does not match configured bodies")
+    root = Path(config["checkpoint"]) / "payloads"
+    verify_payload_path(root, stat.S_ISDIR)
+    for body, configured_size in bodies.items():
+        metadata = prepared[body]
+        expected_size = int(configured_size)
+        if metadata.get("bytes") != expected_size:
+            raise RuntimeError(f"prepared payload size metadata mismatch for {body}")
+        directory = root / body
+        verify_payload_path(directory, stat.S_ISDIR)
+        for filename in ("proxy", "body.bin"):
+            path = directory / filename
+            verify_payload_path(path, stat.S_ISREG)
+            actual_size = path.stat().st_size
+            if actual_size != expected_size:
+                raise RuntimeError(
+                    f"prepared payload size mismatch for {body}/{filename}: expected {expected_size}, got {actual_size}"
+                )
+            if sha256(path) != metadata["sha256"]:
+                raise RuntimeError(f"prepared payload hash mismatch for {body}/{filename}")
+
+
+def validate_docker_mount_source(path: str | Path, label: str) -> None:
+    if "," in str(path):
+        raise ValueError(f"{label} path cannot contain a comma because Docker --mount uses comma-separated options: {path}")
+
+
+def provenance_fingerprint(config: dict) -> str:
+    evidence = {key: config[key] for key in (
+        "images", "image_identities", "input_snapshot", "artifacts", "cpus",
+        "duration", "warmup", "concurrency", "repeats", "bodies", "payloads",
+        "worker_node", "selector", "client_dir", "paths", "node_mount",
+        "linkerd_injected_spec",
+    ) if key in config}
+    evidence["schedule"] = {"algorithm": "balanced-interleave-v1",
+                            "repeats": config.get("repeats")}
+    evidence["native_linker_path"] = config.get("native_linker_path")
+    evidence["native_linker_dir"] = config.get("native_linker_dir")
+    evidence["configmap_identities"] = config.get("configmap_identities")
+    encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def host_path(config: dict, relative: str) -> Path:
+    return Path(config["checkpoint"]) / relative
+
+
+def node_path(config: dict, relative: str) -> str:
+    return str(Path(config["node_mount"]) / relative)
+
+
+def pod_labels(config: dict, engine: str, body: str, name: str) -> dict:
+    labels = {"app": name, "bench-engine": engine, "bench-body": body,
+              "benchmark-run-id": config["run_id"],
+              "app.kubernetes.io/managed-by": "rut-proxy-benchmark"}
+    if config.get("pod_create_attempt"):
+        labels["benchmark-create-attempt"] = config["pod_create_attempt"]
+    return labels
+
+
+def pod_spec(config: dict, engine: str, body: str, name: str) -> dict:
+    """Return one unmeshed-control or stock inbound-Linkerd Pod manifest."""
+    node_root = Path(config["node_mount"])
+    cpus = config["cpus"]
+    proxy_cpu = int(cpus["proxy"])
+    origin_cpus = sorted(cpu_set(cpus["origin"]))
+    selector = config["selector"]
+    if engine == "linkerd":
+        return {
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": config["namespace"],
+                         "labels": pod_labels(config, engine, body, name),
+                         "annotations": {
+                             "linkerd.io/inject": "enabled",
+                             "config.linkerd.io/default-inbound-policy": "all-unauthenticated",
+                             "config.linkerd.io/proxy-log-level": "error",
+                             "config.linkerd.io/proxy-cpu-request": "1",
+                         }},
+            "spec": {
+                "nodeName": config["worker_node"],
+                "nodeSelector": {selector["key"]: selector["value"]},
+                "terminationGracePeriodSeconds": 1,
+                "containers": [{
+                    "name": "origin", "image": config["images"]["nginx"],
+                    "imagePullPolicy": "IfNotPresent", "ports": [{"name": "http", "containerPort": 8080}],
+                    "volumeMounts": [
+                        {"name": "payload", "mountPath": "/data", "readOnly": True},
+                        {"name": "config", "mountPath": "/etc/nginx/nginx.conf", "subPath": "linkerd-origin.conf", "readOnly": True},
+                    ], "resources": {"requests": {"cpu": 4, "memory": "64Mi"}},
+                }],
+                "volumes": [
+                    {"name": "payload", "hostPath": {"path": str(node_root / "payloads" / body), "type": "Directory"}},
+                    {"name": "config", "configMap": {"name": config["configmaps"]["linkerd"]}},
+                ],
+            },
+        }
+
+    configmap = config["configmaps"]["native"]
+    payload_path = str(node_root / "payloads" / body / "proxy")
+    front = {"name": "frontend", "ports": [{"name": "http", "containerPort": 8080}],
+             "resources": {"requests": {"memory": "64Mi"}}}
+    volumes = [
+        {"name": "config", "configMap": {"name": configmap}},
+        {"name": "payload", "hostPath": {"path": payload_path, "type": "File"}},
+    ]
+    origin = {
+        "name": "origin", "image": config["images"]["nginx"], "imagePullPolicy": "IfNotPresent",
+        "ports": [{"name": "origin", "containerPort": 8081}],
+        "volumeMounts": [
+            {"name": "config", "mountPath": "/etc/nginx/nginx.conf", "subPath": "origin-nginx.conf", "readOnly": True},
+            {"name": "payload", "mountPath": "/data/proxy", "readOnly": True},
+        ], "resources": {"requests": {"memory": "64Mi"}},
+    }
+
+    if engine in ("rut-rps", "rut-throughput"):
+        variant = "rut_rps" if engine == "rut-rps" else "rut_throughput"
+        binary_dir = config["paths"][variant]
+        if not Path(binary_dir, "rut").is_file() or not Path(binary_dir, "rut-compile").is_file():
+            raise ValueError(f"{variant} must contain matching rut and rut-compile binaries")
+        mount_root = Path(config["node_mount"])
+        binary_rel = Path(binary_dir).relative_to(Path(config["checkpoint"]))
+        config_rel = Path(config["paths"]["rut_config_dir"]).relative_to(Path(config["checkpoint"]))
+        libs_rel = Path(config["paths"]["runtime_libs"]).relative_to(Path(config["checkpoint"]))
+        clang_rel = Path(config["paths"]["clang"]).relative_to(Path(config["checkpoint"]))
+        ld_rel = Path(config["paths"]["ld"]).relative_to(Path(config["checkpoint"]))
+        route_config = "proxy-rps.rut" if engine == "rut-rps" else "proxy-throughput.rut"
+        front.update({
+            "image": config["images"]["client"], "imagePullPolicy": "IfNotPresent",
+            "command": ["/runtime/rut"],
+            "args": [f"/benchmark/{route_config}", "--shards", "1", "--no-pin", "--drain", "1", "--opt", "2", "--backend", "io_uring"],
+            "env": [{"name": "LD_LIBRARY_PATH", "value": "/lib64"}],
+            "securityContext": {"runAsUser": 0, "allowPrivilegeEscalation": False,
+                                "seccompProfile": {"type": "Unconfined"}},
+            "volumeMounts": [
+                {"name": "rut-binaries", "mountPath": "/runtime", "readOnly": True},
+                {"name": "rut-config", "mountPath": "/benchmark", "readOnly": True},
+                {"name": "runtime-libs", "mountPath": "/lib64", "readOnly": True},
+                {"name": "runtime-clang", "mountPath": config["native_linker_path"], "readOnly": True},
+                {"name": "runtime-ld", "mountPath": str(Path(config["native_linker_dir"]) / "ld"), "readOnly": True},
+            ],
+        })
+        volumes.extend([
+            {"name": "rut-binaries", "hostPath": {"path": str(mount_root / binary_rel), "type": "Directory"}},
+            {"name": "rut-config", "hostPath": {"path": str(mount_root / config_rel), "type": "Directory"}},
+            {"name": "runtime-libs", "hostPath": {"path": str(mount_root / libs_rel), "type": "Directory"}},
+            {"name": "runtime-clang", "hostPath": {"path": str(mount_root / clang_rel), "type": "File"}},
+            {"name": "runtime-ld", "hostPath": {"path": str(mount_root / ld_rel), "type": "File"}},
+        ])
+    elif engine == "nginx":
+        front.update({"image": config["images"]["nginx"], "imagePullPolicy": "IfNotPresent",
+                      "command": ["nginx"], "args": ["-c", "/etc/nginx/front-nginx.conf", "-g", "daemon off;"],
+                      "volumeMounts": [{"name": "config", "mountPath": "/etc/nginx/front-nginx.conf", "subPath": "front-nginx.conf", "readOnly": True}]})
+    elif engine == "envoy":
+        front.update({"image": config["images"]["envoy"], "imagePullPolicy": "IfNotPresent",
+                      "command": ["envoy"], "args": ["-c", "/etc/envoy/bootstrap.json", "--concurrency", "1", "--disable-hot-restart", "--log-level", "error"],
+                      "volumeMounts": [{"name": "config", "mountPath": "/etc/envoy/bootstrap.json", "subPath": "envoy-bootstrap.json", "readOnly": True}]})
+    else:
+        raise ValueError(f"unknown engine: {engine}")
+
+    metadata = {"name": name, "namespace": config["namespace"],
+                "labels": pod_labels(config, engine, body, name)}
+    if engine != "linkerd":
+        metadata["annotations"] = {"linkerd.io/inject": "disabled"}
+    return {
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": metadata,
+        "spec": {"nodeName": config["worker_node"],
+                 "nodeSelector": {selector["key"]: selector["value"]},
+                 "terminationGracePeriodSeconds": 1,
+                 "securityContext": {"seccompProfile": {"type": "Unconfined"}} if engine.startswith("rut-") else {},
+                 "containers": [front, origin], "volumes": volumes},
+    }
+
+
+def write_json(path: str | Path, value: object) -> None:
+    Path(path).write_text(json.dumps(value, indent=2) + "\n")

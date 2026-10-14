@@ -1,0 +1,34 @@
+# Optional benchmark client image. This is not a Rut build/runtime dependency.
+ARG BASE_IMAGE=nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40
+ARG WRK_COMMIT=a211dd5a7050b1f9e8a9870b95513060e72ac4a0
+ARG OPENSSL_VERSION=3.5.9
+ARG OPENSSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+
+FROM ${BASE_IMAGE} AS wrk-build
+ARG WRK_COMMIT
+ARG OPENSSL_VERSION
+ARG OPENSSL_SHA256
+COPY --from=wrk-source / /tmp/wrk
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl build-essential perl unzip \
+    && rm -rf /var/lib/apt/lists/*
+RUN test "$(cat /tmp/wrk/.benchmark-source-revision)" = "${WRK_COMMIT}"
+RUN curl --fail --location --retry 3 \
+        "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+        --output /tmp/openssl.tar.gz \
+    && echo "${OPENSSL_SHA256}  /tmp/openssl.tar.gz" | sha256sum --check - \
+    && mkdir -p /tmp/openssl-src \
+    && tar -xzf /tmp/openssl.tar.gz --strip-components=1 -C /tmp/openssl-src
+RUN cd /tmp/openssl-src \
+    && ./Configure linux-x86_64 no-shared no-module no-dso no-autoload-config \
+        --prefix=/tmp/openssl --libdir=lib \
+    && make -j4 build_libs \
+    && make install_dev
+RUN make -C /tmp/wrk WITH_OPENSSL=/tmp/openssl VER="${WRK_COMMIT}"
+
+FROM ${BASE_IMAGE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=wrk-build /tmp/wrk/wrk /usr/local/bin/wrk
+ENTRYPOINT ["/usr/local/bin/wrk"]

@@ -1,0 +1,1145 @@
+#!/usr/bin/env python3
+"""Run a serial, interleaved HTTP/1.1 proxy matrix in a prepared kind cluster."""
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+from common import (cpu_set, duration_seconds, image_reference_matches, ip_authority, ip_url,
+                    load_config, parse_wrk_metrics, select_ipv4_pod_ip,
+                    normalized_linkerd_injection_spec, pod_spec,
+                    provenance_fingerprint, snapshot_inputs, verify_payload_path, verify_payloads,
+                    validate_docker_mount_source, verify_client_image_config_identity, write_json)
+
+SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
+ENGINES = {"4k": ("linkerd", "rut-rps", "nginx", "envoy"),
+           "large": ("linkerd", "rut-throughput", "nginx", "envoy")}
+
+
+class TerminatedBySignal(KeyboardInterrupt):
+    def __init__(self, signum: int):
+        super().__init__(f"received signal {signum}")
+        self.signum = signum
+
+
+def handle_sigterm(signum, _frame):
+    raise TerminatedBySignal(signum)
+
+
+def invoke(argv: list[str], *, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run([str(x) for x in argv], text=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, timeout=timeout)
+    if check and result.returncode:
+        raise RuntimeError(f"command failed ({result.returncode}): {argv}\n{result.stdout}")
+    return result
+
+
+def verify_unlimited_cpu_max(value: str, name: str) -> None:
+    fields = value.split()
+    if (len(fields) != 2 or fields[0] != "max" or
+            not fields[1].isdigit() or int(fields[1]) <= 0):
+        raise RuntimeError(f"{name} has unexpected CPU quota {value}")
+
+
+def verify_unlimited_cpu_max_ancestry(text: str, name: str) -> list[dict[str, str]]:
+    evidence = []
+    for line in text.splitlines():
+        fields = line.split("\t", 1)
+        path = Path(fields[0]) if fields else Path()
+        if (len(fields) != 2 or
+                (fields[0] != "/sys/fs/cgroup" and not fields[0].startswith("/sys/fs/cgroup/"))):
+            raise RuntimeError(f"{name} has malformed cpu.max ancestry row {line!r}")
+        if ".." in path.parts:
+            raise RuntimeError(f"{name} has unsafe cpu.max ancestry path {fields[0]!r}")
+        if evidence and Path(evidence[-1]["path"]).parent != path:
+            raise RuntimeError(f"{name} cpu.max ancestry skips a cgroup parent at {fields[0]}")
+        if fields[1] == "implicit-unlimited":
+            if fields[0] != "/sys/fs/cgroup":
+                raise RuntimeError(f"{name} only permits an implicit quota at the visible cgroup root")
+        else:
+            verify_unlimited_cpu_max(fields[1], f"{name} at {fields[0]}")
+        evidence.append({"path": fields[0], "value": fields[1]})
+    if not evidence or evidence[-1]["path"] != "/sys/fs/cgroup":
+        raise RuntimeError(f"{name} cpu.max ancestry does not reach the visible cgroup root")
+    return evidence
+
+
+def cpu_max_ancestry_script(pid: int) -> str:
+    if pid <= 0:
+        raise ValueError("cgroup PID must be positive")
+    return ("cg=$(awk -F: '$1==\"0\" {print $3}' /proc/" + str(pid) + "/cgroup); "
+            "[ -n \"$cg\" ] && case \"$cg\" in /*) ;; *) exit 31;; esac; "
+            "case \"$cg\" in *..*) exit 32;; esac; "
+            "[ \"$cg\" != / ] || cg=; "
+            "p=/sys/fs/cgroup$cg; "
+            "while :; do if [ ! -r \"$p/cpu.max\" ]; then "
+            "[ \"$p\" = /sys/fs/cgroup ] || exit 33; "
+            "printf '%s\\timplicit-unlimited\\n' \"$p\"; break; fi; "
+            "printf '%s\\t' \"$p\"; cat \"$p/cpu.max\"; "
+            "[ \"$p\" = /sys/fs/cgroup ] && break; "
+            "p=$(dirname \"$p\"); case \"$p\" in /sys/fs/cgroup|/sys/fs/cgroup/*) ;; *) exit 34;; esac; done")
+
+
+def measurement_client_cpu_check_due(client_running: bool, already_checked: bool) -> bool:
+    return client_running and not already_checked
+
+
+def parse_smaps_rollup(pids: list[int], stdout: str, returncode: int) -> dict:
+    rows = []
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit() and fields[2].isdigit():
+            rows.append({"pid": int(fields[0]), "rss_kb": int(fields[1]), "pss_kb": int(fields[2])})
+        elif len(fields) == 2 and fields[0].isdigit() and fields[1] == "missing":
+            rows.append({"pid": int(fields[0]), "rss_kb": None, "pss_kb": None})
+    unique_pids = sorted(set(pids))
+    rows_by_pid = {row["pid"]: row for row in rows}
+    # Duplicate or unexpected rows are malformed evidence, not extra processes.
+    well_formed = len(rows) == len(rows_by_pid) and set(rows_by_pid) <= set(unique_pids)
+    complete = (returncode == 0 and well_formed and bool(unique_pids) and
+                set(rows_by_pid) == set(unique_pids) and
+                all(row["rss_kb"] is not None and row["pss_kb"] is not None for row in rows))
+    return {"rows": [rows_by_pid[pid] for pid in unique_pids if pid in rows_by_pid],
+            "complete": complete, "command_returncode": returncode}
+
+
+def mapped_shared_object_paths(maps_text: str) -> list[str]:
+    paths = set()
+    for line in maps_text.splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6:
+            continue
+        path = fields[5]
+        if path.endswith(" (deleted)"):
+            path = path[:-10]
+        path = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), path)
+        if path.startswith("/") and re.search(r"\.so(?:\.|$)", path):
+            paths.add(path)
+    return sorted(paths)
+
+
+def verify_origin_affinity(master_pid: int, cpus: str, rows: list[dict]) -> None:
+    expected = cpu_set(cpus)
+    by_process: dict[int, set[frozenset[int]]] = {}
+    for row in rows:
+        pid = int(row["pid"])
+        allowed = cpu_set(row["allowed"])
+        if not allowed or not allowed <= expected:
+            raise RuntimeError(f"origin process {pid} affinity {row['allowed']} escapes {cpus}")
+        by_process.setdefault(pid, set()).add(frozenset(allowed))
+    master_masks = by_process.pop(master_pid, set())
+    if master_masks != {frozenset(expected)}:
+        raise RuntimeError(f"nginx master affinity does not match origin CPU set {cpus}")
+    workers = list(by_process.values())
+    if len(expected) == 1 and not workers:
+        return
+    worker_cpus = set()
+    for masks in workers:
+        if len(masks) != 1:
+            raise RuntimeError("nginx worker threads have inconsistent CPU affinity")
+        mask = next(iter(masks))
+        if len(mask) != 1:
+            raise RuntimeError("nginx worker affinity must remain pinned to one origin CPU")
+        cpu = next(iter(mask))
+        if cpu in worker_cpus:
+            raise RuntimeError(f"multiple nginx workers share origin CPU {cpu}")
+        worker_cpus.add(cpu)
+    if worker_cpus != expected:
+        raise RuntimeError(f"nginx worker CPU assignment {sorted(worker_cpus)} does not cover {cpus}")
+
+
+class Matrix:
+    def __init__(self, config: dict, config_path: Path | None = None):
+        self.c = config
+        self.pod_create_attempt = uuid.uuid4().hex
+        self.out = Path(config["output"])
+        self.config_path = self.out / "samples" / f"client-config-{provenance_fingerprint(config)}.json"
+        self.samples = self.out / "samples"
+        self.kubectl = config["tools"]["kubectl"]
+        self.docker = config["tools"]["docker"]
+        self.linkerd = config["tools"]["linkerd"]
+        self.kubeconfig = config["kubeconfig"]
+
+    def host_cpu_max_ancestry(self, pid: int, name: str) -> list[dict[str, str]]:
+        output = invoke(["sh", "-eu", "-c", cpu_max_ancestry_script(pid)]).stdout
+        return verify_unlimited_cpu_max_ancestry(output, name)
+
+    def client_argv(self, client: Path, label: str, pod_ip: str, duration: str,
+                    lua: str, target: Path) -> list[str]:
+        return [sys.executable, str(client), "--config", str(self.config_path), "--label", label,
+                "--pod-ip", pod_ip, "--duration", duration, "--lua", lua, "--output", str(target)]
+
+    def freeze_client_config(self) -> Path:
+        """Persist the config loaded by this process so both driver phases use one snapshot."""
+        self.samples.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(self.c, indent=2, sort_keys=True) + "\n"
+        if self.config_path.exists():
+            if json.loads(self.config_path.read_text()) != self.c:
+                raise RuntimeError("existing client config snapshot differs from selected benchmark")
+        else:
+            self.config_path.write_text(encoded)
+        return self.config_path
+
+    def kube(self, *args: str, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:
+        return invoke([self.kubectl, "--kubeconfig", self.kubeconfig, *args], check=check, timeout=timeout)
+
+    @staticmethod
+    def file_sha(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def metric(self, pod: str, outdir: Path, phase: str) -> str:
+        result = invoke([self.linkerd, "--kubeconfig", self.kubeconfig, "diagnostics", "proxy-metrics",
+                         "-n", self.c["namespace"], f"po/{pod}"], timeout=90)
+        (outdir / f"linkerd-metrics-{phase}.txt").write_text(result.stdout)
+        return result.stdout
+
+    def cleanup_owned_docker_container(self, name: str, owner_labels: dict[str, str], *, strict: bool = False) -> bool:
+        inspected = invoke([self.docker, "inspect", name], check=False, timeout=5)
+        if inspected.returncode:
+            if strict and not any(text in inspected.stdout.lower()
+                                  for text in ("no such object", "no such container")):
+                raise RuntimeError(f"cannot verify cleanup for Docker container {name}: {inspected.stdout}")
+            return False
+        try:
+            containers = json.loads(inspected.stdout)
+        except (ValueError, TypeError) as error:
+            if strict:
+                raise RuntimeError(f"cannot parse Docker ownership for {name}: {error}") from error
+            return False
+        if not isinstance(containers, list) or len(containers) != 1 or not isinstance(containers[0], dict):
+            return False
+        container = containers[0]
+        config = container.get("Config")
+        if not isinstance(config, dict):
+            if strict:
+                raise RuntimeError(f"Docker inspect lacks ownership labels for {name}")
+            return False
+        labels = config.get("Labels") or {}
+        if not isinstance(labels, dict):
+            if strict:
+                raise RuntimeError(f"Docker inspect has malformed ownership labels for {name}")
+            return False
+        container_id = container.get("Id")
+        if ((container.get("Name") or "").lstrip("/") != name or
+                not isinstance(container_id, str) or not container_id or
+                any(labels.get(key) != value for key, value in owner_labels.items())):
+            return False
+        removed = invoke([self.docker, "rm", "-f", container_id], check=False, timeout=5)
+        if strict and removed.returncode:
+            raise RuntimeError(f"cannot remove owned Docker container {name}: {removed.stdout}")
+        return removed.returncode == 0
+
+    def run_owned_probe(self, argv: list[str], name: str, owner_labels: dict[str, str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+        try:
+            result = invoke(argv, timeout=timeout)
+        except BaseException as error:
+            try:
+                self.cleanup_owned_docker_container(name, owner_labels, strict=True)
+            except Exception as cleanup_error:
+                if hasattr(error, "add_note"):
+                    error.add_note(f"owned probe cleanup also failed: {cleanup_error}")
+            raise
+        self.cleanup_owned_docker_container(name, owner_labels, strict=True)
+        return result
+
+    def wait_frontend(self, pod_ip: str) -> None:
+        """Wait until the application socket accepts an HTTP request."""
+        deadline = time.monotonic() + 180
+        safe_ip = re.sub(r"[^A-Za-z0-9_.-]", "-", pod_ip)
+        name = f"proxybench-ready-{self.c.get('run_id', 'run')}-{safe_ip}"
+        attempt_id = uuid.uuid4().hex
+        owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                        "benchmark-run-id": self.c.get("run_id", "run"),
+                        "benchmark-create-attempt": attempt_id}
+        while time.monotonic() < deadline:
+            argv = [self.docker, "run", "--rm", "--name", name,
+                    *[part for key, value in owner_labels.items()
+                      for part in ("--label", f"{key}={value}")],
+                    "--network", f"container:{self.c['worker_container']}",
+                    "--cpuset-cpus", self.c["cpus"]["client"], "--entrypoint", "curl",
+                    self.c["images"]["client"], "--http1.1", "--fail", "--silent", "--show-error",
+                    "--connect-timeout", "2", "--max-time", "4",
+                    "--output", "/dev/null", ip_url(pod_ip, 8080, "/proxy")]
+            try:
+                result = invoke(argv, check=False, timeout=5)
+            except subprocess.TimeoutExpired:
+                result = None
+            finally:
+                try:
+                    self.cleanup_owned_docker_container(name, owner_labels)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                except (RuntimeError, ValueError, TypeError):
+                    pass
+            if result is not None and result.returncode == 0:
+                return
+            time.sleep(1)
+        raise RuntimeError(f"frontend at {pod_ip}:8080 did not become ready")
+
+    @staticmethod
+    def inbound_requests(text: str, target: str) -> float:
+        values = []
+        for line in text.splitlines():
+            if line.startswith("request_total{") and 'direction="inbound"' in line and f'target_addr="{target}"' in line:
+                values.append(float(line.split()[-1]))
+        return sum(values)
+
+    def inspect_runtime(self, engine: str, outdir: Path) -> dict[str, list[int]]:
+        pod = json.loads((outdir / "pod.json").read_text())
+        if pod["spec"].get("nodeName") != self.c["worker_node"]:
+            raise RuntimeError(f"Pod scheduled on unexpected node {pod['spec'].get('nodeName')}")
+        statuses_all = pod["status"].get("containerStatuses", []) + pod["status"].get("initContainerStatuses", [])
+        if engine == "linkerd":
+            injected = normalized_linkerd_injection_spec(pod)
+            if injected != self.c.get("linkerd_injected_spec"):
+                raise RuntimeError("Linkerd injected container spec differs from prepared benchmark")
+        expected = {"origin", "linkerd-proxy"} if engine == "linkerd" else {"origin", "frontend"}
+        statuses = [item for item in statuses_all if item.get("name") in expected and item.get("containerID")]
+        if {item["name"] for item in statuses} != expected:
+            raise RuntimeError(f"container set mismatch: expected {expected}, got {[x.get('name') for x in statuses]}")
+        spec_containers = pod["spec"].get("containers", []) + pod["spec"].get("initContainers", [])
+        spec_by_name = {item.get("name"): item for item in spec_containers}
+        verify_statuses = statuses_all if engine == "linkerd" else statuses
+        injected_names = ({item["name"] for item in normalized_linkerd_injection_spec(pod)["containers"] +
+                           normalized_linkerd_injection_spec(pod)["initContainers"]} if engine == "linkerd" else set())
+        if injected_names and not injected_names <= {item.get("name") for item in verify_statuses}:
+            raise RuntimeError("Linkerd injected container status set is incomplete")
+        for status in verify_statuses:
+            if status.get("name") not in expected and status.get("name") not in injected_names:
+                continue
+            if status.get("name") in injected_names and not status.get("containerID"):
+                raise RuntimeError(f"Linkerd injected container {status.get('name')} has no runtime identity")
+            spec = spec_by_name.get(status["name"], {})
+            verify_status_image_identity(status["name"], spec.get("image"), status.get("imageID", ""),
+                                         self.c.get("image_identities", {}))
+        if engine == "linkerd" and not any(item.get("name") == "linkerd-proxy" for item in spec_containers):
+            raise RuntimeError("Linkerd did not inject the stock sidecar")
+        if engine != "linkerd" and any(item.get("name", "").startswith("linkerd-") for item in spec_containers):
+            raise RuntimeError("control Pod unexpectedly has a Linkerd sidecar")
+
+        details = []
+        worker_inspect = json.loads(invoke([self.docker, "inspect", self.c["worker_container"]]).stdout)[0]
+        worker_host_pid = int(worker_inspect.get("State", {}).get("Pid", 0))
+        if worker_host_pid <= 0:
+            raise RuntimeError("kind worker has no host PID for cgroup quota ancestry verification")
+        worker_host_cpu_max = self.host_cpu_max_ancestry(worker_host_pid, "kind worker host PID")
+        resource_pids = {"proxy": [], "origin": []}
+        frontend_binaries = {}
+        mapped_libraries = {"proxy": {}, "origin": {}}
+        for item in statuses:
+            name = item["name"]
+            cid = item["containerID"].split("://", 1)[-1]
+            inspected = json.loads(invoke([self.docker, "exec", self.c["worker_container"], "crictl", "inspect", cid]).stdout)
+            pid = int(inspected["info"]["pid"])
+            cpus = self.c["cpus"]["origin"] if name == "origin" else str(self.c["cpus"]["proxy"])
+            pin = invoke([self.docker, "exec", self.c["worker_container"], "taskset", "-apc", cpus, str(pid)])
+            cg = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"/proc/{pid}/cgroup"]).stdout.strip().splitlines()[-1]
+            cgroot = "/sys/fs/cgroup" + cg.split(":", 2)[2]
+            procs = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"{cgroot}/cgroup.procs"]).stdout.split()
+            if name != "origin":
+                for process in procs:
+                    invoke([self.docker, "exec", self.c["worker_container"], "taskset", "-apc", cpus, process])
+            cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-eu", "-c",
+                              cpu_max_ancestry_script(pid)]).stdout
+            cpu_max_ancestry = verify_unlimited_cpu_max_ancestry(cpu_max, name)
+            worker_cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-eu", "-c",
+                                     cpu_max_ancestry_script(1)]).stdout
+            worker_cpu_max_ancestry = verify_unlimited_cpu_max_ancestry(worker_cpu_max, "worker PID 1")
+            affinity = []
+            process_binaries = []
+            process_libraries = set()
+            for process in procs:
+                command = (f"for f in /proc/{process}/task/*/status; do "
+                           "tid=${f%/status}; tid=${tid##*/}; "
+                           "awk -v t=\"$tid\" '/^Name:/{n=$2}/^Cpus_allowed_list:/{print t, n, $2}' \"$f\"; done")
+                lines = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-c", command]).stdout.splitlines()
+                for line in lines:
+                    fields = line.split()
+                    if len(fields) != 3 or not fields[0].isdigit():
+                        raise RuntimeError(f"cannot read thread affinity for process {process}: {line!r}")
+                    row = {"pid": process, "tid": int(fields[0]), "name": fields[1], "allowed": fields[2]}
+                    affinity.append(row)
+                    if name == "origin":
+                        if not cpu_set(fields[2]) or not cpu_set(fields[2]) <= cpu_set(cpus):
+                            raise RuntimeError(f"{name} thread in process {process} affinity {fields[2]} escapes {cpus}")
+                    elif cpu_set(fields[2]) != cpu_set(cpus):
+                        raise RuntimeError(f"{name} thread in process {process} affinity {fields[2]} != {cpus}")
+                exe = invoke([self.docker, "exec", self.c["worker_container"], "readlink", f"/proc/{process}/exe"]).stdout.strip()
+                size = int(invoke([self.docker, "exec", self.c["worker_container"], "stat", "-Lc", "%s", f"/proc/{process}/exe"]).stdout.strip())
+                digest = invoke([self.docker, "exec", self.c["worker_container"], "sha256sum", f"/proc/{process}/exe"]).stdout.split()[0]
+                process_binaries.append({"pid": process, "path": exe, "size_bytes": size, "sha256": digest})
+                maps = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"/proc/{process}/maps"]).stdout
+                process_libraries.update(mapped_shared_object_paths(maps))
+            if name == "origin":
+                verify_origin_affinity(pid, cpus, affinity)
+            if name != "origin":
+                resource_pids["proxy"].extend(int(process) for process in procs)
+                role = "proxy"
+                for binary in process_binaries:
+                    frontend_binaries[binary["sha256"]] = {"path": binary["path"], "size_bytes": binary["size_bytes"], "sha256": binary["sha256"]}
+            else:
+                resource_pids["origin"].extend(int(process) for process in procs)
+                role = "origin"
+            for path in process_libraries:
+                if path in mapped_libraries[role]:
+                    continue
+                selected_pid = procs[0]
+                proc_path = f"/proc/{selected_pid}/root{path}"
+                size_result = invoke([self.docker, "exec", self.c["worker_container"], "stat", "-Lc", "%s", proc_path], check=False)
+                hash_result = invoke([self.docker, "exec", self.c["worker_container"], "sha256sum", proc_path], check=False)
+                library = {"path": path, "size_bytes": int(size_result.stdout.strip()) if size_result.returncode == 0 and size_result.stdout.strip().isdigit() else None,
+                           "sha256": hash_result.stdout.split()[0] if hash_result.returncode == 0 and hash_result.stdout.split() else None}
+                mapped_libraries[role][path] = library
+            write_json(outdir / f"container-{name}-inspect.json", inspected)
+            details.append({"name": name, "container_id": cid, "image_id": item.get("imageID"),
+                            "restart_count": item.get("restartCount", 0), "pid": pid,
+                            "cpuset_command": pin.stdout, "cpu_max": cpu_max_ancestry,
+                            "worker_pid1_cpu_max": worker_cpu_max_ancestry,
+                            "worker_host_cpu_max": worker_host_cpu_max, "cgroup": cgroot,
+                            "processes": affinity, "process_binaries": process_binaries,
+                            "mapped_shared_objects": sorted(process_libraries)})
+        write_json(outdir / "container-runtime.json", details)
+        write_json(outdir / "frontend-executables.json", list(frontend_binaries.values()))
+        library_report = {}
+        for role, libraries in mapped_libraries.items():
+            files = list(libraries.values())
+            complete = all(item["size_bytes"] is not None and item["sha256"] is not None for item in files)
+            library_report[role] = {"files": files, "complete": complete,
+                                    "total_bytes": sum(item["size_bytes"] for item in files) if complete else None}
+        write_json(outdir / "mapped-shared-objects.json", library_report)
+        return {key: sorted(set(value)) for key, value in resource_pids.items()}
+
+    def verify_live_runtime(self, runtime: list[dict]) -> None:
+        worker_inspect = json.loads(invoke([self.docker, "inspect", self.c["worker_container"]]).stdout)[0]
+        worker_host_pid = int(worker_inspect.get("State", {}).get("Pid", 0))
+        if worker_host_pid <= 0:
+            raise RuntimeError("kind worker has no live host PID for cgroup quota verification")
+        self.host_cpu_max_ancestry(worker_host_pid, "kind worker host PID live")
+        for record in runtime:
+            inspected = json.loads(invoke([self.docker, "exec", self.c["worker_container"],
+                                           "crictl", "inspect", record["container_id"]]).stdout)
+            if int(inspected["info"]["pid"]) != record["pid"]:
+                raise RuntimeError(f"container {record['name']} process PID changed during measurement")
+            cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-eu", "-c",
+                              cpu_max_ancestry_script(record["pid"])]).stdout
+            verify_unlimited_cpu_max_ancestry(cpu_max, f"{record['name']} live")
+            worker_cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-eu", "-c",
+                                     cpu_max_ancestry_script(1)]).stdout
+            verify_unlimited_cpu_max_ancestry(worker_cpu_max, "worker PID 1 live")
+            cg = invoke([self.docker, "exec", self.c["worker_container"], "cat",
+                         f"/proc/{record['pid']}/cgroup"]).stdout.strip().splitlines()[-1]
+            cgroot = "/sys/fs/cgroup" + cg.split(":", 2)[2]
+            pids = set(invoke([self.docker, "exec", self.c["worker_container"], "cat",
+                               f"{cgroot}/cgroup.procs"]).stdout.split())
+            baseline_pids = {str(row["pid"]) for row in record["processes"]}
+            if not baseline_pids <= pids:
+                raise RuntimeError(f"container {record['name']} process set changed during measurement")
+            observed = []
+            for pid in sorted(pids):
+                cmd = (f"for f in /proc/{pid}/task/*/status; do "
+                       "tid=${f%/status}; tid=${tid##*/}; "
+                       "awk -v t=\"$tid\" '/^Name:/{n=$2}/^Cpus_allowed_list:/{print t, n, $2}' \"$f\"; done")
+                lines = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-c", cmd]).stdout.splitlines()
+                for line in lines:
+                    fields = line.split()
+                    if len(fields) != 3 or not fields[0].isdigit():
+                        raise RuntimeError(f"cannot verify live thread affinity for {record['name']}")
+                    observed.append((int(pid), int(fields[0]), fields[1], fields[2]))
+            expected = {(int(row["pid"]), int(row["tid"]), row["name"], row["allowed"])
+                        for row in record["processes"]}
+            if set(observed) != expected:
+                raise RuntimeError(f"container {record['name']} process/affinity changed during measurement")
+
+    def capture_resources(self, outdir: Path, phase: str, pids: dict[str, list[int]]) -> dict:
+        all_pids = sorted(set(pids["proxy"]) | set(pids["origin"]))
+        groups = {"proxy": set(pids["proxy"]), "origin": set(pids["origin"])}
+        if all_pids:
+            cases = " ".join(str(pid) for pid in all_pids)
+            script = (f"for bench_pid in {cases}; do "
+                      "roll=/proc/$bench_pid/smaps_rollup; "
+                      "[ -r $roll ] || { echo $bench_pid missing; continue; }; "
+                      "awk -v p=$bench_pid '/^Rss:/{r=$2}/^Pss:/{s=$2}END{print p,r,s}' $roll; done")
+            result = invoke([self.docker, "exec", self.c["worker_container"], "taskset", "-c",
+                             self.c["cpus"]["helpers"], "sh", "-c", script], check=False)
+            parsed = parse_smaps_rollup(all_pids, result.stdout, result.returncode)
+            process_rows = parsed["rows"]
+            command_returncode = parsed["command_returncode"]
+        else:
+            process_rows = []
+            command_returncode = 0
+            parsed = {"complete": False}
+        grouped = {}
+        for name, selected in groups.items():
+            rows = [row for row in process_rows if row["pid"] in selected]
+            complete = parsed["complete"] and bool(selected) and len(rows) == len(selected) and all(
+                row["rss_kb"] is not None and row["pss_kb"] is not None for row in rows)
+            grouped[name] = {"expected_process_count": len(selected), "process_count": len(rows),
+                             "rss_kb": sum(row["rss_kb"] for row in rows) if complete else None,
+                             "pss_kb": sum(row["pss_kb"] for row in rows) if complete else None,
+                             "complete": complete, "processes": rows}
+        record = {"phase": phase, **grouped, "command_returncode": command_returncode}
+        write_json(outdir / f"resources-{phase}.json", record)
+        return record
+
+    def client_is_running(self, target: Path) -> bool:
+        client_id_path = target / "container-id.txt"
+        if not client_id_path.is_file():
+            return False
+        client_id = client_id_path.read_text().strip()
+        running = invoke([self.docker, "inspect", "--format", "{{.State.Running}}", client_id], check=False)
+        return running.returncode == 0 and running.stdout.strip() == "true"
+
+    def verify_client_cpu_max(self, target: Path) -> list[dict[str, str]]:
+        client_id = (target / "container-id.txt").read_text().strip()
+        inspected = json.loads(invoke([self.docker, "inspect", client_id]).stdout)[0]
+        pid = int(inspected.get("State", {}).get("Pid", 0))
+        if pid <= 0 or not inspected.get("State", {}).get("Running"):
+            raise RuntimeError("wrk client has no live host PID for CPU quota verification")
+        output = invoke(["sh", "-eu", "-c", cpu_max_ancestry_script(pid)]).stdout
+        evidence = verify_unlimited_cpu_max_ancestry(output, "wrk client")
+        write_json(target / "client-cpu-max-ancestry.json", {"pid": pid, "ancestry": evidence})
+        return evidence
+
+    def verify_wrk_container_cleanup(self, target: Path) -> None:
+        identity_path = target / "container-id.txt"
+        if not identity_path.is_file():
+            return
+        container_id = identity_path.read_text().strip()
+        if not container_id:
+            raise RuntimeError(f"wrk driver recorded an empty container ID in {target}")
+        inspected = invoke([self.docker, "inspect", container_id], check=False, timeout=5)
+        if inspected.returncode:
+            if any(text in inspected.stdout.lower() for text in ("no such object", "no such container")):
+                return
+            raise RuntimeError(f"cannot verify wrk container cleanup for {container_id}: {inspected.stdout}")
+        try:
+            items = json.loads(inspected.stdout)
+        except (ValueError, TypeError) as error:
+            raise RuntimeError(f"cannot parse wrk container identity for {container_id}: {error}") from error
+        if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+            raise RuntimeError(f"cannot parse wrk container identity for {container_id}")
+        container = items[0]
+        if not isinstance(container.get("Config"), dict):
+            raise RuntimeError(f"wrk container has malformed labels for {container_id}")
+        labels = container.get("Config", {}).get("Labels") or {}
+        if not isinstance(labels, dict):
+            raise RuntimeError(f"wrk container has malformed labels for {container_id}")
+        if (container.get("Id") != container_id or
+                labels.get("app.kubernetes.io/managed-by") != "rut-proxy-benchmark" or
+                labels.get("benchmark-run-id") != self.c["run_id"] or
+                not labels.get("benchmark-create-attempt")):
+            raise RuntimeError(f"wrk container identity is not owned by this run: {container_id}")
+        removed = invoke([self.docker, "rm", "-f", container_id], check=False, timeout=5)
+        if removed.returncode and not any(text in removed.stdout.lower()
+                                          for text in ("no such object", "no such container")):
+            raise RuntimeError(f"cannot remove owned wrk container {container_id}: {removed.stdout}")
+        confirmed = invoke([self.docker, "inspect", container_id], check=False, timeout=5)
+        if confirmed.returncode == 0:
+            raise RuntimeError(f"owned wrk container remains after cleanup: {container_id}")
+        if not any(text in confirmed.stdout.lower() for text in ("no such object", "no such container")):
+            raise RuntimeError(f"cannot confirm wrk container removal {container_id}: {confirmed.stdout}")
+
+    def cancel_client_driver(self, child: subprocess.Popen, target: Path) -> None:
+        if child.poll() is None:
+            try:
+                child.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                output = child.communicate(timeout=10)[0]
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                try:
+                    output = child.communicate(timeout=5)[0]
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    output = child.communicate(timeout=5)[0]
+        else:
+            output = child.communicate()[0]
+        (target / "driver-cancel.log").write_text(output or "")
+        self.verify_wrk_container_cleanup(target)
+
+    @contextmanager
+    def client_driver_guard(self, child: subprocess.Popen, target: Path):
+        try:
+            yield
+        except BaseException as error:
+            try:
+                self.cancel_client_driver(child, target)
+            except Exception as cleanup_error:
+                if hasattr(error, "add_note"):
+                    error.add_note(f"client driver cleanup also failed: {cleanup_error}")
+            raise
+        else:
+            self.verify_wrk_container_cleanup(target)
+
+    def curl(self, pod_ip: str, outdir: Path, body: str, *, marker: str | None = None, many: bool = False) -> None:
+        validate_docker_mount_source(outdir.resolve(), "cell output")
+        client_cpus = self.c["cpus"]["client"]
+        image = self.c["image_identities"]["client"]["docker_id"]
+        attempt_id = uuid.uuid4().hex
+        run_id = self.c.get("run_id", "run")
+        owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                        "benchmark-run-id": run_id,
+                        "benchmark-create-attempt": attempt_id}
+        name = f"proxybench-preflight-{run_id}-{attempt_id[:12]}"
+        argv = [self.docker, "run", "--rm", "--name", name,
+                *[part for key, value in owner_labels.items() for part in ("--label", f"{key}={value}")],
+                "--security-opt", "label=disable", "--network",
+                f"container:{self.c['worker_container']}", "--cpuset-cpus", client_cpus,
+                "--mount", f"type=bind,src={outdir},dst=/out", "--entrypoint", "curl", image,
+                "--http1.1", "--fail", "--silent", "--show-error", "-H", "Host: client.example",
+                "--connect-timeout", "2", "--max-time", "5", "-H", "Connection: keep-alive"]
+        url = ip_url(pod_ip, 8080, "/proxy")
+        if marker:
+            argv += ["-H", f"X-Rut-Benchmark-Preflight: {marker}"]
+        if many:
+            for _ in range(100):
+                argv += ["--output", "/dev/null", "--write-out", "%{http_version} %{http_code} %{size_download} %{num_connects}\\n", url]
+            (outdir / "keepalive-preflight-command.json").write_text(json.dumps(argv, indent=2) + "\n")
+            result = self.run_owned_probe(argv, name, owner_labels, timeout=180)
+            (outdir / "keepalive-preflight.log").write_text(result.stdout)
+            lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
+            if len(lines) != 100 or any(len(line) != 4 or line[:2] != ["1.1", "200"] or int(line[2]) != SIZES[body] for line in lines):
+                raise RuntimeError(f"HTTP/1.1 100-response preflight failed: {result.stdout[:1200]}")
+            if int(lines[0][3]) != 1 or any(int(line[3]) != 0 for line in lines[1:]):
+                raise RuntimeError("downstream keepalive preflight used more than one connection")
+            return
+        argv += ["-D", "/out/response.headers", "-o", "/out/response.bin", "-w", "%{http_version} %{http_code} %{size_download}\\n", url]
+        (outdir / "byte-preflight-command.json").write_text(json.dumps(argv, indent=2) + "\n")
+        result = self.run_owned_probe(argv, name, owner_labels, timeout=30)
+        (outdir / "byte-preflight-status.txt").write_text(result.stdout)
+        expected = Path(self.c["checkpoint"]) / "payloads" / body / "proxy"
+        response = outdir / "response.bin"
+        if result.stdout.strip() != f"1.1 200 {expected.stat().st_size}" or self.file_sha(response) != self.file_sha(expected):
+            raise RuntimeError("HTTP/1.1 byte/hash preflight failed")
+        (outdir / "response.sha256").write_text(self.file_sha(response) + "\n")
+
+    def run_cell(self, body: str, engine: str, rep: int) -> Path:
+        verify_artifacts(self.c)
+        verify_payloads(self.c)
+        verify_provenance(self.c)
+        label = f"{body}-{engine}-r{rep}"
+        pod_name = f"proxybench-{self.c['run_id']}-{body}-{rep}-{engine}"
+        outdir = self.samples / body / label
+        outdir.mkdir(parents=True, exist_ok=False)
+        manifest = pod_spec({**self.c, "pod_create_attempt": self.pod_create_attempt}, engine, body, pod_name)
+        pod_path = outdir / "pod.json"
+        write_json(outdir / "pod.yaml", manifest)  # JSON is a valid Kubernetes YAML document.
+        created = self.kube("create", "-f", str(outdir / "pod.yaml"))
+        (outdir / "pod-create.txt").write_text(created.stdout)
+        ready = self.kube("wait", "--for=condition=Ready", f"pod/{pod_name}", "-n", self.c["namespace"], "--timeout=180s", timeout=190)
+        (outdir / "pod-ready.txt").write_text(ready.stdout)
+        fetched = self.kube("get", "pod", pod_name, "-n", self.c["namespace"], "-o", "json")
+        pod_path.write_text(fetched.stdout)
+        pod = json.loads(fetched.stdout)
+        pod_ip = pod["status"]["podIP"]
+        client_ip = select_ipv4_pod_ip(pod["status"])
+        (outdir / "pod-ip.txt").write_text(pod_ip + "\n")
+        (outdir / "client-ip.txt").write_text(client_ip + "\n")
+        self.wait_frontend(client_ip)
+        resource_pids = self.inspect_runtime(engine, outdir)
+        resource_records = [self.capture_resources(outdir, "idle", resource_pids)]
+
+        before = self.metric(pod_name, outdir, "before") if engine == "linkerd" else None
+        self.curl(client_ip, outdir, body)
+        marker = origin_preflight_marker(body, engine, rep)
+        if marker:
+            self.curl(client_ip, outdir, body, marker=marker, many=True)
+            origin_log = self.kube("logs", pod_name, "-n", self.c["namespace"], "-c", "origin").stdout
+            (outdir / "origin-100-request-preflight.log").write_text(origin_log)
+            tagged = [line for line in origin_log.splitlines() if f"marker={marker}" in line]
+            connections, requests, protocols = set(), [], set()
+            for line in tagged:
+                match = re.search(r"connection=(\d+) requests=(\d+) protocol=([^ ]+)", line)
+                if not match:
+                    raise RuntimeError(f"cannot parse origin marker: {line}")
+                connections.add(match.group(1)); requests.append(int(match.group(2))); protocols.add(match.group(3))
+            sequential = len(requests) == 100 and sorted(requests) == list(range(min(requests), min(requests) + 100))
+            if len(tagged) != 100 or len(connections) != 1 or not sequential or protocols != {"HTTP/1.1"}:
+                raise RuntimeError("origin HTTP/1.1 keepalive preflight failed")
+            write_json(outdir / "origin-100-request-preflight-summary.json",
+                       {"requests_logged": len(tagged), "connections": sorted(connections), "protocols": sorted(protocols)})
+        if engine == "linkerd":
+            after = self.metric(pod_name, outdir, "after")
+            target = ip_authority(client_ip, 8080)
+            if self.inbound_requests(after, target) <= self.inbound_requests(before, target):
+                raise RuntimeError(f"Linkerd inbound request_total did not increase for {target}")
+
+        if engine.startswith("rut-"):
+            server = self.kube("logs", pod_name, "-n", self.c["namespace"], "-c", "frontend").stdout
+            (outdir / "frontend-server.log").write_text(server)
+            if "Backend: io_uring" not in server or "Listening" not in server:
+                raise RuntimeError("Rut did not prove io_uring backend/listening")
+        else:
+            containers = ("linkerd-proxy", "origin") if engine == "linkerd" else ("frontend", "origin")
+            for container in containers:
+                logs = self.kube("logs", pod_name, "-n", self.c["namespace"], "-c", container, check=False)
+                (outdir / f"{container}-server.log").write_text(logs.stdout)
+
+        write_json(outdir / "cell.json", {"body": body, "engine": engine, "rep": rep, "pod_ip": pod_ip,
+                   "client_ip": client_ip,
+                   "duration": self.c["duration"], "warmup": self.c["warmup"], "concurrency": self.c["concurrency"],
+                   "proxy_cpu": self.c["cpus"]["proxy"], "origin_cpus": self.c["cpus"]["origin"],
+                   "client_cpus": self.c["cpus"]["client"], "route_config": "proxy-rps.rut" if engine == "rut-rps" else "proxy-throughput.rut" if engine == "rut-throughput" else None,
+                   "provenance_fingerprint": provenance_fingerprint(self.c)})
+        client = Path(__file__).with_name("run_client.py")
+        for kind, duration, lua, target in (("warmup", self.c["warmup"], "warmup.lua", outdir / "warmup"),
+                                            ("measurement", self.c["duration"], "request.lua", outdir / "measurement")):
+            argv = self.client_argv(client, f"{label}-{kind}", client_ip, duration, lua, target)
+            (outdir / f"{kind}-driver-command.json").write_text(json.dumps(argv, indent=2) + "\n")
+            child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            measure_start = None
+            client_running = False
+            client_cpu_checked = False
+            next_state_check = time.monotonic()
+            next_snapshot = 2.0
+            measurement_duration = duration_seconds(self.c["duration"])
+            with self.client_driver_guard(child, target):
+                while child.poll() is None:
+                    now = time.monotonic()
+                    if kind == "measurement" and now >= next_state_check:
+                        client_running = self.client_is_running(target)
+                        stamp = target / "measurement-start-monotonic.txt"
+                        if client_running and measure_start is None and stamp.is_file():
+                            measure_start = float(stamp.read_text().strip())
+                        if kind == "measurement" and measurement_client_cpu_check_due(
+                                client_running, client_cpu_checked):
+                            self.verify_client_cpu_max(target)
+                            client_cpu_checked = True
+                        next_state_check = now + 0.5
+                    if kind == "measurement" and measure_start is not None:
+                        elapsed = now - measure_start
+                        if (client_running and elapsed < measurement_duration and elapsed >= next_snapshot and
+                                len([r for r in resource_records if r["phase"].startswith("under-load")]) < 3):
+                            sample_no = len([r for r in resource_records if r["phase"].startswith("under-load")]) + 1
+                            snapshot_start = time.monotonic()
+                            running_before = self.client_is_running(target)
+                            client_cpu_max = self.verify_client_cpu_max(target) if running_before else []
+                            resource = self.capture_resources(outdir, f"under-load-{sample_no}", resource_pids)
+                            snapshot_end = time.monotonic()
+                            running_after = self.client_is_running(target)
+                            start_elapsed = snapshot_start - measure_start
+                            end_elapsed = snapshot_end - measure_start
+                            in_window = (running_before and running_after and bool(client_cpu_max) and start_elapsed >= 0 and
+                                         end_elapsed <= measurement_duration)
+                            resource["measurement_window_start_elapsed_sec"] = round(start_elapsed, 3)
+                            resource["measurement_window_end_elapsed_sec"] = round(end_elapsed, 3)
+                            resource["client_state_running_before"] = running_before
+                            resource["client_state_running_after"] = running_after
+                            resource["snapshot_valid"] = in_window and all(resource[role]["complete"] for role in ("proxy", "origin"))
+                            if not resource["snapshot_valid"]:
+                                for role in ("proxy", "origin"):
+                                    resource[role]["complete"] = False
+                                    resource[role]["rss_kb"] = None
+                                    resource[role]["pss_kb"] = None
+                            write_json(outdir / f"resources-under-load-{sample_no}.json", resource)
+                            resource_records.append(resource)
+                            next_snapshot += 3.0
+                    time.sleep(0.2)
+                driver_output = child.communicate()[0]
+            (outdir / f"{kind}-driver.log").write_text(driver_output)
+            if child.returncode:
+                raise RuntimeError(f"{kind} wrk returned {child.returncode}; see {target}")
+            if kind == "measurement" and not client_cpu_checked:
+                raise RuntimeError("measurement client ended without verified CPU quota ancestry")
+            if kind == "warmup":
+                resource_records.append(self.capture_resources(outdir, "after-warmup", resource_pids))
+            log = (target / "wrk.log").read_text()
+            if (target / "returncode.txt").read_text().strip() != "0":
+                raise RuntimeError(f"invalid wrk return code in {target}")
+            try:
+                parse_wrk_metrics(log)
+            except ValueError as error:
+                raise RuntimeError(f"invalid wrk metrics in {target}: {error}") from error
+        verify_artifacts(self.c)
+        verify_payloads(self.c)
+        verify_provenance(self.c)
+        final = self.kube("get", "pod", pod_name, "-n", self.c["namespace"], "-o", "json")
+        runtime = json.loads((outdir / "container-runtime.json").read_text())
+        verify_pod_runtime_stable(pod, json.loads(final.stdout), runtime)
+        self.verify_live_runtime(runtime)
+        under_load = [row for row in resource_records if row["phase"].startswith("under-load")]
+        write_json(outdir / "resources-summary.json", {
+            "frontend_executables": json.loads((outdir / "frontend-executables.json").read_text()),
+            "mapped_shared_objects": json.loads((outdir / "mapped-shared-objects.json").read_text()),
+            "idle": {name: next((row[name] for row in resource_records if row["phase"] == "idle"), None) for name in ("proxy", "origin")},
+            "after_warmup": {name: next((row[name] for row in resource_records if row["phase"] == "after-warmup"), None) for name in ("proxy", "origin")},
+            "under_load_samples": under_load,
+            "sampling_complete": (len(under_load) == 3 and all(row.get("snapshot_valid", False) for row in under_load) and
+                                  all(row[role]["complete"] for row in resource_records if row["phase"] in ("idle", "after-warmup") for role in ("proxy", "origin"))),
+            "expected_under_load_samples": 3,
+            "observed_under_load_samples": len(under_load),
+        })
+        delete_details = cleanup_cell_pod(self, self.c,
+                                          {"body": body, "engine": engine, "rep": rep},
+                                          expected_uid=pod.get("metadata", {}).get("uid"),
+                                          require_owned=True)
+        (outdir / "pod-delete.txt").write_text(delete_details)
+        (outdir / "valid.txt").write_text("warmup and measurement valid; error counters 0\n")
+        return outdir
+
+
+def plan(repeats: int = 3) -> list[dict]:
+    schedules = {
+        "4k": [["linkerd", "rut-rps", "nginx", "envoy"], ["envoy", "nginx", "rut-rps", "linkerd"], ["nginx", "linkerd", "envoy", "rut-rps"]],
+        "64k": [["linkerd", "rut-throughput", "nginx", "envoy"], ["envoy", "nginx", "rut-throughput", "linkerd"], ["nginx", "linkerd", "envoy", "rut-throughput"]],
+        "256k": [["linkerd", "rut-throughput", "nginx", "envoy"], ["envoy", "nginx", "rut-throughput", "linkerd"], ["nginx", "linkerd", "envoy", "rut-throughput"]],
+        "1m": [["linkerd", "rut-throughput", "nginx", "envoy"], ["envoy", "nginx", "rut-throughput", "linkerd"], ["nginx", "linkerd", "envoy", "rut-throughput"]],
+    }
+    if repeats < 1:
+        raise ValueError("repeats must be positive")
+    return [{"body": body, "engine": engine, "rep": rep}
+            for body, rounds in schedules.items() for rep in range(1, repeats + 1)
+            for engine in rounds[(rep - 1) % len(rounds)]]
+
+
+def origin_preflight_marker(body: str, engine: str, rep: int) -> str | None:
+    if rep == 1 and (body == "4k" or engine == "rut-throughput"):
+        return f"{engine}-{body}-r{rep}"
+    return None
+
+
+def verify_artifacts(config: dict) -> None:
+    for name, artifact in config["artifacts"].items():
+        path = Path(artifact["path"])
+        if path.is_symlink():
+            raise RuntimeError(f"recorded artifact is a symlink: {name}: {path}")
+        if not path.is_file():
+            raise RuntimeError(f"recorded artifact is missing: {name}: {path}")
+        if not os.access(path, os.X_OK):
+            raise RuntimeError(f"recorded artifact is not executable: {name}: {path}")
+        actual = Matrix.file_sha(path)
+        if actual != artifact["sha256"]:
+            raise RuntimeError(f"recorded artifact hash mismatch for {name}: expected {artifact['sha256']}, got {actual}")
+
+
+def image_identity_matches(actual: str, expected: dict) -> bool:
+    actual_id = actual.rsplit("://", 1)[-1]
+    expected_id = expected.get("worker_id", "")
+    if expected_id and (actual_id == expected_id or actual_id.endswith(expected_id)):
+        return True
+    if "@" in actual_id:
+        actual_digest = actual_id.rsplit("@", 1)[-1]
+        return any("@" in candidate and candidate.rsplit("@", 1)[-1] == actual_digest
+                   for candidate in expected.get("worker_repo_digests", []))
+    return False
+
+
+def pod_runtime_statuses(pod: dict) -> dict:
+    statuses = pod.get("status", {}).get("containerStatuses", []) + pod.get("status", {}).get("initContainerStatuses", [])
+    return {item.get("name"): (item.get("containerID", "").split("://", 1)[-1], item.get("imageID", ""),
+                                int(item.get("restartCount", 0))) for item in statuses}
+
+
+def verify_pod_runtime_stable(initial: dict, final: dict, runtime: list[dict]) -> None:
+    before, after = pod_runtime_statuses(initial), pod_runtime_statuses(final)
+    for record in runtime:
+        name = record["name"]
+        expected = (record["container_id"], record["image_id"], record.get("restart_count", 0))
+        if before.get(name) != expected or after.get(name) != expected:
+            raise RuntimeError(f"container {name} identity/restart state changed during measurement")
+    # Every runtime process and its captured affinity must still be present in the
+    # original container record; inspect_runtime records the PID and per-thread masks.
+    if not runtime or any(not item.get("pid") or not item.get("processes") for item in runtime):
+        raise RuntimeError("runtime process/affinity baseline is incomplete")
+
+
+def expected_container_identity(name: str, image: str, identities: dict) -> dict | None:
+    if name == "linkerd-proxy":
+        return identities.get("linkerd_proxy")
+    return next((value for value in identities.values() if value["reference"] == image), None)
+
+
+def verify_status_image_identity(name: str, image: str, actual: str, identities: dict) -> None:
+    identity = expected_container_identity(name, image, identities)
+    if (name in {"origin", "frontend", "linkerd-proxy"} or name.startswith("linkerd-")) and not identity:
+        raise RuntimeError(f"prepared {name} image identity missing")
+    if identity and not image_identity_matches(actual, identity):
+        raise RuntimeError(f"{name} image identity changed: {actual}")
+
+
+def verify_effective_paths(config: dict) -> None:
+    snapshot_paths = {name: Path(entry["path"]).resolve(strict=True)
+                      for name, entry in config["input_snapshot"].items()}
+    path_snapshots = {
+        "client_dir": "client_dir",
+        "rut_config_dir": "rut_config_dir",
+        "runtime_libs": "runtime_libs",
+        "clang": "clang",
+        "ld": "ld",
+    }
+    for path_key, snapshot_name in path_snapshots.items():
+        actual = config.get("client_dir") if path_key == "client_dir" else config.get("paths", {}).get(path_key)
+        if actual is None or snapshot_name not in snapshot_paths or Path(actual).resolve(strict=True) != snapshot_paths[snapshot_name]:
+            raise RuntimeError(f"effective benchmark path {path_key} differs from its prepared input snapshot")
+    artifacts = config.get("artifacts", {})
+    for path_key, artifact_key in (("rut_rps", "rut_rps"),
+                                   ("rut_throughput", "rut_throughput")):
+        binary_dir = config.get("paths", {}).get(path_key)
+        artifact = artifacts.get(artifact_key, {})
+        artifact_path = artifact.get("path")
+        if (binary_dir is None or artifact_path is None or
+                (Path(binary_dir) / "rut").resolve(strict=True) != Path(artifact_path).resolve(strict=True)):
+            raise RuntimeError(f"effective benchmark path {path_key} differs from its prepared artifact")
+    compiler_artifacts = (("rut_rps", "rut_rps_compiler"),
+                          ("rut_throughput", "rut_throughput_compiler"))
+    for path_key, artifact_key in compiler_artifacts:
+        binary_dir = config["paths"][path_key]
+        artifact_path = artifacts[artifact_key]["path"]
+        if (Path(binary_dir) / "rut-compile").resolve(strict=True) != Path(artifact_path).resolve(strict=True):
+            raise RuntimeError(f"effective benchmark path {path_key}/rut-compile differs from its prepared artifact")
+
+
+def verify_worker_mount(config: dict, docker: str) -> None:
+    worker = json.loads(invoke([docker, "inspect", config["worker_container"]]).stdout)[0]
+    checkpoint = Path(config["checkpoint"]).resolve(strict=True)
+    if not any(Path(mount["Source"]).resolve() == checkpoint and
+               mount.get("Destination") == config["node_mount"]
+               for mount in worker.get("Mounts", [])):
+        raise RuntimeError("kind worker checkpoint mount differs from prepared node_mount")
+
+
+def verify_provenance(config: dict) -> None:
+    if "input_snapshot" not in config or "image_identities" not in config:
+        raise RuntimeError("benchmark config lacks input/image provenance; rerun prepare.py")
+    # The snapshot must identify the code that will actually execute this
+    # matrix. Otherwise a checkpoint prepared by one checkout could be resumed
+    # with another checkout while only the former's files are rehashed.
+    driver_sources = {
+        "benchmark_common": Path(sys.modules["common"].__file__).resolve(),
+        "benchmark_driver": Path(__file__).with_name("run_client.py").resolve(),
+        "benchmark_matrix": Path(__file__).resolve(),
+    }
+    snapshot = config["input_snapshot"]
+    present = driver_sources.keys() & snapshot.keys()
+    if present != driver_sources.keys():
+        raise RuntimeError("benchmark config has incomplete driver source provenance; rerun prepare.py")
+    for name, actual_path in driver_sources.items():
+        if name in snapshot and Path(snapshot[name]["path"]).resolve() != actual_path:
+            raise RuntimeError(f"current benchmark {name} differs from prepared driver source")
+    verify_effective_paths(config)
+    try:
+        current_snapshot = snapshot_inputs({name: entry["path"]
+                                            for name, entry in config["input_snapshot"].items()})
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"cannot validate mounted benchmark inputs: {error}") from error
+    if current_snapshot != config["input_snapshot"]:
+        raise RuntimeError("mounted benchmark inputs changed since prepare.py")
+    verify_configmaps(config)
+    docker = config["tools"]["docker"]
+    verify_worker_mount(config, docker)
+    for name, identity in config["image_identities"].items():
+        if identity.get("docker_id"):
+            actual = invoke([docker, "image", "inspect", "--format", "{{.Id}}", identity["reference"]]).stdout.strip()
+            if actual != identity["docker_id"]:
+                raise RuntimeError(f"Docker image identity changed for {name}: expected {identity['docker_id']}, got {actual}")
+    inventory = json.loads(invoke([docker, "exec", config["worker_container"], "crictl", "images", "-o", "json"]).stdout)
+    images = inventory.get("images", [])
+    for name, identity in config["image_identities"].items():
+        expected_id = identity.get("worker_id")
+        if not expected_id:
+            raise RuntimeError(f"prepared worker image identity missing for {name}")
+        matches = [image for image in images
+                   if any(image_reference_matches(identity["reference"], candidate)
+                          for candidate in (image.get("repoTags") or []) + (image.get("repoDigests") or []))]
+        ids = {image.get("id") for image in matches if image.get("id")}
+        if ids != {expected_id}:
+            raise RuntimeError(f"kind worker image identity changed for {name}: expected {expected_id}, got {sorted(ids)}")
+    verify_client_image_config_identity(config["image_identities"].get("client", {}))
+
+
+def verify_configmaps(config: dict) -> None:
+    expected = config.get("configmap_identities")
+    if not expected:
+        return
+    for name, identity in expected.items():
+        result = invoke([config["tools"]["kubectl"], "--kubeconfig", config["kubeconfig"],
+                         "get", "configmap", config["configmaps"][name], "-n", config["namespace"], "-o", "json"])
+        actual = json.loads(result.stdout)
+        if (actual.get("metadata", {}).get("uid") != identity.get("uid") or
+                actual.get("data") != identity.get("data") or actual.get("immutable") is not True):
+            raise RuntimeError(f"ConfigMap identity or data changed for {name}")
+
+
+def cleanup_cell_pod(matrix: Matrix, config: dict, cell: dict, *,
+                     expected_uid: str | None = None, require_owned: bool = False) -> str:
+    pod_name = f"proxybench-{config['run_id']}-{cell['body']}-{cell['rep']}-{cell['engine']}"
+    fetched = matrix.kube("get", "pod", pod_name, "-n", config["namespace"], "-o", "json", check=False)
+    if fetched.returncode:
+        details = f"ownership lookup failed ({fetched.returncode}): {fetched.stdout}"
+        if require_owned:
+            raise RuntimeError(details)
+        return details
+    pod = json.loads(fetched.stdout)
+    metadata = pod.get("metadata", {})
+    labels = metadata.get("labels", {})
+    owned = (metadata.get("name") == pod_name and metadata.get("namespace") == config["namespace"] and
+             labels.get("app.kubernetes.io/managed-by") == "rut-proxy-benchmark" and
+             labels.get("benchmark-run-id") == config["run_id"] and
+             labels.get("benchmark-create-attempt") == matrix.pod_create_attempt)
+    outdir = matrix.samples / cell["body"] / f"{cell['body']}-{cell['engine']}-r{cell['rep']}"
+    pod_path = outdir / "pod.json"
+    if expected_uid is None and pod_path.is_file():
+        expected_uid = json.loads(pod_path.read_text()).get("metadata", {}).get("uid")
+    actual_uid = metadata.get("uid")
+    if expected_uid and actual_uid != expected_uid:
+        owned = False
+    if not owned or not actual_uid:
+        details = f"pod not deleted: ownership or UID mismatch (uid={actual_uid!r})"
+        if require_owned:
+            raise RuntimeError(details)
+        return details
+    selector = (f"app.kubernetes.io/managed-by=rut-proxy-benchmark,"
+                f"benchmark-run-id={config['run_id']},"
+                f"benchmark-create-attempt={matrix.pod_create_attempt}")
+    cleanup = matrix.kube("delete", "pod", "-n", config["namespace"], "-l", selector,
+                          "--field-selector", f"metadata.name={pod_name}",
+                          "--grace-period=1", "--wait=true",
+                          check=require_owned, timeout=90)
+    if cleanup.returncode:
+        details = f"delete failed ({cleanup.returncode}): {cleanup.stdout}"
+        if require_owned:
+            raise RuntimeError(details)
+        return details
+    return cleanup.stdout
+
+
+def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: BaseException) -> str:
+    try:
+        details = cleanup_cell_pod(matrix, config, cell)
+    except Exception as cleanup_error:
+        details = f"cleanup command failed: {cleanup_error}"
+    write_json(matrix.samples / "last-failure.json",
+               {"cell": cell, "error": str(error), "cleanup": details})
+    return details
+
+
+def archive_interrupted_cell_output(matrix: Matrix, cell: dict) -> Path | None:
+    label = f"{cell['body']}-{cell['engine']}-r{cell['rep']}"
+    partial = matrix.samples / cell["body"] / label
+    if not partial.exists():
+        return None
+    archive_dir = matrix.samples / "interrupted"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived = archive_dir / f"{label}-{uuid.uuid4().hex}"
+    os.replace(partial, archived)
+    failure_path = matrix.samples / "last-failure.json"
+    if failure_path.is_file():
+        details = json.loads(failure_path.read_text())
+        details["interrupted_output"] = str(archived.relative_to(matrix.out))
+        write_json(failure_path, details)
+    return archived
+
+
+def write_index_atomic(path: Path, index: list[dict]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(index, indent=2) + "\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def run_cell_and_index(matrix: Matrix, config: dict, cell: dict,
+                       index_path: Path, index: list[dict]) -> Path:
+    try:
+        result = run_cell_with_cleanup(matrix, config, cell)
+        rel = lambda path: str(path.relative_to(matrix.out))
+        index.append({"body_size": cell["body"], "engine": cell["engine"], "rep": cell["rep"],
+                      "warmup_dir": rel(result / "warmup"), "measure_dir": rel(result / "measurement"),
+                      "valid": True, "validation_path": rel(result / "valid.txt")})
+        write_index_atomic(index_path, index)
+        return result
+    except TerminatedBySignal as error:
+        on_disk = json.loads(index_path.read_text()) if index_path.is_file() else []
+        key = (cell["body"], cell["engine"], cell["rep"])
+        indexed = any((row.get("body_size"), row.get("engine"), row.get("rep")) == key for row in on_disk)
+        if not indexed:
+            archived = archive_interrupted_cell_output(matrix, cell)
+            if not (matrix.samples / "last-failure.json").is_file():
+                write_json(matrix.samples / "last-failure.json",
+                           {"cell": cell, "error": str(error), "cleanup": "cell interrupted after Pod cleanup",
+                            "interrupted_output": (str(archived.relative_to(matrix.out)) if archived else None)})
+        raise
+
+
+def run_cell_with_cleanup(matrix: Matrix, config: dict, cell: dict) -> Path:
+    try:
+        return matrix.run_cell(cell["body"], cell["engine"], cell["rep"])
+    except KeyboardInterrupt as error:
+        cleanup_failed_cell(matrix, config, cell, error)
+        raise
+    except Exception as error:
+        cleanup_failed_cell(matrix, config, cell, error)
+        raise
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True, help="benchmark.json from prepare.py")
+    parser.add_argument("--limit", type=int, default=0, help="optional number of new cells for a smoke run")
+    args = parser.parse_args()
+    config = load_config(args.config)
+    if not config.get("verified_cluster_checks") or not config.get("configmaps_applied"):
+        parser.error("run prepare.py --verify-cluster --apply-configmaps before measurement")
+    verify_artifacts(config)
+    verify_payloads(config)
+    verify_provenance(config)
+    matrix = Matrix(config, args.config.resolve())
+    matrix.samples.mkdir(parents=True, exist_ok=True)
+    matrix.freeze_client_config()
+    plan_path = matrix.samples / "schedule.json"
+    work = plan(int(config["repeats"]))
+    if plan_path.exists() and json.loads(plan_path.read_text()) != work:
+        raise RuntimeError("existing run schedule does not match the selected benchmark")
+    write_json(plan_path, work)
+    index_path = matrix.samples / "index.json"
+    index = json.loads(index_path.read_text()) if index_path.exists() else []
+    keys = {(row["body_size"], row["engine"], row["rep"]) for row in index}
+    completed = 0
+    for i, cell in enumerate(work, 1):
+        key = (cell["body"], cell["engine"], cell["rep"])
+        if key in keys:
+            continue
+        if args.limit and completed >= args.limit:
+            break
+        label = f"{cell['body']}-{cell['engine']}-r{cell['rep']}"
+        expected = matrix.samples / cell["body"] / label
+        if expected.exists():
+            raise RuntimeError(f"partial output already exists; inspect and move it before resuming: {expected}")
+        print(f"START {i}/{len(work)} {label}", flush=True)
+        result = run_cell_and_index(matrix, config, cell, index_path, index)
+        keys.add(key); completed += 1
+        print(f"DONE {i}/{len(work)} {result}", flush=True)
+    write_json(matrix.samples / "completed.json", {"count": len(index), "complete": len(index) == len(work)})
+    return 0
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    try:
+        raise SystemExit(main())
+    except TerminatedBySignal as error:
+        print(f"run_matrix: {error}", file=sys.stderr)
+        raise SystemExit(128 + error.signum)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"run_matrix: {error}", file=sys.stderr)
+        raise SystemExit(2)

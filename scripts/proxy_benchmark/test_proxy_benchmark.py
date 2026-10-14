@@ -1,0 +1,2335 @@
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+import common
+import collect_runtime_libs
+import prepare
+import run_client
+import run_matrix
+import summarize
+
+
+def test_runtime_manifest(library_dir: Path, binaries: list[Path], libraries: list[Path] | None = None) -> None:
+    libraries = libraries or []
+    manifest = {
+        "schema": 1,
+        "binaries": [{"path": str(path.resolve()), "bytes": path.stat().st_size,
+                      "sha256": common.sha256(path), "dependencies": []} for path in binaries],
+        "libraries": [{"soname": path.name, "bytes": path.stat().st_size,
+                       "sha256": common.sha256(path)} for path in libraries],
+    }
+    (library_dir / "runtime-libs.json").write_text(json.dumps(manifest))
+
+
+class ProxyBenchmarkTests(unittest.TestCase):
+    def test_payload_matches_native_streaming_fixture(self):
+        known_sha = {
+            "4k": "1c5d61d93c7f698d07b9214c78c07d59cc268ce4acdcce696f73fb40d208f17d",
+            "64k": "0b4eedd2bd10476fb32848ab25484834e80cd7b583fae6f2bdcbdf2286bb6226",
+            "256k": "c82bc5892ddae66cd45bf3beb38cedc385943477771fcf970370abb3efc97788",
+            "1m": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+        }
+        for label, size in prepare.SIZES.items():
+            with self.subTest(body=label):
+                actual = prepare.native_body(size)
+                self.assertEqual(len(actual), size)
+                self.assertEqual(hashlib.sha256(actual).hexdigest(), known_sha[label])
+
+    def test_cpu_masks_are_binary_and_select_one_cpu(self):
+        for cpu in (2, 3, 8, 14):
+            mask = prepare.mask(cpu)
+            self.assertEqual(len(mask), 64)
+            self.assertEqual(mask.count("1"), 1)
+            self.assertEqual(mask[-1 - cpu], "1")
+            self.assertTrue(set(mask) <= {"0", "1"})
+
+    def test_cpu_affinity_lists_compare_as_sets_and_canonicalize_adjacent_helpers(self):
+        self.assertEqual(common.cpu_set("3,4,8,9"), common.cpu_set("3-4,8-9"))
+        self.assertNotEqual(common.cpu_set("3-4,8-9"), common.cpu_set("3-4,8-10"))
+        self.assertEqual(prepare.cpus("3-4,8-9", 4, "--origin-cpus"), [3, 4, 8, 9])
+        self.assertEqual(common.canonical_cpu_list({6, 7, 14}), "6-7,14")
+        helper_script = prepare.helper_verify_script([6, 7, 14], False)
+        self.assertIn("expected='6-7,14'", helper_script)
+        self.assertIn('"$allowed" != "$expected"', helper_script)
+
+    def test_wrk_duration_parser_matches_positive_integer_s_m_h_syntax(self):
+        for value, seconds in (("1s", 1), ("2m", 120), ("1h", 3600), ("12s", 12)):
+            with self.subTest(value=value):
+                self.assertEqual(common.duration_seconds(value), seconds)
+        for value in ("0s", "0m", "1.5s", "500ms", "1d", "-1s"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                common.duration_seconds(value)
+
+    def test_ip_authorities_and_urls_cover_ipv4_and_compressed_ipv6(self):
+        self.assertEqual(common.ip_authority("10.0.0.2", 8080), "10.0.0.2:8080")
+        self.assertEqual(common.ip_authority("2001:0db8:0:0::2", 8080), "[2001:db8::2]:8080")
+        self.assertEqual(common.ip_url("2001:db8::2", 8080, "/proxy"),
+                         "http://[2001:db8::2]:8080/proxy")
+        metric = 'request_total{direction="inbound",target_addr="[2001:db8::2]:8080"} 7'
+        self.assertEqual(run_matrix.Matrix.inbound_requests(metric, "[2001:db8::2]:8080"), 7)
+        with self.assertRaises(ValueError):
+            common.ip_authority("not-an-ip", 8080)
+
+    def test_benchmark_requires_ipv4_pod_cidr_and_selects_ipv4_from_dual_stack_pod(self):
+        self.assertIsNone(common.ipv4_pod_cidr({"spec": {"podCIDRs": ["fd00::/64"]}}))
+        self.assertEqual(common.ipv4_pod_cidr({"spec": {"podCIDRs": ["fd00::/64", "10.244.0.0/16"]}}),
+                         "10.244.0.0/16")
+        status = {"podIP": "fd00::12", "podIPs": [{"ip": "fd00::12"}, {"ip": "10.244.1.12"}]}
+        self.assertEqual(common.select_ipv4_pod_ip(status), "10.244.1.12")
+        self.assertEqual(common.select_ipv4_pod_ip({"podIP": "10.244.1.12"}), "10.244.1.12")
+        with self.assertRaisesRegex(ValueError, "no IPv4 address"):
+            common.select_ipv4_pod_ip({"podIP": "fd00::12", "podIPs": [{"ip": "fd00::12"}]})
+
+    def test_wrk_metrics_reject_zero_requests_elapsed_and_errors(self):
+        self.assertEqual(common.parse_wrk_metrics("METRICS 2 100 1 2 3 0 0 0 0 0\n")["requests"], 2)
+        for line in ("METRICS 0 100 1 2 3 0 0 0 0 0",
+                     "METRICS 2 0 1 2 3 0 0 0 0 0",
+                     "METRICS 2 100 1 2 3 0 0 0 1 0",
+                     "METRICS 2 nope 1 2 3 0 0 0 0 0"):
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                common.parse_wrk_metrics(line)
+
+    def test_worker_effective_cpuset_must_contain_all_assigned_benchmark_cpus(self):
+        with mock.patch("prepare.run", return_value="2-9,14\n") as run:
+            self.assertEqual(prepare.verify_worker_cpu_set("docker", "worker", {2, 3, 5, 9}),
+                             set(range(2, 10)) | {14})
+        self.assertEqual(run.call_args.args[0], ["docker", "exec", "worker", "sh", "-eu", "-c",
+                                                  "cat /sys/fs/cgroup/cpuset.cpus.effective"])
+        for value, assigned in (("2-8", {2, 9}), ("", {2}), ("bogus", {2})):
+            with mock.patch("prepare.run", return_value=value), self.subTest(value=value):
+                with self.assertRaises(RuntimeError):
+                    prepare.verify_worker_cpu_set("docker", "worker", assigned)
+
+    def test_image_reference_normalization_handles_docker_and_kubernetes_names(self):
+        self.assertTrue(common.image_reference_matches("nginx@sha256:abc", "docker.io/library/nginx@sha256:abc"))
+        self.assertTrue(common.image_reference_matches("client:local", "docker.io/library/client:local"))
+        self.assertFalse(common.image_reference_matches("client:local", "client:other"))
+        self.assertTrue(run_matrix.image_identity_matches(
+            "docker-pullable://docker.io/library/nginx@sha256:manifest",
+            {"worker_id": "sha256:config", "worker_repo_digests": ["nginx@sha256:manifest"]}))
+
+    def test_prepare_resolves_worker_images_through_cri_with_mocked_inventory(self):
+        identities = {
+            "nginx": {"reference": "nginx@sha256:abc"},
+            "client": {"reference": "client:local", "docker_id": "sha256:client"},
+        }
+        inventory = {"images": [
+            {"id": "sha256:nginx", "repoTags": [], "repoDigests": ["docker.io/library/nginx@sha256:abc"]},
+            {"id": "sha256:client", "repoTags": ["docker.io/library/client:local"], "repoDigests": []},
+        ]}
+        with mock.patch("prepare.run", return_value=json.dumps(inventory)) as run:
+            result = prepare.worker_image_identities("docker", "worker", identities)
+        self.assertEqual(result["nginx"]["worker_id"], "sha256:nginx")
+        self.assertEqual(result["client"]["worker_id"], "sha256:client")
+        self.assertEqual(run.call_args.args[0], ["docker", "exec", "worker", "crictl", "images", "-o", "json"])
+
+    def test_prepare_requires_matching_client_config_ids_not_repo_digests(self):
+        host_id = "sha256:" + "a" * 64
+        worker_id = " SHA256:" + "A" * 64 + " "
+        identities = {"client": {"reference": "client:local", "docker_id": host_id,
+                                  "repo_digests": ["client@sha256:host-manifest"]}}
+        inventory = {"images": [{"id": worker_id, "repoTags": ["client:local"],
+                                  "repoDigests": ["client@sha256:different-manifest"]}]}
+        with mock.patch("prepare.run", return_value=json.dumps(inventory)):
+            resolved = prepare.resolve_worker_image_identities("docker", "worker", identities)
+        self.assertEqual(resolved["client"]["worker_id"], worker_id)
+
+        inventory["images"][0]["id"] = "sha256:" + "b" * 64
+        with mock.patch("prepare.run", return_value=json.dumps(inventory)):
+            with self.assertRaisesRegex(RuntimeError, "config IDs differ"):
+                prepare.resolve_worker_image_identities("docker", "worker", identities)
+        for missing in ({"docker_id": "", "worker_id": "sha256:x"},
+                        {"docker_id": "sha256:x", "worker_id": None}):
+            with self.subTest(missing=missing), self.assertRaisesRegex(RuntimeError, "identity missing"):
+                common.verify_client_image_config_identity(missing)
+
+    def test_nginx_origin_modes_match_the_two_topologies(self):
+        native = prepare.nginx_origin(8081, [3, 4, 8, 9], "/data/proxy")
+        linkerd = prepare.nginx_origin(8080, [3, 4, 8, 9], "/data/body.bin", "0.0.0.0")
+        self.assertIn("listen 127.0.0.1:8081;", native)
+        self.assertIn("listen 0.0.0.0:8080;", linkerd)
+        self.assertIn("alias /data/proxy;", native)
+        self.assertIn("alias /data/body.bin;", linkerd)
+        self.assertIn("keepalive_requests 1000000000;", native)
+        self.assertIn("keepalive_requests 1000000000;", linkerd)
+        self.assertIn("worker_cpu_affinity", native)
+        self.assertIn(prepare.mask(9), native)
+
+    def test_envoy_config_is_http1_router_only(self):
+        config = prepare.envoy_config()
+        listener = config["static_resources"]["listeners"][0]
+        hcm = listener["filter_chains"][0]["filters"][0]["typed_config"]
+        cluster = config["static_resources"]["clusters"][0]
+        self.assertEqual(hcm["codec_type"], "HTTP1")
+        self.assertEqual([entry["name"] for entry in hcm["http_filters"]], ["envoy.filters.http.router"])
+        self.assertEqual(cluster["connect_timeout"], "1s")
+        self.assertIn("explicit_http_config", cluster["typed_extension_protocol_options"][
+            "envoy.extensions.upstreams.http.v3.HttpProtocolOptions"])
+        self.assertEqual(len(config["static_resources"]["listeners"]), 1)
+
+    def test_pod_specs_preserve_single_hop_topology_and_runtime_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binaries = root / "rps"
+            binaries.mkdir()
+            (binaries / "rut").write_bytes(b"runtime has no embedded compiler path")
+            (binaries / "rut-compile").write_bytes(b"compiler\0/usr/bin/clang\0/usr/bin/\0")
+            config = {
+                "run_id": "test123", "checkpoint": tmp, "node_mount": "/benchmark",
+                "pod_create_attempt": "attempt-123",
+                "worker_node": "bench-worker", "namespace": "bench",
+                "selector": {"key": "benchmark-role", "value": "worker"},
+                "configmaps": {"native": "pb-test-native", "linkerd": "pb-test-linkerd"},
+                "images": {"nginx": "nginx@sha256:abc", "envoy": "envoy@sha256:def", "client": "client:test"},
+                # prepare.py stores origin CPUs in canonical range form.
+                "cpus": {"proxy": 2, "origin": "3-4,8-9", "client": "5,7", "helpers": "6,14"},
+                "native_linker_path": "/opt/llvm/bin/clang-22", "native_linker_dir": "/opt/llvm/bin/",
+                "paths": {"rut_rps": str(binaries), "rut_throughput": str(binaries),
+                          "runtime_libs": str(root / "libs"), "clang": str(root / "clang"),
+                          "ld": str(root / "ld"), "rut_config_dir": str(root / "config")},
+            }
+            linkerd = common.pod_spec(config, "linkerd", "4k", "pb-test-linkerd-4k")
+            self.assertEqual(linkerd["spec"]["nodeName"], "bench-worker")
+            self.assertEqual(linkerd["spec"]["nodeSelector"], {"benchmark-role": "worker"})
+            self.assertEqual(len(linkerd["spec"]["containers"]), 1)
+            self.assertIn("linkerd.io/inject", linkerd["metadata"]["annotations"])
+            for engine in ("rut-rps", "nginx", "envoy"):
+                control = common.pod_spec(config, engine, "4k", f"pb-test-{engine}")
+                self.assertEqual(control["metadata"]["annotations"], {"linkerd.io/inject": "disabled"})
+            self.assertNotIn("limits", linkerd["spec"]["containers"][0].get("resources", {}))
+            native_origin = prepare.nginx_origin(
+                8081, sorted(common.cpu_set(config["cpus"]["origin"])), "/data/proxy")
+            self.assertIn("worker_cpu_affinity", native_origin)
+            for cpu in (3, 4, 8, 9):
+                self.assertIn(prepare.mask(cpu), native_origin)
+            rut = common.pod_spec(config, "rut-rps", "4k", "pb-test-rut")
+            frontend = rut["spec"]["containers"][0]
+            self.assertEqual(frontend["args"][-2:], ["--backend", "io_uring"])
+            self.assertEqual(frontend["command"], ["/runtime/rut"])
+            self.assertEqual(frontend["image"], config["images"]["client"])
+            mounts = {item["name"]: item["mountPath"] for item in frontend["volumeMounts"]}
+            self.assertEqual(mounts["runtime-clang"], "/opt/llvm/bin/clang-22")
+            self.assertEqual(mounts["runtime-ld"], "/opt/llvm/bin/ld")
+            self.assertEqual(rut["metadata"]["labels"]["benchmark-run-id"], "test123")
+            self.assertEqual(rut["metadata"]["labels"]["benchmark-create-attempt"], "attempt-123")
+
+    def test_matrix_has_all_interleaved_unique_cells(self):
+        cells = run_matrix.plan()
+        self.assertEqual(len(cells), 48)
+        self.assertEqual(len({(x["body"], x["engine"], x["rep"]) for x in cells}), 48)
+        self.assertEqual([x["engine"] for x in cells[:4]], ["linkerd", "rut-rps", "nginx", "envoy"])
+        self.assertEqual({x["engine"] for x in cells if x["body"] == "4k"},
+                         {"linkerd", "rut-rps", "nginx", "envoy"})
+        self.assertEqual({x["engine"] for x in cells if x["body"] == "1m"},
+                         {"linkerd", "rut-throughput", "nginx", "envoy"})
+
+    def test_matrix_repeat_count_controls_cells_and_reuses_balanced_interleave(self):
+        once = run_matrix.plan(1)
+        four = run_matrix.plan(4)
+        self.assertEqual(len(once), 16)
+        self.assertEqual(len(four), 64)
+        self.assertEqual({cell["rep"] for cell in four}, {1, 2, 3, 4})
+        self.assertEqual([cell["engine"] for cell in four[:4]], ["linkerd", "rut-rps", "nginx", "envoy"])
+        with self.assertRaises(ValueError):
+            run_matrix.plan(0)
+
+    def test_run_id_matches_kubernetes_name_and_label_rules(self):
+        for accepted in ("a", "run-123", "proxy-bench-9"):
+            self.assertTrue(prepare.valid_run_id(accepted))
+        for rejected in ("ABC", "测试", "-start", "end-", "two--ok?", "a" * 21):
+            self.assertFalse(prepare.valid_run_id(rejected))
+
+    def test_throughput_route_gets_origin_keepalive_preflight_on_first_rep(self):
+        self.assertEqual(run_matrix.origin_preflight_marker("4k", "rut-rps", 1), "rut-rps-4k-r1")
+        self.assertEqual(run_matrix.origin_preflight_marker("64k", "rut-throughput", 1),
+                         "rut-throughput-64k-r1")
+        self.assertEqual(run_matrix.origin_preflight_marker("64k", "rut-throughput", 2), None)
+        self.assertEqual(run_matrix.origin_preflight_marker("64k", "nginx", 1), None)
+
+    def test_prepare_defines_default_tool_commands_in_benchmark_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            for name in ("rps", "throughput", "runtime-libs", "runtime-tools"):
+                (checkpoint / name).mkdir()
+            for directory in ("rps", "throughput"):
+                for filename in ("rut", "rut-compile"):
+                    data = (filename.encode() if filename == "rut" else
+                            b"compiler\0/usr/bin/clang\0/usr/bin/\0")
+                    path = checkpoint / directory / filename
+                    path.write_bytes(data)
+                    path.chmod(0o755)
+            for filename in ("clang", "ld"):
+                path = checkpoint / "runtime-tools" / filename
+                path.write_bytes(filename.encode())
+                path.chmod(0o755)
+            output = root / "output"
+            argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                    "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
+                    "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                    "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
+                    "--runtime-libs", str(checkpoint / "runtime-libs"),
+                    "--clang", str(checkpoint / "runtime-tools" / "clang"), "--ld", str(checkpoint / "runtime-tools" / "ld"),
+                    "--client-image", "client:test", "--helper-cpus", "15,16"]
+            (checkpoint / "rps" / "rut").chmod(0o644)
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            run.assert_not_called()
+            (checkpoint / "rps" / "rut").chmod(0o755)
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            run.assert_not_called()
+            test_runtime_manifest(checkpoint / "runtime-libs", [
+                checkpoint / directory / filename
+                for directory in ("rps", "throughput")
+                for filename in ("rut", "rut-compile")
+            ] + [checkpoint / "runtime-tools" / name for name in ("clang", "ld")])
+            outside = root / "outside-payload"
+            outside.mkdir()
+            (outside / "sentinel").write_text("preserve me")
+            for case in ("payload-root", "body-directory", "payload-file"):
+                with self.subTest(payload_case=case):
+                    payload_root = checkpoint / "payloads"
+                    if case == "payload-root":
+                        payload_root.symlink_to(outside, target_is_directory=True)
+                    elif case == "body-directory":
+                        payload_root.mkdir()
+                        (payload_root / "4k").symlink_to(outside, target_is_directory=True)
+                    else:
+                        (payload_root / "4k").mkdir(parents=True)
+                        (payload_root / "4k" / "proxy").symlink_to(outside / "sentinel")
+                    with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                        with self.assertRaises(SystemExit):
+                            prepare.main()
+                    self.assertFalse(output.exists())
+                    self.assertEqual((outside / "sentinel").read_text(), "preserve me")
+                    run.assert_not_called()
+                    if case == "payload-root":
+                        payload_root.unlink()
+                    elif case == "body-directory":
+                        (payload_root / "4k").unlink()
+                        payload_root.rmdir()
+                    else:
+                        (payload_root / "4k" / "proxy").unlink()
+                        (payload_root / "4k").rmdir()
+                        payload_root.rmdir()
+            comma_output = root / "out,put"
+            comma_argv = list(argv)
+            comma_argv[comma_argv.index("--output") + 1] = str(comma_output)
+            with mock.patch("sys.argv", comma_argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(comma_output.exists())
+            run.assert_not_called()
+            comma_client = checkpoint / "client,inputs"
+            comma_client.mkdir()
+            for name in ("request.lua", "warmup.lua"):
+                (comma_client / name).write_text("return true")
+            comma_argv = list(argv) + ["--client-dir", str(comma_client)]
+            with mock.patch("sys.argv", comma_argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            run.assert_not_called()
+            docker_image = {"Id": "sha256:" + "a" * 64, "RepoDigests": []}
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run", return_value=json.dumps(docker_image)):
+                self.assertEqual(prepare.main(), 0)
+            config = json.loads((output / "benchmark.json").read_text())
+            self.assertEqual(config["tools"], {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"})
+            self.assertEqual(config["cpus"]["helpers"], "15-16")
+            self.assertEqual(config["image_identities"]["client"]["docker_id"], docker_image["Id"])
+            self.assertEqual(set(config["input_snapshot"]), {
+                "client_dir", "rut_config_dir", "runtime_libs", "clang", "ld",
+                "benchmark_common", "benchmark_driver", "benchmark_matrix", "benchmark_summarize"})
+            self.assertEqual(config["payloads"]["4k"], json.loads((output / "payloads.json").read_text())["4k"])
+            self.assertEqual(json.loads((output / "native-configmap.json").read_text())["immutable"], True)
+
+    def test_prepare_rejects_configmap_apply_without_cluster_verification_before_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            output = root / "output"
+            argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                    "--kubeconfig", str(root / "kubeconfig"), "--cluster-name", "bench",
+                    "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                    "--rut-rps-dir", str(root / "rps"), "--rut-throughput-dir", str(root / "throughput"),
+                    "--runtime-libs", str(root / "libs"), "--clang", str(root / "clang"),
+                    "--ld", str(root / "ld"), "--client-image", "client:test", "--apply-configmaps"]
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            run.assert_not_called()
+
+    def test_prepare_rejects_invalid_duration_before_creating_output_or_running_tools(self):
+        for option, value in (("--duration", "10"), ("--duration", "0s"),
+                              ("--warmup", "500ms"), ("--warmup", "1.5s")):
+            with self.subTest(option=option, value=value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint = root / "checkpoint"
+                checkpoint.mkdir()
+                output = root / "output"
+                argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                        "--kubeconfig", str(root / "kubeconfig"), "--cluster-name", "bench",
+                        "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                        "--rut-rps-dir", str(root / "rps"), "--rut-throughput-dir", str(root / "throughput"),
+                        "--runtime-libs", str(root / "libs"), "--clang", str(root / "clang"),
+                        "--ld", str(root / "ld"), "--client-image", "client:test", option, value]
+                with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                    with self.assertRaises(SystemExit):
+                        prepare.main()
+                self.assertFalse(output.exists())
+                run.assert_not_called()
+
+    def test_prepare_rejects_client_concurrency_below_two_before_side_effects(self):
+        for concurrency in (0, 1):
+            with self.subTest(concurrency=concurrency), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint = root / "checkpoint"
+                checkpoint.mkdir()
+                output = root / "output"
+                argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                        "--kubeconfig", str(root / "kubeconfig"), "--cluster-name", "bench",
+                        "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                        "--rut-rps-dir", str(root / "rps"), "--rut-throughput-dir", str(root / "throughput"),
+                        "--runtime-libs", str(root / "libs"), "--clang", str(root / "clang"),
+                        "--ld", str(root / "ld"), "--client-image", "client:test",
+                        "--concurrency", str(concurrency)]
+                with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                    with self.assertRaises(SystemExit):
+                        prepare.main()
+                self.assertFalse(output.exists())
+                run.assert_not_called()
+
+    def test_output_overlap_validator_rejects_both_directions_but_allows_sibling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            inputs = root / "checkpoint" / "config"
+            inputs.mkdir(parents=True)
+            prepare.validate_output_disjoint(root / "results", [inputs])
+            for output in (inputs, inputs / "results", root / "checkpoint"):
+                with self.subTest(output=output), self.assertRaisesRegex(ValueError, "overlap"):
+                    prepare.validate_output_disjoint(output, [inputs])
+
+    def test_prepare_rejects_output_inside_generated_config_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            for name in ("rps", "throughput", "libs", "tools", "client"):
+                (checkpoint / name).mkdir()
+            for dirname in ("rps", "throughput"):
+                for filename, contents in (("rut", b"runtime"),
+                                           ("rut-compile", b"compiler\0/usr/bin/clang\0/usr/bin/\0")):
+                    program = checkpoint / dirname / filename
+                    program.write_bytes(contents)
+                    program.chmod(0o755)
+            for filename in ("clang", "ld"):
+                program = checkpoint / "tools" / filename
+                program.write_text(filename)
+                program.chmod(0o755)
+            for filename in ("request.lua", "warmup.lua"):
+                (checkpoint / "client" / filename).write_text("return true")
+            output = checkpoint / "config" / "results"
+            argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                    "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
+                    "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                    "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
+                    "--runtime-libs", str(checkpoint / "libs"), "--clang", str(checkpoint / "tools" / "clang"),
+                    "--ld", str(checkpoint / "tools" / "ld"), "--client-dir", str(checkpoint / "client"),
+                    "--client-image", "client:test"]
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            self.assertFalse((checkpoint / "config").exists())
+            run.assert_not_called()
+
+    def test_prepare_rejects_symlinked_generated_config_paths_before_any_writes(self):
+        for destination in ("config-root", "proxy-rps.rut", "proxy-throughput.rut"):
+            for target_kind in ("absolute", "relative"):
+                with self.subTest(destination=destination, target_kind=target_kind), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    checkpoint = root / "checkpoint"
+                    checkpoint.mkdir()
+                    target = root / "outside-config"
+                    target.mkdir()
+                    for filename in ("proxy-rps.rut", "proxy-throughput.rut"):
+                        (target / filename).write_text("preserve me")
+                    for name in ("rps", "throughput", "libs", "tools", "client"):
+                        (checkpoint / name).mkdir()
+                    for dirname in ("rps", "throughput"):
+                        for filename, contents in (("rut", b"runtime"),
+                                                   ("rut-compile", b"compiler\0/usr/bin/clang\0/usr/bin/\0")):
+                            program = checkpoint / dirname / filename
+                            program.write_bytes(contents)
+                            program.chmod(0o755)
+                    for filename in ("clang", "ld"):
+                        program = checkpoint / "tools" / filename
+                        program.write_text(filename)
+                        program.chmod(0o755)
+                    for filename in ("request.lua", "warmup.lua"):
+                        (checkpoint / "client" / filename).write_text("return true")
+                    config_root = checkpoint / "config"
+                    if destination == "config-root":
+                        target_path = target if target_kind == "absolute" else Path("../outside-config")
+                        config_root.symlink_to(target_path, target_is_directory=True)
+                    else:
+                        config_root.mkdir()
+                        filename = destination
+                        target_path = target / filename if target_kind == "absolute" else Path("../../outside-config") / filename
+                        (config_root / filename).symlink_to(target_path)
+                    output = root / "results"
+                    argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                            "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
+                            "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                            "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
+                            "--runtime-libs", str(checkpoint / "libs"), "--clang", str(checkpoint / "tools" / "clang"),
+                            "--ld", str(checkpoint / "tools" / "ld"), "--client-dir", str(checkpoint / "client"),
+                            "--client-image", "client:test"]
+                    with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                        with self.assertRaises(SystemExit):
+                            prepare.main()
+                    self.assertFalse(output.exists())
+                    self.assertEqual({path.name: path.read_text() for path in target.iterdir()},
+                                     {"proxy-rps.rut": "preserve me", "proxy-throughput.rut": "preserve me"})
+                    run.assert_not_called()
+
+    def test_prepare_checks_only_compiler_nul_strings_and_rejects_mismatched_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime, compiler = Path(tmp) / "rut", Path(tmp) / "rut-compile"
+            runtime.write_bytes(b"no linker strings in rut")
+            compiler.write_bytes(b"/opt/llvm/bin/clang-22\0/opt/llvm/bin/\0")
+            self.assertTrue(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
+            self.assertEqual(prepare.embedded_clang_path(compiler), "/opt/llvm/bin/clang-22")
+            self.assertFalse(prepare.linker_paths_match(compiler, "/usr/bin/clang", "/usr/bin/"))
+            self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang-22", "/usr/bin/"))
+            self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang", "/opt/llvm/bin/"))
+
+    def test_prepare_requires_execute_permission_for_every_benchmark_program(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [root / "rut-rps" / "rut", root / "rut-rps" / "rut-compile",
+                     root / "rut-throughput" / "rut", root / "rut-throughput" / "rut-compile",
+                     root / "clang", root / "ld"]
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("executable placeholder")
+                path.chmod(0o755)
+                prepare.require_executable(path, path.name)
+                path.chmod(0o644)
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "executable file"):
+                    prepare.require_executable(path, path.name)
+                path.chmod(0o755)
+
+    def test_prepare_rejects_symlinked_benchmark_executables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            external = root / "external-rut"
+            external.write_text("executable")
+            external.chmod(0o755)
+            link = root / "rut"
+            link.symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "executable file"):
+                prepare.require_executable(link, "rut-rps/rut")
+            nested = root / "checkpoint" / "rps"
+            nested.mkdir(parents=True)
+            relative_link = nested / "rut-compile"
+            relative_link.symlink_to("../../external-rut")
+            with self.assertRaisesRegex(ValueError, "executable file"):
+                prepare.require_executable(relative_link, "rut-rps/rut-compile")
+
+    def test_origin_affinity_preserves_one_cpu_per_nginx_worker(self):
+        rows = [{"pid": "100", "allowed": "3-4,8-9"},
+                {"pid": "101", "allowed": "3"}, {"pid": "102", "allowed": "4"},
+                {"pid": "103", "allowed": "8"}, {"pid": "104", "allowed": "9"}]
+        run_matrix.verify_origin_affinity(100, "3-4,8-9", rows)
+        for changed in (
+                [{**row, "allowed": "3-4,8-9"} if row["pid"] == "101" else row for row in rows],
+                rows[:-1],
+                [{**row, "allowed": "10"} if row["pid"] == "104" else row for row in rows]):
+            with self.assertRaises(RuntimeError):
+                run_matrix.verify_origin_affinity(100, "3-4,8-9", changed)
+
+    def test_interrupted_cell_runs_pod_cleanup_and_reraises_keyboard_interrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"output": tmp, "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            matrix.samples.mkdir(parents=True)
+            interruption = KeyboardInterrupt()
+            cell = {"body": "4k", "engine": "linkerd", "rep": 1}
+            name = "proxybench-run123-4k-1-linkerd"
+            pod = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-int",
+                    "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                               "benchmark-run-id": "run123",
+                               "benchmark-create-attempt": matrix.pod_create_attempt}}}
+            with mock.patch.object(matrix, "run_cell", side_effect=interruption), \
+                    mock.patch.object(matrix, "kube", side_effect=[
+                        subprocess.CompletedProcess([], 0, json.dumps(pod), ""),
+                        subprocess.CompletedProcess([], 0, "deleted\n", "")]) as kube:
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    run_matrix.run_cell_with_cleanup(matrix, config, cell)
+            self.assertIs(caught.exception, interruption)
+            self.assertEqual(kube.call_args_list[1].args[:3], ("delete", "pod", "-n"))
+            self.assertIn(f"benchmark-create-attempt={matrix.pod_create_attempt}",
+                          " ".join(kube.call_args_list[1].args))
+            self.assertIn(f"metadata.name={name}", kube.call_args_list[1].args)
+
+    def test_sigterm_reaps_driver_before_pod_cleanup_and_archives_partial_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            matrix.samples.mkdir(parents=True)
+            cell = {"body": "4k", "engine": "linkerd", "rep": 1}
+            label = "4k-linkerd-r1"
+            partial = matrix.samples / "4k" / label
+            events = []
+            pod_name = "proxybench-run123-4k-1-linkerd"
+            pod = {"metadata": {"name": pod_name, "namespace": "bench", "uid": "uid-term",
+                    "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                               "benchmark-run-id": "run123",
+                               "benchmark-create-attempt": matrix.pod_create_attempt}}}
+
+            class Child:
+                returncode = None
+
+                def poll(self):
+                    return None
+
+                def send_signal(self, _signum):
+                    events.append("driver-signalled")
+
+                def communicate(self, timeout=None):
+                    events.append("driver-reaped")
+                    return "driver stopped", None
+
+            child = Child()
+
+            def interrupted_run_cell(*_args):
+                partial.mkdir(parents=True)
+                (partial / "pod.json").write_text(json.dumps(pod))
+                with matrix.client_driver_guard(child, partial):
+                    raise run_matrix.TerminatedBySignal(run_matrix.signal.SIGTERM)
+
+            def kube(*args, **_kwargs):
+                if args[0] == "get":
+                    events.append("pod-looked-up")
+                    return subprocess.CompletedProcess([], 0, json.dumps(pod), "")
+                events.append("pod-deleted")
+                return subprocess.CompletedProcess([], 0, "deleted\n", "")
+
+            with mock.patch.object(matrix, "run_cell", side_effect=interrupted_run_cell), \
+                    mock.patch.object(matrix, "verify_wrk_container_cleanup",
+                                      side_effect=lambda _target: events.append("container-cleaned")), \
+                    mock.patch.object(matrix, "kube", side_effect=kube):
+                with self.assertRaises(run_matrix.TerminatedBySignal):
+                    run_matrix.run_cell_and_index(matrix, config, cell,
+                                                  matrix.samples / "index.json", [])
+
+            self.assertEqual(events, ["driver-signalled", "driver-reaped", "container-cleaned",
+                                      "pod-looked-up", "pod-deleted"])
+            self.assertFalse(partial.exists())
+            archived = list((matrix.samples / "interrupted").glob("4k-linkerd-r1-*"))
+            self.assertEqual(len(archived), 1)
+            self.assertTrue((archived[0] / "pod.json").is_file())
+            self.assertFalse((matrix.samples / "index.json").exists())
+            with self.assertRaises(run_matrix.TerminatedBySignal) as caught:
+                run_matrix.handle_sigterm(run_matrix.signal.SIGTERM, None)
+            self.assertEqual(caught.exception.signum, run_matrix.signal.SIGTERM)
+
+    def test_runtime_library_collector_binds_six_sources_and_duplicate_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "libs"
+            source_dir = root / "source"
+            source_dir.mkdir()
+            binaries = []
+            for index in range(6):
+                binary = source_dir / f"binary-{index}"
+                binary.write_bytes(f"binary {index}".encode())
+                binaries.append(binary)
+            library = source_dir / "libshared.so.1"
+            library.write_bytes(b"same library bytes")
+            argv = ["collect_runtime_libs.py", "--output", str(output), *map(str, binaries)]
+            with mock.patch("sys.argv", argv), mock.patch.object(
+                    collect_runtime_libs, "dependencies", return_value=[(library.name, library)]):
+                self.assertEqual(collect_runtime_libs.main(), 0)
+            manifest = json.loads((output / "runtime-libs.json").read_text())
+            self.assertEqual(len(manifest["binaries"]), 6)
+            self.assertEqual(sum(len(row["dependencies"]) for row in manifest["binaries"]), 6)
+            self.assertEqual(len(manifest["libraries"]), 1)
+            expected = {f"source_{index}": binary for index, binary in enumerate(binaries)}
+            prepare.validate_runtime_libs(output, expected)
+            (output / library.name).write_bytes(b"other library bytes")
+            with self.assertRaisesRegex(ValueError, "missing or changed"):
+                prepare.validate_runtime_libs(output, expected)
+            (output / library.name).write_bytes(library.read_bytes())
+            binaries[0].write_bytes(b"altered!")
+            with self.assertRaisesRegex(ValueError, "stale for"):
+                prepare.validate_runtime_libs(output, expected)
+
+    def test_runtime_library_bundle_must_be_a_directory_and_have_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            libraries = root / "libs"
+            libraries.mkdir()
+            with self.assertRaisesRegex(ValueError, "runtime-libs.json"):
+                prepare.validate_runtime_libs(libraries, {})
+            file_path = root / "libs-file"
+            file_path.write_text("not a directory")
+            with self.assertRaisesRegex(ValueError, "runtime-libs must be a directory"):
+                prepare.validate_runtime_libs(file_path, {})
+
+    def test_compiler_string_scan_ignores_non_ascii_binary_chunks(self):
+        real_binary = Path(sys.executable).read_bytes()
+        self.assertTrue(real_binary)
+        prepare.nul_strings(Path(sys.executable))
+        with tempfile.TemporaryDirectory() as tmp:
+            compiler = Path(tmp) / "rut-compile"
+            compiler.write_bytes(b"\x7fELF\x00\xff\xfe machine code\x00/opt/llvm/bin/clang-22\x00/opt/llvm/bin/\x00")
+            self.assertEqual(prepare.embedded_clang_path(compiler), "/opt/llvm/bin/clang-22")
+            self.assertTrue(prepare.linker_paths_match(
+                compiler, "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
+
+    def test_prepare_run_forwards_default_and_extended_subprocess_timeouts(self):
+        completed = subprocess.CompletedProcess([], 0, "ok", "")
+        with mock.patch("prepare.subprocess.run", return_value=completed) as process_run:
+            self.assertEqual(prepare.run(["probe"]), "ok")
+            self.assertEqual(process_run.call_args.kwargs["timeout"], 90)
+            self.assertEqual(prepare.run(["probe"], timeout=190), "ok")
+            self.assertEqual(process_run.call_args.kwargs["timeout"], 190)
+
+    def test_configmap_immutable_uses_top_level_api_field(self):
+        config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
+                  "kubeconfig": "/tmp/kube", "namespace": "bench",
+                  "configmap_identities": {"native": {"uid": "uid1", "data": {"x": "one"}}}}
+        api_object = {"metadata": {"uid": "uid1"}, "data": {"x": "one"}, "immutable": True}
+        with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(api_object), "")):
+            run_matrix.verify_configmaps(config)
+        api_object["immutable"] = False
+        with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(api_object), "")):
+            with self.assertRaisesRegex(RuntimeError, "ConfigMap identity or data changed"):
+                run_matrix.verify_configmaps(config)
+        self.assertEqual(prepare.applied_configmap_identity(
+            {"metadata": {"uid": "uid2"}, "data": {"x": "one"}, "immutable": True}, {"x": "one"}),
+            {"uid": "uid2", "data": {"x": "one"}})
+        with self.assertRaisesRegex(RuntimeError, "not immutable"):
+            prepare.applied_configmap_identity(
+                {"metadata": {"uid": "uid2", "immutable": True}, "data": {"x": "one"}}, {"x": "one"})
+
+    def test_configmap_apply_failure_cleans_only_resources_confirmed_owned_by_run(self):
+        run_id = "run123"
+        attempt_id = "attempt-current"
+        namespace = "bench"
+        manifests = {}
+        paths = {}
+        for name in ("native", "linkerd"):
+            manifests[name] = {"metadata": {"name": f"pb-{run_id}-{name}", "namespace": namespace,
+                "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                           "benchmark-run-id": run_id, "benchmark-create-attempt": attempt_id}},
+                "data": {"config": name}}
+            paths[name] = Path(f"/{name}.json")
+        owned = {"metadata": {**manifests["native"]["metadata"], "uid": "native-uid"},
+                 "data": manifests["native"]["data"], "immutable": True}
+        unrelated = {"metadata": {**manifests["linkerd"]["metadata"], "uid": "other-uid",
+                                   "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                                               "benchmark-run-id": run_id,
+                                               "benchmark-create-attempt": "attempt-old"}},
+                     "data": manifests["linkerd"]["data"], "immutable": True}
+        with mock.patch("prepare.run", side_effect=[
+                RuntimeError("create response lost after partial success"),
+                json.dumps(owned), "", json.dumps(unrelated)]
+                ) as run:
+            with self.assertRaisesRegex(RuntimeError, "create response lost"):
+                prepare.apply_configmaps(["kubectl"], namespace, run_id, attempt_id, manifests, paths)
+        deletes = [call.args[0] for call in run.call_args_list if "delete" in call.args[0]]
+        self.assertEqual(deletes, [["kubectl", "delete", "configmap", "pb-run123-native", "-n", namespace,
+                                    "--ignore-not-found=true", "--wait=true"]])
+
+    def test_configmap_identity_failure_rolls_back_and_preserves_original_error(self):
+        run_id = "run456"
+        attempt_id = "attempt-current"
+        namespace = "bench"
+        manifests = {}
+        paths = {}
+        for name in ("native", "linkerd"):
+            manifests[name] = {"metadata": {"name": f"pb-{run_id}-{name}", "namespace": namespace,
+                "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                           "benchmark-run-id": run_id, "benchmark-create-attempt": attempt_id}},
+                "data": {"config": name}}
+            paths[name] = Path(f"/{name}.json")
+        mismatched = {"metadata": {**manifests["native"]["metadata"], "uid": "native-uid"},
+                      "data": {"config": "stale"}, "immutable": True}
+        with mock.patch("prepare.run", side_effect=["created", json.dumps(mismatched),
+                json.dumps(mismatched), RuntimeError("delete unavailable"), RuntimeError("not found")]) as run:
+            with self.assertRaisesRegex(RuntimeError, "data differs"):
+                prepare.apply_configmaps(["kubectl"], namespace, run_id, attempt_id, manifests, paths)
+        self.assertTrue(any("delete" in call.args[0] for call in run.call_args_list))
+
+    def test_linkerd_probe_waits_for_pull_records_identity_and_deletes_probe(self):
+        pod = {"metadata": {"name": "probe", "namespace": "bench", "uid": "probe-uid"},
+               "spec": {"containers": [], "initContainers": [{"name": "linkerd-proxy", "image": "proxy:edge",
+                                                                  "restartPolicy": "Always",
+                                                                  "args": ["--log-level=error"],
+                                                                  "env": [{"name": "A", "value": "B"}],
+                                                                  "resources": {"requests": {"cpu": "1"}}}]},
+               "status": {"initContainerStatuses": [{"name": "linkerd-proxy", "imageID": "containerd://sha256:cfg"}]}}
+        inventory = {"images": [{"id": "sha256:cfg", "repoTags": ["proxy:edge"], "repoDigests": []}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-1")
+            probe.write_text(json.dumps(spec))
+            pod["metadata"]["labels"] = spec["metadata"]["labels"]
+            with mock.patch("prepare.run", side_effect=["", "", json.dumps(pod), json.dumps(inventory),
+                                                         json.dumps(pod), ""]) as run:
+                identity = prepare.discover_linkerd_proxy_identity(
+                    ["kubectl", "--kubeconfig", "/kube"], "docker", "worker", probe, "probe", "bench")
+        self.assertEqual(identity["identities"]["linkerd_proxy"]["worker_id"], "sha256:cfg")
+        self.assertEqual(identity["injected_spec"]["initContainers"][0]["args"], ["--log-level=error"])
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn("wait", commands[1])
+        self.assertIn("create", commands[0])
+        self.assertEqual(commands[-1][3:6], ["delete", "pod", "-n"])
+        self.assertIn("metadata.name=probe", commands[-1])
+        self.assertTrue(any("benchmark-create-attempt=attempt-1" in item for item in commands[-1]))
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 190)
+
+    def test_linkerd_probe_deletes_pod_when_readiness_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-ready")
+            probe.write_text(json.dumps(spec))
+            pod = {"metadata": {**spec["metadata"], "uid": "probe-uid"}}
+            with mock.patch("prepare.run", side_effect=["", RuntimeError("not ready"), json.dumps(pod), ""]) as run:
+                with self.assertRaisesRegex(RuntimeError, "not ready"):
+                    prepare.discover_linkerd_proxy_identity(
+                        ["kubectl"], "docker", "worker", probe, "probe", "bench")
+        self.assertIn("delete", run.call_args_list[-1].args[0])
+
+    def test_linkerd_probe_cleanup_attempts_delete_after_ambiguous_create_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-ambiguous")
+            probe.write_text(json.dumps(spec))
+            owned = {"metadata": {**spec["metadata"], "uid": "created-after-timeout"}}
+            create_timeout = subprocess.TimeoutExpired(["kubectl", "create"], 90)
+            with mock.patch("prepare.run", side_effect=[create_timeout, json.dumps(owned), ""]) as run:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    prepare.discover_linkerd_proxy_identity(
+                        ["kubectl"], "docker", "worker", probe, "probe", "bench")
+        cleanup = run.call_args_list[-1]
+        self.assertIn("delete", cleanup.args[0])
+        self.assertIn("--ignore-not-found=true", cleanup.args[0])
+        self.assertEqual(cleanup.kwargs["timeout"], 90)
+
+    def test_linkerd_probe_cleanup_skips_preexisting_name_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-current")
+            probe.write_text(json.dumps(spec))
+            preexisting = {"metadata": {"name": "probe", "namespace": "bench", "uid": "old",
+                                         "labels": {"benchmark-create-attempt": "attempt-old"}}}
+            create_error = RuntimeError("already exists")
+            with mock.patch("prepare.run", side_effect=[create_error, json.dumps(preexisting)]) as run:
+                with self.assertRaisesRegex(RuntimeError, "already exists"):
+                    prepare.discover_linkerd_proxy_identity(
+                        ["kubectl"], "docker", "worker", probe, "probe", "bench")
+            self.assertEqual(len(run.call_args_list), 2)
+            self.assertIn("get", run.call_args_list[-1].args[0])
+
+    def test_linkerd_probe_cleanup_failure_does_not_mask_create_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.json"
+            spec = prepare.linkerd_probe_spec("probe", "bench", "worker", "nginx:test", "attempt-error")
+            probe.write_text(json.dumps(spec))
+            with mock.patch("prepare.run", side_effect=[RuntimeError("create timed out"), OSError("get unavailable")]) as run:
+                with self.assertRaisesRegex(RuntimeError, "create timed out"):
+                    prepare.discover_linkerd_proxy_identity(
+                        ["kubectl"], "docker", "worker", probe, "probe", "bench")
+        self.assertIn("get", run.call_args_list[-1].args[0])
+
+    def test_linkerd_injected_proxy_image_is_taken_from_admitted_pod(self):
+        admitted = {"spec": {"containers": [{"name": "origin", "image": "nginx@sha256:abc"}],
+                             "initContainers": [{"name": "linkerd-proxy", "image": "cr.l5d.io/linkerd/proxy:edge",
+                                                 "restartPolicy": "Always"}]}}
+        self.assertEqual(prepare.injected_linkerd_proxy_image(admitted), "cr.l5d.io/linkerd/proxy:edge")
+        with self.assertRaisesRegex(ValueError, "found 0"):
+            prepare.injected_linkerd_proxy_image({"spec": {"containers": []}})
+        duplicate = {"spec": {"containers": [{"name": "linkerd-proxy", "image": "one"}],
+                              "initContainers": [{"name": "linkerd-proxy", "image": "two"}]}}
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            prepare.injected_linkerd_proxy_image(duplicate)
+
+    def test_linkerd_probe_matches_benchmark_origin_injection_inputs(self):
+        config = {"namespace": "bench", "run_id": "run1", "worker_node": "worker",
+                  "node_mount": "/node", "cpus": {"proxy": 3, "origin": "4-5"},
+                  "selector": {"key": "role", "value": "bench"},
+                  "images": {"nginx": "nginx@sha256:abc"},
+                  "configmaps": {"linkerd": "cfg"}}
+        benchmark = common.pod_spec(config, "linkerd", "4k", "matrix")
+        probe = prepare.linkerd_probe_spec("probe", "bench", "worker", config["images"]["nginx"])
+        benchmark_origin = benchmark["spec"]["containers"][0]
+        probe_app = probe["spec"]["containers"][0]
+        self.assertEqual(probe["metadata"]["annotations"], benchmark["metadata"]["annotations"])
+        self.assertEqual(probe_app["ports"], benchmark_origin["ports"])
+        self.assertEqual(probe_app["imagePullPolicy"], benchmark_origin["imagePullPolicy"])
+        self.assertEqual(probe_app["image"], benchmark_origin["image"])
+
+    def test_linkerd_proxy_container_requires_prepared_image_identity(self):
+        identities = {"linkerd_proxy": {"reference": "linkerd/proxy@sha256:abc", "worker_id": "sha256:cfg"}}
+        identity = run_matrix.expected_container_identity("linkerd-proxy", "linkerd/proxy:edge", identities)
+        self.assertIsNotNone(identity)
+        run_matrix.verify_status_image_identity("linkerd-proxy", "linkerd/proxy:edge", "containerd://sha256:cfg", identities)
+        with self.assertRaisesRegex(RuntimeError, "linkerd-proxy image identity changed"):
+            run_matrix.verify_status_image_identity("linkerd-proxy", "linkerd/proxy:edge", "containerd://sha256:changed", identities)
+        with self.assertRaisesRegex(RuntimeError, "identity missing"):
+            run_matrix.verify_status_image_identity("linkerd-proxy", "", "containerd://sha256:cfg", {})
+
+    def test_linkerd_injection_spec_binds_runtime_relevant_container_settings(self):
+        pod = {"spec": {"containers": [
+            {"name": "origin", "image": "nginx"},
+            {"name": "linkerd-proxy", "image": "proxy", "args": ["--x"],
+             "env": [{"name": "A", "value": "B"}], "resources": {"limits": {"cpu": "2"}},
+             "securityContext": {"runAsUser": 1000}, "volumeMounts": [{"name": "x", "mountPath": "/x"}]},
+        ], "initContainers": [{"name": "linkerd-init", "image": "init", "command": ["init"]}]}}
+        normalized = common.normalized_linkerd_injection_spec(pod)
+        self.assertEqual([item["name"] for item in normalized["containers"]], ["linkerd-proxy"])
+        changed = json.loads(json.dumps(pod))
+        changed["spec"]["containers"][1]["env"][0]["value"] = "C"
+        self.assertNotEqual(normalized, common.normalized_linkerd_injection_spec(changed))
+        base_config = {"images": {}, "linkerd_injected_spec": normalized}
+        changed_config = {**base_config, "linkerd_injected_spec": common.normalized_linkerd_injection_spec(changed)}
+        self.assertNotEqual(common.provenance_fingerprint(base_config),
+                            common.provenance_fingerprint(changed_config))
+
+    def test_service_account_mount_suffix_is_normalized_without_ignoring_other_mount_settings(self):
+        def pod(suffix, mount_path="/var/run/secrets/kubernetes.io/serviceaccount"):
+            return {"spec": {"containers": [{"name": "linkerd-proxy", "image": "proxy",
+                "volumeMounts": [{"name": f"kube-api-access-{suffix}", "mountPath": mount_path,
+                                  "readOnly": True}, {"name": "linkerd-config", "mountPath": "/etc/linkerd"}]}]}}
+        left, right = pod("abc"), pod("xyz")
+        left_normalized = common.normalized_linkerd_injection_spec(left)
+        self.assertEqual(left_normalized, common.normalized_linkerd_injection_spec(right))
+        self.assertEqual(left["spec"]["containers"][0]["volumeMounts"][0]["name"], "kube-api-access-abc")
+        self.assertNotEqual(left_normalized, common.normalized_linkerd_injection_spec(pod("xyz", "/different")))
+        changed_config = {"linkerd_injected_spec": common.normalized_linkerd_injection_spec(pod("xyz"))}
+        changed_config["linkerd_injected_spec"]["containers"][0]["args"] = ["changed"]
+        self.assertNotEqual(common.provenance_fingerprint({"linkerd_injected_spec": left_normalized}),
+                            common.provenance_fingerprint(changed_config))
+
+    def test_linkerd_injection_spec_binds_referenced_volume_definitions(self):
+        def pod(token_suffix, audience="linkerd", medium="Memory", app_value="before"):
+            return {"spec": {
+                "containers": [
+                    {"name": "origin", "volumeMounts": [{"name": "app-data", "mountPath": "/app"}]},
+                    {"name": "linkerd-proxy", "volumeMounts": [
+                        {"name": f"kube-api-access-{token_suffix}",
+                         "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount"},
+                        {"name": "linkerd-identity", "mountPath": "/var/run/linkerd/identity"}]},
+                ],
+                "initContainers": [{"name": "linkerd-init", "volumeMounts": [
+                    {"name": "linkerd-init-state", "mountPath": "/run/linkerd"}]}],
+                "volumes": [
+                    {"name": "kube-api-access-" + token_suffix,
+                     "projected": {"sources": [{"serviceAccountToken": {
+                         "audience": audience, "expirationSeconds": 86400}}]}},
+                    {"name": "linkerd-identity", "emptyDir": {"medium": medium}},
+                    {"name": "linkerd-init-state", "emptyDir": {}},
+                    {"name": "app-data", "configMap": {"name": app_value}},
+                ]}}
+        baseline = common.normalized_linkerd_injection_spec(pod("random-a"))
+        self.assertEqual(baseline, common.normalized_linkerd_injection_spec(pod("random-b")))
+        self.assertEqual([volume["name"] for volume in baseline["volumes"]],
+                         ["kube-api-access", "linkerd-identity", "linkerd-init-state"])
+        for changed in (pod("random-c", audience="other"), pod("random-d", medium="")):
+            self.assertNotEqual(baseline, common.normalized_linkerd_injection_spec(changed))
+        self.assertEqual(baseline, common.normalized_linkerd_injection_spec(pod("random-e", app_value="changed")))
+
+    def test_client_ambiguous_create_removes_only_matching_owned_container_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "measurement"
+            config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
+                      "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
+                      "concurrency": 4, "client_dir": "/benchmark",
+                      "tools": {"docker": "docker"}, "worker_container": "worker"}
+            expected = {}
+            def docker_run(argv, **kwargs):
+                if argv[1] == "create":
+                    for index, part in enumerate(argv[:-1]):
+                        if part == "--label":
+                            key, value = argv[index + 1].split("=", 1)
+                            expected[key] = value
+                    raise subprocess.TimeoutExpired(argv, 30)
+                if argv[1] == "inspect":
+                    pod = {"Id": "owned-container-id", "Name": "/" + argv[-1],
+                           "Config": {"Labels": expected}}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([pod]), "")
+                if argv[1] == "rm":
+                    raise OSError("daemon unavailable")
+                self.fail(f"unexpected Docker command: {argv}")
+            with mock.patch("run_client.load_config", return_value=config), \
+                    mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "4k-nginx-r1",
+                                             "--pod-ip", "10.0.0.2", "--duration", "2s", "--lua", "warmup.lua",
+                                             "--output", str(out)]), \
+                    mock.patch("run_client.subprocess.run", side_effect=docker_run) as run:
+                self.assertEqual(run_client.main(), 124)
+            self.assertEqual(run.call_args_list[0].args[0][1], "create")
+            self.assertIn("benchmark-create-attempt", expected)
+            self.assertEqual(run.call_args_list[1].args[0], ["docker", "inspect", "proxybench-run123-4k-nginx-r1"])
+            self.assertEqual(run.call_args_list[2].args[0], ["docker", "rm", "-f", "owned-container-id"])
+            self.assertEqual(run.call_args_list[0].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
+            self.assertEqual(run.call_args_list[1].kwargs["timeout"], run_client.DOCKER_CLEANUP_TIMEOUT)
+            self.assertTrue((out / "error.log").is_file())
+            self.assertEqual((out / "returncode.txt").read_text(), "124\n")
+
+    def test_client_create_name_collision_does_not_remove_unowned_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "measurement"
+            config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
+                      "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
+                      "concurrency": 4, "client_dir": "/benchmark",
+                      "tools": {"docker": "docker"}, "worker_container": "worker"}
+            def docker_run(argv, **kwargs):
+                if argv[1] == "create":
+                    raise subprocess.CalledProcessError(1, argv, output="name already in use")
+                if argv[1] == "inspect":
+                    existing = {"Id": "unrelated-id", "Name": "/" + argv[-1],
+                                "Config": {"Labels": {"app.kubernetes.io/managed-by": "other"}}}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([existing]), "")
+                self.fail(f"unexpected Docker command: {argv}")
+            with mock.patch("run_client.load_config", return_value=config), \
+                    mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "4k-nginx-r1",
+                                             "--pod-ip", "10.0.0.2", "--duration", "2s", "--lua", "warmup.lua",
+                                             "--output", str(out)]), \
+                    mock.patch("run_client.subprocess.run", side_effect=docker_run) as run:
+                self.assertEqual(run_client.main(), 1)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[1].args[0][1], "inspect")
+
+    def test_client_rejects_comma_mount_sources_before_creating_output(self):
+        for config_dir, output_suffix in (("/tmp/client,inputs", "measurement"),
+                                          ("/benchmark", "measurement,one")):
+            with self.subTest(client_dir=config_dir, output=output_suffix), tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / output_suffix
+                config = {"client_dir": config_dir}
+                argv = ["run_client.py", "--config", "unused", "--label", "cell",
+                        "--pod-ip", "10.0.0.1", "--duration", "2s", "--lua", "warmup.lua",
+                        "--output", str(out)]
+                with mock.patch("run_client.load_config", return_value=config), \
+                        mock.patch("sys.argv", argv), mock.patch("run_client.subprocess.run") as run:
+                    with self.assertRaises(SystemExit):
+                        run_client.main()
+                self.assertFalse(out.exists())
+                run.assert_not_called()
+
+    def test_matrix_rejects_comma_cell_output_before_docker_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outdir = Path(tmp) / "cell,one"
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl",
+                                                                    "linkerd": "linkerd"},
+                                        "cpus": {"client": "5,7"}, "image_identities": {"client": {"docker_id": "id"}},
+                                        "worker_container": "worker", "kubeconfig": "/kube"})
+            with mock.patch("run_matrix.invoke") as invoke:
+                with self.assertRaisesRegex(ValueError, "comma"):
+                    matrix.curl("127.0.0.1", outdir, "4k")
+                invoke.assert_not_called()
+
+    def test_curl_preflight_has_transfer_deadlines_and_owned_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            output.mkdir()
+            payload_dir = root / "payloads" / "4k"
+            payload_dir.mkdir(parents=True)
+            payload = payload_dir / "proxy"
+            payload.write_bytes(b"body")
+            outdir = output / "cell"
+            outdir.mkdir()
+            matrix = run_matrix.Matrix({"output": str(output), "checkpoint": str(root), "run_id": "run1",
+                "kubeconfig": "/tmp/kube",
+                "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                "worker_container": "worker", "cpus": {"client": "5,7"},
+                "image_identities": {"client": {"docker_id": "sha256:client"}}})
+            commands = []
+            def invoke(argv, **kwargs):
+                argv = [str(value) for value in argv]
+                commands.append((argv, kwargs))
+                if argv[1] == "run":
+                    (outdir / "response.bin").write_bytes(payload.read_bytes())
+                    return subprocess.CompletedProcess(argv, 0, "1.1 200 4\n", "")
+                if argv[1] == "inspect":
+                    run = commands[0][0]
+                    labels = {run[index + 1].split("=", 1)[0]: run[index + 1].split("=", 1)[1]
+                              for index, arg in enumerate(run) if arg == "--label"}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{
+                        "Id": "owned-probe", "Name": "/" + argv[-1],
+                        "Config": {"Labels": labels}}]), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                matrix.curl("127.0.0.1", outdir, "4k")
+            run, run_kwargs = commands[0]
+            self.assertIn("--connect-timeout", run)
+            self.assertIn("--max-time", run)
+            self.assertIn("benchmark-create-attempt", " ".join(run))
+            self.assertEqual(run_kwargs["timeout"], 30)
+            self.assertEqual(commands[1][0][1], "inspect")
+            self.assertEqual(commands[2][0], ["docker", "rm", "-f", "owned-probe"])
+
+    def test_timed_out_curl_probe_cleans_only_its_owned_container_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "run_id": "run1", "kubeconfig": "/tmp/kube",
+                "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            name = "probe-run1-attempt"
+            labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                      "benchmark-run-id": "run1", "benchmark-create-attempt": "token"}
+            events = []
+            def invoke(argv, **kwargs):
+                argv = [str(value) for value in argv]
+                events.append(argv)
+                if argv[1] == "run":
+                    raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+                if argv[1] == "inspect":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{
+                        "Id": "owned-id", "Name": "/" + name, "Config": {"Labels": labels}}]), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    matrix.run_owned_probe(["docker", "run", "--name", name], name, labels, timeout=20)
+            self.assertEqual([row[1] for row in events], ["run", "inspect", "rm"])
+            self.assertEqual(events[-1], ["docker", "rm", "-f", "owned-id"])
+
+    def test_client_measurement_docker_wait_timeout_tracks_requested_duration_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "measurement"
+            config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
+                      "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
+                      "concurrency": 4, "client_dir": "/benchmark",
+                      "tools": {"docker": "docker"}, "worker_container": "worker"}
+            with mock.patch("run_client.load_config", return_value=config), \
+                    mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "cell-measurement",
+                                             "--pod-ip", "10.0.0.2", "--duration", "2m", "--lua", "request.lua",
+                                             "--output", str(out)]), \
+                    mock.patch("run_client.start_and_stamp"), \
+                    mock.patch("run_client.subprocess.run", side_effect=[
+                        subprocess.CompletedProcess([], 0, "container123\n", ""),
+                        subprocess.CompletedProcess([], 0, "{}", ""),
+                        subprocess.TimeoutExpired(["docker", "wait"], 150),
+                        subprocess.CompletedProcess([], 0, "", "")]) as run:
+                self.assertEqual(run_client.main(), 124)
+            self.assertEqual(run.call_args_list[0].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
+            self.assertEqual(run.call_args_list[1].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
+            self.assertEqual(run.call_args_list[2].kwargs["timeout"], 180)
+            self.assertEqual(run.call_args_list[3].args[0], ["docker", "rm", "-f", "container123"])
+            self.assertIn("timed out", (out / "error.log").read_text())
+            self.assertEqual((out / "returncode.txt").read_text(), "124\n")
+
+    def test_cpu_max_accepts_any_positive_period_when_unlimited(self):
+        for value in ("max 100000", "max 200000", "max 1"):
+            with self.subTest(value=value):
+                run_matrix.verify_unlimited_cpu_max(value, "origin")
+        for value in ("100000 100000", "max 0", "max", "max nope", "max 100000 extra"):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "unexpected CPU quota"):
+                run_matrix.verify_unlimited_cpu_max(value, "origin")
+
+    def test_cpu_max_ancestry_rejects_finite_intermediate_and_requires_visible_root(self):
+        good = ("/sys/fs/cgroup/worker\tmax 100000\n"
+                "/sys/fs/cgroup\timplicit-unlimited\n")
+        rows = run_matrix.verify_unlimited_cpu_max_ancestry(good, "origin")
+        self.assertEqual([row["value"] for row in rows], ["max 100000", "implicit-unlimited"])
+        finite = good.replace("/sys/fs/cgroup/worker\tmax 100000",
+                              "/sys/fs/cgroup/worker\t100000 100000")
+        with self.assertRaisesRegex(RuntimeError, "unexpected CPU quota"):
+            run_matrix.verify_unlimited_cpu_max_ancestry(finite, "origin")
+        with self.assertRaisesRegex(RuntimeError, "does not reach"):
+            run_matrix.verify_unlimited_cpu_max_ancestry("/sys/fs/cgroup/worker\tmax 100000\n", "origin")
+        with self.assertRaisesRegex(RuntimeError, "skips a cgroup parent"):
+            run_matrix.verify_unlimited_cpu_max_ancestry(
+                "/sys/fs/cgroup/worker/child\tmax 100000\n/sys/fs/cgroup\timplicit-unlimited\n", "origin")
+        with self.assertRaisesRegex(RuntimeError, "only permits an implicit quota at the visible cgroup root"):
+            run_matrix.verify_unlimited_cpu_max_ancestry(
+                "/sys/fs/cgroup/worker\timplicit-unlimited\n/sys/fs/cgroup\timplicit-unlimited\n", "origin")
+        self.assertIn("/proc/1/cgroup", run_matrix.cpu_max_ancestry_script(1))
+
+    def test_short_measurement_checks_client_quota_before_first_load_sample(self):
+        duration = 1.0
+        elapsed = 0.5
+        next_snapshot = 2.0
+        self.assertLess(elapsed, duration)
+        self.assertLess(elapsed, next_snapshot)
+        self.assertTrue(run_matrix.measurement_client_cpu_check_due(True, False))
+        self.assertFalse(run_matrix.measurement_client_cpu_check_due(True, True))
+        self.assertFalse(run_matrix.measurement_client_cpu_check_due(False, False))
+
+    def test_wrk_client_cpu_max_checks_host_pid_ancestry_while_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "container-id.txt").write_text("client-id\n")
+            matrix = run_matrix.Matrix({"output": str(target), "worker_container": "worker",
+                                        "kubeconfig": "/tmp/kube",
+                                        "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            ancestry = ("/sys/fs/cgroup/docker/client\tmax 100000\n"
+                        "/sys/fs/cgroup/docker\tmax 100000\n"
+                        "/sys/fs/cgroup\tmax 100000\n")
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps([{
+                        "State": {"Pid": 4321, "Running": True}}]), ""),
+                    subprocess.CompletedProcess([], 0, ancestry, "")]) as invoke:
+                evidence = matrix.verify_client_cpu_max(target)
+            self.assertEqual(evidence[-1]["path"], "/sys/fs/cgroup")
+            self.assertEqual(invoke.call_args_list[1].args[0],
+                             ["sh", "-eu", "-c", run_matrix.cpu_max_ancestry_script(4321)])
+            self.assertEqual(json.loads((target / "client-cpu-max-ancestry.json").read_text())["pid"], 4321)
+
+            finite_root = ancestry.replace("/sys/fs/cgroup\tmax 100000",
+                                           "/sys/fs/cgroup\t50000 100000")
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps([{
+                        "State": {"Pid": 4321, "Running": True}}]), ""),
+                    subprocess.CompletedProcess([], 0, finite_root, "")]):
+                with self.assertRaisesRegex(RuntimeError, "unexpected CPU quota"):
+                    matrix.verify_client_cpu_max(target)
+
+    def test_selected_config_is_frozen_for_both_client_phases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            selected = Path(tmp) / "selected.json"
+            config = {"output": str(output), "duration": "10s", "warmup": "2s",
+                      "concurrency": 4, "kubeconfig": "/tmp/kube",
+                      "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"}}
+            selected.write_text(json.dumps(config))
+            matrix = run_matrix.Matrix(config, selected)
+            snapshot = matrix.freeze_client_config()
+            selected.write_text(json.dumps({**config, "concurrency": 99}))
+            self.assertEqual(json.loads(snapshot.read_text()), config)
+            for kind in ("warmup", "measurement"):
+                argv = matrix.client_argv(Path("run_client.py"), kind, "10.0.0.1", config["duration"], "x.lua", Path(tmp) / kind)
+                self.assertEqual(argv[argv.index("--config") + 1], str(snapshot))
+            self.assertEqual(json.loads(snapshot.read_text())["concurrency"], 4)
+
+    def test_pod_runtime_validation_rejects_restart_and_replacement(self):
+        status = {"name": "origin", "containerID": "containerd://abc", "imageID": "sha256:def", "restartCount": 0}
+        pod = {"status": {"containerStatuses": [status]}}
+        runtime = [{"name": "origin", "container_id": "abc", "image_id": "sha256:def", "restart_count": 0,
+                    "pid": 5, "processes": [{"pid": 5, "name": "origin", "allowed": "2"}]}]
+        run_matrix.verify_pod_runtime_stable(pod, json.loads(json.dumps(pod)), runtime)
+        for field, value in (("restartCount", 1), ("containerID", "containerd://new"), ("imageID", "sha256:new")):
+            changed = json.loads(json.dumps(pod))
+            changed["status"]["containerStatuses"][0][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "changed"):
+                run_matrix.verify_pod_runtime_stable(pod, changed, runtime)
+
+    def test_native_linkerd_proxy_init_container_is_identity_checked_and_inspected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            pod = {"spec": {"nodeName": "worker", "containers": [{"name": "origin", "image": "nginx"}],
+                            "initContainers": [{"name": "linkerd-proxy", "image": "proxy", "restartPolicy": "Always"}]},
+                   "status": {
+                       "containerStatuses": [{"name": "origin", "containerID": "containerd://origin-cid",
+                                               "imageID": "sha256:nginx", "restartCount": 0}],
+                       "initContainerStatuses": [{"name": "linkerd-proxy", "containerID": "containerd://proxy-cid",
+                                                  "imageID": "sha256:proxy", "restartCount": 0}],
+                   }}
+            (output / "pod.json").write_text(json.dumps(pod))
+            config = {"output": str(output), "worker_node": "worker", "worker_container": "worker-container",
+                      "image_identities": {"origin": {"reference": "nginx", "worker_id": "sha256:nginx"},
+                                           "linkerd_proxy": {"reference": "proxy", "worker_id": "sha256:proxy"}},
+                      "linkerd_injected_spec": common.normalized_linkerd_injection_spec(pod),
+                      "cpus": {"origin": "2", "proxy": 3},
+                      "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube"}
+            matrix = run_matrix.Matrix(config)
+            pid_by_cid = {"origin-cid": 100, "proxy-cid": 200}
+            finite_worker_quota = [False]
+            finite_host_worker_quota = [False]
+            def invoke(argv, **_kwargs):
+                argv = [str(item) for item in argv]
+                if "crictl" in argv:
+                    cid = argv[-1]
+                    result = json.dumps({"info": {"pid": pid_by_cid[cid]}})
+                elif len(argv) > 1 and argv[1] == "inspect":
+                    result = json.dumps([{"State": {"Pid": 300, "Running": True}}])
+                elif len(argv) >= 3 and argv[-2] == "-c" and "cpu.max" in argv[-1]:
+                    pid = int(argv[-1].split("/proc/")[1].split("/")[0])
+                    role = "worker-host" if pid == 300 else ("worker" if pid == 1 else ("origin" if pid == 100 else "proxy"))
+                    finite = (finite_worker_quota[0] and pid == 1) or (finite_host_worker_quota[0] and pid == 300)
+                    quota = "50000 100000" if finite else "max 100000"
+                    result = f"/sys/fs/cgroup/{role}\t{quota}\n/sys/fs/cgroup\tmax 200000\n"
+                elif "cgroup" in argv[-1] and "/proc/" in argv[-1]:
+                    pid = int(argv[-1].split("/")[2])
+                    role = "origin" if pid == 100 else "proxy"
+                    result = f"0::/{role}\n"
+                elif argv[-1].endswith("cgroup.procs"):
+                    result = "100\n" if "origin" in argv[-1] else "200\n"
+                elif len(argv) > 1 and argv[-2] == "-c":
+                    result = "100 origin 2\n" if "100" in argv[-1] else "200 linkerd-proxy 3\n"
+                elif "readlink" in argv:
+                    result = "/usr/bin/nginx\n"
+                elif "stat" in argv:
+                    result = "123\n"
+                elif "sha256sum" in argv:
+                    result = "digest  /proc/exe\n"
+                elif argv[-1].endswith("/maps"):
+                    result = ""
+                else:
+                    result = "pinned\n"
+                return subprocess.CompletedProcess(argv, 0, result, "")
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                pids = matrix.inspect_runtime("linkerd", output)
+            records = json.loads((output / "container-runtime.json").read_text())
+            self.assertEqual(pids, {"proxy": [200], "origin": [100]})
+            self.assertEqual({row["name"] for row in records}, {"origin", "linkerd-proxy"})
+            proxy_record = next(row for row in records if row["name"] == "linkerd-proxy")
+            self.assertEqual(proxy_record["pid"], 200)
+            self.assertEqual(proxy_record["cpu_max"][-1]["path"], "/sys/fs/cgroup")
+            self.assertEqual(proxy_record["worker_pid1_cpu_max"][-1]["path"], "/sys/fs/cgroup")
+            self.assertEqual(proxy_record["worker_host_cpu_max"][-1]["path"], "/sys/fs/cgroup")
+            finite_worker_quota[0] = True
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaisesRegex(RuntimeError, "worker PID 1.*unexpected CPU quota"):
+                    matrix.inspect_runtime("linkerd", output)
+            finite_worker_quota[0] = False
+            finite_host_worker_quota[0] = True
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaisesRegex(RuntimeError, "kind worker host PID.*unexpected CPU quota"):
+                    matrix.inspect_runtime("linkerd", output)
+
+    def test_live_runtime_validation_rejects_pid_or_affinity_change(self):
+        config = {"output": "/tmp/out", "worker_container": "worker",
+                  "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                  "kubeconfig": "/tmp/kube"}
+        matrix = run_matrix.Matrix(config)
+        runtime = [{"name": "origin", "container_id": "abc", "pid": 5,
+                    "processes": [{"pid": "5", "tid": 5, "name": "origin", "allowed": "2"}]}]
+        unlimited = "/sys/fs/cgroup/foo\tmax 100000\n/sys/fs/cgroup\tmax 100000\n"
+        outputs = [json.dumps([{"State": {"Pid": 9, "Running": True}}]), unlimited,
+                   json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+                   "0::/foo\n", "5\n", "5 origin 2\n"]
+        with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
+                        subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
+            matrix.verify_live_runtime(runtime)
+        outputs = [json.dumps([{"State": {"Pid": 9, "Running": True}}]), unlimited,
+                   json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+                   "0::/foo\n", "5\n", "5 origin 3\n"]
+        with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
+                        subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
+            with self.assertRaisesRegex(RuntimeError, "affinity changed"):
+                matrix.verify_live_runtime(runtime)
+
+    def test_live_runtime_validation_preserves_duplicate_thread_multiplicity(self):
+        config = {"output": "/tmp/out", "worker_container": "worker",
+                  "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                  "kubeconfig": "/tmp/kube"}
+        matrix = run_matrix.Matrix(config)
+        runtime = [{"name": "origin", "container_id": "abc", "pid": 5,
+                    "processes": [{"pid": "5", "tid": 11, "name": "origin", "allowed": "2"},
+                                  {"pid": "5", "tid": 12, "name": "origin", "allowed": "2"}]}]
+        unlimited = "/sys/fs/cgroup/foo\tmax 100000\n/sys/fs/cgroup\tmax 100000\n"
+        for observed in ("11 origin 2\n", "11 origin 2\n99 origin 2\n"):
+            outputs = [json.dumps([{"State": {"Pid": 9, "Running": True}}]), unlimited,
+                       json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+                       "0::/foo\n", "5\n", observed]
+            with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
+                            subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
+                with self.assertRaisesRegex(RuntimeError, "process/affinity changed"):
+                    matrix.verify_live_runtime(runtime)
+
+    def test_configmap_identity_verification_detects_recreate_and_data_change(self):
+        config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
+                  "kubeconfig": "/tmp/kube", "namespace": "bench",
+                  "configmap_identities": {"native": {"uid": "uid1", "data": {"x": "one"}}}}
+        matching = {"metadata": {"uid": "uid1"}, "data": {"x": "one"}, "immutable": True}
+        with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(matching), "")):
+            run_matrix.verify_configmaps(config)
+        for changed in ({"metadata": {"uid": "uid2"}, "data": {"x": "one"}, "immutable": True},
+                        {"metadata": {"uid": "uid1"}, "data": {"x": "two"}, "immutable": True}):
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 0, json.dumps(changed), "")):
+                with self.assertRaisesRegex(RuntimeError, "ConfigMap identity or data changed"):
+                    run_matrix.verify_configmaps(config)
+
+    def test_input_snapshot_detects_contents_membership_renames_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree = root / "inputs"
+            tree.mkdir()
+            (tree / "a.txt").write_text("one")
+            baseline = common.snapshot_inputs({"bundle": tree})
+            (tree / "a.txt").write_text("two")
+            self.assertNotEqual(common.snapshot_inputs({"bundle": tree}), baseline)
+            (tree / "a.txt").write_text("one")
+            (tree / "b.txt").write_text("new")
+            self.assertNotEqual(common.snapshot_inputs({"bundle": tree}), baseline)
+            (tree / "b.txt").unlink()
+            (tree / "a.txt").rename(tree / "renamed.txt")
+            self.assertNotEqual(common.snapshot_inputs({"bundle": tree}), baseline)
+            (tree / "renamed.txt").unlink()
+            (tree / "link").symlink_to(root / "outside")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                common.snapshot_inputs({"bundle": tree})
+            (tree / "link").unlink()
+            absolute_root = root / "absolute-config"
+            relative_root = root / "relative-config"
+            target = root / "outside-config"
+            target.mkdir()
+            absolute_root.symlink_to(target, target_is_directory=True)
+            relative_root.symlink_to("outside-config", target_is_directory=True)
+            for symlink_root in (absolute_root, relative_root):
+                with self.subTest(root=symlink_root), self.assertRaisesRegex(ValueError, "root is a symlink"):
+                    common.snapshot_inputs({"config": symlink_root})
+
+    def test_provenance_check_detects_image_retag_and_worker_image_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            (inputs / "request.lua").write_text("return true")
+            config_dir = root / "config"
+            libs = root / "libs"
+            clang = root / "clang"
+            ld = root / "ld"
+            rps = root / "rps"
+            throughput = root / "throughput"
+            for directory in (config_dir, libs, rps, throughput):
+                directory.mkdir()
+            for path in (clang, ld):
+                path.write_text(path.name)
+            artifacts = {}
+            for directory, name in ((rps, "rut_rps"), (rps, "rut_rps_compiler"),
+                                    (throughput, "rut_throughput"), (throughput, "rut_throughput_compiler")):
+                file_name = "rut-compile" if name.endswith("compiler") else "rut"
+                path = directory / file_name
+                path.write_text(name)
+                artifacts[name] = {"path": str(path), "sha256": common.sha256(path)}
+            host_id = "sha256:" + "a" * 64
+            worker_id = host_id
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            config = {
+                "input_snapshot": common.snapshot_inputs({"client_dir": inputs, "rut_config_dir": config_dir,
+                    "runtime_libs": libs, "clang": clang, "ld": ld,
+                    "benchmark_common": Path(common.__file__),
+                    "benchmark_driver": Path(run_matrix.__file__).with_name("run_client.py"),
+                    "benchmark_matrix": Path(run_matrix.__file__)}),
+                "client_dir": str(inputs),
+                "paths": {"rut_config_dir": str(config_dir), "runtime_libs": str(libs),
+                          "clang": str(clang), "ld": str(ld), "rut_rps": str(rps),
+                          "rut_throughput": str(throughput)},
+                "artifacts": artifacts, "checkpoint": str(checkpoint), "node_mount": "/benchmark",
+                "tools": {"docker": "docker"}, "worker_container": "bench-worker",
+                "image_identities": {"client": {"reference": "client:local", "docker_id": host_id,
+                                                    "worker_id": worker_id}},
+            }
+            inventory = {"images": [{"id": worker_id, "repoTags": ["client:local"], "repoDigests": []}]}
+            worker = [{"Mounts": [{"Source": str(checkpoint), "Destination": "/benchmark"}]}]
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(worker), ""),
+                    subprocess.CompletedProcess([], 0, host_id + "\n", ""),
+                    subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
+                run_matrix.verify_provenance(config)
+            split_worker_id = "sha256:" + "b" * 64
+            config["image_identities"]["client"]["worker_id"] = split_worker_id
+            inventory["images"][0]["id"] = split_worker_id
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(worker), ""),
+                    subprocess.CompletedProcess([], 0, host_id + "\n", ""),
+                    subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
+                with self.assertRaisesRegex(RuntimeError, "client Docker and kind worker image config IDs differ"):
+                    run_matrix.verify_provenance(config)
+            config["image_identities"]["client"]["worker_id"] = worker_id
+            inventory["images"][0]["id"] = worker_id
+            (inputs / "request.lua").write_text("changed")
+            with mock.patch("run_matrix.invoke") as invoke:
+                with self.assertRaisesRegex(RuntimeError, "mounted benchmark inputs changed"):
+                    run_matrix.verify_provenance(config)
+                invoke.assert_not_called()
+            (inputs / "request.lua").write_text("return true")
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(worker), ""),
+                    subprocess.CompletedProcess([], 0, "sha256:retagged\n", "")]):
+                with self.assertRaisesRegex(RuntimeError, "Docker image identity changed"):
+                    run_matrix.verify_provenance(config)
+            inventory["images"][0]["id"] = "sha256:changed"
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(worker), ""),
+                    subprocess.CompletedProcess([], 0, host_id + "\n", ""),
+                    subprocess.CompletedProcess([], 0, json.dumps(inventory), "")]):
+                with self.assertRaisesRegex(RuntimeError, "kind worker image identity changed"):
+                    run_matrix.verify_provenance(config)
+
+    def test_prepared_provenance_binds_measurement_driver_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = {}
+            for key in ("client_dir", "rut_config_dir", "runtime_libs", "rut_rps", "rut_throughput"):
+                inputs[key] = root / key
+                inputs[key].mkdir()
+            for key in ("clang", "ld"):
+                inputs[key] = root / key
+                inputs[key].write_text(key)
+            artifacts = {}
+            for variant in ("rut_rps", "rut_throughput"):
+                for filename, artifact_key in (("rut", variant), ("rut-compile", f"{variant}_compiler")):
+                    artifact_path = inputs[variant] / filename
+                    artifact_path.write_text(artifact_key)
+                    artifacts[artifact_key] = {"path": str(artifact_path), "sha256": common.sha256(artifact_path)}
+            (inputs["client_dir"] / "request.lua").write_text("return true")
+            driver_dir = root / "drivers"
+            driver_dir.mkdir()
+            driver_paths = {"benchmark_common": driver_dir / "common.py",
+                            "benchmark_driver": driver_dir / "run_client.py",
+                            "benchmark_matrix": driver_dir / "run_matrix.py"}
+            for path in driver_paths.values():
+                path.write_text("prepared version")
+            snapshot_paths = {**inputs, **driver_paths}
+            snapshot = common.snapshot_inputs(snapshot_paths)
+            config = {"client_dir": str(inputs["client_dir"]),
+                      "paths": {key: str(value) for key, value in inputs.items() if key != "client_dir"},
+                      "input_snapshot": snapshot, "artifacts": artifacts,
+                      "image_identities": {}}
+            old_fingerprint = common.provenance_fingerprint(config)
+            driver_paths["benchmark_driver"].write_text("updated driver")
+            changed = common.snapshot_inputs(snapshot_paths)
+            self.assertNotEqual(old_fingerprint,
+                                common.provenance_fingerprint({**config, "input_snapshot": changed}))
+            with mock.patch.object(run_matrix, "__file__", str(driver_paths["benchmark_matrix"])), \
+                    mock.patch.object(common, "__file__", str(driver_paths["benchmark_common"])), \
+                    mock.patch("run_matrix.invoke") as invoke:
+                with self.assertRaisesRegex(RuntimeError, "mounted benchmark inputs changed"):
+                    run_matrix.verify_provenance(config)
+                invoke.assert_not_called()
+
+    def test_resume_rejects_driver_execution_from_another_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout_a = root / "checkout-a"
+            checkout_b = root / "checkout-b"
+            checkout_a.mkdir()
+            checkout_b.mkdir()
+            snapshot = {}
+            for name, filename in (("benchmark_common", "common.py"),
+                                   ("benchmark_driver", "run_client.py"),
+                                   ("benchmark_matrix", "run_matrix.py")):
+                source = checkout_a / filename
+                source.write_text("prepared source")
+                snapshot[name] = {"path": str(source), "bytes": len("prepared source"),
+                                  "sha256": common.sha256(source)}
+                (checkout_b / filename).write_text("alternate checkout source")
+            config = {"input_snapshot": snapshot, "image_identities": {}}
+            with mock.patch.object(run_matrix, "__file__", str(checkout_b / "run_matrix.py")), \
+                    mock.patch.object(common, "__file__", str(checkout_b / "common.py")), \
+                    mock.patch("run_matrix.invoke") as invoke:
+                with self.assertRaisesRegex(RuntimeError, "current benchmark benchmark_common differs"):
+                    run_matrix.verify_provenance(config)
+                invoke.assert_not_called()
+
+    def test_effective_runtime_paths_must_match_prepared_snapshot_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = {}
+            for key in ("client_dir", "rut_config_dir", "runtime_libs", "clang", "ld", "rut_rps", "rut_throughput"):
+                path = root / key
+                if key in ("clang", "ld"):
+                    path.write_text(key)
+                else:
+                    path.mkdir()
+                paths[key] = path
+            artifacts = {}
+            for binary_key, binary_name in (("rut_rps", "rut_rps"), ("rut_throughput", "rut_throughput")):
+                for artifact_key, file_name in ((binary_name, "rut"), (f"{binary_name}_compiler", "rut-compile")):
+                    file = paths[binary_key] / file_name
+                    file.write_text(artifact_key)
+                    artifacts[artifact_key] = {"path": str(file), "sha256": common.sha256(file)}
+            config = {"client_dir": str(paths["client_dir"]),
+                      "paths": {key: str(value) for key, value in paths.items() if key != "client_dir"},
+                      "input_snapshot": common.snapshot_inputs({key: paths[key] for key in
+                          ("client_dir", "rut_config_dir", "runtime_libs", "clang", "ld")}),
+                      "artifacts": artifacts, "node_mount": "/benchmark"}
+            run_matrix.verify_effective_paths(config)
+            for mutation in (
+                {**config, "client_dir": str(paths["rut_config_dir"])},
+                {**config, "paths": {**config["paths"], "rut_config_dir": str(paths["client_dir"])}},
+                {**config, "paths": {**config["paths"], "rut_rps": str(paths["rut_throughput"])}},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "effective benchmark path"):
+                    run_matrix.verify_effective_paths(mutation)
+            for key, value in (("client_dir", str(paths["rut_config_dir"])),
+                               ("paths", {**config["paths"], "rut_config_dir": "/other/config"}),
+                               ("node_mount", "/other/mount")):
+                self.assertNotEqual(common.provenance_fingerprint({**config, key: value}),
+                                    common.provenance_fingerprint(config))
+
+    def test_worker_node_mount_mapping_is_rechecked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp)
+            config = {"worker_container": "worker", "checkpoint": str(checkpoint),
+                      "node_mount": "/benchmark"}
+            worker = [{"Mounts": [{"Source": str(checkpoint), "Destination": "/benchmark"}]}]
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(worker), "")) as invoke:
+                run_matrix.verify_worker_mount(config, "docker")
+            self.assertEqual(invoke.call_args.args[0], ["docker", "inspect", "worker"])
+            config["node_mount"] = "/changed"
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(worker), "")):
+                with self.assertRaisesRegex(RuntimeError, "checkpoint mount differs"):
+                    run_matrix.verify_worker_mount(config, "docker")
+
+    def test_client_drivers_receive_frozen_config_path_and_workload_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"output": str(Path(tmp) / "output"),
+                  "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                  "kubeconfig": "/tmp/kube"}
+            matrix = run_matrix.Matrix(config, Path(tmp) / "selected.json")
+            snapshot = matrix.freeze_client_config()
+            for kind, duration, lua in (("warmup", "2s", "warmup.lua"),
+                                        ("measurement", "10s", "request.lua")):
+                argv = matrix.client_argv(Path("run_client.py"), f"cell-{kind}", "10.0.0.2",
+                                          duration, lua, Path("results") / kind)
+                self.assertEqual(argv[argv.index("--config") + 1], str(snapshot))
+                self.assertEqual(argv[argv.index("--duration") + 1], duration)
+                self.assertEqual(argv[argv.index("--lua") + 1], lua)
+
+    def test_effective_runtime_paths_must_match_prepared_snapshot_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = {}
+            for key in ("client_dir", "rut_config_dir", "runtime_libs", "clang", "ld", "rut_rps", "rut_throughput"):
+                path = root / key
+                if key in ("clang", "ld"):
+                    path.write_text(key)
+                else:
+                    path.mkdir()
+                paths[key] = path
+            artifacts = {}
+            for binary_key, binary_name in (("rut_rps", "rut_rps"), ("rut_throughput", "rut_throughput")):
+                for artifact_key, file_name in ((binary_name, "rut"), (f"{binary_name}_compiler", "rut-compile")):
+                    file = paths[binary_key] / file_name
+                    file.write_text(artifact_key)
+                    artifacts[artifact_key] = {"path": str(file), "sha256": common.sha256(file)}
+            config = {"client_dir": str(paths["client_dir"]),
+                      "paths": {key: str(value) for key, value in paths.items() if key != "client_dir"},
+                      "input_snapshot": common.snapshot_inputs({key: paths[key] for key in
+                          ("client_dir", "rut_config_dir", "runtime_libs", "clang", "ld")}),
+                      "artifacts": artifacts, "node_mount": "/benchmark"}
+            run_matrix.verify_effective_paths(config)
+            for mutation in (
+                {**config, "client_dir": str(paths["rut_config_dir"])},
+                {**config, "paths": {**config["paths"], "rut_config_dir": str(paths["client_dir"])}},
+                {**config, "paths": {**config["paths"], "rut_rps": str(paths["rut_throughput"])}},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "effective benchmark path"):
+                    run_matrix.verify_effective_paths(mutation)
+            for key, value in (("client_dir", str(paths["rut_config_dir"])),
+                               ("paths", {**config["paths"], "rut_config_dir": "/other/config"}),
+                               ("node_mount", "/other/mount")):
+                self.assertNotEqual(common.provenance_fingerprint({**config, key: value}),
+                                    common.provenance_fingerprint(config))
+
+    def test_worker_node_mount_mapping_is_rechecked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp)
+            config = {"worker_container": "worker", "checkpoint": str(checkpoint),
+                      "node_mount": "/benchmark"}
+            worker = [{"Mounts": [{"Source": str(checkpoint), "Destination": "/benchmark"}]}]
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(worker), "")) as invoke:
+                run_matrix.verify_worker_mount(config, "docker")
+            self.assertEqual(invoke.call_args.args[0], ["docker", "inspect", "worker"])
+            config["node_mount"] = "/changed"
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(worker), "")):
+                with self.assertRaisesRegex(RuntimeError, "checkpoint mount differs"):
+                    run_matrix.verify_worker_mount(config, "docker")
+
+    def test_failed_cell_cleanup_deletes_only_exact_invocation_owned_pod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            (output / "samples").mkdir(parents=True)
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            name = "proxybench-run123-4k-1-nginx"
+            pod = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-created",
+                    "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                               "benchmark-run-id": "run123",
+                               "benchmark-create-attempt": matrix.pod_create_attempt}}}
+            with mock.patch.object(matrix, "kube", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(pod), ""),
+                    subprocess.CompletedProcess([], 0, "deleted\n", "")]) as kube:
+                result = run_matrix.cleanup_failed_cell(matrix, config,
+                    {"body": "4k", "engine": "nginx", "rep": 1}, RuntimeError("create timed out"))
+            self.assertEqual(kube.call_args_list[0].args[:3], ("get", "pod", name))
+            delete_args = kube.call_args_list[1].args
+            self.assertEqual(delete_args[:3], ("delete", "pod", "-n"))
+            self.assertIn(f"benchmark-create-attempt={matrix.pod_create_attempt}", " ".join(delete_args))
+            self.assertIn(f"metadata.name={name}", " ".join(delete_args))
+            self.assertNotIn("--ignore-not-found=true", delete_args)
+            self.assertFalse((output / "samples/4k/4k-nginx-r1/pod-create.txt").exists())
+            self.assertEqual(result, "deleted\n")
+            self.assertIn("create timed out", (output / "samples/last-failure.json").read_text())
+
+    def test_failed_cell_cleanup_skips_colliding_or_replaced_pod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            samples = output / "samples"
+            samples.mkdir(parents=True)
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            name = "proxybench-run123-4k-1-nginx"
+            cell = {"body": "4k", "engine": "nginx", "rep": 1}
+
+            collision = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-old",
+                         "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                                    "benchmark-run-id": "run123", "benchmark-create-attempt": "old-attempt"}}}
+            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(collision), "")) as kube:
+                run_matrix.cleanup_failed_cell(matrix, config, cell, RuntimeError("name collision"))
+            self.assertEqual(kube.call_count, 1)
+            self.assertEqual(kube.call_args.args[:3], ("get", "pod", name))
+
+            cell_output = samples / "4k" / "4k-nginx-r1"
+            cell_output.mkdir(parents=True)
+            (cell_output / "pod.json").write_text(json.dumps({"metadata": {"uid": "uid-original"}}))
+            replacement = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-replacement",
+                           "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                                      "benchmark-run-id": "run123",
+                                      "benchmark-create-attempt": matrix.pod_create_attempt}}}
+            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(replacement), "")) as kube:
+                run_matrix.cleanup_failed_cell(matrix, config, cell, RuntimeError("pod replaced"))
+            self.assertEqual(kube.call_count, 1)
+            self.assertEqual(kube.call_args.args[:3], ("get", "pod", name))
+
+    def test_successful_cell_cleanup_checks_invocation_labels_and_initial_uid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            (output / "samples").mkdir(parents=True)
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            name = "proxybench-run123-4k-1-nginx"
+            pod = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-original",
+                    "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                               "benchmark-run-id": "run123",
+                               "benchmark-create-attempt": matrix.pod_create_attempt}}}
+            cell = {"body": "4k", "engine": "nginx", "rep": 1}
+            with mock.patch.object(matrix, "kube", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(pod), ""),
+                    subprocess.CompletedProcess([], 0, "deleted\n", "")]) as kube:
+                result = run_matrix.cleanup_cell_pod(matrix, config, cell,
+                                                     expected_uid="uid-original", require_owned=True)
+            self.assertEqual(result, "deleted\n")
+            self.assertEqual(kube.call_args_list[0].args[:3], ("get", "pod", name))
+            delete_args = kube.call_args_list[1].args
+            self.assertEqual(delete_args[:3], ("delete", "pod", "-n"))
+            self.assertIn(f"benchmark-create-attempt={matrix.pod_create_attempt}", " ".join(delete_args))
+            self.assertIn(f"metadata.name={name}", " ".join(delete_args))
+            replacement = {**pod, "metadata": {**pod["metadata"], "uid": "uid-replacement"}}
+            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(replacement), "")) as kube:
+                with self.assertRaisesRegex(RuntimeError, "ownership or UID mismatch"):
+                    run_matrix.cleanup_cell_pod(matrix, config, cell,
+                                                expected_uid="uid-original", require_owned=True)
+            self.assertEqual(kube.call_count, 1)
+
+    def test_summary_rejects_sample_from_different_input_or_image_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            sample_dir = Path("samples") / "4k" / "4k-nginx-r1"
+            validation = output / sample_dir / "valid.txt"
+            validation.parent.mkdir(parents=True)
+            validation.write_text("valid\n")
+            row = {"body_size": "4k", "engine": "nginx", "rep": 1,
+                   "validation_path": (sample_dir / "valid.txt").as_posix(),
+                   "warmup_dir": (sample_dir / "warmup").as_posix(),
+                   "measure_dir": (sample_dir / "measurement").as_posix()}
+            config = {"images": {"client": "client:local"},
+                      "image_identities": {"client": {"docker_id": "sha256:client", "worker_id": "sha256:node"}},
+                      "input_snapshot": {"client_dir": {"entries": {"request.lua": {"sha256": "abc"}}}}}
+            fingerprint = common.provenance_fingerprint(config)
+            (validation.parent / "cell.json").write_text(json.dumps({
+                "body": "4k", "engine": "nginx", "rep": 1,
+                "provenance_fingerprint": fingerprint}))
+            summarize.validate_sample_provenance(output, row, fingerprint)
+            changed = common.provenance_fingerprint({**config, "images": {"client": "client:new"}})
+            with self.assertRaisesRegex(ValueError, "provenance does not match"):
+                summarize.validate_sample_provenance(output, row, changed)
+            changed_configmap = common.provenance_fingerprint({**config,
+                "configmap_identities": {"native": {"uid": "new", "data": {"x": "changed"}}}})
+            self.assertNotEqual(changed_configmap, fingerprint)
+            configured = {**config, "concurrency": 128, "duration": "10s", "warmup": "2s",
+                          "repeats": 3, "bodies": {"4k": 4096},
+                          "cpus": {"proxy": 2, "origin": "3-4", "client": "5,7"},
+                          "artifacts": {"rut": {"sha256": "before"}}}
+            baseline = common.provenance_fingerprint(configured)
+            (validation.parent / "cell.json").write_text(json.dumps({"body": "4k", "engine": "nginx", "rep": 1,
+                                                                      "provenance_fingerprint": baseline}))
+            mutations = [
+                {**configured, "concurrency": 256},
+                {**configured, "duration": "20s"},
+                {**configured, "warmup": "4s"},
+                {**configured, "repeats": 4},
+                {**configured, "bodies": {"4k": 4096, "64k": 65536}},
+                {**configured, "cpus": {"proxy": 3, "origin": "3-4", "client": "5,7"}},
+                {**configured, "artifacts": {"rut": {"sha256": "after"}}},
+                {**configured, "client_dir": "/different/client"},
+                {**configured, "paths": {"rut_config_dir": "/different/config"}},
+                {**configured, "node_mount": "/different/mount"},
+            ]
+            for mutated in mutations:
+                changed_settings = common.provenance_fingerprint(mutated)
+                self.assertNotEqual(changed_settings, baseline)
+                with self.assertRaisesRegex(ValueError, "provenance does not match"):
+                    summarize.validate_sample_provenance(output, row, changed_settings)
+            self.assertEqual(common.provenance_fingerprint({**configured,
+                "output": "/different/location", "checkpoint": "/other/checkpoint"}), baseline)
+
+    def test_summary_rejects_index_identity_or_result_path_swaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            sample_dir = Path("samples") / "4k" / "4k-nginx-r1"
+            cell_dir = output / sample_dir
+            cell_dir.mkdir(parents=True)
+            row = {"body_size": "4k", "engine": "nginx", "rep": 1,
+                   "validation_path": (sample_dir / "valid.txt").as_posix(),
+                   "warmup_dir": (sample_dir / "warmup").as_posix(),
+                   "measure_dir": (sample_dir / "measurement").as_posix()}
+            fingerprint = common.provenance_fingerprint({})
+            (cell_dir / "cell.json").write_text(json.dumps({
+                "body": "4k", "engine": "nginx", "rep": 1,
+                "provenance_fingerprint": fingerprint}))
+            summarize.validate_sample_provenance(output, row, fingerprint)
+            for mutated in ({**row, "engine": "envoy"},
+                            {**row, "body_size": "64k"},
+                            {**row, "rep": 2},
+                            {**row, "warmup_dir": "samples/4k/4k-envoy-r1/warmup"},
+                            {**row, "measure_dir": "samples/4k/4k-envoy-r1/measurement"}):
+                with self.assertRaisesRegex(ValueError, "index"):
+                    summarize.validate_sample_provenance(output, mutated, fingerprint)
+
+    def test_run_rechecks_every_recorded_artifact_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rut"
+            path.write_bytes(b"original")
+            path.chmod(0o755)
+            config = {"artifacts": {"rut": {"path": str(path), "sha256": common.sha256(path)}}}
+            run_matrix.verify_artifacts(config)
+            path.chmod(0o644)
+            with self.assertRaisesRegex(RuntimeError, "not executable"):
+                run_matrix.verify_artifacts(config)
+            path.chmod(0o755)
+            path.write_bytes(b"changed")
+            with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                run_matrix.verify_artifacts(config)
+            path.unlink()
+            external = Path(tmp) / "external-rut"
+            external.write_bytes(b"original")
+            external.chmod(0o755)
+            path.symlink_to(external)
+            with self.assertRaisesRegex(RuntimeError, "artifact is a symlink"):
+                run_matrix.verify_artifacts(config)
+
+    def test_prepared_payload_verification_detects_mutation_and_truncation_in_both_mount_copies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            payload_dir = checkpoint / "payloads" / "4k"
+            payload_dir.mkdir(parents=True)
+            content = b"prepared-payload"
+            for filename in ("proxy", "body.bin"):
+                (payload_dir / filename).write_bytes(content)
+            output = root / "output"
+            output.mkdir()
+            metadata = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+            (output / "payloads.json").write_text(json.dumps({"4k": metadata}))
+            config = {"output": str(output), "checkpoint": str(checkpoint), "bodies": {"4k": len(content)},
+                      "payloads": {"4k": metadata}}
+            run_matrix.verify_payloads(config)
+            for filename in ("proxy", "body.bin"):
+                path = payload_dir / filename
+                path.write_bytes(b"modified-payload")
+                with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
+                    run_matrix.verify_payloads(config)
+                path.write_bytes(content[:-1])
+                with self.assertRaisesRegex(RuntimeError, "size mismatch"):
+                    run_matrix.verify_payloads(config)
+                path.write_bytes(content)
+            run_matrix.verify_payloads(config)
+
+    def test_payload_provenance_rejects_symlink_root_directories_and_files(self):
+        for component in ("root", "directory", "file"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint = root / "checkpoint"
+                payload_dir = checkpoint / "payloads" / "4k"
+                payload_dir.mkdir(parents=True)
+                content = b"prepared-payload"
+                for name in ("proxy", "body.bin"):
+                    (payload_dir / name).write_bytes(content)
+                output = root / "output"
+                output.mkdir()
+                metadata = {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+                (output / "payloads.json").write_text(json.dumps({"4k": metadata}))
+                config = {"output": str(output), "checkpoint": str(checkpoint),
+                          "bodies": {"4k": len(content)}, "payloads": {"4k": metadata}}
+                run_matrix.verify_payloads(config)
+                outside = root / "outside"
+                outside.mkdir()
+                (outside / "proxy").write_bytes(content)
+                (outside / "body.bin").write_bytes(content)
+                if component == "root":
+                    (checkpoint / "payloads").rename(checkpoint / "payloads-original")
+                    (checkpoint / "payloads").symlink_to(outside, target_is_directory=True)
+                elif component == "directory":
+                    (payload_dir).rename(checkpoint / "payloads" / "4k-original")
+                    payload_dir.symlink_to(outside, target_is_directory=True)
+                else:
+                    (payload_dir / "proxy").unlink()
+                    (payload_dir / "proxy").symlink_to(outside / "proxy")
+                with self.assertRaisesRegex(RuntimeError, "symlink"):
+                    run_matrix.verify_payloads(config)
+
+    def test_same_size_payload_and_metadata_replacement_is_rejected_and_changes_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            payload_dir = checkpoint / "payloads" / "4k"
+            payload_dir.mkdir(parents=True)
+            original = b"original payload bytes"
+            replacement = b"replaced payload bytes"
+            self.assertEqual(len(replacement), len(original))
+            for filename in ("proxy", "body.bin"):
+                (payload_dir / filename).write_bytes(original)
+            output = root / "output"
+            output.mkdir()
+            original_metadata = {"bytes": len(original), "sha256": hashlib.sha256(original).hexdigest()}
+            replacement_metadata = {"bytes": len(replacement),
+                                    "sha256": hashlib.sha256(replacement).hexdigest()}
+            (output / "payloads.json").write_text(json.dumps({"4k": original_metadata}))
+            config = {"schema": 1, "output": str(output), "checkpoint": str(checkpoint),
+                      "bodies": {"4k": len(original)},
+                      "payloads": {"4k": original_metadata},
+                      "input_snapshot": common.snapshot_inputs({
+                          "benchmark_common": common.__file__, "benchmark_summarize": summarize.__file__})}
+            original_fingerprint = common.provenance_fingerprint(config)
+            sample_dir = Path("samples") / "4k" / "4k-nginx-r1"
+            validation = output / sample_dir / "valid.txt"
+            validation.parent.mkdir(parents=True)
+            validation.write_text("valid\n")
+            row = {"body_size": "4k", "engine": "nginx", "rep": 1,
+                   "validation_path": (sample_dir / "valid.txt").as_posix(),
+                   "warmup_dir": (sample_dir / "warmup").as_posix(),
+                   "measure_dir": (sample_dir / "measurement").as_posix()}
+            (validation.parent / "cell.json").write_text(json.dumps({
+                "body": "4k", "engine": "nginx", "rep": 1,
+                "provenance_fingerprint": original_fingerprint}))
+            run_matrix.verify_payloads(config)
+            for filename in ("proxy", "body.bin"):
+                (payload_dir / filename).write_bytes(replacement)
+            (output / "payloads.json").write_text(json.dumps({"4k": replacement_metadata}))
+            with self.assertRaisesRegex(RuntimeError, "differs from benchmark config"):
+                run_matrix.verify_payloads(config)
+            config_path = output / "benchmark.json"
+            config_path.write_text(json.dumps(config))
+            with mock.patch("sys.argv", ["summarize.py", "--config", str(config_path)]):
+                with self.assertRaisesRegex(RuntimeError, "differs from benchmark config"):
+                    summarize.main()
+            mutated_config = {**config, "payloads": {"4k": replacement_metadata}}
+            self.assertNotEqual(common.provenance_fingerprint(mutated_config), original_fingerprint)
+            with self.assertRaisesRegex(ValueError, "provenance does not match"):
+                summarize.validate_sample_provenance(output, row,
+                    common.provenance_fingerprint(mutated_config))
+
+    def test_summarizer_provenance_binds_active_checkout_and_source_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout_a, checkout_b = root / "checkout-a", root / "checkout-b"
+            checkout_a.mkdir(); checkout_b.mkdir()
+            common_a, summarize_a = checkout_a / "common.py", checkout_a / "summarize.py"
+            common_b, summarize_b = checkout_b / "common.py", checkout_b / "summarize.py"
+            common_a.write_text("common A")
+            summarize_a.write_text("summarize A")
+            common_b.write_text("common B")
+            summarize_b.write_text("summarize B")
+            snapshot = common.snapshot_inputs({"benchmark_common": common_a,
+                                               "benchmark_summarize": summarize_a})
+            config = {"input_snapshot": snapshot}
+            with mock.patch.object(common, "__file__", str(common_a)), \
+                    mock.patch.object(summarize, "__file__", str(summarize_a)):
+                summarize.verify_summarizer_provenance(config)
+            with mock.patch.object(common, "__file__", str(common_b)), \
+                    mock.patch.object(summarize, "__file__", str(summarize_b)):
+                with self.assertRaisesRegex(ValueError, "differs from prepared"):
+                    summarize.verify_summarizer_provenance(config)
+            summarize_a.write_text("modified summarize A")
+            with mock.patch.object(common, "__file__", str(common_a)), \
+                    mock.patch.object(summarize, "__file__", str(summarize_a)):
+                with self.assertRaisesRegex(ValueError, "inputs changed"):
+                    summarize.verify_summarizer_provenance(config)
+
+    def test_summary_checks_active_provenance_before_opening_sample_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "benchmark.json"
+            config_path.write_text(json.dumps({"schema": 1, "output": tmp}))
+            with mock.patch("sys.argv", ["summarize.py", "--config", str(config_path)]), \
+                    mock.patch("summarize.verify_summarizer_provenance",
+                               side_effect=ValueError("provenance gate")) as verify:
+                with self.assertRaisesRegex(ValueError, "provenance gate"):
+                    summarize.main()
+            verify.assert_called_once()
+
+    def test_measurement_start_stamp_follows_delayed_docker_start_and_running_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stamp = Path(tmp) / "measurement-start-monotonic.txt"
+            state = [subprocess.CompletedProcess([], 0, "", ""),
+                     subprocess.CompletedProcess([], 0, "false\n", ""),
+                     subprocess.CompletedProcess([], 0, "true\n", "")]
+            with mock.patch("run_client.subprocess.run", side_effect=state) as docker_run, \
+                    mock.patch("run_client.time.sleep"), \
+                    mock.patch("run_client.time.monotonic", side_effect=[100.0, 100.1, 100.3, 100.8]), \
+                    mock.patch("run_client.os.replace", wraps=os.replace) as atomic_replace:
+                run_client.start_and_stamp("docker", "wrk-container", stamp)
+            self.assertEqual(stamp.read_text(), "100.800000000\n")
+            atomic_replace.assert_called_once()
+            self.assertEqual(list(Path(tmp).iterdir()), [stamp])
+            self.assertEqual(docker_run.call_args_list[0].args[0], ["docker", "start", "wrk-container"])
+            self.assertEqual(docker_run.call_args_list[1].args[0],
+                             ["docker", "inspect", "--format", "{{.State.Running}}", "wrk-container"])
+            self.assertEqual(docker_run.call_args_list[2].args[0],
+                             ["docker", "inspect", "--format", "{{.State.Running}}", "wrk-container"])
+            self.assertTrue(all(call.kwargs["timeout"] == run_client.DOCKER_CONTROL_TIMEOUT
+                                for call in docker_run.call_args_list))
+
+    def test_client_warmup_attach_docker_call_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "warmup"
+            config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
+                      "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
+                      "concurrency": 4, "client_dir": "/benchmark",
+                      "tools": {"docker": "docker"}, "worker_container": "worker"}
+            with mock.patch("run_client.load_config", return_value=config), \
+                    mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "cell-warmup",
+                                             "--pod-ip", "2001:db8::2", "--duration", "2s", "--lua", "warmup.lua",
+                                             "--output", str(out)]), \
+                    mock.patch("run_client.subprocess.run", side_effect=[
+                        subprocess.CompletedProcess([], 0, "container123\n", ""),
+                        subprocess.CompletedProcess([], 0, "{}", ""),
+                        subprocess.CompletedProcess([], 0, "METRICS 1", ""),
+                        subprocess.CompletedProcess([], 0, "", "")]) as run:
+                self.assertEqual(run_client.main(), 0)
+            self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list],
+                             [run_client.DOCKER_CONTROL_TIMEOUT,
+                              run_client.DOCKER_CONTROL_TIMEOUT,
+                              run_client.wrk_timeout("2s"),
+                              run_client.DOCKER_CLEANUP_TIMEOUT])
+            self.assertEqual(run.call_args_list[3].args[0], ["docker", "rm", "-f", "container123"])
+            command = json.loads((out / "command.json").read_text())
+            self.assertEqual(command[-1], "http://[2001:db8::2]:8080/proxy")
+
+    def test_frontend_readiness_retries_probe_timeouts_and_connection_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                                        "kubeconfig": "", "worker_container": "worker",
+                                        "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
+            success = subprocess.CompletedProcess([], 0, "", "")
+            events = []
+            def invoke(argv, **_kwargs):
+                events.append([str(item) for item in argv])
+                if argv[1] == "run":
+                    attempt = sum(1 for event in events if event[1] == "run")
+                    if attempt == 1:
+                        raise subprocess.TimeoutExpired("curl", 5)
+                    return subprocess.CompletedProcess([], 7, "", "refused") if attempt == 2 else success
+                if argv[1] == "inspect":
+                    run = next(row for row in events if row[1] == "run")
+                    labels = {}
+                    for index, item in enumerate(run):
+                        if item == "--label":
+                            key, value = run[index + 1].split("=", 1)
+                            labels[key] = value
+                    return subprocess.CompletedProcess([], 0, json.dumps([{
+                        "Id": "owned-id", "Name": "/" + argv[-1], "Config": {"Labels": labels}}]), "")
+                return subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch("run_matrix.time.monotonic", return_value=0), \
+                    mock.patch("run_matrix.time.sleep") as sleep, \
+                    mock.patch("run_matrix.invoke", side_effect=invoke) as invoke_mock:
+                matrix.wait_frontend("2001:db8::2")
+            self.assertEqual(invoke_mock.call_count, 9)
+            self.assertEqual([event[1] for event in events],
+                             ["run", "inspect", "rm", "run", "inspect", "rm", "run", "inspect", "rm"])
+            self.assertEqual(sleep.call_count, 2)
+            self.assertIn("--connect-timeout", events[0])
+            self.assertIn("--max-time", events[0])
+            self.assertIn("--name", events[0])
+            self.assertEqual(events[0][-1], "http://[2001:db8::2]:8080/proxy")
+            self.assertEqual(events[2][1:], ["rm", "-f", "owned-id"])
+            label_args = [events[0][index + 1] for index, item in enumerate(events[0]) if item == "--label"]
+            self.assertEqual(len(label_args), 3)
+            self.assertIn("app.kubernetes.io/managed-by=rut-proxy-benchmark", label_args)
+            self.assertIn("benchmark-run-id=run", label_args)
+
+    def test_frontend_cleanup_failure_reuses_same_name_and_cannot_spawn_another_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                                        "kubeconfig": "", "worker_container": "worker", "run_id": "r1",
+                                        "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
+            events = []
+            def invoke(argv, **_kwargs):
+                argv = [str(item) for item in argv]
+                events.append(argv)
+                if argv[1] == "run":
+                    if sum(1 for row in events if row[1] == "run") == 1:
+                        raise subprocess.TimeoutExpired(argv, 5)
+                    return subprocess.CompletedProcess(argv, 125, "container name already in use", "")
+                if argv[1] == "inspect":
+                    run = next(row for row in events if row[1] == "run")
+                    labels = {run[index + 1].split("=", 1)[0]: run[index + 1].split("=", 1)[1]
+                              for index, item in enumerate(run) if item == "--label"}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{
+                        "Id": "owned-id", "Name": "/" + argv[-1], "Config": {"Labels": labels}}]), "")
+                if argv[1] == "rm" and sum(1 for row in events if row[1] == "rm") == 1:
+                    raise OSError("Docker daemon did not remove the timed out probe")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with mock.patch("run_matrix.time.monotonic", side_effect=[0, 0, 0, 181]), \
+                    mock.patch("run_matrix.time.sleep"), \
+                    mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                    matrix.wait_frontend("10.0.0.2")
+            run_events = [row for row in events if row[1] == "run"]
+            self.assertEqual(len(run_events), 2)
+            self.assertEqual(run_events[0][run_events[0].index("--name") + 1],
+                             run_events[1][run_events[1].index("--name") + 1])
+            self.assertEqual([row[1] for row in events], ["run", "inspect", "rm", "run", "inspect", "rm"])
+
+    def test_frontend_name_collision_never_removes_unowned_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                                        "kubeconfig": "", "worker_container": "worker", "run_id": "r1",
+                                        "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
+            events = []
+            def invoke(argv, **_kwargs):
+                argv = [str(item) for item in argv]
+                events.append(argv)
+                if argv[1] == "run":
+                    return subprocess.CompletedProcess(argv, 125, "name already in use", "")
+                if argv[1] == "inspect":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps([{
+                        "Id": "unowned-id", "Name": "/" + argv[-1],
+                        "Config": {"Labels": {"app.kubernetes.io/managed-by": "other"}}}]), "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with mock.patch("run_matrix.time.monotonic", side_effect=[0, 0, 181]), \
+                    mock.patch("run_matrix.time.sleep"), mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                    matrix.wait_frontend("10.0.0.2")
+            self.assertEqual([row[1] for row in events], ["run", "inspect"])
+
+    def test_monitor_failure_cancels_driver_and_confirms_owned_wrk_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "container-id.txt").write_text("wrk-owned\n")
+            matrix = run_matrix.Matrix({"output": tmp, "run_id": "run1",
+                                        "kubeconfig": "/tmp/kube",
+                                        "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            events = []
+            class Child:
+                returncode = None
+                def poll(self):
+                    return self.returncode
+                def send_signal(self, value):
+                    events.append(("signal", value))
+                def communicate(self, timeout=None):
+                    events.append(("communicate", timeout))
+                    self.returncode = -2
+                    return ("cancelled\n", None)
+                def terminate(self):
+                    events.append(("terminate",))
+                def kill(self):
+                    events.append(("kill",))
+            child = Child()
+            owner_labels = {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                            "benchmark-run-id": "run1", "benchmark-create-attempt": "attempt"}
+            inspect = {"Id": "wrk-owned", "Name": "/proxybench-run1-cell",
+                       "Config": {"Labels": owner_labels}}
+            def invoke(argv, **kwargs):
+                argv = [str(value) for value in argv]
+                events.append(("docker", argv[1], argv[-1]))
+                if argv[1] == "inspect" and len(argv) > 2 and argv[2] == "wrk-owned":
+                    if sum(1 for event in events if event[:2] == ("docker", "inspect")) == 1:
+                        return subprocess.CompletedProcess(argv, 0, json.dumps([inspect]), "")
+                    return subprocess.CompletedProcess(argv, 1, "Error: No such object: wrk-owned", "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            monitoring_error = RuntimeError("monitor failed")
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaises(RuntimeError) as caught:
+                    with matrix.client_driver_guard(child, target):
+                        raise monitoring_error
+            self.assertIs(caught.exception, monitoring_error)
+            self.assertEqual(events[0], ("signal", run_matrix.signal.SIGINT))
+            self.assertIn(("communicate", 10), events)
+            self.assertIn(("docker", "rm", "wrk-owned"), events)
+            self.assertEqual((target / "driver-cancel.log").read_text(), "cancelled\n")
+
+    def test_wrk_cleanup_refuses_to_remove_unowned_container_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "container-id.txt").write_text("other-id\n")
+            matrix = run_matrix.Matrix({"output": tmp, "run_id": "run1",
+                                        "kubeconfig": "/tmp/kube",
+                                        "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            inspected = {"Id": "other-id", "Config": {"Labels": {"benchmark-run-id": "someone-else"}}}
+            with mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps([inspected]), "")) as invoke:
+                with self.assertRaisesRegex(RuntimeError, "not owned"):
+                    matrix.verify_wrk_container_cleanup(target)
+            self.assertEqual(invoke.call_count, 1)
+
+    def test_driver_cancellation_escalates_and_reaps_with_bounded_waits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "run_id": "run1", "kubeconfig": "/tmp/kube",
+                                        "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            events = []
+            class Child:
+                returncode = None
+                def poll(self):
+                    return self.returncode
+                def send_signal(self, value):
+                    events.append(("signal", value))
+                def communicate(self, timeout=None):
+                    events.append(("communicate", timeout))
+                    if len([event for event in events if event[0] == "communicate"]) == 1:
+                        raise subprocess.TimeoutExpired("driver", timeout)
+                    self.returncode = -15
+                    return ("terminated\n", None)
+                def terminate(self):
+                    events.append(("terminate",))
+                def kill(self):
+                    events.append(("kill",))
+            child = Child()
+            with mock.patch("run_matrix.invoke") as invoke:
+                matrix.cancel_client_driver(child, Path(tmp))
+            self.assertEqual(events, [("signal", run_matrix.signal.SIGINT), ("communicate", 10),
+                                      ("terminate",), ("communicate", 5)])
+            invoke.assert_not_called()
+            self.assertEqual((Path(tmp) / "driver-cancel.log").read_text(), "terminated\n")
+
+    def test_frontend_readiness_fails_after_bounded_retry_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                                        "kubeconfig": "", "worker_container": "worker",
+                                        "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
+            with mock.patch("run_matrix.time.monotonic", side_effect=[0, 0, 181]), \
+                    mock.patch("run_matrix.time.sleep"), \
+                    mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 7, "", "refused")) as invoke:
+                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                    matrix.wait_frontend("10.0.0.2")
+            self.assertEqual(invoke.call_count, 2)
+
+    def test_resource_snapshot_requires_complete_unique_rows_and_successful_command(self):
+        output = "101 120 80\n102 320 240\n"
+        parsed = run_matrix.parse_smaps_rollup([101, 102, 101], output, 0)
+        self.assertTrue(parsed["complete"])
+        self.assertEqual(parsed["rows"], [
+            {"pid": 101, "rss_kb": 120, "pss_kb": 80},
+            {"pid": 102, "rss_kb": 320, "pss_kb": 240},
+        ])
+        self.assertFalse(run_matrix.parse_smaps_rollup([101, 102], output, 1)["complete"])
+        self.assertFalse(run_matrix.parse_smaps_rollup([101, 102], "101 120 80\n", 0)["complete"])
+        self.assertFalse(run_matrix.parse_smaps_rollup([101], "101 120 80\n101 120 80\n", 0)["complete"])
+        self.assertFalse(run_matrix.parse_smaps_rollup([101], "101 missing\n", 0)["complete"])
+
+    def test_maps_parser_reports_only_mapped_shared_objects(self):
+        maps = ("7f000000-7f001000 r-xp 00000000 08:01 10 /usr/lib/libc.so.6\n"
+                "7f001000-7f002000 rw-p 00000000 00:00 0 [heap]\n"
+                "7f002000-7f003000 r-xp 00000000 08:01 11 /opt/lib with space/libx.so.1\n")
+        self.assertEqual(run_matrix.mapped_shared_object_paths(maps),
+                         ["/opt/lib with space/libx.so.1", "/usr/lib/libc.so.6"])
+
+    def test_summary_rejects_errors_and_computes_rps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            sample = out / "samples" / "one"
+            sample.mkdir(parents=True)
+            (sample / "returncode.txt").write_text("0\n")
+            (sample / "wrk.log").write_text("METRICS 100 2000000 10 20 30 0 0 0 0 0\n")
+            result = summarize.sample_metrics(out, "samples/one")
+            self.assertEqual(result["rps"], 50)
+            self.assertEqual(result["p99_us"], 30)
+            (sample / "wrk.log").write_text("METRICS 100 2000000 10 20 30 0 0 0 1 0\n")
+            with self.assertRaises(ValueError):
+                summarize.sample_metrics(out, "samples/one")
+            for metrics in ("METRICS 0 2000000 10 20 30 0 0 0 0 0\n",
+                            "METRICS 100 0 10 20 30 0 0 0 0 0\n"):
+                (sample / "wrk.log").write_text(metrics)
+                with self.subTest(metrics=metrics), self.assertRaisesRegex(ValueError, "positive"):
+                    summarize.sample_metrics(out, "samples/one")
+
+    def test_resource_summary_keeps_proxy_and_origin_separate_and_nulls_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            cell = out / "samples" / "4k" / "one"
+            cell.mkdir(parents=True)
+            (cell / "valid.txt").write_text("valid\n")
+            row = {"validation_path": "samples/4k/one/valid.txt"}
+            empty = summarize.resource_metrics(out, row)
+            self.assertIsNone(empty["proxy_idle_pss_kb"])
+            proxy_idle = {"complete": True, "rss_kb": 100, "pss_kb": 80}
+            origin_idle = {"complete": True, "rss_kb": 300, "pss_kb": 240}
+            proxy_load = {"complete": True, "rss_kb": 120, "pss_kb": 90}
+            origin_load = {"complete": True, "rss_kb": 320, "pss_kb": 250}
+            summary = {
+                "frontend_executables": [{"path": "/rut", "size_bytes": 123, "sha256": "abc"}],
+                "mapped_shared_objects": {
+                    "proxy": {"files": [{"path": "/lib/libc.so.6", "size_bytes": 1000, "sha256": "def"}],
+                              "complete": True, "total_bytes": 1000},
+                    "origin": {"files": [], "complete": True, "total_bytes": 0},
+                },
+                "idle": {"proxy": proxy_idle, "origin": origin_idle},
+                "after_warmup": {"proxy": proxy_idle, "origin": origin_idle},
+                "under_load_samples": [{"snapshot_valid": True, "proxy": proxy_load, "origin": origin_load}],
+                "sampling_complete": False,
+            }
+            (cell / "resources-summary.json").write_text(json.dumps(summary))
+            found = summarize.resource_metrics(out, row)
+            self.assertEqual(found["proxy_executable_bytes"], 123)
+            self.assertEqual(found["proxy_dynamic_dependency_bytes"], 1000)
+            self.assertIsNone(found["proxy_under_load_pss_kb"])
+            self.assertIsNone(found["origin_under_load_pss_kb"])
+            self.assertEqual(found["proxy_under_load_observations"], 0)
+            self.assertEqual(found["origin_under_load_observations"], 0)
+            self.assertFalse(found["resource_sampling_complete"])
+            summary["sampling_complete"] = True
+            (cell / "resources-summary.json").write_text(json.dumps(summary))
+            complete = summarize.resource_metrics(out, row)
+            self.assertEqual(complete["proxy_under_load_pss_kb"], 90)
+            self.assertEqual(complete["origin_under_load_pss_kb"], 250)
+            self.assertEqual(summarize.aggregate_resource_values(
+                [{**found, "resource_sampling_complete": False}, complete], "proxy_under_load_pss_kb"), [90])
+            self.assertEqual(summarize.aggregate_resource_values(
+                [{**found, "resource_sampling_complete": False}, complete], "proxy_executable_bytes"), [123, 123])
+
+    def test_client_image_has_no_private_default(self):
+        source = Path(prepare.__file__).read_text()
+        self.assertNotIn("rut-watchdog-wrk:attempt89", source)
+        self.assertIn('p.add_argument("--client-image", required=True', source)
+        dockerfile = Path(__file__).with_name("Dockerfile.client").read_text()
+        self.assertIn("curl", dockerfile)
+        self.assertIn("/usr/local/bin/wrk", dockerfile)
+
+
+if __name__ == "__main__":
+    unittest.main()
