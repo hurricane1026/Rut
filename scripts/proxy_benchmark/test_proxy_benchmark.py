@@ -1065,16 +1065,32 @@ class ProxyBenchmarkTests(unittest.TestCase):
 
     def test_cpu_max_ancestry_rejects_finite_intermediate_and_requires_visible_root(self):
         good = ("/sys/fs/cgroup/worker\tmax 100000\n"
-                "/sys/fs/cgroup\tmax 200000\n")
+                "/sys/fs/cgroup\timplicit-unlimited\n")
         rows = run_matrix.verify_unlimited_cpu_max_ancestry(good, "origin")
-        self.assertEqual([row["value"] for row in rows], ["max 100000", "max 200000"])
+        self.assertEqual([row["value"] for row in rows], ["max 100000", "implicit-unlimited"])
         finite = good.replace("/sys/fs/cgroup/worker\tmax 100000",
                               "/sys/fs/cgroup/worker\t100000 100000")
         with self.assertRaisesRegex(RuntimeError, "unexpected CPU quota"):
             run_matrix.verify_unlimited_cpu_max_ancestry(finite, "origin")
         with self.assertRaisesRegex(RuntimeError, "does not reach"):
             run_matrix.verify_unlimited_cpu_max_ancestry("/sys/fs/cgroup/worker\tmax 100000\n", "origin")
+        with self.assertRaisesRegex(RuntimeError, "skips a cgroup parent"):
+            run_matrix.verify_unlimited_cpu_max_ancestry(
+                "/sys/fs/cgroup/worker/child\tmax 100000\n/sys/fs/cgroup\timplicit-unlimited\n", "origin")
+        with self.assertRaisesRegex(RuntimeError, "only permits an implicit quota at the visible cgroup root"):
+            run_matrix.verify_unlimited_cpu_max_ancestry(
+                "/sys/fs/cgroup/worker\timplicit-unlimited\n/sys/fs/cgroup\timplicit-unlimited\n", "origin")
         self.assertIn("/proc/1/cgroup", run_matrix.cpu_max_ancestry_script(1))
+
+    def test_short_measurement_checks_client_quota_before_first_load_sample(self):
+        duration = 1.0
+        elapsed = 0.5
+        next_snapshot = 2.0
+        self.assertLess(elapsed, duration)
+        self.assertLess(elapsed, next_snapshot)
+        self.assertTrue(run_matrix.measurement_client_cpu_check_due(True, False))
+        self.assertFalse(run_matrix.measurement_client_cpu_check_due(True, True))
+        self.assertFalse(run_matrix.measurement_client_cpu_check_due(False, False))
 
     def test_wrk_client_cpu_max_checks_host_pid_ancestry_while_running(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1156,15 +1172,19 @@ class ProxyBenchmarkTests(unittest.TestCase):
             matrix = run_matrix.Matrix(config)
             pid_by_cid = {"origin-cid": 100, "proxy-cid": 200}
             finite_worker_quota = [False]
+            finite_host_worker_quota = [False]
             def invoke(argv, **_kwargs):
                 argv = [str(item) for item in argv]
                 if "crictl" in argv:
                     cid = argv[-1]
                     result = json.dumps({"info": {"pid": pid_by_cid[cid]}})
+                elif len(argv) > 1 and argv[1] == "inspect":
+                    result = json.dumps([{"State": {"Pid": 300, "Running": True}}])
                 elif len(argv) >= 3 and argv[-2] == "-c" and "cpu.max" in argv[-1]:
-                    pid = 1 if "/proc/1/cgroup" in argv[-1] else int(argv[-1].split("/proc/")[1].split("/")[0])
-                    role = "worker" if pid == 1 else ("origin" if pid == 100 else "proxy")
-                    quota = "50000 100000" if finite_worker_quota[0] and pid == 1 else "max 100000"
+                    pid = int(argv[-1].split("/proc/")[1].split("/")[0])
+                    role = "worker-host" if pid == 300 else ("worker" if pid == 1 else ("origin" if pid == 100 else "proxy"))
+                    finite = (finite_worker_quota[0] and pid == 1) or (finite_host_worker_quota[0] and pid == 300)
+                    quota = "50000 100000" if finite else "max 100000"
                     result = f"/sys/fs/cgroup/{role}\t{quota}\n/sys/fs/cgroup\tmax 200000\n"
                 elif "cgroup" in argv[-1] and "/proc/" in argv[-1]:
                     pid = int(argv[-1].split("/")[2])
@@ -1194,9 +1214,15 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(proxy_record["pid"], 200)
             self.assertEqual(proxy_record["cpu_max"][-1]["path"], "/sys/fs/cgroup")
             self.assertEqual(proxy_record["worker_pid1_cpu_max"][-1]["path"], "/sys/fs/cgroup")
+            self.assertEqual(proxy_record["worker_host_cpu_max"][-1]["path"], "/sys/fs/cgroup")
             finite_worker_quota[0] = True
             with mock.patch("run_matrix.invoke", side_effect=invoke):
                 with self.assertRaisesRegex(RuntimeError, "worker PID 1.*unexpected CPU quota"):
+                    matrix.inspect_runtime("linkerd", output)
+            finite_worker_quota[0] = False
+            finite_host_worker_quota[0] = True
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaisesRegex(RuntimeError, "kind worker host PID.*unexpected CPU quota"):
                     matrix.inspect_runtime("linkerd", output)
 
     def test_live_runtime_validation_rejects_pid_or_affinity_change(self):
@@ -1207,12 +1233,14 @@ class ProxyBenchmarkTests(unittest.TestCase):
         runtime = [{"name": "origin", "container_id": "abc", "pid": 5,
                     "processes": [{"pid": "5", "tid": 5, "name": "origin", "allowed": "2"}]}]
         unlimited = "/sys/fs/cgroup/foo\tmax 100000\n/sys/fs/cgroup\tmax 100000\n"
-        outputs = [json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+        outputs = [json.dumps([{"State": {"Pid": 9, "Running": True}}]), unlimited,
+                   json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
                    "0::/foo\n", "5\n", "5 origin 2\n"]
         with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
                         subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
             matrix.verify_live_runtime(runtime)
-        outputs = [json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+        outputs = [json.dumps([{"State": {"Pid": 9, "Running": True}}]), unlimited,
+                   json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
                    "0::/foo\n", "5\n", "5 origin 3\n"]
         with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
                         subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
@@ -1229,7 +1257,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
                                   {"pid": "5", "tid": 12, "name": "origin", "allowed": "2"}]}]
         unlimited = "/sys/fs/cgroup/foo\tmax 100000\n/sys/fs/cgroup\tmax 100000\n"
         for observed in ("11 origin 2\n", "11 origin 2\n99 origin 2\n"):
-            outputs = [json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+            outputs = [json.dumps([{"State": {"Pid": 9, "Running": True}}]), unlimited,
+                       json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
                        "0::/foo\n", "5\n", observed]
             with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
                             subprocess.CompletedProcess([], 0, outputs.pop(0), "")):

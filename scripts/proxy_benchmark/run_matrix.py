@@ -52,7 +52,11 @@ def verify_unlimited_cpu_max_ancestry(text: str, name: str) -> list[dict[str, st
             raise RuntimeError(f"{name} has unsafe cpu.max ancestry path {fields[0]!r}")
         if evidence and Path(evidence[-1]["path"]).parent != path:
             raise RuntimeError(f"{name} cpu.max ancestry skips a cgroup parent at {fields[0]}")
-        verify_unlimited_cpu_max(fields[1], f"{name} at {fields[0]}")
+        if fields[1] == "implicit-unlimited":
+            if fields[0] != "/sys/fs/cgroup":
+                raise RuntimeError(f"{name} only permits an implicit quota at the visible cgroup root")
+        else:
+            verify_unlimited_cpu_max(fields[1], f"{name} at {fields[0]}")
         evidence.append({"path": fields[0], "value": fields[1]})
     if not evidence or evidence[-1]["path"] != "/sys/fs/cgroup":
         raise RuntimeError(f"{name} cpu.max ancestry does not reach the visible cgroup root")
@@ -67,10 +71,16 @@ def cpu_max_ancestry_script(pid: int) -> str:
             "case \"$cg\" in *..*) exit 32;; esac; "
             "[ \"$cg\" != / ] || cg=; "
             "p=/sys/fs/cgroup$cg; "
-            "while :; do [ -r \"$p/cpu.max\" ] || exit 33; "
+            "while :; do if [ ! -r \"$p/cpu.max\" ]; then "
+            "[ \"$p\" = /sys/fs/cgroup ] || exit 33; "
+            "printf '%s\\timplicit-unlimited\\n' \"$p\"; break; fi; "
             "printf '%s\\t' \"$p\"; cat \"$p/cpu.max\"; "
             "[ \"$p\" = /sys/fs/cgroup ] && break; "
             "p=$(dirname \"$p\"); case \"$p\" in /sys/fs/cgroup|/sys/fs/cgroup/*) ;; *) exit 34;; esac; done")
+
+
+def measurement_client_cpu_check_due(client_running: bool, already_checked: bool) -> bool:
+    return client_running and not already_checked
 
 
 def parse_smaps_rollup(pids: list[int], stdout: str, returncode: int) -> dict:
@@ -148,6 +158,10 @@ class Matrix:
         self.docker = config["tools"]["docker"]
         self.linkerd = config["tools"]["linkerd"]
         self.kubeconfig = config["kubeconfig"]
+
+    def host_cpu_max_ancestry(self, pid: int, name: str) -> list[dict[str, str]]:
+        output = invoke(["sh", "-eu", "-c", cpu_max_ancestry_script(pid)]).stdout
+        return verify_unlimited_cpu_max_ancestry(output, name)
 
     def client_argv(self, client: Path, label: str, pod_ip: str, duration: str,
                     lua: str, target: Path) -> list[str]:
@@ -307,6 +321,11 @@ class Matrix:
             raise RuntimeError("control Pod unexpectedly has a Linkerd sidecar")
 
         details = []
+        worker_inspect = json.loads(invoke([self.docker, "inspect", self.c["worker_container"]]).stdout)[0]
+        worker_host_pid = int(worker_inspect.get("State", {}).get("Pid", 0))
+        if worker_host_pid <= 0:
+            raise RuntimeError("kind worker has no host PID for cgroup quota ancestry verification")
+        worker_host_cpu_max = self.host_cpu_max_ancestry(worker_host_pid, "kind worker host PID")
         resource_pids = {"proxy": [], "origin": []}
         frontend_binaries = {}
         mapped_libraries = {"proxy": {}, "origin": {}}
@@ -378,7 +397,8 @@ class Matrix:
             details.append({"name": name, "container_id": cid, "image_id": item.get("imageID"),
                             "restart_count": item.get("restartCount", 0), "pid": pid,
                             "cpuset_command": pin.stdout, "cpu_max": cpu_max_ancestry,
-                            "worker_pid1_cpu_max": worker_cpu_max_ancestry, "cgroup": cgroot,
+                            "worker_pid1_cpu_max": worker_cpu_max_ancestry,
+                            "worker_host_cpu_max": worker_host_cpu_max, "cgroup": cgroot,
                             "processes": affinity, "process_binaries": process_binaries,
                             "mapped_shared_objects": sorted(process_libraries)})
         write_json(outdir / "container-runtime.json", details)
@@ -393,6 +413,11 @@ class Matrix:
         return {key: sorted(set(value)) for key, value in resource_pids.items()}
 
     def verify_live_runtime(self, runtime: list[dict]) -> None:
+        worker_inspect = json.loads(invoke([self.docker, "inspect", self.c["worker_container"]]).stdout)[0]
+        worker_host_pid = int(worker_inspect.get("State", {}).get("Pid", 0))
+        if worker_host_pid <= 0:
+            raise RuntimeError("kind worker has no live host PID for cgroup quota verification")
+        self.host_cpu_max_ancestry(worker_host_pid, "kind worker host PID live")
         for record in runtime:
             inspected = json.loads(invoke([self.docker, "exec", self.c["worker_container"],
                                            "crictl", "inspect", record["container_id"]]).stdout)
@@ -666,6 +691,7 @@ class Matrix:
             child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             measure_start = None
             client_running = False
+            client_cpu_checked = False
             next_state_check = time.monotonic()
             next_snapshot = 2.0
             measurement_duration = duration_seconds(self.c["duration"])
@@ -677,6 +703,10 @@ class Matrix:
                         stamp = target / "measurement-start-monotonic.txt"
                         if client_running and measure_start is None and stamp.is_file():
                             measure_start = float(stamp.read_text().strip())
+                        if kind == "measurement" and measurement_client_cpu_check_due(
+                                client_running, client_cpu_checked):
+                            self.verify_client_cpu_max(target)
+                            client_cpu_checked = True
                         next_state_check = now + 0.5
                     if kind == "measurement" and measure_start is not None:
                         elapsed = now - measure_start
@@ -711,6 +741,8 @@ class Matrix:
             (outdir / f"{kind}-driver.log").write_text(driver_output)
             if child.returncode:
                 raise RuntimeError(f"{kind} wrk returned {child.returncode}; see {target}")
+            if kind == "measurement" and not client_cpu_checked:
+                raise RuntimeError("measurement client ended without verified CPU quota ancestry")
             if kind == "warmup":
                 resource_records.append(self.capture_resources(outdir, "after-warmup", resource_pids))
             log = (target / "wrk.log").read_text()
