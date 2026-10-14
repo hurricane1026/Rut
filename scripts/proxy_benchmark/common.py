@@ -91,8 +91,9 @@ def normalized_linkerd_injection_spec(pod: dict) -> dict:
     init_containers = sorted((item for item in spec.get("initContainers", [])
                               if item.get("name", "").startswith("linkerd-")),
                              key=lambda item: item.get("name", ""))
-    if not any(item.get("name") == "linkerd-proxy" for item in containers):
-        raise ValueError("Linkerd admission did not inject linkerd-proxy")
+    proxies = [item for item in containers + init_containers if item.get("name") == "linkerd-proxy"]
+    if len(proxies) != 1:
+        raise ValueError(f"Linkerd admission must inject exactly one linkerd-proxy; found {len(proxies)}")
     return {"containers": containers, "initContainers": init_containers}
 
 

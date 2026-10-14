@@ -252,11 +252,12 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 {"metadata": {"uid": "uid2", "immutable": True}, "data": {"x": "one"}}, {"x": "one"})
 
     def test_linkerd_probe_waits_for_pull_records_identity_and_deletes_probe(self):
-        pod = {"spec": {"containers": [{"name": "linkerd-proxy", "image": "proxy:edge",
-                                           "args": ["--log-level=error"],
-                                           "env": [{"name": "A", "value": "B"}],
-                                           "resources": {"requests": {"cpu": "1"}}}]},
-               "status": {"containerStatuses": [{"name": "linkerd-proxy", "imageID": "containerd://sha256:cfg"}]}}
+        pod = {"spec": {"containers": [], "initContainers": [{"name": "linkerd-proxy", "image": "proxy:edge",
+                                                                  "restartPolicy": "Always",
+                                                                  "args": ["--log-level=error"],
+                                                                  "env": [{"name": "A", "value": "B"}],
+                                                                  "resources": {"requests": {"cpu": "1"}}}]},
+               "status": {"initContainerStatuses": [{"name": "linkerd-proxy", "imageID": "containerd://sha256:cfg"}]}}
         inventory = {"images": [{"id": "sha256:cfg", "repoTags": ["proxy:edge"], "repoDigests": []}]}
         with tempfile.TemporaryDirectory() as tmp:
             probe = Path(tmp) / "probe.json"
@@ -265,7 +266,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 identity = prepare.discover_linkerd_proxy_identity(
                     ["kubectl", "--kubeconfig", "/kube"], "docker", "worker", probe, "probe", "bench")
         self.assertEqual(identity["identities"]["linkerd_proxy"]["worker_id"], "sha256:cfg")
-        self.assertEqual(identity["injected_spec"]["containers"][0]["args"], ["--log-level=error"])
+        self.assertEqual(identity["injected_spec"]["initContainers"][0]["args"], ["--log-level=error"])
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn("wait", commands[1])
         self.assertIn("create", commands[0])
@@ -307,11 +308,31 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertIn("delete", run.call_args_list[-1].args[0])
 
     def test_linkerd_injected_proxy_image_is_taken_from_admitted_pod(self):
-        admitted = {"spec": {"containers": [{"name": "origin", "image": "nginx@sha256:abc"},
-                                             {"name": "linkerd-proxy", "image": "cr.l5d.io/linkerd/proxy:edge"}]}}
+        admitted = {"spec": {"containers": [{"name": "origin", "image": "nginx@sha256:abc"}],
+                             "initContainers": [{"name": "linkerd-proxy", "image": "cr.l5d.io/linkerd/proxy:edge",
+                                                 "restartPolicy": "Always"}]}}
         self.assertEqual(prepare.injected_linkerd_proxy_image(admitted), "cr.l5d.io/linkerd/proxy:edge")
-        with self.assertRaisesRegex(ValueError, "did not inject"):
+        with self.assertRaisesRegex(ValueError, "found 0"):
             prepare.injected_linkerd_proxy_image({"spec": {"containers": []}})
+        duplicate = {"spec": {"containers": [{"name": "linkerd-proxy", "image": "one"}],
+                              "initContainers": [{"name": "linkerd-proxy", "image": "two"}]}}
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            prepare.injected_linkerd_proxy_image(duplicate)
+
+    def test_linkerd_probe_matches_benchmark_origin_injection_inputs(self):
+        config = {"namespace": "bench", "run_id": "run1", "worker_node": "worker",
+                  "node_mount": "/node", "cpus": {"proxy": 3, "origin": "4-5"},
+                  "selector": {"key": "role", "value": "bench"},
+                  "images": {"nginx": "nginx@sha256:abc"},
+                  "configmaps": {"linkerd": "cfg"}}
+        benchmark = common.pod_spec(config, "linkerd", "4k", "matrix")
+        probe = prepare.linkerd_probe_spec("probe", "bench", "worker", config["images"]["nginx"])
+        benchmark_origin = benchmark["spec"]["containers"][0]
+        probe_app = probe["spec"]["containers"][0]
+        self.assertEqual(probe["metadata"]["annotations"], benchmark["metadata"]["annotations"])
+        self.assertEqual(probe_app["ports"], benchmark_origin["ports"])
+        self.assertEqual(probe_app["imagePullPolicy"], benchmark_origin["imagePullPolicy"])
+        self.assertEqual(probe_app["image"], benchmark_origin["image"])
 
     def test_linkerd_proxy_container_requires_prepared_image_identity(self):
         identities = {"linkerd_proxy": {"reference": "linkerd/proxy@sha256:abc", "worker_id": "sha256:cfg"}}
@@ -368,6 +389,60 @@ class ProxyBenchmarkTests(unittest.TestCase):
             changed["status"]["containerStatuses"][0][field] = value
             with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "changed"):
                 run_matrix.verify_pod_runtime_stable(pod, changed, runtime)
+
+    def test_native_linkerd_proxy_init_container_is_identity_checked_and_inspected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            pod = {"spec": {"nodeName": "worker", "containers": [{"name": "origin", "image": "nginx"}],
+                            "initContainers": [{"name": "linkerd-proxy", "image": "proxy", "restartPolicy": "Always"}]},
+                   "status": {
+                       "containerStatuses": [{"name": "origin", "containerID": "containerd://origin-cid",
+                                               "imageID": "sha256:nginx", "restartCount": 0}],
+                       "initContainerStatuses": [{"name": "linkerd-proxy", "containerID": "containerd://proxy-cid",
+                                                  "imageID": "sha256:proxy", "restartCount": 0}],
+                   }}
+            (output / "pod.json").write_text(json.dumps(pod))
+            config = {"output": str(output), "worker_node": "worker", "worker_container": "worker-container",
+                      "image_identities": {"origin": {"reference": "nginx", "worker_id": "sha256:nginx"},
+                                           "linkerd_proxy": {"reference": "proxy", "worker_id": "sha256:proxy"}},
+                      "linkerd_injected_spec": common.normalized_linkerd_injection_spec(pod),
+                      "cpus": {"origin": "2", "proxy": 3},
+                      "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube"}
+            matrix = run_matrix.Matrix(config)
+            pid_by_cid = {"origin-cid": 100, "proxy-cid": 200}
+            def invoke(argv, **_kwargs):
+                argv = [str(item) for item in argv]
+                if "crictl" in argv:
+                    cid = argv[-1]
+                    result = json.dumps({"info": {"pid": pid_by_cid[cid]}})
+                elif "cgroup" in argv[-1] and "/proc/" in argv[-1]:
+                    pid = int(argv[-1].split("/")[2])
+                    role = "origin" if pid == 100 else "proxy"
+                    result = f"0::/{role}\n"
+                elif argv[-1].endswith("cgroup.procs"):
+                    result = "100\n" if "origin" in argv[-1] else "200\n"
+                elif argv[-1].endswith("cpu.max"):
+                    result = "max 100000\n"
+                elif len(argv) > 1 and argv[-2] == "-c":
+                    result = "origin 2\n" if "100" in argv[-1] else "linkerd-proxy 3\n"
+                elif "readlink" in argv:
+                    result = "/usr/bin/nginx\n"
+                elif "stat" in argv:
+                    result = "123\n"
+                elif "sha256sum" in argv:
+                    result = "digest  /proc/exe\n"
+                elif argv[-1].endswith("/maps"):
+                    result = ""
+                else:
+                    result = "pinned\n"
+                return subprocess.CompletedProcess(argv, 0, result, "")
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                pids = matrix.inspect_runtime("linkerd", output)
+            records = json.loads((output / "container-runtime.json").read_text())
+            self.assertEqual(pids, {"proxy": [200], "origin": [100]})
+            self.assertEqual({row["name"] for row in records}, {"origin", "linkerd-proxy"})
+            self.assertEqual(next(row for row in records if row["name"] == "linkerd-proxy")["pid"], 200)
 
     def test_live_runtime_validation_rejects_pid_or_affinity_change(self):
         config = {"output": "/tmp/out", "worker_container": "worker",

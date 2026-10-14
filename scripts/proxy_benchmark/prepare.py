@@ -100,11 +100,28 @@ def embedded_clang_path(compiler: Path) -> str:
 
 
 def injected_linkerd_proxy_image(pod: dict) -> str:
-    proxy = next((item for item in pod.get("spec", {}).get("containers", [])
-                  if item.get("name") == "linkerd-proxy"), None)
-    if not proxy or not proxy.get("image"):
-        raise ValueError("Linkerd admission did not inject a proxy in the server-side dry run")
+    injected = normalized_linkerd_injection_spec(pod)
+    proxy = next(item for item in injected["containers"] + injected["initContainers"]
+                 if item.get("name") == "linkerd-proxy")
+    if not proxy.get("image"):
+        raise ValueError("Linkerd admission injected a proxy without an image in the server-side dry run")
     return proxy["image"]
+
+
+def linkerd_probe_spec(name: str, namespace: str, worker_node: str, nginx_image: str) -> dict:
+    """Use the same application injection inputs as the benchmark origin Pod."""
+    return {"apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": namespace,
+                         "annotations": {
+                             "linkerd.io/inject": "enabled",
+                             "config.linkerd.io/default-inbound-policy": "all-unauthenticated",
+                             "config.linkerd.io/proxy-log-level": "error",
+                             "config.linkerd.io/proxy-cpu-request": "1",
+                         }},
+            "spec": {"nodeName": worker_node,
+                     "containers": [{"name": "probe", "image": nginx_image,
+                                     "imagePullPolicy": "IfNotPresent",
+                                     "ports": [{"name": "http", "containerPort": 8080}]}]}}
 
 
 def worker_image_status_matches(actual: str, identity: dict) -> bool:
@@ -453,16 +470,7 @@ def main() -> int:
         (output / "linkerd-check.txt").write_text(run([a.linkerd_bin, "--kubeconfig", str(a.kubeconfig.resolve()), "check"]))
         probe_name = f"pb-{run_id}-linkerd-image-probe"
         probe_path = output / "linkerd-image-probe.json"
-        write_json(probe_path, {"apiVersion": "v1", "kind": "Pod",
-                                "metadata": {"name": probe_name, "namespace": a.namespace,
-                                             "annotations": {
-                                                 "linkerd.io/inject": "enabled",
-                                                 "config.linkerd.io/default-inbound-policy": "all-unauthenticated",
-                                                 "config.linkerd.io/proxy-log-level": "error",
-                                                 "config.linkerd.io/proxy-cpu-request": "1",
-                                             }},
-                                "spec": {"nodeName": a.worker_node,
-                                         "containers": [{"name": "probe", "image": a.nginx_image}]}})
+        write_json(probe_path, linkerd_probe_spec(probe_name, a.namespace, a.worker_node, a.nginx_image))
         injection = discover_linkerd_proxy_identity(kube, a.docker_bin, a.worker_container,
                                                     probe_path, probe_name, a.namespace)
         image_identities.update(injection["identities"])
