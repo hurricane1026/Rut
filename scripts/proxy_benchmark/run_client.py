@@ -9,7 +9,7 @@ import sys
 import time
 import uuid
 
-from common import duration_seconds, load_config, validate_docker_mount_source
+from common import duration_seconds, ip_url, load_config, validate_docker_mount_source
 
 DOCKER_CONTROL_TIMEOUT = 30
 DOCKER_CLEANUP_TIMEOUT = 15
@@ -78,7 +78,7 @@ def main() -> int:
         "--entrypoint", "/usr/local/bin/wrk",
         client_image, "-t2", f"-c{config['concurrency']}", f"-d{args.duration}",
         "--latency", "--timeout", "2s", "-s", f"/benchmark/{args.lua}",
-        f"http://{args.pod_ip}:8080/proxy",
+        ip_url(args.pod_ip, 8080, "/proxy"),
     ]
     (output / "command.json").write_text(json.dumps(argv, indent=2) + "\n")
     (output / "image.json").write_text(json.dumps({"reference": config["images"]["client"],

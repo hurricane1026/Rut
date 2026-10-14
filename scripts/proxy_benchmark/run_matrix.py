@@ -15,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
-from common import (cpu_set, duration_seconds, image_reference_matches, load_config,
+from common import (cpu_set, duration_seconds, image_reference_matches, ip_authority, ip_url, load_config,
                     normalized_linkerd_injection_spec, pod_spec,
                     provenance_fingerprint, snapshot_inputs, verify_payload_path, verify_payloads,
                     validate_docker_mount_source, verify_client_image_config_identity, write_json)
@@ -38,6 +38,39 @@ def verify_unlimited_cpu_max(value: str, name: str) -> None:
     if (len(fields) != 2 or fields[0] != "max" or
             not fields[1].isdigit() or int(fields[1]) <= 0):
         raise RuntimeError(f"{name} has unexpected CPU quota {value}")
+
+
+def verify_unlimited_cpu_max_ancestry(text: str, name: str) -> list[dict[str, str]]:
+    evidence = []
+    for line in text.splitlines():
+        fields = line.split("\t", 1)
+        path = Path(fields[0]) if fields else Path()
+        if (len(fields) != 2 or
+                (fields[0] != "/sys/fs/cgroup" and not fields[0].startswith("/sys/fs/cgroup/"))):
+            raise RuntimeError(f"{name} has malformed cpu.max ancestry row {line!r}")
+        if ".." in path.parts:
+            raise RuntimeError(f"{name} has unsafe cpu.max ancestry path {fields[0]!r}")
+        if evidence and Path(evidence[-1]["path"]).parent != path:
+            raise RuntimeError(f"{name} cpu.max ancestry skips a cgroup parent at {fields[0]}")
+        verify_unlimited_cpu_max(fields[1], f"{name} at {fields[0]}")
+        evidence.append({"path": fields[0], "value": fields[1]})
+    if not evidence or evidence[-1]["path"] != "/sys/fs/cgroup":
+        raise RuntimeError(f"{name} cpu.max ancestry does not reach the visible cgroup root")
+    return evidence
+
+
+def cpu_max_ancestry_script(pid: int) -> str:
+    if pid <= 0:
+        raise ValueError("cgroup PID must be positive")
+    return ("cg=$(awk -F: '$1==\"0\" {print $3}' /proc/" + str(pid) + "/cgroup); "
+            "[ -n \"$cg\" ] && case \"$cg\" in /*) ;; *) exit 31;; esac; "
+            "case \"$cg\" in *..*) exit 32;; esac; "
+            "[ \"$cg\" != / ] || cg=; "
+            "p=/sys/fs/cgroup$cg; "
+            "while :; do [ -r \"$p/cpu.max\" ] || exit 33; "
+            "printf '%s\\t' \"$p\"; cat \"$p/cpu.max\"; "
+            "[ \"$p\" = /sys/fs/cgroup ] && break; "
+            "p=$(dirname \"$p\"); case \"$p\" in /sys/fs/cgroup|/sys/fs/cgroup/*) ;; *) exit 34;; esac; done")
 
 
 def parse_smaps_rollup(pids: list[int], stdout: str, returncode: int) -> dict:
@@ -215,7 +248,7 @@ class Matrix:
                     "--cpuset-cpus", self.c["cpus"]["client"], "--entrypoint", "curl",
                     self.c["images"]["client"], "--http1.1", "--fail", "--silent", "--show-error",
                     "--connect-timeout", "2", "--max-time", "4",
-                    "--output", "/dev/null", f"http://{pod_ip}:8080/proxy"]
+                    "--output", "/dev/null", ip_url(pod_ip, 8080, "/proxy")]
             try:
                 result = invoke(argv, check=False, timeout=5)
             except subprocess.TimeoutExpired:
@@ -290,8 +323,12 @@ class Matrix:
             if name != "origin":
                 for process in procs:
                     invoke([self.docker, "exec", self.c["worker_container"], "taskset", "-apc", cpus, process])
-            cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"{cgroot}/cpu.max"]).stdout.strip()
-            verify_unlimited_cpu_max(cpu_max, name)
+            cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-eu", "-c",
+                              cpu_max_ancestry_script(pid)]).stdout
+            cpu_max_ancestry = verify_unlimited_cpu_max_ancestry(cpu_max, name)
+            worker_cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-eu", "-c",
+                                     cpu_max_ancestry_script(1)]).stdout
+            worker_cpu_max_ancestry = verify_unlimited_cpu_max_ancestry(worker_cpu_max, "worker PID 1")
             affinity = []
             process_binaries = []
             process_libraries = set()
@@ -340,7 +377,8 @@ class Matrix:
             write_json(outdir / f"container-{name}-inspect.json", inspected)
             details.append({"name": name, "container_id": cid, "image_id": item.get("imageID"),
                             "restart_count": item.get("restartCount", 0), "pid": pid,
-                            "cpuset_command": pin.stdout, "cpu_max": cpu_max, "cgroup": cgroot,
+                            "cpuset_command": pin.stdout, "cpu_max": cpu_max_ancestry,
+                            "worker_pid1_cpu_max": worker_cpu_max_ancestry, "cgroup": cgroot,
                             "processes": affinity, "process_binaries": process_binaries,
                             "mapped_shared_objects": sorted(process_libraries)})
         write_json(outdir / "container-runtime.json", details)
@@ -360,6 +398,12 @@ class Matrix:
                                            "crictl", "inspect", record["container_id"]]).stdout)
             if int(inspected["info"]["pid"]) != record["pid"]:
                 raise RuntimeError(f"container {record['name']} process PID changed during measurement")
+            cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-eu", "-c",
+                              cpu_max_ancestry_script(record["pid"])]).stdout
+            verify_unlimited_cpu_max_ancestry(cpu_max, f"{record['name']} live")
+            worker_cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-eu", "-c",
+                                     cpu_max_ancestry_script(1)]).stdout
+            verify_unlimited_cpu_max_ancestry(worker_cpu_max, "worker PID 1 live")
             cg = invoke([self.docker, "exec", self.c["worker_container"], "cat",
                          f"/proc/{record['pid']}/cgroup"]).stdout.strip().splitlines()[-1]
             cgroot = "/sys/fs/cgroup" + cg.split(":", 2)[2]
@@ -422,6 +466,17 @@ class Matrix:
         client_id = client_id_path.read_text().strip()
         running = invoke([self.docker, "inspect", "--format", "{{.State.Running}}", client_id], check=False)
         return running.returncode == 0 and running.stdout.strip() == "true"
+
+    def verify_client_cpu_max(self, target: Path) -> list[dict[str, str]]:
+        client_id = (target / "container-id.txt").read_text().strip()
+        inspected = json.loads(invoke([self.docker, "inspect", client_id]).stdout)[0]
+        pid = int(inspected.get("State", {}).get("Pid", 0))
+        if pid <= 0 or not inspected.get("State", {}).get("Running"):
+            raise RuntimeError("wrk client has no live host PID for CPU quota verification")
+        output = invoke(["sh", "-eu", "-c", cpu_max_ancestry_script(pid)]).stdout
+        evidence = verify_unlimited_cpu_max_ancestry(output, "wrk client")
+        write_json(target / "client-cpu-max-ancestry.json", {"pid": pid, "ancestry": evidence})
+        return evidence
 
     def verify_wrk_container_cleanup(self, target: Path) -> None:
         identity_path = target / "container-id.txt"
@@ -513,7 +568,7 @@ class Matrix:
                 "--mount", f"type=bind,src={outdir},dst=/out", "--entrypoint", "curl", image,
                 "--http1.1", "--fail", "--silent", "--show-error", "-H", "Host: client.example",
                 "--connect-timeout", "2", "--max-time", "5", "-H", "Connection: keep-alive"]
-        url = f"http://{pod_ip}:8080/proxy"
+        url = ip_url(pod_ip, 8080, "/proxy")
         if marker:
             argv += ["-H", f"X-Rut-Benchmark-Preflight: {marker}"]
         if many:
@@ -583,7 +638,7 @@ class Matrix:
                        {"requests_logged": len(tagged), "connections": sorted(connections), "protocols": sorted(protocols)})
         if engine == "linkerd":
             after = self.metric(pod_name, outdir, "after")
-            target = f"{pod_ip}:8080"
+            target = ip_authority(pod_ip, 8080)
             if self.inbound_requests(after, target) <= self.inbound_requests(before, target):
                 raise RuntimeError(f"Linkerd inbound request_total did not increase for {target}")
 
@@ -630,12 +685,13 @@ class Matrix:
                             sample_no = len([r for r in resource_records if r["phase"].startswith("under-load")]) + 1
                             snapshot_start = time.monotonic()
                             running_before = self.client_is_running(target)
+                            client_cpu_max = self.verify_client_cpu_max(target) if running_before else []
                             resource = self.capture_resources(outdir, f"under-load-{sample_no}", resource_pids)
                             snapshot_end = time.monotonic()
                             running_after = self.client_is_running(target)
                             start_elapsed = snapshot_start - measure_start
                             end_elapsed = snapshot_end - measure_start
-                            in_window = (running_before and running_after and start_elapsed >= 0 and
+                            in_window = (running_before and running_after and bool(client_cpu_max) and start_elapsed >= 0 and
                                          end_elapsed <= measurement_duration)
                             resource["measurement_window_start_elapsed_sec"] = round(start_elapsed, 3)
                             resource["measurement_window_end_elapsed_sec"] = round(end_elapsed, 3)

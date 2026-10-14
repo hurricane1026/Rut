@@ -67,6 +67,16 @@ class ProxyBenchmarkTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 common.duration_seconds(value)
 
+    def test_ip_authorities_and_urls_cover_ipv4_and_compressed_ipv6(self):
+        self.assertEqual(common.ip_authority("10.0.0.2", 8080), "10.0.0.2:8080")
+        self.assertEqual(common.ip_authority("2001:0db8:0:0::2", 8080), "[2001:db8::2]:8080")
+        self.assertEqual(common.ip_url("2001:db8::2", 8080, "/proxy"),
+                         "http://[2001:db8::2]:8080/proxy")
+        metric = 'request_total{direction="inbound",target_addr="[2001:db8::2]:8080"} 7'
+        self.assertEqual(run_matrix.Matrix.inbound_requests(metric, "[2001:db8::2]:8080"), 7)
+        with self.assertRaises(ValueError):
+            common.ip_authority("not-an-ip", 8080)
+
     def test_worker_effective_cpuset_must_contain_all_assigned_benchmark_cpus(self):
         with mock.patch("prepare.run", return_value="2-9,14\n") as run:
             self.assertEqual(prepare.verify_worker_cpu_set("docker", "worker", {2, 3, 5, 9}),
@@ -1053,6 +1063,48 @@ class ProxyBenchmarkTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "unexpected CPU quota"):
                 run_matrix.verify_unlimited_cpu_max(value, "origin")
 
+    def test_cpu_max_ancestry_rejects_finite_intermediate_and_requires_visible_root(self):
+        good = ("/sys/fs/cgroup/worker\tmax 100000\n"
+                "/sys/fs/cgroup\tmax 200000\n")
+        rows = run_matrix.verify_unlimited_cpu_max_ancestry(good, "origin")
+        self.assertEqual([row["value"] for row in rows], ["max 100000", "max 200000"])
+        finite = good.replace("/sys/fs/cgroup/worker\tmax 100000",
+                              "/sys/fs/cgroup/worker\t100000 100000")
+        with self.assertRaisesRegex(RuntimeError, "unexpected CPU quota"):
+            run_matrix.verify_unlimited_cpu_max_ancestry(finite, "origin")
+        with self.assertRaisesRegex(RuntimeError, "does not reach"):
+            run_matrix.verify_unlimited_cpu_max_ancestry("/sys/fs/cgroup/worker\tmax 100000\n", "origin")
+        self.assertIn("/proc/1/cgroup", run_matrix.cpu_max_ancestry_script(1))
+
+    def test_wrk_client_cpu_max_checks_host_pid_ancestry_while_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "container-id.txt").write_text("client-id\n")
+            matrix = run_matrix.Matrix({"output": str(target), "worker_container": "worker",
+                                        "kubeconfig": "/tmp/kube",
+                                        "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"}})
+            ancestry = ("/sys/fs/cgroup/docker/client\tmax 100000\n"
+                        "/sys/fs/cgroup/docker\tmax 100000\n"
+                        "/sys/fs/cgroup\tmax 100000\n")
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps([{
+                        "State": {"Pid": 4321, "Running": True}}]), ""),
+                    subprocess.CompletedProcess([], 0, ancestry, "")]) as invoke:
+                evidence = matrix.verify_client_cpu_max(target)
+            self.assertEqual(evidence[-1]["path"], "/sys/fs/cgroup")
+            self.assertEqual(invoke.call_args_list[1].args[0],
+                             ["sh", "-eu", "-c", run_matrix.cpu_max_ancestry_script(4321)])
+            self.assertEqual(json.loads((target / "client-cpu-max-ancestry.json").read_text())["pid"], 4321)
+
+            finite_root = ancestry.replace("/sys/fs/cgroup\tmax 100000",
+                                           "/sys/fs/cgroup\t50000 100000")
+            with mock.patch("run_matrix.invoke", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps([{
+                        "State": {"Pid": 4321, "Running": True}}]), ""),
+                    subprocess.CompletedProcess([], 0, finite_root, "")]):
+                with self.assertRaisesRegex(RuntimeError, "unexpected CPU quota"):
+                    matrix.verify_client_cpu_max(target)
+
     def test_selected_config_is_frozen_for_both_client_phases(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"
@@ -1103,19 +1155,23 @@ class ProxyBenchmarkTests(unittest.TestCase):
                       "kubeconfig": "/tmp/kube"}
             matrix = run_matrix.Matrix(config)
             pid_by_cid = {"origin-cid": 100, "proxy-cid": 200}
+            finite_worker_quota = [False]
             def invoke(argv, **_kwargs):
                 argv = [str(item) for item in argv]
                 if "crictl" in argv:
                     cid = argv[-1]
                     result = json.dumps({"info": {"pid": pid_by_cid[cid]}})
+                elif len(argv) >= 3 and argv[-2] == "-c" and "cpu.max" in argv[-1]:
+                    pid = 1 if "/proc/1/cgroup" in argv[-1] else int(argv[-1].split("/proc/")[1].split("/")[0])
+                    role = "worker" if pid == 1 else ("origin" if pid == 100 else "proxy")
+                    quota = "50000 100000" if finite_worker_quota[0] and pid == 1 else "max 100000"
+                    result = f"/sys/fs/cgroup/{role}\t{quota}\n/sys/fs/cgroup\tmax 200000\n"
                 elif "cgroup" in argv[-1] and "/proc/" in argv[-1]:
                     pid = int(argv[-1].split("/")[2])
                     role = "origin" if pid == 100 else "proxy"
                     result = f"0::/{role}\n"
                 elif argv[-1].endswith("cgroup.procs"):
                     result = "100\n" if "origin" in argv[-1] else "200\n"
-                elif argv[-1].endswith("cpu.max"):
-                    result = "max 100000\n"
                 elif len(argv) > 1 and argv[-2] == "-c":
                     result = "100 origin 2\n" if "100" in argv[-1] else "200 linkerd-proxy 3\n"
                 elif "readlink" in argv:
@@ -1134,7 +1190,14 @@ class ProxyBenchmarkTests(unittest.TestCase):
             records = json.loads((output / "container-runtime.json").read_text())
             self.assertEqual(pids, {"proxy": [200], "origin": [100]})
             self.assertEqual({row["name"] for row in records}, {"origin", "linkerd-proxy"})
-            self.assertEqual(next(row for row in records if row["name"] == "linkerd-proxy")["pid"], 200)
+            proxy_record = next(row for row in records if row["name"] == "linkerd-proxy")
+            self.assertEqual(proxy_record["pid"], 200)
+            self.assertEqual(proxy_record["cpu_max"][-1]["path"], "/sys/fs/cgroup")
+            self.assertEqual(proxy_record["worker_pid1_cpu_max"][-1]["path"], "/sys/fs/cgroup")
+            finite_worker_quota[0] = True
+            with mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaisesRegex(RuntimeError, "worker PID 1.*unexpected CPU quota"):
+                    matrix.inspect_runtime("linkerd", output)
 
     def test_live_runtime_validation_rejects_pid_or_affinity_change(self):
         config = {"output": "/tmp/out", "worker_container": "worker",
@@ -1143,11 +1206,14 @@ class ProxyBenchmarkTests(unittest.TestCase):
         matrix = run_matrix.Matrix(config)
         runtime = [{"name": "origin", "container_id": "abc", "pid": 5,
                     "processes": [{"pid": "5", "tid": 5, "name": "origin", "allowed": "2"}]}]
-        outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", "5 origin 2\n"]
+        unlimited = "/sys/fs/cgroup/foo\tmax 100000\n/sys/fs/cgroup\tmax 100000\n"
+        outputs = [json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+                   "0::/foo\n", "5\n", "5 origin 2\n"]
         with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
                         subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
             matrix.verify_live_runtime(runtime)
-        outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", "5 origin 3\n"]
+        outputs = [json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+                   "0::/foo\n", "5\n", "5 origin 3\n"]
         with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
                         subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
             with self.assertRaisesRegex(RuntimeError, "affinity changed"):
@@ -1161,8 +1227,10 @@ class ProxyBenchmarkTests(unittest.TestCase):
         runtime = [{"name": "origin", "container_id": "abc", "pid": 5,
                     "processes": [{"pid": "5", "tid": 11, "name": "origin", "allowed": "2"},
                                   {"pid": "5", "tid": 12, "name": "origin", "allowed": "2"}]}]
+        unlimited = "/sys/fs/cgroup/foo\tmax 100000\n/sys/fs/cgroup\tmax 100000\n"
         for observed in ("11 origin 2\n", "11 origin 2\n99 origin 2\n"):
-            outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", observed]
+            outputs = [json.dumps({"info": {"pid": 5}}), unlimited, unlimited,
+                       "0::/foo\n", "5\n", observed]
             with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
                             subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
                 with self.assertRaisesRegex(RuntimeError, "process/affinity changed"):
@@ -1844,7 +1912,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                       "tools": {"docker": "docker"}, "worker_container": "worker"}
             with mock.patch("run_client.load_config", return_value=config), \
                     mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "cell-warmup",
-                                             "--pod-ip", "10.0.0.2", "--duration", "2s", "--lua", "warmup.lua",
+                                             "--pod-ip", "2001:db8::2", "--duration", "2s", "--lua", "warmup.lua",
                                              "--output", str(out)]), \
                     mock.patch("run_client.subprocess.run", side_effect=[
                         subprocess.CompletedProcess([], 0, "container123\n", ""),
@@ -1858,6 +1926,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
                               run_client.wrk_timeout("2s"),
                               run_client.DOCKER_CLEANUP_TIMEOUT])
             self.assertEqual(run.call_args_list[3].args[0], ["docker", "rm", "-f", "container123"])
+            command = json.loads((out / "command.json").read_text())
+            self.assertEqual(command[-1], "http://[2001:db8::2]:8080/proxy")
 
     def test_frontend_readiness_retries_probe_timeouts_and_connection_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1886,7 +1956,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
             with mock.patch("run_matrix.time.monotonic", return_value=0), \
                     mock.patch("run_matrix.time.sleep") as sleep, \
                     mock.patch("run_matrix.invoke", side_effect=invoke) as invoke_mock:
-                matrix.wait_frontend("10.0.0.2")
+                matrix.wait_frontend("2001:db8::2")
             self.assertEqual(invoke_mock.call_count, 9)
             self.assertEqual([event[1] for event in events],
                              ["run", "inspect", "rm", "run", "inspect", "rm", "run", "inspect", "rm"])
@@ -1894,6 +1964,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertIn("--connect-timeout", events[0])
             self.assertIn("--max-time", events[0])
             self.assertIn("--name", events[0])
+            self.assertEqual(events[0][-1], "http://[2001:db8::2]:8080/proxy")
             self.assertEqual(events[2][1:], ["rm", "-f", "owned-id"])
             label_args = [events[0][index + 1] for index, item in enumerate(events[0]) if item == "--label"]
             self.assertEqual(len(label_args), 3)

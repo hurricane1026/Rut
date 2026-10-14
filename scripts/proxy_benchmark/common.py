@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -24,6 +25,17 @@ def duration_seconds(value: str) -> float:
         raise ValueError(f"unsupported wrk duration {value!r}; use a positive integer followed by s, m, or h")
     amount = int(match.group(1))
     return amount * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+
+
+def ip_authority(host: str, port: int | str) -> str:
+    """Format an IP literal as an HTTP authority, retaining IPv4 spelling."""
+    address = ipaddress.ip_address(host)
+    rendered = f"[{address.compressed}]" if address.version == 6 else str(address)
+    return f"{rendered}:{port}"
+
+
+def ip_url(host: str, port: int | str, path: str) -> str:
+    return f"http://{ip_authority(host, port)}{path}"
 
 
 def run(argv: list[str], *, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:
