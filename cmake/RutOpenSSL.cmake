@@ -31,14 +31,18 @@ set(_rut_openssl_install "${_rut_openssl_prefix}/install")
 # dependency below installs the actual headers before consumers are compiled.
 file(MAKE_DIRECTORY "${_rut_openssl_install}/include")
 string(TOUPPER "${CMAKE_BUILD_TYPE}" _rut_openssl_build_type)
-set(_rut_openssl_cflags "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${_rut_openssl_build_type}}")
+include("${CMAKE_CURRENT_LIST_DIR}/RutOpenSSLCompiler.cmake")
+rut_openssl_compiler_environment(_rut_openssl_cc _rut_openssl_cflags
+    "${CMAKE_C_COMPILER}" "${CMAKE_C_COMPILER_ARG1}"
+    "${CMAKE_C_COMPILER_TARGET}" "${CMAKE_SYSROOT}"
+    "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${_rut_openssl_build_type}}")
 
 ExternalProject_Add(rut_openssl
     PREFIX "${_rut_openssl_prefix}"
     URL https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
     URL_HASH SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
     CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env
-        "CC=${CMAKE_C_COMPILER}" "AR=${CMAKE_AR}" "RANLIB=${CMAKE_RANLIB}"
+        "CC=${_rut_openssl_cc}" "AR=${CMAKE_AR}" "RANLIB=${CMAKE_RANLIB}"
         "CFLAGS=${_rut_openssl_cflags}"
         ${PERL_EXECUTABLE} <SOURCE_DIR>/Configure ${RUT_OPENSSL_TARGET}
         no-shared no-module no-dso no-autoload-config

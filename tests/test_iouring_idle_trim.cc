@@ -596,12 +596,10 @@ TEST(iouring_idle_trim, burst_larger_than_budget_is_trimmed_exactly_once_over_la
         REQUIRE(c != nullptr);
         if (i == 0) sample = c;
     }
-    // The burst can let the kernel reclaim the first touched slice before the
-    // baseline is measured. Re-fault both sample pages so the test observes the
-    // trim transition, rather than the residency of a page from earlier in the
-    // burst.
-    sample->recv_slice[0] = 1;
-    sample->send_slice[0] = 1;
+    // mincore observes page residency, not byte values, so make these touches
+    // volatile to prevent the optimizer discarding them as overwritten stores.
+    *reinterpret_cast<volatile u8*>(sample->recv_slice) = 1;
+    *reinterpret_cast<volatile u8*>(sample->send_slice) = 1;
     CHECK_EQ(resident_pages(sample->recv_slice, SlicePool::kSliceSize), 1u);
     CHECK_EQ(resident_pages(sample->send_slice, SlicePool::kSliceSize), 1u);
 

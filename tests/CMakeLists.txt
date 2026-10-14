@@ -18,6 +18,10 @@ set_tests_properties(test_framework PROPERTIES WILL_FAIL TRUE)
 add_test(NAME test_framework_sharding COMMAND test_framework --sharding-self-test)
 set_tests_properties(test_framework_sharding PROPERTIES LABELS "unit" TIMEOUT 30)
 
+add_test(NAME test_rut_openssl_compiler
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/test_rut_openssl_compiler.cmake)
+set_tests_properties(test_rut_openssl_compiler PROPERTIES LABELS "unit" TIMEOUT 30)
+
 # Pure #358 Stage 2a1 fixture-worker protocol self-check.  This deliberately
 # has no Docker/network label and runs in ordinary CI on an unprivileged host.
 add_library(fixture_worker_protocol STATIC fixture_worker_protocol.cc)
