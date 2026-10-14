@@ -8,16 +8,26 @@ import subprocess
 import sys
 import time
 
-from common import load_config
+from common import duration_seconds, load_config
+
+DOCKER_CONTROL_TIMEOUT = 30
+DOCKER_CLEANUP_TIMEOUT = 15
+WRK_EXIT_MARGIN = 60
+
+
+def wrk_timeout(duration: str) -> int:
+    return int(duration_seconds(duration)) + WRK_EXIT_MARGIN
 
 
 def start_and_stamp(docker: str, container: str, stamp: Path, *, timeout: float = 30.0) -> None:
     subprocess.run([docker, "start", container], check=True, text=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                   timeout=DOCKER_CONTROL_TIMEOUT)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         state = subprocess.run([docker, "inspect", "--format", "{{.State.Running}}", container],
-                               check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                               check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=DOCKER_CONTROL_TIMEOUT)
         if state.stdout.strip() == "true":
             temporary = stamp.with_name(f".{stamp.name}.{os.getpid()}.tmp")
             try:
@@ -47,6 +57,7 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=False)
     name = f"proxybench-{config['run_id']}-{args.label}".replace("_", "-")
     client_image = config["image_identities"]["client"]["docker_id"]
+    command_timeout = wrk_timeout(args.duration)
     argv = [
         config["tools"]["docker"], "create", "--name", name,
         "--security-opt", "label=disable",
@@ -63,22 +74,28 @@ def main() -> int:
                                                     "image_id": client_image}, indent=2) + "\n")
     created = None
     try:
-        p = subprocess.run(argv, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        p = subprocess.run(argv, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=DOCKER_CONTROL_TIMEOUT)
         created = p.stdout.strip()
         (output / "container-id.txt").write_text(created + "\n")
         inspect = subprocess.run([config["tools"]["docker"], "inspect", created], check=True,
-                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 timeout=DOCKER_CONTROL_TIMEOUT)
         (output / "client-container-inspect.json").write_text(inspect.stdout)
         if args.lua == "request.lua":
-            start_and_stamp(config["tools"]["docker"], created, output / "measurement-start-monotonic.txt")
+            start_and_stamp(config["tools"]["docker"], created, output / "measurement-start-monotonic.txt",
+                            timeout=DOCKER_CONTROL_TIMEOUT)
             waited = subprocess.run([config["tools"]["docker"], "wait", created], check=True,
-                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    timeout=command_timeout)
             sample = subprocess.run([config["tools"]["docker"], "logs", created], check=True,
-                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    timeout=DOCKER_CONTROL_TIMEOUT)
             sample_returncode = int(waited.stdout.strip())
         else:
             sample = subprocess.run([config["tools"]["docker"], "start", "--attach", created],
-                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    timeout=command_timeout)
             sample_returncode = sample.returncode
         (output / "wrk.log").write_text(sample.stdout)
         if sample_returncode or "cannot open /benchmark/" in sample.stdout or "METRICS " not in sample.stdout:
@@ -91,10 +108,18 @@ def main() -> int:
         (output / "error.log").write_text(error.stdout or "")
         (output / "returncode.txt").write_text(f"{error.returncode}\n")
         return error.returncode
+    except subprocess.TimeoutExpired as error:
+        details = f"Docker command timed out after {error.timeout}s: {error.cmd}\n"
+        if error.output:
+            details += error.output if isinstance(error.output, str) else error.output.decode(errors="replace")
+        (output / "error.log").write_text(details)
+        (output / "returncode.txt").write_text("124\n")
+        return 124
     finally:
         try:
             subprocess.run([config["tools"]["docker"], "rm", "-f", name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=DOCKER_CLEANUP_TIMEOUT)
         except (OSError, subprocess.SubprocessError):
             # The create response may be lost even after Docker created `name`;
             # cleanup is best effort and must not hide the original failure.

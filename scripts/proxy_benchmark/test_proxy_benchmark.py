@@ -115,8 +115,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertIn("listen 0.0.0.0:8080;", linkerd)
         self.assertIn("alias /data/proxy;", native)
         self.assertIn("alias /data/body.bin;", linkerd)
-        self.assertNotIn("keepalive_requests", native)
-        self.assertNotIn("keepalive_requests", linkerd)
+        self.assertIn("keepalive_requests 1000000000;", native)
+        self.assertIn("keepalive_requests 1000000000;", linkerd)
         self.assertIn("worker_cpu_affinity", native)
         self.assertIn(prepare.mask(9), native)
 
@@ -281,6 +281,50 @@ class ProxyBenchmarkTests(unittest.TestCase):
                         prepare.main()
                 self.assertFalse(output.exists())
                 run.assert_not_called()
+
+    def test_output_overlap_validator_rejects_both_directions_but_allows_sibling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            inputs = root / "checkpoint" / "config"
+            inputs.mkdir(parents=True)
+            prepare.validate_output_disjoint(root / "results", [inputs])
+            for output in (inputs, inputs / "results", root / "checkpoint"):
+                with self.subTest(output=output), self.assertRaisesRegex(ValueError, "overlap"):
+                    prepare.validate_output_disjoint(output, [inputs])
+
+    def test_prepare_rejects_output_inside_generated_config_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            for name in ("rps", "throughput", "libs", "tools", "client"):
+                (checkpoint / name).mkdir()
+            for dirname in ("rps", "throughput"):
+                for filename, contents in (("rut", b"runtime"),
+                                           ("rut-compile", b"compiler\0/usr/bin/clang\0/usr/bin/\0")):
+                    program = checkpoint / dirname / filename
+                    program.write_bytes(contents)
+                    program.chmod(0o755)
+            for filename in ("clang", "ld"):
+                program = checkpoint / "tools" / filename
+                program.write_text(filename)
+                program.chmod(0o755)
+            for filename in ("request.lua", "warmup.lua"):
+                (checkpoint / "client" / filename).write_text("return true")
+            output = checkpoint / "config" / "results"
+            argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                    "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
+                    "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                    "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
+                    "--runtime-libs", str(checkpoint / "libs"), "--clang", str(checkpoint / "tools" / "clang"),
+                    "--ld", str(checkpoint / "tools" / "ld"), "--client-dir", str(checkpoint / "client"),
+                    "--client-image", "client:test"]
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            self.assertFalse((checkpoint / "config").exists())
+            run.assert_not_called()
 
     def test_prepare_checks_only_compiler_nul_strings_and_rejects_mismatched_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -617,9 +661,45 @@ class ProxyBenchmarkTests(unittest.TestCase):
                                              "--output", str(out)]), \
                     mock.patch("run_client.subprocess.run", side_effect=[
                         subprocess.TimeoutExpired(["docker", "create"], 30), OSError("daemon unavailable")]) as run:
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    run_client.main()
+                self.assertEqual(run_client.main(), 124)
             self.assertEqual(run.call_args_list[1].args[0], ["docker", "rm", "-f", "proxybench-run123-4k-nginx-r1"])
+            self.assertEqual(run.call_args_list[0].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
+            self.assertEqual(run.call_args_list[1].kwargs["timeout"], run_client.DOCKER_CLEANUP_TIMEOUT)
+            self.assertTrue((out / "error.log").is_file())
+            self.assertEqual((out / "returncode.txt").read_text(), "124\n")
+
+    def test_client_measurement_docker_wait_timeout_tracks_requested_duration_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "measurement"
+            config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
+                      "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
+                      "concurrency": 4, "client_dir": "/benchmark",
+                      "tools": {"docker": "docker"}, "worker_container": "worker"}
+            with mock.patch("run_client.load_config", return_value=config), \
+                    mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "cell-measurement",
+                                             "--pod-ip", "10.0.0.2", "--duration", "2m", "--lua", "request.lua",
+                                             "--output", str(out)]), \
+                    mock.patch("run_client.start_and_stamp"), \
+                    mock.patch("run_client.subprocess.run", side_effect=[
+                        subprocess.CompletedProcess([], 0, "container123\n", ""),
+                        subprocess.CompletedProcess([], 0, "{}", ""),
+                        subprocess.TimeoutExpired(["docker", "wait"], 150),
+                        subprocess.CompletedProcess([], 0, "", "")]) as run:
+                self.assertEqual(run_client.main(), 124)
+            self.assertEqual(run.call_args_list[0].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
+            self.assertEqual(run.call_args_list[1].kwargs["timeout"], run_client.DOCKER_CONTROL_TIMEOUT)
+            self.assertEqual(run.call_args_list[2].kwargs["timeout"], 180)
+            self.assertEqual(run.call_args_list[3].args[0], ["docker", "rm", "-f", "proxybench-run123-cell-measurement"])
+            self.assertIn("timed out", (out / "error.log").read_text())
+            self.assertEqual((out / "returncode.txt").read_text(), "124\n")
+
+    def test_cpu_max_accepts_any_positive_period_when_unlimited(self):
+        for value in ("max 100000", "max 200000", "max 1"):
+            with self.subTest(value=value):
+                run_matrix.verify_unlimited_cpu_max(value, "origin")
+        for value in ("100000 100000", "max 0", "max", "max nope", "max 100000 extra"):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "unexpected CPU quota"):
+                run_matrix.verify_unlimited_cpu_max(value, "origin")
 
     def test_selected_config_is_frozen_for_both_client_phases(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1087,6 +1167,13 @@ class ProxyBenchmarkTests(unittest.TestCase):
             path.write_bytes(b"changed")
             with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
                 run_matrix.verify_artifacts(config)
+            path.unlink()
+            external = Path(tmp) / "external-rut"
+            external.write_bytes(b"original")
+            external.chmod(0o755)
+            path.symlink_to(external)
+            with self.assertRaisesRegex(RuntimeError, "artifact is a symlink"):
+                run_matrix.verify_artifacts(config)
 
     def test_prepared_payload_verification_detects_mutation_and_truncation_in_both_mount_copies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1183,6 +1270,31 @@ class ProxyBenchmarkTests(unittest.TestCase):
                              ["docker", "inspect", "--format", "{{.State.Running}}", "wrk-container"])
             self.assertEqual(docker_run.call_args_list[2].args[0],
                              ["docker", "inspect", "--format", "{{.State.Running}}", "wrk-container"])
+            self.assertTrue(all(call.kwargs["timeout"] == run_client.DOCKER_CONTROL_TIMEOUT
+                                for call in docker_run.call_args_list))
+
+    def test_client_warmup_attach_docker_call_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "warmup"
+            config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
+                      "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
+                      "concurrency": 4, "client_dir": "/benchmark",
+                      "tools": {"docker": "docker"}, "worker_container": "worker"}
+            with mock.patch("run_client.load_config", return_value=config), \
+                    mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "cell-warmup",
+                                             "--pod-ip", "10.0.0.2", "--duration", "2s", "--lua", "warmup.lua",
+                                             "--output", str(out)]), \
+                    mock.patch("run_client.subprocess.run", side_effect=[
+                        subprocess.CompletedProcess([], 0, "container123\n", ""),
+                        subprocess.CompletedProcess([], 0, "{}", ""),
+                        subprocess.CompletedProcess([], 0, "METRICS 1", ""),
+                        subprocess.CompletedProcess([], 0, "", "")]) as run:
+                self.assertEqual(run_client.main(), 0)
+            self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list],
+                             [run_client.DOCKER_CONTROL_TIMEOUT,
+                              run_client.DOCKER_CONTROL_TIMEOUT,
+                              run_client.wrk_timeout("2s"),
+                              run_client.DOCKER_CLEANUP_TIMEOUT])
 
     def test_frontend_readiness_retries_probe_timeouts_and_connection_failures(self):
         with tempfile.TemporaryDirectory() as tmp:

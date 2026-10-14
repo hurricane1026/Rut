@@ -47,6 +47,12 @@ def validate_runtime_libs(path: Path) -> None:
         raise ValueError("--runtime-libs must be a directory")
 
 
+def validate_output_disjoint(output: Path, input_roots: list[Path]) -> None:
+    for root in input_roots:
+        if output == root or output.is_relative_to(root) or root.is_relative_to(output):
+            raise ValueError(f"--output must not overlap snapshotted input tree {root}")
+
+
 def require_executable(path: Path, label: str) -> None:
     if path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK):
         raise ValueError(f"{label} must be an executable file: {path}")
@@ -302,6 +308,7 @@ http {{
     access_log off;
     sendfile on;
     keepalive_timeout 65s;
+    keepalive_requests 1000000000;
     server {{
         listen {address}:{port};
         access_log /dev/stdout rut_preflight if=$benchmark_preflight;
@@ -427,7 +434,6 @@ def main() -> int:
     output = a.output.resolve()
     if output.exists() and any(output.iterdir()):
         p.error("--output must be new or empty")
-    output.mkdir(parents=True, exist_ok=True)
     run_id = a.run_id or uuid.uuid4().hex[:10]
     if not valid_run_id(run_id):
         p.error("--run-id must be 1..20 lowercase DNS-compatible letters, digits, or interior hyphens")
@@ -451,6 +457,15 @@ def main() -> int:
 
     paths = {"rut_rps": a.rut_rps_dir.resolve(strict=True), "rut_throughput": a.rut_throughput_dir.resolve(strict=True),
              "runtime_libs": a.runtime_libs.resolve(strict=True), "clang": a.clang.resolve(strict=True), "ld": a.ld.resolve(strict=True)}
+    client_dir = a.client_dir.resolve(strict=True)
+    config_dir = checkpoint / "config"
+    try:
+        validate_output_disjoint(output, [client_dir, paths["rut_rps"], paths["rut_throughput"],
+                                          paths["runtime_libs"], paths["clang"], paths["ld"],
+                                          config_dir.resolve()])
+    except ValueError as error:
+        p.error(str(error))
+    output.mkdir(parents=True, exist_ok=True)
     try:
         validate_runtime_libs(paths["runtime_libs"])
     except ValueError as error:
@@ -476,7 +491,6 @@ def main() -> int:
     for key in ("rut_rps", "rut_throughput"):
         if not linker_paths_match(paths[key] / "rut-compile", a.native_linker_path, a.native_linker_dir):
             p.error(f"{key}/rut-compile does not embed the configured native linker path/directory")
-    client_dir = a.client_dir.resolve(strict=True)
     if not (client_dir / "request.lua").is_file() or not (client_dir / "warmup.lua").is_file():
         p.error("--client-dir must contain request.lua and warmup.lua")
     for key in ("clang", "ld"):
@@ -489,7 +503,6 @@ def main() -> int:
     image_identities = {name: {"reference": reference} for name, reference in image_refs.items()}
     image_identities["client"] = docker_image_identity(a.docker_bin, a.client_image)
 
-    config_dir = checkpoint / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "proxy-rps.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .rps, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')
     (config_dir / "proxy-throughput.rut").write_text('listen :8080\nupstream backend at "127.0.0.1:8081"\nroute GET "/proxy" { return forward(backend, hint: .throughput, request_policy: { version: .http11, host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] }) }\n')

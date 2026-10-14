@@ -30,6 +30,13 @@ def invoke(argv: list[str], *, check: bool = True, timeout: int = 240) -> subpro
     return result
 
 
+def verify_unlimited_cpu_max(value: str, name: str) -> None:
+    fields = value.split()
+    if (len(fields) != 2 or fields[0] != "max" or
+            not fields[1].isdigit() or int(fields[1]) <= 0):
+        raise RuntimeError(f"{name} has unexpected CPU quota {value}")
+
+
 def parse_smaps_rollup(pids: list[int], stdout: str, returncode: int) -> dict:
     rows = []
     for line in stdout.splitlines():
@@ -223,8 +230,7 @@ class Matrix:
                 for process in procs:
                     invoke([self.docker, "exec", self.c["worker_container"], "taskset", "-apc", cpus, process])
             cpu_max = invoke([self.docker, "exec", self.c["worker_container"], "cat", f"{cgroot}/cpu.max"]).stdout.strip()
-            if cpu_max != "max 100000":
-                raise RuntimeError(f"{name} has unexpected CPU quota {cpu_max}")
+            verify_unlimited_cpu_max(cpu_max, name)
             affinity = []
             process_binaries = []
             process_libraries = set()
@@ -555,6 +561,8 @@ def plan(repeats: int = 3) -> list[dict]:
 def verify_artifacts(config: dict) -> None:
     for name, artifact in config["artifacts"].items():
         path = Path(artifact["path"])
+        if path.is_symlink():
+            raise RuntimeError(f"recorded artifact is a symlink: {name}: {path}")
         if not path.is_file():
             raise RuntimeError(f"recorded artifact is missing: {name}: {path}")
         if not os.access(path, os.X_OK):
