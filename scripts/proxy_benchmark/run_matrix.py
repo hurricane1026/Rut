@@ -12,21 +12,14 @@ import sys
 import time
 from pathlib import Path
 
-from common import (cpu_set, image_reference_matches, load_config, normalized_linkerd_injection_spec, pod_spec,
+from common import (cpu_set, duration_seconds, image_reference_matches, load_config,
+                    normalized_linkerd_injection_spec, pod_spec,
                     provenance_fingerprint, snapshot_inputs,
                     verify_client_image_config_identity, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 ENGINES = {"4k": ("linkerd", "rut-rps", "nginx", "envoy"),
            "large": ("linkerd", "rut-throughput", "nginx", "envoy")}
-
-
-def duration_seconds(value: str) -> float:
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)(ms|s|m)", value)
-    if not match:
-        raise ValueError(f"unsupported wrk duration {value!r}; use a number followed by ms, s, or m")
-    amount = float(match.group(1))
-    return amount / 1000 if match.group(2) == "ms" else amount * (60 if match.group(2) == "m" else 1)
 
 
 def invoke(argv: list[str], *, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:

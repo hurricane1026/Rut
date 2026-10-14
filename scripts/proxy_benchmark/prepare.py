@@ -14,7 +14,7 @@ import sys
 import uuid
 
 from common import (canonical_cpu_list, cpu_set, image_reference_matches,
-                    normalized_linkerd_injection_spec, snapshot_inputs,
+                    duration_seconds, normalized_linkerd_injection_spec, snapshot_inputs,
                     verify_client_image_config_identity, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
@@ -399,6 +399,12 @@ def main() -> int:
                    help="pin existing kind-worker threads to --helper-cpus before verification")
     p.add_argument("--apply-configmaps", action="store_true")
     a = p.parse_args()
+
+    for value, name in ((a.duration, "--duration"), (a.warmup, "--warmup")):
+        try:
+            duration_seconds(value)
+        except ValueError as error:
+            p.error(f"{name}: {error}")
 
     checkpoint = a.checkpoint.resolve(strict=True)
     output = a.output.resolve()

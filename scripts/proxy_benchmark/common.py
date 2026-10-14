@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 from pathlib import Path
+import re
 import stat
 import subprocess
 
@@ -15,6 +16,14 @@ def load_config(path: str | Path) -> dict:
     if config.get("schema") != 1:
         raise ValueError("unsupported benchmark config schema")
     return config
+
+
+def duration_seconds(value: str) -> float:
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(ms|s|m)", value)
+    if not match:
+        raise ValueError(f"unsupported wrk duration {value!r}; use a number followed by ms, s, or m")
+    amount = float(match.group(1))
+    return amount / 1000 if match.group(2) == "ms" else amount * (60 if match.group(2) == "m" else 1)
 
 
 def run(argv: list[str], *, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:

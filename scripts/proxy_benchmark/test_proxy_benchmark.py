@@ -223,6 +223,24 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(config["payloads"]["4k"], json.loads((output / "payloads.json").read_text())["4k"])
             self.assertEqual(json.loads((output / "native-configmap.json").read_text())["immutable"], True)
 
+    def test_prepare_rejects_invalid_duration_before_creating_output_or_running_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            output = root / "output"
+            argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                    "--kubeconfig", str(root / "kubeconfig"), "--cluster-name", "bench",
+                    "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                    "--rut-rps-dir", str(root / "rps"), "--rut-throughput-dir", str(root / "throughput"),
+                    "--runtime-libs", str(root / "libs"), "--clang", str(root / "clang"),
+                    "--ld", str(root / "ld"), "--client-image", "client:test", "--duration", "10"]
+            with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                with self.assertRaises(SystemExit):
+                    prepare.main()
+            self.assertFalse(output.exists())
+            run.assert_not_called()
+
     def test_prepare_checks_only_compiler_nul_strings_and_rejects_mismatched_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, compiler = Path(tmp) / "rut", Path(tmp) / "rut-compile"
