@@ -948,7 +948,10 @@ class ProxyBenchmarkTests(unittest.TestCase):
             checkpoint.mkdir()
             config = {
                 "input_snapshot": common.snapshot_inputs({"client_dir": inputs, "rut_config_dir": config_dir,
-                    "runtime_libs": libs, "clang": clang, "ld": ld}),
+                    "runtime_libs": libs, "clang": clang, "ld": ld,
+                    "benchmark_common": Path(common.__file__),
+                    "benchmark_driver": Path(run_matrix.__file__).with_name("run_client.py"),
+                    "benchmark_matrix": Path(run_matrix.__file__)}),
                 "client_dir": str(inputs),
                 "paths": {"rut_config_dir": str(config_dir), "runtime_libs": str(libs),
                           "clang": str(clang), "ld": str(ld), "rut_rps": str(rps),
@@ -1030,8 +1033,34 @@ class ProxyBenchmarkTests(unittest.TestCase):
             changed = common.snapshot_inputs(snapshot_paths)
             self.assertNotEqual(old_fingerprint,
                                 common.provenance_fingerprint({**config, "input_snapshot": changed}))
-            with mock.patch("run_matrix.invoke") as invoke:
+            with mock.patch.object(run_matrix, "__file__", str(driver_paths["benchmark_matrix"])), \
+                    mock.patch.object(common, "__file__", str(driver_paths["benchmark_common"])), \
+                    mock.patch("run_matrix.invoke") as invoke:
                 with self.assertRaisesRegex(RuntimeError, "mounted benchmark inputs changed"):
+                    run_matrix.verify_provenance(config)
+                invoke.assert_not_called()
+
+    def test_resume_rejects_driver_execution_from_another_checkout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout_a = root / "checkout-a"
+            checkout_b = root / "checkout-b"
+            checkout_a.mkdir()
+            checkout_b.mkdir()
+            snapshot = {}
+            for name, filename in (("benchmark_common", "common.py"),
+                                   ("benchmark_driver", "run_client.py"),
+                                   ("benchmark_matrix", "run_matrix.py")):
+                source = checkout_a / filename
+                source.write_text("prepared source")
+                snapshot[name] = {"path": str(source), "bytes": len("prepared source"),
+                                  "sha256": common.sha256(source)}
+                (checkout_b / filename).write_text("alternate checkout source")
+            config = {"input_snapshot": snapshot, "image_identities": {}}
+            with mock.patch.object(run_matrix, "__file__", str(checkout_b / "run_matrix.py")), \
+                    mock.patch.object(common, "__file__", str(checkout_b / "common.py")), \
+                    mock.patch("run_matrix.invoke") as invoke:
+                with self.assertRaisesRegex(RuntimeError, "current benchmark benchmark_common differs"):
                     run_matrix.verify_provenance(config)
                 invoke.assert_not_called()
 

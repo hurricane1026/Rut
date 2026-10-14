@@ -697,6 +697,21 @@ def verify_worker_mount(config: dict, docker: str) -> None:
 def verify_provenance(config: dict) -> None:
     if "input_snapshot" not in config or "image_identities" not in config:
         raise RuntimeError("benchmark config lacks input/image provenance; rerun prepare.py")
+    # The snapshot must identify the code that will actually execute this
+    # matrix. Otherwise a checkpoint prepared by one checkout could be resumed
+    # with another checkout while only the former's files are rehashed.
+    driver_sources = {
+        "benchmark_common": Path(sys.modules["common"].__file__).resolve(),
+        "benchmark_driver": Path(__file__).with_name("run_client.py").resolve(),
+        "benchmark_matrix": Path(__file__).resolve(),
+    }
+    snapshot = config["input_snapshot"]
+    present = driver_sources.keys() & snapshot.keys()
+    if present != driver_sources.keys():
+        raise RuntimeError("benchmark config has incomplete driver source provenance; rerun prepare.py")
+    for name, actual_path in driver_sources.items():
+        if name in snapshot and Path(snapshot[name]["path"]).resolve() != actual_path:
+            raise RuntimeError(f"current benchmark {name} differs from prepared driver source")
     verify_effective_paths(config)
     try:
         current_snapshot = snapshot_inputs({name: entry["path"]
