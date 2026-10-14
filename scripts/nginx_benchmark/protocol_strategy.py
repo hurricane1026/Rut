@@ -27,6 +27,39 @@ CASES = [
 ]
 
 
+def ws_async_splice_settings(env=None):
+    env = os.environ if env is None else env
+    return {
+        'ws_async_splice_mode': env.get('RUT_STUDY_WS_ASYNC_SPLICE',
+                                        env.get('ws_async_splice_mode', 'off')),
+        'ws_linked_splice_mode': env.get('RUT_STUDY_WS_LINKED_SPLICE',
+                                         env.get('ws_linked_splice_mode', 'off')),
+        'ws_poll_next_read_mode': env.get('RUT_STUDY_WS_POLL_NEXT_READ',
+                                          env.get('ws_poll_next_read_mode', 'off')),
+        'ws_async_splice_queue_budget_mode': env.get(
+            'RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET',
+            env.get('ws_async_splice_queue_budget_mode', 'off')),
+    }
+
+
+def validate_ws_async_splice_startup(log, settings):
+    async_on = settings['ws_async_splice_mode'] == 'on'
+    expected = {
+        'RUT_STUDY_WS_ASYNC_SPLICE': async_on,
+        'RUT_STUDY_WS_LINKED_SPLICE': async_on and settings['ws_linked_splice_mode'] == 'on',
+        'RUT_STUDY_WS_POLL_NEXT_READ': async_on and settings['ws_poll_next_read_mode'] == 'on',
+        'RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET': (
+            async_on and settings['ws_async_splice_queue_budget_mode'] == 'on'),
+    }
+    for name, enabled in expected.items():
+        mode = 'on' if enabled else 'off'
+        if name == 'RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET':
+            if f'{name} mode={mode} ' not in log:
+                raise RuntimeError(f'{name} setting did not activate')
+        elif f'{name} mode={mode}\n' not in log:
+            raise RuntimeError(f'{name} setting did not activate')
+
+
 def positive_nofile_limit(value):
     try:
         parsed = int(value)
@@ -273,6 +306,7 @@ def main():
                     ws_recv_mode=os.environ.get('RUT_STUDY_WS_RECV', 'once'),
                     nginx_keepalive_requests=1000000, nginx_buffer_kib=args.nginx_buffer_kib,
                     ws_splice_mode=os.environ.get('RUT_STUDY_WS_SPLICE', 'off'),
+                    **ws_async_splice_settings(),
                     ws_segment=os.environ.get('RUT_STUDY_WS_SEGMENT', '64k'),
                     ws_calls=os.environ.get('RUT_STUDY_WS_CALLS', '8'),
                     repeats=1 if args.smoke else args.repeats,
@@ -422,6 +456,8 @@ def main():
                                 raise RuntimeError('WebSocket receive mode did not activate')
                             if engine == 'uring' and manifest['ws_splice_mode'] == 'on' and 'RUT_STUDY_WS_SPLICE mode=on' not in log:
                                 raise RuntimeError('WebSocket splice mode did not activate')
+                            if engine == 'uring':
+                                validate_ws_async_splice_startup(log, manifest)
                             if engine == 'uring' and manifest['ws_splice_mode'] == 'on':
                                 chunk = {'16k': 16384, '64k': 65536, '128k': 131072}[manifest['ws_segment']]
                                 if f"RUT_STUDY_WS_PARAMETERS chunk={chunk} calls={manifest['ws_calls']}" not in log:
@@ -459,6 +495,8 @@ def main():
                         row.update(case=case, engine=engine, policy=policy, repeat=repeat,
                                    ws_recv_mode=manifest['ws_recv_mode'] if engine == 'uring' else None,
                                    ws_splice_mode=manifest['ws_splice_mode'] if engine == 'uring' else None,
+                                   **{key: value if engine == 'uring' else None
+                                      for key, value in ws_async_splice_settings(manifest).items()},
                                    ws_segment=manifest['ws_segment'] if engine == 'uring' else None,
                                    ws_calls=manifest['ws_calls'] if engine == 'uring' else None,
                                    cpu_observation_seconds=usage_seconds,

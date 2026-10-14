@@ -54,6 +54,33 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_protocol_strategy_records_async_splice_settings_and_checks_startup(self):
+        settings = protocol_strategy.ws_async_splice_settings({
+            "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+            "RUT_STUDY_WS_LINKED_SPLICE": "on",
+            "RUT_STUDY_WS_POLL_NEXT_READ": "on",
+            "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET": "on",
+        })
+        self.assertEqual(settings, {
+            "ws_async_splice_mode": "on",
+            "ws_linked_splice_mode": "on",
+            "ws_poll_next_read_mode": "on",
+            "ws_async_splice_queue_budget_mode": "on",
+        })
+        log = ("RUT_STUDY_WS_ASYNC_SPLICE mode=on\n"
+               "RUT_STUDY_WS_LINKED_SPLICE mode=on\n"
+               "RUT_STUDY_WS_POLL_NEXT_READ mode=on\n"
+               "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET mode=on sq_entries=32\n")
+        protocol_strategy.validate_ws_async_splice_startup(log, settings)
+        with self.assertRaisesRegex(RuntimeError, "LINKED_SPLICE"):
+            protocol_strategy.validate_ws_async_splice_startup(
+                log.replace("RUT_STUDY_WS_LINKED_SPLICE mode=on",
+                            "RUT_STUDY_WS_LINKED_SPLICE mode=off"), settings)
+
+    def test_protocol_strategy_async_splice_defaults_are_recorded_as_off(self):
+        settings = protocol_strategy.ws_async_splice_settings({})
+        self.assertTrue(all(value == "off" for value in settings.values()))
+
     def test_protocol_strategy_nofile_cli_and_child_limit_preserve_hard_limit(self):
         parser = argparse.ArgumentParser()
         protocol_strategy.add_nofile_argument(parser)

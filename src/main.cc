@@ -476,6 +476,14 @@ static bool configure_study_policy(Loop* loop) {
                 write_str(loop->ws_splice.asynchronous && loop->backend.splice_supported
                               ? "RUT_STUDY_WS_ASYNC_SPLICE mode=on\n"
                               : "RUT_STUDY_WS_ASYNC_SPLICE mode=off\n");
+                const bool ws_async_effective =
+                    loop->ws_splice.asynchronous && loop->backend.splice_supported;
+                write_str(ws_async_effective && loop->ws_splice.linked
+                              ? "RUT_STUDY_WS_LINKED_SPLICE mode=on\n"
+                              : "RUT_STUDY_WS_LINKED_SPLICE mode=off\n");
+                write_str(ws_async_effective && loop->ws_splice.poll_next_read
+                              ? "RUT_STUDY_WS_POLL_NEXT_READ mode=on\n"
+                              : "RUT_STUDY_WS_POLL_NEXT_READ mode=off\n");
                 const bool ws_queue_budget_effective = loop->ws_splice.async_queue_budget &&
                                                        loop->ws_splice.asynchronous &&
                                                        loop->backend.splice_supported;

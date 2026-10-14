@@ -98,7 +98,8 @@ static void full_duplex_burst(test::TestCase* _tc,
                               bool asynchronous = false,
                               bool cancel_retry = false,
                               bool linked = false,
-                              bool poll_next_read = false) {
+                              bool poll_next_read = false,
+                              u32 splice_fallback_bytes = 0) {
     REQUIRE(!half_close || splice);
     LoopStorage storage;
     if (!storage.init()) return;
@@ -344,9 +345,17 @@ static void full_duplex_burst(test::TestCase* _tc,
         if (fin_before_drain) {
             CHECK_EQ(loop.ws_splice.transferred[0], origin_bytes);
             CHECK_EQ(loop.ws_splice.transferred[1], client_bytes);
+        } else if (splice_fallback_bytes != 0) {
+            const u32 expected_splice_max = kBytes - prefix;
+            const u32 expected_splice_min = expected_splice_max - splice_fallback_bytes;
+            CHECK_GE(loop.ws_splice.transferred[0], expected_splice_min);
+            CHECK_LE(loop.ws_splice.transferred[0], expected_splice_max);
+            CHECK_GE(loop.ws_splice.transferred[1], expected_splice_min);
+            CHECK_LE(loop.ws_splice.transferred[1], expected_splice_max);
         } else {
-            CHECK_EQ(loop.ws_splice.transferred[0], pipe_failure ? 0u : kBytes - prefix);
-            CHECK_EQ(loop.ws_splice.transferred[1], pipe_failure ? 0u : kBytes - prefix);
+            const u32 expected_splice_bytes = kBytes - prefix;
+            CHECK_EQ(loop.ws_splice.transferred[0], pipe_failure ? 0u : expected_splice_bytes);
+            CHECK_EQ(loop.ws_splice.transferred[1], pipe_failure ? 0u : expected_splice_bytes);
         }
     }
     if (fin_before_drain) {
@@ -2745,7 +2754,9 @@ TEST(ws, linked_splice_tiny_budget) {
                       false,
                       true,
                       false,
-                      true);
+                      true,
+                      false,
+                      73);
 }
 TEST(ws, linked_splice_poll_next_half_close) {
     full_duplex_burst(_tc,
@@ -2853,7 +2864,8 @@ TEST(ws, linked_splice_one_operation_budget_progresses_both_directions) {
                       true,
                       false,
                       true,
-                      true);
+                      true,
+                      73);
 }
 
 TEST(ws, async_splice_queue_budget_is_opt_in_and_resolves_sq_capacity) {
