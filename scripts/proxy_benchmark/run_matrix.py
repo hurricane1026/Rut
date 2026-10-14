@@ -116,17 +116,25 @@ class Matrix:
     def wait_frontend(self, pod_ip: str) -> None:
         """Wait until the application socket accepts an HTTP request."""
         deadline = time.monotonic() + 180
-        argv = [self.docker, "run", "--rm", "--network", f"container:{self.c['worker_container']}",
-                "--cpuset-cpus", self.c["cpus"]["client"], "--entrypoint", "curl",
-                self.c["images"]["client"], "--http1.1", "--fail", "--silent", "--show-error",
-                "--output", "/dev/null", f"http://{pod_ip}:8080/proxy"]
+        safe_ip = re.sub(r"[^A-Za-z0-9_.-]", "-", pod_ip)
+        name = f"proxybench-ready-{self.c.get('run_id', 'run')}-{safe_ip}"
         while time.monotonic() < deadline:
+            argv = [self.docker, "run", "--rm", "--name", name,
+                    "--network", f"container:{self.c['worker_container']}",
+                    "--cpuset-cpus", self.c["cpus"]["client"], "--entrypoint", "curl",
+                    self.c["images"]["client"], "--http1.1", "--fail", "--silent", "--show-error",
+                    "--connect-timeout", "2", "--max-time", "4",
+                    "--output", "/dev/null", f"http://{pod_ip}:8080/proxy"]
             try:
                 result = invoke(argv, check=False, timeout=5)
             except subprocess.TimeoutExpired:
-                time.sleep(1)
-                continue
-            if result.returncode == 0:
+                result = None
+            finally:
+                try:
+                    invoke([self.docker, "rm", "-f", name], check=False, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+            if result is not None and result.returncode == 0:
                 return
             time.sleep(1)
         raise RuntimeError(f"frontend at {pod_ip}:8080 did not become ready")

@@ -83,9 +83,13 @@ def main() -> int:
         (output / "returncode.txt").write_text(f"{error.returncode}\n")
         return error.returncode
     finally:
-        if created:
-            subprocess.run([config["tools"]["docker"], "rm", "-f", created],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run([config["tools"]["docker"], "rm", "-f", name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            # The create response may be lost even after Docker created `name`;
+            # cleanup is best effort and must not hide the original failure.
+            pass
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -85,10 +86,18 @@ def image_reference_matches(reference: str, candidate: str) -> bool:
 
 def normalized_linkerd_injection_spec(pod: dict) -> dict:
     spec = pod.get("spec", {})
-    containers = sorted((item for item in spec.get("containers", [])
+    def normalize_container(item: dict) -> dict:
+        normalized = copy.deepcopy(item)
+        for mount in normalized.get("volumeMounts", []):
+            if (mount.get("name", "").startswith("kube-api-access-") and
+                    mount.get("mountPath") == "/var/run/secrets/kubernetes.io/serviceaccount"):
+                mount["name"] = "kube-api-access"
+        return normalized
+
+    containers = sorted((normalize_container(item) for item in spec.get("containers", [])
                          if item.get("name", "").startswith("linkerd-")),
                         key=lambda item: item.get("name", ""))
-    init_containers = sorted((item for item in spec.get("initContainers", [])
+    init_containers = sorted((normalize_container(item) for item in spec.get("initContainers", [])
                               if item.get("name", "").startswith("linkerd-")),
                              key=lambda item: item.get("name", ""))
     proxies = [item for item in containers + init_containers if item.get("name") == "linkerd-proxy"]

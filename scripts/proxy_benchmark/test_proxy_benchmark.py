@@ -361,6 +361,38 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertNotEqual(common.provenance_fingerprint(base_config),
                             common.provenance_fingerprint(changed_config))
 
+    def test_service_account_mount_suffix_is_normalized_without_ignoring_other_mount_settings(self):
+        def pod(suffix, mount_path="/var/run/secrets/kubernetes.io/serviceaccount"):
+            return {"spec": {"containers": [{"name": "linkerd-proxy", "image": "proxy",
+                "volumeMounts": [{"name": f"kube-api-access-{suffix}", "mountPath": mount_path,
+                                  "readOnly": True}, {"name": "linkerd-config", "mountPath": "/etc/linkerd"}]}]}}
+        left, right = pod("abc"), pod("xyz")
+        left_normalized = common.normalized_linkerd_injection_spec(left)
+        self.assertEqual(left_normalized, common.normalized_linkerd_injection_spec(right))
+        self.assertEqual(left["spec"]["containers"][0]["volumeMounts"][0]["name"], "kube-api-access-abc")
+        self.assertNotEqual(left_normalized, common.normalized_linkerd_injection_spec(pod("xyz", "/different")))
+        changed_config = {"linkerd_injected_spec": common.normalized_linkerd_injection_spec(pod("xyz"))}
+        changed_config["linkerd_injected_spec"]["containers"][0]["args"] = ["changed"]
+        self.assertNotEqual(common.provenance_fingerprint({"linkerd_injected_spec": left_normalized}),
+                            common.provenance_fingerprint(changed_config))
+
+    def test_client_create_timeout_still_removes_deterministic_container_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "measurement"
+            config = {"run_id": "run123", "image_identities": {"client": {"docker_id": "sha256:client"}},
+                      "images": {"client": "client:tag"}, "cpus": {"client": "2,3"},
+                      "concurrency": 4, "client_dir": "/benchmark",
+                      "tools": {"docker": "docker"}, "worker_container": "worker"}
+            with mock.patch("run_client.load_config", return_value=config), \
+                    mock.patch("sys.argv", ["run_client.py", "--config", "unused", "--label", "4k-nginx-r1",
+                                             "--pod-ip", "10.0.0.2", "--duration", "2s", "--lua", "warmup.lua",
+                                             "--output", str(out)]), \
+                    mock.patch("run_client.subprocess.run", side_effect=[
+                        subprocess.TimeoutExpired(["docker", "create"], 30), OSError("daemon unavailable")]) as run:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run_client.main()
+            self.assertEqual(run.call_args_list[1].args[0], ["docker", "rm", "-f", "proxybench-run123-4k-nginx-r1"])
+
     def test_selected_config_is_frozen_for_both_client_phases(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"
@@ -896,14 +928,52 @@ class ProxyBenchmarkTests(unittest.TestCase):
                                         "kubeconfig": "", "worker_container": "worker",
                                         "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
             success = subprocess.CompletedProcess([], 0, "", "")
+            events = []
+            def invoke(argv, **_kwargs):
+                events.append([str(item) for item in argv])
+                if argv[1] == "run":
+                    attempt = sum(1 for event in events if event[1] == "run")
+                    if attempt == 1:
+                        raise subprocess.TimeoutExpired("curl", 5)
+                    return subprocess.CompletedProcess([], 7, "", "refused") if attempt == 2 else success
+                return subprocess.CompletedProcess([], 0, "", "")
             with mock.patch("run_matrix.time.monotonic", return_value=0), \
                     mock.patch("run_matrix.time.sleep") as sleep, \
-                    mock.patch("run_matrix.invoke", side_effect=[subprocess.TimeoutExpired("curl", 5),
-                                                                    subprocess.CompletedProcess([], 7, "", "refused"),
-                                                                    success]) as invoke:
+                    mock.patch("run_matrix.invoke", side_effect=invoke) as invoke_mock:
                 matrix.wait_frontend("10.0.0.2")
-            self.assertEqual(invoke.call_count, 3)
+            self.assertEqual(invoke_mock.call_count, 6)
+            self.assertEqual([event[1] for event in events], ["run", "rm", "run", "rm", "run", "rm"])
             self.assertEqual(sleep.call_count, 2)
+            self.assertIn("--connect-timeout", events[0])
+            self.assertIn("--max-time", events[0])
+            self.assertIn("--name", events[0])
+
+    def test_frontend_cleanup_failure_reuses_same_name_and_cannot_spawn_another_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = run_matrix.Matrix({"output": tmp, "tools": {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"},
+                                        "kubeconfig": "", "worker_container": "worker", "run_id": "r1",
+                                        "cpus": {"client": "5,7"}, "images": {"client": "client:test"}})
+            events = []
+            def invoke(argv, **_kwargs):
+                argv = [str(item) for item in argv]
+                events.append(argv)
+                if argv[1] == "run":
+                    if sum(1 for row in events if row[1] == "run") == 1:
+                        raise subprocess.TimeoutExpired(argv, 5)
+                    return subprocess.CompletedProcess(argv, 125, "container name already in use", "")
+                if sum(1 for row in events if row[1] == "rm") == 1:
+                    raise OSError("Docker daemon did not remove the timed out probe")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            with mock.patch("run_matrix.time.monotonic", side_effect=[0, 0, 0, 181]), \
+                    mock.patch("run_matrix.time.sleep"), \
+                    mock.patch("run_matrix.invoke", side_effect=invoke):
+                with self.assertRaisesRegex(RuntimeError, "did not become ready"):
+                    matrix.wait_frontend("10.0.0.2")
+            run_events = [row for row in events if row[1] == "run"]
+            self.assertEqual(len(run_events), 2)
+            self.assertEqual(run_events[0][run_events[0].index("--name") + 1],
+                             run_events[1][run_events[1].index("--name") + 1])
+            self.assertEqual([row[1] for row in events], ["run", "rm", "run", "rm"])
 
     def test_frontend_readiness_fails_after_bounded_retry_window(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -915,7 +985,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     mock.patch("run_matrix.invoke", return_value=subprocess.CompletedProcess([], 7, "", "refused")) as invoke:
                 with self.assertRaisesRegex(RuntimeError, "did not become ready"):
                     matrix.wait_frontend("10.0.0.2")
-            self.assertEqual(invoke.call_count, 1)
+            self.assertEqual(invoke.call_count, 2)
 
     def test_resource_snapshot_requires_complete_unique_rows_and_successful_command(self):
         output = "101 120 80\n102 320 240\n"
