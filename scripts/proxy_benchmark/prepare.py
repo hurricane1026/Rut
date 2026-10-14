@@ -170,8 +170,9 @@ def native_body(size: int) -> bytes:
     return b"".join(chunks)[:size]
 
 
-def run(argv: list[str]) -> str:
-    result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+def run(argv: list[str], *, timeout: int = 90) -> str:
+    result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout)
     if result.returncode:
         raise RuntimeError(f"command failed ({result.returncode}): {argv}\n{result.stdout}")
     return result.stdout

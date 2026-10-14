@@ -215,6 +215,14 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertTrue(prepare.linker_paths_match(
                 compiler, "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
 
+    def test_prepare_run_forwards_default_and_extended_subprocess_timeouts(self):
+        completed = subprocess.CompletedProcess([], 0, "ok", "")
+        with mock.patch("prepare.subprocess.run", return_value=completed) as process_run:
+            self.assertEqual(prepare.run(["probe"]), "ok")
+            self.assertEqual(process_run.call_args.kwargs["timeout"], 90)
+            self.assertEqual(prepare.run(["probe"], timeout=190), "ok")
+            self.assertEqual(process_run.call_args.kwargs["timeout"], 190)
+
     def test_configmap_immutable_uses_top_level_api_field(self):
         config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
                   "kubeconfig": "/tmp/kube", "namespace": "bench",
