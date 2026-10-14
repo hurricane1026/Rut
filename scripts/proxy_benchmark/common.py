@@ -106,7 +106,13 @@ def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
 
 
 def provenance_fingerprint(config: dict) -> str:
-    evidence = {key: config[key] for key in ("images", "image_identities", "input_snapshot")}
+    evidence = {key: config[key] for key in (
+        "images", "image_identities", "input_snapshot", "artifacts", "cpus",
+        "duration", "warmup", "concurrency", "repeats", "bodies",
+        "worker_node", "selector",
+    ) if key in config}
+    evidence["schedule"] = {"algorithm": "balanced-interleave-v1",
+                            "repeats": config.get("repeats")}
     evidence["native_linker_path"] = config.get("native_linker_path")
     evidence["native_linker_dir"] = config.get("native_linker_dir")
     evidence["configmap_identities"] = config.get("configmap_identities")

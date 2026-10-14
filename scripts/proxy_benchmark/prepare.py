@@ -67,7 +67,17 @@ def worker_image_identities(docker: str, worker: str, identities: dict) -> dict:
 
 
 def nul_strings(path: Path) -> set[str]:
-    return {item.decode("ascii") for item in path.read_bytes().split(b"\0") if item}
+    # ELF files contain arbitrary machine-code bytes between their textual
+    # strings. Ignore those chunks instead of letting them abort inspection.
+    strings = set()
+    for item in path.read_bytes().split(b"\0"):
+        if not item:
+            continue
+        try:
+            strings.add(item.decode("ascii"))
+        except UnicodeDecodeError:
+            continue
+    return strings
 
 
 def linker_paths_match(compiler: Path, linker_path: str, linker_dir: str) -> bool:
@@ -116,7 +126,7 @@ def discover_linkerd_proxy_identity(kube: list[str], docker: str, worker: str,
         run(kube + ["create", "-f", str(probe_path)])
         created = True
         run(kube + ["wait", "--for=condition=Ready", f"pod/{pod_name}", "-n", namespace,
-                    "--timeout=180s"])
+                    "--timeout=180s"], timeout=190)
         actual = json.loads(run(kube + ["get", "pod", pod_name, "-n", namespace, "-o", "json"]))
         proxy = injected_linkerd_proxy_image(actual)
         status = next((item for item in actual.get("status", {}).get("containerStatuses", [])

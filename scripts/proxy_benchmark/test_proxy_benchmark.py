@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -201,6 +202,19 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang-22", "/usr/bin/"))
             self.assertFalse(prepare.linker_paths_match(compiler, "/opt/llvm/bin/clang", "/opt/llvm/bin/"))
 
+    def test_compiler_string_scan_ignores_non_ascii_elf_chunks(self):
+        real_binary = Path(sys.executable).read_bytes()
+        self.assertEqual(real_binary[:4], b"\x7fELF")
+        self.assertTrue(any(any(byte > 0x7f for byte in chunk)
+                            for chunk in real_binary.split(b"\0")))
+        prepare.nul_strings(Path(sys.executable))
+        with tempfile.TemporaryDirectory() as tmp:
+            compiler = Path(tmp) / "rut-compile"
+            compiler.write_bytes(b"\x7fELF\x00\xff\xfe machine code\x00/opt/llvm/bin/clang-22\x00/opt/llvm/bin/\x00")
+            self.assertEqual(prepare.embedded_clang_path(compiler), "/opt/llvm/bin/clang-22")
+            self.assertTrue(prepare.linker_paths_match(
+                compiler, "/opt/llvm/bin/clang-22", "/opt/llvm/bin/"))
+
     def test_configmap_immutable_uses_top_level_api_field(self):
         config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
                   "kubeconfig": "/tmp/kube", "namespace": "bench",
@@ -234,6 +248,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
         self.assertIn("wait", commands[1])
         self.assertIn("create", commands[0])
         self.assertEqual(commands[-1][3:6], ["delete", "pod", "probe"])
+        self.assertEqual(run.call_args_list[1].kwargs["timeout"], 190)
 
     def test_linkerd_probe_deletes_pod_when_readiness_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -349,6 +364,29 @@ class ProxyBenchmarkTests(unittest.TestCase):
             changed_configmap = common.provenance_fingerprint({**config,
                 "configmap_identities": {"native": {"uid": "new", "data": {"x": "changed"}}}})
             self.assertNotEqual(changed_configmap, fingerprint)
+            configured = {**config, "concurrency": 128, "duration": "10s", "warmup": "2s",
+                          "repeats": 3, "bodies": {"4k": 4096},
+                          "cpus": {"proxy": 2, "origin": "3-4", "client": "5,7"},
+                          "artifacts": {"rut": {"sha256": "before"}}}
+            baseline = common.provenance_fingerprint(configured)
+            (validation.parent / "cell.json").write_text(json.dumps({"provenance_fingerprint": baseline}))
+            mutations = [
+                {**configured, "concurrency": 256},
+                {**configured, "duration": "20s"},
+                {**configured, "warmup": "4s"},
+                {**configured, "repeats": 4},
+                {**configured, "bodies": {"4k": 4096, "64k": 65536}},
+                {**configured, "cpus": {"proxy": 3, "origin": "3-4", "client": "5,7"}},
+                {**configured, "artifacts": {"rut": {"sha256": "after"}}},
+            ]
+            for mutated in mutations:
+                changed_settings = common.provenance_fingerprint(mutated)
+                self.assertNotEqual(changed_settings, baseline)
+                with self.assertRaisesRegex(ValueError, "provenance does not match"):
+                    summarize.validate_sample_provenance(output, row, changed_settings)
+            self.assertEqual(common.provenance_fingerprint({**configured,
+                "output": "/different/location", "checkpoint": "/other/checkpoint",
+                "paths": {"rut": "/path/only"}}), baseline)
 
     def test_run_rechecks_every_recorded_artifact_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
