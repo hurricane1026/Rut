@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from common import (cpu_set, image_reference_matches, load_config, pod_spec,
+from common import (cpu_set, image_reference_matches, load_config, normalized_linkerd_injection_spec, pod_spec,
                     provenance_fingerprint, snapshot_inputs, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
@@ -73,7 +73,7 @@ class Matrix:
     def __init__(self, config: dict, config_path: Path | None = None):
         self.c = config
         self.out = Path(config["output"])
-        self.config_path = config_path or (self.out / "benchmark.json")
+        self.config_path = self.out / "samples" / f"client-config-{provenance_fingerprint(config)}.json"
         self.samples = self.out / "samples"
         self.kubectl = config["tools"]["kubectl"]
         self.docker = config["tools"]["docker"]
@@ -84,6 +84,17 @@ class Matrix:
                     lua: str, target: Path) -> list[str]:
         return [sys.executable, str(client), "--config", str(self.config_path), "--label", label,
                 "--pod-ip", pod_ip, "--duration", duration, "--lua", lua, "--output", str(target)]
+
+    def freeze_client_config(self) -> Path:
+        """Persist the config loaded by this process so both driver phases use one snapshot."""
+        self.samples.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(self.c, indent=2, sort_keys=True) + "\n"
+        if self.config_path.exists():
+            if json.loads(self.config_path.read_text()) != self.c:
+                raise RuntimeError("existing client config snapshot differs from selected benchmark")
+        else:
+            self.config_path.write_text(encoded)
+        return self.config_path
 
     def kube(self, *args: str, check: bool = True, timeout: int = 240) -> subprocess.CompletedProcess[str]:
         return invoke([self.kubectl, "--kubeconfig", self.kubeconfig, *args], check=check, timeout=timeout)
@@ -133,13 +144,26 @@ class Matrix:
         if pod["spec"].get("nodeName") != self.c["worker_node"]:
             raise RuntimeError(f"Pod scheduled on unexpected node {pod['spec'].get('nodeName')}")
         statuses_all = pod["status"].get("containerStatuses", []) + pod["status"].get("initContainerStatuses", [])
+        if engine == "linkerd":
+            injected = normalized_linkerd_injection_spec(pod)
+            if injected != self.c.get("linkerd_injected_spec"):
+                raise RuntimeError("Linkerd injected container spec differs from prepared benchmark")
         expected = {"origin", "linkerd-proxy"} if engine == "linkerd" else {"origin", "frontend"}
         statuses = [item for item in statuses_all if item.get("name") in expected and item.get("containerID")]
         if {item["name"] for item in statuses} != expected:
             raise RuntimeError(f"container set mismatch: expected {expected}, got {[x.get('name') for x in statuses]}")
         spec_containers = pod["spec"].get("containers", []) + pod["spec"].get("initContainers", [])
         spec_by_name = {item.get("name"): item for item in spec_containers}
-        for status in statuses:
+        verify_statuses = statuses_all if engine == "linkerd" else statuses
+        injected_names = ({item["name"] for item in normalized_linkerd_injection_spec(pod)["containers"] +
+                           normalized_linkerd_injection_spec(pod)["initContainers"]} if engine == "linkerd" else set())
+        if injected_names and not injected_names <= {item.get("name") for item in verify_statuses}:
+            raise RuntimeError("Linkerd injected container status set is incomplete")
+        for status in verify_statuses:
+            if status.get("name") not in expected and status.get("name") not in injected_names:
+                continue
+            if status.get("name") in injected_names and not status.get("containerID"):
+                raise RuntimeError(f"Linkerd injected container {status.get('name')} has no runtime identity")
             spec = spec_by_name.get(status["name"], {})
             verify_status_image_identity(status["name"], spec.get("image"), status.get("imageID", ""),
                                          self.c.get("image_identities", {}))
@@ -207,7 +231,8 @@ class Matrix:
                            "sha256": hash_result.stdout.split()[0] if hash_result.returncode == 0 and hash_result.stdout.split() else None}
                 mapped_libraries[role][path] = library
             write_json(outdir / f"container-{name}-inspect.json", inspected)
-            details.append({"name": name, "container_id": cid, "image_id": item.get("imageID"), "pid": pid,
+            details.append({"name": name, "container_id": cid, "image_id": item.get("imageID"),
+                            "restart_count": item.get("restartCount", 0), "pid": pid,
                             "cpuset_command": pin.stdout, "cpu_max": cpu_max, "cgroup": cgroot,
                             "processes": affinity, "process_binaries": process_binaries,
                             "mapped_shared_objects": sorted(process_libraries)})
@@ -221,6 +246,34 @@ class Matrix:
                                     "total_bytes": sum(item["size_bytes"] for item in files) if complete else None}
         write_json(outdir / "mapped-shared-objects.json", library_report)
         return {key: sorted(set(value)) for key, value in resource_pids.items()}
+
+    def verify_live_runtime(self, runtime: list[dict]) -> None:
+        for record in runtime:
+            inspected = json.loads(invoke([self.docker, "exec", self.c["worker_container"],
+                                           "crictl", "inspect", record["container_id"]]).stdout)
+            if int(inspected["info"]["pid"]) != record["pid"]:
+                raise RuntimeError(f"container {record['name']} process PID changed during measurement")
+            cg = invoke([self.docker, "exec", self.c["worker_container"], "cat",
+                         f"/proc/{record['pid']}/cgroup"]).stdout.strip().splitlines()[-1]
+            cgroot = "/sys/fs/cgroup" + cg.split(":", 2)[2]
+            pids = set(invoke([self.docker, "exec", self.c["worker_container"], "cat",
+                               f"{cgroot}/cgroup.procs"]).stdout.split())
+            baseline_pids = {str(row["pid"]) for row in record["processes"]}
+            if not baseline_pids <= pids:
+                raise RuntimeError(f"container {record['name']} process set changed during measurement")
+            observed = []
+            for pid in sorted(pids):
+                cmd = (f"for f in /proc/{pid}/task/*/status; do "
+                       "awk '/^Name:/{n=$2}/^Cpus_allowed_list:/{print n, $2}' \"$f\"; done")
+                lines = invoke([self.docker, "exec", self.c["worker_container"], "sh", "-c", cmd]).stdout.splitlines()
+                for line in lines:
+                    fields = line.split()
+                    if len(fields) != 2:
+                        raise RuntimeError(f"cannot verify live thread affinity for {record['name']}")
+                    observed.append((int(pid), fields[0], fields[1]))
+            expected = {(int(row["pid"]), row["name"], row["allowed"]) for row in record["processes"]}
+            if set(observed) != expected:
+                raise RuntimeError(f"container {record['name']} process/affinity changed during measurement")
 
     def capture_resources(self, outdir: Path, phase: str, pids: dict[str, list[int]]) -> dict:
         all_pids = sorted(set(pids["proxy"]) | set(pids["origin"]))
@@ -421,6 +474,10 @@ class Matrix:
         verify_artifacts(self.c)
         verify_payloads(self.c)
         verify_provenance(self.c)
+        final = self.kube("get", "pod", pod_name, "-n", self.c["namespace"], "-o", "json")
+        runtime = json.loads((outdir / "container-runtime.json").read_text())
+        verify_pod_runtime_stable(pod, json.loads(final.stdout), runtime)
+        self.verify_live_runtime(runtime)
         (outdir / "valid.txt").write_text("warmup and measurement valid; error counters 0\n")
         under_load = [row for row in resource_records if row["phase"].startswith("under-load")]
         write_json(outdir / "resources-summary.json", {
@@ -503,6 +560,25 @@ def image_identity_matches(actual: str, expected: dict) -> bool:
     return False
 
 
+def pod_runtime_statuses(pod: dict) -> dict:
+    statuses = pod.get("status", {}).get("containerStatuses", []) + pod.get("status", {}).get("initContainerStatuses", [])
+    return {item.get("name"): (item.get("containerID", "").split("://", 1)[-1], item.get("imageID", ""),
+                                int(item.get("restartCount", 0))) for item in statuses}
+
+
+def verify_pod_runtime_stable(initial: dict, final: dict, runtime: list[dict]) -> None:
+    before, after = pod_runtime_statuses(initial), pod_runtime_statuses(final)
+    for record in runtime:
+        name = record["name"]
+        expected = (record["container_id"], record["image_id"], record.get("restart_count", 0))
+        if before.get(name) != expected or after.get(name) != expected:
+            raise RuntimeError(f"container {name} identity/restart state changed during measurement")
+    # Every runtime process and its captured affinity must still be present in the
+    # original container record; inspect_runtime records the PID and per-thread masks.
+    if not runtime or any(not item.get("pid") or not item.get("processes") for item in runtime):
+        raise RuntimeError("runtime process/affinity baseline is incomplete")
+
+
 def expected_container_identity(name: str, image: str, identities: dict) -> dict | None:
     if name == "linkerd-proxy":
         return identities.get("linkerd_proxy")
@@ -511,8 +587,8 @@ def expected_container_identity(name: str, image: str, identities: dict) -> dict
 
 def verify_status_image_identity(name: str, image: str, actual: str, identities: dict) -> None:
     identity = expected_container_identity(name, image, identities)
-    if name == "linkerd-proxy" and not identity:
-        raise RuntimeError("prepared Linkerd proxy image identity missing")
+    if (name in {"origin", "frontend", "linkerd-proxy"} or name.startswith("linkerd-")) and not identity:
+        raise RuntimeError(f"prepared {name} image identity missing")
     if identity and not image_identity_matches(actual, identity):
         raise RuntimeError(f"{name} image identity changed: {actual}")
 
@@ -631,6 +707,7 @@ def main() -> int:
     verify_provenance(config)
     matrix = Matrix(config, args.config.resolve())
     matrix.samples.mkdir(parents=True, exist_ok=True)
+    matrix.freeze_client_config()
     plan_path = matrix.samples / "schedule.json"
     work = plan(int(config["repeats"]))
     if plan_path.exists() and json.loads(plan_path.read_text()) != work:

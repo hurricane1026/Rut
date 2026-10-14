@@ -12,7 +12,8 @@ import subprocess
 import sys
 import uuid
 
-from common import canonical_cpu_list, cpu_set, image_reference_matches, snapshot_inputs, write_json
+from common import (canonical_cpu_list, cpu_set, image_reference_matches,
+                    normalized_linkerd_injection_spec, snapshot_inputs, write_json)
 
 SIZES = {"4k": 4096, "64k": 65536, "256k": 262144, "1m": 1048576}
 IMAGES = {
@@ -131,15 +132,28 @@ def discover_linkerd_proxy_identity(kube: list[str], docker: str, worker: str,
         run(kube + ["wait", "--for=condition=Ready", f"pod/{pod_name}", "-n", namespace,
                     "--timeout=180s"], timeout=190)
         actual = json.loads(run(kube + ["get", "pod", pod_name, "-n", namespace, "-o", "json"]))
-        proxy = injected_linkerd_proxy_image(actual)
-        status = next((item for item in actual.get("status", {}).get("containerStatuses", [])
-                       if item.get("name") == "linkerd-proxy"), None)
-        if not status or not status.get("imageID"):
-            raise RuntimeError("Linkerd probe Pod has no proxy imageID")
-        identity = worker_image_identities(docker, worker, {"linkerd_proxy": {"reference": proxy}})["linkerd_proxy"]
-        if not worker_image_status_matches(status["imageID"], identity):
-            raise RuntimeError(f"Linkerd probe imageID differs from resolved worker identity: {status['imageID']}")
-        return identity
+        injected_spec = normalized_linkerd_injection_spec(actual)
+        references = {}
+        for item in injected_spec["containers"] + injected_spec["initContainers"]:
+            name = item["name"]
+            identity_name = ("linkerd_proxy" if name == "linkerd-proxy" else
+                             "linkerd_" + name.removeprefix("linkerd-").replace("-", "_"))
+            references[identity_name] = {"reference": item["image"]}
+        identities = worker_image_identities(docker, worker, references)
+        statuses = {item.get("name"): item for item in
+                    actual.get("status", {}).get("containerStatuses", []) +
+                    actual.get("status", {}).get("initContainerStatuses", [])}
+        for item in injected_spec["containers"] + injected_spec["initContainers"]:
+            name = item["name"]
+            status = statuses.get(name)
+            if not status or not status.get("imageID"):
+                raise RuntimeError(f"Linkerd probe has no image identity status for {name}")
+            identity_name = ("linkerd_proxy" if name == "linkerd-proxy" else
+                             "linkerd_" + name.removeprefix("linkerd-").replace("-", "_"))
+            identity = identities[identity_name]
+            if not worker_image_status_matches(status["imageID"], identity):
+                raise RuntimeError(f"Linkerd probe {name} imageID differs from resolved worker identity: {status['imageID']}")
+        return {"identities": identities, "injected_spec": injected_spec}
     finally:
         active_error = sys.exc_info()[0] is not None
         try:
@@ -441,12 +455,18 @@ def main() -> int:
         probe_path = output / "linkerd-image-probe.json"
         write_json(probe_path, {"apiVersion": "v1", "kind": "Pod",
                                 "metadata": {"name": probe_name, "namespace": a.namespace,
-                                             "annotations": {"linkerd.io/inject": "enabled"}},
+                                             "annotations": {
+                                                 "linkerd.io/inject": "enabled",
+                                                 "config.linkerd.io/default-inbound-policy": "all-unauthenticated",
+                                                 "config.linkerd.io/proxy-log-level": "error",
+                                                 "config.linkerd.io/proxy-cpu-request": "1",
+                                             }},
                                 "spec": {"nodeName": a.worker_node,
                                          "containers": [{"name": "probe", "image": a.nginx_image}]}})
-        proxy_identity = discover_linkerd_proxy_identity(kube, a.docker_bin, a.worker_container,
-                                                         probe_path, probe_name, a.namespace)
-        image_identities["linkerd_proxy"] = proxy_identity
+        injection = discover_linkerd_proxy_identity(kube, a.docker_bin, a.worker_container,
+                                                    probe_path, probe_name, a.namespace)
+        image_identities.update(injection["identities"])
+        config["linkerd_injected_spec"] = injection["injected_spec"]
         resolved_images = worker_image_identities(a.docker_bin, a.worker_container, image_identities)
         helper_cpus = canonical_cpu_list(set(helpers))
         verify_script = helper_verify_script(helpers, a.pin_worker_helpers)

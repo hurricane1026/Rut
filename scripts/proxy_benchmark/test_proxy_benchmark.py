@@ -252,7 +252,10 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 {"metadata": {"uid": "uid2", "immutable": True}, "data": {"x": "one"}}, {"x": "one"})
 
     def test_linkerd_probe_waits_for_pull_records_identity_and_deletes_probe(self):
-        pod = {"spec": {"containers": [{"name": "linkerd-proxy", "image": "proxy:edge"}]},
+        pod = {"spec": {"containers": [{"name": "linkerd-proxy", "image": "proxy:edge",
+                                           "args": ["--log-level=error"],
+                                           "env": [{"name": "A", "value": "B"}],
+                                           "resources": {"requests": {"cpu": "1"}}}]},
                "status": {"containerStatuses": [{"name": "linkerd-proxy", "imageID": "containerd://sha256:cfg"}]}}
         inventory = {"images": [{"id": "sha256:cfg", "repoTags": ["proxy:edge"], "repoDigests": []}]}
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,7 +264,8 @@ class ProxyBenchmarkTests(unittest.TestCase):
             with mock.patch("prepare.run", side_effect=["", "", json.dumps(pod), json.dumps(inventory), ""]) as run:
                 identity = prepare.discover_linkerd_proxy_identity(
                     ["kubectl", "--kubeconfig", "/kube"], "docker", "worker", probe, "probe", "bench")
-        self.assertEqual(identity["worker_id"], "sha256:cfg")
+        self.assertEqual(identity["identities"]["linkerd_proxy"]["worker_id"], "sha256:cfg")
+        self.assertEqual(identity["injected_spec"]["containers"][0]["args"], ["--log-level=error"])
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn("wait", commands[1])
         self.assertIn("create", commands[0])
@@ -318,6 +322,69 @@ class ProxyBenchmarkTests(unittest.TestCase):
             run_matrix.verify_status_image_identity("linkerd-proxy", "linkerd/proxy:edge", "containerd://sha256:changed", identities)
         with self.assertRaisesRegex(RuntimeError, "identity missing"):
             run_matrix.verify_status_image_identity("linkerd-proxy", "", "containerd://sha256:cfg", {})
+
+    def test_linkerd_injection_spec_binds_runtime_relevant_container_settings(self):
+        pod = {"spec": {"containers": [
+            {"name": "origin", "image": "nginx"},
+            {"name": "linkerd-proxy", "image": "proxy", "args": ["--x"],
+             "env": [{"name": "A", "value": "B"}], "resources": {"limits": {"cpu": "2"}},
+             "securityContext": {"runAsUser": 1000}, "volumeMounts": [{"name": "x", "mountPath": "/x"}]},
+        ], "initContainers": [{"name": "linkerd-init", "image": "init", "command": ["init"]}]}}
+        normalized = common.normalized_linkerd_injection_spec(pod)
+        self.assertEqual([item["name"] for item in normalized["containers"]], ["linkerd-proxy"])
+        changed = json.loads(json.dumps(pod))
+        changed["spec"]["containers"][1]["env"][0]["value"] = "C"
+        self.assertNotEqual(normalized, common.normalized_linkerd_injection_spec(changed))
+        base_config = {"images": {}, "linkerd_injected_spec": normalized}
+        changed_config = {**base_config, "linkerd_injected_spec": common.normalized_linkerd_injection_spec(changed)}
+        self.assertNotEqual(common.provenance_fingerprint(base_config),
+                            common.provenance_fingerprint(changed_config))
+
+    def test_selected_config_is_frozen_for_both_client_phases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            selected = Path(tmp) / "selected.json"
+            config = {"output": str(output), "duration": "10s", "warmup": "2s",
+                      "concurrency": 4, "kubeconfig": "/tmp/kube",
+                      "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"}}
+            selected.write_text(json.dumps(config))
+            matrix = run_matrix.Matrix(config, selected)
+            snapshot = matrix.freeze_client_config()
+            selected.write_text(json.dumps({**config, "concurrency": 99}))
+            self.assertEqual(json.loads(snapshot.read_text()), config)
+            for kind in ("warmup", "measurement"):
+                argv = matrix.client_argv(Path("run_client.py"), kind, "10.0.0.1", config["duration"], "x.lua", Path(tmp) / kind)
+                self.assertEqual(argv[argv.index("--config") + 1], str(snapshot))
+            self.assertEqual(json.loads(snapshot.read_text())["concurrency"], 4)
+
+    def test_pod_runtime_validation_rejects_restart_and_replacement(self):
+        status = {"name": "origin", "containerID": "containerd://abc", "imageID": "sha256:def", "restartCount": 0}
+        pod = {"status": {"containerStatuses": [status]}}
+        runtime = [{"name": "origin", "container_id": "abc", "image_id": "sha256:def", "restart_count": 0,
+                    "pid": 5, "processes": [{"pid": 5, "name": "origin", "allowed": "2"}]}]
+        run_matrix.verify_pod_runtime_stable(pod, json.loads(json.dumps(pod)), runtime)
+        for field, value in (("restartCount", 1), ("containerID", "containerd://new"), ("imageID", "sha256:new")):
+            changed = json.loads(json.dumps(pod))
+            changed["status"]["containerStatuses"][0][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "changed"):
+                run_matrix.verify_pod_runtime_stable(pod, changed, runtime)
+
+    def test_live_runtime_validation_rejects_pid_or_affinity_change(self):
+        config = {"output": "/tmp/out", "worker_container": "worker",
+                  "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                  "kubeconfig": "/tmp/kube"}
+        matrix = run_matrix.Matrix(config)
+        runtime = [{"name": "origin", "container_id": "abc", "pid": 5,
+                    "processes": [{"pid": "5", "name": "origin", "allowed": "2"}]}]
+        outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", "origin 2\n"]
+        with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
+                        subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
+            matrix.verify_live_runtime(runtime)
+        outputs = [json.dumps({"info": {"pid": 5}}), "0::/foo\n", "5\n", "origin 3\n"]
+        with mock.patch("run_matrix.invoke", side_effect=lambda *_args, **_kwargs:
+                        subprocess.CompletedProcess([], 0, outputs.pop(0), "")):
+            with self.assertRaisesRegex(RuntimeError, "affinity changed"):
+                matrix.verify_live_runtime(runtime)
 
     def test_configmap_identity_verification_detects_recreate_and_data_change(self):
         config = {"configmaps": {"native": "pb-run-native"}, "tools": {"kubectl": "kubectl"},
@@ -486,19 +553,20 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(result, "deleted\n")
             self.assertIn("create timed out", (output / "samples/last-failure.json").read_text())
 
-    def test_client_drivers_receive_the_selected_config_path_and_workload_values(self):
-        config = {"output": "/benchmark/output",
+    def test_client_drivers_receive_frozen_config_path_and_workload_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"output": str(Path(tmp) / "output"),
                   "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
                   "kubeconfig": "/tmp/kube"}
-        selected = Path("/tmp/selected/benchmark.json")
-        matrix = run_matrix.Matrix(config, selected)
-        for kind, duration, lua in (("warmup", "2s", "warmup.lua"),
-                                    ("measurement", "10s", "request.lua")):
-            argv = matrix.client_argv(Path("run_client.py"), f"cell-{kind}", "10.0.0.2",
-                                      duration, lua, Path("results") / kind)
-            self.assertEqual(argv[argv.index("--config") + 1], str(selected))
-            self.assertEqual(argv[argv.index("--duration") + 1], duration)
-            self.assertEqual(argv[argv.index("--lua") + 1], lua)
+            matrix = run_matrix.Matrix(config, Path(tmp) / "selected.json")
+            snapshot = matrix.freeze_client_config()
+            for kind, duration, lua in (("warmup", "2s", "warmup.lua"),
+                                        ("measurement", "10s", "request.lua")):
+                argv = matrix.client_argv(Path("run_client.py"), f"cell-{kind}", "10.0.0.2",
+                                          duration, lua, Path("results") / kind)
+                self.assertEqual(argv[argv.index("--config") + 1], str(snapshot))
+                self.assertEqual(argv[argv.index("--duration") + 1], duration)
+                self.assertEqual(argv[argv.index("--lua") + 1], lua)
 
     def test_effective_runtime_paths_must_match_prepared_snapshot_and_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -83,6 +83,19 @@ def image_reference_matches(reference: str, candidate: str) -> bool:
     return canonical_image_reference(reference) == canonical_image_reference(candidate)
 
 
+def normalized_linkerd_injection_spec(pod: dict) -> dict:
+    spec = pod.get("spec", {})
+    containers = sorted((item for item in spec.get("containers", [])
+                         if item.get("name", "").startswith("linkerd-")),
+                        key=lambda item: item.get("name", ""))
+    init_containers = sorted((item for item in spec.get("initContainers", [])
+                              if item.get("name", "").startswith("linkerd-")),
+                             key=lambda item: item.get("name", ""))
+    if not any(item.get("name") == "linkerd-proxy" for item in containers):
+        raise ValueError("Linkerd admission did not inject linkerd-proxy")
+    return {"containers": containers, "initContainers": init_containers}
+
+
 def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
     snapshot = {}
     for name, raw_path in sorted(paths.items()):
@@ -110,6 +123,7 @@ def provenance_fingerprint(config: dict) -> str:
         "images", "image_identities", "input_snapshot", "artifacts", "cpus",
         "duration", "warmup", "concurrency", "repeats", "bodies", "payloads",
         "worker_node", "selector", "client_dir", "paths", "node_mount",
+        "linkerd_injected_spec",
     ) if key in config}
     evidence["schedule"] = {"algorithm": "balanced-interleave-v1",
                             "repeats": config.get("repeats")}
