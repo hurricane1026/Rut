@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -560,6 +561,8 @@ def verify_artifacts(config: dict) -> None:
         path = Path(artifact["path"])
         if not path.is_file():
             raise RuntimeError(f"recorded artifact is missing: {name}: {path}")
+        if not os.access(path, os.X_OK):
+            raise RuntimeError(f"recorded artifact is not executable: {name}: {path}")
         actual = Matrix.file_sha(path)
         if actual != artifact["sha256"]:
             raise RuntimeError(f"recorded artifact hash mismatch for {name}: expected {artifact['sha256']}, got {actual}")

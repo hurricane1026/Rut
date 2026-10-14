@@ -325,6 +325,50 @@ class ProxyBenchmarkTests(unittest.TestCase):
             prepare.applied_configmap_identity(
                 {"metadata": {"uid": "uid2", "immutable": True}, "data": {"x": "one"}}, {"x": "one"})
 
+    def test_configmap_apply_failure_cleans_only_resources_confirmed_owned_by_run(self):
+        run_id = "run123"
+        namespace = "bench"
+        manifests = {}
+        paths = {}
+        for name in ("native", "linkerd"):
+            manifests[name] = {"metadata": {"name": f"pb-{run_id}-{name}", "namespace": namespace,
+                "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                           "benchmark-run-id": run_id}}, "data": {"config": name}}
+            paths[name] = Path(f"/{name}.json")
+        owned = {"metadata": {**manifests["native"]["metadata"], "uid": "native-uid"},
+                 "data": manifests["native"]["data"], "immutable": True}
+        unrelated = {"metadata": {**manifests["linkerd"]["metadata"], "uid": "other-uid",
+                                   "labels": {"app.kubernetes.io/managed-by": "someone-else",
+                                               "benchmark-run-id": run_id}},
+                     "data": manifests["linkerd"]["data"], "immutable": True}
+        with mock.patch("prepare.run", side_effect=[
+                RuntimeError("create response lost after partial success"),
+                json.dumps(owned), "", json.dumps(unrelated)]
+                ) as run:
+            with self.assertRaisesRegex(RuntimeError, "create response lost"):
+                prepare.apply_configmaps(["kubectl"], namespace, run_id, manifests, paths)
+        deletes = [call.args[0] for call in run.call_args_list if "delete" in call.args[0]]
+        self.assertEqual(deletes, [["kubectl", "delete", "configmap", "pb-run123-native", "-n", namespace,
+                                    "--ignore-not-found=true", "--wait=true"]])
+
+    def test_configmap_identity_failure_rolls_back_and_preserves_original_error(self):
+        run_id = "run456"
+        namespace = "bench"
+        manifests = {}
+        paths = {}
+        for name in ("native", "linkerd"):
+            manifests[name] = {"metadata": {"name": f"pb-{run_id}-{name}", "namespace": namespace,
+                "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                           "benchmark-run-id": run_id}}, "data": {"config": name}}
+            paths[name] = Path(f"/{name}.json")
+        mismatched = {"metadata": {**manifests["native"]["metadata"], "uid": "native-uid"},
+                      "data": {"config": "stale"}, "immutable": True}
+        with mock.patch("prepare.run", side_effect=["created", json.dumps(mismatched),
+                json.dumps(mismatched), RuntimeError("delete unavailable"), RuntimeError("not found")]) as run:
+            with self.assertRaisesRegex(RuntimeError, "data differs"):
+                prepare.apply_configmaps(["kubectl"], namespace, run_id, manifests, paths)
+        self.assertTrue(any("delete" in call.args[0] for call in run.call_args_list))
+
     def test_linkerd_probe_waits_for_pull_records_identity_and_deletes_probe(self):
         pod = {"spec": {"containers": [], "initContainers": [{"name": "linkerd-proxy", "image": "proxy:edge",
                                                                   "restartPolicy": "Always",
@@ -908,8 +952,13 @@ class ProxyBenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rut"
             path.write_bytes(b"original")
+            path.chmod(0o755)
             config = {"artifacts": {"rut": {"path": str(path), "sha256": common.sha256(path)}}}
             run_matrix.verify_artifacts(config)
+            path.chmod(0o644)
+            with self.assertRaisesRegex(RuntimeError, "not executable"):
+                run_matrix.verify_artifacts(config)
+            path.chmod(0o755)
             path.write_bytes(b"changed")
             with self.assertRaisesRegex(RuntimeError, "hash mismatch"):
                 run_matrix.verify_artifacts(config)

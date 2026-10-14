@@ -155,6 +155,49 @@ def applied_configmap_identity(actual: dict, expected_data: dict) -> dict:
     return {"uid": actual["metadata"]["uid"], "data": actual["data"]}
 
 
+def configmap_is_owned_by_run(actual: dict, name: str, namespace: str, run_id: str) -> bool:
+    metadata = actual.get("metadata", {})
+    labels = metadata.get("labels", {})
+    return (metadata.get("name") == name and metadata.get("namespace") == namespace and
+            labels.get("app.kubernetes.io/managed-by") == "rut-proxy-benchmark" and
+            labels.get("benchmark-run-id") == run_id)
+
+
+def cleanup_owned_configmaps(kubectl: list[str], namespace: str, run_id: str,
+                             manifests: dict[str, dict]) -> None:
+    for manifest in manifests.values():
+        metadata = manifest["metadata"]
+        name = metadata["name"]
+        try:
+            actual = json.loads(run(kubectl + ["get", "configmap", name, "-n", namespace, "-o", "json"]))
+            if not configmap_is_owned_by_run(actual, name, namespace, run_id):
+                continue
+            run(kubectl + ["delete", "configmap", name, "-n", namespace,
+                           "--ignore-not-found=true", "--wait=true"])
+        except BaseException:
+            # Cleanup is best-effort and must never replace the preparation failure.
+            continue
+
+
+def apply_configmaps(kubectl: list[str], namespace: str, run_id: str,
+                     manifests: dict[str, dict], paths: dict[str, Path]) -> dict:
+    try:
+        run(kubectl + ["create", "-f", str(paths["native"]), "-f", str(paths["linkerd"])])
+        identities = {}
+        for name in ("native", "linkerd"):
+            expected = manifests[name]
+            cm_name = expected["metadata"]["name"]
+            actual = json.loads(run(kubectl + ["get", "configmap", cm_name,
+                                               "-n", namespace, "-o", "json"]))
+            if not configmap_is_owned_by_run(actual, cm_name, namespace, run_id):
+                raise RuntimeError(f"ConfigMap {cm_name} ownership differs from this benchmark run")
+            identities[name] = applied_configmap_identity(actual, expected["data"])
+        return identities
+    except BaseException:
+        cleanup_owned_configmaps(kubectl, namespace, run_id, manifests)
+        raise
+
+
 def discover_linkerd_proxy_identity(kube: list[str], docker: str, worker: str,
                                     probe_path: Path, pod_name: str, namespace: str) -> dict:
     try:
@@ -509,18 +552,13 @@ def main() -> int:
     if a.apply_configmaps:
         if not a.verify_cluster:
             p.error("--apply-configmaps requires --verify-cluster")
-        run([a.kubectl_bin, "--kubeconfig", str(a.kubeconfig.resolve()), "create", "-f", str(output / "native-configmap.json"), "-f", str(output / "linkerd-configmap.json")])
+        manifests = {name: json.loads((output / f"{name}-configmap.json").read_text())
+                     for name in ("native", "linkerd")}
+        config["configmap_identities"] = apply_configmaps(
+            [a.kubectl_bin, "--kubeconfig", str(a.kubeconfig.resolve())],
+            a.namespace, run_id, manifests,
+            {name: output / f"{name}-configmap.json" for name in manifests})
         config["configmaps_applied"] = True
-        config["configmap_identities"] = {}
-        for name in ("native", "linkerd"):
-            cm_name = config["configmaps"][name]
-            actual = json.loads(run([a.kubectl_bin, "--kubeconfig", str(a.kubeconfig.resolve()),
-                                     "get", "configmap", cm_name, "-n", a.namespace, "-o", "json"]))
-            expected = json.loads((output / f"{name}-configmap.json").read_text())
-            try:
-                config["configmap_identities"][name] = applied_configmap_identity(actual, expected["data"])
-            except RuntimeError as error:
-                p.error(f"{cm_name}: {error}")
     else:
         config["configmaps_applied"] = False
     write_json(output / "benchmark.json", config)
