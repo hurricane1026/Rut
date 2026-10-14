@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from common import (cpu_set, duration_seconds, image_reference_matches, load_config,
@@ -104,6 +105,7 @@ def verify_origin_affinity(master_pid: int, cpus: str, rows: list[dict]) -> None
 class Matrix:
     def __init__(self, config: dict, config_path: Path | None = None):
         self.c = config
+        self.pod_create_attempt = uuid.uuid4().hex
         self.out = Path(config["output"])
         self.config_path = self.out / "samples" / f"client-config-{provenance_fingerprint(config)}.json"
         self.samples = self.out / "samples"
@@ -403,7 +405,7 @@ class Matrix:
         pod_name = f"proxybench-{self.c['run_id']}-{body}-{rep}-{engine}"
         outdir = self.samples / body / label
         outdir.mkdir(parents=True, exist_ok=False)
-        manifest = pod_spec(self.c, engine, body, pod_name)
+        manifest = pod_spec({**self.c, "pod_create_attempt": self.pod_create_attempt}, engine, body, pod_name)
         pod_path = outdir / "pod.json"
         write_json(outdir / "pod.yaml", manifest)  # JSON is a valid Kubernetes YAML document.
         created = self.kube("create", "-f", str(outdir / "pod.yaml"))
@@ -421,7 +423,7 @@ class Matrix:
 
         before = self.metric(pod_name, outdir, "before") if engine == "linkerd" else None
         self.curl(pod_ip, outdir, body)
-        marker = engine if body == "4k" and rep == 1 else None
+        marker = origin_preflight_marker(body, engine, rep)
         if marker:
             self.curl(pod_ip, outdir, body, marker=marker, many=True)
             origin_log = self.kube("logs", pod_name, "-n", self.c["namespace"], "-c", "origin").stdout
@@ -556,6 +558,12 @@ def plan(repeats: int = 3) -> list[dict]:
     return [{"body": body, "engine": engine, "rep": rep}
             for body, rounds in schedules.items() for rep in range(1, repeats + 1)
             for engine in rounds[(rep - 1) % len(rounds)]]
+
+
+def origin_preflight_marker(body: str, engine: str, rep: int) -> str | None:
+    if rep == 1 and (body == "4k" or engine == "rut-throughput"):
+        return f"{engine}-{body}-r{rep}"
+    return None
 
 
 def verify_artifacts(config: dict) -> None:
@@ -736,10 +744,36 @@ def verify_configmaps(config: dict) -> None:
 def cleanup_failed_cell(matrix: Matrix, config: dict, cell: dict, error: BaseException) -> str:
     pod_name = f"proxybench-{config['run_id']}-{cell['body']}-{cell['rep']}-{cell['engine']}"
     try:
-        cleanup = matrix.kube("delete", "pod", pod_name, "-n", config["namespace"],
-                              "--ignore-not-found=true", "--grace-period=1", "--wait=true",
-                              check=False, timeout=90)
-        details = cleanup.stdout
+        fetched = matrix.kube("get", "pod", pod_name, "-n", config["namespace"], "-o", "json", check=False)
+        if fetched.returncode:
+            details = f"ownership lookup failed ({fetched.returncode}): {fetched.stdout}"
+        else:
+            pod = json.loads(fetched.stdout)
+            metadata = pod.get("metadata", {})
+            labels = metadata.get("labels", {})
+            owned = (metadata.get("name") == pod_name and metadata.get("namespace") == config["namespace"] and
+                     labels.get("app.kubernetes.io/managed-by") == "rut-proxy-benchmark" and
+                     labels.get("benchmark-run-id") == config["run_id"] and
+                     labels.get("benchmark-create-attempt") == matrix.pod_create_attempt)
+            outdir = matrix.samples / cell["body"] / f"{cell['body']}-{cell['engine']}-r{cell['rep']}"
+            recorded_uid = None
+            pod_path = outdir / "pod.json"
+            if pod_path.is_file():
+                recorded_uid = json.loads(pod_path.read_text()).get("metadata", {}).get("uid")
+            actual_uid = metadata.get("uid")
+            if recorded_uid and actual_uid != recorded_uid:
+                owned = False
+            if not owned or not actual_uid:
+                details = f"pod not deleted: ownership or UID mismatch (uid={actual_uid!r})"
+            else:
+                selector = (f"app.kubernetes.io/managed-by=rut-proxy-benchmark,"
+                            f"benchmark-run-id={config['run_id']},"
+                            f"benchmark-create-attempt={matrix.pod_create_attempt}")
+                cleanup = matrix.kube("delete", "pod", "-n", config["namespace"], "-l", selector,
+                                      "--field-selector", f"metadata.name={pod_name}",
+                                      "--grace-period=1", "--wait=true",
+                                      check=False, timeout=90)
+                details = cleanup.stdout
     except Exception as cleanup_error:
         details = f"cleanup command failed: {cleanup_error}"
     write_json(matrix.samples / "last-failure.json",

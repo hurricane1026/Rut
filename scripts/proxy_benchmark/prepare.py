@@ -460,6 +460,8 @@ def main() -> int:
     client_dir = a.client_dir.resolve(strict=True)
     config_dir = checkpoint / "config"
     try:
+        if config_dir.is_symlink():
+            raise ValueError(f"mounted input root is a symlink: {config_dir}")
         validate_output_disjoint(output, [client_dir, paths["rut_rps"], paths["rut_throughput"],
                                           paths["runtime_libs"], paths["clang"], paths["ld"],
                                           config_dir.resolve()])
@@ -529,8 +531,12 @@ def main() -> int:
                "data": {"linkerd-origin.conf": linkerd_origin}}
     write_json(output / "native-configmap.json", native)
     write_json(output / "linkerd-configmap.json", linkerd)
+    driver_dir = Path(__file__).resolve().parent
     input_paths = {"client_dir": client_dir, "rut_config_dir": config_dir,
-                   "runtime_libs": paths["runtime_libs"], "clang": paths["clang"], "ld": paths["ld"]}
+                   "runtime_libs": paths["runtime_libs"], "clang": paths["clang"], "ld": paths["ld"],
+                   "benchmark_common": driver_dir / "common.py",
+                   "benchmark_driver": driver_dir / "run_client.py",
+                   "benchmark_matrix": driver_dir / "run_matrix.py"}
     input_snapshot = snapshot_inputs(input_paths)
 
     config = {"schema": 1, "run_id": run_id, "checkpoint": str(checkpoint), "output": str(output), "kubeconfig": str(a.kubeconfig.resolve()),

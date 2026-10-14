@@ -154,7 +154,14 @@ def normalized_linkerd_injection_spec(pod: dict) -> dict:
 def snapshot_inputs(paths: dict[str, str | Path]) -> dict:
     snapshot = {}
     for name, raw_path in sorted(paths.items()):
-        root = Path(raw_path).resolve(strict=True)
+        supplied_root = Path(raw_path)
+        try:
+            root_mode = supplied_root.lstat().st_mode
+        except OSError as error:
+            raise ValueError(f"mounted input root is unavailable: {supplied_root}") from error
+        if stat.S_ISLNK(root_mode):
+            raise ValueError(f"mounted input root is a symlink: {supplied_root}")
+        root = supplied_root.resolve(strict=True)
         entries = {}
         selected = [root, *sorted(root.rglob("*"))] if root.is_dir() else [root]
         for path in selected:
@@ -197,6 +204,15 @@ def node_path(config: dict, relative: str) -> str:
     return str(Path(config["node_mount"]) / relative)
 
 
+def pod_labels(config: dict, engine: str, body: str, name: str) -> dict:
+    labels = {"app": name, "bench-engine": engine, "bench-body": body,
+              "benchmark-run-id": config["run_id"],
+              "app.kubernetes.io/managed-by": "rut-proxy-benchmark"}
+    if config.get("pod_create_attempt"):
+        labels["benchmark-create-attempt"] = config["pod_create_attempt"]
+    return labels
+
+
 def pod_spec(config: dict, engine: str, body: str, name: str) -> dict:
     """Return one unmeshed-control or stock inbound-Linkerd Pod manifest."""
     node_root = Path(config["node_mount"])
@@ -208,8 +224,7 @@ def pod_spec(config: dict, engine: str, body: str, name: str) -> dict:
         return {
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": name, "namespace": config["namespace"],
-                         "labels": {"app": name, "bench-engine": engine, "bench-body": body,
-                                    "benchmark-run-id": config["run_id"]},
+                         "labels": pod_labels(config, engine, body, name),
                          "annotations": {
                              "linkerd.io/inject": "enabled",
                              "config.linkerd.io/default-inbound-policy": "all-unauthenticated",
@@ -300,8 +315,7 @@ def pod_spec(config: dict, engine: str, body: str, name: str) -> dict:
     return {
         "apiVersion": "v1", "kind": "Pod",
         "metadata": {"name": name, "namespace": config["namespace"],
-                     "labels": {"app": name, "bench-engine": engine, "bench-body": body,
-                                "benchmark-run-id": config["run_id"]}},
+            "labels": pod_labels(config, engine, body, name)},
         "spec": {"nodeName": config["worker_node"],
                  "nodeSelector": {selector["key"]: selector["value"]},
                  "terminationGracePeriodSeconds": 1,

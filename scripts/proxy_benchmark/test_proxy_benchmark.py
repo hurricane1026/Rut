@@ -141,6 +141,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
             (binaries / "rut-compile").write_bytes(b"compiler\0/usr/bin/clang\0/usr/bin/\0")
             config = {
                 "run_id": "test123", "checkpoint": tmp, "node_mount": "/benchmark",
+                "pod_create_attempt": "attempt-123",
                 "worker_node": "bench-worker", "namespace": "bench",
                 "selector": {"key": "benchmark-role", "value": "worker"},
                 "configmaps": {"native": "pb-test-native", "linkerd": "pb-test-linkerd"},
@@ -172,6 +173,7 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(mounts["runtime-clang"], "/opt/llvm/bin/clang-22")
             self.assertEqual(mounts["runtime-ld"], "/opt/llvm/bin/ld")
             self.assertEqual(rut["metadata"]["labels"]["benchmark-run-id"], "test123")
+            self.assertEqual(rut["metadata"]["labels"]["benchmark-create-attempt"], "attempt-123")
 
     def test_matrix_has_all_interleaved_unique_cells(self):
         cells = run_matrix.plan()
@@ -198,6 +200,13 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertTrue(prepare.valid_run_id(accepted))
         for rejected in ("ABC", "测试", "-start", "end-", "two--ok?", "a" * 21):
             self.assertFalse(prepare.valid_run_id(rejected))
+
+    def test_throughput_route_gets_origin_keepalive_preflight_on_first_rep(self):
+        self.assertEqual(run_matrix.origin_preflight_marker("4k", "rut-rps", 1), "rut-rps-4k-r1")
+        self.assertEqual(run_matrix.origin_preflight_marker("64k", "rut-throughput", 1),
+                         "rut-throughput-64k-r1")
+        self.assertEqual(run_matrix.origin_preflight_marker("64k", "rut-throughput", 2), None)
+        self.assertEqual(run_matrix.origin_preflight_marker("64k", "nginx", 1), None)
 
     def test_prepare_defines_default_tool_commands_in_benchmark_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,7 +247,9 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertEqual(config["tools"], {"docker": "docker", "kubectl": "kubectl", "linkerd": "linkerd"})
             self.assertEqual(config["cpus"]["helpers"], "15-16")
             self.assertEqual(config["image_identities"]["client"]["docker_id"], docker_image["Id"])
-            self.assertEqual(set(config["input_snapshot"]), {"client_dir", "rut_config_dir", "runtime_libs", "clang", "ld"})
+            self.assertEqual(set(config["input_snapshot"]), {
+                "client_dir", "rut_config_dir", "runtime_libs", "clang", "ld",
+                "benchmark_common", "benchmark_driver", "benchmark_matrix"})
             self.assertEqual(config["payloads"]["4k"], json.loads((output / "payloads.json").read_text())["4k"])
             self.assertEqual(json.loads((output / "native-configmap.json").read_text())["immutable"], True)
 
@@ -326,6 +337,46 @@ class ProxyBenchmarkTests(unittest.TestCase):
             self.assertFalse((checkpoint / "config").exists())
             run.assert_not_called()
 
+    def test_prepare_rejects_symlinked_generated_config_root_before_any_writes(self):
+        for target_kind in ("absolute", "relative"):
+            with self.subTest(target_kind=target_kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint = root / "checkpoint"
+                checkpoint.mkdir()
+                target = root / "outside-config"
+                target.mkdir()
+                for name in ("rps", "throughput", "libs", "tools", "client"):
+                    (checkpoint / name).mkdir()
+                for dirname in ("rps", "throughput"):
+                    for filename, contents in (("rut", b"runtime"),
+                                               ("rut-compile", b"compiler\0/usr/bin/clang\0/usr/bin/\0")):
+                        program = checkpoint / dirname / filename
+                        program.write_bytes(contents)
+                        program.chmod(0o755)
+                for filename in ("clang", "ld"):
+                    program = checkpoint / "tools" / filename
+                    program.write_text(filename)
+                    program.chmod(0o755)
+                for filename in ("request.lua", "warmup.lua"):
+                    (checkpoint / "client" / filename).write_text("return true")
+                config_root = checkpoint / "config"
+                target_path = target if target_kind == "absolute" else Path("../outside-config")
+                config_root.symlink_to(target_path, target_is_directory=True)
+                output = root / "results"
+                argv = ["prepare.py", "--checkpoint", str(checkpoint), "--output", str(output),
+                        "--kubeconfig", str(checkpoint / "kubeconfig"), "--cluster-name", "bench",
+                        "--worker-container", "bench-worker", "--worker-node", "bench-worker",
+                        "--rut-rps-dir", str(checkpoint / "rps"), "--rut-throughput-dir", str(checkpoint / "throughput"),
+                        "--runtime-libs", str(checkpoint / "libs"), "--clang", str(checkpoint / "tools" / "clang"),
+                        "--ld", str(checkpoint / "tools" / "ld"), "--client-dir", str(checkpoint / "client"),
+                        "--client-image", "client:test"]
+                with mock.patch("sys.argv", argv), mock.patch("prepare.run") as run:
+                    with self.assertRaises(SystemExit):
+                        prepare.main()
+                self.assertFalse(output.exists())
+                self.assertFalse(any(target.iterdir()))
+                run.assert_not_called()
+
     def test_prepare_checks_only_compiler_nul_strings_and_rejects_mismatched_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime, compiler = Path(tmp) / "rut", Path(tmp) / "rut-compile"
@@ -390,13 +441,22 @@ class ProxyBenchmarkTests(unittest.TestCase):
             matrix.samples.mkdir(parents=True)
             interruption = KeyboardInterrupt()
             cell = {"body": "4k", "engine": "linkerd", "rep": 1}
+            name = "proxybench-run123-4k-1-linkerd"
+            pod = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-int",
+                    "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                               "benchmark-run-id": "run123",
+                               "benchmark-create-attempt": matrix.pod_create_attempt}}}
             with mock.patch.object(matrix, "run_cell", side_effect=interruption), \
-                    mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess([], 0, "deleted\n", "")) as kube:
+                    mock.patch.object(matrix, "kube", side_effect=[
+                        subprocess.CompletedProcess([], 0, json.dumps(pod), ""),
+                        subprocess.CompletedProcess([], 0, "deleted\n", "")]) as kube:
                 with self.assertRaises(KeyboardInterrupt) as caught:
                     run_matrix.run_cell_with_cleanup(matrix, config, cell)
             self.assertIs(caught.exception, interruption)
-            self.assertEqual(kube.call_args.args[:3], ("delete", "pod", "proxybench-run123-4k-1-linkerd"))
-            self.assertIn("--ignore-not-found=true", kube.call_args.args)
+            self.assertEqual(kube.call_args_list[1].args[:3], ("delete", "pod", "-n"))
+            self.assertIn(f"benchmark-create-attempt={matrix.pod_create_attempt}",
+                          " ".join(kube.call_args_list[1].args))
+            self.assertIn(f"metadata.name={name}", kube.call_args_list[1].args)
 
     def test_runtime_library_bundle_must_be_a_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -848,6 +908,16 @@ class ProxyBenchmarkTests(unittest.TestCase):
             (tree / "link").symlink_to(root / "outside")
             with self.assertRaisesRegex(ValueError, "symlink"):
                 common.snapshot_inputs({"bundle": tree})
+            (tree / "link").unlink()
+            absolute_root = root / "absolute-config"
+            relative_root = root / "relative-config"
+            target = root / "outside-config"
+            target.mkdir()
+            absolute_root.symlink_to(target, target_is_directory=True)
+            relative_root.symlink_to("outside-config", target_is_directory=True)
+            for symlink_root in (absolute_root, relative_root):
+                with self.subTest(root=symlink_root), self.assertRaisesRegex(ValueError, "root is a symlink"):
+                    common.snapshot_inputs({"config": symlink_root})
 
     def test_provenance_check_detects_image_retag_and_worker_image_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -925,6 +995,46 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "kind worker image identity changed"):
                     run_matrix.verify_provenance(config)
 
+    def test_prepared_provenance_binds_measurement_driver_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = {}
+            for key in ("client_dir", "rut_config_dir", "runtime_libs", "rut_rps", "rut_throughput"):
+                inputs[key] = root / key
+                inputs[key].mkdir()
+            for key in ("clang", "ld"):
+                inputs[key] = root / key
+                inputs[key].write_text(key)
+            artifacts = {}
+            for variant in ("rut_rps", "rut_throughput"):
+                for filename, artifact_key in (("rut", variant), ("rut-compile", f"{variant}_compiler")):
+                    artifact_path = inputs[variant] / filename
+                    artifact_path.write_text(artifact_key)
+                    artifacts[artifact_key] = {"path": str(artifact_path), "sha256": common.sha256(artifact_path)}
+            (inputs["client_dir"] / "request.lua").write_text("return true")
+            driver_dir = root / "drivers"
+            driver_dir.mkdir()
+            driver_paths = {"benchmark_common": driver_dir / "common.py",
+                            "benchmark_driver": driver_dir / "run_client.py",
+                            "benchmark_matrix": driver_dir / "run_matrix.py"}
+            for path in driver_paths.values():
+                path.write_text("prepared version")
+            snapshot_paths = {**inputs, **driver_paths}
+            snapshot = common.snapshot_inputs(snapshot_paths)
+            config = {"client_dir": str(inputs["client_dir"]),
+                      "paths": {key: str(value) for key, value in inputs.items() if key != "client_dir"},
+                      "input_snapshot": snapshot, "artifacts": artifacts,
+                      "image_identities": {}}
+            old_fingerprint = common.provenance_fingerprint(config)
+            driver_paths["benchmark_driver"].write_text("updated driver")
+            changed = common.snapshot_inputs(snapshot_paths)
+            self.assertNotEqual(old_fingerprint,
+                                common.provenance_fingerprint({**config, "input_snapshot": changed}))
+            with mock.patch("run_matrix.invoke") as invoke:
+                with self.assertRaisesRegex(RuntimeError, "mounted benchmark inputs changed"):
+                    run_matrix.verify_provenance(config)
+                invoke.assert_not_called()
+
     def test_effective_runtime_paths_must_match_prepared_snapshot_and_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -976,23 +1086,6 @@ class ProxyBenchmarkTests(unittest.TestCase):
                     [], 0, json.dumps(worker), "")):
                 with self.assertRaisesRegex(RuntimeError, "checkpoint mount differs"):
                     run_matrix.verify_worker_mount(config, "docker")
-
-    def test_failed_cell_cleanup_attempts_unconditional_not_found_tolerant_delete(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / "output"
-            (output / "samples").mkdir(parents=True)
-            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
-                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
-            matrix = run_matrix.Matrix(config)
-            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess([], 0, "deleted\n", "")) as kube:
-                result = run_matrix.cleanup_failed_cell(matrix, config,
-                    {"body": "4k", "engine": "nginx", "rep": 1}, RuntimeError("create timed out"))
-            args = kube.call_args.args
-            self.assertEqual(args[:3], ("delete", "pod", "proxybench-run123-4k-1-nginx"))
-            self.assertIn("--ignore-not-found=true", args)
-            self.assertFalse((output / "samples/4k/4k-nginx-r1/pod-create.txt").exists())
-            self.assertEqual(result, "deleted\n")
-            self.assertIn("create timed out", (output / "samples/last-failure.json").read_text())
 
     def test_client_drivers_receive_frozen_config_path_and_workload_values(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1061,22 +1154,65 @@ class ProxyBenchmarkTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "checkpoint mount differs"):
                     run_matrix.verify_worker_mount(config, "docker")
 
-    def test_failed_cell_cleanup_attempts_unconditional_not_found_tolerant_delete(self):
+    def test_failed_cell_cleanup_deletes_only_exact_invocation_owned_pod(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "output"
             (output / "samples").mkdir(parents=True)
             config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
                       "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
             matrix = run_matrix.Matrix(config)
-            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess([], 0, "deleted\n", "")) as kube:
+            name = "proxybench-run123-4k-1-nginx"
+            pod = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-created",
+                    "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                               "benchmark-run-id": "run123",
+                               "benchmark-create-attempt": matrix.pod_create_attempt}}}
+            with mock.patch.object(matrix, "kube", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps(pod), ""),
+                    subprocess.CompletedProcess([], 0, "deleted\n", "")]) as kube:
                 result = run_matrix.cleanup_failed_cell(matrix, config,
                     {"body": "4k", "engine": "nginx", "rep": 1}, RuntimeError("create timed out"))
-            args = kube.call_args.args
-            self.assertEqual(args[:3], ("delete", "pod", "proxybench-run123-4k-1-nginx"))
-            self.assertIn("--ignore-not-found=true", args)
+            self.assertEqual(kube.call_args_list[0].args[:3], ("get", "pod", name))
+            delete_args = kube.call_args_list[1].args
+            self.assertEqual(delete_args[:3], ("delete", "pod", "-n"))
+            self.assertIn(f"benchmark-create-attempt={matrix.pod_create_attempt}", " ".join(delete_args))
+            self.assertIn(f"metadata.name={name}", " ".join(delete_args))
+            self.assertNotIn("--ignore-not-found=true", delete_args)
             self.assertFalse((output / "samples/4k/4k-nginx-r1/pod-create.txt").exists())
             self.assertEqual(result, "deleted\n")
             self.assertIn("create timed out", (output / "samples/last-failure.json").read_text())
+
+    def test_failed_cell_cleanup_skips_colliding_or_replaced_pod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            samples = output / "samples"
+            samples.mkdir(parents=True)
+            config = {"output": str(output), "tools": {"kubectl": "kubectl", "docker": "docker", "linkerd": "linkerd"},
+                      "kubeconfig": "/tmp/kube", "namespace": "bench", "run_id": "run123"}
+            matrix = run_matrix.Matrix(config)
+            name = "proxybench-run123-4k-1-nginx"
+            cell = {"body": "4k", "engine": "nginx", "rep": 1}
+
+            collision = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-old",
+                         "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                                    "benchmark-run-id": "run123", "benchmark-create-attempt": "old-attempt"}}}
+            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(collision), "")) as kube:
+                run_matrix.cleanup_failed_cell(matrix, config, cell, RuntimeError("name collision"))
+            self.assertEqual(kube.call_count, 1)
+            self.assertEqual(kube.call_args.args[:3], ("get", "pod", name))
+
+            cell_output = samples / "4k" / "4k-nginx-r1"
+            cell_output.mkdir(parents=True)
+            (cell_output / "pod.json").write_text(json.dumps({"metadata": {"uid": "uid-original"}}))
+            replacement = {"metadata": {"name": name, "namespace": "bench", "uid": "uid-replacement",
+                           "labels": {"app.kubernetes.io/managed-by": "rut-proxy-benchmark",
+                                      "benchmark-run-id": "run123",
+                                      "benchmark-create-attempt": matrix.pod_create_attempt}}}
+            with mock.patch.object(matrix, "kube", return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(replacement), "")) as kube:
+                run_matrix.cleanup_failed_cell(matrix, config, cell, RuntimeError("pod replaced"))
+            self.assertEqual(kube.call_count, 1)
+            self.assertEqual(kube.call_args.args[:3], ("get", "pod", name))
 
     def test_summary_rejects_sample_from_different_input_or_image_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
