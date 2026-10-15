@@ -651,7 +651,8 @@ struct WsSpliceExperiment {
         if (d.pair_pending || d.pair_cancel_owned || d.pair_cancel_acknowledged) return;
         d.pair_active = false;
         const i32 read = d.pair_read_result, written = d.pair_write_result;
-        const bool write_empty = written == -EAGAIN || written == -EWOULDBLOCK || written == 0;
+        const bool write_empty =
+            written == -EAGAIN || written == -EWOULDBLOCK || written == -EINTR || written == 0;
         if (read == -EAGAIN || read == -EWOULDBLOCK) ++eagain[0];
         if (written == -EAGAIN || written == -EWOULDBLOCK) ++eagain[1];
         if (read < 0) {

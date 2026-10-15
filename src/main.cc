@@ -473,20 +473,19 @@ static bool configure_study_policy(Loop* loop) {
                 if (str_eq(*item, "RUT_STUDY_WS_CALLS=64")) loop->ws_splice.call_budget = 64;
             }
             if (report_study) {
-                write_str(loop->ws_splice.asynchronous && loop->backend.splice_supported
-                              ? "RUT_STUDY_WS_ASYNC_SPLICE mode=on\n"
-                              : "RUT_STUDY_WS_ASYNC_SPLICE mode=off\n");
-                const bool ws_async_effective =
-                    loop->ws_splice.asynchronous && loop->backend.splice_supported;
+                const bool ws_async_effective = loop->ws_splice.enabled &&
+                                                loop->ws_splice.asynchronous &&
+                                                loop->backend.splice_supported;
+                write_str(ws_async_effective ? "RUT_STUDY_WS_ASYNC_SPLICE mode=on\n"
+                                             : "RUT_STUDY_WS_ASYNC_SPLICE mode=off\n");
                 write_str(ws_async_effective && loop->ws_splice.linked
                               ? "RUT_STUDY_WS_LINKED_SPLICE mode=on\n"
                               : "RUT_STUDY_WS_LINKED_SPLICE mode=off\n");
                 write_str(ws_async_effective && loop->ws_splice.poll_next_read
                               ? "RUT_STUDY_WS_POLL_NEXT_READ mode=on\n"
                               : "RUT_STUDY_WS_POLL_NEXT_READ mode=off\n");
-                const bool ws_queue_budget_effective = loop->ws_splice.async_queue_budget &&
-                                                       loop->ws_splice.asynchronous &&
-                                                       loop->backend.splice_supported;
+                const bool ws_queue_budget_effective =
+                    ws_async_effective && loop->ws_splice.async_queue_budget;
                 write_str(ws_queue_budget_effective
                               ? "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET mode=on sq_entries="
                               : "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET mode=off sq_entries=");

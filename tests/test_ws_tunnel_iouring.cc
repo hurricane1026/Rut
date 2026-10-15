@@ -2868,6 +2868,80 @@ TEST(ws, linked_splice_one_operation_budget_progresses_both_directions) {
                       73);
 }
 
+TEST(ws, linked_splice_retries_retryable_read_with_interrupted_write_in_either_order) {
+    const auto exercise_order = [&](bool read_first, i32 read_result) {
+        LoopStorage storage;
+        if (!storage.init()) return;
+        auto& loop = *storage.loop;
+        REQUIRE(loop.ws_splice.enable(loop.connection_capacity));
+        if (!loop.backend.splice_supported) return;
+        loop.ws_splice.asynchronous = true;
+        loop.ws_splice.linked = true;
+
+        int downstream[2], upstream[2];
+        REQUIRE_EQ(test::stream_socketpair(downstream), 0);
+        REQUIRE_EQ(test::stream_socketpair(upstream), 0);
+        Peer client{downstream[1]}, origin{upstream[1]};
+        auto* conn = loop.alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->fd = downstream[0];
+        conn->upstream_fd = upstream[0];
+        conn->upstream_episode = 1;
+        REQUIRE(set_nonblocking(conn->fd));
+        REQUIRE(set_nonblocking(conn->upstream_fd));
+
+        auto& owner = loop.ws_splice.owners[conn->id];
+        owner.active = true;
+        owner.episode = conn->upstream_episode;
+        ++conn->pending_ops;  // owner pin
+        auto& direction = owner.direction[0];
+        int pipe_fds[2];
+        REQUIRE_EQ(pipe2(pipe_fds, O_NONBLOCK | O_CLOEXEC), 0);
+        direction.read_fd = pipe_fds[0];
+        direction.write_fd = pipe_fds[1];
+        direction.pair_active = true;
+        direction.pair_pending = 3;
+        conn->pending_ops += 2;
+
+        const IoEvent read_retry{
+            conn->id, read_result, 0, 0, IoEventType::RelayRead, 0, 32, owner.episode};
+        const IoEvent write_eintr{
+            conn->id, -EINTR, 0, 0, IoEventType::RelayWrite, 0, 32, owner.episode};
+        if (read_first) {
+            REQUIRE(loop.ws_splice.dispatch(loop, read_retry));
+            CHECK(direction.pair_active);
+            REQUIRE(loop.ws_splice.dispatch(loop, write_eintr));
+        } else {
+            REQUIRE(loop.ws_splice.dispatch(loop, write_eintr));
+            CHECK(direction.pair_active);
+            REQUIRE(loop.ws_splice.dispatch(loop, read_retry));
+        }
+        CHECK_FALSE(direction.pair_active);
+        CHECK(direction.armed);
+        CHECK_FALSE(direction.writing);
+        CHECK(conn->fd >= 0);
+        CHECK_EQ(conn->pending_ops, 2u);  // owner pin + retry read poll
+        CHECK_EQ(loop.ws_splice.eagain[0], read_result == -EAGAIN ? 1u : 0u);
+        CHECK_EQ(loop.ws_splice.eagain[1], 0u);  // EINTR is not EAGAIN
+
+        loop.close_conn(*conn);
+        for (u32 i = 0; i < 1000 && conn->pending_ops != 0; ++i) {
+            IoEvent events[kMaxEventsPerWait]{};
+            const u32 count = loop.backend.wait(
+                events, kMaxEventsPerWait, loop.conns, loop.slots_initialized, false);
+            loop.dispatch_batch(events, count);
+            if (count == 0) usleep(1000);
+        }
+        CHECK_EQ(conn->pending_ops, 0u);
+        CHECK_EQ(loop.backend.failure_code(), 0);
+    };
+
+    exercise_order(true, -EINTR);
+    exercise_order(false, -EINTR);
+    exercise_order(true, -EAGAIN);
+    exercise_order(false, -EAGAIN);
+}
+
 TEST(ws, async_splice_queue_budget_is_opt_in_and_resolves_sq_capacity) {
     LoopStorage storage;
     if (!storage.init()) return;

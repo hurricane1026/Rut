@@ -61,11 +61,13 @@ class ToolsTest(unittest.TestCase):
             "RUT_STUDY_WS_POLL_NEXT_READ": "on",
             "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET": "on",
         })
+        settings["ws_splice_mode"] = "on"
         self.assertEqual(settings, {
             "ws_async_splice_mode": "on",
             "ws_linked_splice_mode": "on",
             "ws_poll_next_read_mode": "on",
             "ws_async_splice_queue_budget_mode": "on",
+            "ws_splice_mode": "on",
         })
         log = ("RUT_STUDY_WS_ASYNC_SPLICE mode=on\n"
                "RUT_STUDY_WS_LINKED_SPLICE mode=on\n"
@@ -76,6 +78,14 @@ class ToolsTest(unittest.TestCase):
             protocol_strategy.validate_ws_async_splice_startup(
                 log.replace("RUT_STUDY_WS_LINKED_SPLICE mode=on",
                             "RUT_STUDY_WS_LINKED_SPLICE mode=off"), settings)
+
+    def test_protocol_strategy_rejects_async_splice_without_base_splice(self):
+        settings = dict(protocol_strategy.ws_async_splice_settings({
+            "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+        }), ws_splice_mode="off")
+        with self.assertRaisesRegex(RuntimeError, "requires RUT_STUDY_WS_SPLICE=on"):
+            protocol_strategy.validate_ws_async_splice_startup(
+                "RUT_STUDY_WS_ASYNC_SPLICE mode=off\n", settings)
 
     def test_protocol_strategy_async_splice_defaults_are_recorded_as_off(self):
         settings = protocol_strategy.ws_async_splice_settings({})

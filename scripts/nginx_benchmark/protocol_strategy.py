@@ -43,6 +43,7 @@ def ws_async_splice_settings(env=None):
 
 
 def validate_ws_async_splice_startup(log, settings):
+    validate_ws_async_splice_configuration(settings)
     async_on = settings['ws_async_splice_mode'] == 'on'
     expected = {
         'RUT_STUDY_WS_ASYNC_SPLICE': async_on,
@@ -58,6 +59,12 @@ def validate_ws_async_splice_startup(log, settings):
                 raise RuntimeError(f'{name} setting did not activate')
         elif f'{name} mode={mode}\n' not in log:
             raise RuntimeError(f'{name} setting did not activate')
+
+
+def validate_ws_async_splice_configuration(settings):
+    if (settings['ws_async_splice_mode'] == 'on' and
+            settings['ws_splice_mode'] != 'on'):
+        raise RuntimeError('RUT_STUDY_WS_ASYNC_SPLICE=on requires RUT_STUDY_WS_SPLICE=on')
 
 
 def positive_nofile_limit(value):
@@ -323,6 +330,7 @@ def main():
                     mask_helper_min=int(os.environ.get('RUT_BENCH_WS_MASK_MIN', '4096')),
                     mask_helper=os.environ.get('RUT_BENCH_WS_MASK_HELPER'),
                     mask_helper_sha256=hashlib.sha256(Path(os.environ['RUT_BENCH_WS_MASK_HELPER']).read_bytes()).hexdigest() if os.environ.get('RUT_BENCH_WS_MASK_HELPER') else None)
+    validate_ws_async_splice_configuration(manifest)
     prior = out / 'study.json'
     if prior.exists() and json.loads(prior.read_text()) != manifest:
         raise RuntimeError('manifest changed; use another output directory')
