@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import resource
 import signal
 import socket
 import subprocess
@@ -22,6 +23,7 @@ import run
 import matrix
 import workload_strategy
 import protocol_workload
+import protocol_strategy
 import relay_compare
 import paced_http_client
 
@@ -52,6 +54,239 @@ class FakeSocket:
 
 
 class ToolsTest(unittest.TestCase):
+    def test_protocol_strategy_records_async_splice_settings_and_checks_startup(self):
+        settings = protocol_strategy.ws_async_splice_settings({
+            "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+            "RUT_STUDY_WS_LINKED_SPLICE": "on",
+            "RUT_STUDY_WS_POLL_NEXT_READ": "on",
+            "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET": "on",
+        })
+        settings["ws_splice_mode"] = "on"
+        self.assertEqual(settings, {
+            "ws_async_splice_mode": "on",
+            "ws_linked_splice_mode": "on",
+            "ws_poll_next_read_mode": "on",
+            "ws_async_splice_queue_budget_mode": "on",
+            "ws_splice_mode": "on",
+        })
+        log = ("RUT_STUDY_WS_ASYNC_SPLICE mode=on\n"
+               "RUT_STUDY_WS_LINKED_SPLICE mode=on\n"
+               "RUT_STUDY_WS_POLL_NEXT_READ mode=on\n"
+               "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET mode=on sq_entries=32\n")
+        protocol_strategy.validate_ws_async_splice_startup(log, settings)
+        with self.assertRaisesRegex(RuntimeError, "LINKED_SPLICE"):
+            protocol_strategy.validate_ws_async_splice_startup(
+                log.replace("RUT_STUDY_WS_LINKED_SPLICE mode=on",
+                            "RUT_STUDY_WS_LINKED_SPLICE mode=off"), settings)
+
+    def test_protocol_strategy_rejects_async_splice_without_base_splice(self):
+        settings = dict(protocol_strategy.ws_async_splice_settings({
+            "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+        }), ws_splice_mode="off")
+        with self.assertRaisesRegex(RuntimeError, "requires RUT_STUDY_WS_SPLICE=on"):
+            protocol_strategy.validate_ws_async_splice_startup(
+                "RUT_STUDY_WS_ASYNC_SPLICE mode=off\n", settings)
+
+    def test_protocol_strategy_rejects_ignored_copy_options_with_async_splice(self):
+        for key, name in (("ws_copy", "RUT_STUDY_WS_COPY"),
+                          ("ws_available", "RUT_STUDY_WS_AVAILABLE")):
+            settings = dict(protocol_strategy.ws_async_splice_settings({
+                "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+            }), ws_splice_mode="on", **{key: "on", "ws_copy_limit": "4k"})
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf'{name}=on is unsupported with RUT_STUDY_WS_ASYNC_SPLICE=on'):
+                protocol_strategy.validate_ws_async_splice_configuration(settings)
+        # Copy limit alone is inert while copy-first is off; do not reject it.
+        protocol_strategy.validate_ws_async_splice_configuration(dict(
+            protocol_strategy.ws_async_splice_settings({
+                "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+            }), ws_splice_mode="on", ws_copy="off", ws_available="off",
+            ws_copy_limit="16k"))
+
+    def test_protocol_strategy_rejects_async_splice_dependents_without_async_mode(self):
+        for key, env_name in (
+                ("RUT_STUDY_WS_LINKED_SPLICE", "LINKED_SPLICE"),
+                ("RUT_STUDY_WS_POLL_NEXT_READ", "POLL_NEXT_READ"),
+                ("RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET", "ASYNC_SPLICE_QUEUE_BUDGET")):
+            settings = dict(protocol_strategy.ws_async_splice_settings({key: "on"}),
+                            ws_splice_mode="on")
+            with self.assertRaisesRegex(
+                    RuntimeError, rf'RUT_STUDY_WS_{env_name}=on requires RUT_STUDY_WS_ASYNC_SPLICE=on'):
+                protocol_strategy.validate_ws_async_splice_configuration(settings)
+
+        # The parent async mode may run alone or with any supported dependents.
+        for overrides in (
+                {},
+                {"RUT_STUDY_WS_LINKED_SPLICE": "on"},
+                {"RUT_STUDY_WS_POLL_NEXT_READ": "on"},
+                {"RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET": "on"},
+                {"RUT_STUDY_WS_LINKED_SPLICE": "on",
+                 "RUT_STUDY_WS_POLL_NEXT_READ": "on",
+                 "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET": "on"}):
+            settings = dict(protocol_strategy.ws_async_splice_settings(dict(
+                {"RUT_STUDY_WS_ASYNC_SPLICE": "on"}, **overrides)),
+                ws_splice_mode="on")
+            protocol_strategy.validate_ws_async_splice_configuration(settings)
+
+    def test_protocol_strategy_async_splice_defaults_are_recorded_as_off(self):
+        settings = protocol_strategy.ws_async_splice_settings({})
+        self.assertTrue(all(value == "off" for value in settings.values()))
+
+    def test_protocol_strategy_nofile_cli_and_child_limit_preserve_hard_limit(self):
+        parser = argparse.ArgumentParser()
+        protocol_strategy.add_nofile_argument(parser)
+        self.assertIsNone(parser.parse_args([]).nofile)
+        self.assertEqual(parser.parse_args(["--nofile", "8192"]).nofile, 8192)
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["--nofile", "0"])
+
+        with mock.patch.object(protocol_strategy.resource, "getrlimit",
+                                return_value=(1024, 524288)), \
+                mock.patch.object(protocol_strategy.resource, "setrlimit") as setrlimit:
+            protocol_strategy.set_child_nofile_soft_limit(8192)
+        setrlimit.assert_called_once_with(protocol_strategy.resource.RLIMIT_NOFILE,
+                                          (8192, 524288))
+
+        with mock.patch.object(protocol_strategy.resource, "getrlimit",
+                               return_value=(1024, 4096)), \
+                mock.patch.object(protocol_strategy.resource, "setrlimit") as setrlimit:
+            with self.assertRaisesRegex(ValueError, "hard limit"):
+                protocol_strategy.set_child_nofile_soft_limit(8192)
+        setrlimit.assert_not_called()
+
+    def test_protocol_strategy_nofile_limit_is_confined_to_child(self):
+        parent_limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+        requested = 256
+        if (parent_limits[0] != resource.RLIM_INFINITY and parent_limits[0] < requested) or \
+                (parent_limits[1] != resource.RLIM_INFINITY and parent_limits[1] < requested):
+            self.skipTest("inherited nofile limit is below the child test value")
+        with tempfile.TemporaryDirectory() as directory:
+            with protocol_strategy.process(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    Path(directory) / "child.log", nofile_soft_limit=requested) as child:
+                child_limits = protocol_strategy.process_nofile_limits(child.pid)
+                self.assertEqual(child_limits, {"soft": requested, "hard": (
+                    "unlimited" if parent_limits[1] == resource.RLIM_INFINITY else parent_limits[1])})
+        self.assertEqual(resource.getrlimit(resource.RLIMIT_NOFILE), parent_limits)
+
+    def test_protocol_strategy_parses_shutdown_ws_admission_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "frontend.log"
+            log.write_text("RUT_WS_SPLICE admissions=159 client_bytes=8 upstream_bytes=9 "
+                           "calls=42 polls=3 read_eagain=4 write_eagain=5 "
+                           "pipe_grow_failures=1 min_pipe_capacity=65536\n")
+            self.assertEqual(protocol_strategy.ws_splice_diagnostics(log), [{
+                "admissions": 159,
+                "client_bytes": 8,
+                "upstream_bytes": 9,
+                "calls": 42,
+                "polls": 3,
+                "read_eagain": 4,
+                "write_eagain": 5,
+                "pipe_grow_failures": 1,
+                "min_pipe_capacity": 65536,
+            }])
+
+    def test_protocol_strategy_requires_valid_diagnostics_for_enabled_uring_splice(self):
+        label = "case-uring-current-r1"
+        valid = {
+            "kind": "websocket",
+            "concurrent_connections": 3,
+            "ws_splice_diagnostics": [{
+                "admissions": 4,
+                "client_bytes": 0,
+                "upstream_bytes": 0,
+                "calls": 0,
+                "polls": 0,
+                "read_eagain": 0,
+                "write_eagain": 0,
+                "pipe_grow_failures": 0,
+                "min_pipe_capacity": 0,
+            }],
+        }
+        protocol_strategy.validate_ws_splice_result_diagnostics(valid, "uring", "on", label)
+        # Each shard may report separately; the cumulative total must reach
+        # the configured clients plus the one successful preflight session.
+        multi_shard = dict(valid, ws_splice_diagnostics=[
+            dict(valid["ws_splice_diagnostics"][0], admissions=2),
+            dict(valid["ws_splice_diagnostics"][0], admissions=2),
+        ])
+        protocol_strategy.validate_ws_splice_result_diagnostics(
+            multi_shard, "uring", "on", label)
+        insufficient = dict(valid, ws_splice_diagnostics=[
+            dict(valid["ws_splice_diagnostics"][0], admissions=3)])
+        mismatched_resume = dict(valid, concurrent_connections=2)
+        for row in ({}, dict(valid, ws_splice_diagnostics=None),
+                    dict(valid, ws_splice_diagnostics=[]),
+                    dict(valid, ws_splice_diagnostics=[{}]), insufficient,
+                    dict(valid, concurrent_connections=True), mismatched_resume):
+            with self.assertRaises(RuntimeError):
+                protocol_strategy.validate_ws_splice_result_diagnostics(
+                    row, "uring", "on", label,
+                    expected_connections=3 if row is mismatched_resume else None)
+
+    def test_protocol_strategy_disabled_splice_and_epoll_allow_missing_diagnostics(self):
+        for engine, splice_mode in (("uring", "off"), ("epoll", "on")):
+            protocol_strategy.validate_ws_splice_result_diagnostics(
+                {}, engine, splice_mode, "case-r1")
+        # Streaming rows still require complete shutdown diagnostics, but do
+        # not require WebSocket splice admissions.
+        streaming = {
+            "kind": "streaming",
+            "ws_splice_diagnostics": [{
+                "admissions": 0, "client_bytes": 0, "upstream_bytes": 0,
+                "calls": 0, "polls": 0, "read_eagain": 0, "write_eagain": 0,
+                "pipe_grow_failures": 0, "min_pipe_capacity": 0,
+            }],
+        }
+        protocol_strategy.validate_ws_splice_result_diagnostics(
+            streaming, "uring", "on", "streaming-r1")
+        for diagnostics in (None, [], [{}]):
+            with self.assertRaisesRegex(RuntimeError, "lacks valid shutdown diagnostics"):
+                protocol_strategy.validate_ws_splice_result_diagnostics(
+                    dict(streaming, ws_splice_diagnostics=diagnostics),
+                    "uring", "on", "streaming-r1")
+
+    def test_protocol_strategy_rejects_under_admitted_preserved_websocket_result(self):
+        case = {"name": "websocket-bulk", "kind": "websocket", "size": 65536,
+                "chunks": 16, "delay": 0}
+        record = {
+            "admissions": 2, "client_bytes": 1, "upstream_bytes": 1,
+            "calls": 1, "polls": 0, "read_eagain": 0, "write_eagain": 0,
+            "pipe_grow_failures": 0, "min_pipe_capacity": 65536,
+        }
+        row = {
+            "valid": True, "case": case, "kind": "websocket", "engine": "uring",
+            "policy": "current", "repeat": 1, "concurrent_connections": 2,
+            "ws_splice_mode": "on", "ws_splice_diagnostics": [record],
+            "ws_splice_admissions_total": 2, "ws_splice_calls_total": 1,
+            "frontend_nofile_limits": {"soft": 65536, "hard": 65536},
+        }
+        manifest = {"ws_splice_mode": "on", "connections": 2}
+        with self.assertRaisesRegex(RuntimeError, "admissions below minimum"):
+            protocol_strategy.validate_preserved_protocol_result(
+                row, case, "uring", "current", 1, manifest, "preserved-r1")
+        row["ws_splice_diagnostics"] = [dict(record, admissions=3)]
+        protocol_strategy.validate_preserved_protocol_result(
+            row, case, "uring", "current", 1, manifest, "preserved-r1")
+
+    def test_protocol_strategy_reads_shutdown_diagnostics_after_stopping_frontend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "frontend.log"
+            log.write_text("runtime is still running\n")
+            stack = contextlib.ExitStack()
+            stack.callback(
+                log.write_text,
+                "RUT_WS_SPLICE admissions=2 client_bytes=64 upstream_bytes=64 "
+                "calls=2 polls=1 read_eagain=0 write_eagain=0 pipe_grow_failures=0 "
+                "min_pipe_capacity=65536\n")
+            diagnostics = protocol_strategy.shutdown_and_read_ws_splice_diagnostics(
+                stack, log, "uring", "on", "case-uring-current-r1", {
+                    "kind": "websocket", "concurrent_connections": 1})
+            self.assertEqual(len(diagnostics), 1)
+            self.assertEqual(diagnostics[0]["admissions"], 2)
+
     def test_api_origin_smoke_and_reuse_policy(self):
         cpu = str(min(os.sched_getaffinity(0)))
         with tempfile.TemporaryDirectory() as directory:

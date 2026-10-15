@@ -1,0 +1,1043 @@
+{
+  "scope": "Stacked on perf/iouring-native-direct-recv, experimental WS flags remain default off.",
+  "provenance": "Measurements from detached local performance checkout721bc191 with additional uncommitted changes; binary hashes accompany source experiment records. Not measured on isolated PR head.",
+  "full_admission_profile": {
+    "results_dir": "/tmp/pr-watchdog/ws-profile-allsplice-20261015/results",
+    "cases": {
+      "websocket-interactive-64": {
+        "control": {
+          "messages_per_second": 82505.17,
+          "rtt_us": {
+            "p50_us": 2289.0,
+            "p95_us": 2635.0,
+            "p99_us": 5515.0,
+            "max_us": 31215.0
+          },
+          "valid": true,
+          "errors": 0,
+          "frontend_nofile_limits": {
+            "soft": 8192,
+            "hard": 524288
+          },
+          "ws_splice_admissions_total": 193,
+          "ws_splice_calls_total": 10485624
+        },
+        "profile": {
+          "messages_per_second": 79470.32,
+          "rtt_us": {
+            "p50_us": 2367.0,
+            "p95_us": 2767.0,
+            "p99_us": 5187.0,
+            "max_us": 21407.0
+          },
+          "valid": true,
+          "errors": 0,
+          "frontend_nofile_limits": {
+            "soft": 8192,
+            "hard": 524288
+          },
+          "ws_splice_admissions_total": 193,
+          "ws_splice_calls_total": 10103900,
+          "ws_splice_diagnostics": [
+            {
+              "admissions": 193,
+              "client_bytes": 176802262,
+              "upstream_bytes": 166699262,
+              "calls": 10103900,
+              "polls": 5051696,
+              "read_eagain": 0,
+              "write_eagain": 0,
+              "pipe_grow_failures": 0,
+              "min_pipe_capacity": 131072
+            }
+          ]
+        },
+        "profile_rate_change_pct": -3.678375549071644,
+        "profile_window": {
+          "frontend_pid": 1315885,
+          "origin_pid": 1315880,
+          "client_pid": 1315893,
+          "runner_pid": 1315879,
+          "gate_elapsed_s": 3.0001489630085416,
+          "client_returncode": 0,
+          "client_end_monotonic": 322155.598367703,
+          "observation_seconds": 32.06014475499978,
+          "cpu_seconds": 30.442071,
+          "cpu_pct": 94.95300546093932,
+          "profile_start_monotonic": 322126.978628648,
+          "profile_stop_monotonic": 322155.641375888,
+          "profile_elapsed_seconds": 28.662747240043245,
+          "profile_collects_cpus": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "sampler_cpu": 10,
+          "bpftrace_output_format": "json",
+          "kernel_stack_depth": 16,
+          "user_stack_depth": 16,
+          "max_map_keys": 32768,
+          "stack_maps": [
+            "@kernel[cpu,pid,tid,comm,kstack(16)]",
+            "@user[cpu,pid,tid,comm,ustack(16)]"
+          ],
+          "ustack_note": "Frames can be incomplete when frame pointers are omitted.",
+          "io_uring_enter_semantics": "to_submit is requested; positive ret sum is accepted SQEs.",
+          "sampler_roles": [
+            "frontend",
+            "origin",
+            "client",
+            "runner"
+          ],
+          "harness_frontend_cpu_pct_note": "The harness window includes profile dump wait; use task samples for steady-window attribution.",
+          "frontend_nofile_requested_soft": 8192
+        },
+        "io_uring_enter": {
+          "enter_calls": 101155,
+          "requested_to_submit": 13696619,
+          "return_calls": 101155,
+          "positive_return_calls": 101047,
+          "accepted_sqes": 13696721,
+          "errors": 0,
+          "accepted_sqes_per_enter_call": 135.40330186347686,
+          "requested_sqes_per_enter_call": 135.40229350995997,
+          "calls_without_observed_exit_at_stop": 0,
+          "profile_window_seconds": 28.662747240043245,
+          "enter_calls_per_second": 3529.145310212329,
+          "accepted_sqes_per_second": 477857.92775875365,
+          "full_run_message_rate_used_for_estimate": 79470.32,
+          "estimated_enters_per_message": 0.044408344023433265,
+          "estimated_accepted_sqes_per_message": 6.013036411062062,
+          "window_note": "io_uring counters use attach-to-stop profile window; message rate covers full client run, so per-message values are estimates, not aligned exact ratios",
+          "worker_attribution_note": "pid-filtered enter maps aggregate frontend thread-group calls; syscall comm keys may identify frontend/io-wq workers when present"
+        },
+        "proc_cpu_fd_window": {
+          "window_samples": 54,
+          "window_start": 322127.047899592,
+          "window_end": 322154.177096555,
+          "seconds": 27.12919696298195,
+          "roles": {
+            "runner": {
+              "cpu_seconds": 0.01,
+              "cpu_pct_of_wall": 0.03686065611763258,
+              "estimated_us_per_message": 0.0046382921470094225
+            },
+            "origin": {
+              "cpu_seconds": 85.94999999999999,
+              "cpu_pct_of_wall": 316.817339331052,
+              "estimated_us_per_message": 39.86612100354598
+            },
+            "frontend": {
+              "cpu_seconds": 15.739999999999998,
+              "cpu_pct_of_wall": 58.01867272915368,
+              "estimated_us_per_message": 7.30067183939283
+            },
+            "client": {
+              "cpu_seconds": 25.750000000000004,
+              "cpu_pct_of_wall": 94.91618950290392,
+              "estimated_us_per_message": 11.943602278549264
+            }
+          },
+          "fd_peak_by_role": {
+            "runner": 6,
+            "origin": 66,
+            "frontend": 1160,
+            "client": 201
+          },
+          "fd_peak_by_pid": {
+            "1315879": 6,
+            "1315880": 12,
+            "1315881": 66,
+            "1315882": 65,
+            "1315883": 55,
+            "1315884": 62,
+            "1315885": 1160,
+            "1315893": 201
+          },
+          "nofile_by_pid": {
+            "1315879": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315880": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315881": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315882": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315883": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315884": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315885": {
+              "nofile_soft": "8192",
+              "nofile_hard": "524288"
+            },
+            "1315893": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            }
+          },
+          "process_evidence_by_pid": {
+            "1315879": {
+              "role": "runner",
+              "comm": "python3",
+              "peak_fd_count": 6,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315880": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 12,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315881": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 66,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315882": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 65,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315883": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 55,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315884": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 62,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315885": {
+              "role": "frontend",
+              "comm": "rut",
+              "peak_fd_count": 1160,
+              "nofile": {
+                "nofile_soft": "8192",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315893": {
+              "role": "client",
+              "comm": "tcpkali2",
+              "peak_fd_count": 201,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            }
+          },
+          "cpu_percent_by_cpu": {
+            "cpu2": {
+              "user": 1.9904165130851457,
+              "nice": 0.0,
+              "system": 64.39366015481018,
+              "idle": 0.0,
+              "iowait": 0.0,
+              "irq": 0.36859565057132326,
+              "softirq": 33.247327681533356,
+              "steal": 0.0
+            },
+            "cpu3": {
+              "user": 46.1283185840708,
+              "nice": 0.0,
+              "system": 43.067846607669615,
+              "idle": 2.028023598820059,
+              "iowait": 0.0,
+              "irq": 0.4056047197640118,
+              "softirq": 8.370206489675516,
+              "steal": 0.0
+            },
+            "cpu4": {
+              "user": 47.547030616008854,
+              "nice": 0.0,
+              "system": 20.398376982663223,
+              "idle": 24.16082626337145,
+              "iowait": 0.0,
+              "irq": 0.33198081888601993,
+              "softirq": 7.561785319070454,
+              "steal": 0.0
+            },
+            "cpu5": {
+              "user": 17.146017699115045,
+              "nice": 0.0,
+              "system": 18.91592920353982,
+              "idle": 56.969026548672566,
+              "iowait": 0.0,
+              "irq": 0.2949852507374631,
+              "softirq": 6.674041297935103,
+              "steal": 0.0
+            },
+            "cpu6": {
+              "user": 18.091378039793664,
+              "nice": 0.0,
+              "system": 18.607221812822402,
+              "idle": 56.22697126013264,
+              "iowait": 0.0,
+              "irq": 0.3316138540899042,
+              "softirq": 6.742815033161385,
+              "steal": 0.0
+            },
+            "cpu7": {
+              "user": 18.151693667157584,
+              "nice": 0.0,
+              "system": 19.14580265095729,
+              "idle": 55.670103092783506,
+              "iowait": 0.036818851251840944,
+              "irq": 0.29455081001472755,
+              "softirq": 6.701030927835052,
+              "steal": 0.0
+            },
+            "cpu8": {
+              "user": 44.52635458901585,
+              "nice": 0.0,
+              "system": 40.61924069295982,
+              "idle": 6.892738665683745,
+              "iowait": 0.0,
+              "irq": 0.4054552156284556,
+              "softirq": 7.556210836712127,
+              "steal": 0.0
+            },
+            "cpu9": {
+              "user": 45.038731095536704,
+              "nice": 0.0,
+              "system": 42.71486536333456,
+              "idle": 4.020656584286241,
+              "iowait": 0.0,
+              "irq": 0.4426410918480266,
+              "softirq": 7.783105864994467,
+              "steal": 0.0
+            }
+          },
+          "frontend_thread_cpu_seconds_by_comm": {
+            "rut": 3.64,
+            "iou-wrk-1315889": 12.1
+          },
+          "frontend_thread_estimated_us_per_message_by_comm": {
+            "rut": 1.6883383415114297,
+            "iou-wrk-1315889": 5.6123334978814015
+          },
+          "shard_cpu_seconds": 3.64,
+          "shard_estimated_us_per_message": 1.6883383415114297,
+          "io_wq_cpu_seconds": 12.1,
+          "io_wq_estimated_us_per_message": 5.6123334978814015
+        },
+        "bpf_integrity": {
+          "map_keys_capacity": 32768,
+          "kernel_stack_map_keys": 6148,
+          "user_stack_map_keys": 4551,
+          "helper_or_lost_events": [],
+          "log_loss_or_map_errors": [],
+          "no_reported_loss": true
+        },
+        "runtime_lifecycle_diagnostics": [
+          {
+            "name": "RUT_WS_THREAD",
+            "voluntary": 41585,
+            "involuntary": 1076
+          },
+          {
+            "name": "RUT_WS_QUEUE_BUDGET",
+            "mode": "on",
+            "sq_entries": 1024,
+            "effective_calls": 1024,
+            "yields": 9
+          },
+          {
+            "name": "RUT_WS_SPLICE",
+            "admissions": 193,
+            "client_bytes": 176802262,
+            "upstream_bytes": 166699262,
+            "calls": 10103900,
+            "polls": 5051696,
+            "read_eagain": 0,
+            "write_eagain": 0,
+            "pipe_grow_failures": 0,
+            "min_pipe_capacity": 131072
+          },
+          {
+            "name": "RUT_IO_WAIT",
+            "calls": 111616,
+            "enters": 111608,
+            "submitted": 15156892,
+            "events": 15157696,
+            "empty": 62,
+            "max_events": 256,
+            "empty_per_call": 0.0005554759174311927,
+            "events_per_enter": 135.8119131245072,
+            "submitted_per_enter": 135.80470933983227
+          },
+          {
+            "name": "RUT_WS_NODELAY",
+            "changes": 0,
+            "failures": 0
+          }
+        ],
+        "lifetime_diagnostics_note": "RUT_WS_SPLICE admissions/calls/polls and RUT_IO_WAIT are process-lifetime diagnostics, including preflight/setup and teardown; derived IO_WAIT ratios are lifecycle-only, not profile-window measures.",
+        "completion_cost_note": "No CQ completion probe was collected; no exact completion-cost claim is made.",
+        "proc_cpu_pairing_note": "CPU ticks are first/last snapshots keyed by PID/TID; tasks born after the first or exited before the last sample are omitted from role CPU deltas.",
+        "admissions_target": 193
+      },
+      "websocket-bulk-64k": {
+        "control": {
+          "messages_per_second": 22119.06,
+          "rtt_us": {
+            "p50_us": 8551.0,
+            "p95_us": 10047.0,
+            "p99_us": 10415.0,
+            "max_us": 15199.0
+          },
+          "valid": true,
+          "errors": 0,
+          "frontend_nofile_limits": {
+            "soft": 8192,
+            "hard": 524288
+          },
+          "ws_splice_admissions_total": 193,
+          "ws_splice_calls_total": 2850458
+        },
+        "profile": {
+          "messages_per_second": 21847.3,
+          "rtt_us": {
+            "p50_us": 9175.0,
+            "p95_us": 9903.0,
+            "p99_us": 10303.0,
+            "max_us": 15735.0
+          },
+          "valid": true,
+          "errors": 0,
+          "frontend_nofile_limits": {
+            "soft": 8192,
+            "hard": 524288
+          },
+          "ws_splice_admissions_total": 193,
+          "ws_splice_calls_total": 2804576,
+          "ws_splice_diagnostics": [
+            {
+              "admissions": 193,
+              "client_bytes": 45801817092,
+              "upstream_bytes": 45799022152,
+              "calls": 2804576,
+              "polls": 1401934,
+              "read_eagain": 0,
+              "write_eagain": 0,
+              "pipe_grow_failures": 0,
+              "min_pipe_capacity": 131072
+            }
+          ]
+        },
+        "profile_rate_change_pct": -1.2286236395217642,
+        "profile_window": {
+          "frontend_pid": 1315985,
+          "origin_pid": 1315980,
+          "client_pid": 1315993,
+          "runner_pid": 1315979,
+          "gate_elapsed_s": 3.000164416967891,
+          "client_returncode": 0,
+          "client_end_monotonic": 322224.090137445,
+          "observation_seconds": 32.06237876100931,
+          "cpu_seconds": 29.441799,
+          "cpu_pct": 91.8266209112464,
+          "profile_start_monotonic": 322195.523040312,
+          "profile_stop_monotonic": 322224.092552496,
+          "profile_elapsed_seconds": 28.56951218401082,
+          "profile_collects_cpus": [
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9
+          ],
+          "sampler_cpu": 10,
+          "bpftrace_output_format": "json",
+          "kernel_stack_depth": 16,
+          "user_stack_depth": 16,
+          "max_map_keys": 32768,
+          "stack_maps": [
+            "@kernel[cpu,pid,tid,comm,kstack(16)]",
+            "@user[cpu,pid,tid,comm,ustack(16)]"
+          ],
+          "ustack_note": "Frames can be incomplete when frame pointers are omitted.",
+          "io_uring_enter_semantics": "to_submit is requested; positive ret sum is accepted SQEs.",
+          "sampler_roles": [
+            "frontend",
+            "origin",
+            "client",
+            "runner"
+          ],
+          "harness_frontend_cpu_pct_note": "The harness window includes profile dump wait; use task samples for steady-window attribution.",
+          "frontend_nofile_requested_soft": 8192
+        },
+        "io_uring_enter": {
+          "enter_calls": 1317228,
+          "requested_to_submit": 3757468,
+          "return_calls": 1317225,
+          "positive_return_calls": 1313727,
+          "accepted_sqes": 3757452,
+          "errors": 0,
+          "accepted_sqes_per_enter_call": 2.8525448897229637,
+          "requested_sqes_per_enter_call": 2.8525570364431974,
+          "calls_without_observed_exit_at_stop": 3,
+          "profile_window_seconds": 28.56951218401082,
+          "enter_calls_per_second": 46106.07249840263,
+          "accepted_sqes_per_second": 131519.64149051488,
+          "full_run_message_rate_used_for_estimate": 21847.3,
+          "estimated_enters_per_message": 2.1103785135189534,
+          "estimated_accepted_sqes_per_message": 6.019949444119635,
+          "window_note": "io_uring counters use attach-to-stop profile window; message rate covers full client run, so per-message values are estimates, not aligned exact ratios",
+          "worker_attribution_note": "pid-filtered enter maps aggregate frontend thread-group calls; syscall comm keys may identify frontend/io-wq workers when present"
+        },
+        "proc_cpu_fd_window": {
+          "window_samples": 54,
+          "window_start": 322195.607579234,
+          "window_end": 322222.769769393,
+          "seconds": 27.162190159026068,
+          "roles": {
+            "runner": {
+              "cpu_seconds": 0.01,
+              "cpu_pct_of_wall": 0.03681588245076391,
+              "estimated_us_per_message": 0.01685145645034577
+            },
+            "origin": {
+              "cpu_seconds": 102.25999999999999,
+              "cpu_pct_of_wall": 376.4792139415118,
+              "estimated_us_per_message": 172.3229936612358
+            },
+            "frontend": {
+              "cpu_seconds": 16.939999999999998,
+              "cpu_pct_of_wall": 62.366104871594054,
+              "estimated_us_per_message": 28.546367226885724
+            },
+            "client": {
+              "cpu_seconds": 24.96,
+              "cpu_pct_of_wall": 91.89244259710672,
+              "estimated_us_per_message": 42.06123530006304
+            }
+          },
+          "fd_peak_by_role": {
+            "runner": 6,
+            "origin": 70,
+            "frontend": 1160,
+            "client": 201
+          },
+          "fd_peak_by_pid": {
+            "1315979": 6,
+            "1315980": 12,
+            "1315981": 62,
+            "1315982": 62,
+            "1315983": 54,
+            "1315984": 70,
+            "1315985": 1160,
+            "1315993": 201
+          },
+          "nofile_by_pid": {
+            "1315979": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315980": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315981": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315982": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315983": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315984": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            },
+            "1315985": {
+              "nofile_soft": "8192",
+              "nofile_hard": "524288"
+            },
+            "1315993": {
+              "nofile_soft": "1024",
+              "nofile_hard": "524288"
+            }
+          },
+          "process_evidence_by_pid": {
+            "1315979": {
+              "role": "runner",
+              "comm": "python3",
+              "peak_fd_count": 6,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315980": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 12,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315981": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 62,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315982": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 62,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315983": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 54,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315984": {
+              "role": "origin",
+              "comm": "python3",
+              "peak_fd_count": 70,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315985": {
+              "role": "frontend",
+              "comm": "rut",
+              "peak_fd_count": 1160,
+              "nofile": {
+                "nofile_soft": "8192",
+                "nofile_hard": "524288"
+              }
+            },
+            "1315993": {
+              "role": "client",
+              "comm": "tcpkali2",
+              "peak_fd_count": 201,
+              "nofile": {
+                "nofile_soft": "1024",
+                "nofile_hard": "524288"
+              }
+            }
+          },
+          "cpu_percent_by_cpu": {
+            "cpu2": {
+              "user": 3.130755064456722,
+              "nice": 0.0,
+              "system": 61.25230202578269,
+              "idle": 0.7366482504604052,
+              "iowait": 8.324125230202577,
+              "irq": 0.6629834254143646,
+              "softirq": 25.89318600368324,
+              "steal": 0.0
+            },
+            "cpu3": {
+              "user": 76.27992633517495,
+              "nice": 0.0,
+              "system": 17.863720073664826,
+              "idle": 0.0,
+              "iowait": 0.0,
+              "irq": 0.9208103130755064,
+              "softirq": 4.935543278084714,
+              "steal": 0.0
+            },
+            "cpu4": {
+              "user": 76.64825046040515,
+              "nice": 0.0,
+              "system": 17.495395948434624,
+              "idle": 0.0,
+              "iowait": 0.0,
+              "irq": 0.9208103130755064,
+              "softirq": 4.935543278084714,
+              "steal": 0.0
+            },
+            "cpu5": {
+              "user": 15.022091310751104,
+              "nice": 0.0,
+              "system": 18.48306332842415,
+              "idle": 60.198821796759944,
+              "iowait": 0.0,
+              "irq": 0.6627393225331369,
+              "softirq": 5.633284241531665,
+              "steal": 0.0
+            },
+            "cpu6": {
+              "user": 15.2317880794702,
+              "nice": 0.0,
+              "system": 18.61662987490802,
+              "idle": 59.8233995584989,
+              "iowait": 0.0,
+              "irq": 0.6990434142752023,
+              "softirq": 5.629139072847682,
+              "steal": 0.0
+            },
+            "cpu7": {
+              "user": 14.696132596685082,
+              "nice": 0.0,
+              "system": 17.826887661141804,
+              "idle": 61.36279926335175,
+              "iowait": 0.0,
+              "irq": 0.6629834254143646,
+              "softirq": 5.4511970534069984,
+              "steal": 0.0
+            },
+            "cpu8": {
+              "user": 76.77585572322414,
+              "nice": 0.0,
+              "system": 17.29849098270151,
+              "idle": 0.0,
+              "iowait": 0.0,
+              "irq": 0.9201324990798675,
+              "softirq": 5.005520794994479,
+              "steal": 0.0
+            },
+            "cpu9": {
+              "user": 76.65684830633285,
+              "nice": 0.0,
+              "system": 17.52577319587629,
+              "idle": 0.0,
+              "iowait": 0.0,
+              "irq": 0.7731958762886598,
+              "softirq": 5.044182621502209,
+              "steal": 0.0
+            }
+          },
+          "frontend_thread_cpu_seconds_by_comm": {
+            "rut": 4.95,
+            "iou-wrk-1315990": 11.99
+          },
+          "frontend_thread_estimated_us_per_message_by_comm": {
+            "rut": 8.341470942921156,
+            "iou-wrk-1315990": 20.204896283964576
+          },
+          "shard_cpu_seconds": 4.95,
+          "shard_estimated_us_per_message": 8.341470942921156,
+          "io_wq_cpu_seconds": 11.99,
+          "io_wq_estimated_us_per_message": 20.204896283964576
+        },
+        "bpf_integrity": {
+          "map_keys_capacity": 32768,
+          "kernel_stack_map_keys": 3865,
+          "user_stack_map_keys": 2163,
+          "helper_or_lost_events": [],
+          "log_loss_or_map_errors": [],
+          "no_reported_loss": true
+        },
+        "runtime_lifecycle_diagnostics": [
+          {
+            "name": "RUT_WS_THREAD",
+            "voluntary": 1327511,
+            "involuntary": 558
+          },
+          {
+            "name": "RUT_WS_QUEUE_BUDGET",
+            "mode": "on",
+            "sq_entries": 1024,
+            "effective_calls": 1024,
+            "yields": 8
+          },
+          {
+            "name": "RUT_WS_SPLICE",
+            "admissions": 193,
+            "client_bytes": 45801817092,
+            "upstream_bytes": 45799022152,
+            "calls": 2804576,
+            "polls": 1401934,
+            "read_eagain": 0,
+            "write_eagain": 0,
+            "pipe_grow_failures": 0,
+            "min_pipe_capacity": 131072
+          },
+          {
+            "name": "RUT_IO_WAIT",
+            "calls": 1473504,
+            "enters": 1473485,
+            "submitted": 4207797,
+            "events": 4208509,
+            "empty": 38,
+            "max_events": 256,
+            "empty_per_call": 2.5788867895845548e-05,
+            "events_per_enter": 2.856160055921845,
+            "submitted_per_enter": 2.855676847745311
+          },
+          {
+            "name": "RUT_WS_NODELAY",
+            "changes": 0,
+            "failures": 0
+          }
+        ],
+        "lifetime_diagnostics_note": "RUT_WS_SPLICE admissions/calls/polls and RUT_IO_WAIT are process-lifetime diagnostics, including preflight/setup and teardown; derived IO_WAIT ratios are lifecycle-only, not profile-window measures.",
+        "completion_cost_note": "No CQ completion probe was collected; no exact completion-cost claim is made.",
+        "proc_cpu_pairing_note": "CPU ticks are first/last snapshots keyed by PID/TID; tasks born after the first or exited before the last sample are omitted from role CPU deltas.",
+        "admissions_target": 193
+      }
+    }
+  },
+  "origin_capacity": {
+    "medians": {
+      "baseline": {
+        "messages_per_second": 22251.98,
+        "origin_cpu_pct": 377.12463086600565,
+        "frontend_cpu_pct": 60.39606531520901,
+        "p99_us": 10199.0
+      },
+      "expanded": {
+        "messages_per_second": 25407.96,
+        "origin_cpu_pct": 748.7552610416517,
+        "frontend_cpu_pct": 63.31856331663381,
+        "p99_us": 11647.0
+      }
+    },
+    "paired_comparison": [
+      {
+        "runs": [
+          1,
+          2
+        ],
+        "baseline_messages_per_second": 22815.35,
+        "expanded_messages_per_second": 25473.11,
+        "expanded_delta_pct": 11.648999467463806,
+        "baseline_origin_cpu_pct": 377.24148834047566,
+        "expanded_origin_cpu_pct": 750.1779574821655,
+        "baseline_p99_us": 10271.0,
+        "expanded_p99_us": 10103.0,
+        "p99_change_pct": -1.6356732547950559
+      },
+      {
+        "runs": [
+          3,
+          4
+        ],
+        "baseline_messages_per_second": 22251.98,
+        "expanded_messages_per_second": 24307.51,
+        "expanded_delta_pct": 9.237515043605104,
+        "baseline_origin_cpu_pct": 377.12463086600565,
+        "expanded_origin_cpu_pct": 748.7552610416517,
+        "baseline_p99_us": 9647.0,
+        "expanded_p99_us": 12263.0,
+        "p99_change_pct": 27.117238519747076
+      },
+      {
+        "runs": [
+          5,
+          6
+        ],
+        "baseline_messages_per_second": 22127.0,
+        "expanded_messages_per_second": 25407.96,
+        "expanded_delta_pct": 14.827857368825414,
+        "baseline_origin_cpu_pct": 376.7757531373474,
+        "expanded_origin_cpu_pct": 748.7232848666694,
+        "baseline_p99_us": 10199.0,
+        "expanded_p99_us": 11647.0,
+        "p99_change_pct": 14.197470340229422
+      }
+    ],
+    "interpretation": {
+      "runtime_changed": false,
+      "HTTP_async_splice": "on throughout",
+      "scope": "64KiB WebSocket, localhost,192connections,3paired30second runs with2second warmup; no nginx comparison",
+      "origin_topology": "4 to8 workers/logicalCPUs on the SAME4physicalcores; both worker distribution and SMT utilization change",
+      "conclusion": "Origin configuration materially limits throughput in this setup; throughput gains have mixed/worse tail latency and increased origin CPU. Does not establish a gateway code speedup or remove all origin bottlenecks.",
+      "acceptance": "Sol independently verified6valid zeroerror runs, unchanged binary, worker count, FD8192 and lifetime admissions193."
+    }
+  },
+  "rejected_poll_link": {
+    "candidate": "Default-off WS poll/read/write triple chain",
+    "decision": "Reject: no stable throughput improvement under expanded-origin configuration; do not retain additional lifecycle complexity.",
+    "tests": "Candidate build and test_ws_tunnel_iouring/test_splice/test_runtime_no_cxx_dependencies passed.",
+    "mixed_http": "Not run: candidate failed throughput screening. No HTTP fairness claim.",
+    "limitations": [
+      "8second measurement+2second warmup per run;3paired repeats per case/config.",
+      "Origin8 uses SMT on same4physicalcores.",
+      "Localhost/shared host; no nginx or cross-machine comparison."
+    ],
+    "configurations": {
+      "ab": {
+        "runtime_sha256": "159d76bda6ce6a05250317799043a640337318ba5a2d1ebb28a8723714bc05c0",
+        "origin_cpus": [
+          3,
+          4,
+          8,
+          9
+        ],
+        "pairs": [
+          {
+            "pair": 1,
+            "case": "websocket-bulk-64k",
+            "off_mps": 22572.28,
+            "on_mps": 22647.4,
+            "throughput_change_pct": 0.3327975729523258,
+            "p99_change_pct": -7.005629523724421
+          },
+          {
+            "pair": 1,
+            "case": "websocket-interactive-64",
+            "off_mps": 83913.87,
+            "on_mps": 81495.84,
+            "throughput_change_pct": -2.881561772803465,
+            "p99_change_pct": -4.81513327601032
+          },
+          {
+            "pair": 2,
+            "case": "websocket-bulk-64k",
+            "off_mps": 22085.95,
+            "on_mps": 22402.3,
+            "throughput_change_pct": 1.4323585809077555,
+            "p99_change_pct": -0.15374267320072965
+          },
+          {
+            "pair": 2,
+            "case": "websocket-interactive-64",
+            "off_mps": 80739.83,
+            "on_mps": 80503.65,
+            "throughput_change_pct": -0.2925198133312934,
+            "p99_change_pct": 14.012482383732628
+          },
+          {
+            "pair": 3,
+            "case": "websocket-bulk-64k",
+            "off_mps": 21703.79,
+            "on_mps": 22023.19,
+            "throughput_change_pct": 1.4716323738849235,
+            "p99_change_pct": 8.439921575949949
+          },
+          {
+            "pair": 3,
+            "case": "websocket-interactive-64",
+            "off_mps": 80645.35,
+            "on_mps": 83058.85,
+            "throughput_change_pct": 2.9927329970047767,
+            "p99_change_pct": -3.4372367312552665
+          }
+        ]
+      },
+      "ab-origin8": {
+        "runtime_sha256": "159d76bda6ce6a05250317799043a640337318ba5a2d1ebb28a8723714bc05c0",
+        "origin_cpus": [
+          0,
+          1,
+          3,
+          4,
+          8,
+          9,
+          11,
+          12
+        ],
+        "pairs": [
+          {
+            "pair": 1,
+            "case": "websocket-bulk-64k",
+            "off_mps": 25212.93,
+            "on_mps": 25104.54,
+            "throughput_change_pct": -0.4298984687618579,
+            "p99_change_pct": -2.1584890576596405
+          },
+          {
+            "pair": 1,
+            "case": "websocket-interactive-64",
+            "off_mps": 79728.94,
+            "on_mps": 79499.75,
+            "throughput_change_pct": -0.2874614913982332,
+            "p99_change_pct": -24.767123287671232
+          },
+          {
+            "pair": 2,
+            "case": "websocket-bulk-64k",
+            "off_mps": 25294.19,
+            "on_mps": 25101.13,
+            "throughput_change_pct": -0.7632582818425826,
+            "p99_change_pct": 1.6585466984554875
+          },
+          {
+            "pair": 2,
+            "case": "websocket-interactive-64",
+            "off_mps": 79635.36,
+            "on_mps": 79025.95,
+            "throughput_change_pct": -0.7652505118329378,
+            "p99_change_pct": -1.127507875974132
+          },
+          {
+            "pair": 3,
+            "case": "websocket-bulk-64k",
+            "off_mps": 25302.34,
+            "on_mps": 25324.91,
+            "throughput_change_pct": 0.0892012359331229,
+            "p99_change_pct": 7.414428646656135
+          },
+          {
+            "pair": 3,
+            "case": "websocket-interactive-64",
+            "off_mps": 80105.58,
+            "on_mps": 79290.94,
+            "throughput_change_pct": -1.016957869851265,
+            "p99_change_pct": -3.7396883593033947
+          }
+        ]
+      }
+    },
+    "restoration": "Six candidate files restored byte-for-byte to pre-iteration snapshot; rut and test targets rebuilt; three targeted ctests passed. Prior user changes and accepted experimental queue-budget preserved."
+  },
+  "rejected_cq_classification": "Correctness passed but performance inconsistent and mixed HTTP tail latency worsened; source reverted.",
+  "conclusion": "Preserve experimental controls and lifecycle fixes; resource limits and origin capacity materially affect benchmarks. No universal win over nginx or synchronous splice is established."
+}

@@ -2316,6 +2316,84 @@ TEST(iouring_async_splice, adaptive_quantum_obeys_body_budget_and_pipe_capacity)
     }
 }
 
+TEST(iouring_async_splice, linked_pair_room_retries_partial_submission) {
+    u32 pending = 4;
+    u32 occupied = 8;
+    u32 enter_calls = 0;
+    bool unexpected_error = false;
+    bool unexpected_over_submission = false;
+    const auto status = IoUringBackend::reserve_relay_splice_pair_room(
+        pending,
+        [&] { return occupied <= 6; },
+        [&](u32 to_submit) {
+            CHECK_EQ(to_submit, pending);
+            ++enter_calls;
+            --occupied;
+            return 1;
+        },
+        [&](i32) { unexpected_error = true; },
+        [&] { unexpected_over_submission = true; });
+    CHECK_EQ(status, IoUringBackend::RelaySplicePairStatus::Submitted);
+    CHECK_EQ(enter_calls, 2u);
+    CHECK_EQ(pending, 2u);
+    CHECK_EQ(occupied, 6u);
+    CHECK(!unexpected_error);
+    CHECK(!unexpected_over_submission);
+
+    pending = 4;
+    occupied = 8;
+    enter_calls = 0;
+    const auto deferred = IoUringBackend::reserve_relay_splice_pair_room(
+        pending,
+        [&] { return occupied <= 6; },
+        [&](u32) {
+            ++enter_calls;
+            return 0;
+        },
+        [&](i32) { unexpected_error = true; },
+        [&] { unexpected_over_submission = true; });
+    CHECK_EQ(deferred, IoUringBackend::RelaySplicePairStatus::Deferred);
+    CHECK_EQ(enter_calls, 1u);
+    CHECK_EQ(pending, 4u);
+    CHECK_EQ(occupied, 8u);
+    CHECK(!unexpected_error);
+    CHECK(!unexpected_over_submission);
+
+    pending = 0;
+    occupied = 8;
+    const auto empty = IoUringBackend::reserve_relay_splice_pair_room(
+        pending,
+        [&] { return occupied <= 6; },
+        [](u32) { return 0; },
+        [&](i32) { unexpected_error = true; },
+        [&] { unexpected_over_submission = true; });
+    CHECK_EQ(empty, IoUringBackend::RelaySplicePairStatus::Deferred);
+    CHECK(!unexpected_error);
+    CHECK(!unexpected_over_submission);
+
+    pending = 4;
+    bool reported_error = false;
+    const auto failed = IoUringBackend::reserve_relay_splice_pair_room(
+        pending,
+        [&] { return occupied <= 6; },
+        [](u32) { return -EIO; },
+        [&](i32 error) { reported_error = error == -EIO; },
+        [&] { unexpected_over_submission = true; });
+    CHECK_EQ(failed, IoUringBackend::RelaySplicePairStatus::Failed);
+    CHECK(reported_error);
+
+    reported_error = false;
+    const auto oversubmitted = IoUringBackend::reserve_relay_splice_pair_room(
+        pending,
+        [&] { return occupied <= 6; },
+        [](u32) { return 5; },
+        [&](i32) { reported_error = true; },
+        [&] { unexpected_over_submission = true; });
+    CHECK_EQ(oversubmitted, IoUringBackend::RelaySplicePairStatus::Failed);
+    CHECK(!reported_error);
+    CHECK(unexpected_over_submission);
+}
+
 TEST(iouring_async_splice, linked_full_pair_accepts_reverse_completion_dispatch) {
     ScopedIoUringLoop guard;
     if (!guard.init()) SKIP("io_uring unavailable");

@@ -1,0 +1,661 @@
+{
+  "date": "2026-10-15",
+  "experiment": "WebSocket async splice SQ-capacity turn budget with ordinary-CQ fairness yield",
+  "status": "experimental, opt-in, default off",
+  "flag": "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET=on",
+  "roles": {
+    "architecture": "gpt-6-astra",
+    "implementation": "gpt-6-luna",
+    "acceptance": "gpt-6-sol"
+  },
+  "configuration": {
+    "connections": 192,
+    "measurement_seconds": 8,
+    "warmup_seconds": 2,
+    "proxy_cpus": "2",
+    "origin_cpus": "3,4,8,9",
+    "client_cpus": "5,6,7",
+    "http_probe_cpu": "10",
+    "segment_bytes": 131072,
+    "off_call_budget": 16,
+    "on_effective_call_budget": 1024,
+    "http_async_splice": "on throughout"
+  },
+  "summary": {
+    "websocket-interactive-64": {
+      "off_median_messages_per_second": 81274.12,
+      "on_median_messages_per_second": 84180.81,
+      "paired_gain_pct": [
+        -0.0010928737149917822,
+        3.991553522818836,
+        1.051936454815472
+      ],
+      "median_gain_pct": 3.5764029189119473
+    },
+    "websocket-bulk-64k": {
+      "off_median_messages_per_second": 19631.06,
+      "on_median_messages_per_second": 20886.56,
+      "paired_gain_pct": [
+        3.524890542950221,
+        4.944409522460824,
+        7.28127887607819
+      ],
+      "median_gain_pct": 6.395477371064007
+    }
+  },
+  "validation": {
+    "websocket_tests": 83,
+    "splice_tests": 70,
+    "ctest": "passed, independently rerun by root",
+    "runtime_cxx_dependency_check": "passed",
+    "full_ci_and_sanitizers": "not run"
+  },
+  "limitations": [
+    "Same-host loopback only; no cross-machine 10Gb run.",
+    "Three short pure pairs and two mixed pairs; not a statistical performance guarantee.",
+    "Mixed HTTP probe is 100 requests/s, not saturated HTTP traffic.",
+    "No same-run synchronous-splice or nginx control; cannot establish async superiority over either.",
+    "Origin CPU usage is high and can limit measured throughput.",
+    "Budget resets at existing WS scheduling turn boundaries, not once per outer loop.",
+    "Subsequent investigation found inherited NOFILE1024 limited splice admissions to159 for192load connections in this setup. These initial gains describe mixed splice/fallback paths, not fully admitted asyncsplice performance.",
+    "Measured on a broader local performance candidate, not the isolated PR head. No speedup is claimed for the PR head without rerunning benchmarks."
+  ],
+  "pure": {
+    "runtime_sha256": "83ad8c939b3619602fd01c6acd4c3438249adfd3176dc7385ccc758a7bb9263e",
+    "kernel": "7.2.9-200.fc44.x86_64",
+    "base_environment": {
+      "RUT_STUDY_HTTP_ASYNC_SPLICE": "on",
+      "RUT_STUDY_WS_SPLICE": "on",
+      "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+      "RUT_STUDY_WS_LINKED_SPLICE": "on",
+      "RUT_STUDY_WS_POLL_NEXT_READ": "on",
+      "RUT_STUDY_WS_SEGMENT": "128k",
+      "RUT_STUDY_WS_CALLS": "16",
+      "RUT_STUDY_WS_FAST_BATCH": "on",
+      "RUT_STUDY_WS_FAST_SCAN": "on"
+    },
+    "order": [
+      [
+        "off",
+        "on"
+      ],
+      [
+        "on",
+        "off"
+      ],
+      [
+        "off",
+        "on"
+      ]
+    ],
+    "runs": [
+      {
+        "mode": "off",
+        "repeat": 1,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 20345.88,
+            "rtt_us": {
+              "p50_us": 8895.0,
+              "p95_us": 14383.0,
+              "p99_us": 16167.0,
+              "max_us": 24799.0
+            },
+            "frontend_cpu_pct": 65.9686347118058,
+            "origin_cpu_pct": 364.2225979934294,
+            "valid": true,
+            "errors": 0
+          },
+          {
+            "case": {
+              "name": "websocket-interactive-64",
+              "kind": "websocket",
+              "size": 64,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 84181.73,
+            "rtt_us": {
+              "p50_us": 2217.0,
+              "p95_us": 5331.0,
+              "p99_us": 5783.0,
+              "max_us": 9495.0
+            },
+            "frontend_cpu_pct": 66.29858973710576,
+            "origin_cpu_pct": 299.7892621646271,
+            "valid": true,
+            "errors": 0
+          }
+        ]
+      },
+      {
+        "mode": "on",
+        "repeat": 1,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 21063.05,
+            "rtt_us": {
+              "p50_us": 8703.0,
+              "p95_us": 13631.0,
+              "p99_us": 16831.0,
+              "max_us": 30319.0
+            },
+            "frontend_cpu_pct": 66.2529990935268,
+            "origin_cpu_pct": 372.81010918492814,
+            "valid": true,
+            "errors": 0
+          },
+          {
+            "case": {
+              "name": "websocket-interactive-64",
+              "kind": "websocket",
+              "size": 64,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 84180.81,
+            "rtt_us": {
+              "p50_us": 2245.0,
+              "p95_us": 5391.0,
+              "p99_us": 5799.0,
+              "max_us": 9271.0
+            },
+            "frontend_cpu_pct": 65.56828166500351,
+            "origin_cpu_pct": 309.8870074454931,
+            "valid": true,
+            "errors": 0
+          }
+        ]
+      },
+      {
+        "mode": "on",
+        "repeat": 2,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 20601.7,
+            "rtt_us": {
+              "p50_us": 8983.0,
+              "p95_us": 13791.0,
+              "p99_us": 16607.0,
+              "max_us": 33535.0
+            },
+            "frontend_cpu_pct": 66.00461989338353,
+            "origin_cpu_pct": 371.15210435543736,
+            "valid": true,
+            "errors": 0
+          },
+          {
+            "case": {
+              "name": "websocket-interactive-64",
+              "kind": "websocket",
+              "size": 64,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 84518.22,
+            "rtt_us": {
+              "p50_us": 2235.0,
+              "p95_us": 5443.0,
+              "p99_us": 5771.0,
+              "max_us": 8199.0
+            },
+            "frontend_cpu_pct": 65.36274782868547,
+            "origin_cpu_pct": 303.3069542642188,
+            "valid": true,
+            "errors": 0
+          }
+        ]
+      },
+      {
+        "mode": "off",
+        "repeat": 2,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 19631.06,
+            "rtt_us": {
+              "p50_us": 9103.0,
+              "p95_us": 14807.0,
+              "p99_us": 16735.0,
+              "max_us": 25903.0
+            },
+            "frontend_cpu_pct": 65.66714564747792,
+            "origin_cpu_pct": 364.00923072873576,
+            "valid": true,
+            "errors": 0
+          },
+          {
+            "case": {
+              "name": "websocket-interactive-64",
+              "kind": "websocket",
+              "size": 64,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 81274.12,
+            "rtt_us": {
+              "p50_us": 2327.0,
+              "p95_us": 5403.0,
+              "p99_us": 5851.0,
+              "max_us": 9599.0
+            },
+            "frontend_cpu_pct": 66.26549167023163,
+            "origin_cpu_pct": 314.1658864066221,
+            "valid": true,
+            "errors": 0
+          }
+        ]
+      },
+      {
+        "mode": "off",
+        "repeat": 3,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 19468.97,
+            "rtt_us": {
+              "p50_us": 9055.0,
+              "p95_us": 15087.0,
+              "p99_us": 16879.0,
+              "max_us": 25919.0
+            },
+            "frontend_cpu_pct": 65.26818557536993,
+            "origin_cpu_pct": 360.71882714937277,
+            "valid": true,
+            "errors": 0
+          },
+          {
+            "case": {
+              "name": "websocket-interactive-64",
+              "kind": "websocket",
+              "size": 64,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 80606.58,
+            "rtt_us": {
+              "p50_us": 2313.0,
+              "p95_us": 5431.0,
+              "p99_us": 5931.0,
+              "max_us": 9655.0
+            },
+            "frontend_cpu_pct": 66.39943993385174,
+            "origin_cpu_pct": 312.0574279173513,
+            "valid": true,
+            "errors": 0
+          }
+        ]
+      },
+      {
+        "mode": "on",
+        "repeat": 3,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 20886.56,
+            "rtt_us": {
+              "p50_us": 8839.0,
+              "p95_us": 13711.0,
+              "p99_us": 17007.0,
+              "max_us": 27103.0
+            },
+            "frontend_cpu_pct": 65.71587606324596,
+            "origin_cpu_pct": 370.7049418952336,
+            "valid": true,
+            "errors": 0
+          },
+          {
+            "case": {
+              "name": "websocket-interactive-64",
+              "kind": "websocket",
+              "size": 64,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 81454.51,
+            "rtt_us": {
+              "p50_us": 2313.0,
+              "p95_us": 5599.0,
+              "p99_us": 5943.0,
+              "max_us": 9959.0
+            },
+            "frontend_cpu_pct": 65.6988164010949,
+            "origin_cpu_pct": 313.83895907533645,
+            "valid": true,
+            "errors": 0
+          }
+        ]
+      }
+    ]
+  },
+  "mixed": {
+    "runtime_sha256": "83ad8c939b3619602fd01c6acd4c3438249adfd3176dc7385ccc758a7bb9263e",
+    "kernel": "7.2.9-200.fc44.x86_64",
+    "base_environment": {
+      "RUT_STUDY_HTTP_ASYNC_SPLICE": "on",
+      "RUT_STUDY_WS_SPLICE": "on",
+      "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+      "RUT_STUDY_WS_LINKED_SPLICE": "on",
+      "RUT_STUDY_WS_POLL_NEXT_READ": "on",
+      "RUT_STUDY_WS_SEGMENT": "128k",
+      "RUT_STUDY_WS_CALLS": "16",
+      "RUT_STUDY_WS_FAST_BATCH": "on",
+      "RUT_STUDY_WS_FAST_SCAN": "on"
+    },
+    "order": [
+      [
+        "off",
+        "on"
+      ],
+      [
+        "on",
+        "off"
+      ]
+    ],
+    "runs": [
+      {
+        "mode": "off",
+        "repeat": 1,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 19924.62,
+            "rtt_us": {
+              "p50_us": 8911.0,
+              "p95_us": 14831.0,
+              "p99_us": 16863.0,
+              "max_us": 27407.0
+            },
+            "frontend_cpu_pct": 54.62999239362981,
+            "origin_cpu_pct": 299.1053882185162,
+            "valid": true,
+            "errors": 0
+          }
+        ],
+        "http_probes": [
+          {
+            "path": "/tmp/pr-watchdog/ws-queue-budget-mixed-20261015/queue-off-r1/websocket-bulk-64k-uring-current-r1/http-mixed.json",
+            "data": {
+              "rate_target": 100,
+              "duration": 8.0,
+              "warmup": 2.0,
+              "cpu": 10,
+              "samples": 801,
+              "errors": [],
+              "achieved_rate": 100.125,
+              "p50_us": 705.4840098135173,
+              "p99_us": 2703.182050026953,
+              "max_us": 2871.8080138787627
+            }
+          },
+          {
+            "path": "/tmp/pr-watchdog/ws-queue-budget-mixed-20261015/queue-off-r1/websocket-bulk-64k-uring-current-r1/http-idle.json",
+            "data": {
+              "rate_target": 100,
+              "duration": 2.0,
+              "warmup": 0.0,
+              "cpu": 10,
+              "samples": 201,
+              "errors": [],
+              "achieved_rate": 100.5,
+              "p50_us": 374.89301757887006,
+              "p99_us": 416.1010147072375,
+              "max_us": 424.3619623593986
+            }
+          }
+        ]
+      },
+      {
+        "mode": "on",
+        "repeat": 1,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 20431.97,
+            "rtt_us": {
+              "p50_us": 9023.0,
+              "p95_us": 14623.0,
+              "p99_us": 17503.0,
+              "max_us": 27807.0
+            },
+            "frontend_cpu_pct": 54.98983865897864,
+            "origin_cpu_pct": 306.6075112035106,
+            "valid": true,
+            "errors": 0
+          }
+        ],
+        "http_probes": [
+          {
+            "path": "/tmp/pr-watchdog/ws-queue-budget-mixed-20261015/queue-on-r1/websocket-bulk-64k-uring-current-r1/http-mixed.json",
+            "data": {
+              "rate_target": 100,
+              "duration": 8.0,
+              "warmup": 2.0,
+              "cpu": 10,
+              "samples": 801,
+              "errors": [],
+              "achieved_rate": 100.125,
+              "p50_us": 716.3870031945407,
+              "p99_us": 2403.3579975366592,
+              "max_us": 3249.9919761903584
+            }
+          },
+          {
+            "path": "/tmp/pr-watchdog/ws-queue-budget-mixed-20261015/queue-on-r1/websocket-bulk-64k-uring-current-r1/http-idle.json",
+            "data": {
+              "rate_target": 100,
+              "duration": 2.0,
+              "warmup": 0.0,
+              "cpu": 10,
+              "samples": 201,
+              "errors": [],
+              "achieved_rate": 100.5,
+              "p50_us": 367.5370244309306,
+              "p99_us": 400.7330280728638,
+              "max_us": 419.71501195803285
+            }
+          }
+        ]
+      },
+      {
+        "mode": "on",
+        "repeat": 2,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 20529.36,
+            "rtt_us": {
+              "p50_us": 8655.0,
+              "p95_us": 14575.0,
+              "p99_us": 17119.0,
+              "max_us": 32895.0
+            },
+            "frontend_cpu_pct": 54.95969629809135,
+            "origin_cpu_pct": 307.0304838306908,
+            "valid": true,
+            "errors": 0
+          }
+        ],
+        "http_probes": [
+          {
+            "path": "/tmp/pr-watchdog/ws-queue-budget-mixed-20261015/queue-on-r2/websocket-bulk-64k-uring-current-r1/http-mixed.json",
+            "data": {
+              "rate_target": 100,
+              "duration": 8.0,
+              "warmup": 2.0,
+              "cpu": 10,
+              "samples": 801,
+              "errors": [],
+              "achieved_rate": 100.125,
+              "p50_us": 655.6679727509618,
+              "p99_us": 2383.4630264900625,
+              "max_us": 2560.1109955459833
+            }
+          },
+          {
+            "path": "/tmp/pr-watchdog/ws-queue-budget-mixed-20261015/queue-on-r2/websocket-bulk-64k-uring-current-r1/http-idle.json",
+            "data": {
+              "rate_target": 100,
+              "duration": 2.0,
+              "warmup": 0.0,
+              "cpu": 10,
+              "samples": 201,
+              "errors": [],
+              "achieved_rate": 100.5,
+              "p50_us": 379.8140096478164,
+              "p99_us": 430.11800153180957,
+              "max_us": 432.25998524576426
+            }
+          }
+        ]
+      },
+      {
+        "mode": "off",
+        "repeat": 2,
+        "returncode": 0,
+        "results": [
+          {
+            "case": {
+              "name": "websocket-bulk-64k",
+              "kind": "websocket",
+              "size": 65536,
+              "chunks": 16,
+              "delay": 0
+            },
+            "messages_per_second": 19697.33,
+            "rtt_us": {
+              "p50_us": 8967.0,
+              "p95_us": 15151.0,
+              "p99_us": 16879.0,
+              "max_us": 27135.0
+            },
+            "frontend_cpu_pct": 54.57761380993681,
+            "origin_cpu_pct": 298.77533602297734,
+            "valid": true,
+            "errors": 0
+          }
+        ],
+        "http_probes": [
+          {
+            "path": "/tmp/pr-watchdog/ws-queue-budget-mixed-20261015/queue-off-r2/websocket-bulk-64k-uring-current-r1/http-mixed.json",
+            "data": {
+              "rate_target": 100,
+              "duration": 8.0,
+              "warmup": 2.0,
+              "cpu": 10,
+              "samples": 801,
+              "errors": [],
+              "achieved_rate": 100.125,
+              "p50_us": 743.2710262946784,
+              "p99_us": 2702.732977923006,
+              "max_us": 2967.4359830096364
+            }
+          },
+          {
+            "path": "/tmp/pr-watchdog/ws-queue-budget-mixed-20261015/queue-off-r2/websocket-bulk-64k-uring-current-r1/http-idle.json",
+            "data": {
+              "rate_target": 100,
+              "duration": 2.0,
+              "warmup": 0.0,
+              "cpu": 10,
+              "samples": 201,
+              "errors": [],
+              "achieved_rate": 100.5,
+              "p50_us": 397.82398380339146,
+              "p99_us": 428.19499503821135,
+              "max_us": 442.03101424500346
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "acceptance": {
+    "reviewer": "gpt-6-sol",
+    "result": "accepted as opt-in default-off experiment",
+    "architecture_blockers": 0,
+    "code_blockers": 0,
+    "mixed_http_starvation_observed": false,
+    "mixed_http_p99_us": {
+      "off": [
+        2703.182,
+        2702.733
+      ],
+      "on": [
+        2403.358,
+        2383.463
+      ]
+    },
+    "mixed_websocket_p99_increase_pct": [
+      3.8,
+      1.4
+    ],
+    "caveat": "Short samples support further evaluation, not default promotion or universal superiority."
+  }
+}

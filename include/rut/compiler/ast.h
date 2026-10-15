@@ -1131,6 +1131,10 @@ private:
         for (u32 i = 0; i < stmt_pool.len; i++) rebase_stmt(other, stmt_pool[i]);
         for (u32 i = 0; i < items.len; i++) {
             switch (items[i].kind) {
+                // These declarations contain no references to AstFile's rebased pools.
+                case AstItemKind::Upstream:
+                case AstItemKind::Import:
+                case AstItemKind::Using:
                 case AstItemKind::Listen:
                 case AstItemKind::AccessLog:
                     break;
@@ -1176,8 +1180,6 @@ private:
                     // The init expression is pooled (bulk-rebased above);
                     // only the pointer itself needs relocation.
                     rebase_expr_ptr(other, items[i].state.init);
-                    break;
-                default:
                     break;
             }
         }

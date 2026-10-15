@@ -27,6 +27,201 @@ CASES = [
 ]
 
 
+def ws_async_splice_settings(env=None):
+    env = os.environ if env is None else env
+    return {
+        'ws_async_splice_mode': env.get('RUT_STUDY_WS_ASYNC_SPLICE',
+                                        env.get('ws_async_splice_mode', 'off')),
+        'ws_linked_splice_mode': env.get('RUT_STUDY_WS_LINKED_SPLICE',
+                                         env.get('ws_linked_splice_mode', 'off')),
+        'ws_poll_next_read_mode': env.get('RUT_STUDY_WS_POLL_NEXT_READ',
+                                          env.get('ws_poll_next_read_mode', 'off')),
+        'ws_async_splice_queue_budget_mode': env.get(
+            'RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET',
+            env.get('ws_async_splice_queue_budget_mode', 'off')),
+    }
+
+
+def validate_ws_async_splice_startup(log, settings):
+    validate_ws_async_splice_configuration(settings)
+    async_on = settings['ws_async_splice_mode'] == 'on'
+    expected = {
+        'RUT_STUDY_WS_ASYNC_SPLICE': async_on,
+        'RUT_STUDY_WS_LINKED_SPLICE': async_on and settings['ws_linked_splice_mode'] == 'on',
+        'RUT_STUDY_WS_POLL_NEXT_READ': async_on and settings['ws_poll_next_read_mode'] == 'on',
+        'RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET': (
+            async_on and settings['ws_async_splice_queue_budget_mode'] == 'on'),
+    }
+    for name, enabled in expected.items():
+        mode = 'on' if enabled else 'off'
+        if name == 'RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET':
+            if f'{name} mode={mode} ' not in log:
+                raise RuntimeError(f'{name} setting did not activate')
+        elif f'{name} mode={mode}\n' not in log:
+            raise RuntimeError(f'{name} setting did not activate')
+
+
+def validate_ws_async_splice_configuration(settings):
+    if (settings['ws_async_splice_mode'] == 'on' and
+            settings['ws_splice_mode'] != 'on'):
+        raise RuntimeError('RUT_STUDY_WS_ASYNC_SPLICE=on requires RUT_STUDY_WS_SPLICE=on')
+    if settings['ws_async_splice_mode'] == 'on':
+        for key, name in (('ws_copy', 'RUT_STUDY_WS_COPY'),
+                          ('ws_available', 'RUT_STUDY_WS_AVAILABLE')):
+            if settings.get(key, 'off') == 'on':
+                raise RuntimeError(
+                    f'{name}=on is unsupported with RUT_STUDY_WS_ASYNC_SPLICE=on')
+    dependent_modes = (
+        ('ws_linked_splice_mode', 'RUT_STUDY_WS_LINKED_SPLICE'),
+        ('ws_poll_next_read_mode', 'RUT_STUDY_WS_POLL_NEXT_READ'),
+        ('ws_async_splice_queue_budget_mode', 'RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET'),
+    )
+    if settings['ws_async_splice_mode'] != 'on':
+        for key, name in dependent_modes:
+            if settings[key] == 'on':
+                raise RuntimeError(f'{name}=on requires RUT_STUDY_WS_ASYNC_SPLICE=on')
+
+
+def positive_nofile_limit(value):
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def add_nofile_argument(parser):
+    parser.add_argument(
+        "--nofile",
+        type=positive_nofile_limit,
+        default=None,
+        metavar="SOFT_LIMIT",
+        help="set RLIMIT_NOFILE soft limit for Rut frontend children only",
+    )
+
+
+def set_child_nofile_soft_limit(soft_limit):
+    current_soft, current_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit < 1 or (current_hard != resource.RLIM_INFINITY and soft_limit > current_hard):
+        raise ValueError("requested nofile soft limit exceeds the inherited hard limit")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (soft_limit, current_hard))
+
+
+def inherited_nofile_limits():
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    return {"soft": "unlimited" if soft == resource.RLIM_INFINITY else soft,
+            "hard": "unlimited" if hard == resource.RLIM_INFINITY else hard}
+
+
+def process_nofile_limits(pid):
+    def parse_limit(value):
+        return "unlimited" if value == "unlimited" else int(value)
+
+    try:
+        for line in Path(f"/proc/{pid}/limits").read_text().splitlines():
+            if line.startswith("Max open files"):
+                fields = line.split()
+                return {"soft": parse_limit(fields[3]), "hard": parse_limit(fields[4])}
+    except (OSError, IndexError, ValueError):
+        pass
+    return None
+
+
+def ws_splice_diagnostics(log_path):
+    records = []
+    try:
+        lines = log_path.read_text().splitlines()
+    except OSError:
+        return records
+    for line in lines:
+        if not line.startswith("RUT_WS_SPLICE "):
+            continue
+        record = {}
+        for field in line.split()[1:]:
+            key, separator, value = field.partition("=")
+            if not separator:
+                continue
+            try:
+                record[key] = int(value)
+            except ValueError:
+                record[key] = value
+        records.append(record)
+    return records
+
+
+_WS_SPLICE_DIAGNOSTIC_FIELDS = {
+    'admissions', 'client_bytes', 'upstream_bytes', 'calls', 'polls',
+    'read_eagain', 'write_eagain', 'pipe_grow_failures', 'min_pipe_capacity',
+}
+
+
+def _valid_ws_splice_diagnostic(record):
+    return (isinstance(record, dict) and
+            _WS_SPLICE_DIAGNOSTIC_FIELDS.issubset(record) and
+            all(type(record[key]) is int and record[key] >= 0
+                for key in _WS_SPLICE_DIAGNOSTIC_FIELDS))
+
+
+def validate_ws_splice_result_diagnostics(
+        row, engine, splice_mode, label, expected_connections=None):
+    if engine != 'uring' or splice_mode != 'on':
+        return
+    diagnostics = row.get('ws_splice_diagnostics')
+    if (not isinstance(diagnostics, list) or not diagnostics or
+            not all(_valid_ws_splice_diagnostic(record) for record in diagnostics)):
+        raise RuntimeError('enabled io_uring splice case lacks valid shutdown diagnostics: ' + label)
+    # Streaming does not enter the WebSocket splice path. It still requires
+    # complete shutdown diagnostics, but zero admissions are valid.
+    if row.get('kind') == 'streaming':
+        return
+    if row.get('kind') != 'websocket':
+        raise RuntimeError('enabled io_uring splice case lacks a valid kind: ' + label)
+    # For WebSockets, the preflight handshake plus each configured concurrent
+    # connection must have reached a splice owner at least once.
+    connections = row.get('concurrent_connections')
+    if type(connections) is not int or connections < 1:
+        raise RuntimeError('enabled io_uring splice case lacks valid concurrency: ' + label)
+    if expected_connections is not None and connections != expected_connections:
+        raise RuntimeError('enabled io_uring splice case concurrency mismatch: ' + label)
+    admissions = sum(record['admissions'] for record in diagnostics)
+    minimum = connections + 1  # one additional successful WebSocket preflight
+    if admissions < minimum:
+        raise RuntimeError(
+            f'enabled io_uring splice admissions below minimum ({admissions} < {minimum}): {label}')
+
+
+def shutdown_and_read_ws_splice_diagnostics(
+        stack, log_path, engine, splice_mode, label, row, expected_connections=None):
+    # The splice summary is emitted during runtime shutdown, so stop the frontend
+    # before reading its log or persisting the measurement row.
+    stack.close()
+    diagnostics = ws_splice_diagnostics(log_path)
+    result = dict(row, ws_splice_diagnostics=diagnostics)
+    validate_ws_splice_result_diagnostics(
+        result, engine, splice_mode, label, expected_connections)
+    return diagnostics
+
+
+def validate_preserved_protocol_result(row, case, engine, policy, repeat, manifest, label):
+    if (not row.get('valid') or row.get('case') != case or row.get('kind') != case['kind'] or
+            row.get('engine') != engine or row.get('policy') != policy or
+            row.get('repeat') != repeat):
+        raise RuntimeError('preserved invalid or mismatched case: ' + label)
+    if engine in ('uring', 'epoll') and not all(
+            key in row for key in ('frontend_nofile_limits', 'ws_splice_mode',
+                                   'ws_splice_diagnostics', 'ws_splice_admissions_total',
+                                   'ws_splice_calls_total')):
+        raise RuntimeError('preserved case lacks frontend limit or shutdown diagnostics: ' + label)
+    expected_splice_mode = manifest['ws_splice_mode'] if engine == 'uring' else None
+    if engine in ('uring', 'epoll') and row['ws_splice_mode'] != expected_splice_mode:
+        raise RuntimeError('preserved case WebSocket splice mode mismatch: ' + label)
+    validate_ws_splice_result_diagnostics(
+        row, engine, row.get('ws_splice_mode'), label,
+        manifest['connections'] if case['kind'] == 'websocket' else None)
+
+
 def ready(port, process, log, workers=0):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -44,9 +239,13 @@ def ready(port, process, log, workers=0):
 
 
 @contextlib.contextmanager
-def process(argv, log, env=None):
+def process(argv, log, env=None, nofile_soft_limit=None):
     with log.open('w') as handle:
-        child = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT, env=env)
+        preexec_fn = None
+        if nofile_soft_limit is not None:
+            preexec_fn = lambda: set_child_nofile_soft_limit(nofile_soft_limit)
+        child = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT, env=env,
+                                 preexec_fn=preexec_fn)
         try:
             yield child
         finally:
@@ -176,9 +375,15 @@ def main():
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--policies', nargs='+', choices=['latency', 'balanced', 'current'])
     parser.add_argument('--engines', nargs='+', choices=['direct-origin', 'uring', 'epoll', 'nginx'])
+    add_nofile_argument(parser)
     args = parser.parse_args()
     if args.connections_per_client < 1 or args.repeats < 1:
         parser.error('connections and repeats must be positive')
+    inherited_limits = inherited_nofile_limits()
+    if args.nofile is not None:
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        if hard != resource.RLIM_INFINITY and args.nofile > hard:
+            parser.error('--nofile cannot exceed the inherited hard limit')
     out = args.output.resolve(); out.mkdir(parents=True, exist_ok=True)
     spec = importlib.util.spec_from_file_location('runtime_benchmark', args.harness)
     harness = importlib.util.module_from_spec(spec); spec.loader.exec_module(harness)
@@ -188,9 +393,13 @@ def main():
                     tcpkali2_sha256=hashlib.sha256(args.tcpkali2.read_bytes()).hexdigest() if args.tcpkali2 else None,
                     rut_sha256=hashlib.sha256(args.rut.read_bytes()).hexdigest(), nginx_image=image,
                     fixture_sha256=hashlib.sha256(args.fixture.read_bytes()).hexdigest(),
+                    frontend_nofile_requested_soft=args.nofile,
+                    frontend_nofile_inherited_limits=inherited_limits,
+                    frontend_nofile_scope='Rut frontend subprocess only; None means inherited unchanged',
                     ws_recv_mode=os.environ.get('RUT_STUDY_WS_RECV', 'once'),
                     nginx_keepalive_requests=1000000, nginx_buffer_kib=args.nginx_buffer_kib,
                     ws_splice_mode=os.environ.get('RUT_STUDY_WS_SPLICE', 'off'),
+                    **ws_async_splice_settings(),
                     ws_segment=os.environ.get('RUT_STUDY_WS_SEGMENT', '64k'),
                     ws_calls=os.environ.get('RUT_STUDY_WS_CALLS', '8'),
                     repeats=1 if args.smoke else args.repeats,
@@ -207,6 +416,7 @@ def main():
                     mask_helper_min=int(os.environ.get('RUT_BENCH_WS_MASK_MIN', '4096')),
                     mask_helper=os.environ.get('RUT_BENCH_WS_MASK_HELPER'),
                     mask_helper_sha256=hashlib.sha256(Path(os.environ['RUT_BENCH_WS_MASK_HELPER']).read_bytes()).hexdigest() if os.environ.get('RUT_BENCH_WS_MASK_HELPER') else None)
+    validate_ws_async_splice_configuration(manifest)
     prior = out / 'study.json'
     if prior.exists() and json.loads(prior.read_text()) != manifest:
         raise RuntimeError('manifest changed; use another output directory')
@@ -251,8 +461,8 @@ def main():
                 result_file = directory / 'result.json'
                 if result_file.exists():
                     row = json.loads(result_file.read_text())
-                    if not row['valid'] or not all(key in row for key in ['case', 'engine', 'policy', 'repeat']):
-                        raise RuntimeError('preserved invalid or incomplete case: ' + label)
+                    validate_preserved_protocol_result(
+                        row, case, engine, policy, repeat, manifest, label)
                     rows.append(row)
                     continue
                 if directory.exists():
@@ -309,9 +519,18 @@ def main():
                             command = ['taskset', '-c', '2', str(args.rut.resolve()), str(program),
                                        '--backend', backend, '--shards', '1', '--no-pin', '--drain', '0']
                             frontend_log = directory / 'frontend.log'
-                            frontend = stack.enter_context(process(command, frontend_log,
-                                                                   dict(env, RUT_STUDY_POLICY=policy)))
+                            frontend = stack.enter_context(process(
+                                command, frontend_log, dict(env, RUT_STUDY_POLICY=policy),
+                                nofile_soft_limit=args.nofile))
                             ready(front_port, frontend, frontend_log)
+                            frontend_nofile = process_nofile_limits(frontend.pid)
+                            if args.nofile is not None and (
+                                    frontend_nofile is None or
+                                    frontend_nofile['soft'] != args.nofile):
+                                raise RuntimeError(
+                                    f'Rut frontend nofile soft limit mismatch: requested {args.nofile}, '
+                                    f'observed {frontend_nofile}'
+                                )
                             startup_deadline = time.monotonic() + 30
                             log = frontend_log.read_text()
                             while 'Listening on port' not in log:
@@ -325,6 +544,8 @@ def main():
                                 raise RuntimeError('WebSocket receive mode did not activate')
                             if engine == 'uring' and manifest['ws_splice_mode'] == 'on' and 'RUT_STUDY_WS_SPLICE mode=on' not in log:
                                 raise RuntimeError('WebSocket splice mode did not activate')
+                            if engine == 'uring':
+                                validate_ws_async_splice_startup(log, manifest)
                             if engine == 'uring' and manifest['ws_splice_mode'] == 'on':
                                 chunk = {'16k': 16384, '64k': 65536, '128k': 131072}[manifest['ws_segment']]
                                 if f"RUT_STUDY_WS_PARAMETERS chunk={chunk} calls={manifest['ws_calls']}" not in log:
@@ -358,16 +579,40 @@ def main():
                         origin_after, _ = harness.proc_usage(origin.pid)
                         usage_seconds = time.monotonic() - usage_started
                         row = json.loads(result_file.read_text())
+                        result_file.unlink()
+                        if row.get('kind') != case['kind']:
+                            raise RuntimeError('client result kind mismatch: ' + label)
                         row.update(case=case, engine=engine, policy=policy, repeat=repeat,
                                    ws_recv_mode=manifest['ws_recv_mode'] if engine == 'uring' else None,
                                    ws_splice_mode=manifest['ws_splice_mode'] if engine == 'uring' else None,
+                                   **{key: value if engine == 'uring' else None
+                                      for key, value in ws_async_splice_settings(manifest).items()},
                                    ws_segment=manifest['ws_segment'] if engine == 'uring' else None,
                                    ws_calls=manifest['ws_calls'] if engine == 'uring' else None,
                                    cpu_observation_seconds=usage_seconds,
                                    frontend_cpu_pct=100 * (after - before) / usage_seconds,
                                    origin_cpu_pct=100 * (origin_after - origin_before) / usage_seconds)
-                        result_file.write_text(json.dumps(row, indent=2) + '\n')
-                rows.append(row)
+                    if engine in ('uring', 'epoll'):
+                        diagnostics = shutdown_and_read_ws_splice_diagnostics(
+                            stack, frontend_log, engine, row['ws_splice_mode'], label,
+                            row, manifest['connections'] if case['kind'] == 'websocket' else None)
+                        row['frontend_nofile_limits'] = frontend_nofile
+                        row['ws_splice_diagnostics'] = diagnostics
+                        row['ws_splice_admissions_total'] = (
+                            sum(item.get('admissions', 0) for item in diagnostics)
+                            if diagnostics else None
+                        )
+                        row['ws_splice_calls_total'] = (
+                            sum(item.get('calls', 0) for item in diagnostics)
+                            if diagnostics else None
+                        )
+                        row['ws_splice_admission_scope'] = (
+                            'cumulative successful splice-owner admissions since process startup '
+                            '(includes preflight/setup); not simultaneous active tunnels or a '
+                            'direct fallback counter'
+                        )
+                    result_file.write_text(json.dumps(row, indent=2) + '\n')
+                    rows.append(row)
                 (out / 'measurements.json').write_text(json.dumps(rows, indent=2) + '\n')
                 (out / 'summary.json').write_text(json.dumps(summarize(rows), indent=2) + '\n')
                 print(f'END {label}: {row["messages_per_second"]:.0f} messages/chunks per second, '
