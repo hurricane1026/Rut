@@ -9227,7 +9227,7 @@ u16 h2_status_for_stream(const u8* buf, u32 len, u32 stream_id) {
         Http2FrameHeader h;
         parse_frame_header(buf + pos, len - pos, &h);
         if (pos + kFrameHeaderSize + h.length > len) break;
-        if (h.type == static_cast<u8>(Http2FrameType::Headers) && h.stream_id == stream_id) {
+        if (h.type == static_cast<u8>(Http2FrameType::Headers)) {
             hpack::Header hs[32];
             u8 scratch[4096];
             u32 nh = 0;
@@ -9240,7 +9240,7 @@ u16 h2_status_for_stream(const u8* buf, u32 len, u32 stream_id) {
                                            32,
                                            &nh)) {
                 for (u32 i = 0; i < nh; i++) {
-                    if (hs[i].name.eq(Str{":status", 7})) {
+                    if (h.stream_id == stream_id && hs[i].name.eq(Str{":status", 7})) {
                         u16 s = 0;
                         for (u32 j = 0; j < hs[i].value.len; j++)
                             s = static_cast<u16>(s * 10 + (hs[i].value.ptr[j] - '0'));
@@ -9272,7 +9272,7 @@ bool h2_response_has_header(
         Http2FrameHeader h;
         parse_frame_header(buf + pos, len - pos, &h);
         if (pos + kFrameHeaderSize + h.length > len) break;
-        if (h.type == static_cast<u8>(Http2FrameType::Headers) && h.stream_id == stream_id) {
+        if (h.type == static_cast<u8>(Http2FrameType::Headers)) {
             hpack::Header hs[32];
             u8 scratch[4096];
             u32 nh = 0;
@@ -9285,7 +9285,9 @@ bool h2_response_has_header(
                                            32,
                                            &nh)) {
                 for (u32 i = 0; i < nh; i++)
-                    if (hs[i].name.eq(Str{name, nl}) && hs[i].value.eq(Str{value, vl})) return true;
+                    if (h.stream_id == stream_id && hs[i].name.eq(Str{name, nl}) &&
+                        hs[i].value.eq(Str{value, vl}))
+                        return true;
             }
         }
         pos += kFrameHeaderSize + h.length;
@@ -9310,6 +9312,34 @@ u32 h2_body_for_stream(const u8* buf, u32 len, u32 stream_id, u8* out, u32 cap) 
     return blen;
 }
 
+bool h2_has_data_frame_for_stream(const u8* buf, u32 len, u32 stream_id) {
+    for (u32 pos = 0; pos + kFrameHeaderSize <= len;) {
+        Http2FrameHeader h;
+        if (parse_frame_header(buf + pos, len - pos, &h) != ParseStatus::Complete ||
+            pos + kFrameHeaderSize + h.length > len)
+            break;
+        if (h.type == static_cast<u8>(Http2FrameType::Data) && h.stream_id == stream_id)
+            return true;
+        pos += kFrameHeaderSize + h.length;
+    }
+    return false;
+}
+
+bool h2_headers_end_stream_for_stream(const u8* buf, u32 len, u32 stream_id) {
+    for (u32 pos = 0; pos + kFrameHeaderSize <= len;) {
+        Http2FrameHeader h;
+        if (parse_frame_header(buf + pos, len - pos, &h) != ParseStatus::Complete ||
+            pos + kFrameHeaderSize + h.length > len)
+            break;
+        if (h.type == static_cast<u8>(Http2FrameType::Headers) && h.stream_id == stream_id) {
+            constexpr u8 kTerminalFlags = http2_flag::kEndHeaders | http2_flag::kEndStream;
+            return (h.flags & kTerminalFlags) == kTerminalFlags;
+        }
+        pos += kFrameHeaderSize + h.length;
+    }
+    return false;
+}
+
 // Write preface + an empty client SETTINGS into out; return bytes written.
 u32 h2_client_prologue(u8* out) {
     u32 n = 0;
@@ -9324,6 +9354,16 @@ u32 h2_client_prologue(u8* out) {
 u32 h2_client_get(u8* out, u32 cap, u32 stream_id, const char* path, u32 path_len) {
     const hpack::Header hs[] = {
         {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {path, path_len}},
+        {{":authority", 10}, {"localhost", 9}},
+    };
+    return http2_write_headers(out, cap, stream_id, hs, 4, /*end_stream=*/true);
+}
+
+u32 h2_client_head(u8* out, u32 cap, u32 stream_id, const char* path, u32 path_len) {
+    const hpack::Header hs[] = {
+        {{":method", 7}, {"HEAD", 4}},
         {{":scheme", 7}, {"http", 4}},
         {{":path", 5}, {path, path_len}},
         {{":authority", 10}, {"localhost", 9}},
@@ -13523,16 +13563,15 @@ TEST(route, wait_jit_handler_real_socket) {
     rir.destroy();
 }
 
-// End-to-end async-yield over HTTP/2: a JIT handler that wait(ms)s then returns
-// 200 must suspend its h2 stream and resume to emit the response. Before the h2
-// async path this answered 503 (yielding handlers unsupported); now the stream
-// parks on a real yield timer (h2_suspend_timer → schedule_yield_timer) and
-// resumes through h2_resume_jit_handler to serialize the HEADERS frame. Driven
-// over cleartext h2c on the real EpollEventLoop so the timer actually fires.
-TEST(shard, serves_http2_async_wait_jit_handler) {
+// Timer-resumed HEAD keeps the configured representation length and emits no
+// DATA. A following GET on the same connection verifies the async HEAD bit was
+// cleared with its slot and the ordinary response owner still sends its body.
+TEST(shard, serves_http2_async_wait_head_then_get) {
     using namespace rut;
 
-    const char* src = "route GET \"/sleep\" { wait(50) return 200 }\n";
+    const char* src =
+        "route HEAD \"/sleep\" { wait(50) return response(200, body: \"slept\") }\n"
+        "route GET \"/sleep\" { wait(50) return response(200, body: \"slept\") }\n";
     auto lexed = lex(Str{src, static_cast<u32>(strlen(src))});
     REQUIRE(lexed);
     auto ast = parse_file(lexed.value());
@@ -13552,32 +13591,66 @@ TEST(shard, serves_http2_async_wait_jit_handler) {
     jit::JitEngine engine;
     REQUIRE(engine.init());
     REQUIRE(engine.compile(cg.mod, cg.ctx));
-    auto handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
-    REQUIRE(handler_fn != nullptr);
+    auto head_handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_0"));
+    auto get_handler_fn = reinterpret_cast<jit::HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(head_handler_fn != nullptr);
+    REQUIRE(get_handler_fn != nullptr);
 
     RouteConfig cfg{};
-    REQUIRE(cfg.add_jit_handler("/sleep", 'G', handler_fn));
+    REQUIRE_GT(rir.module.response_body_count, 0u);
+    for (u32 i = 0; i < rir.module.response_body_count; i++) {
+        const auto& body = rir.module.response_bodies[i];
+        REQUIRE_EQ(cfg.add_response_body(body.ptr, body.len), static_cast<u16>(i + 1));
+    }
+    REQUIRE(cfg.add_jit_handler("/sleep", 'H', head_handler_fn));
+    REQUIRE(cfg.add_jit_handler("/sleep", 'G', get_handler_fn));
     const RouteConfig* active = &cfg;
 
     RealLoop* loop = create_real_loop();
+    struct AsyncSocketGuard {
+        RealLoop* loop = nullptr;
+        LoopThread thread{};
+        i32 listen_fd = -1;
+        i32 client_fd = -1;
+        bool initialized = false;
+        bool started = false;
+        void cleanup() {
+            if (client_fd >= 0) close(client_fd);
+            client_fd = -1;
+            if (started) thread.stop();
+            started = false;
+            if (initialized && loop != nullptr) loop->shutdown();
+            initialized = false;
+            if (listen_fd >= 0) close(listen_fd);
+            listen_fd = -1;
+            if (loop != nullptr) destroy_real_loop(loop);
+            loop = nullptr;
+        }
+        ~AsyncSocketGuard() { cleanup(); }
+    } guard{};
+    guard.loop = loop;
     REQUIRE(loop != nullptr);
     auto lfd_result = create_listen_socket(0);
     REQUIRE(lfd_result.has_value());
     i32 lfd = lfd_result.value();
+    guard.listen_fd = lfd;
     u16 port = get_port(lfd);
     REQUIRE(loop->init(0, lfd).has_value());
+    guard.initialized = true;
     loop->config_ptr = &active;
-    LoopThread lt = {loop, {}, 200};
-    lt.start();
-    usleep(10000);
+    guard.thread = {loop, {}, 200};
+    guard.thread.max_run_ms = 5000;
+    guard.thread.start();
+    guard.started = true;
 
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
+    guard.client_fd = c;
     set_socket_timeouts(c, 2);
 
     u8 out[512];
     u32 n = h2_client_prologue(out);
-    n += h2_client_get(out + n, sizeof(out) - n, 1, "/sleep", 6);
+    n += h2_client_head(out + n, sizeof(out) - n, 1, "/sleep", 6);
     REQUIRE(write_all_fd(c, out, n));
 
     u8 resp[4096];
@@ -13589,14 +13662,34 @@ TEST(shard, serves_http2_async_wait_jit_handler) {
         total += static_cast<u32>(got);
         if (h2_status_for_stream(resp, total, 1) != 0) break;
     }
-    // 200 (not 503) proves the suspend/resume round-trip completed.
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "content-length", "5"));
+    CHECK_EQ(h2_body_for_stream(resp, total, 1, out, sizeof(out)), 0u);
+    CHECK_FALSE(h2_has_data_frame_for_stream(resp, total, 1));
+    CHECK(h2_headers_end_stream_for_stream(resp, total, 1));
 
-    close(c);
-    lt.stop();
-    loop->shutdown();
-    close(lfd);
-    destroy_real_loop(loop);
+    n = h2_client_get(out, sizeof(out), 3, "/sleep", 6);
+    REQUIRE(write_all_fd(c, out, n));
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
+        i32 got =
+            recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        u8 body[16];
+        if (h2_status_for_stream(resp, total, 3) == 200 &&
+            h2_body_for_stream(resp, total, 3, body, sizeof(body)) >= 5)
+            break;
+    }
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);
+    CHECK(h2_response_has_header(resp, total, 3, "content-length", "5"));
+    u8 get_body[16];
+    const u32 get_body_len = h2_body_for_stream(resp, total, 3, get_body, sizeof(get_body));
+    CHECK_EQ(get_body_len, 5u);
+    if (get_body_len == 5) CHECK_EQ(memcmp(get_body, "slept", 5), 0);
+    CHECK_FALSE(h2_has_data_frame_for_stream(resp, total, 1));
+    CHECK(h2_headers_end_stream_for_stream(resp, total, 1));
+
+    guard.cleanup();
     engine.shutdown();
     rir.destroy();
 }
@@ -14572,63 +14665,101 @@ static u64 return_200_with_body_1_handler(void* /*conn*/,
     return r.pack();
 }
 
-// End-to-end: handler returns ReturnStatus with body_idx=1;
-// RouteConfig has a body pre-registered; runtime formats response
-// with the body bytes + matching Content-Length + default Content-Type.
-// HTTP/2: a JIT handler returning a status + body, served over h2c. Exercises
-// the native h2 dispatch → request synthesis → handler invoke → HEADERS+DATA.
-TEST(shard, serves_http2_jit_handler_with_body) {
+// Ordinary H2 JIT ReturnStatus HEAD keeps the configured GET representation
+// length while ending on HEADERS. A same-connection GET control still receives
+// the exact body; both requests are sent together on distinct streams.
+TEST(shard, serves_http2_jit_handler_head_and_get_multiplexed) {
     using namespace rut;
 
     RouteConfig cfg{};
     const char kBody[] = "Hello, world";
     REQUIRE_EQ(cfg.add_response_body(kBody, sizeof(kBody) - 1), 1u);
     REQUIRE(cfg.add_jit_handler("/hello", 'G', &return_200_with_body_1_handler));
+    REQUIRE(cfg.add_jit_handler("/hello", 'H', &return_200_with_body_1_handler));
 
     Shard<EpollEventLoop> shard;
     i32 lfd = create_listen_socket(0).value_or(-1);
+    struct ShardSocketGuard {
+        Shard<EpollEventLoop>& shard;
+        i32& listen_fd;
+        i32 client_fd = -1;
+        bool spawned = false;
+        ~ShardSocketGuard() {
+            if (client_fd >= 0) close(client_fd);
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } guard{shard, lfd};
     REQUIRE(lfd >= 0);
     u16 port = get_port(lfd);
     REQUIRE(shard.init(0, lfd).has_value());
     shard.route_config = &cfg;
     REQUIRE(shard.spawn(-1).has_value());
+    guard.spawned = true;
     usleep(50000);
 
     i32 c = connect_to(port);
     REQUIRE(c >= 0);
+    guard.client_fd = c;
     set_socket_timeouts(c, 2);
 
     u8 out[512];
     u32 n = h2_client_prologue(out);
-    n += h2_client_get(out + n, sizeof(out) - n, 1, "/hello", 6);
+    n += h2_client_head(out + n, sizeof(out) - n, 1, "/hello", 6);
+    n += h2_client_get(out + n, sizeof(out) - n, 3, "/hello", 6);
     REQUIRE(write_all_fd(c, out, n));
 
     u8 resp[4096];
     u32 total = 0;
-    for (int attempt = 0; attempt < 6 && total < sizeof(resp); attempt++) {
+    for (int attempt = 0; attempt < 8 && total < sizeof(resp); attempt++) {
         i32 got =
             recv_timeout(c, reinterpret_cast<char*>(resp + total), sizeof(resp) - total, 2000);
         if (got <= 0) break;
         total += static_cast<u32>(got);
         u8 body[256];
-        if (h2_status_for_stream(resp, total, 1) != 0 &&
-            h2_body_for_stream(resp, total, 1, body, sizeof(body)) >= sizeof(kBody) - 1)
+        if (h2_status_for_stream(resp, total, 1) == 200 &&
+            h2_status_for_stream(resp, total, 3) == 200 &&
+            h2_body_for_stream(resp, total, 3, body, sizeof(body)) >= sizeof(kBody) - 1)
             break;
     }
     CHECK_EQ(h2_status_for_stream(resp, total, 1), 200u);
+    CHECK_EQ(h2_status_for_stream(resp, total, 3), 200u);
+    CHECK(h2_response_has_header(resp, total, 1, "content-length", "12"));
+    CHECK(h2_response_has_header(resp, total, 3, "content-length", "12"));
     u8 body[256];
-    u32 blen = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+    u32 head_body_len = h2_body_for_stream(resp, total, 1, body, sizeof(body));
+    CHECK_EQ(head_body_len, 0u);
+    u32 blen = h2_body_for_stream(resp, total, 3, body, sizeof(body));
     CHECK_EQ(blen, sizeof(kBody) - 1);
     bool body_ok = blen == sizeof(kBody) - 1;
     for (u32 i = 0; i < blen && body_ok; i++)
         if (body[i] != static_cast<u8>(kBody[i])) body_ok = false;
     CHECK(body_ok);
 
-    close(c);
-    shard.stop();
-    shard.join();
-    shard.shutdown();
-    close(lfd);
+    bool head_end_stream = false;
+    bool head_data = false;
+    bool get_data = false;
+    for (u32 pos = 0; pos + kFrameHeaderSize <= total;) {
+        Http2FrameHeader frame;
+        if (parse_frame_header(resp + pos, total - pos, &frame) != ParseStatus::Complete ||
+            pos + kFrameHeaderSize + frame.length > total)
+            break;
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers) && frame.stream_id == 1)
+            head_end_stream = (frame.flags & (http2_flag::kEndHeaders | http2_flag::kEndStream)) ==
+                              (http2_flag::kEndHeaders | http2_flag::kEndStream);
+        if (frame.type == static_cast<u8>(Http2FrameType::Data) && frame.stream_id == 1)
+            head_data = true;
+        if (frame.type == static_cast<u8>(Http2FrameType::Data) && frame.stream_id == 3)
+            get_data = true;
+        pos += kFrameHeaderSize + frame.length;
+    }
+    CHECK(head_end_stream);
+    CHECK_FALSE(head_data);
+    CHECK(get_data);
 }
 
 TEST(route, jit_handler_custom_body_real_socket) {
@@ -19682,6 +19813,26 @@ static u64 h2_echo_body_handler(
     return r.pack();
 }
 
+static u64 h2_echo_body_with_response_handler(
+    void* /*conn*/, rut::jit::HandlerCtx* /*ctx*/, const u8* req, u32 len, void* /*arena*/) {
+    u32 body_off = len;
+    for (u32 i = 0; i + 3 < len; i++) {
+        if (req[i] == '\r' && req[i + 1] == '\n' && req[i + 2] == '\r' && req[i + 3] == '\n') {
+            body_off = i + 4;
+            break;
+        }
+    }
+    const u32 blen = len - body_off;
+    const bool ok = blen == 4 && req[body_off] == 'p' && req[body_off + 1] == 'i' &&
+                    req[body_off + 2] == 'n' && req[body_off + 3] == 'g';
+    rut::jit::HandlerResult r{rut::jit::HandlerAction::ReturnStatus,
+                              static_cast<u16>(ok ? 200 : 400),
+                              /*response_body_idx=*/static_cast<u16>(ok ? 1 : 0),
+                              /*next_state=*/0,
+                              rut::jit::YieldKind::HttpGet};
+    return r.pack();
+}
+
 // A body-reading handler for an h2 request that omitted content-length. The
 // bridge synthesizes a content-length so the HTTP/1-shaped parse exposes the
 // DATA bytes; the handler verifies both the injected header and the body.
@@ -19789,6 +19940,117 @@ TEST(shard, serves_http2_request_body) {
     shard.join();
     shard.shutdown();
     close(lfd);
+}
+
+TEST(shard, serves_http2_head_with_deferred_request_body) {
+    using namespace rut;
+
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_response_body("done", 4), 1u);
+    REQUIRE(cfg.add_jit_handler(
+        "/upload", 'H', &h2_echo_body_with_response_handler, /*needs_req_body=*/true));
+    REQUIRE(cfg.add_jit_handler(
+        "/upload", 'G', &h2_echo_body_with_response_handler, /*needs_req_body=*/true));
+
+    Shard<EpollEventLoop> shard;
+    i32 lfd = create_listen_socket(0).value_or(-1);
+    struct ShardSocketGuard {
+        Shard<EpollEventLoop>& shard;
+        i32& listen_fd;
+        i32 client_fd = -1;
+        bool spawned = false;
+        ~ShardSocketGuard() {
+            if (client_fd >= 0) close(client_fd);
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } guard{shard, lfd};
+    REQUIRE(lfd >= 0);
+    const u16 port = get_port(lfd);
+    REQUIRE(shard.init(0, lfd).has_value());
+    shard.route_config = &cfg;
+    REQUIRE(shard.spawn(-1).has_value());
+    guard.spawned = true;
+    usleep(50000);
+
+    i32 c = connect_to(port);
+    REQUIRE(c >= 0);
+    guard.client_fd = c;
+    set_socket_timeouts(c, 2);
+
+    u8 request[512];
+    u32 request_len = h2_client_prologue(request);
+    const hpack::Header head_headers[] = {
+        {{":method", 7}, {"HEAD", 4}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    request_len += http2_write_headers(
+        request + request_len, sizeof(request) - request_len, 1, head_headers, 5, false);
+    request_len +=
+        http2_write_data(request + request_len, 1, reinterpret_cast<const u8*>("ping"), 4, true);
+    REQUIRE(write_all_fd(c, request, request_len));
+
+    u8 response[4096];
+    u32 total = 0;
+    for (int attempt = 0; attempt < 8 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            c, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        if (h2_status_for_stream(response, total, 1) == 200) break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 1), 200u);
+    CHECK(h2_response_has_header(response, total, 1, "content-length", "4"));
+    CHECK_EQ(h2_body_for_stream(response, total, 1, request, sizeof(request)), 0u);
+    CHECK_FALSE(h2_has_data_frame_for_stream(response, total, 1));
+    bool head_headers_end_stream = false;
+    for (u32 pos = 0; pos + kFrameHeaderSize <= total;) {
+        Http2FrameHeader frame;
+        if (parse_frame_header(response + pos, total - pos, &frame) != ParseStatus::Complete ||
+            pos + kFrameHeaderSize + frame.length > total)
+            break;
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers) && frame.stream_id == 1)
+            head_headers_end_stream = (frame.flags & http2_flag::kEndStream) != 0;
+        pos += kFrameHeaderSize + frame.length;
+    }
+    CHECK(head_headers_end_stream);
+
+    request_len = 0;
+    const hpack::Header get_headers[] = {
+        {{":method", 7}, {"GET", 3}},
+        {{":scheme", 7}, {"http", 4}},
+        {{":path", 5}, {"/upload", 7}},
+        {{":authority", 10}, {"localhost", 9}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    request_len += http2_write_headers(request, sizeof(request), 3, get_headers, 5, false);
+    request_len +=
+        http2_write_data(request + request_len, 3, reinterpret_cast<const u8*>("ping"), 4, true);
+    REQUIRE(write_all_fd(c, request, request_len));
+    for (int attempt = 0; attempt < 8 && total < sizeof(response); attempt++) {
+        const i32 got = recv_timeout(
+            c, reinterpret_cast<char*>(response + total), sizeof(response) - total, 2000);
+        if (got <= 0) break;
+        total += static_cast<u32>(got);
+        u8 body[16];
+        if (h2_status_for_stream(response, total, 3) == 200 &&
+            h2_body_for_stream(response, total, 3, body, sizeof(body)) >= 4)
+            break;
+    }
+    CHECK_EQ(h2_status_for_stream(response, total, 3), 200u);
+    u8 get_body[16];
+    const u32 get_body_len = h2_body_for_stream(response, total, 3, get_body, sizeof(get_body));
+    CHECK_EQ(get_body_len, 4u);
+    if (get_body_len == 4) CHECK_EQ(memcmp(get_body, "done", 4), 0);
+    CHECK_FALSE(h2_has_data_frame_for_stream(response, total, 1));
+    CHECK(h2_headers_end_stream_for_stream(response, total, 1));
 }
 
 // A body-reading stream deferred for DATA and a coalesced proxy stream both want

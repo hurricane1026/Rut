@@ -258,6 +258,15 @@ storage; `LoadedProgram` keeps that storage alive through teardown and reload
 retirement. This documents the configured local/static response path and does
 not make dynamic `resp.body` mutation available.
 
+For HTTP/2, the current bounded `HEAD` support applies to ordinary local JIT
+`ReturnStatus` responses with a configured representation body, including
+immediate, deferred-request-body, and timer-resumed handlers. It keeps the
+configured `Content-Length` and ends on HEADERS without DATA. Existing route
+matching still decides whether a HEAD request reaches a handler. Static,
+default, unmatched, firewall, validation, and other status-only results remain
+status-only; redirect remains unsupported, and proxy/strict-local behavior is
+unchanged. This does not claim HEAD equivalence for every HTTP/2 response path.
+
 `body: "..."` keeps the raw source spelling of backslash sequences. To place
 exact bytes — newline, quote, backslash, a `\xNN` byte, or a non-ASCII byte —
 use the byte-string form `body: b"..."`, which decodes `\n`, `\r`, `\t`, `\\`,

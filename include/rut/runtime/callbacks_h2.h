@@ -523,6 +523,7 @@ inline bool h2_proxy_request_forwardable(const hpack::Header* hs, u32 n) {
 
 inline void h2_clear_pending(Http2Conn& h2) {
     h2.pending_stream = 0;
+    h2.pending_is_head = false;
     h2.pending_body_start = 0;
     h2.pending_synth_len = 0;
     h2.pending_body_len = 0;
@@ -670,6 +671,7 @@ bool h2_defer_until_data_end(H2Dispatch<Loop>& d,
     }
     h2->pending_route_param_count = stored;
     h2->pending_stream = stream_id;
+    h2->pending_is_head = req.method == HttpMethod::HEAD;
     return true;
 }
 
@@ -694,6 +696,7 @@ bool h2_defer_prepared_forward(H2Dispatch<Loop>& d,
         return false;
     for (u32 i = 0; i < synth_len; i++) h2->pending_synth[i] = synth[i];
     h2->pending_stream = stream_id;
+    h2->pending_is_head = req.method == HttpMethod::HEAD;
     h2->pending_body_start = synth_len;
     h2->pending_synth_len = synth_len;
     h2->pending_body_len = 0;
@@ -720,7 +723,8 @@ template <typename Loop>
 void h2_emit_outcome(H2Dispatch<Loop>& d,
                      u32 stream_id,
                      const JitDispatchOutcome& o,
-                     const RouteConfig* cfg) {
+                     const RouteConfig* cfg,
+                     bool is_head) {
     const u8* body = nullptr;
     u32 body_len = 0;
     if (o.response_body_idx != 0 && cfg != nullptr &&
@@ -790,7 +794,31 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
     // one over HTTP/2 too, matching the ordinary HTTP/1 formatter.
     const bool bodyless_status =
         o.status_code < 200 || o.status_code == 204 || o.status_code == 205 || o.status_code == 304;
-    if (body_len != 0 && !bodyless_status) {
+    if (body_len != 0 && !bodyless_status && is_head) {
+        hpack::Encoder staged = d.owned_hpack_pending ? d.owned_hpack_after : d.conn->h2->hpack_enc;
+        const u32 n = http2_write_head_response_headers(d.resp + d.resp_len,
+                                                        d.resp_cap - d.resp_len,
+                                                        staged,
+                                                        stream_id,
+                                                        o.status_code,
+                                                        hdrs,
+                                                        nhdrs,
+                                                        body_len);
+        if (n == 0) {
+            if (d.resp_len != 0)
+                d.overflow = true;
+            else
+                h2_emit_status(d, stream_id, 500);
+            return;
+        }
+        if (d.owned_hpack_pending)
+            d.owned_hpack_after = staged;
+        else
+            d.conn->h2->hpack_enc = staged;
+        d.resp_len += n;
+        d.conn->h2->response_flush_pending = true;
+        h2_close_stream(d.conn->h2, stream_id);
+    } else if (body_len != 0 && !bodyless_status) {
         if (!h2_stage_owned_response(d,
                                      stream_id,
                                      o.status_code,
@@ -836,6 +864,7 @@ void h2_async_epoch_leave(Loop* loop, Connection& conn) {
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
     h2.async_stream = 0;
+    h2.async_is_head = false;
     h2.async_kind = H2AsyncKind::None;
     h2.async_cfg = nullptr;
     h2.async_synth_len = 0;
@@ -878,6 +907,7 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
                       u32 synth_len,
                       bool request_body_followed,
                       bool request_forwardable,
+                      bool is_head,
                       const ParsedRequest* open_request = nullptr) {
     Http2Conn* h2 = d.conn->h2;
     // Refuse if a stream is already suspended OR a body-reading request is deferred
@@ -902,6 +932,7 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
         value = reinterpret_cast<const char*>(h2->pending_synth + (ptr - synth));
     }
     h2->async_stream = stream_id;
+    h2->async_is_head = is_head;
     h2->async_kind = H2AsyncKind::Timer;
     h2->async_cfg = cfg;
     h2->async_request_body_followed = request_body_followed;
@@ -937,6 +968,7 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     h2_async_epoch_enter(d.loop, *d.conn);
     h2->async_synth_len = h2_stash_synth(*h2, synth, synth_len);
     h2->async_stream = stream_id;
+    h2->async_is_head = false;
     h2->async_kind = H2AsyncKind::Proxy;
     h2->async_cfg = cfg;
     h2->async_upstream_id = upstream_id;
@@ -959,6 +991,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 synth_len,
                     bool request_body_followed,
                     bool request_forwardable,
+                    bool is_head,
                     const ParsedRequest* open_request = nullptr) {
     if (route_requires_response_read_timeout_preflight_close(route, cfg)) {
         d.close_after_process = true;
@@ -1019,6 +1052,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                               synth_len,
                               request_body_followed,
                               request_forwardable,
+                              is_head,
                               open_request))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
         return;
@@ -1095,7 +1129,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
         return;
     }
-    h2_emit_outcome(d, stream_id, kOutcome, cfg);
+    h2_emit_outcome(d, stream_id, kOutcome, cfg, is_head);
 }
 
 // A deferred stream is complete. If the matched handler reads req.body,
@@ -1161,6 +1195,7 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     const u32 kLen = h2->pending_synth_len;
     const u8* synth = h2->pending_synth;
     const RouteConfig* cfg = h2->pending_route_config;
+    const bool kIsHead = h2->pending_is_head;
     const RouteEntry* route = h2->pending_route;
     const jit::HandlerFn kJitFn = h2->pending_jit_fn;
     const bool kRequestBodyFollowed = h2->pending_body_len != 0;
@@ -1190,7 +1225,8 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
                    synth,
                    kLen,
                    kRequestBodyFollowed,
-                   kRequestForwardable);
+                   kRequestForwardable,
+                   kIsHead);
 }
 
 // Resolve a completed header block (END_HEADERS) to a response. end_stream is
@@ -1276,6 +1312,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 400);
         return;
     }
+    const bool kIsHead = req.method == HttpMethod::HEAD;
     const u8 kMethodKey = route_method_key(req.method);
     const u16 pre_route_policy_id = config != nullptr ? config->pre_route_policy_id(kMethodKey) : 0;
     const bool origin_form_connect =
@@ -1484,6 +1521,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                            kSynthLen,
                            !end_stream,
                            h2_proxy_request_forwardable(headers, nheaders),
+                           kIsHead,
                            end_stream ? nullptr : &req);
             return;
         }
@@ -1937,6 +1975,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     // (mirrors the HTTP/1 resume_jit_handler).
     loop->timer.refresh(&conn, loop->keepalive_timeout);
     const u32 kStreamId = h2->async_stream;
+    const bool kIsHead = h2->async_is_head;
     auto* ctx = conn.jit_ctx();
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
@@ -2102,6 +2141,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
             // correctly refuses an occupied slot).
             h2->async_synth_len = h2_stash_synth(*h2, forward_synth, forward_len);
             h2->async_synth_sent = 0;
+            h2->async_is_head = false;
             h2->async_kind = H2AsyncKind::Proxy;
             h2->async_upstream_id = static_cast<u16>(kOutcome.upstream_id);
             h2->async_resp_len = 0;
@@ -2138,7 +2178,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     u8 resp[8192];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
-        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg);
+        h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kIsHead);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
     }

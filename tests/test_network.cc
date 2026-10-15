@@ -7171,7 +7171,7 @@ TEST(redirect, h1_fixed_302_wire_dispatch_errors_and_h2_rejection_are_bounded) {
         H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
         loop.backend.clear_ops();
         h2_invoke_emit(
-            dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true);
+            dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
         CHECK_EQ(h2_staged_status(dispatch.resp, dispatch.resp_len, 1), 400u);
         CHECK_EQ(h2.async_stream, 0u);
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
@@ -7492,7 +7492,8 @@ TEST(target_transform, h2_forward_rejects_recorded_effect_before_proxy) {
     H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
     loop.backend.clear_ops();
 
-    h2_invoke_emit(dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true);
+    h2_invoke_emit(
+        dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
 
     CHECK(conn->target_transform_recorded);
     CHECK(dispatch.resp_len > 0);  // local 400 is staged, never proxied
@@ -7519,8 +7520,17 @@ TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_st
         u8 response[8192]{};
         H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
         loop.backend.clear_ops();
-        h2_invoke_emit(
-            dispatch, 1, &route, nullptr, 0, &config, kSynth, sizeof(kSynth) - 1, false, true);
+        h2_invoke_emit(dispatch,
+                       1,
+                       &route,
+                       nullptr,
+                       0,
+                       &config,
+                       kSynth,
+                       sizeof(kSynth) - 1,
+                       false,
+                       true,
+                       false);
         CHECK(dispatch.close_after_process);
         CHECK_EQ(dispatch.resp_len, 0u);
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
@@ -7550,8 +7560,17 @@ TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_st
         H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
         deferred_preflight_handler_calls = 0;
         loop.backend.clear_ops();
-        h2_invoke_emit(
-            dispatch, 1, &route, nullptr, 0, &config, kSynth, sizeof(kSynth) - 1, false, true);
+        h2_invoke_emit(dispatch,
+                       1,
+                       &route,
+                       nullptr,
+                       0,
+                       &config,
+                       kSynth,
+                       sizeof(kSynth) - 1,
+                       false,
+                       true,
+                       false);
         CHECK(dispatch.close_after_process);
         CHECK_EQ(dispatch.resp_len, 0u);
         CHECK_EQ(deferred_preflight_handler_calls, 0u);
@@ -7578,8 +7597,17 @@ TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_st
         u8 response[8192]{};
         H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
         loop.backend.clear_ops();
-        h2_invoke_emit(
-            dispatch, 1, &route, nullptr, 0, forged.get(), kSynth, sizeof(kSynth) - 1, false, true);
+        h2_invoke_emit(dispatch,
+                       1,
+                       &route,
+                       nullptr,
+                       0,
+                       forged.get(),
+                       kSynth,
+                       sizeof(kSynth) - 1,
+                       false,
+                       true,
+                       false);
         CHECK(dispatch.close_after_process);
         CHECK_EQ(dispatch.resp_len, 0u);
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
@@ -7728,7 +7756,8 @@ TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
     u8 response[8192]{};
     H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
     loop.backend.clear_ops();
-    h2_invoke_emit(dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true);
+    h2_invoke_emit(
+        dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
     CHECK_EQ(h2.async_stream, 1u);
     CHECK_EQ(dispatch.resp_len, 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
@@ -7801,7 +7830,8 @@ TEST(http2, timer_resume_owned_body_commits_hpack_for_next_response) {
                              synth,
                              sizeof(synth) - 1,
                              false,
-                             true));
+                             true,
+                             false));
     conn->pending_handler_fn = &h2_timer_then_body_handler;
     conn->handler_state = 7;
     h2_resume_jit_handler(&loop, *conn);
@@ -7893,7 +7923,8 @@ TEST(redirect, h2_immediate_rejects_before_async_or_proxy) {
     H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
     loop.backend.clear_ops();
 
-    h2_invoke_emit(dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true);
+    h2_invoke_emit(
+        dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
 
     CHECK_EQ(h2_staged_status(dispatch.resp, dispatch.resp_len, 1), 400u);
     CHECK_EQ(h2.async_stream, 0u);
@@ -10162,7 +10193,7 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     outcome.response_body_idx = 1;
     u8 response[20000]{};
     H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
-    h2_emit_outcome(dispatch, 1, outcome, &cfg);
+    h2_emit_outcome(dispatch, 1, outcome, &cfg, false);
     CHECK_EQ(h2.outbound_stream, 1u);
     CHECK_EQ(h2.outbound_body_len, 9000u);
     CHECK_EQ(h2.outbound_body_offset, 0u);
@@ -10196,6 +10227,53 @@ TEST(http2, nonempty_response_uses_flow_controlled_data_owner) {
     CHECK_EQ(h2.streams[0].send_window, static_cast<i32>(kDefaultInitialWindowSize - sizeof(body)));
 }
 
+TEST(http2, head_return_status_keeps_length_without_body_owners) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    RouteConfig cfg{};
+    REQUIRE_EQ(cfg.add_response_body("representation", 14), 1u);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 1;
+    u8 response[512]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+
+    h2_emit_outcome(dispatch, 1, outcome, &cfg, /*is_head=*/true);
+
+    REQUIRE_GT(dispatch.resp_len, 0u);
+    CHECK_EQ(h2_staged_status(response, dispatch.resp_len, 1), 200u);
+    CHECK_EQ(h2.outbound_stream, 0u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    CHECK_EQ(h2.outbound_body, nullptr);
+    CHECK_EQ(h2.queued_body, nullptr);
+    CHECK(h2.response_flush_pending);
+    const Http2Stream* head_stream = h2.find_stream(1);
+    REQUIRE(head_stream != nullptr);
+    CHECK(head_stream->state == Http2StreamState::HalfClosedLocal);
+    bool has_data = false;
+    for (u32 pos = 0; pos + kFrameHeaderSize <= dispatch.resp_len;) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(response + pos, dispatch.resp_len - pos, &frame),
+                   ParseStatus::Complete);
+        REQUIRE_LE(pos + kFrameHeaderSize + frame.length, dispatch.resp_len);
+        has_data |= frame.type == static_cast<u8>(Http2FrameType::Data);
+        pos += kFrameHeaderSize + frame.length;
+    }
+    CHECK_FALSE(has_data);
+}
+
 TEST(http2, configured_205_body_is_suppressed) {
     SmallLoop loop;
     loop.setup();
@@ -10221,7 +10299,7 @@ TEST(http2, configured_205_body_is_suppressed) {
     outcome.response_body_idx = 1;
     u8 response[512]{};
     H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
-    h2_emit_outcome(dispatch, 1, outcome, &cfg);
+    h2_emit_outcome(dispatch, 1, outcome, &cfg, false);
     CHECK_EQ(h2_staged_status(response, dispatch.resp_len, 1), 205u);
     CHECK_EQ(h2.outbound_body_len, 0u);
     // Exactly one HEADERS frame carrying END_STREAM; no DATA frame follows.
@@ -10258,7 +10336,7 @@ TEST(http2, flow_controlled_route_body_boundaries_and_window_resume) {
         outcome.response_body_idx = 1;
         memset(wire, 0, sizeof(wire));
         H2Dispatch<SmallLoop> dispatch{&loop, conn, wire, sizeof(wire), 0, false, false};
-        h2_emit_outcome(dispatch, 1, outcome, &cfg);
+        h2_emit_outcome(dispatch, 1, outcome, &cfg, false);
         REQUIRE_EQ(h2.outbound_body_len, body_len);
         const u32 header_len = dispatch.resp_len;
         h2.conn_send_window = 0;
@@ -85024,7 +85102,8 @@ TEST(http2, timer_suspend_reanchors_request_overrides) {
                              synth,
                              sizeof(synth),
                              /*request_body_followed=*/false,
-                             /*request_forwardable=*/true));
+                             /*request_forwardable=*/true,
+                             /*is_head=*/false));
     CHECK(conn.req_path_override.ptr == reinterpret_cast<const char*>(h2.pending_synth + 4));
     CHECK(conn.req_header_overrides[0].name.ptr ==
           reinterpret_cast<const char*>(h2.pending_synth + 16));

@@ -361,14 +361,22 @@ TEST(http2_conn, coalesced_rst_cancels_parked_stream) {
     c.process(in, inlen, out, sizeof(out), &ow);
     // Serving layer parks stream 1 on the single async slot.
     c.async_stream = 1;
+    c.async_is_head = true;
     c.async_kind = H2AsyncKind::Proxy;
+    // The engine owns the deferred-upload slot reset before invoking the
+    // serving-layer reset callback.
+    c.pending_stream = 1;
+    c.pending_is_head = true;
     u8 rf[kFrameHeaderSize + 4];
     u32 rn = write_rst_stream(rf, 1, Http2Error::Cancel);
     ow = 0;
     Http2Result r = c.process(rf, rn, out, sizeof(out), &ow);
     CHECK_EQ(r.consumed, rn);  // control frame drained past the park, not buffered
     CHECK_EQ(c.async_stream, 0u);
+    CHECK_FALSE(c.async_is_head);
     CHECK(c.async_kind == H2AsyncKind::None);
+    CHECK_EQ(c.pending_stream, 0u);
+    CHECK_FALSE(c.pending_is_head);
 }
 
 // Complement: a NEW request's HEADERS coalesced behind a parked stream stays
@@ -1093,6 +1101,62 @@ TEST(http2_conn, write_response_with_body_and_headers) {
     parse_frame_header(out + kFrameHeaderSize + h.length, n - kFrameHeaderSize - h.length, &df);
     CHECK_EQ(df.type, static_cast<u8>(Http2FrameType::Data));
     CHECK((df.flags & http2_flag::kEndStream) != 0);
+}
+
+TEST(http2_conn, write_head_headers_with_representation_length_is_transactional) {
+    const hpack::Header hdrs[] = {{{"x-head-check", 12}, {"enabled", 7}}};
+    u8 out[256];
+
+    hpack::Encoder failed_enc;
+    failed_enc.init(4096);
+    const u32 failed_entries = failed_enc.dyn.nent;
+    CHECK_EQ(http2_write_head_response_headers(
+                 out, 1, failed_enc, 1, 200, hdrs, 1, /*representation_length=*/12),
+             0u);
+    CHECK_EQ(failed_enc.dyn.nent, failed_entries);
+    CHECK_EQ(failed_enc.pending_size_update, -1);
+    CHECK_EQ(failed_enc.pending_min_size, -1);
+
+    hpack::Encoder enc;
+    enc.init(4096);
+    const u32 n = http2_write_head_response_headers(
+        out, sizeof(out), enc, 1, 200, hdrs, 1, /*representation_length=*/12);
+    REQUIRE(n != 0);
+    Http2FrameHeader h;
+    REQUIRE(parse_frame_header(out, n, &h) == ParseStatus::Complete);
+    CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK_EQ(n, kFrameHeaderSize + h.length);  // no trailing DATA frame
+    CHECK((h.flags & http2_flag::kEndHeaders) != 0);
+    CHECK((h.flags & http2_flag::kEndStream) != 0);
+
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[16];
+    u8 scratch[256];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       out + kFrameHeaderSize,
+                                       h.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       16,
+                                       &decoded_count));
+    bool has_status = false;
+    bool has_custom = false;
+    bool has_length = false;
+    for (u32 i = 0; i < decoded_count; i++) {
+        if (decoded[i].name.eq(Str{":status", 7}) && decoded[i].value.eq(Str{"200", 3}))
+            has_status = true;
+        if (decoded[i].name.eq(Str{"x-head-check", 12}) && decoded[i].value.eq(Str{"enabled", 7}))
+            has_custom = true;
+        if (decoded[i].name.eq(Str{"content-length", 14}) && decoded[i].value.eq(Str{"12", 2}))
+            has_length = true;
+    }
+    CHECK(has_status);
+    CHECK(has_custom);
+    CHECK(has_length);
+    CHECK_GT(enc.dyn.nent, 0u);  // successful serialization committed HPACK state
 }
 
 // http2_write_response must refuse (return 0) rather than overflow its fixed 8 KiB
