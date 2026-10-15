@@ -2198,6 +2198,7 @@ void pipeline_dispatch(Loop* loop, Connection& conn) {
 // witnesses so malformed line endings cannot hide a later TE field; this does
 // not accept those line endings. The scan is restricted to the first complete
 // HTTP/1 header block; body and pipelined successor bytes are never considered.
+// Empty malformed segments are skipped so only the header bound ends the scan.
 // Successful parses keep using ParsedRequest's classification. The parse-error
 // path also rejects a leading line break after optional OWS because its
 // request-line boundary cannot be trusted.
@@ -2220,7 +2221,6 @@ inline bool http1_raw_header_has_transfer_encoding(const u8* data, u32 header_en
             line_end++;
         if (line_end == header_end) return false;
         const u32 content_end = line_end;
-        if (content_end == pos) return false;
 
         if (!request_line) {
             u32 colon = pos;

@@ -27115,6 +27115,21 @@ TEST(request_framing, public_source_rejects_bare_cr_te_before_upstream_iouring) 
     run_public_source_transfer_encoding_rejection<IoUringEventLoop>(_tc, kRequest);
 }
 
+TEST(request_framing, public_source_rejects_empty_cr_segment_te_before_upstream_epoll) {
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\r\nHost: x\r\rTransfer-Encoding: chunked\r\n\r\n"
+        "0\r\n\r\nGET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+    run_public_source_transfer_encoding_rejection<EpollEventLoop>(_tc, kRequest);
+}
+
+TEST(request_framing, public_source_rejects_empty_cr_segment_te_before_upstream_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\r\nHost: x\r\rTransfer-Encoding: chunked\r\n\r\n"
+        "0\r\n\r\nGET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+    run_public_source_transfer_encoding_rejection<IoUringEventLoop>(_tc, kRequest);
+}
+
 TEST(route, public_ordinary_source_unmatched_options_star_nginx_400_zero_upstream_iouring) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
