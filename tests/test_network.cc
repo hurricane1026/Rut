@@ -34231,6 +34231,89 @@ TEST(metadata, ordinary_205_response_suppresses_representation_body) {
     }
 }
 
+TEST(metadata, ordinary_head_formatters_keep_representation_length_without_body) {
+    const auto wire = [](Connection& conn) {
+        return std::string(reinterpret_cast<const char*>(conn.send_buf.data()),
+                           conn.send_buf.len());
+    };
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_static_response(conn, 200, true, true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_response_with_body(conn, 200, "body", 4, true, true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                 "Content-Type: text/plain; charset=utf-8\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        ResponseHeaderKV headers[] = {{"X-Test", 6, "yes", 3}};
+        CHECK(format_response_with_body_and_headers(
+            conn, 200, "body", 4, headers, 1, true, false, false, true));
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                 "Content-Type: text/plain; charset=utf-8\r\nX-Test: yes\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_response_with_body(conn, 205, "ignored", 7, true, true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[128]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        char value[160]{};
+        memset(value, 'x', sizeof(value));
+        ResponseHeaderKV headers[] = {{"X-Large", 7, value, sizeof(value)}};
+        CHECK_FALSE(format_response_with_body_and_headers(
+            conn, 200, "representation", 14, headers, 1, true, false, false, true, true));
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n"
+                 "Connection: close\r\n\r\n");
+        CHECK_EQ(conn.resp_status, 500u);
+        CHECK_FALSE(conn.keep_alive);
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[128]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        char value[160]{};
+        memset(value, 'x', sizeof(value));
+        ResponseHeaderKV headers[] = {{"X-Large", 7, value, sizeof(value)}};
+        CHECK_FALSE(format_response_with_body_and_headers(
+            conn, 200, "representation", 14, headers, 1, true, false, false, true));
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n"
+                 "Connection: close\r\n\r\nInternal Server Error");
+        CHECK_EQ(conn.resp_status, 500u);
+        CHECK_FALSE(conn.keep_alive);
+    }
+}
+
 TEST(local_response_persistence, exact_request_boundary_matrix) {
     SmallLoop loop;
     loop.setup();
@@ -34454,10 +34537,38 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     }
     {
         auto loop = make_loop();
+        Connection* conn = dispatch(*loop, nullptr, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+        REQUIRE(conn != nullptr);
+        check_wire(*conn, true);
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 2\r\n"));
+        CHECK_EQ(
+            std::string(reinterpret_cast<const char*>(conn->send_buf.data()), conn->send_buf.len()),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+            "Connection: keep-alive\r\n\r\n");
+        u32 header_end = 0;
+        for (u32 i = 0; i + 4 <= conn->send_buf.len(); ++i) {
+            if (memcmp(conn->send_buf.data() + i, "\r\n\r\n", 4) == 0) {
+                header_end = i + 4;
+                break;
+            }
+        }
+        CHECK_EQ(conn->send_buf.len(), header_end);
+    }
+    {
+        auto loop = make_loop();
         Connection* conn =
             dispatch(*loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, false);
+    }
+    {
+        auto loop = make_loop();
+        Connection* conn =
+            dispatch(*loop, nullptr, "HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        REQUIRE(conn != nullptr);
+        check_wire(*conn, false);
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 2\r\n"));
+        CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "\r\nOK"));
     }
     {
         auto loop = make_loop();
@@ -34469,6 +34580,17 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
                                     "Connection: keep-alive\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, true);  // lifecycle only; #282 owns the status-line version
+    }
+    {
+        auto loop = make_loop();
+        RouteConfig config{};
+        REQUIRE(config.add_static("/local", kRouteMethodHead, 200));
+        Connection* conn = dispatch(*loop, &config, "HEAD /local HTTP/1.1\r\nHost: x\r\n\r\n");
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, 200u);
+        check_wire(*conn, true);
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 2\r\n"));
+        CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "\r\nOK"));
     }
     {
         auto loop = make_loop();
@@ -34491,6 +34613,21 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
         REQUIRE(conn != nullptr);
         CHECK_EQ(conn->resp_status, 200u);
         check_wire(*conn, true);
+    }
+    {
+        auto loop = make_loop();
+        ShardMetrics shard{};
+        shard.init();
+        ShardMetrics* shards[] = {&shard};
+        loop->all_shard_metrics = shards;
+        loop->shard_metrics_count = 1;
+        Connection* conn = dispatch(*loop, nullptr, "HEAD /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, 200u);
+        check_wire(*conn, true);
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 2\r\n"));
+        CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "# HELP"));
+        CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "\r\nOK"));
     }
     {
         auto loop = make_loop();
@@ -83421,6 +83558,68 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
         CHECK_EQ(conn->local_body_cursor, nullptr);
         CHECK_EQ(conn->local_response_size, 0u);
     }
+}
+
+TEST(response_headers, head_large_config_body_never_arms_segmented_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    RouteConfig cfg{};
+    static u8 body[1u << 20];
+    REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)), 1u);
+    struct FileGuard {
+        i32 fd;
+        ~FileGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } file_guard{memfd_create("head-large-config-body", MFD_CLOEXEC)};
+    REQUIRE_GE(file_guard.fd, 0);
+    REQUIRE_EQ(write(file_guard.fd, body, sizeof(body)), static_cast<ssize_t>(sizeof(body)));
+    const i32 file = file_guard.fd;
+    cfg.response_bodies[0].file_ref = static_cast<u32>(file) + 1;
+    const char* keys[] = {"X-Test"};
+    const u32 key_lens[] = {6};
+    const char* values[] = {"head"};
+    const u32 value_lens[] = {4};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 1), 1u);
+    conn->request_config = &cfg;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Head);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 1;
+    outcome.response_headers_idx = 1;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 1048576\r\n"));
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "X-Test: head\r\n"));
+    CHECK_EQ(conn->local_body_remaining, 0u);
+    CHECK_EQ(conn->local_body_file_fd, -1);
+    CHECK_EQ(conn->local_body_cursor, nullptr);
+    CHECK_EQ(conn->local_body_base, nullptr);
+    CHECK_EQ(conn->local_response_size, 0u);
+    u32 header_end = 0;
+    for (u32 i = 0; i + 4 <= conn->send_buf.len(); ++i) {
+        if (memcmp(conn->send_buf.data() + i, "\r\n\r\n", 4) == 0) {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(conn->send_buf.len(), header_end);
+    const u32 partial = header_end / 2;
+    REQUIRE_GT(partial, 0u);
+    on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, partial));
+    CHECK_EQ(conn->send_progress, partial);
+    auto* retry = loop.backend.last_op(MockOp::Send);
+    REQUIRE(retry != nullptr);
+    CHECK_EQ(retry->send_buf, conn->send_buf.data() + partial);
+    CHECK_EQ(retry->send_len, header_end - partial);
+    on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, -1));
+    CHECK_EQ(conn->fd, -1);
+    CHECK_EQ(conn->local_body_remaining, 0u);
+    CHECK_EQ(conn->local_body_file_fd, -1);
 }
 
 TEST(send_follow_up, bounded_body_corks_only_committed_following_bytes) {

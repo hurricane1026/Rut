@@ -634,6 +634,18 @@ an END_STREAM HEADERS frame with no DATA and omits `content-length` for the zero
 length. A configured body for one of those statuses is dropped on the wire
 rather than committed; it is not a commit failure.
 
+Ordinary HTTP/1 local publishers honor a parsed `HEAD` request by retaining the
+selected response status and representation headers, including the
+representation `Content-Length`, while emitting no body bytes. This applies to
+JIT status/body responses, static and default responses, and ordinary local
+firewall, rate-limit, request-body rejection, and JIT-failure responses. Large
+configured bodies do not acquire a memory, sendfile, or TLS continuation owner
+for HEAD; completion and access-log response size count the actual header bytes
+sent. Route matching remains unchanged. The explicit strict-local and proxy
+policies retain their own method behavior. Metrics endpoint matching and
+redirect admission remain GET-only. Ordinary HTTP/2 HEAD response publishing is
+a separate pending capability and is not described as implemented here.
+
 The `body: b"..."` byte-string form is the exact-byte alternative: it decodes
 `\n`, `\r`, `\t`, `\\`, `\"`, and `\xNN` to exact bytes and is limited to 4096
 decoded bytes (the same bound as the failure/strict exact-byte bodies), while

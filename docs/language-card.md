@@ -259,6 +259,14 @@ omits `content-length` for the zero length. A configured body for one of those
 statuses is dropped on the wire (it is not a commit failure), matching the
 ordinary local-response framing for the other no-body statuses.
 
+For ordinary local HTTP/1 responses, a parsed `HEAD` request uses the selected
+publisher's status and representation headers, including its representation
+`Content-Length`, and emits no response body bytes. Large configured bodies do
+not start memory, file, or TLS body continuations for HEAD. This bounded runtime
+behavior does not change route matching, the explicit strict-local or proxy
+response policies, GET-only metrics and redirect admission, or HTTP/2 ordinary
+response handling; those remain separate behavior and capability boundaries.
+
 ## State types (top-level, per-shard, bounded)
 
 ```swift

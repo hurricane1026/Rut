@@ -906,7 +906,7 @@ void format_response_with_body(Connection& conn,
     // default formatter for those codes even if a body was supplied.
     const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     if (kNoBody) {
-        format_static_response(conn, code, keep_alive);
+        format_static_response(conn, code, keep_alive, headers_only);
         return;
     }
     const char* reason = status_reason(code);
@@ -1001,7 +1001,8 @@ bool format_response_with_body_and_headers(Connection& conn,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase,
                                            bool suppress_default_content_type,
-                                           bool headers_only) {
+                                           bool headers_only,
+                                           bool fallback_headers_only) {
     const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     const u32 body_len_emit = kNoBody ? 0 : body_len;
     const char* reason = status_reason(code);
@@ -1065,7 +1066,7 @@ bool format_response_with_body_and_headers(Connection& conn,
         // the original status rather than the 500 we actually sent.
         conn.resp_status = 500;
         conn.keep_alive = false;
-        format_static_response(conn, 500, /*keep_alive=*/false);
+        format_static_response(conn, 500, /*keep_alive=*/false, fallback_headers_only);
         return false;
     }
 

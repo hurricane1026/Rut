@@ -990,6 +990,8 @@ struct ResponseHeaderKV {
     const char* value_data;
     u32 value_len;
 };
+// `headers_only` omits the successful-response body, for either staged-body
+// ownership or HEAD; `fallback_headers_only` carries HEAD semantics into overflow.
 bool format_response_with_body_and_headers(Connection& conn,
                                            u16 code,
                                            const char* body_data,
@@ -999,7 +1001,8 @@ bool format_response_with_body_and_headers(Connection& conn,
                                            bool keep_alive,
                                            bool body_is_fallback_reason_phrase = false,
                                            bool suppress_default_content_type = false,
-                                           bool headers_only = false);
+                                           bool headers_only = false,
+                                           bool fallback_headers_only = false);
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
 inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config);
 inline bool build_redirect_response(const Connection& conn,
@@ -2432,7 +2435,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     }
     if (config && !config->firewall_allows_peer(conn.peer_addr, conn.peer_port)) {
         conn.resp_status = 403;
-        format_static_response(conn, 403, /*keep_alive=*/false);
+        format_static_response(conn,
+                               403,
+                               /*keep_alive=*/false,
+                               conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.keep_alive = false;
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2595,7 +2601,10 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         const u32 kRouteIdx = static_cast<u32>(route - config->routes);
         if (rate_limit_exceeded(loop, route->rate_limit, kRouteIdx, key_in, monotonic_us())) {
             conn.resp_status = 429;
-            format_static_response(conn, 429, /*keep_alive=*/false);
+            format_static_response(conn,
+                                   429,
+                                   /*keep_alive=*/false,
+                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2716,14 +2725,20 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_status = route->status_code;
         conn.keep_alive =
             ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/kKeepAlive);
-        format_static_response(conn, route->status_code, conn.keep_alive);
+        format_static_response(conn,
+                               route->status_code,
+                               conn.keep_alive,
+                               conn.req_method == static_cast<u8>(LogHttpMethod::Head));
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
         if (route->needs_req_body) {
             if (conn.req_body_mode == BodyMode::Chunked) {
                 conn.resp_status = 400;
-                format_static_response(conn, 400, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       400,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2760,12 +2775,16 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_status = kStatusOK;
         conn.keep_alive =
             ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/kKeepAlive);
-        conn.send_buf.reset();
-        if (conn.keep_alive)
-            conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), kResponse200Len);
-        else
-            conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
-                                kResponse200CloseLen);
+        if (conn.req_method == static_cast<u8>(LogHttpMethod::Head)) {
+            format_static_response(conn, 200, conn.keep_alive, /*headers_only=*/true);
+        } else {
+            conn.send_buf.reset();
+            if (conn.keep_alive)
+                conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), kResponse200Len);
+            else
+                conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
+                                    kResponse200CloseLen);
+        }
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     }
@@ -3476,6 +3495,7 @@ void handle_jit_outcome(Loop* loop,
         case JitDispatchOutcome::Kind::ReturnStatus: {
             conn.pending_handler_fn = nullptr;
             conn.resp_status = outcome.status_code;
+            const bool is_head = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
             const bool effective_keep_alive =
                 ordinary_local_response_may_persist(loop, conn, keep_alive);
             conn.keep_alive = effective_keep_alive;
@@ -3498,7 +3518,7 @@ void handle_jit_outcome(Loop* loop,
             if constexpr (requires(Loop* candidate, Connection& c) {
                               candidate->submit_send_file(c, 0, 0u, 0u);
                           }) {
-                if (segmented_body && !conn.tls_active) {
+                if (segmented_body && !is_head && !conn.tls_active) {
                     const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                     direct_file_body = body.data != nullptr && body.file_fd() >= 0;
                 }
@@ -3520,7 +3540,7 @@ void handle_jit_outcome(Loop* loop,
                                                     &suppress_default_content_type)) {
                 conn.resp_status = 500;
                 conn.keep_alive = false;
-                format_static_response(conn, 500, false);
+                format_static_response(conn, 500, false, is_head);
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -3565,7 +3585,8 @@ void handle_jit_outcome(Loop* loop,
                                                           effective_keep_alive,
                                                           body_is_fallback,
                                                           suppress_default_content_type,
-                                                          segmented_body);
+                                                          segmented_body || is_head,
+                                                          is_head);
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(conn,
@@ -3573,11 +3594,11 @@ void handle_jit_outcome(Loop* loop,
                                           body.data,
                                           body.len,
                                           effective_keep_alive,
-                                          segmented_body);
+                                          segmented_body || is_head);
             } else {
-                format_static_response(conn, outcome.status_code, effective_keep_alive);
+                format_static_response(conn, outcome.status_code, effective_keep_alive, is_head);
             }
-            if (segmented_body && response_formatted) {
+            if (segmented_body && response_formatted && !is_head) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 const u32 n = direct_file_body ? 0
                                                : (body.len < conn.send_buf.write_avail()
@@ -3635,7 +3656,10 @@ void handle_jit_outcome(Loop* loop,
             // wait(ms) semantics.
             conn.pending_handler_fn = nullptr;
             conn.resp_status = 500;
-            format_static_response(conn, 500, /*keep_alive=*/false);
+            format_static_response(conn,
+                                   500,
+                                   /*keep_alive=*/false,
+                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             // schedule_yield_timer already called timer.remove(&conn);
@@ -3667,7 +3691,10 @@ void handle_jit_outcome(Loop* loop,
                 if (conn.fd < 0) return;
                 conn.pending_handler_fn = nullptr;
                 conn.resp_status = 500;
-                format_static_response(conn, 500, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       500,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -4804,7 +4831,10 @@ void handle_jit_outcome(Loop* loop,
             // fail closed with 500 rather than hang.
             conn.pending_handler_fn = nullptr;
             conn.resp_status = 500;
-            format_static_response(conn, 500, /*keep_alive=*/false);
+            format_static_response(conn,
+                                   500,
+                                   /*keep_alive=*/false,
+                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
