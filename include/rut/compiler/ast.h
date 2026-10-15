@@ -1131,12 +1131,10 @@ private:
         for (u32 i = 0; i < stmt_pool.len; i++) rebase_stmt(other, stmt_pool[i]);
         for (u32 i = 0; i < items.len; i++) {
             switch (items[i].kind) {
-                // These declarations contain only inline values and non-owning
-                // source views; none refer to AstFile's rebased pools.
+                // These declarations contain no references to AstFile's rebased pools.
                 case AstItemKind::Upstream:
                 case AstItemKind::Import:
                 case AstItemKind::Using:
-                    break;
                 case AstItemKind::Listen:
                 case AstItemKind::AccessLog:
                     break;
