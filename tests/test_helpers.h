@@ -44,6 +44,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     bool close_on_failed_send = false;
     u32 send_submit_attempts = 0;
     UpstreamConcurrency* upstream_cc = nullptr;
+    bool fail_response_header_alloc = false;
     bool fail_next_recv_submit = false;
     bool fail_next_upstream_recv_submit = false;
 
@@ -77,6 +78,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         }
         return true;
     }
+
+    // The zero-prefix TLS-overflow resume path does not process TLS input,
+    // but its template requires the production loop interface to be present.
+    bool process_buffered_tls_input(Connection& /*conn*/) { return true; }
 
     bool is_draining() const { return draining; }
     bool upstream_acquire(u16 uid, u32 max) {
@@ -122,6 +127,8 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         running = true;
         close_on_failed_send = false;
         send_submit_attempts = 0;
+        upstream_cc = nullptr;
+        fail_response_header_alloc = false;
         fail_next_recv_submit = false;
         fail_next_upstream_recv_submit = false;
         draining = false;
@@ -158,6 +165,7 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
     }
 
     bool alloc_response_header_buf(ConnectionBase& c) {
+        if (fail_response_header_alloc) return false;
         if (c.response_header_slice) return true;
         c.response_header_slice = response_header_storage[c.id];
         c.response_header_buf.bind(response_header_storage[c.id], kBufSize);
@@ -506,6 +514,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u32 shard_id = 0;
     bool running = true;
     bool fail_pause_recv = false;
+    UpstreamConcurrency* upstream_cc = nullptr;
+    bool fail_response_header_alloc = false;
 
     static constexpr u32 kMaxConns = 64;
     static constexpr u32 kBufSize = 4096;
@@ -528,7 +538,17 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u8 upstream_recv_storage[kMaxConns][kBufSize];
     u8 response_header_storage[kMaxConns][kBufSize];
 
+    // The zero-prefix TLS-overflow resume path does not process TLS input,
+    // but its template requires the production loop interface to be present.
+    bool process_buffered_tls_input(Connection& /*conn*/) { return true; }
+
     bool is_draining() const { return draining; }
+    bool upstream_acquire(u16 uid, u32 max) {
+        return upstream_cc ? upstream_cc->try_acquire(uid, max) : true;
+    }
+    void upstream_release(u16 uid) {
+        if (upstream_cc) upstream_cc->release(uid);
+    }
 
     // Per-shard control plane pointers (mirrors EventLoop for testing).
     const RouteConfig** config_ptr = nullptr;
@@ -560,6 +580,7 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     }
 
     bool alloc_response_header_buf(ConnectionBase& c) {
+        if (fail_response_header_alloc) return false;
         if (c.response_header_slice) return true;
         c.response_header_slice = response_header_storage[c.id];
         c.response_header_buf.bind(response_header_storage[c.id], kBufSize);
@@ -569,6 +590,8 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     void setup() {
         running = true;
         fail_pause_recv = false;
+        upstream_cc = nullptr;
+        fail_response_header_alloc = false;
         draining = false;
         access_log = nullptr;
         live_access_log = nullptr;

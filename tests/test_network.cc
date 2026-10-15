@@ -39,6 +39,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -34426,6 +34427,89 @@ TEST(metadata, ordinary_205_response_suppresses_representation_body) {
     }
 }
 
+TEST(metadata, ordinary_head_formatters_keep_representation_length_without_body) {
+    const auto wire = [](Connection& conn) {
+        return std::string(reinterpret_cast<const char*>(conn.send_buf.data()),
+                           conn.send_buf.len());
+    };
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_static_response(conn, 200, true, true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_response_with_body(conn, 200, "body", 4, true, true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                 "Content-Type: text/plain; charset=utf-8\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        ResponseHeaderKV headers[] = {{"X-Test", 6, "yes", 3}};
+        CHECK(format_response_with_body_and_headers(
+            conn, 200, "body", 4, headers, 1, true, false, false, true));
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n"
+                 "Content-Type: text/plain; charset=utf-8\r\nX-Test: yes\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[1024]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        format_response_with_body(conn, 205, "ignored", 7, true, true);
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 205 Reset Content\r\nContent-Length: 0\r\n"
+                 "Connection: keep-alive\r\n\r\n");
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[128]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        char value[160]{};
+        memset(value, 'x', sizeof(value));
+        ResponseHeaderKV headers[] = {{"X-Large", 7, value, sizeof(value)}};
+        CHECK_FALSE(format_response_with_body_and_headers(
+            conn, 200, "representation", 14, headers, 1, true, false, false, true, true));
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n"
+                 "Connection: close\r\n\r\n");
+        CHECK_EQ(conn.resp_status, 500u);
+        CHECK_FALSE(conn.keep_alive);
+    }
+    {
+        Connection conn;
+        conn.reset();
+        u8 storage[128]{};
+        conn.send_buf.bind(storage, sizeof(storage));
+        char value[160]{};
+        memset(value, 'x', sizeof(value));
+        ResponseHeaderKV headers[] = {{"X-Large", 7, value, sizeof(value)}};
+        CHECK_FALSE(format_response_with_body_and_headers(
+            conn, 200, "representation", 14, headers, 1, true, false, false, true));
+        CHECK_EQ(wire(conn),
+                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n"
+                 "Connection: close\r\n\r\nInternal Server Error");
+        CHECK_EQ(conn.resp_status, 500u);
+        CHECK_FALSE(conn.keep_alive);
+    }
+}
+
 TEST(local_response_persistence, exact_request_boundary_matrix) {
     SmallLoop loop;
     loop.setup();
@@ -34649,10 +34733,38 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
     }
     {
         auto loop = make_loop();
+        Connection* conn = dispatch(*loop, nullptr, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n");
+        REQUIRE(conn != nullptr);
+        check_wire(*conn, true);
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 2\r\n"));
+        CHECK_EQ(
+            std::string(reinterpret_cast<const char*>(conn->send_buf.data()), conn->send_buf.len()),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+            "Connection: keep-alive\r\n\r\n");
+        u32 header_end = 0;
+        for (u32 i = 0; i + 4 <= conn->send_buf.len(); ++i) {
+            if (memcmp(conn->send_buf.data() + i, "\r\n\r\n", 4) == 0) {
+                header_end = i + 4;
+                break;
+            }
+        }
+        CHECK_EQ(conn->send_buf.len(), header_end);
+    }
+    {
+        auto loop = make_loop();
         Connection* conn =
             dispatch(*loop, nullptr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, false);
+    }
+    {
+        auto loop = make_loop();
+        Connection* conn =
+            dispatch(*loop, nullptr, "HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        REQUIRE(conn != nullptr);
+        check_wire(*conn, false);
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 2\r\n"));
+        CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "\r\nOK"));
     }
     {
         auto loop = make_loop();
@@ -34664,6 +34776,17 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
                                     "Connection: keep-alive\r\n\r\n");
         REQUIRE(conn != nullptr);
         check_wire(*conn, true);  // lifecycle only; #282 owns the status-line version
+    }
+    {
+        auto loop = make_loop();
+        RouteConfig config{};
+        REQUIRE(config.add_static("/local", kRouteMethodHead, 200));
+        Connection* conn = dispatch(*loop, &config, "HEAD /local HTTP/1.1\r\nHost: x\r\n\r\n");
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, 200u);
+        check_wire(*conn, true);
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 2\r\n"));
+        CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "\r\nOK"));
     }
     {
         auto loop = make_loop();
@@ -34686,6 +34809,21 @@ TEST(local_response_persistence, ordinary_publishers_share_wire_and_lifecycle_de
         REQUIRE(conn != nullptr);
         CHECK_EQ(conn->resp_status, 200u);
         check_wire(*conn, true);
+    }
+    {
+        auto loop = make_loop();
+        ShardMetrics shard{};
+        shard.init();
+        ShardMetrics* shards[] = {&shard};
+        loop->all_shard_metrics = shards;
+        loop->shard_metrics_count = 1;
+        Connection* conn = dispatch(*loop, nullptr, "HEAD /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        REQUIRE(conn != nullptr);
+        CHECK_EQ(conn->resp_status, 200u);
+        check_wire(*conn, true);
+        CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 2\r\n"));
+        CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "# HELP"));
+        CHECK_FALSE(buf_has(conn->send_buf.data(), conn->send_buf.len(), "\r\nOK"));
     }
     {
         auto loop = make_loop();
@@ -37807,6 +37945,117 @@ static u64 state_invariant_wait_recv_then_status(
         return jit::HandlerResult::make_status(got_recv ? 204 : 500).pack();
     }
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Recv).pack();
+}
+
+template <typename Loop>
+static void check_event_yield_502_body(
+    rut::test::TestCase* _tc, Loop& loop, jit::YieldKind kind, u32 failure_case, bool is_head) {
+    loop.setup();
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    conn->req_method = static_cast<u8>(is_head ? LogHttpMethod::Head : LogHttpMethod::Get);
+    loop.timer.add(conn, loop.keepalive_timeout);
+
+    RouteConfig cfg;
+    if (failure_case == 1 || failure_case == 4) {
+        REQUIRE(cfg.add_upstream("api", 0x7F000001, 9000).has_value());
+        conn->request_config = &cfg;
+    }
+    if (kind == jit::YieldKind::UpstreamSend || kind == jit::YieldKind::UpstreamRecv) {
+        // The mock close_conn_impl only cancels and clears this descriptor;
+        // use a sentinel so no real process fd can be closed by the fixture.
+        conn->upstream_fd = 77;
+        conn->upstream_idx = 0;
+    }
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 9;
+    outcome.yield_kind = kind;
+    if (kind == jit::YieldKind::UpstreamConnect) outcome.timer_ms = failure_case == 0 ? 2 : 1;
+    if (kind == jit::YieldKind::UpstreamSend || kind == jit::YieldKind::UpstreamRecv)
+        outcome.timer_ms = 1;
+
+    if (failure_case == 1) loop.backend.fail_connect = true;
+    if (failure_case == 2) loop.backend.fail_upstream_send = true;
+    if (failure_case == 3) loop.backend.fail_upstream_recv = true;
+    if (failure_case == 4) {
+        rut::test_fault::ScopedSocketFailure fail_socket;
+        handle_jit_outcome<Loop>(
+            &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+    } else {
+        handle_jit_outcome<Loop>(
+            &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+    }
+    loop.backend.fail_connect = false;
+    loop.backend.fail_upstream_send = false;
+    loop.backend.fail_upstream_recv = false;
+
+    REQUIRE_EQ(conn->resp_status, kStatusBadGateway);
+    REQUIRE_EQ(conn->state, ConnState::Sending);
+    REQUIRE_EQ(conn->pending_handler_fn, nullptr);
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 11\r\n"));
+    const bool has_body =
+        buf_has(conn->send_buf.data(), conn->send_buf.len(), "\r\n\r\nBad Gateway");
+    CHECK_EQ(has_body, !is_head);
+    if (is_head) {
+        u32 header_end = 0;
+        while (header_end + 4 <= conn->send_buf.len() &&
+               __builtin_memcmp(conn->send_buf.data() + header_end, "\r\n\r\n", 4) != 0)
+            header_end++;
+        REQUIRE(header_end + 4 <= conn->send_buf.len());
+        CHECK_EQ(header_end + 4, conn->send_buf.len());
+    }
+
+    const u32 conn_id = conn->id;
+    const u32 response_len = conn->send_buf.len();
+    loop.dispatch(make_ev(conn_id, IoEventType::Send, static_cast<i32>(response_len)));
+    CHECK_EQ(conn->fd, -1);
+    CHECK_EQ(conn->on_send, nullptr);
+    CHECK_EQ(conn->pending_handler_fn, nullptr);
+    CHECK(conn->timer_node.empty());
+}
+
+TEST(state_invariant, jit_event_yield_502_suppresses_head_body_on_both_backends) {
+    // An invalid target follows the early UpstreamConnect failure arm. The GET
+    // case keeps the reason body as a wire-contract control on both templates.
+    {
+        SmallLoop loop;
+        check_event_yield_502_body(
+            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, false);
+    }
+    {
+        SmallLoop loop;
+        check_event_yield_502_body(
+            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, true);
+    }
+    {
+        AsyncSmallLoop loop;
+        check_event_yield_502_body(
+            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, false);
+    }
+    {
+        AsyncSmallLoop loop;
+        check_event_yield_502_body(
+            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, true);
+    }
+
+    const u32 failure_cases[] = {1, 4, 2, 3};
+    for (bool async_backend : {false, true}) {
+        for (u32 i = 0; i < sizeof(failure_cases) / sizeof(failure_cases[0]); i++) {
+            const jit::YieldKind kind =
+                i < 2 ? jit::YieldKind::UpstreamConnect
+                      : (i == 2 ? jit::YieldKind::UpstreamSend : jit::YieldKind::UpstreamRecv);
+            if (async_backend) {
+                AsyncSmallLoop loop;
+                check_event_yield_502_body(_tc, loop, kind, failure_cases[i], true);
+            } else {
+                SmallLoop loop;
+                check_event_yield_502_body(_tc, loop, kind, failure_cases[i], true);
+            }
+        }
+    }
 }
 
 TEST(local_response_persistence, yielded_jit_uses_pinned_request_and_publication_time_drain) {
@@ -77594,6 +77843,276 @@ TEST(state_invariant, jit_forward_closes_prior_wait_connect_socket) {
     close(new_fds[1]);
 }
 
+enum class OrdinaryHeadFailure : u8 {
+    Capacity,
+    SocketCreate,
+    ConnectSubmit,
+    InvalidTarget,
+    MutationAlloc
+};
+
+static void check_ordinary_local_error(rut::test::TestCase* _tc,
+                                       const Connection& conn,
+                                       u16 status,
+                                       bool is_head) {
+    const char* reason = status == 503   ? "Service Unavailable"
+                         : status == 504 ? "Gateway Timeout"
+                         : status == 413 ? "Payload Too Large"
+                         : status == 400 ? "Bad Request"
+                         : status == 500 ? "Internal Server Error"
+                                         : "Bad Gateway";
+    const u32 reason_len = status == 503   ? 19u
+                           : status == 504 ? 15u
+                           : status == 413 ? 17u
+                           : status == 400 ? 11u
+                           : status == 500 ? 21u
+                                           : 11u;
+    CHECK_EQ(conn.resp_status, status);
+    const u32 content_length = reason_len;
+    u32 header_end = 0;
+    for (u32 i = 0; i + 4 <= conn.send_buf.len(); ++i) {
+        if (memcmp(conn.send_buf.data() + i, "\r\n\r\n", 4) == 0) {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(conn.send_buf.len(), header_end + (is_head ? 0u : reason_len));
+    if (!is_head) CHECK(memcmp(conn.send_buf.data() + header_end, reason, reason_len) == 0);
+    char status_line[64];
+    snprintf(status_line, sizeof(status_line), "HTTP/1.1 %u %s\r\n", status, reason);
+    std::string expected = status_line;
+    expected += "Content-Length: ";
+    char length[16];
+    snprintf(length, sizeof(length), "%u", content_length);
+    expected += length;
+    expected += "\r\nConnection: close\r\n\r\n";
+    if (!is_head) expected.append(reason, reason_len);
+    const u32 compare_len =
+        conn.send_buf.len() < expected.size() ? conn.send_buf.len() : expected.size();
+    if (conn.resp_status != status || conn.send_buf.len() != expected.size() ||
+        memcmp(conn.send_buf.data(), expected.data(), compare_len) != 0) {
+        fprintf(stderr,
+                "ordinary local error expected-status %u actual-status %u head=%d actual=%.*s "
+                "expected=%s\n",
+                status,
+                conn.resp_status,
+                is_head,
+                static_cast<int>(conn.send_buf.len()),
+                reinterpret_cast<const char*>(conn.send_buf.data()),
+                expected.c_str());
+    }
+    REQUIRE_EQ(conn.send_buf.len(), expected.size());
+    CHECK(memcmp(conn.send_buf.data(), expected.data(), expected.size()) == 0);
+    CHECK_EQ(conn.state, ConnState::Sending);
+    CHECK_FALSE(conn.keep_alive);
+}
+
+template <typename Loop>
+static void finish_ordinary_local_error(rut::test::TestCase* _tc, Loop& loop, Connection& conn) {
+    const u32 id = conn.id;
+    const u32 send_len = conn.send_buf.len();
+    loop.inject_and_dispatch(make_ev(id, IoEventType::Send, static_cast<i32>(send_len)));
+    CHECK_EQ(conn.fd, -1);
+    CHECK_EQ(conn.upstream_fd, -1);
+    CHECK_FALSE(conn.upstream_slot_held);
+    CHECK_EQ(conn.on_send, nullptr);
+    CHECK_EQ(conn.on_recv, nullptr);
+    CHECK_EQ(conn.on_upstream_send, nullptr);
+    CHECK_EQ(conn.on_upstream_recv, nullptr);
+    CHECK_EQ(conn.pending_handler_fn, nullptr);
+    CHECK_EQ(conn.timer_node.next, &conn.timer_node);
+    if constexpr (requires { loop.pending_free_count; }) CHECK_EQ(loop.pending_free_count, 0u);
+    CHECK_EQ(loop.free_top, Loop::kMaxConns);
+}
+
+template <typename Loop>
+static void run_direct_proxy_head_failure(rut::test::TestCase* _tc,
+                                          OrdinaryHeadFailure failure,
+                                          bool is_head) {
+    RouteConfig cfg{};
+    const auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight =
+        failure == OrdinaryHeadFailure::Capacity ? 1u : 0u;
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(upstream.value())));
+    const RouteConfig* active = &cfg;
+    Loop loop;
+    loop.setup();
+    loop.config_ptr = &active;
+    UpstreamConcurrency concurrency{};
+    concurrency.reset();
+    loop.upstream_cc = &concurrency;
+    if (failure == OrdinaryHeadFailure::Capacity)
+        REQUIRE(concurrency.try_acquire(static_cast<u16>(upstream.value()), 1));
+    if (failure == OrdinaryHeadFailure::ConnectSubmit) loop.backend.fail_connect = true;
+    rut::test_fault::ScopedSocketFailure socket_failure_scope(
+        failure == OrdinaryHeadFailure::SocketCreate ? 1 : 0);
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    const char* request =
+        is_head ? "HEAD /api HTTP/1.1\r\nHost: x\r\n\r\n" : "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
+    const u32 request_len = static_cast<u32>(strlen(request));
+    conn->recv_buf.reset();
+    conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len);
+    loop.backend.inject(make_ev(conn->id, IoEventType::Recv, static_cast<i32>(request_len)));
+    IoEvent events[8];
+    const u32 n = loop.backend.wait(events, 8);
+    for (u32 i = 0; i < n; ++i) loop.dispatch(events[i]);
+    const u16 expected = failure == OrdinaryHeadFailure::Capacity ? 503 : 502;
+    check_ordinary_local_error(_tc, *conn, expected, is_head);
+    finish_ordinary_local_error(_tc, loop, *conn);
+    if (failure == OrdinaryHeadFailure::Capacity)
+        concurrency.release(static_cast<u16>(upstream.value()));
+}
+
+template <typename Loop>
+static void run_jit_forward_head_failure(rut::test::TestCase* _tc,
+                                         OrdinaryHeadFailure failure,
+                                         bool is_head) {
+    RouteConfig cfg{};
+    const auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    cfg.upstreams[upstream.value()].max_inflight =
+        failure == OrdinaryHeadFailure::Capacity ? 1u : 0u;
+    Loop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    // This fixture calls the JIT outcome directly, so retire the mock Accept
+    // receive owner before checking full local-response teardown.
+    conn->recv_armed = false;
+    conn->pending_ops = 0;
+    loop.backend.clear_ops();
+    conn->request_config = &cfg;
+    conn->req_method = static_cast<u8>(is_head ? LogHttpMethod::Head : LogHttpMethod::Get);
+    UpstreamConcurrency concurrency{};
+    concurrency.reset();
+    loop.upstream_cc = &concurrency;
+    if (failure == OrdinaryHeadFailure::Capacity)
+        REQUIRE(concurrency.try_acquire(static_cast<u16>(upstream.value()), 1));
+    if (failure == OrdinaryHeadFailure::ConnectSubmit) loop.backend.fail_connect = true;
+    if (failure == OrdinaryHeadFailure::MutationAlloc) {
+        conn->resp_header_mutation_count = 1;
+        loop.fail_response_header_alloc = true;
+    }
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = failure == OrdinaryHeadFailure::InvalidTarget
+                              ? static_cast<u16>(cfg.upstream_count)
+                              : static_cast<u16>(upstream.value());
+    rut::test_fault::ScopedSocketFailure socket_failure_scope(
+        failure == OrdinaryHeadFailure::SocketCreate ? 1 : 0);
+    handle_jit_outcome<Loop>(&loop, *conn, outcome, nullptr, true);
+    const u16 expected = failure == OrdinaryHeadFailure::Capacity        ? 503
+                         : failure == OrdinaryHeadFailure::MutationAlloc ? 500
+                                                                         : 502;
+    check_ordinary_local_error(_tc, *conn, expected, is_head);
+    finish_ordinary_local_error(_tc, loop, *conn);
+    if (failure == OrdinaryHeadFailure::Capacity)
+        concurrency.release(static_cast<u16>(upstream.value()));
+}
+
+TEST(state_invariant, ordinary_proxy_and_forward_failures_suppress_head_bodies) {
+    for (const bool is_head : {true, false}) {
+        for (const OrdinaryHeadFailure failure : {OrdinaryHeadFailure::Capacity,
+                                                  OrdinaryHeadFailure::SocketCreate,
+                                                  OrdinaryHeadFailure::ConnectSubmit}) {
+            run_direct_proxy_head_failure<SmallLoop>(_tc, failure, is_head);
+            run_direct_proxy_head_failure<AsyncSmallLoop>(_tc, failure, is_head);
+        }
+        for (const OrdinaryHeadFailure failure : {OrdinaryHeadFailure::Capacity,
+                                                  OrdinaryHeadFailure::SocketCreate,
+                                                  OrdinaryHeadFailure::ConnectSubmit,
+                                                  OrdinaryHeadFailure::InvalidTarget,
+                                                  OrdinaryHeadFailure::MutationAlloc}) {
+            run_jit_forward_head_failure<SmallLoop>(_tc, failure, is_head);
+            run_jit_forward_head_failure<AsyncSmallLoop>(_tc, failure, is_head);
+        }
+    }
+}
+
+enum class OrdinaryAsyncFailure : u8 {
+    ConnectCompletion,
+    ReusedEof,
+    ResponseParseError,
+    RewriteFailure
+};
+
+template <typename Loop>
+static void run_async_local_failure(rut::test::TestCase* _tc,
+                                    OrdinaryAsyncFailure failure,
+                                    bool is_head) {
+    RouteConfig cfg{};
+    const auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
+    REQUIRE(upstream.has_value());
+    Loop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    // Invoke the upstream callback directly with no mock Accept operation left
+    // outstanding; the downstream send completion then owns final reclamation.
+    conn->recv_armed = false;
+    conn->pending_ops = 0;
+    loop.backend.clear_ops();
+    conn->request_config = &cfg;
+    conn->req_method = static_cast<u8>(is_head ? LogHttpMethod::Head : LogHttpMethod::Get);
+    conn->upstream_idx = static_cast<u16>(upstream.value());
+    conn->state = ConnState::Proxying;
+    i32 fds[2];
+    REQUIRE_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    conn->upstream_fd = fds[0];
+    if (failure == OrdinaryAsyncFailure::RewriteFailure) {
+        conn->req_path_overridden = true;
+        conn->req_path_override = {"/replacement", 12};
+        conn->set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+        on_upstream_connected<Loop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    } else if (failure == OrdinaryAsyncFailure::ConnectCompletion) {
+        conn->upstream_attempts = 1;
+        conn->upstream_start_us = 1;
+        conn->set_slots(nullptr, nullptr, nullptr, &on_upstream_connected<Loop>);
+        on_upstream_connected<Loop>(
+            &loop, *conn, make_ev(conn->id, IoEventType::UpstreamConnect, -ECONNREFUSED));
+    } else if (failure == OrdinaryAsyncFailure::ReusedEof) {
+        conn->upstream_reused = true;
+        conn->request_upload_complete = true;
+        conn->on_upstream_send = nullptr;
+        conn->upstream_send_armed = false;
+        on_upstream_response<Loop>(&loop, *conn, make_ev(conn->id, IoEventType::UpstreamRecv, 0));
+    } else {
+        REQUIRE(loop.alloc_upstream_buf(*conn));
+        static constexpr char kBadResponse[] = "not an HTTP response\r\n\r\n";
+        REQUIRE_EQ(conn->upstream_recv_buf.write(reinterpret_cast<const u8*>(kBadResponse),
+                                                 sizeof(kBadResponse) - 1),
+                   sizeof(kBadResponse) - 1);
+        on_upstream_response<Loop>(
+            &loop,
+            *conn,
+            make_ev(
+                conn->id, IoEventType::UpstreamRecv, static_cast<i32>(sizeof(kBadResponse) - 1)));
+    }
+    check_ordinary_local_error(
+        _tc, *conn, failure == OrdinaryAsyncFailure::RewriteFailure ? 500 : 502, is_head);
+    close(fds[1]);
+    finish_ordinary_local_error(_tc, loop, *conn);
+}
+
+TEST(state_invariant, ordinary_async_connect_and_response_errors_suppress_head_bodies) {
+    for (const bool is_head : {true, false}) {
+        for (const OrdinaryAsyncFailure failure : {OrdinaryAsyncFailure::ConnectCompletion,
+                                                   OrdinaryAsyncFailure::ReusedEof,
+                                                   OrdinaryAsyncFailure::ResponseParseError,
+                                                   OrdinaryAsyncFailure::RewriteFailure}) {
+            run_async_local_failure<SmallLoop>(_tc, failure, is_head);
+            run_async_local_failure<AsyncSmallLoop>(_tc, failure, is_head);
+        }
+    }
+}
+
 TEST(state_invariant, jit_forward_connect_submit_failure_sends_502) {
     RouteConfig cfg;
     auto upstream = cfg.add_upstream("api", 0x7F000001, 9000);
@@ -77991,6 +78510,108 @@ TEST(state_invariant, timeout_failure_policy_forged_outcomes_reject_before_any_f
         }
         CHECK_EQ(loop.backend.count_ops(MockOp::Recv), 0u);
         CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    }
+}
+
+template <typename Loop>
+static void run_ordinary_timeout_or_overflow(rut::test::TestCase* _tc,
+                                             u16 status,
+                                             bool is_head,
+                                             bool tls_resume = false) {
+    Loop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->state = ConnState::Proxying;
+    conn->req_method = static_cast<u8>(is_head ? LogHttpMethod::Head : LogHttpMethod::Get);
+    loop.backend.clear_ops();
+    if (status == 504) {
+        respond_upstream_timeout(&loop, *conn);
+    } else if (tls_resume) {
+        conn->tls_active = true;
+        conn->set_tls_recv_overflow_resume_pending(true);
+        conn->set_tls_recv_overflow_prefix_size(0);
+        resume_request_body_tls_overflow(&loop, *conn);
+    } else {
+        respond_request_body_overflow(&loop, *conn);
+    }
+    check_ordinary_local_error(_tc, *conn, status, is_head);
+    finish_ordinary_local_error(_tc, loop, *conn);
+}
+
+template <typename Loop>
+static void run_ordinary_policy_reject(rut::test::TestCase* _tc, bool is_head, bool response) {
+    Loop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    conn->req_method = static_cast<u8>(is_head ? LogHttpMethod::Head : LogHttpMethod::Get);
+    loop.backend.clear_ops();
+    if (response)
+        reject_response_policy(&loop, *conn);
+    else
+        reject_request_policy(&loop, *conn);
+    check_ordinary_local_error(_tc, *conn, 400, is_head);
+    finish_ordinary_local_error(_tc, loop, *conn);
+}
+
+template <typename Loop>
+static void run_ordinary_response_header_alloc_failure(rut::test::TestCase* _tc, bool is_head) {
+    Loop loop;
+    loop.setup();
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    ForwardResponsePolicySpec policy{};
+    policy.version = ResponsePolicyVersion::Http11;
+    policy.framing = ResponsePolicyFraming::ContentLength;
+    policy.connection = ResponsePolicyConnection::Request;
+    policy.date = ResponsePolicyDate::Current;
+    policy.head_mode =
+        is_head ? ResponsePolicyHeadMode::SuppressBody : ResponsePolicyHeadMode::Reject;
+    policy.server = {"nginx", 5};
+    REQUIRE_EQ(cfg.add_response_policy(policy), 1u);
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE_GE(conn->fd, 0);
+    const char* request = is_head ? "HEAD /api HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                                  : "GET /api HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    const u32 request_len = static_cast<u32>(strlen(request));
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+               request_len);
+    capture_request_metadata(*conn);
+    conn->request_config = &cfg;
+    loop.fail_response_header_alloc = true;
+    loop.backend.clear_ops();
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::Forward;
+    outcome.upstream_id = 0;
+    outcome.response_policy_id = 1;
+    handle_jit_outcome<Loop>(&loop, *conn, outcome, nullptr, true);
+    check_ordinary_local_error(_tc, *conn, 502, is_head);
+    finish_ordinary_local_error(_tc, loop, *conn);
+}
+
+TEST(state_invariant, ordinary_timeout_overflow_and_policy_rejections_suppress_head_bodies) {
+    for (const bool is_head : {true, false}) {
+        for (const u16 status : {504u, 413u}) {
+            run_ordinary_timeout_or_overflow<SmallLoop>(_tc, status, is_head);
+            run_ordinary_timeout_or_overflow<AsyncSmallLoop>(_tc, status, is_head);
+            if (status == 413) {
+                run_ordinary_timeout_or_overflow<SmallLoop>(_tc, status, is_head, true);
+                run_ordinary_timeout_or_overflow<AsyncSmallLoop>(_tc, status, is_head, true);
+            }
+        }
+        run_ordinary_response_header_alloc_failure<SmallLoop>(_tc, is_head);
+        run_ordinary_response_header_alloc_failure<AsyncSmallLoop>(_tc, is_head);
+        for (const bool response : {false, true}) {
+            run_ordinary_policy_reject<SmallLoop>(_tc, is_head, response);
+            run_ordinary_policy_reject<AsyncSmallLoop>(_tc, is_head, response);
+        }
     }
 }
 
@@ -83616,6 +84237,76 @@ TEST(response_headers, large_config_body_sends_from_pinned_read_only_memory) {
         CHECK_EQ(conn->local_body_cursor, nullptr);
         CHECK_EQ(conn->local_response_size, 0u);
     }
+}
+
+TEST(response_headers, head_large_config_body_never_arms_segmented_send) {
+    SmallLoop loop;
+    loop.setup();
+    loop.inject_and_dispatch(make_ev(0, IoEventType::Accept, 42));
+    auto* conn = loop.find_fd(42);
+    REQUIRE(conn != nullptr);
+    RouteConfig cfg{};
+    static u8 body[1u << 20];
+    REQUIRE_EQ(cfg.add_response_body_view(reinterpret_cast<const char*>(body), sizeof(body)), 1u);
+    char path[] = "/tmp/rut-head-large-config-body-XXXXXX";
+    struct FileGuard {
+        i32 fd;
+        ~FileGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } file_guard{mkstemp(path)};
+    REQUIRE_GE(file_guard.fd, 0);
+    REQUIRE_EQ(unlink(path), 0);
+    size_t written = 0;
+    while (written < sizeof(body)) {
+        const ssize_t n = write(file_guard.fd, body + written, sizeof(body) - written);
+        if (n < 0 && errno == EINTR) continue;
+        REQUIRE_GT(n, 0);
+        written += static_cast<size_t>(n);
+    }
+    const i32 file = file_guard.fd;
+    cfg.response_bodies[0].file_ref = static_cast<u32>(file) + 1;
+    const char* keys[] = {"X-Test"};
+    const u32 key_lens[] = {6};
+    const char* values[] = {"head"};
+    const u32 value_lens[] = {4};
+    REQUIRE_EQ(cfg.add_response_header_set(keys, key_lens, values, value_lens, 1), 1u);
+    conn->request_config = &cfg;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Head);
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 1;
+    outcome.response_headers_idx = 1;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 1048576\r\n"));
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "X-Test: head\r\n"));
+    CHECK_EQ(conn->local_body_remaining, 0u);
+    CHECK_EQ(conn->local_body_file_fd, -1);
+    CHECK_EQ(conn->local_body_cursor, nullptr);
+    CHECK_EQ(conn->local_body_base, nullptr);
+    CHECK_EQ(conn->local_response_size, 0u);
+    u32 header_end = 0;
+    for (u32 i = 0; i + 4 <= conn->send_buf.len(); ++i) {
+        if (memcmp(conn->send_buf.data() + i, "\r\n\r\n", 4) == 0) {
+            header_end = i + 4;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(conn->send_buf.len(), header_end);
+    const u32 partial = header_end / 2;
+    REQUIRE_GT(partial, 0u);
+    on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, partial));
+    CHECK_EQ(conn->send_progress, partial);
+    auto* retry = loop.backend.last_op(MockOp::Send);
+    REQUIRE(retry != nullptr);
+    CHECK_EQ(retry->send_buf, conn->send_buf.data() + partial);
+    CHECK_EQ(retry->send_len, header_end - partial);
+    on_response_sent<SmallLoop>(&loop, *conn, make_ev(conn->id, IoEventType::Send, -1));
+    CHECK_EQ(conn->fd, -1);
+    CHECK_EQ(conn->local_body_remaining, 0u);
+    CHECK_EQ(conn->local_body_file_fd, -1);
 }
 
 TEST(send_follow_up, bounded_body_corks_only_committed_following_bytes) {

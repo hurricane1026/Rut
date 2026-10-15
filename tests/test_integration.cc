@@ -20976,6 +20976,136 @@ route GET "/old" {
     rir.destroy();
 }
 
+template <typename Backend>
+static void run_ordinary_head_pipelined_get(rut::test::TestCase* _tc, bool check_io_uring) {
+    using namespace rut;
+    if (check_io_uring && !iouring_socket_live()) SKIP("io_uring async socket ops unavailable");
+
+    static constexpr char kSource[] =
+        "listen :0\n"
+        "route HEAD \"/head\" { return response(200, body: \"hello-head\") }\n"
+        "route GET \"/head\" { return response(200, body: \"hello-head\") }\n";
+    struct SourceGuard {
+        char path[64] = "/tmp/rut_ordinary_head_XXXXXX";
+        i32 fd = -1;
+        bool present = false;
+        ~SourceGuard() {
+            if (fd >= 0) close(fd);
+            if (present) unlink(path);
+        }
+    } source;
+    source.fd = mkstemp(source.path);
+    REQUIRE_GE(source.fd, 0);
+    source.present = true;
+    u32 written = 0;
+    while (written < sizeof(kSource) - 1u) {
+        const ssize_t count = write(source.fd, kSource + written, sizeof(kSource) - 1u - written);
+        if (count < 0 && errno == EINTR) continue;
+        REQUIRE_GT(count, 0);
+        written += static_cast<u32>(count);
+    }
+    REQUIRE_EQ(close(source.fd), 0);
+    source.fd = -1;
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        ~ProgramGuard() { program.destroy(); }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+
+    Shard<Backend> shard;
+    struct ShardGuard {
+        Shard<Backend>& shard;
+        i32 listen_fd = -1;
+        i32 client_fd = -1;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (client_fd >= 0) close(client_fd);
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) shard.shutdown();
+            if (listen_fd >= 0) close(listen_fd);
+        }
+    } guard{shard};
+    guard.listen_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(guard.listen_fd, 0);
+    const u16 port = get_port(guard.listen_fd);
+    REQUIRE(shard.init(0, guard.listen_fd).has_value());
+    guard.initialized = true;
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.spawn(-1).has_value());
+    guard.spawned = true;
+
+    guard.client_fd = connect_to(port);
+    REQUIRE_GE(guard.client_fd, 0);
+    static constexpr char kRequests[] =
+        "HEAD /head HTTP/1.1\r\nHost: x\r\n\r\n"
+        "GET /head HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    REQUIRE(send_all(guard.client_fd, kRequests, sizeof(kRequests) - 1u));
+
+    char wire[2048];
+    u32 wire_len = 0;
+    bool eof = false;
+    while (wire_len < sizeof(wire)) {
+        const i32 count =
+            recv_timeout(guard.client_fd, wire + wire_len, sizeof(wire) - wire_len, 3000);
+        if (count == 0) {
+            eof = true;
+            break;
+        }
+        REQUIRE_GT(count, 0);
+        wire_len += static_cast<u32>(count);
+    }
+    REQUIRE(eof);
+    static constexpr char kExpected[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: close\r\n\r\nhello-head";
+    CHECK_EQ(wire_len, sizeof(kExpected) - 1u);
+    if (wire_len == sizeof(kExpected) - 1u)
+        CHECK_EQ(memcmp(wire, kExpected, sizeof(kExpected) - 1u), 0);
+
+    shard.stop();
+    shard.join();
+    guard.spawned = false;
+    settle_stopped_iouring_shard(shard);
+    REQUIRE(shard.loop != nullptr);
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+    if constexpr (requires { shard.loop->pending_free_count; })
+        CHECK_EQ(shard.loop->pending_free_count, 0u);
+    u32 initialized_slots = 0;
+    if constexpr (requires { shard.loop->slots_initialized; })
+        initialized_slots = shard.loop->slots_initialized;
+    else
+        initialized_slots = shard.loop->connection_capacity;
+    for (u32 i = 0; i < initialized_slots; ++i) CHECK_EQ(shard.loop->conns[i].fd, -1);
+}
+
+TEST(route, ordinary_head_pipelined_get_epoll_exact_wire_and_eof) {
+    run_ordinary_head_pipelined_get<rut::EpollEventLoop>(_tc, false);
+}
+
+#ifdef __linux__
+TEST(route, ordinary_head_pipelined_get_iouring_exact_wire_and_eof) {
+    run_ordinary_head_pipelined_get<rut::IoUringEventLoop>(_tc, true);
+}
+#endif
+
 // End-to-end DSL forward: compile `upstream backend route GET "/api"
 // { return forward(backend) }`, register the upstream in RouteConfig
 // pointing at 127.0.0.1:9999 (nothing listening → ECONNREFUSED),
