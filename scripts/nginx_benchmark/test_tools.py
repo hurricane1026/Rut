@@ -132,16 +132,61 @@ class ToolsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "frontend.log"
             log.write_text("RUT_WS_SPLICE admissions=159 client_bytes=8 upstream_bytes=9 "
-                           "calls=42 polls=3 pipe_grow_failures=1 min_pipe_capacity=65536\n")
+                           "calls=42 polls=3 read_eagain=4 write_eagain=5 "
+                           "pipe_grow_failures=1 min_pipe_capacity=65536\n")
             self.assertEqual(protocol_strategy.ws_splice_diagnostics(log), [{
                 "admissions": 159,
                 "client_bytes": 8,
                 "upstream_bytes": 9,
                 "calls": 42,
                 "polls": 3,
+                "read_eagain": 4,
+                "write_eagain": 5,
                 "pipe_grow_failures": 1,
                 "min_pipe_capacity": 65536,
             }])
+
+    def test_protocol_strategy_requires_valid_diagnostics_for_enabled_uring_splice(self):
+        label = "case-uring-current-r1"
+        valid = {
+            "ws_splice_diagnostics": [{
+                "admissions": 0,
+                "client_bytes": 0,
+                "upstream_bytes": 0,
+                "calls": 0,
+                "polls": 0,
+                "read_eagain": 0,
+                "write_eagain": 0,
+                "pipe_grow_failures": 0,
+                "min_pipe_capacity": 0,
+            }],
+        }
+        protocol_strategy.validate_ws_splice_result_diagnostics(valid, "uring", "on", label)
+        for row in ({}, {"ws_splice_diagnostics": None},
+                    {"ws_splice_diagnostics": []}, {"ws_splice_diagnostics": [{}]}):
+            with self.assertRaisesRegex(RuntimeError, "lacks valid shutdown diagnostics"):
+                protocol_strategy.validate_ws_splice_result_diagnostics(
+                    row, "uring", "on", label)
+
+    def test_protocol_strategy_disabled_splice_and_epoll_allow_missing_diagnostics(self):
+        for engine, splice_mode in (("uring", "off"), ("epoll", "on")):
+            protocol_strategy.validate_ws_splice_result_diagnostics(
+                {}, engine, splice_mode, "case-r1")
+
+    def test_protocol_strategy_reads_shutdown_diagnostics_after_stopping_frontend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "frontend.log"
+            log.write_text("runtime is still running\n")
+            stack = contextlib.ExitStack()
+            stack.callback(
+                log.write_text,
+                "RUT_WS_SPLICE admissions=1 client_bytes=64 upstream_bytes=64 "
+                "calls=2 polls=1 read_eagain=0 write_eagain=0 pipe_grow_failures=0 "
+                "min_pipe_capacity=65536\n")
+            diagnostics = protocol_strategy.shutdown_and_read_ws_splice_diagnostics(
+                stack, log, "uring", "on", "case-uring-current-r1")
+            self.assertEqual(len(diagnostics), 1)
+            self.assertEqual(diagnostics[0]["admissions"], 1)
 
     def test_api_origin_smoke_and_reuse_policy(self):
         cpu = str(min(os.sched_getaffinity(0)))

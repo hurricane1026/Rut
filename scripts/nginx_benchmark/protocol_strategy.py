@@ -136,6 +136,38 @@ def ws_splice_diagnostics(log_path):
     return records
 
 
+_WS_SPLICE_DIAGNOSTIC_FIELDS = {
+    'admissions', 'client_bytes', 'upstream_bytes', 'calls', 'polls',
+    'read_eagain', 'write_eagain', 'pipe_grow_failures', 'min_pipe_capacity',
+}
+
+
+def _valid_ws_splice_diagnostic(record):
+    return (isinstance(record, dict) and
+            _WS_SPLICE_DIAGNOSTIC_FIELDS.issubset(record) and
+            all(type(record[key]) is int and record[key] >= 0
+                for key in _WS_SPLICE_DIAGNOSTIC_FIELDS))
+
+
+def validate_ws_splice_result_diagnostics(row, engine, splice_mode, label):
+    if engine != 'uring' or splice_mode != 'on':
+        return
+    diagnostics = row.get('ws_splice_diagnostics')
+    if (not isinstance(diagnostics, list) or
+            not any(_valid_ws_splice_diagnostic(record) for record in diagnostics)):
+        raise RuntimeError('enabled io_uring splice case lacks valid shutdown diagnostics: ' + label)
+
+
+def shutdown_and_read_ws_splice_diagnostics(stack, log_path, engine, splice_mode, label):
+    # The splice summary is emitted during runtime shutdown, so stop the frontend
+    # before reading its log or persisting the measurement row.
+    stack.close()
+    diagnostics = ws_splice_diagnostics(log_path)
+    validate_ws_splice_result_diagnostics(
+        {'ws_splice_diagnostics': diagnostics}, engine, splice_mode, label)
+    return diagnostics
+
+
 def ready(port, process, log, workers=0):
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -379,10 +411,16 @@ def main():
                         raise RuntimeError('preserved invalid or incomplete case: ' + label)
                     if engine in ('uring', 'epoll') and not all(
                             key in row for key in ('frontend_nofile_limits',
+                                                   'ws_splice_mode',
                                                    'ws_splice_diagnostics',
                                                    'ws_splice_admissions_total',
                                                    'ws_splice_calls_total')):
                         raise RuntimeError('preserved case lacks frontend limit or shutdown diagnostics: ' + label)
+                    expected_splice_mode = manifest['ws_splice_mode'] if engine == 'uring' else None
+                    if engine in ('uring', 'epoll') and row['ws_splice_mode'] != expected_splice_mode:
+                        raise RuntimeError('preserved case WebSocket splice mode mismatch: ' + label)
+                    validate_ws_splice_result_diagnostics(
+                        row, engine, row['ws_splice_mode'], label)
                     rows.append(row)
                     continue
                 if directory.exists():
@@ -511,7 +549,8 @@ def main():
                                    frontend_cpu_pct=100 * (after - before) / usage_seconds,
                                    origin_cpu_pct=100 * (origin_after - origin_before) / usage_seconds)
                     if engine in ('uring', 'epoll'):
-                        diagnostics = ws_splice_diagnostics(frontend_log)
+                        diagnostics = shutdown_and_read_ws_splice_diagnostics(
+                            stack, frontend_log, engine, row['ws_splice_mode'], label)
                         row['frontend_nofile_limits'] = frontend_nofile
                         row['ws_splice_diagnostics'] = diagnostics
                         row['ws_splice_admissions_total'] = (
