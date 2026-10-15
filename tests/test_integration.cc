@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <errno.h>
@@ -38859,24 +38860,35 @@ TEST(
     }
 }
 
-TEST(route, ordinary_source_local_response_request_persistence_iouring) {
+template <typename Backend>
+static void run_ordinary_source_local_response_request_persistence(rut::test::TestCase* test_case) {
+    auto* _tc = test_case;
     using namespace rut;
-    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    if constexpr (std::is_same_v<Backend, IoUringEventLoop>) {
+        if (!iouring_socket_live())
+            SKIP("io_uring async socket ops unavailable in this environment");
+    }
 
     static constexpr char kSource[] =
-        "route GET \"/static\" { return response(200, body: \"static280\") }\n";
+        "route GET \"/static\" { return response(200, body: \"static280\") }\n"
+        "route HEAD \"/static\" { return response(200, body: \"static280\") }\n";
     static constexpr char kExpectedKeepAlive[] =
-        "HTTP/1.1 200 OK\r\n"
+        "HTTP/1.0 200 OK\r\n"
         "Content-Length: 9\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n"
         "Connection: keep-alive\r\n\r\n"
         "static280";
     static constexpr char kExpectedClose[] =
-        "HTTP/1.1 200 OK\r\n"
+        "HTTP/1.0 200 OK\r\n"
         "Content-Length: 9\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n"
         "Connection: close\r\n\r\n"
         "static280";
+    static constexpr char kExpectedHead[] =
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Length: 9\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: keep-alive\r\n\r\n";
     static_assert(sizeof("static280") - 1u == 9u);
 
     struct TempSource {
@@ -38919,7 +38931,7 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
     // This must be the ordinary source-loader/JIT path, not a hand-built
     // RouteConfig or the legacy static action. Prove the published config and
     // its owned response-body table before the shard can observe either.
-    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.route_count, 2u);
     REQUIRE_EQ(program.config.response_body_count, 1u);
     REQUIRE_EQ(program.config.upstream_count, 0u);
     const RouteEntry* compiled_route = program.config.match(
@@ -38935,9 +38947,9 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
     REQUIRE_EQ(compiled_body.len, sizeof("static280") - 1u);
     CHECK_EQ(memcmp(compiled_body.data, "static280", compiled_body.len), 0);
 
-    Shard<IoUringEventLoop> shard;
+    Shard<Backend> shard;
     struct ShardGuard {
-        Shard<IoUringEventLoop>& shard;
+        Shard<Backend>& shard;
         bool initialized = false;
         ~ShardGuard() {
             if (initialized) shard.shutdown();
@@ -38994,8 +39006,9 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
     };
 
     static constexpr char kRequestOne[] =
-        "GET /static HTTP/1.1\r\n"
+        "GET /static HTTP/1.0\r\n"
         "Host: client.example\r\n"
+        "Connection: keep-alive\r\n"
         "X-Request: one\r\n\r\n";
     REQUIRE(send_all(client.fd, kRequestOne, sizeof(kRequestOne) - 1u));
     char response[sizeof(kExpectedKeepAlive) + 32]{};
@@ -39014,14 +39027,30 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
 
     // Request 2 is intentionally absent until a complete first response is
     // observed and the live production shard leaves the downstream boundary
-    // open and byte-quiet. This is sequential #280 evidence, not #276.
+    // open and byte-quiet.
     char probe[32];
     REQUIRE_EQ(recv_timeout(client.fd, probe, sizeof(probe), 200), -EAGAIN);
     REQUIRE(shard.loop->is_running());
     REQUIRE_EQ(shard.backend_failure_code(), 0);
 
+    static constexpr char kHeadRequest[] =
+        "HEAD /static HTTP/1.0\r\n"
+        "Host: client.example\r\n"
+        "Connection: keep-alive\r\n\r\n";
+    REQUIRE(send_all(client.fd, kHeadRequest, sizeof(kHeadRequest) - 1u));
+    memset(response, 0, sizeof(response));
+    response_len = 0;
+    const i64 head_deadline_ms = test_mono_ms() + 5000;
+    REQUIRE_EQ(
+        read_exact_until(
+            client.fd, response, sizeof(kExpectedHead) - 1u, head_deadline_ms, &response_len),
+        ReadOutcome::Complete);
+    REQUIRE_EQ(response_len, sizeof(kExpectedHead) - 1u);
+    CHECK_EQ(memcmp(response, kExpectedHead, response_len), 0);
+    REQUIRE_EQ(recv_timeout(client.fd, probe, sizeof(probe), 200), -EAGAIN);
+
     static constexpr char kRequestTwo[] =
-        "GET /static HTTP/1.1\r\n"
+        "GET /static HTTP/1.0\r\n"
         "Host: client.example\r\n"
         "Connection: close\r\n"
         "X-Request: two\r\n\r\n";
@@ -39058,6 +39087,101 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
     // stale fd that might later close an unrelated descriptor.
     REQUIRE_EQ(close(client.fd), 0);
     client.fd = -1;
+
+    // HTTP/1.0 without an explicit keep-alive token follows the parser's
+    // default-close persistence decision and closes after the exact response.
+    client.fd = connect_to(port);
+    REQUIRE_GE(client.fd, 0);
+    static constexpr char kH10DefaultCloseRequest[] =
+        "GET /static HTTP/1.0\r\nHost: client.example\r\n\r\n";
+    static constexpr char kH10DefaultCloseResponse[] =
+        "HTTP/1.0 200 OK\r\n"
+        "Content-Length: 9\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "static280";
+    REQUIRE(send_all(client.fd, kH10DefaultCloseRequest, sizeof(kH10DefaultCloseRequest) - 1u));
+    memset(response, 0, sizeof(response));
+    response_len = 0;
+    const i64 default_close_deadline_ms = test_mono_ms() + 5000;
+    REQUIRE_EQ(read_exact_until(client.fd,
+                                response,
+                                sizeof(kH10DefaultCloseResponse) - 1u,
+                                default_close_deadline_ms,
+                                &response_len),
+               ReadOutcome::Complete);
+    REQUIRE_EQ(response_len, sizeof(kH10DefaultCloseResponse) - 1u);
+    CHECK_EQ(memcmp(response, kH10DefaultCloseResponse, response_len), 0);
+    const i64 default_eof_deadline_ms = test_mono_ms() + 3000;
+    i32 default_eof_result = -EAGAIN;
+    do {
+        const i64 remaining_ms = default_eof_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        default_eof_result =
+            recv_timeout(client.fd, probe, sizeof(probe), static_cast<i32>(remaining_ms));
+    } while (default_eof_result == -EINTR);
+    REQUIRE_EQ(default_eof_result, 0);
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+
+    // Preserve the original HTTP/1.1 keep-alive/reuse control on a separate
+    // accepted socket after the HTTP/1.0-specific exchanges.
+    static constexpr char kH11ExpectedKeepAlive[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 9\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: keep-alive\r\n\r\n"
+        "static280";
+    static constexpr char kH11ExpectedClose[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 9\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "static280";
+    client.fd = connect_to(port);
+    REQUIRE_GE(client.fd, 0);
+    static constexpr char kH11RequestOne[] =
+        "GET /static HTTP/1.1\r\nHost: client.example\r\nX-Request: h11-one\r\n\r\n";
+    REQUIRE(send_all(client.fd, kH11RequestOne, sizeof(kH11RequestOne) - 1u));
+    memset(response, 0, sizeof(response));
+    response_len = 0;
+    const i64 h11_one_deadline_ms = test_mono_ms() + 5000;
+    REQUIRE_EQ(read_exact_until(client.fd,
+                                response,
+                                sizeof(kH11ExpectedKeepAlive) - 1u,
+                                h11_one_deadline_ms,
+                                &response_len),
+               ReadOutcome::Complete);
+    REQUIRE_EQ(response_len, sizeof(kH11ExpectedKeepAlive) - 1u);
+    CHECK_EQ(memcmp(response, kH11ExpectedKeepAlive, response_len), 0);
+    REQUIRE_EQ(recv_timeout(client.fd, probe, sizeof(probe), 200), -EAGAIN);
+    static constexpr char kH11RequestTwo[] =
+        "GET /static HTTP/1.1\r\nHost: client.example\r\n"
+        "Connection: close\r\nX-Request: h11-two\r\n\r\n";
+    REQUIRE(send_all(client.fd, kH11RequestTwo, sizeof(kH11RequestTwo) - 1u));
+    memset(response, 0, sizeof(response));
+    response_len = 0;
+    const i64 h11_two_deadline_ms = test_mono_ms() + 5000;
+    REQUIRE_EQ(read_exact_until(client.fd,
+                                response,
+                                sizeof(kH11ExpectedClose) - 1u,
+                                h11_two_deadline_ms,
+                                &response_len),
+               ReadOutcome::Complete);
+    REQUIRE_EQ(response_len, sizeof(kH11ExpectedClose) - 1u);
+    CHECK_EQ(memcmp(response, kH11ExpectedClose, response_len), 0);
+    const i64 h11_eof_deadline_ms = test_mono_ms() + 3000;
+    i32 h11_eof_result = -EAGAIN;
+    do {
+        const i64 remaining_ms = h11_eof_deadline_ms - test_mono_ms();
+        if (remaining_ms <= 0) break;
+        h11_eof_result =
+            recv_timeout(client.fd, probe, sizeof(probe), static_cast<i32>(remaining_ms));
+    } while (h11_eof_result == -EINTR);
+    REQUIRE_EQ(h11_eof_result, 0);
+    REQUIRE_EQ(close(client.fd), 0);
+    client.fd = -1;
+
     shard.drain(1);
     shard.join();
     settle_stopped_iouring_shard(shard);
@@ -39065,23 +39189,32 @@ TEST(route, ordinary_source_local_response_request_persistence_iouring) {
     REQUIRE_EQ(shard.backend_failure_code(), 0);
     CHECK_FALSE(shard.loop->is_running());
     CHECK_EQ(shard.loop->active_count(), 0u);
-    CHECK_EQ(shard.loop->pending_free_count, 0u);
+    if constexpr (requires { shard.loop->pending_free_count; })
+        CHECK_EQ(shard.loop->pending_free_count, 0u);
     CHECK_EQ(shard.loop->pool.in_use(), 0u);
     CHECK_EQ(shard.upstream->idle_count.load(std::memory_order_acquire), 0u);
     CHECK_EQ(shard.upstream->free_top, UpstreamPool::kMaxConns);
-    CHECK_EQ(shard.shard_metrics.connections_total, 1u);
+    CHECK_EQ(shard.shard_metrics.connections_total, 3u);
     CHECK_EQ(shard.shard_metrics.connections_active, 0u);
-    CHECK_EQ(shard.shard_metrics.connections_closed, 1u);
-    CHECK_EQ(shard.shard_metrics.requests_total, 2u);
+    CHECK_EQ(shard.shard_metrics.connections_closed, 3u);
+    CHECK_EQ(shard.shard_metrics.requests_total, 6u);
     CHECK_EQ(shard.shard_metrics.requests_active, 0u);
-    CHECK_EQ(shard.shard_metrics.request_latency.count, 2u);
-    CHECK_EQ(shard.epoch.epoch.load(std::memory_order_acquire), 4u);
+    CHECK_EQ(shard.shard_metrics.request_latency.count, 6u);
+    CHECK_EQ(shard.epoch.epoch.load(std::memory_order_acquire), 12u);
 
     // Tear down the shard before releasing the source mmap and JIT code.
     shard.shutdown();
     shard_guard.initialized = false;
     program.destroy();
     program_guard.armed = false;
+}
+
+TEST(route, ordinary_source_local_response_request_persistence_iouring) {
+    run_ordinary_source_local_response_request_persistence<rut::IoUringEventLoop>(_tc);
+}
+
+TEST(route, ordinary_source_local_response_request_persistence_epoll) {
+    run_ordinary_source_local_response_request_persistence<rut::EpollEventLoop>(_tc);
 }
 
 TEST(

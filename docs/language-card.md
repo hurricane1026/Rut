@@ -229,6 +229,15 @@ resp.status                       // StatusCode, read/write
 return resp
 ```
 
+Ordinary local HTTP/1 responses mirror the version of a complete strictly
+parsed request (`HTTP/1.0` or `HTTP/1.1`). Responses to requests without a
+captured valid version keep the HTTP/1.1 fallback. This does not change
+keep-alive/close decisions or body framing. Configured strict-local,
+redirect, and proxy/failure policy responses remain HTTP/1.1; generic
+proxy/upstream errors keep their existing HTTP/1.1 default. Ordinary JIT-local
+error publishers, including EventYield invalid-target errors, use the captured
+request version. HTTP/2 uses its separate serializer.
+
 Dynamic handler-local Response mutations require a direct route with no guards,
 decorators, `wait`, or `for`, exactly one builder, and that builder must be
 returned directly. A `chain after` helper must have exactly one `Response`

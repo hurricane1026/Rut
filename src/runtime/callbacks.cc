@@ -818,9 +818,11 @@ static void write_response_headers(Connection& conn,
                                    u32 body_len,
                                    bool keep_alive,
                                    const char* content_type,
-                                   u32 content_type_len) {
+                                   u32 content_type_len,
+                                   HttpVersion response_version) {
     conn.send_buf.reset();
-    conn.send_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 "), 9);
+    const char* version = response_version == HttpVersion::Http10 ? "HTTP/1.0 " : "HTTP/1.1 ";
+    conn.send_buf.write(reinterpret_cast<const u8*>(version), 9);
     char code_buf[3];
     code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
     code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
@@ -882,7 +884,8 @@ static void write_response_headers(Connection& conn,
     conn.send_buf.write(reinterpret_cast<const u8*>("\r\n"), 2);
 }
 
-void format_static_response(Connection& conn, u16 code, bool keep_alive, bool headers_only) {
+void format_static_response(
+    Connection& conn, u16 code, bool keep_alive, bool headers_only, HttpVersion response_version) {
     const char* reason = status_reason(code);
     u32 reason_len = 0;
     while (reason[reason_len]) reason_len++;
@@ -891,7 +894,8 @@ void format_static_response(Connection& conn, u16 code, bool keep_alive, bool he
     // HEAD carries the representation length in Content-Length while emitting
     // no body bytes on the wire.
     const u32 kBodyLen = kNoBody ? 0 : reason_len;
-    write_response_headers(conn, code, reason, reason_len, kBodyLen, keep_alive, nullptr, 0);
+    write_response_headers(
+        conn, code, reason, reason_len, kBodyLen, keep_alive, nullptr, 0, response_version);
     if (!kSuppressBody && kBodyLen > 0)
         conn.send_buf.write(reinterpret_cast<const u8*>(reason), kBodyLen);
 }
@@ -901,12 +905,13 @@ void format_response_with_body(Connection& conn,
                                const char* body_data,
                                u32 body_len,
                                bool keep_alive,
-                               bool headers_only) {
+                               bool headers_only,
+                               HttpVersion response_version) {
     // 204 / 304 / 1xx carry no body per HTTP spec; fall back to the
     // default formatter for those codes even if a body was supplied.
     const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     if (kNoBody) {
-        format_static_response(conn, code, keep_alive, headers_only);
+        format_static_response(conn, code, keep_alive, headers_only, response_version);
         return;
     }
     const char* reason = status_reason(code);
@@ -920,7 +925,8 @@ void format_response_with_body(Connection& conn,
                            body_len,
                            keep_alive,
                            kDefaultContentType,
-                           sizeof(kDefaultContentType) - 1);
+                           sizeof(kDefaultContentType) - 1,
+                           response_version);
     if (!headers_only && body_len > 0)
         conn.send_buf.write(reinterpret_cast<const u8*>(body_data), body_len);
 }
@@ -1002,7 +1008,8 @@ bool format_response_with_body_and_headers(Connection& conn,
                                            bool body_is_fallback_reason_phrase,
                                            bool suppress_default_content_type,
                                            bool headers_only,
-                                           bool fallback_headers_only) {
+                                           bool fallback_headers_only,
+                                           HttpVersion response_version) {
     const bool kNoBody = (code < 200 || code == 204 || code == 205 || code == 304);
     const u32 body_len_emit = kNoBody ? 0 : body_len;
     const char* reason = status_reason(code);
@@ -1066,13 +1073,15 @@ bool format_response_with_body_and_headers(Connection& conn,
         // the original status rather than the 500 we actually sent.
         conn.resp_status = 500;
         conn.keep_alive = false;
-        format_static_response(conn, 500, /*keep_alive=*/false, fallback_headers_only);
+        format_static_response(
+            conn, 500, /*keep_alive=*/false, fallback_headers_only, response_version);
         return false;
     }
 
     conn.send_buf.reset();
-    // Status line: "HTTP/1.1 <3-digit code> <reason>\r\n"
-    conn.send_buf.write(reinterpret_cast<const u8*>("HTTP/1.1 "), 9);
+    // Status line: "HTTP/1.x <3-digit code> <reason>\r\n"
+    const char* version = response_version == HttpVersion::Http10 ? "HTTP/1.0 " : "HTTP/1.1 ";
+    conn.send_buf.write(reinterpret_cast<const u8*>(version), 9);
     char code_buf[3];
     code_buf[0] = static_cast<char>('0' + (code / 100) % 10);
     code_buf[1] = static_cast<char>('0' + (code / 10) % 10);
