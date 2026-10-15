@@ -952,6 +952,9 @@ const char* status_reason(u16 code);
 // when `out` is null; every `u16` code otherwise gets a phrase.
 bool canonical_status_reason(u16 code, Str* out);
 void format_static_response(Connection& conn, u16 code, bool keep_alive, bool headers_only = false);
+inline bool http1_request_is_head(const Connection& conn) {
+    return conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+}
 // Custom-body variant: writes status line + Content-Length matching
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
 // bytes. For codes that must have no body (1xx / 204 / 304) falls
@@ -2645,7 +2648,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             }
             if (!acquired) {
                 conn.resp_status = 503;
-                format_static_response(conn, 503, /*keep_alive=*/false);
+                format_static_response(
+                    conn, 503, /*keep_alive=*/false, http1_request_is_head(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2703,7 +2707,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         const i32 kUpstreamFd = UpstreamPool::create_socket();
         if (kUpstreamFd < 0) {
             conn.resp_status = kStatusBadGateway;
-            format_static_response(conn, 502, false);
+            format_static_response(conn, 502, false, http1_request_is_head(conn));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2715,7 +2719,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             (void)detach_upstream_close(loop, conn);
             conn.upstream_idx = 0;
             conn.resp_status = kStatusBadGateway;
-            format_static_response(conn, 502, false);
+            format_static_response(conn, 502, false, http1_request_is_head(conn));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -4290,7 +4294,8 @@ void handle_jit_outcome(Loop* loop,
                 // the config doesn't know. Fail closed with 502 rather
                 // than hanging or silently discarding the request.
                 conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
+                format_static_response(
+                    conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -4649,7 +4654,8 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 conn.resp_status = kStatusInternalServerError;
-                format_static_response(conn, 500, /*keep_alive=*/false);
+                format_static_response(
+                    conn, 500, /*keep_alive=*/false, http1_request_is_head(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -4672,7 +4678,8 @@ void handle_jit_outcome(Loop* loop,
                         return;
                     }
                     conn.resp_status = 503;
-                    format_static_response(conn, 503, /*keep_alive=*/false);
+                    format_static_response(
+                        conn, 503, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -4789,7 +4796,8 @@ void handle_jit_outcome(Loop* loop,
                     respond_upstream_connect_failure(loop, conn);
                 } else {
                     conn.resp_status = kStatusBadGateway;
-                    format_static_response(conn, 502, /*keep_alive=*/false);
+                    format_static_response(
+                        conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -4809,7 +4817,8 @@ void handle_jit_outcome(Loop* loop,
                     (void)detach_upstream_close(loop, conn);
                     conn.upstream_idx = 0;
                     conn.resp_status = kStatusBadGateway;
-                    format_static_response(conn, 502, /*keep_alive=*/false);
+                    format_static_response(
+                        conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -7668,14 +7677,19 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
         if (conn.failure_policy_id != 0) {
             respond_upstream_connect_failure(loop, conn);
         } else {
-            static const char k502[] =
-                "HTTP/1.1 502 Bad Gateway\r\n"
-                "Content-Length: 11\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "Bad Gateway";
-            conn.send_buf.reset();
-            conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+            if (http1_request_is_head(conn)) {
+                conn.send_buf.reset();
+                format_static_response(conn, 502, /*keep_alive=*/false, /*headers_only=*/true);
+            } else {
+                static const char k502[] =
+                    "HTTP/1.1 502 Bad Gateway\r\n"
+                    "Content-Length: 11\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "Bad Gateway";
+                conn.send_buf.reset();
+                conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+            }
             conn.keep_alive = false;
             conn.resp_status = kStatusBadGateway;
             conn.transition_to_sending(&on_response_sent<Loop>);
@@ -12321,17 +12335,22 @@ inline void respond_upstream_connect_failure(Loop* loop, Connection& conn) {
             loop->close_conn(conn);
             return;
         }
-        static constexpr char k502[] =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Length: 11\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Bad Gateway";
-        conn.send_buf.reset();
-        if (conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1) !=
-            sizeof(k502) - 1) {
-            loop->close_conn(conn);
-            return;
+        if (http1_request_is_head(conn)) {
+            conn.send_buf.reset();
+            format_static_response(conn, 502, /*keep_alive=*/false, /*headers_only=*/true);
+        } else {
+            static constexpr char k502[] =
+                "HTTP/1.1 502 Bad Gateway\r\n"
+                "Content-Length: 11\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "Bad Gateway";
+            conn.send_buf.reset();
+            if (conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1) !=
+                sizeof(k502) - 1) {
+                loop->close_conn(conn);
+                return;
+            }
         }
         conn.keep_alive = false;
     }
@@ -13791,14 +13810,19 @@ void on_upstream_response(void* lp, Connection& conn, IoEvent ev) {
             return;
         }
         (void)detach_upstream_close_only(loop, conn);
-        static const char k502[] =
-            "HTTP/1.1 502 Bad Gateway\r\n"
-            "Content-Length: 11\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Bad Gateway";
-        conn.send_buf.reset();
-        conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+        if (http1_request_is_head(conn)) {
+            conn.send_buf.reset();
+            format_static_response(conn, 502, /*keep_alive=*/false, /*headers_only=*/true);
+        } else {
+            static const char k502[] =
+                "HTTP/1.1 502 Bad Gateway\r\n"
+                "Content-Length: 11\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "Bad Gateway";
+            conn.send_buf.reset();
+            conn.send_buf.write(reinterpret_cast<const u8*>(k502), sizeof(k502) - 1);
+        }
         conn.keep_alive = false;
         conn.resp_status = kStatusBadGateway;
         conn.transition_to_sending(&on_response_sent<Loop>);
