@@ -149,8 +149,10 @@ class ToolsTest(unittest.TestCase):
     def test_protocol_strategy_requires_valid_diagnostics_for_enabled_uring_splice(self):
         label = "case-uring-current-r1"
         valid = {
+            "kind": "websocket",
+            "concurrent_connections": 3,
             "ws_splice_diagnostics": [{
-                "admissions": 0,
+                "admissions": 4,
                 "client_bytes": 0,
                 "upstream_bytes": 0,
                 "calls": 0,
@@ -162,16 +164,70 @@ class ToolsTest(unittest.TestCase):
             }],
         }
         protocol_strategy.validate_ws_splice_result_diagnostics(valid, "uring", "on", label)
-        for row in ({}, {"ws_splice_diagnostics": None},
-                    {"ws_splice_diagnostics": []}, {"ws_splice_diagnostics": [{}]}):
-            with self.assertRaisesRegex(RuntimeError, "lacks valid shutdown diagnostics"):
+        # Each shard may report separately; the cumulative total must reach
+        # the configured clients plus the one successful preflight session.
+        multi_shard = dict(valid, ws_splice_diagnostics=[
+            dict(valid["ws_splice_diagnostics"][0], admissions=2),
+            dict(valid["ws_splice_diagnostics"][0], admissions=2),
+        ])
+        protocol_strategy.validate_ws_splice_result_diagnostics(
+            multi_shard, "uring", "on", label)
+        insufficient = dict(valid, ws_splice_diagnostics=[
+            dict(valid["ws_splice_diagnostics"][0], admissions=3)])
+        mismatched_resume = dict(valid, concurrent_connections=2)
+        for row in ({}, dict(valid, ws_splice_diagnostics=None),
+                    dict(valid, ws_splice_diagnostics=[]),
+                    dict(valid, ws_splice_diagnostics=[{}]), insufficient,
+                    dict(valid, concurrent_connections=True), mismatched_resume):
+            with self.assertRaises(RuntimeError):
                 protocol_strategy.validate_ws_splice_result_diagnostics(
-                    row, "uring", "on", label)
+                    row, "uring", "on", label,
+                    expected_connections=3 if row is mismatched_resume else None)
 
     def test_protocol_strategy_disabled_splice_and_epoll_allow_missing_diagnostics(self):
         for engine, splice_mode in (("uring", "off"), ("epoll", "on")):
             protocol_strategy.validate_ws_splice_result_diagnostics(
                 {}, engine, splice_mode, "case-r1")
+        # Streaming rows still require complete shutdown diagnostics, but do
+        # not require WebSocket splice admissions.
+        streaming = {
+            "kind": "streaming",
+            "ws_splice_diagnostics": [{
+                "admissions": 0, "client_bytes": 0, "upstream_bytes": 0,
+                "calls": 0, "polls": 0, "read_eagain": 0, "write_eagain": 0,
+                "pipe_grow_failures": 0, "min_pipe_capacity": 0,
+            }],
+        }
+        protocol_strategy.validate_ws_splice_result_diagnostics(
+            streaming, "uring", "on", "streaming-r1")
+        for diagnostics in (None, [], [{}]):
+            with self.assertRaisesRegex(RuntimeError, "lacks valid shutdown diagnostics"):
+                protocol_strategy.validate_ws_splice_result_diagnostics(
+                    dict(streaming, ws_splice_diagnostics=diagnostics),
+                    "uring", "on", "streaming-r1")
+
+    def test_protocol_strategy_rejects_under_admitted_preserved_websocket_result(self):
+        case = {"name": "websocket-bulk", "kind": "websocket", "size": 65536,
+                "chunks": 16, "delay": 0}
+        record = {
+            "admissions": 2, "client_bytes": 1, "upstream_bytes": 1,
+            "calls": 1, "polls": 0, "read_eagain": 0, "write_eagain": 0,
+            "pipe_grow_failures": 0, "min_pipe_capacity": 65536,
+        }
+        row = {
+            "valid": True, "case": case, "kind": "websocket", "engine": "uring",
+            "policy": "current", "repeat": 1, "concurrent_connections": 2,
+            "ws_splice_mode": "on", "ws_splice_diagnostics": [record],
+            "ws_splice_admissions_total": 2, "ws_splice_calls_total": 1,
+            "frontend_nofile_limits": {"soft": 65536, "hard": 65536},
+        }
+        manifest = {"ws_splice_mode": "on", "connections": 2}
+        with self.assertRaisesRegex(RuntimeError, "admissions below minimum"):
+            protocol_strategy.validate_preserved_protocol_result(
+                row, case, "uring", "current", 1, manifest, "preserved-r1")
+        row["ws_splice_diagnostics"] = [dict(record, admissions=3)]
+        protocol_strategy.validate_preserved_protocol_result(
+            row, case, "uring", "current", 1, manifest, "preserved-r1")
 
     def test_protocol_strategy_reads_shutdown_diagnostics_after_stopping_frontend(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -180,13 +236,14 @@ class ToolsTest(unittest.TestCase):
             stack = contextlib.ExitStack()
             stack.callback(
                 log.write_text,
-                "RUT_WS_SPLICE admissions=1 client_bytes=64 upstream_bytes=64 "
+                "RUT_WS_SPLICE admissions=2 client_bytes=64 upstream_bytes=64 "
                 "calls=2 polls=1 read_eagain=0 write_eagain=0 pipe_grow_failures=0 "
                 "min_pipe_capacity=65536\n")
             diagnostics = protocol_strategy.shutdown_and_read_ws_splice_diagnostics(
-                stack, log, "uring", "on", "case-uring-current-r1")
+                stack, log, "uring", "on", "case-uring-current-r1", {
+                    "kind": "websocket", "concurrent_connections": 1})
             self.assertEqual(len(diagnostics), 1)
-            self.assertEqual(diagnostics[0]["admissions"], 1)
+            self.assertEqual(diagnostics[0]["admissions"], 2)
 
     def test_api_origin_smoke_and_reuse_policy(self):
         cpu = str(min(os.sched_getaffinity(0)))

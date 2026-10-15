@@ -149,23 +149,62 @@ def _valid_ws_splice_diagnostic(record):
                 for key in _WS_SPLICE_DIAGNOSTIC_FIELDS))
 
 
-def validate_ws_splice_result_diagnostics(row, engine, splice_mode, label):
+def validate_ws_splice_result_diagnostics(
+        row, engine, splice_mode, label, expected_connections=None):
     if engine != 'uring' or splice_mode != 'on':
         return
     diagnostics = row.get('ws_splice_diagnostics')
-    if (not isinstance(diagnostics, list) or
-            not any(_valid_ws_splice_diagnostic(record) for record in diagnostics)):
+    if (not isinstance(diagnostics, list) or not diagnostics or
+            not all(_valid_ws_splice_diagnostic(record) for record in diagnostics)):
         raise RuntimeError('enabled io_uring splice case lacks valid shutdown diagnostics: ' + label)
+    # Streaming does not enter the WebSocket splice path. It still requires
+    # complete shutdown diagnostics, but zero admissions are valid.
+    if row.get('kind') == 'streaming':
+        return
+    if row.get('kind') != 'websocket':
+        raise RuntimeError('enabled io_uring splice case lacks a valid kind: ' + label)
+    # For WebSockets, the preflight handshake plus each configured concurrent
+    # connection must have reached a splice owner at least once.
+    connections = row.get('concurrent_connections')
+    if type(connections) is not int or connections < 1:
+        raise RuntimeError('enabled io_uring splice case lacks valid concurrency: ' + label)
+    if expected_connections is not None and connections != expected_connections:
+        raise RuntimeError('enabled io_uring splice case concurrency mismatch: ' + label)
+    admissions = sum(record['admissions'] for record in diagnostics)
+    minimum = connections + 1  # one additional successful WebSocket preflight
+    if admissions < minimum:
+        raise RuntimeError(
+            f'enabled io_uring splice admissions below minimum ({admissions} < {minimum}): {label}')
 
 
-def shutdown_and_read_ws_splice_diagnostics(stack, log_path, engine, splice_mode, label):
+def shutdown_and_read_ws_splice_diagnostics(
+        stack, log_path, engine, splice_mode, label, row, expected_connections=None):
     # The splice summary is emitted during runtime shutdown, so stop the frontend
     # before reading its log or persisting the measurement row.
     stack.close()
     diagnostics = ws_splice_diagnostics(log_path)
+    result = dict(row, ws_splice_diagnostics=diagnostics)
     validate_ws_splice_result_diagnostics(
-        {'ws_splice_diagnostics': diagnostics}, engine, splice_mode, label)
+        result, engine, splice_mode, label, expected_connections)
     return diagnostics
+
+
+def validate_preserved_protocol_result(row, case, engine, policy, repeat, manifest, label):
+    if (not row.get('valid') or row.get('case') != case or row.get('kind') != case['kind'] or
+            row.get('engine') != engine or row.get('policy') != policy or
+            row.get('repeat') != repeat):
+        raise RuntimeError('preserved invalid or mismatched case: ' + label)
+    if engine in ('uring', 'epoll') and not all(
+            key in row for key in ('frontend_nofile_limits', 'ws_splice_mode',
+                                   'ws_splice_diagnostics', 'ws_splice_admissions_total',
+                                   'ws_splice_calls_total')):
+        raise RuntimeError('preserved case lacks frontend limit or shutdown diagnostics: ' + label)
+    expected_splice_mode = manifest['ws_splice_mode'] if engine == 'uring' else None
+    if engine in ('uring', 'epoll') and row['ws_splice_mode'] != expected_splice_mode:
+        raise RuntimeError('preserved case WebSocket splice mode mismatch: ' + label)
+    validate_ws_splice_result_diagnostics(
+        row, engine, row.get('ws_splice_mode'), label,
+        manifest['connections'] if case['kind'] == 'websocket' else None)
 
 
 def ready(port, process, log, workers=0):
@@ -407,20 +446,8 @@ def main():
                 result_file = directory / 'result.json'
                 if result_file.exists():
                     row = json.loads(result_file.read_text())
-                    if not row['valid'] or not all(key in row for key in ['case', 'engine', 'policy', 'repeat']):
-                        raise RuntimeError('preserved invalid or incomplete case: ' + label)
-                    if engine in ('uring', 'epoll') and not all(
-                            key in row for key in ('frontend_nofile_limits',
-                                                   'ws_splice_mode',
-                                                   'ws_splice_diagnostics',
-                                                   'ws_splice_admissions_total',
-                                                   'ws_splice_calls_total')):
-                        raise RuntimeError('preserved case lacks frontend limit or shutdown diagnostics: ' + label)
-                    expected_splice_mode = manifest['ws_splice_mode'] if engine == 'uring' else None
-                    if engine in ('uring', 'epoll') and row['ws_splice_mode'] != expected_splice_mode:
-                        raise RuntimeError('preserved case WebSocket splice mode mismatch: ' + label)
-                    validate_ws_splice_result_diagnostics(
-                        row, engine, row['ws_splice_mode'], label)
+                    validate_preserved_protocol_result(
+                        row, case, engine, policy, repeat, manifest, label)
                     rows.append(row)
                     continue
                 if directory.exists():
@@ -538,6 +565,8 @@ def main():
                         usage_seconds = time.monotonic() - usage_started
                         row = json.loads(result_file.read_text())
                         result_file.unlink()
+                        if row.get('kind') != case['kind']:
+                            raise RuntimeError('client result kind mismatch: ' + label)
                         row.update(case=case, engine=engine, policy=policy, repeat=repeat,
                                    ws_recv_mode=manifest['ws_recv_mode'] if engine == 'uring' else None,
                                    ws_splice_mode=manifest['ws_splice_mode'] if engine == 'uring' else None,
@@ -550,7 +579,8 @@ def main():
                                    origin_cpu_pct=100 * (origin_after - origin_before) / usage_seconds)
                     if engine in ('uring', 'epoll'):
                         diagnostics = shutdown_and_read_ws_splice_diagnostics(
-                            stack, frontend_log, engine, row['ws_splice_mode'], label)
+                            stack, frontend_log, engine, row['ws_splice_mode'], label,
+                            row, manifest['connections'] if case['kind'] == 'websocket' else None)
                         row['frontend_nofile_limits'] = frontend_nofile
                         row['ws_splice_diagnostics'] = diagnostics
                         row['ws_splice_admissions_total'] = (
