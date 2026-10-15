@@ -65,6 +65,15 @@ def validate_ws_async_splice_configuration(settings):
     if (settings['ws_async_splice_mode'] == 'on' and
             settings['ws_splice_mode'] != 'on'):
         raise RuntimeError('RUT_STUDY_WS_ASYNC_SPLICE=on requires RUT_STUDY_WS_SPLICE=on')
+    dependent_modes = (
+        ('ws_linked_splice_mode', 'RUT_STUDY_WS_LINKED_SPLICE'),
+        ('ws_poll_next_read_mode', 'RUT_STUDY_WS_POLL_NEXT_READ'),
+        ('ws_async_splice_queue_budget_mode', 'RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET'),
+    )
+    if settings['ws_async_splice_mode'] != 'on':
+        for key, name in dependent_modes:
+            if settings[key] == 'on':
+                raise RuntimeError(f'{name}=on requires RUT_STUDY_WS_ASYNC_SPLICE=on')
 
 
 def positive_nofile_limit(value):

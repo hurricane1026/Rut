@@ -87,6 +87,31 @@ class ToolsTest(unittest.TestCase):
             protocol_strategy.validate_ws_async_splice_startup(
                 "RUT_STUDY_WS_ASYNC_SPLICE mode=off\n", settings)
 
+    def test_protocol_strategy_rejects_async_splice_dependents_without_async_mode(self):
+        for key, env_name in (
+                ("RUT_STUDY_WS_LINKED_SPLICE", "LINKED_SPLICE"),
+                ("RUT_STUDY_WS_POLL_NEXT_READ", "POLL_NEXT_READ"),
+                ("RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET", "ASYNC_SPLICE_QUEUE_BUDGET")):
+            settings = dict(protocol_strategy.ws_async_splice_settings({key: "on"}),
+                            ws_splice_mode="on")
+            with self.assertRaisesRegex(
+                    RuntimeError, rf'RUT_STUDY_WS_{env_name}=on requires RUT_STUDY_WS_ASYNC_SPLICE=on'):
+                protocol_strategy.validate_ws_async_splice_configuration(settings)
+
+        # The parent async mode may run alone or with any supported dependents.
+        for overrides in (
+                {},
+                {"RUT_STUDY_WS_LINKED_SPLICE": "on"},
+                {"RUT_STUDY_WS_POLL_NEXT_READ": "on"},
+                {"RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET": "on"},
+                {"RUT_STUDY_WS_LINKED_SPLICE": "on",
+                 "RUT_STUDY_WS_POLL_NEXT_READ": "on",
+                 "RUT_STUDY_WS_ASYNC_SPLICE_QUEUE_BUDGET": "on"}):
+            settings = dict(protocol_strategy.ws_async_splice_settings(dict(
+                {"RUT_STUDY_WS_ASYNC_SPLICE": "on"}, **overrides)),
+                ws_splice_mode="on")
+            protocol_strategy.validate_ws_async_splice_configuration(settings)
+
     def test_protocol_strategy_async_splice_defaults_are_recorded_as_off(self):
         settings = protocol_strategy.ws_async_splice_settings({})
         self.assertTrue(all(value == "off" for value in settings.values()))
