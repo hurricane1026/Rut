@@ -3679,7 +3679,10 @@ void handle_jit_outcome(Loop* loop,
             auto send_bad_gateway = [&]() {
                 conn.pending_handler_fn = nullptr;
                 conn.resp_status = kStatusBadGateway;
-                format_static_response(conn, 502, /*keep_alive=*/false);
+                format_static_response(conn,
+                                       502,
+                                       /*keep_alive=*/false,
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -3749,23 +3752,13 @@ void handle_jit_outcome(Loop* loop,
                 const RouteConfig* config = conn.request_config;
                 const u32 upstream_id = outcome.timer_ms - 1;
                 if (!config || upstream_id >= config->upstream_count) {
-                    conn.pending_handler_fn = nullptr;
-                    conn.resp_status = kStatusBadGateway;
-                    format_static_response(conn, 502, /*keep_alive=*/false);
-                    conn.keep_alive = false;
-                    conn.transition_to_sending(&on_response_sent<Loop>);
-                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    send_bad_gateway();
                     return;
                 }
                 auto& target = config->upstreams[upstream_id];
                 const i32 kUpstreamFd = UpstreamPool::create_socket();
                 if (kUpstreamFd < 0) {
-                    conn.pending_handler_fn = nullptr;
-                    conn.resp_status = kStatusBadGateway;
-                    format_static_response(conn, 502, /*keep_alive=*/false);
-                    conn.keep_alive = false;
-                    conn.transition_to_sending(&on_response_sent<Loop>);
-                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    send_bad_gateway();
                     return;
                 }
                 if (conn.upstream_fd >= 0) {

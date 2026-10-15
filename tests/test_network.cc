@@ -37751,6 +37751,117 @@ static u64 state_invariant_wait_recv_then_status(
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Recv).pack();
 }
 
+template <typename Loop>
+static void check_event_yield_502_body(
+    rut::test::TestCase* _tc, Loop& loop, jit::YieldKind kind, u32 failure_case, bool is_head) {
+    loop.setup();
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->fd = 42;
+    conn->req_method = static_cast<u8>(is_head ? LogHttpMethod::Head : LogHttpMethod::Get);
+    loop.timer.add(conn, loop.keepalive_timeout);
+
+    RouteConfig cfg;
+    if (failure_case == 1 || failure_case == 4) {
+        REQUIRE(cfg.add_upstream("api", 0x7F000001, 9000).has_value());
+        conn->request_config = &cfg;
+    }
+    if (kind == jit::YieldKind::UpstreamSend || kind == jit::YieldKind::UpstreamRecv) {
+        // The mock close_conn_impl only cancels and clears this descriptor;
+        // use a sentinel so no real process fd can be closed by the fixture.
+        conn->upstream_fd = 77;
+        conn->upstream_idx = 0;
+    }
+
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::EventYield;
+    outcome.next_state = 9;
+    outcome.yield_kind = kind;
+    if (kind == jit::YieldKind::UpstreamConnect) outcome.timer_ms = failure_case == 0 ? 2 : 1;
+    if (kind == jit::YieldKind::UpstreamSend || kind == jit::YieldKind::UpstreamRecv)
+        outcome.timer_ms = 1;
+
+    if (failure_case == 1) loop.backend.fail_connect = true;
+    if (failure_case == 2) loop.backend.fail_upstream_send = true;
+    if (failure_case == 3) loop.backend.fail_upstream_recv = true;
+    if (failure_case == 4) {
+        rut::test_fault::ScopedSocketFailure fail_socket;
+        handle_jit_outcome<Loop>(
+            &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+    } else {
+        handle_jit_outcome<Loop>(
+            &loop, *conn, outcome, &state_invariant_wait_recv_then_status, true);
+    }
+    loop.backend.fail_connect = false;
+    loop.backend.fail_upstream_send = false;
+    loop.backend.fail_upstream_recv = false;
+
+    REQUIRE_EQ(conn->resp_status, kStatusBadGateway);
+    REQUIRE_EQ(conn->state, ConnState::Sending);
+    REQUIRE_EQ(conn->pending_handler_fn, nullptr);
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Content-Length: 11\r\n"));
+    const bool has_body =
+        buf_has(conn->send_buf.data(), conn->send_buf.len(), "\r\n\r\nBad Gateway");
+    CHECK_EQ(has_body, !is_head);
+    if (is_head) {
+        u32 header_end = 0;
+        while (header_end + 4 <= conn->send_buf.len() &&
+               __builtin_memcmp(conn->send_buf.data() + header_end, "\r\n\r\n", 4) != 0)
+            header_end++;
+        REQUIRE(header_end + 4 <= conn->send_buf.len());
+        CHECK_EQ(header_end + 4, conn->send_buf.len());
+    }
+
+    const u32 conn_id = conn->id;
+    const u32 response_len = conn->send_buf.len();
+    loop.dispatch(make_ev(conn_id, IoEventType::Send, static_cast<i32>(response_len)));
+    CHECK_EQ(conn->fd, -1);
+    CHECK_EQ(conn->on_send, nullptr);
+    CHECK_EQ(conn->pending_handler_fn, nullptr);
+    CHECK(conn->timer_node.empty());
+}
+
+TEST(state_invariant, jit_event_yield_502_suppresses_head_body_on_both_backends) {
+    // An invalid target follows the early UpstreamConnect failure arm. The GET
+    // case keeps the reason body as a wire-contract control on both templates.
+    {
+        SmallLoop loop;
+        check_event_yield_502_body(
+            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, false);
+    }
+    {
+        SmallLoop loop;
+        check_event_yield_502_body(
+            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, true);
+    }
+    {
+        AsyncSmallLoop loop;
+        check_event_yield_502_body(
+            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, false);
+    }
+    {
+        AsyncSmallLoop loop;
+        check_event_yield_502_body(
+            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, true);
+    }
+
+    const u32 failure_cases[] = {1, 4, 2, 3};
+    for (bool async_backend : {false, true}) {
+        for (u32 i = 0; i < sizeof(failure_cases) / sizeof(failure_cases[0]); i++) {
+            const jit::YieldKind kind =
+                i < 2 ? jit::YieldKind::UpstreamConnect
+                      : (i == 2 ? jit::YieldKind::UpstreamSend : jit::YieldKind::UpstreamRecv);
+            if (async_backend) {
+                AsyncSmallLoop loop;
+                check_event_yield_502_body(_tc, loop, kind, failure_cases[i], true);
+            } else {
+                SmallLoop loop;
+                check_event_yield_502_body(_tc, loop, kind, failure_cases[i], true);
+            }
+        }
+    }
+}
+
 TEST(local_response_persistence, yielded_jit_uses_pinned_request_and_publication_time_drain) {
     for (const bool drain_before_resume : {false, true}) {
         SmallLoop loop;
