@@ -228,10 +228,10 @@ static inline bool is_transfer_coding_token_char(u8 c) {
            c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
 }
 
-// Classify one complete Transfer-Encoding field.  Parameters and duplicate
-// fields are deliberately unsupported: local-response connection reuse needs
-// one exact, unambiguous request boundary.  The legacy `chunked` bit is parsed
-// separately below so this metadata addition does not alter proxy behaviour.
+// Classify one complete Transfer-Encoding field. Parameters and duplicate
+// fields are deliberately unsupported. The legacy `chunked` bit is parsed
+// separately below; HTTP/1 dispatch admits only the classified final-chunked
+// subset and rejects unsupported or ambiguous framing before routing.
 static inline RequestTransferEncoding classify_transfer_encoding(const u8* val, u32 vlen) {
     if (vlen == 0) return RequestTransferEncoding::Unsupported;
     bool saw_token = false;

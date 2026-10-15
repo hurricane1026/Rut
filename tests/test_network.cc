@@ -22231,6 +22231,168 @@ TEST(request_admission, h2_pending_prepared_forward_fragment_keeps_owner) {
     run_strict_fence(false, true);
 }
 
+TEST(request_admission, unsupported_transfer_framing_rejected_before_route_or_upstream) {
+    SmallLoop loop;
+    loop.setup();
+
+    RouteConfig direct_proxy{};
+    REQUIRE(direct_proxy.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(direct_proxy.add_proxy("/", kRouteMethodAny, 0));
+
+    RouteConfig jit_forward{};
+    REQUIRE(jit_forward.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(jit_forward.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
+
+    const char* requests[] = {
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\nopaque-body",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"
+        "3\r\nabc\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n"
+        "Invalid Header: value\r\n\r\nopaque-body",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n"
+        "Transfer-Encoding: gzip\r\n\r\nabc",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    };
+
+    for (RouteConfig* config : {&direct_proxy, &jit_forward}) {
+        pre_route_root_handler_calls = 0;
+        for (const char* request : requests) {
+            loop.backend.clear_ops();
+            Connection* conn = dispatch_unmatched_request(loop, *config, request);
+            REQUIRE(conn != nullptr);
+            CHECK_EQ(conn->resp_status, 400u);
+            CHECK_FALSE(conn->keep_alive);
+            CHECK_EQ(conn->upstream_fd, -1);
+            CHECK_EQ(conn->upstream_attempts, 0u);
+            CHECK_FALSE(conn->upstream_slot_held);
+            CHECK_EQ(pre_route_root_handler_calls, 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+            CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+            loop.inject_and_dispatch(
+                make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+            CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+        }
+    }
+
+    // A fragmented header remains pending until its terminator arrives. Once
+    // complete, the unsupported request and any coalesced successor are closed
+    // together before route dispatch.
+    pre_route_root_handler_calls = 0;
+    loop.backend.clear_ops();
+    const RouteConfig* active = &jit_forward;
+    loop.config_ptr = &active;
+    Connection* fragmented = loop.alloc_conn();
+    REQUIRE(fragmented != nullptr);
+    static constexpr char kPrefix[] = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n";
+    static constexpr char kSuffix[] = "\r\nopaque-bodyGET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    REQUIRE_EQ(
+        fragmented->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1),
+        sizeof(kPrefix) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *fragmented, make_ev(fragmented->id, IoEventType::Recv, sizeof(kPrefix) - 1));
+    CHECK_EQ(fragmented->state, ConnState::ReadingHeader);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(pre_route_root_handler_calls, 0u);
+    REQUIRE_EQ(
+        fragmented->recv_buf.write(reinterpret_cast<const u8*>(kSuffix), sizeof(kSuffix) - 1),
+        sizeof(kSuffix) - 1);
+    on_header_received<SmallLoop>(
+        &loop, *fragmented, make_ev(fragmented->id, IoEventType::Recv, sizeof(kSuffix) - 1));
+    CHECK_EQ(fragmented->resp_status, 400u);
+    CHECK_FALSE(fragmented->keep_alive);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    CHECK_EQ(pre_route_root_handler_calls, 0u);
+    loop.inject_and_dispatch(
+        make_ev(fragmented->id, IoEventType::Send, static_cast<i32>(fragmented->send_buf.len())));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    loop.config_ptr = nullptr;
+
+    // Final chunked codings stay supported. The parser owns exactly the chunk
+    // body, and proxy admission leaves the original gzip,chunked wire bytes
+    // unchanged for the upstream.
+    static constexpr char kFinalChunked[] =
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"
+        "3\r\nabc\r\n0\r\n\r\n";
+    static constexpr char kPipelinedSuccessor[] =
+        "GET /later HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+    char kFinalChunkedPipeline[sizeof(kFinalChunked) + sizeof(kPipelinedSuccessor) - 1u]{};
+    __builtin_memcpy(kFinalChunkedPipeline, kFinalChunked, sizeof(kFinalChunked) - 1u);
+    __builtin_memcpy(kFinalChunkedPipeline + sizeof(kFinalChunked) - 1u,
+                     kPipelinedSuccessor,
+                     sizeof(kPipelinedSuccessor) - 1u);
+    const u32 kFinalChunkedPipelineLen = sizeof(kFinalChunkedPipeline) - 1u;
+    loop.backend.clear_ops();
+    Connection* accepted = dispatch_unmatched_request(loop, direct_proxy, kFinalChunkedPipeline);
+    REQUIRE(accepted != nullptr);
+    CHECK_EQ(accepted->req_body_mode, BodyMode::Chunked);
+    CHECK_EQ(accepted->req_chunk_parser.state, ChunkedParser::State::Complete);
+    CHECK_EQ(accepted->req_initial_send_len, sizeof(kFinalChunked) - 1u);
+    CHECK_EQ(accepted->recv_buf.len(), kFinalChunkedPipelineLen);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    CHECK(__builtin_memcmp(
+              accepted->recv_buf.data(), kFinalChunkedPipeline, kFinalChunkedPipelineLen) == 0);
+    loop.inject_and_dispatch(make_ev(accepted->id, IoEventType::UpstreamConnect, 0));
+    const MockOp* final_chunked_send = loop.backend.last_op(MockOp::Send);
+    REQUIRE(final_chunked_send != nullptr);
+    CHECK_EQ(final_chunked_send->fd, accepted->upstream_fd);
+    CHECK_EQ(final_chunked_send->send_len, sizeof(kFinalChunked) - 1u);
+    CHECK(__builtin_memcmp(
+              final_chunked_send->send_buf, kFinalChunked, sizeof(kFinalChunked) - 1u) == 0);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    loop.close_conn(*accepted);
+}
+
+TEST(request_admission, malformed_te_successor_cannot_inherit_completed_forward_state) {
+    SmallLoop loop;
+    loop.setup();
+    RouteConfig config{};
+    REQUIRE(config.add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(config.add_proxy("/", kRouteMethodAny, 0));
+
+    static constexpr char kFirst[] = "GET / HTTP/1.1\r\nHost: first.example\r\n\r\n";
+    Connection* conn = dispatch_unmatched_request(loop, config, kFirst);
+    REQUIRE(conn != nullptr);
+    const u32 first_len = sizeof(kFirst) - 1u;
+    REQUIRE_EQ(conn->req_initial_send_len, first_len);
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamConnect, 0));
+    loop.inject_and_dispatch(make_ev(conn->id, IoEventType::UpstreamSend, first_len));
+    inject_upstream_response(loop, *conn);
+    REQUIRE_EQ(conn->on_send, &on_proxy_response_sent<SmallLoop>);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    REQUIRE_EQ(conn->state, ConnState::ReadingHeader);
+
+    static constexpr char kSuccessor[] =
+        "POST / HTTP/1.1\r\nHost: second.example\r\nTransfer-Encoding: gzip\r\n\r\n"
+        "opaque-bodyGET /later HTTP/1.1\r\nHost: later.example\r\n\r\n";
+    REQUIRE_EQ(
+        conn->recv_buf.write(reinterpret_cast<const u8*>(kSuccessor), sizeof(kSuccessor) - 1u),
+        sizeof(kSuccessor) - 1u);
+    loop.backend.clear_ops();
+    on_header_received<SmallLoop>(
+        &loop, *conn, make_ev(conn->id, IoEventType::Recv, sizeof(kSuccessor) - 1u));
+
+    CHECK_EQ(conn->resp_status, 400u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->upstream_name[0], '\0');
+    CHECK_EQ(conn->upstream_us, 0u);
+    CHECK_EQ(conn->response_policy_id, 0u);
+    CHECK_EQ(conn->failure_policy_id, 0u);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(count_upstream_send_ops(loop, *conn), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+}
+
 TEST(request_admission, fragmented_and_pipelined_fragment_targets_close) {
     SmallLoop loop;
     loop.setup();

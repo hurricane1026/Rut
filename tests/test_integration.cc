@@ -26930,6 +26930,170 @@ static bool normalize_lowercase_date(char* data, u32 length) {
 #endif
 
 #if RUT_ENABLE_JIT_TESTS
+template <typename Loop>
+static void run_public_source_transfer_encoding_rejection(rut::test::TestCase* _tc) {
+    using namespace rut;
+
+    auto upstream_listener = create_listen_socket(0);
+    REQUIRE(upstream_listener.has_value());
+    const i32 upstream_fd = upstream_listener.value();
+    struct FdGuard {
+        i32 fd;
+        ~FdGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } upstream_guard{upstream_fd};
+    REQUIRE(rut::set_nonblocking(upstream_fd).has_value());
+    const u16 upstream_port = get_port(upstream_fd);
+
+    std::string source_text =
+        "listen :0\nupstream backend at \"127.0.0.1:" + std::to_string(upstream_port) + "\"\n";
+    source_text += R"rut(
+route POST "/" { return forward(backend) }
+)rut";
+
+    struct TempSource {
+        char path[64] = "/tmp/rut_te_admission_XXXXXX";
+        i32 fd = -1;
+        bool create(const std::string& text) {
+            fd = mkstemp(path);
+            if (fd < 0) return false;
+            u32 written = 0;
+            while (written < text.size()) {
+                const ssize_t count = write(fd, text.data() + written, text.size() - written);
+                if (count < 0 && errno == EINTR) continue;
+                if (count <= 0) return false;
+                written += static_cast<u32>(count);
+            }
+            if (close(fd) != 0) return false;
+            fd = -1;
+            return true;
+        }
+        ~TempSource() {
+            if (fd >= 0) close(fd);
+            unlink(path);
+        }
+    } source;
+    REQUIRE(source.create(source_text));
+
+    LoadedProgram program{};
+    struct ProgramGuard {
+        LoadedProgram& program;
+        ~ProgramGuard() { program.destroy(); }
+    } program_guard{program};
+    LoadError load_error{};
+    const bool loaded = load_rut_program(source.path, program, load_error, jit::OptLevel::O0);
+    char load_message[512]{};
+    if (!loaded) format_load_error(load_error, load_message, sizeof(load_message));
+    REQUIRE_MSG(loaded, load_message);
+    REQUIRE(program.jit_inited);
+    REQUIRE(program.has_listener);
+    REQUIRE_EQ(program.config.route_count, 1u);
+    REQUIRE_EQ(program.config.upstream_count, 1u);
+
+    Shard<Loop> shard;
+    i32 listener_fd = create_listen_socket(0).value_or(-1);
+    REQUIRE_GE(listener_fd, 0);
+    struct ShardGuard {
+        Shard<Loop>& shard;
+        i32& listener_fd;
+        bool initialized = false;
+        bool spawned = false;
+        ~ShardGuard() {
+            if (spawned) {
+                shard.stop();
+                shard.join();
+            }
+            if (initialized) shard.shutdown();
+            if (listener_fd >= 0) close(listener_fd);
+        }
+    } shard_guard{shard, listener_fd};
+    const auto init = shard.init(0, listener_fd);
+    REQUIRE(init.has_value());
+    shard_guard.initialized = true;
+    const auto listener_context = derive_listener_context(listener_fd, program.listener);
+    REQUIRE(listener_context.has_value());
+    shard.loop->listener_context = listener_context.value();
+    shard.route_config = &program.config;
+    shard.active_config = shard.route_config;
+    REQUIRE(shard.spawn(-1).has_value());
+    shard_guard.spawned = true;
+
+    const i32 client_fd = connect_to(get_port(listener_fd));
+    REQUIRE_GE(client_fd, 0);
+    struct ClientGuard {
+        i32 fd;
+        ~ClientGuard() {
+            if (fd >= 0) close(fd);
+        }
+    } client_guard{client_fd};
+    set_socket_timeouts(client_fd, 3);
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\r\nHost: client.example\r\nTransfer-Encoding: gzip\r\n\r\n"
+        "opaque-body\r\n\r\nGET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+    REQUIRE(send_all(client_fd, kRequest, sizeof(kRequest) - 1u));
+
+    static constexpr char kExpected[] =
+        "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n"
+        "\r\nBad Request";
+    char response[256]{};
+    u32 response_len = 0;
+    bool saw_eof = false;
+    while (response_len < sizeof(response)) {
+        const i32 count =
+            recv_timeout(client_fd, response + response_len, sizeof(response) - response_len, 3000);
+        if (count == 0) {
+            saw_eof = true;
+            break;
+        }
+        if (count < 0) break;
+        response_len += static_cast<u32>(count);
+    }
+    CHECK(saw_eof);
+    CHECK_EQ(response_len, sizeof(kExpected) - 1u);
+    if (response_len == sizeof(kExpected) - 1u)
+        CHECK_EQ(memcmp(response, kExpected, sizeof(kExpected) - 1u), 0);
+
+    // Give a wrongly admitted connect time to reach the bound upstream. Its
+    // nonblocking accept queue must stay empty after the downstream was closed.
+    bool upstream_connection_seen = false;
+    const u64 upstream_quiet_deadline_us = monotonic_us() + 100000u;
+    while (monotonic_us() < upstream_quiet_deadline_us && !upstream_connection_seen) {
+        const i32 accepted_fd = accept(upstream_fd, nullptr, nullptr);
+        if (accepted_fd >= 0) {
+            upstream_connection_seen = true;
+            close(accepted_fd);
+            break;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            FAIL("unexpected error while checking upstream accept queue");
+        }
+        usleep(5000);
+    }
+    CHECK_FALSE(upstream_connection_seen);
+
+    close(client_guard.fd);
+    client_guard.fd = -1;
+    shard.stop();
+    shard.join();
+    settle_stopped_iouring_shard(shard);
+    shard_guard.spawned = false;
+    CHECK_EQ(shard.loop->active_count(), 0u);
+    if constexpr (requires(Loop* candidate) { candidate->pending_free_count; })
+        CHECK_EQ(shard.loop->pending_free_count, 0u);
+    CHECK_EQ(shard.loop->pool.in_use(), 0u);
+}
+
+TEST(request_framing, public_source_rejects_unsupported_te_before_upstream_epoll) {
+    run_public_source_transfer_encoding_rejection<EpollEventLoop>(_tc);
+}
+
+TEST(request_framing, public_source_rejects_unsupported_te_before_upstream_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    run_public_source_transfer_encoding_rejection<IoUringEventLoop>(_tc);
+}
+
 TEST(route, public_ordinary_source_unmatched_options_star_nginx_400_zero_upstream_iouring) {
     using namespace rut;
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");

@@ -17,6 +17,7 @@
 #include "rut/runtime/rate_limit_enforce.h"
 #include "rut/runtime/response_read_deadline.h"
 #include "rut/runtime/route_table.h"
+#include "rut/runtime/simd/simd.h"
 #include "rut/runtime/slice_pool.h"  // SlicePool::kSliceSize (terminate reassembly cap)
 #include "rut/runtime/timer_wheel.h"
 #include "rut/runtime/tls_iouring.h"  // tls_fill_output / TlsFill for the io_uring-TLS proxy path
@@ -2255,6 +2256,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
     complete_pipeline_request = conn.pipeline_depth > 0 && pre_status == ParseStatus::Complete;
+    const bool transfer_encoding_header_complete =
+        pre_parser.header_end != 0 ||
+        simd::find_header_end(conn.recv_buf.data(), conn.recv_buf.len(), 0) > 0;
+    const bool reject_transfer_framing =
+        transfer_encoding_header_complete &&
+        pre_req.transfer_encoding != RequestTransferEncoding::None &&
+        pre_req.transfer_encoding != RequestTransferEncoding::Unparsed &&
+        (pre_req.transfer_encoding == RequestTransferEncoding::Unsupported ||
+         pre_req.has_content_length);
 
     conn.clear_response_accounting();
     capture_request_metadata(conn);
@@ -2413,6 +2423,28 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     }
     loop->epoch_enter();
     if (loop->metrics) loop->metrics->on_request_start();
+    // Requests with transfer codings outside the exact final-chunked subset
+    // have no safe HTTP/1 body boundary for proxying. Reject them before route
+    // handlers, upstream pool reuse/connect, or request mutations can observe
+    // or publish the request. This follows the existing strict inventory and
+    // pre-route fences, preserving their close-without-response contract.
+    // Incomplete headers stay on the receive path above. The raw delimiter
+    // witness also catches a complete header when parsing failed after its TE
+    // field (including CL + chunked), without treating a fragmented header as
+    // complete.
+    if (reject_transfer_framing) {
+        conn.req_method = map_log_method(pre_req.method);
+        conn.resp_status = 400;
+        format_static_response(conn,
+                               400,
+                               /*keep_alive=*/false,
+                               pre_req.method == HttpMethod::HEAD);
+        conn.keep_alive = false;
+        conn.transition_to_sending(&on_response_sent<Loop>);
+        if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))
+            close_conn_if_live(loop, conn);
+        return;
+    }
     // The raw target witness covers both path and query. A literal fragment
     // delimiter is invalid before any route, handler or upstream effect;
     // percent-encoded %23 remains ordinary request-target data.

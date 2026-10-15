@@ -239,6 +239,15 @@ success terminator, so guard and pre-middleware short circuits cannot inherit
 them. Reading or changing a buffered response body/status remains ⏳ and needs a
 resumable, stream-owned runtime Response object.
 
+After existing strict inventory and pre-route fail-closed fences, HTTP/1
+request admission rejects unsupported or ambiguous `Transfer-Encoding` and
+every request combining `Content-Length` with `Transfer-Encoding` using `400`
+and connection close before route handlers or upstream effects. A final
+`chunked` coding remains supported, including `gzip, chunked`; the transparent
+proxy path preserves those request header and body bytes and uses the chunk
+boundary to keep any pipelined successor separate. Fragmented headers are
+classified only after the complete header arrives.
+
 The literal `response(status, body: "...")` form is limited to 1 MiB. Its bytes
 are a non-owning view into the loaded program's RIR/module response-body
 storage; `LoadedProgram` keeps that storage alive through teardown and reload
