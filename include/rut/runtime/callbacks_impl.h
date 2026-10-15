@@ -2194,9 +2194,9 @@ void pipeline_dispatch(Loop* loop, Connection& conn) {
 
 // Parse-error framing admission needs a raw field-name witness because the
 // semantic parser can stop before visiting Transfer-Encoding (or before it
-// records a malformed Content-Length). LF is a cold-path boundary witness
-// here so malformed line endings cannot hide a later TE field; this does not
-// accept those line endings. The scan is restricted to the first complete
+// records a malformed Content-Length). CR and LF are cold-path boundary
+// witnesses so malformed line endings cannot hide a later TE field; this does
+// not accept those line endings. The scan is restricted to the first complete
 // HTTP/1 header block; body and pipelined successor bytes are never considered.
 // Successful parses keep using ParsedRequest's classification. The parse-error
 // path also rejects a leading line break after optional OWS because its
@@ -2216,10 +2216,10 @@ inline bool http1_raw_header_has_transfer_encoding(const u8* data, u32 header_en
     bool request_line = true;
     while (pos < header_end) {
         u32 line_end = pos;
-        while (line_end < header_end && data[line_end] != '\n') line_end++;
+        while (line_end < header_end && data[line_end] != '\r' && data[line_end] != '\n')
+            line_end++;
         if (line_end == header_end) return false;
-        u32 content_end = line_end;
-        if (content_end > pos && data[content_end - 1u] == '\r') content_end--;
+        const u32 content_end = line_end;
         if (content_end == pos) return false;
 
         if (!request_line) {
@@ -2244,7 +2244,10 @@ inline bool http1_raw_header_has_transfer_encoding(const u8* data, u32 header_en
         }
 
         request_line = false;
-        pos = line_end + 1u;
+        pos = line_end +
+              (data[line_end] == '\r' && line_end + 1u < header_end && data[line_end + 1u] == '\n'
+                   ? 2u
+                   : 1u);
     }
     return false;
 }

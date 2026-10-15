@@ -22244,6 +22244,7 @@ TEST(request_admission, unsupported_transfer_framing_rejected_before_route_or_up
     REQUIRE(jit_forward.add_jit_handler("/", kRouteMethodAny, &pre_route_root_handler, false));
 
     const char* requests[] = {
+        "POST / HTTP/1.1\rTransfer-Encoding: chunked\r\nHost: x\r\n\r\n0\r\n\r\n",
         "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\nopaque-body",
         "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"
         "3\r\nabc\r\n0\r\n\r\n",

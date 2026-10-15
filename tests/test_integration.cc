@@ -26931,7 +26931,8 @@ static bool normalize_lowercase_date(char* data, u32 length) {
 
 #if RUT_ENABLE_JIT_TESTS
 template <typename Loop>
-static void run_public_source_transfer_encoding_rejection(rut::test::TestCase* _tc) {
+static void run_public_source_transfer_encoding_rejection(rut::test::TestCase* _tc,
+                                                          const char* request) {
     using namespace rut;
 
     auto upstream_listener = create_listen_socket(0);
@@ -27028,11 +27029,7 @@ route POST "/" { return forward(backend) }
         }
     } client_guard{client_fd};
     set_socket_timeouts(client_fd, 3);
-    static constexpr char kRequest[] =
-        "POST / HTTP/1.1\r\nHost: client.example\r\nContent-Length: x\r\n"
-        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
-        "GET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
-    REQUIRE(send_all(client_fd, kRequest, sizeof(kRequest) - 1u));
+    REQUIRE(send_all(client_fd, request, static_cast<u32>(strlen(request))));
 
     static constexpr char kExpected[] =
         "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n"
@@ -27087,12 +27084,35 @@ route POST "/" { return forward(backend) }
 }
 
 TEST(request_framing, public_source_rejects_unsupported_te_before_upstream_epoll) {
-    run_public_source_transfer_encoding_rejection<EpollEventLoop>(_tc);
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\r\nHost: client.example\r\nContent-Length: x\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        "GET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+    run_public_source_transfer_encoding_rejection<EpollEventLoop>(_tc, kRequest);
 }
 
 TEST(request_framing, public_source_rejects_unsupported_te_before_upstream_iouring) {
     if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
-    run_public_source_transfer_encoding_rejection<IoUringEventLoop>(_tc);
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\r\nHost: client.example\r\nContent-Length: x\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        "GET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+    run_public_source_transfer_encoding_rejection<IoUringEventLoop>(_tc, kRequest);
+}
+
+TEST(request_framing, public_source_rejects_bare_cr_te_before_upstream_epoll) {
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\rTransfer-Encoding: chunked\r\nHost: x\r\n\r\n"
+        "0\r\n\r\nGET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+    run_public_source_transfer_encoding_rejection<EpollEventLoop>(_tc, kRequest);
+}
+
+TEST(request_framing, public_source_rejects_bare_cr_te_before_upstream_iouring) {
+    if (!iouring_socket_live()) SKIP("io_uring async socket ops unavailable in this environment");
+    static constexpr char kRequest[] =
+        "POST / HTTP/1.1\rTransfer-Encoding: chunked\r\nHost: x\r\n\r\n"
+        "0\r\n\r\nGET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+    run_public_source_transfer_encoding_rejection<IoUringEventLoop>(_tc, kRequest);
 }
 
 TEST(route, public_ordinary_source_unmatched_options_star_nginx_400_zero_upstream_iouring) {
