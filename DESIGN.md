@@ -4815,6 +4815,21 @@ struct ParsedRequest {
 int parse_request(const u8* buf, u32 len, ParsedRequest* out);
 ```
 
+For HTTP/1 requests, dispatch retains the ordered `Transfer-Encoding`
+classification produced by the parser. After existing strict inventory and
+pre-route fail-closed fences, it rejects unsupported or ambiguous transfer-
+coding lists, and every request combining `Content-Length` with
+`Transfer-Encoding`, with `400` and connection close after the complete header
+arrives and before route handlers or upstream effects. A final `chunked`
+coding remains supported, including `gzip, chunked`. The transparent proxy path
+preserves the original header and chunk bytes, and uses the chunk parser to keep
+the request boundary separate from any pipelined successor. Incomplete headers
+remain pending until their end is received. On the parse-error fallback path,
+a complete header whose prefix, after optional OWS, begins with a line break is
+rejected because the request-line boundary is not trustworthy. A non-empty
+malformed first line without a raw `Transfer-Encoding` field continues to use
+the legacy fallback behavior.
+
 ### 7.2 Routing
 
 Compile-time built **radix trie**. The JIT compiler can compile the trie traversal into a series of switch/jump instructions.
