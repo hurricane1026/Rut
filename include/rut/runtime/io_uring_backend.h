@@ -58,6 +58,8 @@ using Connection = ConnectionBase;  // alias (matches connection.h)
 // shard = one ring = one submitting thread already holds by construction.
 //
 struct IoUringBackend {
+    enum class RelaySplicePairStatus : u8 { Submitted, Deferred, Failed };
+
     IoUringInitFailureDetail last_init_failure_detail = IoUringInitFailureDetail::None;
     SlicePool* response_pool = nullptr;
     // io_uring is async: the kernel may still access user buffers between
@@ -334,16 +336,39 @@ struct IoUringBackend {
                           u32 length,
                           bool more = false,
                           u8 auxiliary = 4);
-    bool add_relay_splice_pair(i32 source_fd,
-                               i32 pipe_write_fd,
-                               i32 pipe_read_fd,
-                               i32 destination_fd,
-                               u32 conn_id,
-                               u32 upstream_episode,
-                               u32 length,
-                               bool more = false,
-                               bool hardlink = false,
-                               u8 auxiliary = 4);
+    RelaySplicePairStatus add_relay_splice_pair(i32 source_fd,
+                                                i32 pipe_write_fd,
+                                                i32 pipe_read_fd,
+                                                i32 destination_fd,
+                                                u32 conn_id,
+                                                u32 upstream_episode,
+                                                u32 length,
+                                                bool more = false,
+                                                bool hardlink = false,
+                                                u8 auxiliary = 4);
+    template <typename HasRoom, typename Enter, typename EnterError, typename InvalidResult>
+    static RelaySplicePairStatus reserve_relay_splice_pair_room(u32& pending,
+                                                                HasRoom&& has_room,
+                                                                Enter&& enter,
+                                                                EnterError&& enter_error,
+                                                                InvalidResult&& invalid_result) {
+        while (!has_room()) {
+            if (pending == 0) return RelaySplicePairStatus::Deferred;
+            const i32 submitted = enter(pending);
+            if (submitted == -EINTR) continue;
+            if (submitted < 0) {
+                enter_error(submitted);
+                return RelaySplicePairStatus::Failed;
+            }
+            if (static_cast<u32>(submitted) > pending) {
+                invalid_result();
+                return RelaySplicePairStatus::Failed;
+            }
+            if (submitted == 0) return RelaySplicePairStatus::Deferred;
+            pending -= static_cast<u32>(submitted);
+        }
+        return RelaySplicePairStatus::Submitted;
+    }
     bool add_relay_poll(
         i32 fd, u32 conn_id, IoEventType type, u32 upstream_episode, u8 auxiliary = 0);
     // Dedicated single submission point for the bounded explicit

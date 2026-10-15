@@ -47,6 +47,7 @@ struct WsSpliceExperiment {
     u32 queued_count = 0, queued_head = 0, turn_budget_remaining = 0;
     u32 budget_deferred_runnable_count = 0;
     bool turn_budget_active = false;
+    bool submission_deferred = false;
     bool budget_deferred_runnable = false;
     u32 admission_budget_remaining = 0;
     bool asynchronous = false, linked = false, poll_next_read = false;
@@ -65,6 +66,9 @@ struct WsSpliceExperiment {
     u32 copy_limit = 4096;
     u64 polls = 0, eagain[2]{}, pipe_grow_failures = 0;
     u32 minimum_pipe_capacity = 0xffffffffu;
+    bool async_copy_options_compatible(bool splice_supported) const {
+        return !(enabled && asynchronous && splice_supported && (copy_first || check_available));
+    }
     bool enable(u32 capacity) {
         if (!owners.init(capacity) || !queued.init(capacity)) return false;
         enabled = true;
@@ -162,6 +166,7 @@ struct WsSpliceExperiment {
         budget_deferred_runnable_count = 0;
         budget_deferred_runnable = false;
         turn_budget_active = false;
+        submission_deferred = false;
     }
     template <class Loop>
     bool intercept_recv(Loop& loop, Connection& c) {
@@ -277,16 +282,25 @@ struct WsSpliceExperiment {
             // A hard link preserves the write after a short read. Each direction
             // owns an empty private pipe, so the write cannot consume more than
             // this read actually produced. Account only after both CQEs arrive.
-            if (!loop.backend.add_relay_splice_pair(source,
-                                                    d.write_fd,
-                                                    d.read_fd,
-                                                    destination,
-                                                    c.id,
-                                                    o.episode,
-                                                    chunk_size,
-                                                    false,
-                                                    true,
-                                                    static_cast<u8>(32 + index))) {
+            const auto status = loop.backend.add_relay_splice_pair(source,
+                                                                   d.write_fd,
+                                                                   d.read_fd,
+                                                                   destination,
+                                                                   c.id,
+                                                                   o.episode,
+                                                                   chunk_size,
+                                                                   false,
+                                                                   true,
+                                                                   static_cast<u8>(32 + index));
+            if (status == IoUringBackend::RelaySplicePairStatus::Deferred) {
+                // Wait for a CQE before trying again; do not spin or close a
+                // healthy tunnel when the SQ cannot currently reserve a pair.
+                submission_deferred = true;
+                turn_budget_remaining = 0;
+                enqueue(c.id);
+                return;
+            }
+            if (status != IoUringBackend::RelaySplicePairStatus::Submitted) {
                 loop.close_conn(c);
                 return;
             }
@@ -772,6 +786,7 @@ struct WsSpliceExperiment {
     }
     template <class Loop>
     void progress(Loop& loop) {
+        if (submission_deferred) return;
         budget_deferred_runnable = false;
         if (!turn_budget_active) begin_turn(loop);
         const u32 kOwnersToVisit = queued_count < turn_call_limit ? queued_count : turn_call_limit;

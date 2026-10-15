@@ -87,6 +87,23 @@ class ToolsTest(unittest.TestCase):
             protocol_strategy.validate_ws_async_splice_startup(
                 "RUT_STUDY_WS_ASYNC_SPLICE mode=off\n", settings)
 
+    def test_protocol_strategy_rejects_ignored_copy_options_with_async_splice(self):
+        for key, name in (("ws_copy", "RUT_STUDY_WS_COPY"),
+                          ("ws_available", "RUT_STUDY_WS_AVAILABLE")):
+            settings = dict(protocol_strategy.ws_async_splice_settings({
+                "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+            }), ws_splice_mode="on", **{key: "on", "ws_copy_limit": "4k"})
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf'{name}=on is unsupported with RUT_STUDY_WS_ASYNC_SPLICE=on'):
+                protocol_strategy.validate_ws_async_splice_configuration(settings)
+        # Copy limit alone is inert while copy-first is off; do not reject it.
+        protocol_strategy.validate_ws_async_splice_configuration(dict(
+            protocol_strategy.ws_async_splice_settings({
+                "RUT_STUDY_WS_ASYNC_SPLICE": "on",
+            }), ws_splice_mode="on", ws_copy="off", ws_available="off",
+            ws_copy_limit="16k"))
+
     def test_protocol_strategy_rejects_async_splice_dependents_without_async_mode(self):
         for key, env_name in (
                 ("RUT_STUDY_WS_LINKED_SPLICE", "LINKED_SPLICE"),

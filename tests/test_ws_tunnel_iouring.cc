@@ -1808,6 +1808,56 @@ TEST(websocket, iouring_splice_large_pipe_long_turn) {
     full_duplex_burst(_tc, false, false, true, true, false, 37, false, 131072, 16);
 }
 
+TEST(websocket, async_splice_rejects_copy_first_and_available_options) {
+    WsSpliceExperiment config{};
+    config.enabled = true;
+    config.asynchronous = true;
+    CHECK(config.async_copy_options_compatible(true));
+    config.copy_first = true;
+    CHECK(!config.async_copy_options_compatible(true));
+    CHECK(config.async_copy_options_compatible(false));
+    config.copy_first = false;
+    config.check_available = true;
+    CHECK(!config.async_copy_options_compatible(true));
+    config.asynchronous = false;
+    CHECK(config.async_copy_options_compatible(true));
+}
+
+TEST(websocket, deferred_pair_wait_keeps_ws_and_http_owners_runnable) {
+    LoopStorage storage;
+    if (!storage.init()) return;
+    auto& loop = *storage.loop;
+    loop.initialize_slots_to(2);
+    REQUIRE(loop.ws_splice.enable(2));
+
+    auto& ws_owner = loop.ws_splice.owners[0];
+    ws_owner.active = true;
+    auto& http_owner = loop.conns[1];
+    http_owner.relay_owner.upstream_episode = 7;
+    loop.defer_response_splice_read(http_owner, true);
+    loop.defer_response_splice_read(http_owner, true);
+    CHECK_EQ(loop.deferred_relay_read_count, 1u);
+    CHECK(loop.should_wait_for_event());
+    loop.clear_deferred_relay_read(http_owner.id);
+    CHECK_EQ(loop.deferred_relay_read_count, 0u);
+    CHECK_FALSE(loop.deferred_relay_read_wait);
+    CHECK(loop.should_wait_for_event());
+
+    loop.ws_splice.submission_deferred = true;
+    loop.ws_splice.enqueue(0);
+    loop.ws_splice.enqueue(0);
+    CHECK_EQ(loop.ws_splice.queued_count, 1u);
+    CHECK(loop.should_wait_for_event());
+    loop.ws_splice.progress(loop);
+    CHECK_EQ(loop.ws_splice.queued_count, 1u);
+    loop.ws_splice.submission_deferred = false;  // backend.wait() returned at its CQ boundary
+    CHECK_FALSE(loop.ws_splice.submission_deferred);
+    CHECK_EQ(loop.ws_splice.queued_count, 1u);
+    ws_owner.active = false;
+    loop.ws_splice.progress(loop);
+    CHECK_EQ(loop.ws_splice.queued_count, 0u);
+}
+
 TEST(websocket, iouring_splice_copy_first_small_and_threshold) {
     full_duplex_burst(_tc, false, false, false, true, true, 0, false, 65536, 2, true, 64);
     full_duplex_burst(_tc, false, false, true, true, false, 0, false, 65536, 2, true, 4096);

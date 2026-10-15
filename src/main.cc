@@ -472,6 +472,11 @@ static bool configure_study_policy(Loop* loop) {
                 if (str_eq(*item, "RUT_STUDY_WS_CALLS=16")) loop->ws_splice.call_budget = 16;
                 if (str_eq(*item, "RUT_STUDY_WS_CALLS=64")) loop->ws_splice.call_budget = 64;
             }
+            if (!loop->ws_splice.async_copy_options_compatible(loop->backend.splice_supported)) {
+                write_str(
+                    "RUT_STUDY_WS_COPY/AVAILABLE are unsupported with effective async splice\n");
+                return false;
+            }
             if (report_study) {
                 const bool ws_async_effective = loop->ws_splice.enabled &&
                                                 loop->ws_splice.asynchronous &&

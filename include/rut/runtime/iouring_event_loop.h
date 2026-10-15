@@ -301,6 +301,7 @@ struct IoUringEventLoop : EventLoopCRTP<IoUringEventLoop> {
     static constexpr u32 kDeferredRelayReadLimit = kMaxEventsPerWait;
     u32 deferred_relay_read_count = 0;
     u32 deferred_relay_read_head = 0;
+    bool deferred_relay_read_wait = false;
     bool study_http_relay_ring = false;
     u32 deferred_relay_read_ids[kDeferredRelayReadLimit]{};
     u32 deferred_relay_read_episodes[kDeferredRelayReadLimit]{};
@@ -742,6 +743,7 @@ public:
         deferred_relay_read_count = 0;
         ws_cache_upstream_rearm_pending_count = 0;
         deferred_relay_read_head = 0;
+        deferred_relay_read_wait = false;
         free_top = 0;
         response_read_deadline_body_pump_pending = false;
         body_pump_ready_words.destroy();
@@ -828,6 +830,7 @@ public:
         upstream_retirement_retry_count = 0;
         deferred_relay_read_count = 0;
         deferred_relay_read_head = 0;
+        deferred_relay_read_wait = false;
         http1_boundary_ready_pending = false;
         response_read_deadline_expiry_pending = false;
         response_read_deadline_body_pump_pending = false;
@@ -872,6 +875,7 @@ public:
     }
 
     bool should_wait_for_event() const {
+        if (deferred_relay_read_wait || ws_splice.submission_deferred) return true;
         return deferred_relay_read_count == 0 && !ws_splice.budget_deferred_runnable;
     }
 
@@ -895,6 +899,7 @@ public:
             ws_splice.progress(*this);
             const u32 kEventCount = backend.wait(
                 events, study_event_batch_limit, conns, slots_initialized, should_wait_for_event());
+            ws_splice.submission_deferred = false;
             if (backend.failure_code() != 0) {
                 // A zero-event wait is valid; a sticky backend error is not. Stop
                 // this shard so an io_uring_enter failure cannot become a silent
@@ -4530,9 +4535,10 @@ public:
         return true;
     }
 
-    void defer_response_splice_read(Connection& c) {
+    void defer_response_splice_read(Connection& c, bool wait_for_completion = false) {
         RelayOwner& r = c.relay_owner;
         r.phase = RelayPhase::Reading;
+        deferred_relay_read_wait = deferred_relay_read_wait || wait_for_completion;
         for (u32 i = 0; i < deferred_relay_read_count; i++) {
             if (deferred_relay_read_ids[deferred_relay_read_slot(i)] == c.id &&
                 deferred_relay_read_episodes[deferred_relay_read_slot(i)] == r.upstream_episode)
@@ -4612,6 +4618,7 @@ public:
 
     void flush_deferred_relay_reads() {
         ++study_relay_turns;
+        deferred_relay_read_wait = false;
         const u64 phase_started = monotonic_ns();
         const u32 start_calls = relay_budget_calls;
         const u32 kCount = deferred_relay_read_count;
@@ -4706,6 +4713,7 @@ public:
                     deferred_relay_read_episodes[deferred_relay_read_slot(j + 1)];
             }
         }
+        if (deferred_relay_read_count == 0) deferred_relay_read_wait = false;
     }
 
     bool arm_response_splice_read(Connection& c) {
@@ -4880,16 +4888,21 @@ public:
                 relay_budget_bytes / 2);
             if (study_http_async_splice && backend.splice_supported && !completed_splice) {
                 if (study_http_async_splice_link) {
-                    if (!backend.add_relay_splice_pair(
-                            c.upstream_fd,
-                            r.pipe_write,
-                            r.pipe_read,
-                            c.fd,
-                            c.id,
-                            r.upstream_episode,
-                            want,
-                            study_http_async_splice_more && c.resp_body_remaining > want,
-                            study_http_async_splice_hardlink)) {
+                    const auto status = backend.add_relay_splice_pair(
+                        c.upstream_fd,
+                        r.pipe_write,
+                        r.pipe_read,
+                        c.fd,
+                        c.id,
+                        r.upstream_episode,
+                        want,
+                        study_http_async_splice_more && c.resp_body_remaining > want,
+                        study_http_async_splice_hardlink);
+                    if (status == IoUringBackend::RelaySplicePairStatus::Deferred) {
+                        defer_response_splice_read(c, true);
+                        return;
+                    }
+                    if (status != IoUringBackend::RelaySplicePairStatus::Submitted) {
                         handle_response_splice_poll_failure(c);
                         return;
                     }

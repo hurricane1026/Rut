@@ -756,16 +756,16 @@ bool IoUringBackend::add_relay_splice(i32 source_fd,
 #endif
 }
 
-bool IoUringBackend::add_relay_splice_pair(i32 source_fd,
-                                           i32 pipe_write_fd,
-                                           i32 pipe_read_fd,
-                                           i32 destination_fd,
-                                           u32 conn_id,
-                                           u32 upstream_episode,
-                                           u32 length,
-                                           bool more,
-                                           bool hardlink,
-                                           u8 auxiliary) {
+IoUringBackend::RelaySplicePairStatus IoUringBackend::add_relay_splice_pair(i32 source_fd,
+                                                                            i32 pipe_write_fd,
+                                                                            i32 pipe_read_fd,
+                                                                            i32 destination_fd,
+                                                                            u32 conn_id,
+                                                                            u32 upstream_episode,
+                                                                            u32 length,
+                                                                            bool more,
+                                                                            bool hardlink,
+                                                                            u8 auxiliary) {
 #if !RUT_HAVE_IORING_OP_SPLICE
     (void)source_fd;
     (void)pipe_write_fd;
@@ -777,13 +777,13 @@ bool IoUringBackend::add_relay_splice_pair(i32 source_fd,
     (void)more;
     (void)hardlink;
     (void)auxiliary;
-    return false;
+    return RelaySplicePairStatus::Failed;
 #else
     if ((auxiliary != 4 && auxiliary != 32 && auxiliary != 33) || !splice_supported ||
         source_fd < 0 || pipe_write_fd < 0 || pipe_read_fd < 0 || destination_fd < 0 ||
-        conn_id >= connection_capacity || length == 0 ||
+        ring_fd < 0 || conn_id >= connection_capacity || length == 0 ||
         !valid_upstream_episode(upstream_episode) || sq_ring_entries < 2)
-        return false;
+        return RelaySplicePairStatus::Failed;
     // Reserve both entries before publishing the linked read. A half-pair
     // must never be flushed as a link to an unrelated operation.
     auto room = [&] {
@@ -791,19 +791,16 @@ bool IoUringBackend::add_relay_splice_pair(i32 source_fd,
                    __atomic_load_n(sq_head, __ATOMIC_ACQUIRE) <=
                sq_ring_entries - 2;
     };
-    if (!room() && !disable_full_sq_flush && ring_fd >= 0 && pending > 0) {
-        for (;;) {
-            const i32 flushed = io_uring_enter(ring_fd, pending, 0, IORING_ENTER_SQ_WAKEUP);
-            if (flushed >= 0) {
-                pending -= static_cast<u32>(flushed);
-                break;
-            }
-            if (flushed == -EINTR) continue;
-            record_enter_error(flushed);
-            return false;
-        }
-    }
-    if (!room()) return false;
+    const RelaySplicePairStatus kSpace = reserve_relay_splice_pair_room(
+        pending,
+        room,
+        [&](u32 to_submit) {
+            if (disable_full_sq_flush || ring_fd < 0) return 0;
+            return io_uring_enter(ring_fd, to_submit, 0, IORING_ENTER_SQ_WAKEUP);
+        },
+        [&](i32 error) { record_enter_error(error); },
+        [&] { fatal_error.store(EPROTO, std::memory_order_release); });
+    if (kSpace != RelaySplicePairStatus::Submitted) return kSpace;
     const u32 tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
     const u32 mask = *sq_ring_mask;
     for (u32 side = 0; side < 2; ++side) {
@@ -827,7 +824,7 @@ bool IoUringBackend::add_relay_splice_pair(i32 source_fd,
     }
     __atomic_store_n(sq_tail, tail + 2, __ATOMIC_RELEASE);
     pending += 2;
-    return true;
+    return RelaySplicePairStatus::Submitted;
 #endif
 }
 
