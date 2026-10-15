@@ -2192,6 +2192,63 @@ void pipeline_dispatch(Loop* loop, Connection& conn) {
     on_header_received<Loop>(static_cast<void*>(loop), conn, kSynth);
 }
 
+// Parse-error framing admission needs a raw field-name witness because the
+// semantic parser can stop before visiting Transfer-Encoding (or before it
+// records a malformed Content-Length). LF is a cold-path boundary witness
+// here so malformed line endings cannot hide a later TE field; this does not
+// accept those line endings. The scan is restricted to the first complete
+// HTTP/1 header block; body and pipelined successor bytes are never considered.
+// Successful parses keep using ParsedRequest's classification. The parse-error
+// path also rejects a leading line break after optional OWS because its
+// request-line boundary cannot be trusted.
+inline bool http1_raw_header_has_leading_line_break_prefix(const u8* data, u32 header_end) {
+    if (data == nullptr || header_end == 0) return false;
+
+    u32 pos = 0;
+    while (pos < header_end && (data[pos] == ' ' || data[pos] == '\t')) pos++;
+    return pos < header_end && (data[pos] == '\r' || data[pos] == '\n');
+}
+
+inline bool http1_raw_header_has_transfer_encoding(const u8* data, u32 header_end) {
+    if (data == nullptr || header_end < 4u) return false;
+
+    u32 pos = 0;
+    bool request_line = true;
+    while (pos < header_end) {
+        u32 line_end = pos;
+        while (line_end < header_end && data[line_end] != '\n') line_end++;
+        if (line_end == header_end) return false;
+        u32 content_end = line_end;
+        if (content_end > pos && data[content_end - 1u] == '\r') content_end--;
+        if (content_end == pos) return false;
+
+        if (!request_line) {
+            u32 colon = pos;
+            while (colon < content_end && data[colon] != ':') colon++;
+            if (colon < content_end) {
+                u32 name_start = pos;
+                u32 name_end = colon;
+                while (name_start < name_end &&
+                       (data[name_start] == ' ' || data[name_start] == '\t'))
+                    name_start++;
+                while (name_end > name_start &&
+                       (data[name_end - 1u] == ' ' || data[name_end - 1u] == '\t'))
+                    name_end--;
+                if (name_end - name_start == 17u &&
+                    http_header_name_eq_ci(reinterpret_cast<const char*>(data + name_start),
+                                           name_end - name_start,
+                                           "transfer-encoding",
+                                           17))
+                    return true;
+            }
+        }
+
+        request_line = false;
+        pos = line_end + 1u;
+    }
+    return false;
+}
+
 template <typename Loop>
 void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
@@ -2247,24 +2304,35 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     pre_parser.reset();
     const ParseStatus pre_status =
         pre_parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &pre_req);
-    if (pre_status == ParseStatus::Incomplete) {
+    const u32 raw_header_end =
+        pre_parser.header_end != 0 ? pre_parser.header_end
+        : pre_status == ParseStatus::Error
+            ? simd::find_header_end(conn.recv_buf.data(), conn.recv_buf.len(), 0)
+            : 0u;
+    const bool raw_header_complete = raw_header_end != 0;
+    if (pre_status == ParseStatus::Incomplete ||
+        (pre_status == ParseStatus::Error && !raw_header_complete)) {
         // Keep pipeline_depth unchanged so fragmented successors retain their
         // generation boundary. Initial requests likewise retain every byte.
-        // A full incomplete buffer cannot make progress and must not spin.
+        // Parse errors also wait for the complete header before entering the
+        // legacy fallback. A full buffer cannot make progress and must not
+        // spin. This preserves the old no-TE malformed-request behavior once
+        // the delimiter arrives while preventing a partial framing field from
+        // reaching routing before its later TE field can be witnessed.
         conn.transition_to_reading_header(&on_header_received<Loop>);
         if (conn.recv_buf.write_avail() == 0 || !loop->submit_recv(conn)) loop->close_conn(conn);
         return;
     }
     complete_pipeline_request = conn.pipeline_depth > 0 && pre_status == ParseStatus::Complete;
-    const bool transfer_encoding_header_complete =
-        pre_parser.header_end != 0 ||
-        simd::find_header_end(conn.recv_buf.data(), conn.recv_buf.len(), 0) > 0;
-    const bool reject_transfer_framing =
-        transfer_encoding_header_complete &&
-        pre_req.transfer_encoding != RequestTransferEncoding::None &&
-        pre_req.transfer_encoding != RequestTransferEncoding::Unparsed &&
-        (pre_req.transfer_encoding == RequestTransferEncoding::Unsupported ||
-         pre_req.has_content_length);
+    const bool reject_untrusted_request_framing =
+        pre_status == ParseStatus::Error
+            ? http1_raw_header_has_leading_line_break_prefix(conn.recv_buf.data(),
+                                                             raw_header_end) ||
+                  http1_raw_header_has_transfer_encoding(conn.recv_buf.data(), raw_header_end)
+            : raw_header_complete && pre_req.transfer_encoding != RequestTransferEncoding::None &&
+                  pre_req.transfer_encoding != RequestTransferEncoding::Unparsed &&
+                  (pre_req.transfer_encoding == RequestTransferEncoding::Unsupported ||
+                   pre_req.has_content_length);
 
     conn.clear_response_accounting();
     capture_request_metadata(conn);
@@ -2428,11 +2496,11 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     // handlers, upstream pool reuse/connect, or request mutations can observe
     // or publish the request. This follows the existing strict inventory and
     // pre-route fences, preserving their close-without-response contract.
-    // Incomplete headers stay on the receive path above. The raw delimiter
-    // witness also catches a complete header when parsing failed after its TE
-    // field (including CL + chunked), without treating a fragmented header as
-    // complete.
-    if (reject_transfer_framing) {
+    // Parse errors use bounded raw-header witnesses for both TE fields and a
+    // leading line break after optional OWS. They do not scan body or pipeline.
+    // Incomplete/malformed headers stay on the receive path until the first
+    // header terminator arrives.
+    if (reject_untrusted_request_framing) {
         conn.req_method = map_log_method(pre_req.method);
         conn.resp_status = 400;
         format_static_response(conn,

@@ -1048,11 +1048,17 @@ TEST(replay_gap, large_header_truncated_by_smallloop) {
     entry.raw_headers[pos++] = '\n';
     entry.raw_header_len = static_cast<u16>(pos);
 
-    // replay_one should not crash — headers get truncated to 4KB
+    // The replay buffer truncates this header before its terminator. It must
+    // not turn the partial request into a synthetic 200 or execute a route.
     ReplayResult result = replay_one(loop, entry, 42);
-    CHECK(result.replayed);
-    // Status might not match exactly due to truncation, but no crash
-    CHECK_EQ(result.actual_status, 200);
+    CHECK_FALSE(result.replayed);
+    CHECK_EQ(result.actual_status, 0u);
+    CHECK_EQ(result.output_bytes, 0u);
+    CHECK_FALSE(result.status_match);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    for (const Connection& conn : loop.conns) CHECK(conn.fd != 42);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
 }
 
 // G3. format_static_response wire format: verify Content-Length matches body

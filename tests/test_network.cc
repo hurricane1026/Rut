@@ -22252,6 +22252,21 @@ TEST(request_admission, unsupported_transfer_framing_rejected_before_route_or_up
         "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:\r\n\r\n",
         "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n"
         "Invalid Header: value\r\n\r\nopaque-body",
+        "POST / HTTP/1.1\r\nHost: x\r\nInvalid Header: value\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nInvalid Header: value\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "\r\nPOST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "\r\n\r\nPOST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "\r\r\n\r\nPOST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "\nPOST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        " \t\r\nPOST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: x\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+        "Content-Length: x\r\n\r\n0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999999999999999999999999999999\r\n"
+        "Transfer-Encoding: gzip\r\n\r\nopaque-body",
         "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n"
         "Transfer-Encoding: gzip\r\n\r\nabc",
         "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n"
@@ -22278,17 +22293,17 @@ TEST(request_admission, unsupported_transfer_framing_rejected_before_route_or_up
         }
     }
 
-    // A fragmented header remains pending until its terminator arrives. Once
-    // complete, the unsupported request and any coalesced successor are closed
-    // together before route dispatch.
+    // Even a parser error remains pending until the full header is present, so
+    // a later framing field cannot be hidden behind an invalid length prefix.
     pre_route_root_handler_calls = 0;
     loop.backend.clear_ops();
     const RouteConfig* active = &jit_forward;
     loop.config_ptr = &active;
     Connection* fragmented = loop.alloc_conn();
     REQUIRE(fragmented != nullptr);
-    static constexpr char kPrefix[] = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n";
-    static constexpr char kSuffix[] = "\r\nopaque-bodyGET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    static constexpr char kPrefix[] = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: x\r\n";
+    static constexpr char kSuffix[] =
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n";
     REQUIRE_EQ(
         fragmented->recv_buf.write(reinterpret_cast<const u8*>(kPrefix), sizeof(kPrefix) - 1),
         sizeof(kPrefix) - 1);
@@ -22346,6 +22361,20 @@ TEST(request_admission, unsupported_transfer_framing_rejected_before_route_or_up
               final_chunked_send->send_buf, kFinalChunked, sizeof(kFinalChunked) - 1u) == 0);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     loop.close_conn(*accepted);
+
+    // A malformed header may still take the legacy fallback when the only TE
+    // looking bytes are in the body or pipelined successor. The raw scan must
+    // stop at the first CRLFCRLF boundary.
+    static constexpr char kBodyTeText[] =
+        "POST / HTTP/1.1\r\nHost: x\r\nInvalid Header: value\r\nContent-Length: 31\r\n\r\n"
+        "Transfer-Encoding: gzip\r\n\r\n"
+        "GET /later HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n";
+    loop.backend.clear_ops();
+    Connection* body_text = dispatch_unmatched_request(loop, direct_proxy, kBodyTeText);
+    REQUIRE(body_text != nullptr);
+    CHECK(body_text->resp_status != 400u);
+    CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 1u);
+    loop.close_conn(*body_text);
 }
 
 TEST(request_admission, malformed_te_successor_cannot_inherit_completed_forward_state) {

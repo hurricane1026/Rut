@@ -246,7 +246,11 @@ and connection close before route handlers or upstream effects. A final
 `chunked` coding remains supported, including `gzip, chunked`; the transparent
 proxy path preserves those request header and body bytes and uses the chunk
 boundary to keep any pipelined successor separate. Fragmented headers are
-classified only after the complete header arrives.
+classified only after the complete header arrives. On the parse-error fallback
+path, a complete header whose prefix, after optional OWS, begins with a line
+break is rejected because its request-line boundary is not trustworthy.
+Non-empty malformed first lines without a raw `Transfer-Encoding` field retain
+the legacy fallback behavior.
 
 The literal `response(status, body: "...")` form is limited to 1 MiB. Its bytes
 are a non-owning view into the loaded program's RIR/module response-body

@@ -189,7 +189,9 @@ ReplayResult replay_one(Loop& loop, const CaptureEntry& entry, i32 fake_fd) {
     if (send_len == 0) {
         const i32 saved_upstream_fd = conn->upstream_fd;
         if (saved_upstream_fd >= 0) conn->upstream_fd = -1;
-        loop.close_conn(*conn);
+        // Admission may already have closed and reclaimed the connection
+        // while handling the receive event. Avoid reclaiming its slot twice.
+        if (conn->fd >= 0) loop.close_conn(*conn);
         if (saved_upstream_fd >= 0) ::close(saved_upstream_fd);
         result.skipped = true;
         return result;

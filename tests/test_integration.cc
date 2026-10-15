@@ -27029,8 +27029,9 @@ route POST "/" { return forward(backend) }
     } client_guard{client_fd};
     set_socket_timeouts(client_fd, 3);
     static constexpr char kRequest[] =
-        "POST / HTTP/1.1\r\nHost: client.example\r\nTransfer-Encoding: gzip\r\n\r\n"
-        "opaque-body\r\n\r\nGET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
+        "POST / HTTP/1.1\r\nHost: client.example\r\nContent-Length: x\r\n"
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        "GET / HTTP/1.1\r\nHost: successor.example\r\n\r\n";
     REQUIRE(send_all(client_fd, kRequest, sizeof(kRequest) - 1u));
 
     static constexpr char kExpected[] =
