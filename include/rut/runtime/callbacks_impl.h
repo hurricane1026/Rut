@@ -4636,7 +4636,8 @@ void handle_jit_outcome(Loop* loop,
                         return;
                     }
                     conn.resp_status = kStatusBadGateway;
-                    format_static_response(conn, 502, /*keep_alive=*/false);
+                    format_static_response(
+                        conn, 502, /*keep_alive=*/false, http1_request_is_head(conn));
                     conn.keep_alive = false;
                     conn.transition_to_sending(&on_response_sent<Loop>);
                     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -5315,7 +5316,12 @@ void respond_upstream_timeout(Loop* loop, Connection& conn) {
         "\r\n"
         "Gateway Timeout";
     conn.send_buf.reset();
-    conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
+    if (http1_request_is_head(conn)) {
+        conn.send_buf.write(reinterpret_cast<const u8*>(k504),
+                            sizeof(k504) - 1 - (sizeof("Gateway Timeout") - 1));
+    } else {
+        conn.send_buf.write(reinterpret_cast<const u8*>(k504), sizeof(k504) - 1);
+    }
     conn.keep_alive = false;
     conn.resp_status = 504;
     conn.transition_to_sending(&on_response_sent<Loop>);
@@ -5545,7 +5551,12 @@ void respond_request_body_overflow(Loop* loop, Connection& conn) {
         "\r\n"
         "Payload Too Large";
     conn.send_buf.reset();
-    conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1);
+    if (http1_request_is_head(conn)) {
+        conn.send_buf.write(reinterpret_cast<const u8*>(k413),
+                            sizeof(k413) - 1 - (sizeof("Payload Too Large") - 1));
+    } else {
+        conn.send_buf.write(reinterpret_cast<const u8*>(k413), sizeof(k413) - 1);
+    }
     conn.keep_alive = false;
     conn.resp_status = 413;
     conn.transition_to_sending(&on_response_sent<Loop>);
@@ -7572,7 +7583,7 @@ inline void reject_request_policy(Loop* loop, Connection& conn) {
         return;
     }
     conn.resp_status = 400;
-    format_static_response(conn, 400, /*keep_alive=*/false);
+    format_static_response(conn, 400, /*keep_alive=*/false, http1_request_is_head(conn));
     conn.keep_alive = false;
     conn.transition_to_sending(&on_response_sent<Loop>);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -7586,7 +7597,7 @@ inline void reject_response_policy(Loop* loop, Connection& conn) {
         return;
     }
     conn.resp_status = 400;
-    format_static_response(conn, 400, /*keep_alive=*/false);
+    format_static_response(conn, 400, /*keep_alive=*/false, http1_request_is_head(conn));
     conn.keep_alive = false;
     conn.transition_to_sending(&on_response_sent<Loop>);
     client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -7762,7 +7773,11 @@ void on_upstream_connected(void* lp, Connection& conn, IoEvent ev) {
                 "\r\n"
                 "Internal Server Error";
             conn.send_buf.reset();
-            conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
+            if (http1_request_is_head(conn)) {
+                format_static_response(conn, 500, /*keep_alive=*/false, /*headers_only=*/true);
+            } else {
+                conn.send_buf.write(reinterpret_cast<const u8*>(k500), sizeof(k500) - 1);
+            }
             conn.keep_alive = false;
             conn.resp_status = kStatusInternalServerError;
             conn.transition_to_sending(&on_response_sent<Loop>);

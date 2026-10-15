@@ -79,6 +79,10 @@ struct SmallLoop : EventLoopCRTP<SmallLoop> {
         return true;
     }
 
+    // The zero-prefix TLS-overflow resume path does not process TLS input,
+    // but its template requires the production loop interface to be present.
+    bool process_buffered_tls_input(Connection& /*conn*/) { return true; }
+
     bool is_draining() const { return draining; }
     bool upstream_acquire(u16 uid, u32 max) {
         return upstream_cc ? upstream_cc->try_acquire(uid, max) : true;
@@ -533,6 +537,10 @@ struct AsyncSmallLoop : EventLoopCRTP<AsyncSmallLoop> {
     u8 send_storage[kMaxConns][kBufSize];
     u8 upstream_recv_storage[kMaxConns][kBufSize];
     u8 response_header_storage[kMaxConns][kBufSize];
+
+    // The zero-prefix TLS-overflow resume path does not process TLS input,
+    // but its template requires the production loop interface to be present.
+    bool process_buffered_tls_input(Connection& /*conn*/) { return true; }
 
     bool is_draining() const { return draining; }
     bool upstream_acquire(u16 uid, u32 max) {
