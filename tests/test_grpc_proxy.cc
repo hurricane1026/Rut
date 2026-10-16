@@ -988,6 +988,54 @@ TEST(grpc_proxy, settings_handshake_health_ejects_and_success_resets_once) {
     grpc_record_handshake_result(conn, false, monotonic_us());
     CHECK_EQ(health->fails, 0u);
 }
+TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    GrpcDriveFixture loop;
+    auto run = [&](u8* bytes, u32 len, bool expect_close) {
+        Connection conn;
+        conn.reset();
+        u8 recv[512]{};
+        REQUIRE(len <= sizeof(recv));
+        for (u32 i = 0; i < len; i++) recv[i] = bytes[i];
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.recv_buf.commit(len);
+        Http2Conn h2;
+        h2.init();
+        h2.preface_seen = true;
+        h2.our_settings_sent = true;
+        h2.grpc.upstream = true;
+        h2.grpc.preface_sent = true;
+        conn.h2 = &h2;
+        conn.upstream_idx = 0;
+        conn.upstream_backend_idx = 0;
+        loop.closed = false;
+        grpc_on_upstream_data(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 1});
+        CHECK_EQ(loop.closed, expect_close);
+    };
+    Http2FrameHeader invalid{1, static_cast<u8>(Http2FrameType::Data), 0, 0};
+    u8 bad[64]{};
+    write_frame_header(bad, invalid);
+    bad[9] = 0;
+    run(bad, 10, true);
+    CHECK_EQ(health->fails, 1u);
+
+    Http2Settings settings;
+    settings.set_defaults();
+    u8 mixed[128]{};
+    u32 mixed_len = write_settings_frame(mixed, settings);
+    write_frame_header(mixed + mixed_len, invalid);
+    mixed[mixed_len + 9] = 0;
+    mixed_len += 10;
+    run(mixed, mixed_len, true);
+    CHECK_EQ(health->fails, 2u);
+
+    u8 good[64]{};
+    const u32 good_len = write_settings_frame(good, settings);
+    run(good, good_len, false);
+    CHECK_EQ(health->fails, 0u);
+}
 TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     EpollEventLoop loop;
     REQUIRE(loop.init(0, -1).has_value());

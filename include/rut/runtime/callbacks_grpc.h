@@ -489,18 +489,19 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
                                   sizeof(g.control) - g.control_len,
                                   &written);
     g.control_len += written;
-    if (!settings_seen_before && h.peer_settings_seen)
-        grpc_record_handshake_result(conn, true, monotonic_us());
     grpc_flush_pending_cancels(h);
     const u32 remaining = conn.recv_buf.len() - result.consumed;
     if (remaining) __builtin_memmove(conn.recv_slice, conn.recv_slice + result.consumed, remaining);
     conn.reset_request_receive_buffer();
     conn.recv_buf.commit(remaining);
     if (result.close) {
+        grpc_record_handshake_result(conn, false, monotonic_us());
         g.busy = false;
         loop->close_conn(conn);
         return;
     }
+    if (!settings_seen_before && h.peer_settings_seen)
+        grpc_record_handshake_result(conn, true, monotonic_us());
     for (auto* x : g.streams) {
         if (!x) continue;
         if (grpc_rejected_by_goaway(h, *x)) x->failure = 14;
