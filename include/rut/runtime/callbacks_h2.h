@@ -2337,7 +2337,9 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                 failure_status = 500;
         }
 
-        if (failure_status == 0 && h2->async_request_stream_open) {
+        if (failure_status == 0 && h2->async_request_stream_open &&
+            (h2->async_cfg == nullptr || kOutcome.upstream_id >= h2->async_cfg->upstream_count ||
+             !h2->async_cfg->upstreams[kOutcome.upstream_id].http2)) {
             ParsedRequest open_request;
             open_request.reset();
             open_request.has_content_length = h2->async_request_has_content_length;

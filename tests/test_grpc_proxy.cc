@@ -23,6 +23,11 @@ namespace {
 u64 grpc_jit_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_forward(0).pack();
 }
+u64 grpc_jit_timer_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0)
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 100).pack();
+    return jit::HandlerResult::make_forward(0).pack();
+}
 
 struct GrpcBackendHealthReset {
     GrpcBackendHealthReset() { reset(); }
@@ -248,7 +253,7 @@ struct Client {
         u32 status = 99;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
              meta = false, trailer = false;
-    } rpcs[16];
+    } rpcs[17];
     nghttp2_session* session = nullptr;
     bool goaway = false;
     int fd = -1;
@@ -340,15 +345,17 @@ struct Client {
         nghttp2_submit_settings(session, 0, nullptr, 0);
         return rc == 0;
     }
-    int request(
-        u32 index, u32 bytes, bool end, const char* timeout = nullptr, bool jit_forward = false) {
+    int request(u32 index, u32 bytes, bool end, const char* timeout = nullptr, bool jit_forward = false,
+                bool jit_timer_forward = false) {
         rpcs[index].size = bytes;
         rpcs[index].end = end;
         static thread_local char content_length[16];
         nghttp2_nv headers[8] = {nv(":method", "POST"),
                                  nv(":scheme", "http"),
                                  nv(":authority", "grpc.test"),
-                                 nv(":path", jit_forward ? "/jit.Echo/Call" : "/test.Echo/Call"),
+                                 nv(":path", jit_timer_forward ? "/jitwait.Echo/Call"
+                                                                : jit_forward ? "/jit.Echo/Call"
+                                                                              : "/test.Echo/Call"),
                                  nv("content-type", "application/grpc+proto"),
                                  nv("te", "trailers"),
                                  nv("grpc-timeout", timeout ? timeout : "1H")};
@@ -421,8 +428,10 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
     RouteConfig cfg;
     REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)).has_value());
     cfg.upstreams[0].http2 = true;
+    CHECK_EQ(cfg.upstreams[0].addr_count, 1u);
     REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
     REQUIRE(cfg.add_jit_handler("/jit.Echo/", 'P', &grpc_jit_forward, false));
+    REQUIRE(cfg.add_jit_handler("/jitwait.Echo/", 'P', &grpc_jit_timer_forward, false));
     shard->route_config = &cfg;
 #if RUT_GRPC_JIT
     struct Program {
@@ -440,7 +449,8 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                      sizeof(source),
                      "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
                      "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
-                     "route POST \"/jit.Echo/Call\" { return forward(grpc) }\n",
+                     "route POST \"/jit.Echo/Call\" { return forward(grpc) }\n"
+                     "route POST \"/jitwait.Echo/Call\" { return forward(grpc) }\n",
                      get_port(server->listen_fd));
         const bool written = write(file, source, len) == len;
         close(file);
@@ -563,7 +573,18 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                 CHECK(a.until(13, true));
                 CHECK(a.rpcs[13].ok);
                 CHECK_EQ(a.rpcs[13].received, 4096u);
-                CHECK_EQ(a.request(14, 128, false), 29);
+                CHECK_EQ(a.request(15, 0, true, nullptr, true, true), 29);
+                CHECK(a.until(15, true));
+                CHECK(a.rpcs[15].ok);
+                CHECK_EQ(a.request(16, 128, false, nullptr, true, true), 31);
+                CHECK(a.until(16, false));
+                a.rpcs[16].size = 128;
+                a.rpcs[16].end = true;
+                CHECK_EQ(nghttp2_session_resume_data(a.session, 31), 0);
+                CHECK(a.until(16, true));
+                CHECK(a.rpcs[16].ok);
+                CHECK_EQ(a.rpcs[16].received, 128u);
+                CHECK_EQ(a.request(14, 128, false), 33);
                 CHECK(a.until(14, false));
                 shard->loop->drain(5);
                 const u64 drain_deadline = monotonic_us() + 2500000;
@@ -573,7 +594,7 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                 CHECK(a.goaway);
                 a.rpcs[14].size = 32768;
                 a.rpcs[14].end = true;
-                CHECK_EQ(nghttp2_session_resume_data(a.session, 29), 0);
+                CHECK_EQ(nghttp2_session_resume_data(a.session, 33), 0);
                 CHECK(a.until(14, true));
                 CHECK(a.rpcs[14].ok);
                 CHECK_EQ(a.rpcs[14].received, 32768u);
@@ -594,6 +615,66 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
     if (tls_server) destroy_tls_server_context(tls_server);
 }
 }  // namespace
+
+TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_data) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init();
+    down->h2->client = true;
+    down->protocol = ConnProtocol::Http2;
+    down->request_config = &cfg;
+    REQUIRE(down->h2->open_stream(1) != nullptr);
+    const char* synth =
+        "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\ncontent-length: 3\r\n\r\n";
+    const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
+    for (u32 i = 0; i < synth_len; i++) down->h2->pending_synth[i] = static_cast<u8>(synth[i]);
+    ParsedRequest open;
+    open.reset();
+    open.has_content_length = true;
+    open.content_length = 3;
+    open.content_length_count = 1;
+    u8 response[8192]{};
+    H2Dispatch<EpollEventLoop> d{&loop, down, response, sizeof(response), 0, false};
+    JitDispatchOutcome yielded{};
+    yielded.kind = JitDispatchOutcome::Kind::TimerYield;
+    yielded.next_state = 1;
+    yielded.timer_ms = 100;
+    REQUIRE(h2_suspend_timer(d,
+                             1,
+                             &grpc_jit_forward,
+                             yielded,
+                             &cfg,
+                             down->h2->pending_synth,
+                             synth_len,
+                             true,
+                             true,
+                             false,
+                             &open));
+    down->pending_handler_fn = &grpc_jit_forward;
+    down->handler_state = 1;
+    const u32 frame_len = http2_write_data(
+        down->recv_buf.write_ptr(), 1, reinterpret_cast<const u8*>("abc"), 3, true);
+    down->recv_buf.commit(frame_len);
+    h2_resume_jit_handler(&loop, *down);
+    CHECK_EQ(down->h2->async_stream, 0u);
+    CHECK_EQ(down->h2->grpc.active, 1u);
+    CHECK(loop.grpc_upstreams != nullptr);
+    GrpcExchange* exchange = nullptr;
+    for (u32 i = 0; i < 64; i++)
+        if (down->h2->grpc.streams[i]) exchange = down->h2->grpc.streams[i];
+    REQUIRE(exchange != nullptr);
+    CHECK(exchange->upstream != nullptr);
+    CHECK(exchange->upstream->h2 != nullptr);
+    CHECK(exchange->upstream->h2->grpc.upstream);
+    loop.force_close_all();
+    loop.shutdown();
+}
 
 TEST(grpc_proxy, streaming_and_pooling_epoll) {
     streaming_case<EpollEventLoop>(_tc);
