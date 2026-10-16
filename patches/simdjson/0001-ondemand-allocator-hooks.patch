@@ -1,0 +1,157 @@
+diff --git a/include/simdjson/base.h b/include/simdjson/base.h
+index 6455416..5ab0577 100644
+--- a/include/simdjson/base.h
++++ b/include/simdjson/base.h
+@@ -11,6 +11,7 @@
+ #include "simdjson/portability.h"
+ #include "simdjson/concepts.h"
+ #include "simdjson/constevalutil.h"
++#include "simdjson/internal/rut_allocator.h"
+
+ #if SIMDJSON_SUPPORTS_CHAR8_T
+ #include <string>
+diff --git a/include/simdjson/generic/dom_parser_implementation.h b/include/simdjson/generic/dom_parser_implementation.h
+index 11a046d..9ffa146 100644
+--- a/include/simdjson/generic/dom_parser_implementation.h
++++ b/include/simdjson/generic/dom_parser_implementation.h
+@@ -20,9 +20,9 @@ static_assert(sizeof(open_container) == 64/8, "Open container must be 64 bits");
+ class dom_parser_implementation final : public internal::dom_parser_implementation {
+ public:
+   /** Tape location of each open { or [ */
+-  std::unique_ptr<open_container[]> open_containers{};
++  simdjson::internal::buffer_ptr<open_container> open_containers{};
+   /** Whether each open container is a [ or { */
+-  std::unique_ptr<bool[]> is_array{};
++  simdjson::internal::buffer_ptr<bool> is_array{};
+   /** Buffer passed to stage 1 */
+   const uint8_t *buf{};
+   /** Length passed to stage 1 */
+@@ -69,7 +69,7 @@ inline simdjson_warn_unused error_code dom_parser_implementation::set_capacity(s
+   }
+   size_t max_structures = rounded_capacity + 9;
+   if(max_structures > SIZE_MAX / sizeof(uint32_t)) { return CAPACITY; }
+-  structural_indexes.reset( new (std::nothrow) uint32_t[max_structures] );
++  structural_indexes.reset( simdjson::internal::allocate_buffer<uint32_t>(max_structures) );
+   if (!structural_indexes) { _capacity = 0; return MEMALLOC; }
+   structural_indexes[0] = 0;
+   n_structural_indexes = 0;
+@@ -81,8 +81,8 @@ inline simdjson_warn_unused error_code dom_parser_implementation::set_capacity(s
+ inline simdjson_warn_unused error_code dom_parser_implementation::set_max_depth(size_t max_depth) noexcept {
+   if(max_depth == 0 || max_depth > SIMDJSON_MAX_DEPTH || max_depth > SIZE_MAX / sizeof(open_container)) { return CAPACITY; }
+   // Stage 2 stacks
+-  open_containers.reset(new (std::nothrow) open_container[max_depth]);
+-  is_array.reset(new (std::nothrow) bool[max_depth]);
++  open_containers.reset(simdjson::internal::allocate_buffer<open_container>(max_depth));
++  is_array.reset(simdjson::internal::allocate_buffer<bool>(max_depth));
+   if (!is_array || !open_containers) { _max_depth = 0; return MEMALLOC; }
+
+   _max_depth = max_depth;
+diff --git a/include/simdjson/generic/ondemand/parser-inl.h b/include/simdjson/generic/ondemand/parser-inl.h
+index d91fce6..4071029 100644
+--- a/include/simdjson/generic/ondemand/parser-inl.h
++++ b/include/simdjson/generic/ondemand/parser-inl.h
+@@ -31,9 +31,11 @@ simdjson_warn_unused simdjson_inline error_code parser::allocate(size_t new_capa
+     return CAPACITY; // overflow, only happen on legacy 32-bit systems with very large capacity
+   }
+   size_t string_capacity = SIMDJSON_ROUNDUP_N(5 * (new_capacity / 3) + SIMDJSON_PADDING, 64);
+-  string_buf.reset(new (std::nothrow) uint8_t[string_capacity]);
++  string_buf.reset(simdjson::internal::allocate_buffer<uint8_t>(string_capacity));
++  if (!string_buf) { return MEMALLOC; }
+ #if SIMDJSON_DEVELOPMENT_CHECKS
+-  start_positions.reset(new (std::nothrow) token_position[new_max_depth]);
++  start_positions.reset(simdjson::internal::allocate_buffer<token_position>(new_max_depth));
++  if (!start_positions) { return MEMALLOC; }
+ #endif
+   if (implementation) {
+     SIMDJSON_TRY( implementation->set_capacity(new_capacity) );
+diff --git a/include/simdjson/generic/ondemand/parser.h b/include/simdjson/generic/ondemand/parser.h
+index 48810fc..9a39cb1 100644
+--- a/include/simdjson/generic/ondemand/parser.h
++++ b/include/simdjson/generic/ondemand/parser.h
+@@ -452,10 +452,10 @@ private:
+   size_t _max_capacity;
+   size_t _max_depth{DEFAULT_MAX_DEPTH};
+   size_t _document_len{0};
+-  std::unique_ptr<uint8_t[]> string_buf{};
++  simdjson::internal::buffer_ptr<uint8_t> string_buf{};
+
+ #if SIMDJSON_DEVELOPMENT_CHECKS
+-  std::unique_ptr<token_position[]> start_positions{};
++  simdjson::internal::buffer_ptr<token_position> start_positions{};
+ #endif
+
+   friend class json_iterator;
+diff --git a/include/simdjson/internal/dom_parser_implementation.h b/include/simdjson/internal/dom_parser_implementation.h
+index 181596d..e996735 100644
+--- a/include/simdjson/internal/dom_parser_implementation.h
++++ b/include/simdjson/internal/dom_parser_implementation.h
+@@ -47,6 +47,17 @@ namespace internal {
+  */
+ class dom_parser_implementation {
+ public:
++#ifdef SIMDJSON_RUT_ALLOCATOR
++  static void *operator new(size_t bytes, const std::nothrow_t &) noexcept {
++    return simdjson_rut_allocate(bytes, alignof(std::max_align_t));
++  }
++  static void operator delete(void *pointer) noexcept {
++    if (pointer) simdjson_rut_deallocate(pointer);
++  }
++  static void operator delete(void *pointer, const std::nothrow_t &) noexcept {
++    if (pointer) simdjson_rut_deallocate(pointer);
++  }
++#endif
+
+   /**
+    * @private For internal implementation use
+@@ -172,7 +183,7 @@ public:
+   /** Number of structural indices passed from stage 1 to stage 2 */
+   uint32_t n_structural_indexes{0};
+   /** Structural indices passed from stage 1 to stage 2 */
+-  std::unique_ptr<uint32_t[]> structural_indexes{};
++  simdjson::internal::buffer_ptr<uint32_t> structural_indexes{};
+   /** Next structural index to parse */
+   uint32_t next_structural_index{0};
+
+diff --git a/include/simdjson/internal/rut_allocator.h b/include/simdjson/internal/rut_allocator.h
+new file mode 100644
+index 0000000..714fdac
+--- /dev/null
++++ b/include/simdjson/internal/rut_allocator.h
+@@ -0,0 +1,37 @@
++#ifndef SIMDJSON_INTERNAL_RUT_ALLOCATOR_H
++#define SIMDJSON_INTERNAL_RUT_ALLOCATOR_H
++#include <cstddef>
++#include <memory>
++#include <new>
++#include <limits>
++#include <type_traits>
++
++#ifdef SIMDJSON_RUT_ALLOCATOR
++// Embedding application owns these symbols. Return nullptr on exhaustion.
++// Deallocate must recover the original owner from the pointer, not TLS state.
++extern "C" void *simdjson_rut_allocate(size_t bytes, size_t alignment) noexcept;
++extern "C" void simdjson_rut_deallocate(void *pointer) noexcept;
++#endif
++namespace simdjson { namespace internal {
++template<class T> struct buffer_deleter {
++  void operator()(T *p) const noexcept {
++#ifdef SIMDJSON_RUT_ALLOCATOR
++    if (p) simdjson_rut_deallocate(p);
++#else
++    delete[] p;
++#endif
++  }
++};
++template<class T> using buffer_ptr = std::unique_ptr<T[], buffer_deleter<T>>;
++template<class T> inline T *allocate_buffer(size_t count) noexcept {
++  static_assert(std::is_trivial<T>::value, "Only trivial parser buffers supported");
++  if (count > (std::numeric_limits<size_t>::max)() / sizeof(T)) return nullptr;
++#ifdef SIMDJSON_RUT_ALLOCATOR
++  void *storage = simdjson_rut_allocate(count * sizeof(T), alignof(T));
++  return storage ? ::new (storage) T[count] : nullptr;
++#else
++  return new (std::nothrow) T[count];
++#endif
++}
++} }
++#endif

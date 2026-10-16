@@ -4,3 +4,6 @@
 [submodule "third_party/vectorscan"]
 	path = third_party/vectorscan
 	url = https://github.com/VectorCamp/vectorscan.git
+[submodule "third_party/simdjson"]
+	path = third_party/simdjson
+	url = https://github.com/simdjson/simdjson.git
