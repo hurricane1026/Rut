@@ -620,6 +620,13 @@ inline bool ordinary_local_response_may_persist(Loop* loop,
            ordinary_local_response_request_boundary_reusable(conn);
 }
 
+inline HttpVersion ordinary_local_response_version(const Connection& conn) {
+    if (conn.protocol != ConnProtocol::Http11) return HttpVersion::Http11;
+    if (conn.req_http_version == static_cast<u8>(HttpVersion::Http10)) return HttpVersion::Http10;
+    if (conn.req_http_version == static_cast<u8>(HttpVersion::Http11)) return HttpVersion::Http11;
+    return HttpVersion::Http11;
+}
+
 inline bool exact_strict_local_response_base_request_shape_is_admitted(const Connection& conn) {
     // io_uring TLS parses decrypted application bytes into the same receive
     // buffer. Admit only an established engine; a forged tls_active flag or
@@ -952,7 +959,11 @@ const char* status_reason(u16 code);
 // `Code` value -- rather than being rejected. Only fails (returns false)
 // when `out` is null; every `u16` code otherwise gets a phrase.
 bool canonical_status_reason(u16 code, Str* out);
-void format_static_response(Connection& conn, u16 code, bool keep_alive, bool headers_only = false);
+void format_static_response(Connection& conn,
+                            u16 code,
+                            bool keep_alive,
+                            bool headers_only = false,
+                            HttpVersion response_version = HttpVersion::Http11);
 inline bool http1_request_is_head(const Connection& conn) {
     return conn.req_method == static_cast<u8>(LogHttpMethod::Head);
 }
@@ -965,7 +976,8 @@ void format_response_with_body(Connection& conn,
                                const char* body_data,
                                u32 body_len,
                                bool keep_alive,
-                               bool headers_only = false);
+                               bool headers_only = false,
+                               HttpVersion response_version = HttpVersion::Http11);
 
 // Custom-headers variant: emits each `headers[i]` pair (indexed
 // [0, header_count)) before the blank line. If any user-supplied key
@@ -1006,7 +1018,8 @@ bool format_response_with_body_and_headers(Connection& conn,
                                            bool body_is_fallback_reason_phrase = false,
                                            bool suppress_default_content_type = false,
                                            bool headers_only = false,
-                                           bool fallback_headers_only = false);
+                                           bool fallback_headers_only = false,
+                                           HttpVersion response_version = HttpVersion::Http11);
 inline bool apply_request_policy(Connection& conn, const sockaddr_in& endpoint, u16 policy_id);
 inline bool materialize_request_target_transform(Connection& conn, const RouteConfig& config);
 inline bool build_redirect_response(const Connection& conn,
@@ -2485,7 +2498,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn,
                                400,
                                /*keep_alive=*/false,
-                               conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                               conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                               ordinary_local_response_version(conn));
         conn.keep_alive = false;
         conn.transition_to_sending(&on_response_sent<Loop>);
         if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))
@@ -2515,7 +2529,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn,
                                400,
                                /*keep_alive=*/false,
-                               pre_req.method == HttpMethod::HEAD);
+                               pre_req.method == HttpMethod::HEAD,
+                               ordinary_local_response_version(conn));
         conn.keep_alive = false;
         conn.transition_to_sending(&on_response_sent<Loop>);
         if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))
@@ -2532,7 +2547,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn,
                                400,
                                /*keep_alive=*/false,
-                               conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                               conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                               ordinary_local_response_version(conn));
         conn.keep_alive = false;
         conn.transition_to_sending(&on_response_sent<Loop>);
         if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))
@@ -2544,7 +2560,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn,
                                403,
                                /*keep_alive=*/false,
-                               conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                               conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                               ordinary_local_response_version(conn));
         conn.keep_alive = false;
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2582,9 +2599,16 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             if (kLen > 0) {
                 conn.keep_alive = ordinary_local_response_may_persist(
                     loop, conn, /*terminal_baseline=*/conn.keep_alive);
-                format_response_with_body(conn, 200, mbuf, kLen, conn.keep_alive);
+                format_response_with_body(conn,
+                                          200,
+                                          mbuf,
+                                          kLen,
+                                          conn.keep_alive,
+                                          false,
+                                          ordinary_local_response_version(conn));
             } else {
-                format_static_response(conn, 500, /*keep_alive=*/false);
+                format_static_response(
+                    conn, 500, /*keep_alive=*/false, false, ordinary_local_response_version(conn));
                 conn.keep_alive = false;
             }
             conn.resp_status = kLen > 0 ? 200 : 500;
@@ -2710,7 +2734,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
             format_static_response(conn,
                                    429,
                                    /*keep_alive=*/false,
-                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                                   ordinary_local_response_version(conn));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2835,7 +2860,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn,
                                route->status_code,
                                conn.keep_alive,
-                               conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                               conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                               ordinary_local_response_version(conn));
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
     } else if (route && route->action == RouteAction::JitHandler && route->fn) {
@@ -2845,7 +2871,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
                 format_static_response(conn,
                                        400,
                                        /*keep_alive=*/false,
-                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                                       ordinary_local_response_version(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -2882,15 +2909,17 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.resp_status = kStatusOK;
         conn.keep_alive =
             ordinary_local_response_may_persist(loop, conn, /*terminal_baseline=*/kKeepAlive);
-        if (conn.req_method == static_cast<u8>(LogHttpMethod::Head)) {
-            format_static_response(conn, 200, conn.keep_alive, /*headers_only=*/true);
-        } else {
+        const bool headers_only = conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+        const HttpVersion response_version = ordinary_local_response_version(conn);
+        if (response_version == HttpVersion::Http11 && !headers_only) {
             conn.send_buf.reset();
             if (conn.keep_alive)
                 conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200), kResponse200Len);
             else
                 conn.send_buf.write(reinterpret_cast<const u8*>(kResponse200Close),
                                     kResponse200CloseLen);
+        } else {
+            format_static_response(conn, 200, conn.keep_alive, headers_only, response_version);
         }
         conn.transition_to_sending(&on_response_sent<Loop>);
         client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -3647,7 +3676,8 @@ void handle_jit_outcome(Loop* loop,
                                                     &suppress_default_content_type)) {
                 conn.resp_status = 500;
                 conn.keep_alive = false;
-                format_static_response(conn, 500, false, is_head);
+                format_static_response(
+                    conn, 500, false, is_head, ordinary_local_response_version(conn));
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -3693,7 +3723,8 @@ void handle_jit_outcome(Loop* loop,
                                                           body_is_fallback,
                                                           suppress_default_content_type,
                                                           segmented_body || is_head,
-                                                          is_head);
+                                                          is_head,
+                                                          ordinary_local_response_version(conn));
             } else if (has_body) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
                 format_response_with_body(conn,
@@ -3701,9 +3732,14 @@ void handle_jit_outcome(Loop* loop,
                                           body.data,
                                           body.len,
                                           effective_keep_alive,
-                                          segmented_body || is_head);
+                                          segmented_body || is_head,
+                                          ordinary_local_response_version(conn));
             } else {
-                format_static_response(conn, outcome.status_code, effective_keep_alive, is_head);
+                format_static_response(conn,
+                                       outcome.status_code,
+                                       effective_keep_alive,
+                                       is_head,
+                                       ordinary_local_response_version(conn));
             }
             if (segmented_body && response_formatted && !is_head) {
                 const auto& body = cfg->response_bodies[outcome.response_body_idx - 1];
@@ -3766,7 +3802,8 @@ void handle_jit_outcome(Loop* loop,
             format_static_response(conn,
                                    500,
                                    /*keep_alive=*/false,
-                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                                   ordinary_local_response_version(conn));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             // schedule_yield_timer already called timer.remove(&conn);
@@ -3783,13 +3820,15 @@ void handle_jit_outcome(Loop* loop,
             conn.handler_state = outcome.next_state;
             conn.pending_yield_kind = outcome.yield_kind;
             conn.transition_to_exec_handler_wait();
-            auto send_bad_gateway = [&]() {
+            auto send_bad_gateway = [&](bool ordinary_local_error = false) {
                 conn.pending_handler_fn = nullptr;
                 conn.resp_status = kStatusBadGateway;
                 format_static_response(conn,
                                        502,
                                        /*keep_alive=*/false,
-                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                                       ordinary_local_error ? ordinary_local_response_version(conn)
+                                                            : HttpVersion::Http11);
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -3804,7 +3843,8 @@ void handle_jit_outcome(Loop* loop,
                 format_static_response(conn,
                                        500,
                                        /*keep_alive=*/false,
-                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                                       conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                                       ordinary_local_response_version(conn));
                 conn.keep_alive = false;
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
@@ -3859,7 +3899,7 @@ void handle_jit_outcome(Loop* loop,
                 const RouteConfig* config = conn.request_config;
                 const u32 upstream_id = outcome.timer_ms - 1;
                 if (!config || upstream_id >= config->upstream_count) {
-                    send_bad_gateway();
+                    send_bad_gateway(/*ordinary_local_error=*/true);
                     return;
                 }
                 auto& target = config->upstreams[upstream_id];
@@ -3893,7 +3933,7 @@ void handle_jit_outcome(Loop* loop,
                         return;
                     }
                 } else {
-                    send_bad_gateway();
+                    send_bad_gateway(/*ordinary_local_error=*/true);
                     return;
                 }
             } else if (outcome.yield_kind == jit::YieldKind::UpstreamRecv) {
@@ -3903,7 +3943,7 @@ void handle_jit_outcome(Loop* loop,
                         return;
                     }
                 } else {
-                    send_bad_gateway();
+                    send_bad_gateway(/*ordinary_local_error=*/true);
                     return;
                 }
             }
@@ -4940,7 +4980,8 @@ void handle_jit_outcome(Loop* loop,
             format_static_response(conn,
                                    500,
                                    /*keep_alive=*/false,
-                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head));
+                                   conn.req_method == static_cast<u8>(LogHttpMethod::Head),
+                                   ordinary_local_response_version(conn));
             conn.keep_alive = false;
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());

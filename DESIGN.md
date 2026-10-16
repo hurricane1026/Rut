@@ -4851,6 +4851,17 @@ rejected because the request-line boundary is not trustworthy. A non-empty
 malformed first line without a raw `Transfer-Encoding` field continues to use
 the legacy fallback behavior.
 
+For ordinary local HTTP/1 publishers (static/default responses, JIT `return`,
+metrics, and their ordinary local error responses), the response status-line
+version mirrors the version captured from a complete strict request: HTTP/1.0
+requests receive `HTTP/1.0`, HTTP/1.1 requests receive `HTTP/1.1`, and errors
+without a captured valid version retain the HTTP/1.1 fallback. This selection
+is independent of request persistence and response body framing. Configured
+strict-local, redirect, and proxy/failure policy responses remain HTTP/1.1;
+generic proxy/upstream error publishers also keep their existing HTTP/1.1
+default. Ordinary JIT-local error publishers, including EventYield invalid-target
+errors, use the captured request version. HTTP/2 serialization is separate.
+
 ### 7.2 Routing
 
 Compile-time built **radix trie**. The JIT compiler can compile the trie traversal into a series of switch/jump instructions.
