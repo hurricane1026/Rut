@@ -22042,3 +22042,103 @@ TEST(jit, json_helper_rejects_combined_depth_and_request_budget_overflow) {
     arena.destroy();
     pool.destroy();
 }
+
+TEST(jit, json_nested_struct_producer_evaluated_once_and_executes) {
+    const char* src = R"rut(struct Inner { value: i32 }
+struct Outer { inner: Inner, label: str }
+func make() -> Outer { Outer(inner: Inner(value: 7), label: "x") }
+route GET "/x" { guard let encoded = json(make()) else { return 500 } return response(200, body: encoded) }
+)rut";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    REQUIRE_EQ(mir.value().functions.len, 1u);
+    const auto& function = mir.value().functions[0];
+    u32 producers = 0;
+    for (u32 i = 0; i < function.locals.len; ++i) {
+        const auto& local = function.locals[i];
+        if (local.name.len == 0 && local.init.kind == MirValueKind::StructInit &&
+            local.init.struct_index < mir.value().structs.len &&
+            mir.value().structs[local.init.struct_index].name.eq(lit_str("Outer")))
+            ++producers;
+    }
+    CHECK_EQ(producers, 1u);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(16));
+    auto connection = std::make_unique<Connection>();
+    connection->reset();
+    connection->json_arena.backend.pool = &pool;
+    auto result = HandlerResult::unpack(handler(connection.get(),
+                                                nullptr,
+                                                reinterpret_cast<const u8*>(kGetApiRequest),
+                                                sizeof(kGetApiRequest) - 1,
+                                                nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK(connection->jit_response_body_valid);
+    CHECK(connection->jit_response_body.eq(lit_str("{\"inner\":{\"value\":7},\"label\":\"x\"}")));
+    connection->reset();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, json_struct_producer_respects_route_local_capacity) {
+    auto compile_with_preceding_locals = [](u32 local_count) {
+        char source[2048]{};
+        u32 length = 0;
+        auto append = [&](const char* text, u32 text_length) {
+            __builtin_memcpy(source + length, text, text_length);
+            length += text_length;
+        };
+        const char* prefix =
+            "struct Inner { value: i32 }\n"
+            "struct Outer { inner: Inner, label: str }\n"
+            "func make() -> Outer { Outer(inner: Inner(value: 7), label: \"x\") }\n"
+            "route GET \"/x\" {\n";
+        append(prefix,
+               sizeof("struct Inner { value: i32 }\n"
+                      "struct Outer { inner: Inner, label: str }\n"
+                      "func make() -> Outer { Outer(inner: Inner(value: 7), label: \"x\") }\n"
+                      "route GET \"/x\" {\n") -
+                   1);
+        for (u32 i = 0; i < local_count; ++i) {
+            char declaration[] = "let v00 = 0\n";
+            declaration[5] = static_cast<char>('0' + i / 10);
+            declaration[6] = static_cast<char>('0' + i % 10);
+            append(declaration, sizeof(declaration) - 1);
+        }
+        const char* suffix =
+            "guard let encoded = json(make()) else { return 500 }\n"
+            "return response(200, body: encoded)\n}\n";
+        append(suffix,
+               sizeof("guard let encoded = json(make()) else { return 500 }\n"
+                      "return response(200, body: encoded)\n}\n") -
+                   1);
+        auto tokens = lex({source, length});
+        if (!tokens) return 0x100u + static_cast<u32>(tokens.error().code);
+        auto ast = parse_file_heap(tokens.value());
+        if (!ast) return 0x200u + static_cast<u32>(ast.error().code);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) return 0x300u + static_cast<u32>(hir.error().code);
+        return hir.value().routes[0].locals.len;
+    };
+    // 13 user locals + Outer/Inner producer locals + the encoded guard binding
+    // fill HirRoute::kMaxLocals exactly; one more user local must fail cleanly.
+    CHECK_EQ(compile_with_preceding_locals(13), HirRoute::kMaxLocals);
+    CHECK_EQ(compile_with_preceding_locals(14),
+             0x300u + static_cast<u32>(FrontendError::TooManyItems));
+}

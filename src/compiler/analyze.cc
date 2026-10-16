@@ -3864,6 +3864,7 @@ static FrontendResult<HirExpr> analyze_json_hir_value(const HirExpr& value,
             local.variant_index = value.variant_index;
             local.struct_index = value.struct_index;
             local.shape_index = value.shape_index;
+            local.is_runtime_synthetic = true;
             local.tuple_len = value.tuple_len;
             for (u32 ti = 0; ti < value.tuple_len; ++ti) {
                 local.tuple_types[ti] = value.tuple_types[ti];
@@ -11146,14 +11147,14 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 auto bound = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!bound) return core::make_unexpected(bound.error());
-                auto cond = analyze_guard_cond(inner.expr,
-                                               route,
-                                               mod,
-                                               scoped_locals.data,
-                                               scoped_locals.len,
-                                               binding,
-                                               inner.bind_value,
-                                               inner.match_arms.len != 0);
+                auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                           inner.expr.span,
+                                                           route,
+                                                           scoped_locals.data,
+                                                           scoped_locals.len,
+                                                           inner.bind_value,
+                                                           inner.match_arms.len != 0,
+                                                           kGuardBoolDetail);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard.cond = cond.value();
                 if (inner.match_arms.len != 0) {
@@ -14042,14 +14043,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             auto bound = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!bound) return core::make_unexpected(bound.error());
-            auto cond = analyze_guard_cond(bstmt.expr,
-                                           route,
-                                           mod,
-                                           route->locals.data,
-                                           route->locals.len,
-                                           nullptr,
-                                           bstmt.bind_value,
-                                           bstmt.match_arms.len != 0);
+            auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                       bstmt.expr.span,
+                                                       route,
+                                                       route->locals.data,
+                                                       route->locals.len,
+                                                       bstmt.bind_value,
+                                                       bstmt.match_arms.len != 0,
+                                                       kGuardBoolDetail);
             if (!cond) return core::make_unexpected(cond.error());
             guard.cond = cond.value();
             if (bstmt.match_arms.len != 0) {
@@ -14697,14 +14698,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                       arm_scoped_locals.len,
                                                       arm_binding_ptr);
                             if (!bound) return core::make_unexpected(bound.error());
-                            auto cond = analyze_guard_cond(inner.expr,
-                                                           route,
-                                                           mod,
-                                                           arm_scoped_locals.data,
-                                                           arm_scoped_locals.len,
-                                                           arm_binding_ptr,
-                                                           inner.bind_value,
-                                                           inner.match_arms.len != 0);
+                            auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                                       inner.expr.span,
+                                                                       route,
+                                                                       arm_scoped_locals.data,
+                                                                       arm_scoped_locals.len,
+                                                                       inner.bind_value,
+                                                                       inner.match_arms.len != 0,
+                                                                       kGuardBoolDetail);
                             if (!cond) return core::make_unexpected(cond.error());
                             guard.cond = cond.value();
                             if (inner.match_arms.len != 0) {
@@ -19713,14 +19714,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto bound = analyze_expr(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
-                auto cond = analyze_guard_cond(stmt.expr,
-                                               &route,
-                                               mod,
-                                               route.locals.data,
-                                               route.locals.len,
-                                               nullptr,
-                                               stmt.bind_value,
-                                               stmt.match_arms.len != 0);
+                auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                           stmt.expr.span,
+                                                           &route,
+                                                           route.locals.data,
+                                                           route.locals.len,
+                                                           stmt.bind_value,
+                                                           stmt.match_arms.len != 0,
+                                                           kGuardBoolDetail);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard.cond = cond.value();
                 if (stmt.match_arms.len != 0) {
