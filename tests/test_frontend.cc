@@ -33140,22 +33140,27 @@ TEST(frontend, parse_object_literal_as_call_argument) {
 
 TEST(frontend, serialized_json_body_provenance_survives_local_alias) {
     const char* src =
-        "struct User { name: str } route GET \"/x\" { "
-        "let encoded = json.encode(User(name: \"Ada\")) "
-        "let alias = encoded return 200 }\n";
+        "route GET \"/x\" { "
+        "guard let encoded = json({ name: \"Ada\" }) else { return 500 } "
+        "let alias = encoded return response(200, body: alias) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
     REQUIRE(ast);
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
-    CHECK(hir->routes[0].locals[1].init.is_json_encoded);
+    CHECK(hir->routes[0].control.direct_term.response_body_local_index != 0xffffffffu);
+    CHECK_EQ(hir->routes[0].control.direct_term.response_headers.len, 1u);
+    CHECK(hir->routes[0].control.direct_term.response_headers[0].key.eq(lit_str("Content-Type")));
+    CHECK(hir->routes[0].control.direct_term.response_headers[0].value.eq(
+        lit_str("application/json")));
 }
 
 TEST(frontend, serialized_json_body_explicit_content_type_wins) {
     const char* src =
-        "route GET \"/x\" { let encoded = json({ value: 1 }) "
-        "return response(200, headers: { \"Content-Type\": \"text/custom\" }) }\n";
+        "route GET \"/x\" { guard let encoded = json({ value: 1 }) else { return 500 } "
+        "let alias = encoded return response(200, body: alias, "
+        "headers: { \"Content-Type\": \"text/custom\" }) }\n";
     auto lexed = lex(lit(src));
     REQUIRE(lexed);
     auto ast = parse_file_heap(lexed.value());
@@ -33163,7 +33168,9 @@ TEST(frontend, serialized_json_body_explicit_content_type_wins) {
     auto hir = analyze_file_heap(ast.value());
     REQUIRE(hir);
     const auto& term = hir->routes[0].control.direct_term;
+    CHECK(term.response_body_local_index != 0xffffffffu);
     REQUIRE_EQ(term.response_headers.len, 1u);
+    CHECK(term.response_headers[0].key.eq(lit_str("Content-Type")));
     CHECK(term.response_headers[0].value.eq(lit_str("text/custom")));
 }
 

@@ -5025,6 +5025,7 @@ static FrontendResult<HirExpr> make_guard_bound_init(HirRoute* route,
     HirExpr init{};
     init.kind = HirExprKind::ValueOf;
     init.type = bound.type;
+    init.is_json_encoded = bound.is_json_encoded;
     init.generic_index = bound.generic_index;
     init.generic_has_error_constraint = bound.generic_has_error_constraint;
     init.generic_has_eq_constraint = bound.generic_has_eq_constraint;
@@ -5092,6 +5093,7 @@ static FrontendResult<HirLocal> make_if_let_local(
     local.shape_index = bound.shape_index;
     auto init = make_guard_bound_init(route, bound, span);
     if (!init) return core::make_unexpected(init.error());
+    init->is_json_encoded = bound.is_json_encoded;
     local.init = init.value();
     return local;
 }
