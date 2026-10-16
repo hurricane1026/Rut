@@ -1014,7 +1014,7 @@ public:
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
             }
-            metrics->on_close();
+            if (c.metrics_client) metrics->on_close();
         }
         this->free_conn(c);
     }
@@ -1269,6 +1269,10 @@ public:
                     u32 period = drain_period_.load(std::memory_order_relaxed);
                     u64 now = monotonic_secs();
                     for (u32 i = 0; i < connection_capacity; i++) {
+                        if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
+                            conns[i].h2 && conns[i].h2->grpc.active && !conns[i].h2->goaway_sent)
+                            on_h2_data<EpollEventLoop>(
+                                this, conns[i], {i, 1, 0, 0, IoEventType::Recv, 0});
                         if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
                             !(conns[i].h2 && conns[i].h2->grpc.active) &&
                             should_drain_close(i, start, now, period)) {

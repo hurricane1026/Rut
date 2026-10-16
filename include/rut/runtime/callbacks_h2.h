@@ -1896,8 +1896,11 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     // Control frames the engine emits (SETTINGS/ACK/WINDOW_UPDATE/PING/GOAWAY).
     u8 ctrl[8192];
     // Response frames produced by the dispatch callback.
-    static constexpr u32 kRespCap = 16384;
-    u8 resp[kRespCap];
+    // Keep control frames and staged response frames within the downstream
+    // send slice.  The control buffer can consume up to 8 KiB.
+    static constexpr u32 kRespCap = 8192;
+    static constexpr u32 kRespStorageCap = 16384;
+    u8 resp[kRespStorageCap];
     H2Dispatch<Loop> d{loop, &conn, resp, kRespCap, 0, false, false};
 
     conn.h2->cb_ctx = &d;
@@ -1950,7 +1953,8 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     if (!kClose && conn.h2->grpc.active && conn.h2->outbound_stream == 0) {
         const u32 used = ctrl_len + d.resp_len;
         const u32 wire_room = used < conn.send_buf.capacity() ? conn.send_buf.capacity() - used : 0;
-        const u32 room = d.resp_cap - d.resp_len < wire_room ? d.resp_cap - d.resp_len : wire_room;
+        const u32 storage_room = kRespStorageCap - d.resp_len;
+        const u32 room = storage_room < wire_room ? storage_room : wire_room;
         d.resp_len += grpc_pump_downstream(loop, conn, d.resp + d.resp_len, room);
     }
     conn.h2->grpc.busy = false;
@@ -1968,7 +1972,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         const u32 kN = h2_pump_outbound(
             *conn.h2,
             d.resp + d.resp_len,
-            d.resp_cap - d.resp_len < kWireRoom ? d.resp_cap - d.resp_len : kWireRoom,
+            kRespStorageCap - d.resp_len < kWireRoom ? kRespStorageCap - d.resp_len : kWireRoom,
             pump_status);
         if (pump_status == H2PumpStatus::Invalid) {
             h2_clear_outbound(*conn.h2);

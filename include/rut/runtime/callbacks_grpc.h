@@ -9,6 +9,7 @@
 
 namespace rut {
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us);
+inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us);
 
 template <typename Loop>
 void grpc_refresh_timer(Loop*, Connection&);
@@ -123,7 +124,9 @@ void grpc_connection_closed(void* lp, Connection& conn) {
     if (!conn.h2) return;
     auto& g = conn.h2->grpc;
     g.busy = true;
-    if (g.timer_deadline_us) loop->disarm_yield_timer(conn);
+    if (g.timer_deadline_us) {
+        if constexpr (requires { loop->disarm_yield_timer(conn); }) loop->disarm_yield_timer(conn);
+    }
     // During connect the descriptor is also held in upstream_fd for the
     // backend's connect operation. The ordinary close path must close it once.
     if (g.connecting && conn.fd == conn.upstream_fd) conn.fd = -1;
@@ -445,6 +448,8 @@ template <typename Loop>
 void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result < 0) {
+        record_backend_result(
+            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
         loop->close_conn(conn);
         return;
     }
@@ -513,7 +518,7 @@ bool grpc_start_impl(Loop* loop,
             loop->pool.free(reinterpret_cast<u8*>(x));
             return false;
         }
-        if (loop->metrics) loop->metrics->on_accept();
+        up->metrics_client = false;
         if (!loop->alloc_h2(*up) || !grpc_grow_recv(loop, *up)) {
             loop->close_conn(*up);
             loop->pool.free(reinterpret_cast<u8*>(x));
@@ -578,6 +583,7 @@ bool grpc_start_impl(Loop* loop,
         up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);
         if (up->fd < 0 ||
             !loop->submit_connect(*up, &target.addrs[backend], sizeof(target.addrs[backend]))) {
+            record_backend_result(uid, backend, /*success=*/false, monotonic_us());
             loop->close_conn(*up);
             return true;
         }
@@ -668,7 +674,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             Connection* up = x->upstream;
             if (done) {
                 h2_close_stream(&h, x->downstream_stream);
-                grpc_release(loop, x, true);
+                grpc_release(loop, x, x->failure || !x->request_end_sent);
             }
             if (up && up->h2 && !up->h2->grpc.busy && !up->h2->grpc.connecting) {
                 // Produce the returned response-window credit before the next read.
@@ -736,13 +742,18 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
         if (x && !x->failure && x->deadline_us && (!earliest || x->deadline_us < earliest))
             earliest = x->deadline_us;
     if (earliest == g.timer_deadline_us) return;
-    if (g.timer_deadline_us) loop->disarm_yield_timer(conn);
+    if (g.timer_deadline_us) {
+        if constexpr (requires { loop->disarm_yield_timer(conn); }) loop->disarm_yield_timer(conn);
+    }
     g.timer_deadline_us = earliest;
     if (!earliest) return;
     const u64 now = monotonic_us();
     u64 delay = earliest > now ? earliest - now : 1;
     if (delay > 3600000000ull) delay = 3600000000ull;
-    if (!loop->arm_throttle_timer(conn, delay * 1000)) {
+    if constexpr (!(requires { loop->arm_throttle_timer(conn, delay * 1000); })) {
+        g.timer_deadline_us = 0;
+        return;
+    } else if (!loop->arm_throttle_timer(conn, delay * 1000)) {
         g.timer_deadline_us = 0;
         for (auto* x : g.streams)
             if (x && x->deadline_us) x->failure = 8;

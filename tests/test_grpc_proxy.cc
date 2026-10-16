@@ -20,6 +20,20 @@
 using namespace rut;
 
 namespace {
+struct GrpcBackendHealthReset {
+    GrpcBackendHealthReset() { reset(); }
+    ~GrpcBackendHealthReset() { reset(); }
+    static void reset() {
+        for (u16 uid = 0; uid < RouteConfig::kMaxUpstreams; uid++)
+            for (u32 bid = 0; bid < UpstreamTarget::kMaxBackends; bid++) {
+                auto* h = backend_health(uid, bid);
+                h->fails = 0;
+                h->eject_until_us = 0;
+                h->active_down = false;
+            }
+    }
+};
+
 void set_socket_timeouts(int fd, int secs) {
     timeval timeout{secs, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -124,6 +138,24 @@ struct EchoServer {
                                       nv("grpc-status", "7"),
                                       nv("grpc-message", "denied")};
                 return nghttp2_submit_response(session, s->id, error, 4, nullptr);
+            }
+            if (mode == 3) {
+                static char large_value[12000];
+                static bool initialized = false;
+                if (!initialized) {
+                    for (u32 i = 0; i < sizeof(large_value); i++)
+                        large_value[i] = static_cast<char>('!' + ((i * 37u) % 94u));
+                    initialized = true;
+                }
+                nghttp2_nv large[] = {nv(":status", "200"),
+                                      nv("content-type", "application/grpc"),
+                                      nv("grpc-status", "0"),
+                                      {reinterpret_cast<uint8_t*>(const_cast<char*>("x-large")),
+                                       reinterpret_cast<uint8_t*>(large_value),
+                                       7,
+                                       sizeof(large_value),
+                                       NGHTTP2_NV_FLAG_NONE}};
+                return nghttp2_submit_response(session, s->id, large, 4, nullptr);
             }
             if (mode == 4) nghttp2_submit_goaway(session, 0, s->id, NGHTTP2_NO_ERROR, nullptr, 0);
             nghttp2_nv headers[] = {nv(":status", "200"),
@@ -427,10 +459,12 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
             const bool echoed = a.until(0, false);
             CHECK(echoed);  // response DATA arrives before request END_STREAM
             if (echoed) {
+                const u32 resets_before_completed_rpc = server->resets.load();
                 CHECK_EQ(a.request(1, 200000, true), 3);
                 CHECK(a.until(1, true));  // multiplex while stream 1 stays open
                 CHECK(a.rpcs[1].ok && a.rpcs[1].meta && a.rpcs[1].trailer);
                 CHECK_EQ(a.rpcs[1].received, 200000u);
+                CHECK_EQ(server->resets.load(), resets_before_completed_rpc);
                 CHECK_EQ(b.request(0, 64, true), 1);
                 CHECK(b.until(0, true));  // a second downstream shares the same upstream
                 CHECK(b.rpcs[0].ok);
@@ -497,27 +531,45 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                 CHECK(a.until(10, true));
                 CHECK(a.rpcs[10].ok);
                 CHECK_EQ(a.rpcs[10].received, 8192u);
+                // A successful early response must cancel the still-open
+                // upstream request stream so the server does not retain it.
+                server->reply_mode = 1;
+                const u32 resets_before_early_response = server->resets.load();
+                CHECK_EQ(a.request(11, 1024, false), 23);
+                CHECK(a.until(11, true));
+                const u64 reset_deadline = monotonic_us() + 500000;
+                while (server->resets.load() < resets_before_early_response + 1 &&
+                       monotonic_us() < reset_deadline)
+                    CHECK(a.step());
+                CHECK_EQ(server->resets.load(), resets_before_early_response + 1);
+                server->reply_mode = 3;
+                CHECK_EQ(a.request(12, 0, true), 25);
+                CHECK(a.until(12, true));
+                CHECK(a.rpcs[12].ok);
                 // Draining sends GOAWAY but lets a bidirectional RPC finish.
-                CHECK_EQ(a.request(11, 128, false), 23);
-                CHECK(a.until(11, false));
+                CHECK_EQ(a.request(13, 128, false), 27);
+                CHECK(a.until(13, false));
                 shard->loop->drain(5);
                 const u64 drain_deadline = monotonic_us() + 2500000;
                 while (!a.goaway && monotonic_us() < drain_deadline) {
                     if (!a.step()) break;
                 }
                 CHECK(a.goaway);
-                a.rpcs[11].size = 32768;
-                a.rpcs[11].end = true;
-                CHECK_EQ(nghttp2_session_resume_data(a.session, 23), 0);
-                CHECK(a.until(11, true));
-                CHECK(a.rpcs[11].ok);
-                CHECK_EQ(a.rpcs[11].received, 32768u);
+                a.rpcs[13].size = 32768;
+                a.rpcs[13].end = true;
+                CHECK_EQ(nghttp2_session_resume_data(a.session, 27), 0);
+                CHECK(a.until(13, true));
+                CHECK(a.rpcs[13].ok);
+                CHECK_EQ(a.rpcs[13].received, 32768u);
             }
         }
     }
     shard->stop();
     shard->join();
+    CHECK_EQ(shard->shard_metrics.connections_total, 2u);
     shard->loop->force_close_all();
+    CHECK_EQ(shard->shard_metrics.connections_active, 0u);
+    CHECK_EQ(shard->shard_metrics.connections_closed, 2u);
     if (shard->loop->listen_fd >= 0) {
         close(shard->loop->listen_fd);
         shard->loop->listen_fd = -1;
@@ -532,6 +584,25 @@ TEST(grpc_proxy, streaming_and_pooling_epoll) {
 }
 TEST(grpc_proxy, streaming_and_pooling_iouring) {
     streaming_case<IoUringEventLoop>(_tc);
+}
+TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
+    GrpcBackendHealthReset health_reset{};
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    const u64 now = monotonic_us();
+    for (u32 i = 0; i < kBackendFailThreshold; i++) {
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->upstream_idx = 0;
+        conn->upstream_backend_idx = 0;
+        grpc_connected<EventLoop<MockBackend>>(
+            loop.get(), *conn, {conn->id, -ECONNREFUSED, 0, 0, IoEventType::UpstreamConnect, 0});
+    }
+    CHECK_EQ(health->fails, kBackendFailThreshold);
+    CHECK_EQ(select_backend(0, 2, now + 3), 1u);
+    loop->shutdown();
 }
 TEST(grpc_proxy, tls_downstream_jit_epoll) {
     streaming_case<EpollEventLoop>(_tc, true);

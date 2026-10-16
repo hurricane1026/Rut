@@ -257,6 +257,8 @@ bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 template <typename Loop>
 void grpc_tick(Loop* loop, Connection& conn);
 template <typename Loop>
+void on_h2_data(void* lp, Connection& conn, IoEvent ev);
+template <typename Loop>
 void grpc_deadline_fired(Loop* loop, Connection& conn);
 
 template <typename Loop>

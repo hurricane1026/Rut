@@ -416,6 +416,8 @@ struct ConnectionBase {
     // desynced must never be reused (the next request would be parsed as leftover
     // body). Reset at the per-request boundary like the other reuse flags.
     bool upstream_request_incomplete;
+    // Internal pooled sessions must not affect accepted-client metrics.
+    bool metrics_client;
     // io_uring-only deferred idle-pool return: an upstream fd to park in the pool
     // once its cancelled multishot recv terminal drains (handing the fd out while a
     // recv is still draining on it would let two recvs race the same socket). -1 =
@@ -1933,6 +1935,7 @@ struct ConnectionBase {
         upstream_keep_alive = false;
         upstream_reused = false;
         upstream_request_incomplete = false;
+        metrics_client = true;
         idle_return_fd = -1;
         idle_return_uid = 0;
         idle_return_bidx = 0;
