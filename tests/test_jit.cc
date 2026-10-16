@@ -22096,6 +22096,80 @@ route GET "/x" { guard let encoded = json(make()) else { return 500 } return res
     rir.destroy();
 }
 
+TEST(jit, json_decode_nonlocal_source_is_evaluated_once) {
+    const char* src = R"rut(
+struct Payload { a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32 }
+route POST "/decode" {
+    guard let doc = req.bodyJson() else { return 400 }
+    guard let value = json.decode(Payload,
+        json.remove(json.remove(json.remove(json.remove(doc, "/x1").or(doc), "/x2").or(doc), "/x3").or(doc), "/x4").or(doc)) else { return 422 }
+    if value.a == 1 && value.b == 2 && value.c == 3 && value.d == 4 &&
+       value.e == 5 && value.f == 6 && value.g == 7 && value.h == 8 { return 200 }
+    else { return 409 }
+}
+)rut";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& route = hir.value().routes[0];
+    u32 synthetic_sources = 0;
+    for (u32 i = 0; i < route.locals.len; ++i) {
+        const auto& local = route.locals[i];
+        if (local.is_runtime_synthetic && local.type == HirTypeKind::Json) synthetic_sources++;
+    }
+    CHECK_EQ(synthetic_sources, 1u);
+
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+
+    char body[json::kMaxBytes];
+    u32 body_len = 0;
+    const char* prefix = "{\"padding\":\"";
+    __builtin_memcpy(body + body_len, prefix, strlen(prefix));
+    body_len += static_cast<u32>(strlen(prefix));
+    __builtin_memset(body + body_len, 'x', 7000);
+    body_len += 7000;
+    const char* suffix =
+        "\",\"x1\":1,\"x2\":2,\"x3\":3,\"x4\":4,\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,"
+        "\"g\":7,\"h\":8}";
+    __builtin_memcpy(body + body_len, suffix, strlen(suffix));
+    body_len += static_cast<u32>(strlen(suffix));
+    char request[json::kMaxBytes + 128];
+    const int header_len = snprintf(
+        request, sizeof(request), "POST /decode HTTP/1.1\r\nContent-Length: %u\r\n\r\n", body_len);
+    REQUIRE(header_len > 0 && static_cast<u32>(header_len) + body_len < sizeof(request));
+    __builtin_memcpy(request + header_len, body, body_len);
+
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    auto connection = std::make_unique<Connection>();
+    connection->reset();
+    connection->json_arena.backend.pool = &pool;
+    const auto result = HandlerResult::unpack(handler(connection.get(),
+                                                      nullptr,
+                                                      reinterpret_cast<const u8*>(request),
+                                                      static_cast<u32>(header_len) + body_len,
+                                                      nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK(connection->json_arena.space_used() < 128 * 1024u);
+    connection->reset();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
 TEST(jit, json_struct_producer_respects_route_local_capacity) {
     auto compile_with_preceding_locals = [](u32 local_count) {
         char source[2048]{};
@@ -22138,6 +22212,43 @@ TEST(jit, json_struct_producer_respects_route_local_capacity) {
     };
     // 13 user locals + Outer/Inner producer locals + the encoded guard binding
     // fill HirRoute::kMaxLocals exactly; one more user local must fail cleanly.
+    CHECK_EQ(compile_with_preceding_locals(13), HirRoute::kMaxLocals);
+    CHECK_EQ(compile_with_preceding_locals(14),
+             0x300u + static_cast<u32>(FrontendError::TooManyItems));
+}
+
+TEST(jit, json_decode_source_respects_route_local_capacity) {
+    auto compile_with_preceding_locals = [](u32 local_count) {
+        char source[1024]{};
+        u32 length = 0;
+        auto append = [&](const char* text, u32 text_length) {
+            __builtin_memcpy(source + length, text, text_length);
+            length += text_length;
+        };
+        const char* prefix = "struct Payload { value: i32 }\nroute POST \"/\" {\n";
+        append(prefix, static_cast<u32>(strlen(prefix)));
+        for (u32 i = 0; i < local_count; ++i) {
+            char declaration[] = "let v00 = 0\n";
+            declaration[5] = static_cast<char>('0' + i / 10);
+            declaration[6] = static_cast<char>('0' + i % 10);
+            append(declaration, sizeof(declaration) - 1);
+        }
+        const char* suffix =
+            "guard let doc = req.bodyJson() else { return 400 }\n"
+            "guard let value = json.decode(Payload, json.remove(doc, \"/missing\").or(doc)) "
+            "else { return 422 }\n"
+            "return 200\n}\n";
+        append(suffix, static_cast<u32>(strlen(suffix)));
+        auto tokens = lex({source, length});
+        if (!tokens) return 0x100u + static_cast<u32>(tokens.error().code);
+        auto ast = parse_file_heap(tokens.value());
+        if (!ast) return 0x200u + static_cast<u32>(ast.error().code);
+        auto hir = analyze_file_heap(ast.value());
+        if (!hir) return 0x300u + static_cast<u32>(hir.error().code);
+        return hir.value().routes[0].locals.len;
+    };
+    // The non-local Json source adds one synthetic local before the decoded
+    // binding, and must fail cleanly when that exceeds the route-local budget.
     CHECK_EQ(compile_with_preceding_locals(13), HirRoute::kMaxLocals);
     CHECK_EQ(compile_with_preceding_locals(14),
              0x300u + static_cast<u32>(FrontendError::TooManyItems));

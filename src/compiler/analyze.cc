@@ -4038,6 +4038,25 @@ static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
     if (depth > json::kMaxDepth || index >= mod.structs.len)
         return frontend_error(
             FrontendError::UnsupportedSyntax, span, lit_str("recursive JSON decoding shape"));
+    HirExpr stable_source = source;
+    if (stable_source.kind != HirExprKind::LocalRef) {
+        // Decoding references the source for the object check and each field.
+        // Materialize it once so effectful JSON expressions are not repeated.
+        if (route->locals.len >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::TooManyItems, span);
+        HirLocal local{};
+        local.span = span;
+        local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        local.type = source.type;
+        local.is_runtime_synthetic = true;
+        local.init = source;
+        if (!route->locals.push(local)) return frontend_error(FrontendError::TooManyItems, span);
+        stable_source = {};
+        stable_source.kind = HirExprKind::LocalRef;
+        stable_source.type = source.type;
+        stable_source.span = span;
+        stable_source.local_index = local.ref_index;
+    }
     const auto& decl = mod.structs[index];
     HirExpr result{};
     result.kind = HirExprKind::JsonDecode;
@@ -4045,8 +4064,14 @@ static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
     result.struct_index = index;
     result.may_nil = true;
     result.span = span;
-    auto object = make_json_op(
-        json::Op::RequireObject, HirTypeKind::Json, true, &source, nullptr, nullptr, span, route);
+    auto object = make_json_op(json::Op::RequireObject,
+                               HirTypeKind::Json,
+                               true,
+                               &stable_source,
+                               nullptr,
+                               nullptr,
+                               span,
+                               route);
     if (!object) return object;
     if (!route->exprs.push(object.value()))
         return frontend_error(FrontendError::TooManyItems, span);
@@ -4073,7 +4098,7 @@ static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
         key.type = HirTypeKind::Str;
         key.str_value = {owned.data(), static_cast<u32>(owned.size())};
         auto selected = make_json_op(
-            json::Op::Get, HirTypeKind::Json, false, &source, &key, nullptr, span, route);
+            json::Op::Get, HirTypeKind::Json, false, &stable_source, &key, nullptr, span, route);
         if (!selected) return selected;
         FrontendResult<HirExpr> decoded = selected;
         if (field.type == HirTypeKind::Struct) {
