@@ -625,13 +625,21 @@ struct GrpcDriveFixture {
     Connection* grpc_upstreams = nullptr;
     const RouteConfig** config_ptr = nullptr;
     TimerWheel timer;
+    SlicePool pool;
+    bool pool_ready = false;
     u32 keepalive_timeout = 60;
     u32 upstream_timeout = 1;
     u32 sends = 0;
     u32 last_send_len = 0;
     u32 released = 0;
     bool closed = false;
-    GrpcDriveFixture() { timer.init(); }
+    GrpcDriveFixture() {
+        timer.init();
+        pool_ready = pool.init(128, 0).has_value();
+    }
+    ~GrpcDriveFixture() {
+        if (pool_ready) pool.destroy();
+    }
     bool submit_send(Connection&, const u8*, u32 len) {
         sends++;
         last_send_len = len;
@@ -706,25 +714,64 @@ TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
     CHECK(downstream.on_send == &pending_send);
 }
 
-TEST(grpc_proxy, failed_deadline_arm_marks_exchange_for_immediate_wakeup) {
+TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[SlicePool::kSliceSize];
+    u8 upstream_recv[SlicePool::kSliceSize];
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    upstream.recv_slice = upstream_recv;
+    upstream.recv_slice_capacity = sizeof(upstream_recv);
+    upstream.recv_buf.bind(upstream_recv, sizeof(upstream_recv));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.peer_settings_seen = true;
+    upstream_h2.grpc.preface_sent = true;
+    upstream.h2 = &upstream_h2;
+
     Connection downstream;
     downstream.reset();
-    Http2Conn h2;
-    h2.init_client();
-    downstream.h2 = &h2;
-    auto* stream = h2.open_stream(1);
-    REQUIRE(stream != nullptr);
-    GrpcExchange x;
-    x.init();
-    x.downstream = &downstream;
-    x.downstream_stream = 1;
-    x.deadline_us = monotonic_us() + 1000000;
-    h2.grpc.streams[0] = &x;
-    h2.grpc.active = 1;
+    u8 downstream_send[SlicePool::kSliceSize];
+    downstream.send_slice = downstream_send;
+    downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(3) != nullptr);
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(3) != nullptr);
+    GrpcExchange reset_exchange;
+    GrpcExchange pending_exchange;
+    reset_exchange.init();
+    pending_exchange.init();
+    reset_exchange.downstream = pending_exchange.downstream = &downstream;
+    reset_exchange.upstream = pending_exchange.upstream = &upstream;
+    reset_exchange.downstream_stream = reset_exchange.upstream_stream = 1;
+    pending_exchange.downstream_stream = pending_exchange.upstream_stream = 3;
+    pending_exchange.deadline_us = monotonic_us() + 1000000;
+    downstream_h2.grpc.streams[0] = &reset_exchange;
+    downstream_h2.grpc.streams[1] = &pending_exchange;
+    downstream_h2.grpc.active = 2;
+    upstream_h2.grpc.streams[0] = &reset_exchange;
+    upstream_h2.grpc.streams[1] = &pending_exchange;
+    upstream_h2.grpc.active = 2;
+    // Model the completed upstream RST callback: the first exchange is ready
+    // to emit its failure while the second one is still deadline-pending.
+    reset_exchange.failure = 1;
+    reset_exchange.response_end = true;
     grpc_refresh_timer(&loop, downstream);
-    CHECK_EQ(x.failure, 8u);
-    CHECK_EQ(h2.grpc.timer_deadline_us, 0u);
+    u8 response[4096];
+    const u32 response_len = grpc_pump_downstream(&loop, downstream, response, sizeof(response));
+    CHECK_EQ(reset_exchange.failure, 1u);
+    CHECK_EQ(pending_exchange.failure, 8u);
+    CHECK_EQ(downstream_h2.grpc.active, 0u);
+    CHECK_EQ(downstream_h2.grpc.timer_deadline_us, 0u);
+    CHECK_GT(response_len, 0u);
 }
 
 TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {
