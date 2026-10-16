@@ -1450,8 +1450,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // The mutation logs are connection-owned. Clear them at every new request
     // boundary once no suspended proxy owns them; a later plain proxy stream must
     // never inherit a completed JIT stream's mutations.
-    if (d.conn->h2->async_stream == 0 && d.conn->h2->pending_stream == 0)
-        h2_reset_request_mutations(*d.conn);
+    if (d.conn->h2->async_stream == 0) h2_reset_request_mutations(*d.conn);
     ParsedRequest req;
     if (!h2_headers_to_request(headers, nheaders, &req)) {
         if (has_exact_inventory && req.target_has_fragment) {

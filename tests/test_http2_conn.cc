@@ -1703,6 +1703,7 @@ TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
         CHECK(h2.pending_local_outcome);
         CHECK_EQ(d.resp_len, 0u);
         if (mutate_concurrently) {
+            h2_reset_request_mutations(conn);
             conn.resp_header_mutations[0] = {
                 {"x-local", 7}, {"changed", 7}, Connection::RespHeaderMutationMode::Set};
             conn.resp_header_mutation_count = 1;
