@@ -591,7 +591,6 @@ bool grpc_start_impl(Loop* loop,
         }
     } else
         grpc_drive_upstream(loop, *up);
-    up->h2->grpc.connected_at_us = now;
     loop->timer.refresh(up, 1);
     loop->timer.refresh(&down, 1);
     grpc_refresh_timer(loop, down);
@@ -783,11 +782,11 @@ void grpc_tick(Loop* loop, Connection& conn) {
         if (((h.grpc.connecting || !h.peer_settings_seen) &&
              now - h.grpc.connected_at_us >= static_cast<u64>(loop->upstream_timeout) * 1000000) ||
             (h.grpc.active == 0 &&
-             (h.peer_goaway || now - h.grpc.connected_at_us >=
-                                   static_cast<u64>(loop->keepalive_timeout) * 1000000))) {
-            loop->close_conn(conn);
-            return;
-        }
+             (loop->is_draining() || h.peer_goaway ||
+              now - h.grpc.connected_at_us >= static_cast<u64>(loop->keepalive_timeout) * 1000000)))) {
+                loop->close_conn(conn);
+                return;
+            }
     } else {
         for (auto* x : h.grpc.streams)
             if (x && x->deadline_us && now >= x->deadline_us) x->failure = 4;
