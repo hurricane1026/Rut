@@ -1526,7 +1526,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             // when the handler does not read req.body. Such handlers still
             // avoid buffering DATA; requests without a declared length retain
             // the immediate body-agnostic dispatch path below.
-            if (!end_stream && (route->needs_req_body || req.has_content_length)) {
+            if (!end_stream &&
+                (route->needs_req_body || (req.has_content_length && !grpc_request(req)))) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
