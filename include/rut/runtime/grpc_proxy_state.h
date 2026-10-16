@@ -69,7 +69,6 @@ struct GrpcProxyState {
     // At most 64 header-sent streams can be awaiting cancellation.
     u32 pending_cancels[64];
     u64 connected_at_us;
-    u64 last_activity_us;
     u64 idle_since_us;
     u64 timer_deadline_us;
     bool upstream;
@@ -82,7 +81,7 @@ struct GrpcProxyState {
         for (auto& stream : streams) stream = nullptr;
         pool_next = nullptr;
         active = cursor = control_len = pending_cancel_count = 0;
-        connected_at_us = last_activity_us = idle_since_us = timer_deadline_us = 0;
+        connected_at_us = idle_since_us = timer_deadline_us = 0;
         upstream = connecting = busy = preface_sent = false;
     }
 };

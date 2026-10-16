@@ -120,7 +120,6 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
         if (!down->h2->grpc.busy) grpc_refresh_timer(loop, *down);
     }
     if (up && up->h2) {
-        up->h2->grpc.last_activity_us = monotonic_us();
         auto& h = *up->h2;
         h.consume_data(x->upstream_stream, x->download_len);
         if (auto* s = h.find_stream(x->upstream_stream)) {
@@ -209,7 +208,6 @@ inline bool grpc_response_header_allowed(const hpack::Header& h) {
 }
 inline void grpc_begin_handshake(GrpcProxyState& g, u64 now_us) {
     if (!g.connected_at_us) g.connected_at_us = now_us;
-    if (!g.last_activity_us) g.last_activity_us = now_us;
 }
 inline void grpc_record_connect_result(const Connection& conn, bool success, u64 now_us) {
     record_backend_result(conn.upstream_idx, conn.upstream_backend_idx, success, now_us);
@@ -466,7 +464,6 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     auto& h = *conn.h2;
     auto& g = h.grpc;
     if (g.connecting) return;
-    g.last_activity_us = monotonic_us();
     GrpcClientDispatch<Loop> dispatch{loop, &conn};
     h.cb_ctx = &dispatch;
     h.on_headers = &grpc_response_headers<Loop>;

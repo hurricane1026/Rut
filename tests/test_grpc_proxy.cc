@@ -689,7 +689,6 @@ TEST(grpc_proxy, idle_upstream_close_policy_respects_drain_and_activity) {
     GrpcProxyState g{};
     g.init();
     g.connected_at_us = 100;
-    g.last_activity_us = 100;
     g.idle_since_us = 5000;
     CHECK(grpc_idle_upstream_should_close(g, false, true, 101, 1000));
     g.active = 1;
