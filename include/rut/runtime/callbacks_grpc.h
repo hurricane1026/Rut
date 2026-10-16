@@ -528,6 +528,15 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
     if (conn.h2 && !loop->submit_recv(conn)) loop->close_conn(conn);
 }
 
+inline bool grpc_upstream_reusable(const Connection& conn,
+                                   const RouteConfig* cfg,
+                                   u16 upstream_id,
+                                   u32 backend_idx) {
+    return conn.h2 && conn.request_config == cfg && conn.upstream_idx == upstream_id &&
+           conn.upstream_backend_idx == backend_idx && !conn.h2->peer_goaway &&
+           conn.h2->grpc.active < 64 && conn.h2->last_stream_id < 0x7ffffffdu;
+}
+
 template <typename Loop>
 bool grpc_start_impl(Loop* loop,
                      Connection& down,
@@ -554,9 +563,7 @@ bool grpc_start_impl(Loop* loop,
     const u32 backend = select_backend(uid, target.addr_count, now);
     Connection* up = nullptr;
     for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next) {
-        if (c->request_config == cfg && c->upstream_idx == uid &&
-            c->upstream_backend_idx == backend && !c->h2->peer_goaway && c->h2->grpc.active < 64 &&
-            c->h2->last_stream_id < 0x7ffffffdu) {
+        if (grpc_upstream_reusable(*c, cfg, uid, backend)) {
             up = c;
             break;
         }

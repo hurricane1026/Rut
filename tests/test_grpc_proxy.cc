@@ -692,6 +692,25 @@ TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retire
     h2.grpc.streams[2] = &newest;
     h2.grpc.active = 3;
     loop.grpc_upstreams = &upstream;
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    upstream.request_config = &cfg;
+    upstream.upstream_idx = 0;
+    upstream.upstream_backend_idx = 0;
+
+    CHECK(grpc_upstream_reusable(upstream, &cfg, 0, 0));
+    CHECK_FALSE(grpc_upstream_reusable(upstream, nullptr, 0, 0));
+    CHECK_FALSE(grpc_upstream_reusable(upstream, &cfg, 0, 1));
+    h2.grpc.active = 64;
+    CHECK_FALSE(grpc_upstream_reusable(upstream, &cfg, 0, 0));
+    h2.grpc.active = 3;
+    h2.peer_goaway = true;
+    CHECK_FALSE(grpc_upstream_reusable(upstream, &cfg, 0, 0));
+    h2.peer_goaway = false;
+    h2.last_stream_id = 0x7ffffffd;
+    CHECK_FALSE(grpc_upstream_reusable(upstream, &cfg, 0, 0));
+    h2.last_stream_id = 5;
 
     // The response on stream 1 has ended, but its exchange remains attached
     // while slowdown cleanup drains it.  Its sent HEADERS still count as an
