@@ -1270,6 +1270,79 @@ TEST(grpc_proxy, upstream_session_close_releases_slots_with_blocked_downstream) 
     }
 }
 
+TEST(grpc_proxy, terminal_response_releases_slot_while_downstream_send_is_blocked) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    Connection downstream;
+    downstream.reset();
+    u8 downstream_send[SlicePool::kSliceSize];
+    downstream.send_slice = downstream_send;
+    downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+    downstream.on_send = &pending_send;
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(3) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(3) != nullptr);
+    GrpcExchange trailers;
+    trailers.init();
+    trailers.downstream = &downstream;
+    trailers.upstream = &upstream;
+    trailers.downstream_stream = trailers.upstream_stream = 1;
+    trailers.slot_held = true;
+    trailers.upstream_id = 7;
+    upstream_h2.grpc.streams[0] = &trailers;
+    downstream_h2.grpc.streams[0] = &trailers;
+    GrpcExchange headers;
+    headers.init();
+    headers.downstream = &downstream;
+    headers.upstream = &upstream;
+    headers.downstream_stream = headers.upstream_stream = 3;
+    headers.slot_held = true;
+    headers.upstream_id = 7;
+    upstream_h2.grpc.streams[1] = &headers;
+    downstream_h2.grpc.streams[1] = &headers;
+    upstream_h2.grpc.active = downstream_h2.grpc.active = 2;
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const hpack::Header trailer_headers[] = {
+        {Str{"grpc-status", 11}, Str{"0", 1}},
+    };
+    grpc_response_trailers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, trailer_headers, 1, true);
+    CHECK_FALSE(trailers.slot_held);
+    CHECK_EQ(loop.released, 1u);
+    CHECK(trailers.response_end);
+    CHECK_GT(trailers.response_trailers_len, 0u);
+    CHECK_EQ(upstream_h2.grpc.streams[0], &trailers);
+    CHECK_EQ(downstream_h2.grpc.streams[0], &trailers);
+    CHECK_EQ(upstream_h2.grpc.active, 2u);
+    CHECK_EQ(downstream_h2.grpc.active, 2u);
+    grpc_response_trailers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, trailer_headers, 1, true);
+    CHECK_EQ(loop.released, 1u);
+
+    const hpack::Header terminal_headers[] = {
+        {Str{":status", 7}, Str{"200", 3}},
+        {Str{"content-type", 12}, Str{"application/grpc", 16}},
+        {Str{"grpc-status", 11}, Str{"0", 1}},
+    };
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 3, terminal_headers, 3, true);
+    CHECK_FALSE(headers.slot_held);
+    CHECK_EQ(loop.released, 2u);
+    CHECK(headers.response_end);
+    CHECK_GT(headers.response_headers_len, 0u);
+    CHECK_EQ(upstream_h2.grpc.streams[1], &headers);
+    CHECK_EQ(downstream_h2.grpc.streams[1], &headers);
+    CHECK_EQ(upstream_h2.grpc.active, 2u);
+    CHECK_EQ(downstream_h2.grpc.active, 2u);
+    CHECK(downstream.on_send == &pending_send);
+}
+
 TEST(grpc_proxy, timer_resume_expired_grpc_timeout_is_cancelled_before_forward) {
     EpollEventLoop loop;
     REQUIRE(loop.init(0, -1).has_value());

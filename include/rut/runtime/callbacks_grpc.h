@@ -207,6 +207,12 @@ inline bool grpc_has_status(const hpack::Header* hs, u32 n) {
         if (hs[i].name.eq({"grpc-status", 11})) return true;
     return false;
 }
+template <typename Loop>
+inline void grpc_release_slot(Loop* loop, GrpcExchange& x) {
+    if (!x.slot_held) return;
+    loop->upstream_release(x.upstream_id);
+    x.slot_held = false;
+}
 inline bool grpc_request_header_allowed(const hpack::Header& h) {
     if (h.name.eq({"connection", 10}) || h.name.eq({"keep-alive", 10}) ||
         h.name.eq({"proxy-connection", 16}) || h.name.eq({"transfer-encoding", 17}) ||
@@ -239,7 +245,7 @@ inline bool grpc_idle_upstream_should_close(
 template <typename Loop>
 void grpc_response_headers(
     void* ctx, Http2Conn& h, u32 sid, const hpack::Header* hs, u32 n, bool end) {
-    (void)ctx;
+    auto* dispatch = static_cast<GrpcClientDispatch<Loop>*>(ctx);
     auto* x = grpc_find(h, sid);
     if (!x) return;
     bool status = false;
@@ -281,6 +287,7 @@ void grpc_response_headers(
                 break;
         }
         x->response_end = true;
+        grpc_release_slot(dispatch->loop, *x);
         return;
     }
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
@@ -298,9 +305,12 @@ void grpc_response_headers(
     if (!x->response_headers_len) x->failure = 8;
     x->response_end = end;
     if (end && !grpc_has_status(hs, n)) x->failure = 2;
+    if (x->response_end) grpc_release_slot(dispatch->loop, *x);
 }
 template <typename Loop>
-void grpc_response_trailers(void*, Http2Conn& h, u32 sid, const hpack::Header* hs, u32 n, bool) {
+void grpc_response_trailers(
+    void* ctx, Http2Conn& h, u32 sid, const hpack::Header* hs, u32 n, bool) {
+    auto* dispatch = static_cast<GrpcClientDispatch<Loop>*>(ctx);
     auto* x = grpc_find(h, sid);
     if (!x) return;
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
@@ -318,9 +328,11 @@ void grpc_response_trailers(void*, Http2Conn& h, u32 sid, const hpack::Header* h
     if (!x->response_trailers_len) x->failure = 8;
     if (!grpc_has_status(hs, n)) x->failure = 2;
     x->response_end = true;
+    grpc_release_slot(dispatch->loop, *x);
 }
 template <typename Loop>
-void grpc_response_data(void*, Http2Conn& h, u32 sid, const u8* data, u32 len, bool end) {
+void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 len, bool end) {
+    auto* dispatch = static_cast<GrpcClientDispatch<Loop>*>(ctx);
     auto* x = grpc_find(h, sid);
     if (!x) {
         h.consume_data(sid, len);
@@ -335,6 +347,7 @@ void grpc_response_data(void*, Http2Conn& h, u32 sid, const u8* data, u32 len, b
     if (end) {
         x->failure = 2;
         x->response_end = true;
+        grpc_release_slot(dispatch->loop, *x);
     }  // gRPC requires status trailers.
 }
 template <typename Loop>
@@ -365,10 +378,7 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
             stream->state = Http2StreamState::Closed;
         grpc_detach(h, x);
         x->upstream = nullptr;
-        if (x->slot_held) {
-            d->loop->upstream_release(x->upstream_id);
-            x->slot_held = false;
-        }
+        grpc_release_slot(d->loop, *x);
         if (down) grpc_kick_downstream(d->loop, *down);
     }
 }
