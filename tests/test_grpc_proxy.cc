@@ -633,6 +633,7 @@ struct GrpcDriveFixture {
     u32 last_send_len = 0;
     u32 downstream_sends = 0;
     u32 downstream_last_send_len = 0;
+    bool saw_downstream_stream3 = false;
     u32 released = 0;
     bool closed = false;
     GrpcDriveFixture() {
@@ -642,12 +643,22 @@ struct GrpcDriveFixture {
     ~GrpcDriveFixture() {
         if (pool_ready) pool.destroy();
     }
-    bool submit_send(Connection& conn, const u8*, u32 len) {
+    bool submit_send(Connection& conn, const u8* data, u32 len) {
         sends++;
         last_send_len = len;
         if (conn.h2 && !conn.h2->grpc.upstream) {
             downstream_sends++;
             downstream_last_send_len = len;
+            for (u32 off = 0; off + kFrameHeaderSize <= len;) {
+                const u32 frame_len = (static_cast<u32>(data[off]) << 16) |
+                                      (static_cast<u32>(data[off + 1]) << 8) | data[off + 2];
+                const u32 sid = (static_cast<u32>(data[off + 5]) << 24) |
+                                (static_cast<u32>(data[off + 6]) << 16) |
+                                (static_cast<u32>(data[off + 7]) << 8) | data[off + 8];
+                if ((sid & 0x7fffffffu) == 3u) saw_downstream_stream3 = true;
+                if (off + kFrameHeaderSize + frame_len > len) break;
+                off += kFrameHeaderSize + frame_len;
+            }
         }
         return true;
     }
@@ -942,6 +953,49 @@ TEST(grpc_proxy, direct_http2_proxy_rejects_missing_scheme_before_upstream) {
     CHECK_EQ(h2.grpc.active, 0u);
     CHECK(loop.grpc_upstreams == nullptr);
     CHECK_EQ(downstream.send_buf.len(), 0u);
+}
+
+TEST(grpc_proxy, grpc_pump_is_not_blocked_by_ordinary_outbound_window) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection downstream;
+    downstream.reset();
+    u8 send[SlicePool::kSliceSize];
+    u8 recv[SlicePool::kSliceSize];
+    downstream.send_slice = send;
+    downstream.send_buf.bind(send, sizeof(send));
+    downstream.bind_request_receive_buffer(recv, sizeof(recv));
+    Http2Conn h2;
+    h2.init_client();
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.peer_settings_seen = true;
+    downstream.h2 = &h2;
+    auto* ordinary = h2.open_stream(1);
+    auto* grpc_stream = h2.open_stream(3);
+    REQUIRE(ordinary != nullptr);
+    REQUIRE(grpc_stream != nullptr);
+    ordinary->state = Http2StreamState::Open;
+    ordinary->send_window = 0;
+    h2.outbound_stream = 1;
+    static const u8 body[] = {'x'};
+    h2.outbound_body = body;
+    h2.outbound_body_len = sizeof(body);
+    h2.outbound_body_offset = 0;
+    h2.conn_send_window = 65535;
+    auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(x != nullptr);
+    x->init();
+    x->downstream = &downstream;
+    x->downstream_stream = 3;
+    x->failure = 1;
+    x->response_end = true;
+    h2.grpc.streams[0] = x;
+    h2.grpc.active = 1;
+    on_h2_data<GrpcDriveFixture>(&loop, downstream, {downstream.id, 1, 0, 0, IoEventType::Recv, 1});
+    CHECK(loop.saw_downstream_stream3);
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK_EQ(ordinary->send_window, 0);
 }
 
 TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {
