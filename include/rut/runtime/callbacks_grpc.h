@@ -510,10 +510,11 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
         u32 opened = 0;
         u32 next_header = 0x7fffffffu;
         for (auto* x : g.streams) {
-            if (!x || x->failure || x->response_end) continue;
-            if (x->request_headers_sent)
-                opened++;
-            else if (x->upstream_stream < next_header)
+            if (!x || x->failure) continue;
+            auto* stream = h.find_stream(x->upstream_stream);
+            if (x->request_headers_sent) {
+                if (stream && stream->state != Http2StreamState::Closed) opened++;
+            } else if (x->upstream_stream < next_header)
                 next_header = x->upstream_stream;
         }
         for (u32 step = 0; step < 64; step++) {

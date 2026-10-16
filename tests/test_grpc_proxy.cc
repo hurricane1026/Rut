@@ -1085,9 +1085,14 @@ TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retire
     CHECK_FALSE(grpc_upstream_reusable(upstream, &cfg, 0, 0));
     h2.last_stream_id = 5;
 
+    auto* retained_stream = h2.find_stream(1);
+    REQUIRE(retained_stream != nullptr);
+    retained.response_end = true;
+    retained_stream->state = Http2StreamState::HalfClosedRemote;
+    downstream.on_send = &pending_send;
     // The response on stream 1 has ended, but its exchange remains attached
-    // while slowdown cleanup drains it.  Its sent HEADERS still count as an
-    // opened peer stream until the exchange is retired, so queued RPCs wait.
+    // while the blocked downstream drains it. The half-closed upstream stream
+    // still counts against the peer limit until the stream is closed locally.
     CHECK_EQ(h2.grpc.control_len, 0u);
     CHECK_EQ(h2.conn_recv_credit, 0u);
     CHECK(h2.peer_settings_seen);
@@ -1097,7 +1102,7 @@ TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retire
     CHECK_FALSE(newest.request_headers_sent);
     CHECK_EQ(loop.grpc_upstreams, &upstream);
 
-    retained.response_end = true;
+    retained_stream->state = Http2StreamState::Closed;
     grpc_drive_upstream(&loop, upstream);
     CHECK_EQ(loop.sends, 1u);
     CHECK(queued.request_headers_sent);
