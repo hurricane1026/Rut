@@ -686,6 +686,12 @@ TEST(grpc_proxy, request_header_filter_preserves_only_trailers_te) {
     for (const auto& h : allowed) CHECK(grpc_request_header_allowed(h));
     for (const auto& h : blocked) CHECK(!grpc_request_header_allowed(h));
 }
+TEST(grpc_proxy, content_type_prefix_is_ascii_case_insensitive) {
+    CHECK(grpc_content_type({"Application/GRPC", 16}));
+    CHECK(grpc_content_type({"APPLICATION/grpc+proto", 22}));
+    CHECK(grpc_content_type({"application/grpc; charset=utf-8", 32}));
+    CHECK(!grpc_content_type({"application/grpcx", 17}));
+}
 TEST(grpc_proxy, response_header_filter_strips_content_length_only) {
     const hpack::Header headers[] = {{Str{"content-length", 14}, Str{"0", 1}},
                                      {Str{"grpc-status", 11}, Str{"0", 1}},

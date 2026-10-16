@@ -14,7 +14,12 @@ inline bool grpc_header_name(Str name, Str expected) {
 }
 inline bool grpc_content_type(Str value) {
     constexpr Str prefix{"application/grpc", 16};
-    if (value.len < prefix.len || !Str{value.ptr, prefix.len}.eq(prefix)) return false;
+    if (value.len < prefix.len) return false;
+    for (u32 i = 0; i < prefix.len; i++) {
+        char c = value.ptr[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if (c != prefix.ptr[i]) return false;
+    }
     return value.len == prefix.len || value.ptr[prefix.len] == '+' || value.ptr[prefix.len] == ';';
 }
 inline bool grpc_request(const ParsedRequest& req) {
