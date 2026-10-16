@@ -608,6 +608,12 @@ static u64 h2_alloc_timer_handler(void* opaque, jit::HandlerCtx*, const u8*, u32
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
 }
 
+static u64 h2_rearm_fail_timer_handler(void* opaque, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    (void)h2_alloc_json(static_cast<Connection*>(opaque));
+    const u32 delay = ctx != nullptr && ctx->state == 7 ? 64'000u : 1u;
+    return jit::HandlerResult::make_yield_payload(7, jit::YieldKind::Timer, delay).pack();
+}
+
 static u64 h2_timer_then_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx != nullptr && ctx->state == 7) {
         auto result = jit::HandlerResult::make_status(200);
@@ -8091,6 +8097,35 @@ TEST(http2, h2_failed_timer_suspension_releases_json_arena) {
     CHECK_EQ(h2_staged_status(dispatch.resp, dispatch.resp_len, 1), 503u);
     CHECK_EQ(conn->json_arena.current, nullptr);
     loop.free_conn(*conn);
+    json_pool.destroy();
+}
+
+TEST(http2, h2_timer_rearm_failure_closes_and_releases_json_arena) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    SlicePool json_pool;
+    REQUIRE(json_pool.init(8));
+    conn->json_arena.backend.pool = &json_pool;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    RouteEntry route{};
+    route.fn = &h2_rearm_fail_timer_handler;
+    h2_json_allocated = false;
+    const u8 synth[] = "GET /timer HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    h2_invoke_emit(
+        dispatch, 1, &route, nullptr, 0, nullptr, synth, sizeof(synth) - 1, false, true, false);
+    REQUIRE(h2_json_allocated);
+    REQUIRE_EQ(h2.async_stream, 1u);
+    conn->pending_handler_fn = &h2_rearm_fail_timer_handler;
+    conn->handler_state = 7;
+    h2_resume_jit_handler(&loop, *conn);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(conn->json_arena.current, nullptr);
     json_pool.destroy();
 }
 
