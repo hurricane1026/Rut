@@ -80,6 +80,8 @@ enum class MirValueKind : u8 {
     Mod,
     WidenI64,
     TimeNowMicros,
+    JsonOp,
+    JsonDecode,
     MaxInt,
     MinInt,
     Or,
@@ -275,6 +277,7 @@ struct MirTerminator {
     // ReturnStatus terminators. lower_rir maps identical literals to a
     // shared body_idx that codegen packs into HandlerResult.upstream_id.
     Str response_body{};
+    u32 response_body_local_index = 0xffffffffu;
     // Optional response headers carried from HIR. Inline-stored.
     // len == 0 means "no kwarg". lower_rir interns these into the
     // RIR module's shared header pool.
@@ -326,7 +329,9 @@ struct MirFunction {
     Str name{};
     static constexpr u32 kMaxLocals = 16;
     static constexpr u32 kMaxBlocks = 16;
-    static constexpr u32 kMaxValues = 64;
+    // Nested JSON decoding and subsequent struct field checks need bounded
+    // temporaries for each pointer operation and decoded field.
+    static constexpr u32 kMaxValues = 256;
     static constexpr u32 kMaxWaits = kMaxRouteWaits;
     FixedVec<MirValue, kMaxValues> values;
     FixedVec<MirLocal, kMaxLocals> locals;

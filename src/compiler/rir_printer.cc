@@ -300,6 +300,12 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::CmpGe:
             buf.put_cstr("cmp.ge");
             break;
+        case Opcode::RespBody:
+            buf.put_cstr("resp.body");
+            break;
+        case Opcode::JsonOp:
+            buf.put_cstr("json.op");
+            break;
         case Opcode::TimeNowMicros:
             buf.put_cstr("time.now_micros");
             break;
@@ -684,6 +690,18 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
         case Opcode::ResumeEventKind:
         case Opcode::ResumeEventResult:
         case Opcode::RespCommitHeaders:
+            break;
+        case Opcode::RespBody:
+            buf.put(' ');
+            print_value_ref(buf, inst.operands[0]);
+            break;
+        case Opcode::JsonOp:
+            buf.put(' ');
+            buf.put_i64(inst.imm.i32_val);
+            for (u32 i = 0; i < inst.operand_count; ++i) {
+                buf.put_cstr(", ");
+                print_value_ref(buf, inst.operands[i]);
+            }
             break;
         case Opcode::CtxLoadSlotI32:
             buf.put(' ');

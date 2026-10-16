@@ -268,6 +268,7 @@ struct AstStatement {
     // still be rejected while body plumbing is not wired end-to-end.
     Str response_body{};
     bool has_response_body = false;
+    Str response_body_local{};
     u32 workload_body_bytes = 0;
     // `return <ident>` / `respond <ident>` where the identifier names a local
     // created by `response(status)`. Kept distinct from the literal-status

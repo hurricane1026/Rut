@@ -285,6 +285,8 @@ enum class Opcode : u8 {
     YieldHttpGet,   // %r = yield.http_get url, headers
     YieldHttpPost,  // %r = yield.http_post url, headers, body
     YieldForward,   // %r = yield.forward upstream
+    JsonOp,
+    RespBody,
 };
 
 // ── Instruction ─────────────────────────────────────────────────────

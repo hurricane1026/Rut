@@ -2387,6 +2387,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.http1_pipeline_request_generation = conn.handler_gen;
     }
     conn.req_start_us = monotonic_us();
+    conn.json_arena.destroy();
+    conn.jit_response_body = {};
+    conn.jit_response_body_valid = false;
     // Per-request proxy state must start clean on EVERY request. reset() runs
     // only at connection alloc, so on a keep-alive-reused connection these flags
     // would otherwise leak from the previous request: a prior forward(set_path:)
@@ -3640,6 +3643,44 @@ void handle_jit_outcome(Loop* loop,
             // status-reason body). Out-of-range indices fall back to
             // the default rather than rendering garbage.
             const RouteConfig* cfg = conn.request_config;
+            if (outcome.response_body_idx == 0xffffu) {
+                constexpr u32 kMaxHeaders =
+                    RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+                ResponseHeaderKV headers[kMaxHeaders];
+                u32 count = 0;
+                bool suppress_type = false;
+                const bool ok = conn.jit_response_body_valid &&
+                                collect_effective_response_headers(conn,
+                                                                   cfg,
+                                                                   outcome.response_headers_idx,
+                                                                   headers,
+                                                                   kMaxHeaders,
+                                                                   &count,
+                                                                   &suppress_type) &&
+                                format_response_with_body_and_headers(
+                                    conn,
+                                    outcome.status_code,
+                                    conn.jit_response_body.ptr,
+                                    conn.jit_response_body.len,
+                                    headers,
+                                    count,
+                                    effective_keep_alive,
+                                    false,
+                                    suppress_type,
+                                    conn.jit_response_head,
+                                    false,
+                                    conn.req_http_version == static_cast<u8>(HttpVersion::Http10)
+                                        ? HttpVersion::Http10
+                                        : HttpVersion::Http11);
+                if (!ok) {
+                    conn.resp_status = 500;
+                    conn.keep_alive = false;
+                    format_static_response(conn, 500, false);
+                }
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
             const bool segmented_body = has_body && outcome.status_code >= 200 &&

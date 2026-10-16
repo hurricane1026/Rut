@@ -1358,7 +1358,28 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!created) return frontend_error(FrontendError::OutOfMemory, span);
         return created.value();
     }
-    if (value.kind == MirValueKind::StructInit) {
+    if (value.kind == MirValueKind::StructInit || value.kind == MirValueKind::JsonDecode) {
+        const bool decoding = value.kind == MirValueKind::JsonDecode;
+        rir::ValueId missing = rir::kNoValue;
+        if (decoding) {
+            auto object = materialize_value(*value.lhs,
+                                            mir,
+                                            variant_infos,
+                                            tuple_infos,
+                                            tuple_info_count,
+                                            error_scalar_infos,
+                                            error_variant_infos,
+                                            error_struct_infos,
+                                            user_struct_defs,
+                                            b,
+                                            locals,
+                                            local_count,
+                                            span);
+            if (!object) return core::make_unexpected(object.error());
+            auto absent = b.emit_opt_is_nil(object.value(), {span.line, span.col});
+            if (!absent) return frontend_error(FrontendError::OutOfMemory, span);
+            missing = absent.value();
+        }
         const auto struct_shape = resolved_shape(mir, value);
         const u32 struct_index = struct_shape.struct_index;
         if (struct_index >= mir.structs.len || user_struct_defs[struct_index] == nullptr)
@@ -1390,6 +1411,20 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                                  span);
             if (!field_value) return core::make_unexpected(field_value.error());
             field_vals[fi] = field_value.value();
+            if (decoding) {
+                auto absent = b.emit_opt_is_nil(field_value.value(), {span.line, span.col});
+                auto yes = b.emit_const_bool(true, {span.line, span.col});
+                if (!absent || !yes) return frontend_error(FrontendError::OutOfMemory, span);
+                auto any_missing =
+                    b.emit_select(absent.value(), yes.value(), missing, {span.line, span.col});
+                if (!any_missing) return frontend_error(FrontendError::OutOfMemory, span);
+                missing = any_missing.value();
+                auto payload = b.emit_opt_unwrap(field_value.value(),
+                                                 user_struct_defs[struct_index]->fields()[fi].type,
+                                                 {span.line, span.col});
+                if (!payload) return frontend_error(FrontendError::OutOfMemory, span);
+                field_vals[fi] = payload.value();
+            }
         }
         auto created =
             b.emit_struct_create(const_cast<rir::StructDef*>(user_struct_defs[struct_index]),
@@ -1397,6 +1432,16 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                  mir.structs[struct_index].fields.len,
                                  {span.line, span.col});
         if (!created) return frontend_error(FrontendError::OutOfMemory, span);
+        if (decoding) {
+            auto wrapped = b.emit_opt_wrap(created.value(), {span.line, span.col});
+            auto* type = b.cur_func->values[created->id].type;
+            auto nil = b.emit_opt_nil(type, {span.line, span.col});
+            if (!wrapped || !nil) return frontend_error(FrontendError::OutOfMemory, span);
+            auto selected =
+                b.emit_select(missing, nil.value(), wrapped.value(), {span.line, span.col});
+            if (!selected) return frontend_error(FrontendError::OutOfMemory, span);
+            return selected.value();
+        }
         return created.value();
     }
     if (value.kind == MirValueKind::VariantCase) {
@@ -1600,6 +1645,38 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         auto v = b.emit_req_content_length({span.line, span.col});
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
+    }
+    if (value.kind == MirValueKind::JsonOp) {
+        rir::ValueId args[3]{};
+        for (u32 i = 0; i < value.args.len; ++i) {
+            auto child = materialize_value(*value.args[i],
+                                           mir,
+                                           variant_infos,
+                                           tuple_infos,
+                                           tuple_info_count,
+                                           error_scalar_infos,
+                                           error_variant_infos,
+                                           error_struct_infos,
+                                           user_struct_defs,
+                                           b,
+                                           locals,
+                                           local_count,
+                                           span);
+            if (!child) return core::make_unexpected(child.error());
+            args[i] = child.value();
+        }
+        const auto type = value.type == MirTypeKind::Bool  ? rir::TypeKind::Bool
+                          : value.type == MirTypeKind::I64 ? rir::TypeKind::I64
+                          : value.type == MirTypeKind::I32 ? rir::TypeKind::I32
+                                                           : rir::TypeKind::Str;
+        auto result = b.emit_json(static_cast<u32>(value.int_value),
+                                  type,
+                                  value.may_nil,
+                                  args,
+                                  value.args.len,
+                                  {span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
     }
     if (value.kind == MirValueKind::TimeNowMicros) {
         auto out = b.emit_time_now_micros({span.line, span.col});
@@ -3080,6 +3157,14 @@ static FrontendResult<void> emit_term(const MirTerminator& term,
         // and pack the 1-based idx into RetStatus's immediate. Empty /
         // missing body ⇒ idx = 0 ⇒ runtime uses default status-reason.
         u16 body_idx = 0;
+        if (term.response_body_local_index != 0xffffffffu) {
+            if (term.response_body_local_index >= local_count)
+                return frontend_error(FrontendError::UnsupportedSyntax, term.span);
+            if (!b.emit_resp_body(locals[term.response_body_local_index],
+                                  {term.span.line, term.span.col}))
+                return frontend_error(FrontendError::OutOfMemory, term.span);
+            body_idx = 0xffffu;
+        }
         if (term.response_body.ptr != nullptr && term.response_body.len > 0) {
             body_idx = b.intern_response_body(term.response_body);
             if (body_idx == 0) {

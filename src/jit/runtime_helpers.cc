@@ -1464,3 +1464,83 @@ void rut_helper_str_trim_prefix(
     *out_ptr = s;
     *out_len = s_len;
 }
+
+// JSON workspace is shard-thread local and cannot escape a synchronous helper.
+// Persistent results belong to the caller's request arena or validated input.
+#include "rut/runtime/json.h"
+
+extern "C" void rut_helper_json(void* conn,
+                                void* arena,
+                                u32 op,
+                                const char* a,
+                                u32 a_len,
+                                const char* b,
+                                u32 b_len,
+                                const char* c,
+                                u32 c_len,
+                                i64 number,
+                                u8* has_value,
+                                const char** out_ptr,
+                                u32* out_len,
+                                i64* out_number) {
+    *has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    *out_number = 0;
+    if (op > static_cast<u32>(json::Op::Stringify)) return;
+    thread_local json::Document document;
+    char bytes[json::kMaxBytes];
+    json::Writer writer{bytes};
+    Str view{};
+    i64 scalar = 0;
+    if (!json::apply(document,
+                     static_cast<json::Op>(op),
+                     {a, a_len},
+                     {b, b_len},
+                     {c, c_len},
+                     number,
+                     writer,
+                     view,
+                     scalar))
+        return;
+    const auto operation = static_cast<json::Op>(op);
+    const bool scalar_only = operation == json::Op::AsBool || operation == json::Op::AsInt ||
+                             operation == json::Op::AsI32 || operation == json::Op::Count;
+    if (scalar_only) view = {"", 0};
+    // Edits must not publish a document that exceeds the parser's depth/node
+    // budget after inserting an independently valid subtree.
+    if (view.ptr == nullptr && operation != json::Op::AsString &&
+        !document.parse({bytes, writer.len}))
+        return;
+    if (view.ptr == nullptr) {
+        if (arena == nullptr && conn != nullptr) {
+            auto& owned = static_cast<ConnectionBase*>(conn)->json_arena;
+            if (owned.backend.pool == nullptr) return;
+            if (owned.current == nullptr && !owned.init(owned.backend.pool)) return;
+            arena = &owned;
+        }
+        if (arena == nullptr) return;
+        // A request cannot retain unbounded intermediate JSON results.
+        if (static_cast<SliceArena*>(arena)->space_used() > 262144 - writer.len) return;
+        // Allocate a byte even for empty strings so nullptr remains failure.
+        auto* storage =
+            static_cast<char*>(static_cast<SliceArena*>(arena)->alloc(writer.len ? writer.len : 1));
+        if (storage == nullptr) return;
+        if (writer.len) __builtin_memcpy(storage, bytes, writer.len);
+        view = {storage, writer.len};
+    }
+    *has_value = 1;
+    *out_ptr = view.ptr;
+    *out_len = view.len;
+    *out_number = scalar;
+}
+
+extern "C" void rut_helper_resp_body(
+    void* conn, const char* ptr, u32 len, const u8* request, u32 request_len) {
+    if (conn == nullptr) return;
+    auto& c = *static_cast<ConnectionBase*>(conn);
+    const auto& parsed = parse_cached(request, request_len);
+    c.jit_response_head = parsed.ok && parsed.req.method == HttpMethod::HEAD;
+    c.jit_response_body = {ptr, len};
+    c.jit_response_body_valid = ptr != nullptr && len <= json::kMaxBytes;
+}

@@ -3020,6 +3020,9 @@ struct Parser {
                             auto body = parse_response_body_literal();
                             if (!body) return core::make_unexpected(body.error());
                             stmt.response_body = body.value();
+                        } else if (cur().type == TokenType::Ident) {
+                            stmt.response_body_local = cur().text;
+                            ++pos;
                         } else {
                             auto body_tok = expect(TokenType::StringLit);
                             if (!body_tok) return core::make_unexpected(body_tok.error());

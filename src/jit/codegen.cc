@@ -2,6 +2,7 @@
 
 #include "rut/compiler/rir.h"
 #include "rut/jit/handler_abi.h"
+#include "rut/runtime/json.h"
 #include <atomic>
 #include <cstddef>
 
@@ -1420,6 +1421,115 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             break;
         }
 
+        case rir::Opcode::RespBody: {
+            LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.i32_ty, c.ptr_ty, c.i32_ty};
+            LLVMTypeRef ft = LLVMFunctionType(c.void_ty, params, 5, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_resp_body");
+            if (!fn) fn = LLVMAddFunction(c.llvm_mod, "rut_helper_resp_body", ft);
+            const auto value = c.get_value(inst.operands[0]);
+            LLVMValueRef args[] = {c.param_conn,
+                                   LLVMBuildExtractValue(c.builder, value, 0, "body.ptr"),
+                                   LLVMBuildExtractValue(c.builder, value, 1, "body.len"),
+                                   c.param_req_data,
+                                   c.param_req_len};
+            LLVMBuildCall2(c.builder, ft, fn, args, 5, "");
+            break;
+        }
+        case rir::Opcode::JsonOp: {
+            LLVMTypeRef params[] = {c.ptr_ty,
+                                    c.ptr_ty,
+                                    c.i32_ty,
+                                    c.ptr_ty,
+                                    c.i32_ty,
+                                    c.ptr_ty,
+                                    c.i32_ty,
+                                    c.ptr_ty,
+                                    c.i32_ty,
+                                    c.i64_ty,
+                                    c.ptr_ty,
+                                    c.ptr_ty,
+                                    c.ptr_ty,
+                                    c.ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(c.void_ty, params, 14, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_json");
+            if (!fn) fn = LLVMAddFunction(c.llvm_mod, "rut_helper_json", ft);
+            LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "json.has");
+            LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "json.ptr");
+            LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "json.len");
+            LLVMValueRef out_num = LLVMBuildAlloca(c.builder, c.i64_ty, "json.num");
+            LLVMValueRef args[] = {c.param_conn,
+                                   c.param_arena,
+                                   LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), 0),
+                                   LLVMConstNull(c.ptr_ty),
+                                   LLVMConstInt(c.i32_ty, 0, 0),
+                                   LLVMConstNull(c.ptr_ty),
+                                   LLVMConstInt(c.i32_ty, 0, 0),
+                                   LLVMConstNull(c.ptr_ty),
+                                   LLVMConstInt(c.i32_ty, 0, 0),
+                                   LLVMConstInt(c.i64_ty, 0, 0),
+                                   out_has,
+                                   out_ptr,
+                                   out_len,
+                                   out_num};
+            for (u32 i = 0; i < inst.operand_count; ++i) {
+                auto val = c.get_value(inst.operands[i]);
+                const auto* ty = c.cur_fn->values[inst.operands[i].id].type;
+                if (ty->kind == rir::TypeKind::Str) {
+                    args[3 + i * 2] = LLVMBuildExtractValue(c.builder, val, 0, "json.arg.ptr");
+                    args[4 + i * 2] = LLVMBuildExtractValue(c.builder, val, 1, "json.arg.len");
+                } else if (ty->kind == rir::TypeKind::I64)
+                    args[9] = val;
+                else if (ty->kind == rir::TypeKind::I32)
+                    args[9] = LLVMBuildSExt(c.builder, val, c.i64_ty, "json.int");
+                else
+                    args[9] = LLVMBuildZExt(c.builder, val, c.i64_ty, "json.bool");
+            }
+            LLVMBuildCall2(c.builder, ft, fn, args, 14, "");
+            const auto* result_type = c.cur_fn->values[inst.result.id].type;
+            const bool optional = result_type->kind == rir::TypeKind::Optional;
+            const auto* inner = optional ? result_type->inner : result_type;
+            LLVMValueRef result;
+            if (inner->kind == rir::TypeKind::Str) {
+                result = LLVMGetUndef(c.str_ty);
+                result = LLVMBuildInsertValue(
+                    c.builder,
+                    result,
+                    LLVMBuildLoad2(c.builder, c.ptr_ty, out_ptr, "json.result.ptr"),
+                    0,
+                    "");
+                result = LLVMBuildInsertValue(
+                    c.builder,
+                    result,
+                    LLVMBuildLoad2(c.builder, c.i32_ty, out_len, "json.result.len"),
+                    1,
+                    "");
+            } else {
+                result = LLVMBuildLoad2(c.builder, c.i64_ty, out_num, "json.result.number");
+                if (inner->kind == rir::TypeKind::I32)
+                    result = LLVMBuildTrunc(c.builder, result, c.i32_ty, "json.count");
+                if (inner->kind == rir::TypeKind::Bool)
+                    result = LLVMBuildTrunc(c.builder, result, c.i1_ty, "json.boolean");
+            }
+            if (optional) {
+                LLVMValueRef opt = LLVMGetUndef(c.map_type(result_type));
+                opt = LLVMBuildInsertValue(
+                    c.builder,
+                    opt,
+                    LLVMBuildLoad2(c.builder, c.i8_ty, out_has, "json.result.has"),
+                    0,
+                    "");
+                if (inner->kind == rir::TypeKind::Str) {
+                    opt = LLVMBuildInsertValue(
+                        c.builder, opt, LLVMBuildExtractValue(c.builder, result, 0, ""), 1, "");
+                    opt = LLVMBuildInsertValue(
+                        c.builder, opt, LLVMBuildExtractValue(c.builder, result, 1, ""), 2, "");
+                } else
+                    opt = LLVMBuildInsertValue(c.builder, opt, result, 1, "");
+                result = opt;
+            }
+            c.set_value(inst.result, result);
+            break;
+        }
         case rir::Opcode::TimeNowMicros: {
             LLVMValueRef v = LLVMBuildCall2(c.builder,
                                             LLVMGlobalGetValueType(c.get_time_now_micros()),

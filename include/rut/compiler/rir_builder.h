@@ -819,6 +819,32 @@ struct Builder {
 
     // ── Domain operations ───────────────────────────────────────────
 
+    Result<ValueId> emit_resp_body(ValueId value, SourceLoc loc = {}) {
+        if (!val_has_type(value, TypeKind::Str)) return err(RirError::InvalidState);
+        auto [inst, vid] = TRY(emit(Opcode::RespBody, nullptr, loc));
+        inst->operands[0] = value;
+        inst->operand_count = 1;
+        return vid;
+    }
+
+    Result<ValueId> emit_json(u32 op,
+                              TypeKind result,
+                              bool optional,
+                              const ValueId* args,
+                              u32 count,
+                              SourceLoc loc = {}) {
+        if (count > 3) return err(RirError::InvalidState);
+        for (u32 i = 0; i < count; ++i)
+            if (!valid_val(args[i])) return err(RirError::InvalidState);
+        const Type* ty = TRY(make_type(result));
+        if (optional) ty = TRY(make_type(TypeKind::Optional, ty));
+        auto [inst, vid] = TRY(emit(Opcode::JsonOp, ty, loc));
+        inst->imm.i32_val = static_cast<i32>(op);
+        inst->operand_count = count;
+        for (u32 i = 0; i < count; ++i) inst->operands[i] = args[i];
+        return vid;
+    }
+
     Result<ValueId> emit_time_now_micros(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::I64));
         return TRY(emit(Opcode::TimeNowMicros, ty, loc)).vid;
