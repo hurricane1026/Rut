@@ -3799,3 +3799,16 @@ if(RUT_TEST_SIMDJSON_PATCH)
     set_tests_properties(test_simdjson_allocator_patch PROPERTIES
         LABELS "dependency" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
+
+# JSON core has no LLVM, TLS, allocation or external-library dependencies.
+add_executable(test_json test_json.cc)
+target_include_directories(test_json PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_json COMMAND test_json)
+set_tests_properties(test_json PROPERTIES LABELS "unit")
+if(RUT_ENABLE_JIT)
+    add_executable(test_json_network test_json_network.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+    target_include_directories(test_json_network PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+    target_link_libraries(test_json_network PRIVATE rut_jit rut_compiler rut_test_fault)
+    add_test(NAME test_json_network COMMAND test_json_network)
+    set_tests_properties(test_json_network PROPERTIES LABELS "unit" RUN_SERIAL TRUE)
+endif()
