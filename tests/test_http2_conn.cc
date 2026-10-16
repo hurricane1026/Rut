@@ -67,6 +67,26 @@ void on_reset(void* ctx, Http2Conn&, u32 sid, Http2Error err) {
     cap->reset_err = err;
 }
 
+struct CoalescedHeadLoop {};
+
+void on_coalesced_head_headers(
+    void* ctx, Http2Conn& h2, u32 sid, const hpack::Header* hs, u32 n, bool) {
+    auto* d = static_cast<H2Dispatch<CoalescedHeadLoop>*>(ctx);
+    bool is_head = false;
+    for (u32 i = 0; i < n; i++)
+        if (hs[i].name.eq({":method", 7})) is_head = hs[i].value.eq({"HEAD", 4});
+    JitDispatchOutcome outcome{};
+    if (is_head) {
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 200;
+        outcome.response_body_idx = 1;
+        h2_emit_outcome(*d, sid, outcome, d->conn->request_config, true);
+    } else {
+        h2_emit_status(*d, sid, 204);
+    }
+    (void)h2;
+}
+
 void setup(Http2Conn& c, Capture& cap) {
     cap.clear();
     c.cb_ctx = &cap;
@@ -205,6 +225,83 @@ TEST(http2_conn, headers_decode_and_deliver) {
     Http2Stream* s = c.find_stream(1);
     REQUIRE(s != nullptr);
     CHECK(s->state == Http2StreamState::HalfClosedRemote);
+}
+
+TEST(http2_conn, coalesced_head_return_status_does_not_serialize_next_headers) {
+    Http2Conn c;
+    c.init();
+    c.preface_seen = true;
+    c.our_settings_sent = true;
+
+    Connection conn;
+    conn.reset();
+    conn.h2 = &c;
+    RouteConfig cfg;
+    REQUIRE_EQ(cfg.add_response_body("representation", 14), 1u);
+    conn.request_config = &cfg;
+
+    u8 responses[1024]{};
+    CoalescedHeadLoop loop;
+    H2Dispatch<CoalescedHeadLoop> dispatch{&loop, &conn, responses, sizeof(responses), 0, false};
+    c.cb_ctx = &dispatch;
+    c.on_headers = on_coalesced_head_headers;
+
+    const hpack::Header head[] = {{{":method", 7}, {"HEAD", 4}},
+                                  {{":scheme", 7}, {"https", 5}},
+                                  {{":path", 5}, {"/head", 5}},
+                                  {{":authority", 10}, {"example.test", 12}}};
+    const hpack::Header get[] = {{{":method", 7}, {"GET", 3}},
+                                 {{":scheme", 7}, {"https", 5}},
+                                 {{":path", 5}, {"/get", 4}},
+                                 {{":authority", 10}, {"example.test", 12}}};
+    const hpack::Header head_again[] = {{{":method", 7}, {"HEAD", 4}},
+                                        {{":scheme", 7}, {"https", 5}},
+                                        {{":path", 5}, {"/head-again", 11}},
+                                        {{":authority", 10}, {"example.test", 12}}};
+    u8 input[1024]{};
+    u32 input_len = http2_write_headers(input, sizeof(input), 1, head, 4, true);
+    input_len +=
+        http2_write_headers(input + input_len, sizeof(input) - input_len, 3, head_again, 4, true);
+    input_len += http2_write_headers(input + input_len, sizeof(input) - input_len, 5, get, 4, true);
+
+    u8 control[128]{};
+    u32 control_len = 0;
+    const Http2Result result = c.process(input, input_len, control, sizeof(control), &control_len);
+    CHECK_FALSE(result.close);
+    CHECK_EQ(result.consumed, input_len);
+    CHECK_FALSE(dispatch.overflow);
+    CHECK_FALSE(c.response_flush_pending);
+    CHECK_EQ(c.outbound_stream, 0u);
+    CHECK_EQ(c.queued_stream, 0u);
+    CHECK_EQ(c.outbound_body, nullptr);
+    CHECK_EQ(c.queued_body, nullptr);
+
+    u32 response_frames = 0;
+    bool head_headers_end_stream = false;
+    bool second_head_headers_end_stream = false;
+    bool get_headers_end_stream = false;
+    for (u32 pos = 0; pos + kFrameHeaderSize <= dispatch.resp_len;) {
+        Http2FrameHeader frame{};
+        REQUIRE_EQ(parse_frame_header(responses + pos, dispatch.resp_len - pos, &frame),
+                   ParseStatus::Complete);
+        REQUIRE_LE(pos + kFrameHeaderSize + frame.length, dispatch.resp_len);
+        if (frame.type == static_cast<u8>(Http2FrameType::Headers)) {
+            response_frames++;
+            if (frame.stream_id == 1)
+                head_headers_end_stream = (frame.flags & http2_flag::kEndStream) != 0;
+            if (frame.stream_id == 3)
+                second_head_headers_end_stream = (frame.flags & http2_flag::kEndStream) != 0;
+            if (frame.stream_id == 5)
+                get_headers_end_stream = (frame.flags & http2_flag::kEndStream) != 0;
+        }
+        CHECK(frame.type != static_cast<u8>(Http2FrameType::Data));
+        pos += kFrameHeaderSize + frame.length;
+    }
+    CHECK_EQ(response_frames, 3u);
+    CHECK(head_headers_end_stream);
+    CHECK(second_head_headers_end_stream);
+    CHECK(get_headers_end_stream);
+    CHECK_EQ(control_len, 0u);
 }
 
 TEST(http2_conn, data_delivered_and_window_replenished) {
@@ -361,14 +458,22 @@ TEST(http2_conn, coalesced_rst_cancels_parked_stream) {
     c.process(in, inlen, out, sizeof(out), &ow);
     // Serving layer parks stream 1 on the single async slot.
     c.async_stream = 1;
+    c.async_is_head = true;
     c.async_kind = H2AsyncKind::Proxy;
+    // The engine owns the deferred-upload slot reset before invoking the
+    // serving-layer reset callback.
+    c.pending_stream = 1;
+    c.pending_is_head = true;
     u8 rf[kFrameHeaderSize + 4];
     u32 rn = write_rst_stream(rf, 1, Http2Error::Cancel);
     ow = 0;
     Http2Result r = c.process(rf, rn, out, sizeof(out), &ow);
     CHECK_EQ(r.consumed, rn);  // control frame drained past the park, not buffered
     CHECK_EQ(c.async_stream, 0u);
+    CHECK_FALSE(c.async_is_head);
     CHECK(c.async_kind == H2AsyncKind::None);
+    CHECK_EQ(c.pending_stream, 0u);
+    CHECK_FALSE(c.pending_is_head);
 }
 
 // Complement: a NEW request's HEADERS coalesced behind a parked stream stays
@@ -1093,6 +1198,62 @@ TEST(http2_conn, write_response_with_body_and_headers) {
     parse_frame_header(out + kFrameHeaderSize + h.length, n - kFrameHeaderSize - h.length, &df);
     CHECK_EQ(df.type, static_cast<u8>(Http2FrameType::Data));
     CHECK((df.flags & http2_flag::kEndStream) != 0);
+}
+
+TEST(http2_conn, write_head_headers_with_representation_length_is_transactional) {
+    const hpack::Header hdrs[] = {{{"x-head-check", 12}, {"enabled", 7}}};
+    u8 out[256];
+
+    hpack::Encoder failed_enc;
+    failed_enc.init(4096);
+    const u32 failed_entries = failed_enc.dyn.nent;
+    CHECK_EQ(http2_write_head_response_headers(
+                 out, 1, failed_enc, 1, 200, hdrs, 1, /*representation_length=*/12),
+             0u);
+    CHECK_EQ(failed_enc.dyn.nent, failed_entries);
+    CHECK_EQ(failed_enc.pending_size_update, -1);
+    CHECK_EQ(failed_enc.pending_min_size, -1);
+
+    hpack::Encoder enc;
+    enc.init(4096);
+    const u32 n = http2_write_head_response_headers(
+        out, sizeof(out), enc, 1, 200, hdrs, 1, /*representation_length=*/12);
+    REQUIRE(n != 0);
+    Http2FrameHeader h;
+    REQUIRE(parse_frame_header(out, n, &h) == ParseStatus::Complete);
+    CHECK_EQ(h.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK_EQ(n, kFrameHeaderSize + h.length);  // no trailing DATA frame
+    CHECK((h.flags & http2_flag::kEndHeaders) != 0);
+    CHECK((h.flags & http2_flag::kEndStream) != 0);
+
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[16];
+    u8 scratch[256];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       out + kFrameHeaderSize,
+                                       h.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       16,
+                                       &decoded_count));
+    bool has_status = false;
+    bool has_custom = false;
+    bool has_length = false;
+    for (u32 i = 0; i < decoded_count; i++) {
+        if (decoded[i].name.eq(Str{":status", 7}) && decoded[i].value.eq(Str{"200", 3}))
+            has_status = true;
+        if (decoded[i].name.eq(Str{"x-head-check", 12}) && decoded[i].value.eq(Str{"enabled", 7}))
+            has_custom = true;
+        if (decoded[i].name.eq(Str{"content-length", 14}) && decoded[i].value.eq(Str{"12", 2}))
+            has_length = true;
+    }
+    CHECK(has_status);
+    CHECK(has_custom);
+    CHECK(has_length);
+    CHECK_GT(enc.dyn.nent, 0u);  // successful serialization committed HPACK state
 }
 
 // http2_write_response must refuse (return 0) rather than overflow its fixed 8 KiB

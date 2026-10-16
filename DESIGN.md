@@ -643,8 +643,17 @@ configured bodies do not acquire a memory, sendfile, or TLS continuation owner
 for HEAD; completion and access-log response size count the actual header bytes
 sent. Route matching remains unchanged. The explicit strict-local and proxy
 policies retain their own method behavior. Metrics endpoint matching and
-redirect admission remain GET-only. Ordinary HTTP/2 HEAD response publishing is
-a separate pending capability and is not described as implemented here.
+redirect admission remain GET-only.
+
+HTTP/2 HEAD handling is bounded to ordinary local JIT `ReturnStatus` outcomes
+with a configured representation body. Immediate dispatch, deferred
+request-body dispatch, and timer-resumed dispatch preserve that body's
+`Content-Length` and terminate with HEADERS without DATA. The existing route
+matcher still decides whether a HEAD request reaches the route. Static/default/
+unmatched responses and firewall, validation, and other status-only outcomes
+remain status-only. Redirect remains rejected, and proxy and strict-local
+response policy are unchanged. This does not claim that all HTTP/2 response
+publishers have GET-equivalent HEAD metadata.
 
 The `body: b"..."` byte-string form is the exact-byte alternative: it decodes
 `\n`, `\r`, `\t`, `\\`, `\"`, and `\xNN` to exact bytes and is limited to 4096

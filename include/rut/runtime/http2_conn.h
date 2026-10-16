@@ -110,6 +110,7 @@ struct Http2Conn {
     // re-match if config swaps between HEADERS and DATA.
     static constexpr u32 kBodySynthCap = 16384;
     u32 pending_stream;
+    bool pending_is_head;
     u32 pending_body_start;
     u32 pending_synth_len;
     u32 pending_body_len;
@@ -152,6 +153,7 @@ struct Http2Conn {
     // the response flush resume (or close) the stream early. h2_arm_async_timer
     // transfers these to the Connection atomically with schedule_yield_timer.
     u32 async_stream;
+    bool async_is_head;
     H2AsyncKind async_kind;
     const RouteConfig* async_cfg;
     u32 async_synth_len;
@@ -244,6 +246,15 @@ u32 http2_write_response_headers(u8* out,
                                  u32 nhdrs,
                                  u32 body_len,
                                  bool end_stream);
+
+u32 http2_write_head_response_headers(u8* out,
+                                      u32 out_cap,
+                                      hpack::Encoder& enc,
+                                      u32 stream_id,
+                                      u16 status,
+                                      const hpack::Header* hdrs,
+                                      u32 nhdrs,
+                                      u32 representation_length);
 
 // --- Request bridge ---
 

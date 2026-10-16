@@ -34,6 +34,7 @@ void Http2Conn::init() {
     hdr_block_len = 0;
     nstreams = 0;
     pending_stream = 0;
+    pending_is_head = false;
     pending_body_start = 0;
     pending_synth_len = 0;
     pending_body_len = 0;
@@ -54,6 +55,7 @@ void Http2Conn::init() {
         pending_route_params[i] = {};
     }
     async_stream = 0;
+    async_is_head = false;
     async_kind = H2AsyncKind::None;
     async_cfg = nullptr;
     async_synth_len = 0;
@@ -270,6 +272,30 @@ u32 http2_write_response_headers(u8* out,
     auto staged = enc;
     const u32 n = http2_write_response_impl(
         out, out_cap, staged, stream_id, status, hdrs, nhdrs, nullptr, body_len, true, end_stream);
+    if (n != 0) enc = staged;
+    return n;
+}
+
+u32 http2_write_head_response_headers(u8* out,
+                                      u32 out_cap,
+                                      hpack::Encoder& enc,
+                                      u32 stream_id,
+                                      u16 status,
+                                      const hpack::Header* hdrs,
+                                      u32 nhdrs,
+                                      u32 representation_length) {
+    auto staged = enc;
+    const u32 n = http2_write_response_impl(out,
+                                            out_cap,
+                                            staged,
+                                            stream_id,
+                                            status,
+                                            hdrs,
+                                            nhdrs,
+                                            nullptr,
+                                            representation_length,
+                                            true,
+                                            true);
     if (n != 0) enc = staged;
     return n;
 }
@@ -530,6 +556,7 @@ Http2Error append_fragment(Http2Conn& c, const u8* p, u32 n) {
 void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     if (c.pending_stream != stream_id) return;
     c.pending_stream = 0;
+    c.pending_is_head = false;
     c.pending_body_start = 0;
     c.pending_synth_len = 0;
     c.pending_body_len = 0;
