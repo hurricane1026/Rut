@@ -61,6 +61,15 @@ void Http2Conn::init() {
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         pending_route_params[i] = {};
     }
+    pending_local_outcome = false;
+    pending_local_status = 0;
+    pending_local_body_idx = 0;
+    pending_local_headers_idx = 0;
+    pending_local_is_head = false;
+    pending_local_cfg = nullptr;
+    pending_local_mutation_count = 0;
+    pending_local_mutation_overflow = false;
+    pending_local_mutation_bytes = 0;
     async_stream = 0;
     async_is_head = false;
     async_kind = H2AsyncKind::None;
@@ -667,6 +676,15 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         c.pending_route_params[i] = {};
     }
+    c.pending_local_outcome = false;
+    c.pending_local_status = 0;
+    c.pending_local_body_idx = 0;
+    c.pending_local_headers_idx = 0;
+    c.pending_local_is_head = false;
+    c.pending_local_cfg = nullptr;
+    c.pending_local_mutation_count = 0;
+    c.pending_local_mutation_overflow = false;
+    c.pending_local_mutation_bytes = 0;
 }
 
 Http2Error reset_known_stream(Http2Conn& c, u32 stream_id, Http2Error error, OutWriter& w) {

@@ -153,6 +153,29 @@ struct Http2Conn {
     u32 pending_route_param_count;
     u8 pending_synth[kBodySynthCap];
 
+    // A local JIT ReturnStatus on a gRPC request with declared Content-Length
+    // runs at HEADERS time, but its response waits for END_STREAM so the
+    // declared length can be checked.  Keep the outcome and response mutations
+    // independent of Connection's scratch mutation log: another multiplexed
+    // stream may invoke a handler before this one finishes.
+    struct PendingRespMutation {
+        Str name;
+        Str value;
+        u8 mode;
+    };
+    static constexpr u32 kPendingRespMutationBytes = 4096;
+    bool pending_local_outcome;
+    u16 pending_local_status;
+    u16 pending_local_body_idx;
+    u16 pending_local_headers_idx;
+    bool pending_local_is_head;
+    const RouteConfig* pending_local_cfg;
+    u8 pending_local_mutation_count;
+    bool pending_local_mutation_overflow;
+    u32 pending_local_mutation_bytes;
+    PendingRespMutation pending_local_mutations[16];
+    u8 pending_local_mutation_storage[kPendingRespMutationBytes];
+
     // One suspended async (wait/timer) stream at a time, mirroring the
     // pending_stream body constraint. When a JIT handler yields on a timer the
     // serving layer parks it here: the resume point lives on the Connection

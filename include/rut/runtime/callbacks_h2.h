@@ -570,6 +570,67 @@ inline void h2_clear_pending(Http2Conn& h2) {
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         h2.pending_route_params[i] = {};
     }
+    h2.pending_local_outcome = false;
+    h2.pending_local_status = 0;
+    h2.pending_local_body_idx = 0;
+    h2.pending_local_headers_idx = 0;
+    h2.pending_local_is_head = false;
+    h2.pending_local_cfg = nullptr;
+    h2.pending_local_mutation_count = 0;
+    h2.pending_local_mutation_overflow = false;
+    h2.pending_local_mutation_bytes = 0;
+}
+
+template <typename Loop>
+void h2_async_epoch_enter(Loop* loop, Connection& conn);
+
+template <typename Loop>
+bool h2_park_local_outcome(H2Dispatch<Loop>& d,
+                           u32 stream_id,
+                           const JitDispatchOutcome& o,
+                           const RouteConfig* cfg,
+                           bool is_head,
+                           u32 content_length) {
+    Http2Conn& h2 = *d.conn->h2;
+    if (h2.pending_stream != 0 || h2.async_stream != 0 || h2.grpc.active != 0) return false;
+    h2_async_epoch_enter(d.loop, *d.conn);
+    h2.pending_stream = stream_id;
+    h2.pending_has_content_length = true;
+    h2.pending_content_length = content_length;
+    h2.pending_body_len = 0;
+    h2.pending_buffer_body = false;
+    h2.pending_local_outcome = true;
+    h2.pending_local_status = o.status_code;
+    h2.pending_local_body_idx = o.response_body_idx;
+    h2.pending_local_headers_idx = o.response_headers_idx;
+    h2.pending_local_is_head = is_head;
+    h2.pending_local_cfg = cfg;
+    h2.pending_local_mutation_count = 0;
+    h2.pending_local_mutation_overflow = d.conn->resp_header_mutation_overflow ||
+                                         d.conn->resp_header_mutation_pending_overflow;
+    h2.pending_local_mutation_bytes = 0;
+    for (u32 i = 0; i < d.conn->resp_header_mutation_count; i++) {
+        if (i >= 16) {
+            h2.pending_local_mutation_overflow = true;
+            break;
+        }
+        const auto& src = d.conn->resp_header_mutations[i];
+        const u32 need = src.name.len + src.value.len;
+        if (need > Http2Conn::kPendingRespMutationBytes - h2.pending_local_mutation_bytes) {
+            h2.pending_local_mutation_overflow = true;
+            break;
+        }
+        auto& dst = h2.pending_local_mutations[h2.pending_local_mutation_count++];
+        u8* storage = h2.pending_local_mutation_storage + h2.pending_local_mutation_bytes;
+        for (u32 j = 0; j < src.name.len; j++) storage[j] = static_cast<u8>(src.name.ptr[j]);
+        dst.name = {reinterpret_cast<const char*>(storage), src.name.len};
+        storage += src.name.len;
+        for (u32 j = 0; j < src.value.len; j++) storage[j] = static_cast<u8>(src.value.ptr[j]);
+        dst.value = {reinterpret_cast<const char*>(storage), src.value.len};
+        h2.pending_local_mutation_bytes += need;
+        dst.mode = static_cast<u8>(src.mode);
+    }
+    return true;
 }
 
 // pending_body_start points just after the synthesized CRLFCRLF; DATA bytes are
@@ -1169,6 +1230,21 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
         return;
     }
+    // gRPC requests with a declared length must still be streamed into the
+    // exchange immediately when the handler chooses Forward.  A local response
+    // has no upstream side effect, so park its already-computed outcome until
+    // END_STREAM validates the length.
+    if (open_request != nullptr && open_request->has_content_length &&
+        grpc_request(*open_request)) {
+        if (!h2_park_local_outcome(d,
+                                   stream_id,
+                                   kOutcome,
+                                   cfg,
+                                   is_head,
+                                   open_request->content_length))
+            h2_emit_status(d, stream_id, 503);
+        return;
+    }
     h2_emit_outcome(d, stream_id, kOutcome, cfg, is_head);
 }
 
@@ -1190,6 +1266,39 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     if (h2->pending_has_content_length && h2->pending_content_length != h2->pending_body_len) {
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 400);
+        return;
+    }
+
+    if (h2->pending_local_outcome) {
+        const u16 status = h2->pending_local_status;
+        const u16 body_idx = h2->pending_local_body_idx;
+        const u16 headers_idx = h2->pending_local_headers_idx;
+        const bool is_head = h2->pending_local_is_head;
+        const RouteConfig* cfg = h2->pending_local_cfg;
+        const bool mutation_overflow = h2->pending_local_mutation_overflow;
+        const u8 mutation_count = h2->pending_local_mutation_count;
+        Http2Conn::PendingRespMutation mutations[16];
+        for (u32 i = 0; i < mutation_count; i++) mutations[i] = h2->pending_local_mutations[i];
+        h2_clear_pending(*h2);
+        h2_reset_request_mutations(*d.conn);
+        for (u32 i = 0; i < mutation_count; i++) {
+            auto& dst = d.conn->resp_header_mutations[i];
+            dst.name = mutations[i].name;
+            dst.value = mutations[i].value;
+            dst.mode = static_cast<Connection::RespHeaderMutationMode>(mutations[i].mode);
+        }
+        d.conn->resp_header_mutation_count = mutation_count;
+        d.conn->resp_header_mutation_overflow = mutation_overflow;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = status;
+        outcome.response_body_idx = body_idx;
+        outcome.response_headers_idx = headers_idx;
+        if (mutation_overflow)
+            h2_emit_status(d, stream_id, 500);
+        else
+            h2_emit_outcome(d, stream_id, outcome, cfg, is_head);
+        h2_reset_request_mutations(*d.conn);
         return;
     }
 
@@ -1340,7 +1449,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
     // The mutation logs are connection-owned. Clear them at every new request
     // boundary once no suspended proxy owns them; a later plain proxy stream must
     // never inherit a completed JIT stream's mutations.
-    if (d.conn->h2->async_stream == 0) h2_reset_request_mutations(*d.conn);
+    if (d.conn->h2->async_stream == 0 && d.conn->h2->pending_stream == 0)
+        h2_reset_request_mutations(*d.conn);
     ParsedRequest req;
     if (!h2_headers_to_request(headers, nheaders, &req)) {
         if (has_exact_inventory && req.target_has_fragment) {
@@ -1675,6 +1785,7 @@ void h2_on_data_cb(
 inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
     (void)ctx;
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
+    if (c.pending_stream == stream_id) h2_clear_pending(c);
     if (c.outbound_stream == stream_id) {
         if (c.queued_stream != 0) {
             h2_clear_primary_outbound(c);
