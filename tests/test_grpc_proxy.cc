@@ -1165,11 +1165,11 @@ TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     ParsedRequest req;
     req.reset();
     req.method = HttpMethod::POST;
+    req.headers[0] = {Str{"content-type", 12}, Str{"application/grpc", 16}};
+    req.header_count = 1;
     req.has_content_length = true;
     req.content_length = 5;
     req.content_length_count = 1;
-    req.headers[0] = {Str{"content-type", 12}, Str{"application/grpc", 16}};
-    req.header_count = 1;
     const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
                                 {{":scheme", 7}, {"http", 4}},
                                 {{":path", 5}, {"/Echo", 5}},
@@ -1199,6 +1199,8 @@ TEST(grpc_proxy, expired_headers_deadline_is_cancelled_before_upstream_headers) 
     ParsedRequest req;
     req.reset();
     req.method = HttpMethod::POST;
+    req.headers[0] = {Str{"content-type", 12}, Str{"application/grpc", 16}};
+    req.header_count = 1;
     const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
                                 {{":scheme", 7}, {"http", 4}},
                                 {{":path", 5}, {"/Echo", 5}},
