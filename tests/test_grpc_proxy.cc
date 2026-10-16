@@ -1155,6 +1155,57 @@ TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_d
     loop.shutdown();
 }
 
+struct FailConnectLoop : EpollEventLoop {
+    bool submit_connect(Connection&, const void*, u32) { return false; }
+};
+
+TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_input) {
+    FailConnectLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init();
+    down->h2->client = true;
+    down->protocol = ConnProtocol::Http2;
+    down->request_config = &cfg;
+    REQUIRE(down->h2->open_stream(1) != nullptr);
+    const char* synth = "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\n\r\n";
+    const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
+    for (u32 i = 0; i < synth_len; i++) down->h2->pending_synth[i] = static_cast<u8>(synth[i]);
+    ParsedRequest open;
+    open.reset();
+    u8 response[8192]{};
+    H2Dispatch<FailConnectLoop> d{&loop, down, response, sizeof(response), 0, false};
+    JitDispatchOutcome yielded{};
+    yielded.kind = JitDispatchOutcome::Kind::TimerYield;
+    yielded.next_state = 1;
+    yielded.timer_ms = 100;
+    REQUIRE(h2_suspend_timer(d,
+                             1,
+                             &grpc_jit_forward,
+                             yielded,
+                             &cfg,
+                             down->h2->pending_synth,
+                             synth_len,
+                             true,
+                             true,
+                             false,
+                             &open));
+    down->pending_handler_fn = &grpc_jit_forward;
+    down->handler_state = 1;
+    h2_resume_jit_handler(&loop, *down);
+    CHECK_EQ(down->h2->async_stream, 0u);
+    CHECK_EQ(down->h2->grpc.active, 0u);
+    CHECK_GT(down->send_buf.len(), 0u);
+    CHECK_EQ(loop.grpc_upstreams, nullptr);
+    loop.force_close_all();
+    loop.shutdown();
+}
+
 TEST(grpc_proxy, timer_resume_expired_grpc_timeout_is_cancelled_before_forward) {
     EpollEventLoop loop;
     REQUIRE(loop.init(0, -1).has_value());
