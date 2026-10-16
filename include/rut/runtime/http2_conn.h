@@ -29,7 +29,7 @@ enum class Http2StreamState : u8 {
 // JIT handler yielded on wait(ms) (resumed by the yield timer). Proxy = the
 // stream is being forwarded to an h1 upstream (resumed by upstream I/O).
 enum class H2AsyncKind : u8 { None, Timer, Proxy };
-enum class H2OutboundBodySource : u8 { None, RouteConfig, ProxySynth };
+enum class H2OutboundBodySource : u8 { None, RouteConfig, ProxySynth, Json };
 
 struct Http2Stream {
     u32 id;
@@ -233,6 +233,9 @@ struct Http2Conn {
     u32 queued_body_offset;
     bool queued_final_staged;
     H2OutboundBodySource queued_source;
+    // Dynamic JSON bodies must survive request scratch reuse and flow-control stalls.
+    u8 json_outbound_body[8192];
+    u8 json_queued_body[8192];
     bool response_flush_pending;
 
     // Set callbacks (any may be null) then call init().

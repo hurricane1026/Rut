@@ -9,6 +9,7 @@
 #include "rut/common/wait_limits.h"
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/access_log.h"
+#include "rut/runtime/arena.h"
 #include "rut/runtime/buffered_send_vector.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/http_parser.h"
@@ -1780,6 +1781,12 @@ struct ConnectionBase {
     u8* send_slice;
     Buffer recv_buf;
     Buffer send_buf;
+    // JSON results own slices until the request completes. Never point a
+    // pending response at a thread-local helper workspace.
+    SliceArena json_arena{};
+    Str jit_response_body{};
+    bool jit_response_body_valid = false;
+    bool jit_response_head = false;
     u32 send_progress;
     const u8* local_body_cursor = nullptr;
     u32 local_body_remaining = 0;
@@ -1912,6 +1919,9 @@ struct ConnectionBase {
     void (*on_close)(void*, ConnectionBase&);
 
     void reset() {
+        json_arena.destroy();
+        jit_response_body = {};
+        jit_response_body_valid = false;
         response_body_tail = {};
         chain_direct_recv_owner = {};
         relay_owner = {};

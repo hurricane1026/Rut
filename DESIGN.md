@@ -3422,6 +3422,9 @@ parseInt("42")                    // typed parse
 req.body(Type)                    // typed body parse, error-capable
 json(value)                       // serialize to JSON string
 resp.body                         // response body string
+// The initial runtime uses bounded request-local JSON storage (8 KiB/2048 nodes).
+// Struct decoding supports str, bool, i32, nested structs, and Json fields;
+// i64 fields remain a documented follow-up until the language's i64 surface is complete.
 
 // --- Regex (Vectorscan) ---
 re"pattern"                       // compile-time validated regex literal

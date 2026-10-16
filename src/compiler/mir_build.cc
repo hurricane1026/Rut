@@ -277,17 +277,17 @@ static bool forward_preflight_metadata_valid(const MirModule& module, const MirF
 }
 
 static MirTypeKind mir_type_kind(HirTypeKind kind) {
-    return kind == HirTypeKind::Bool       ? MirTypeKind::Bool
-           : kind == HirTypeKind::I32      ? MirTypeKind::I32
-           : kind == HirTypeKind::I64      ? MirTypeKind::I64
-           : kind == HirTypeKind::Str      ? MirTypeKind::Str
-           : kind == HirTypeKind::Method   ? MirTypeKind::Method
-           : kind == HirTypeKind::ByteSize ? MirTypeKind::ByteSize
-           : kind == HirTypeKind::IP       ? MirTypeKind::IP
-           : kind == HirTypeKind::Variant  ? MirTypeKind::Variant
-           : kind == HirTypeKind::Tuple    ? MirTypeKind::Tuple
-           : kind == HirTypeKind::Struct   ? MirTypeKind::Struct
-                                           : MirTypeKind::Unknown;
+    return kind == HirTypeKind::Bool                                 ? MirTypeKind::Bool
+           : kind == HirTypeKind::I32                                ? MirTypeKind::I32
+           : kind == HirTypeKind::I64                                ? MirTypeKind::I64
+           : (kind == HirTypeKind::Str || kind == HirTypeKind::Json) ? MirTypeKind::Str
+           : kind == HirTypeKind::Method                             ? MirTypeKind::Method
+           : kind == HirTypeKind::ByteSize                           ? MirTypeKind::ByteSize
+           : kind == HirTypeKind::IP                                 ? MirTypeKind::IP
+           : kind == HirTypeKind::Variant                            ? MirTypeKind::Variant
+           : kind == HirTypeKind::Tuple                              ? MirTypeKind::Tuple
+           : kind == HirTypeKind::Struct                             ? MirTypeKind::Struct
+                                                                     : MirTypeKind::Unknown;
 }
 
 static bool expand_hir_flat_shape(const HirModule& module,
@@ -530,8 +530,16 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
-    if (expr.kind == HirExprKind::StructInit) {
-        v.kind = MirValueKind::StructInit;
+    if (expr.kind == HirExprKind::StructInit || expr.kind == HirExprKind::JsonDecode) {
+        v.kind = expr.kind == HirExprKind::JsonDecode ? MirValueKind::JsonDecode
+                                                      : MirValueKind::StructInit;
+        if (expr.kind == HirExprKind::JsonDecode) {
+            auto object = mir_value(*expr.lhs, module, fn, ctx);
+            if (!object) return core::make_unexpected(object.error());
+            if (!fn->values.push(object.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            v.lhs = &fn->values[fn->values.len - 1];
+        }
         v.type = MirTypeKind::Struct;
         v.struct_index = expr.struct_index;
         v.str_value = expr.str_value;
@@ -727,6 +735,21 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
     if (expr.kind == HirExprKind::ReqContentLength) {
         v.kind = MirValueKind::ReqContentLength;
         v.type = MirTypeKind::ByteSize;
+        return v;
+    }
+    if (expr.kind == HirExprKind::JsonOp) {
+        v.kind = MirValueKind::JsonOp;
+        v.int_value = expr.int_value;
+        v.type = mir_type_kind(expr.type);
+        for (u32 ai = 0; ai < expr.args.len; ++ai) {
+            const auto* arg = expr.args[ai];
+            auto child = mir_value(*arg, module, fn, ctx);
+            if (!child) return core::make_unexpected(child.error());
+            if (!fn->values.push(child.value()))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+            if (!v.args.push(&fn->values[fn->values.len - 1]))
+                return frontend_error(FrontendError::TooManyItems, expr.span);
+        }
         return v;
     }
     if (expr.kind == HirExprKind::TimeNowMicros) {
@@ -1404,6 +1427,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
                                    : MirTerminatorSourceKind::Literal;
             out->local_ref_index = term.local_ref_index;
             out->response_body = term.response_body;
+            out->response_body_local_index = term.response_body_local_index;
             out->forward_set_path = term.forward_set_path;
             out->forward_request_policy_id = term.forward_request_policy_id;
             out->forward_response_policy_id = term.forward_response_policy_id;

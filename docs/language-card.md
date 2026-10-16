@@ -52,7 +52,7 @@ route GET "/health" { return 200 } // zero or more top-level route declarations
 :8080                                   // Port
 re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
-json({ users: [], total: 0 })           // object literal syntax ✅; json() lowering/runtime ⏳
+json({ users: [], total: 0 })           // bounded JSON construction; failure is optional
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)

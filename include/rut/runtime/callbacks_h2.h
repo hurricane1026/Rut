@@ -35,6 +35,9 @@ namespace rut {
 bool h2_apply_forward_request_overrides(Connection& conn);
 
 inline void h2_reset_request_mutations(Connection& conn) {
+    conn.json_arena.destroy();
+    conn.jit_response_body = {};
+    conn.jit_response_body_valid = false;
     conn.clear_raw_request_target_witness();
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
@@ -186,6 +189,10 @@ inline void h2_promote_queued(Http2Conn& h2) {
     h2.outbound_body_offset = h2.queued_body_offset;
     h2.outbound_final_staged = h2.queued_final_staged;
     h2.outbound_source = h2.queued_source;
+    if (h2.outbound_source == H2OutboundBodySource::Json) {
+        __builtin_memcpy(h2.json_outbound_body, h2.json_queued_body, h2.outbound_body_len);
+        h2.outbound_body = h2.json_outbound_body;
+    }
     h2.queued_stream = 0;
     h2.queued_config = nullptr;
     h2.queued_body = nullptr;
@@ -293,10 +300,16 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
     Http2Conn& h2 = *d.conn->h2;
     if (body_len == 0 || !d.conn->epoch_held || h2.find_stream(stream_id) == nullptr) return false;
     const bool queued = h2.outbound_stream != 0;
-    if (queued && (h2.queued_stream != 0 || source != H2OutboundBodySource::RouteConfig))
+    if (queued && (h2.queued_stream != 0 || (source != H2OutboundBodySource::RouteConfig &&
+                                             source != H2OutboundBodySource::Json)))
         return false;
     if (source == H2OutboundBodySource::RouteConfig) {
         if (cfg == nullptr || body == nullptr) return false;
+    } else if (source == H2OutboundBodySource::Json) {
+        if (body == nullptr || body_len > sizeof(h2.json_outbound_body)) return false;
+        u8* storage = queued ? h2.json_queued_body : h2.json_outbound_body;
+        __builtin_memcpy(storage, body, body_len);
+        body = storage;
     } else if (source == H2OutboundBodySource::ProxySynth) {
         if (body != h2.pending_synth || body_len > Http2Conn::kBodySynthCap ||
             d.conn->h2_proxy_synth_quarantined)
@@ -830,6 +843,14 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                      bool is_head) {
     const u8* body = nullptr;
     u32 body_len = 0;
+    if (o.response_body_idx == 0xffffu) {
+        if (!d.conn->jit_response_body_valid) {
+            h2_emit_status(d, stream_id, 500);
+            return;
+        }
+        body = reinterpret_cast<const u8*>(d.conn->jit_response_body.ptr);
+        body_len = d.conn->jit_response_body.len;
+    }
     if (o.response_body_idx != 0 && cfg != nullptr &&
         o.response_body_idx <= cfg->response_body_count) {
         const auto& b = cfg->response_bodies[o.response_body_idx - 1];
@@ -928,7 +949,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                                      nhdrs,
                                      body,
                                      body_len,
-                                     H2OutboundBodySource::RouteConfig,
+                                     o.response_body_idx == 0xffffu
+                                         ? H2OutboundBodySource::Json
+                                         : H2OutboundBodySource::RouteConfig,
                                      cfg)) {
             if (!d.overflow) h2_emit_status(d, stream_id, 500);
         }
@@ -1099,7 +1122,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 synth_len,
                     bool request_body_followed,
                     bool request_forwardable,
-                    bool is_head,
+                    bool is_head = false,
                     const ParsedRequest* open_request = nullptr) {
     if (route_requires_response_read_timeout_preflight_close(route, cfg)) {
         d.close_after_process = true;
@@ -1107,6 +1130,9 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         d.overflow = false;
         return;
     }
+    d.conn->json_arena.destroy();
+    d.conn->jit_response_body = {};
+    d.conn->jit_response_body_valid = false;
     auto* ctx = d.conn->reset_jit_ctx();
     d.conn->resp_header_mutation_pending_count = 0;
     d.conn->resp_header_mutation_pending_overflow = false;
