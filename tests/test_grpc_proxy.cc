@@ -1011,7 +1011,8 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
         conn.upstream_idx = 0;
         conn.upstream_backend_idx = 0;
         loop.closed = false;
-        grpc_on_upstream_data(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 1});
+        grpc_on_upstream_data<GrpcDriveFixture>(
+            &loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 1});
         CHECK_EQ(loop.closed, expect_close);
     };
     Http2FrameHeader invalid{1, static_cast<u8>(Http2FrameType::Data), 0, 0};
