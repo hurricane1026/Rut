@@ -13,10 +13,10 @@
 #include "rut/jit/jit_engine.h"
 #include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
-#include "rut/runtime/json.h"
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/json.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
 #endif
