@@ -1513,6 +1513,50 @@ TEST(grpc_proxy, settings_handshake_health_ejects_and_success_resets_once) {
     grpc_record_handshake_result(conn, false, monotonic_us());
     CHECK_EQ(health->fails, 0u);
 }
+TEST(grpc_proxy, upstream_send_failure_records_handshake_health_once) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    GrpcDriveFixture loop;
+    for (u32 i = 0; i < kBackendFailThreshold; i++) {
+        Connection conn;
+        conn.reset();
+        Http2Conn h2;
+        h2.init_client();
+        h2.grpc.upstream = true;
+        h2.peer_settings_seen = false;
+        conn.h2 = &h2;
+        conn.upstream_idx = 0;
+        conn.upstream_backend_idx = 0;
+        loop.closed = false;
+        grpc_on_upstream_sent<GrpcDriveFixture>(
+            &loop, conn, {conn.id, -EPIPE, 0, 0, IoEventType::Send, 0});
+        CHECK(loop.closed);
+        CHECK_EQ(health->fails, i + 1);
+        CHECK(backend_ejected(0, 0, monotonic_us()) == (i + 1 >= kBackendFailThreshold));
+        grpc_on_upstream_sent<GrpcDriveFixture>(
+            &loop, conn, {conn.id, -EPIPE, 0, 0, IoEventType::Send, 0});
+        CHECK_EQ(health->fails, i + 1);
+    }
+    CHECK_EQ(health->fails, kBackendFailThreshold);
+    CHECK(backend_ejected(0, 0, monotonic_us()));
+
+    Connection settings_conn;
+    settings_conn.reset();
+    Http2Conn settings_h2;
+    settings_h2.init_client();
+    settings_h2.grpc.upstream = true;
+    settings_h2.peer_settings_seen = true;
+    settings_conn.h2 = &settings_h2;
+    settings_conn.upstream_idx = 0;
+    settings_conn.upstream_backend_idx = 0;
+    loop.closed = false;
+    grpc_on_upstream_sent<GrpcDriveFixture>(
+        &loop, settings_conn, {settings_conn.id, -EPIPE, 0, 0, IoEventType::Send, 0});
+    CHECK(loop.closed);
+    CHECK_EQ(health->fails, kBackendFailThreshold);
+}
+
 TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
     GrpcBackendHealthReset health_reset{};
     auto* health = backend_health(0, 0);
