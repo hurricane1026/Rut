@@ -8949,6 +8949,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.generic_protocol_indices[cpi] = locals[i].generic_protocol_indices[cpi];
             out.may_nil = locals[i].may_nil;
             out.may_error = locals[i].may_error;
+            out.is_json_encoded = locals[i].init.is_json_encoded;
             out.local_index = locals[i].ref_index;
             out.variant_index = locals[i].variant_index;
             out.shape_index = locals[i].shape_index;

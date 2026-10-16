@@ -33138,6 +33138,35 @@ TEST(frontend, parse_object_literal_as_call_argument) {
     CHECK_EQ(object.field_inits[1].value->int_value, 0);
 }
 
+TEST(frontend, serialized_json_body_provenance_survives_local_alias) {
+    const char* src =
+        "struct User { name: str } route GET \"/x\" { "
+        "let encoded = json.encode(User(name: \"Ada\")) "
+        "let alias = encoded return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].locals[1].init.is_json_encoded);
+}
+
+TEST(frontend, serialized_json_body_explicit_content_type_wins) {
+    const char* src =
+        "route GET \"/x\" { let encoded = json({ value: 1 }) "
+        "return response(200, headers: { \"Content-Type\": \"text/custom\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    REQUIRE_EQ(term.response_headers.len, 1u);
+    CHECK(term.response_headers[0].value.eq(lit_str("text/custom")));
+}
+
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
     const char* src = "route GET \"/x\" { let payload = encoder.encode({}) return 200 }\n";
     auto lexed = lex(lit(src));
