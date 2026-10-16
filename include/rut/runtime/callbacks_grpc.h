@@ -119,7 +119,13 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
         if (auto* stream = down->h2->find_stream(x->downstream_stream))
             stream->manual_window = false;
         grpc_detach(*down->h2, x);
-        if (!down->h2->grpc.busy) grpc_refresh_timer(loop, *down);
+        if (!down->h2->grpc.busy) {
+            grpc_refresh_timer(loop, *down);
+            if (!down->h2->grpc.active && !down->h2->grpc.timer_deadline_us) {
+                if constexpr (requires { loop->timer.refresh(*down, loop->keepalive_timeout); })
+                    loop->timer.refresh(*down, loop->keepalive_timeout);
+            }
+        }
     }
     if (up && up->h2) {
         auto& h = *up->h2;
@@ -328,7 +334,7 @@ void grpc_response_data(void*, Http2Conn& h, u32 sid, const u8* data, u32 len, b
     }  // gRPC requires status trailers.
 }
 template <typename Loop>
-void grpc_response_reset(void*, Http2Conn& h, u32 sid, Http2Error error) {
+void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
     if (auto* x = grpc_find(h, sid); x && !x->response_end) {
         switch (static_cast<u32>(error)) {
             case static_cast<u32>(Http2Error::Cancel):
@@ -348,6 +354,18 @@ void grpc_response_reset(void*, Http2Conn& h, u32 sid, Http2Error error) {
                 break;
         }
         x->response_end = true;
+        auto* d = static_cast<GrpcClientDispatch<Loop>*>(ctx);
+        Connection* down = x->downstream;
+        if (x->request_headers_sent) grpc_queue_cancel(h, x->upstream_stream);
+        if (auto* stream = h.find_stream(x->upstream_stream))
+            stream->state = Http2StreamState::Closed;
+        grpc_detach(h, x);
+        x->upstream = nullptr;
+        if (x->slot_held) {
+            d->loop->upstream_release(x->upstream_id);
+            x->slot_held = false;
+        }
+        if (down) grpc_kick_downstream(d->loop, *down);
     }
 }
 

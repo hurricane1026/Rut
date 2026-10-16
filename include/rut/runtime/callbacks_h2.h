@@ -1698,6 +1698,10 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         default:
             if (route->upstream_id < config->upstream_count &&
                 config->upstreams[route->upstream_id].http2) {
+                if (!h2_proxy_request_forwardable(headers, nheaders)) {
+                    h2_emit_status(d, stream_id, 400);
+                    return;
+                }
                 if (!grpc_start(d.loop,
                                 *d.conn,
                                 stream_id,
