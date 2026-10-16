@@ -2072,6 +2072,16 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.reset_request_receive_buffer();
     if (kRemaining > 0) conn.recv_buf.commit(kRemaining);
 
+    // A partial frame can consume the ordinary request slice. Promote only
+    // after process has released its view of the input and the bytes have been
+    // compacted; rebinding while the engine is still processing is unsafe.
+    if constexpr (requires { loop->pool.alloc_bulk(); }) {
+        if (!r.close && conn.recv_buf.write_avail() == 0 && !grpc_grow_recv(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
+
     const bool kClose = r.close || d.overflow;
 
     if (!kClose && conn.h2->grpc.active && conn.h2->outbound_stream == 0) {
@@ -2174,12 +2184,6 @@ void enter_h2(Loop* loop, Connection& conn, IoEvent ev) {
         conn.h2->on_data = nullptr;
         conn.h2->on_reset = nullptr;
         conn.h2->init();
-    }
-    if constexpr (requires { loop->pool.alloc_bulk(); }) {
-        if (!grpc_grow_recv(loop, conn)) {
-            loop->close_conn(conn);
-            return;
-        }
     }
     conn.transition_to_reading_header(&on_h2_data<Loop>);
     on_h2_data<Loop>(static_cast<void*>(loop), conn, ev);

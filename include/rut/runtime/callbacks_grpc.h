@@ -541,7 +541,6 @@ bool grpc_start_impl(Loop* loop,
     if (!cfg || uid >= cfg->upstream_count || !cfg->upstreams[uid].http2 ||
         req.method != HttpMethod::POST || !grpc_request(req) || down.h2->grpc.active >= 64)
         return false;
-    if (!grpc_grow_recv(loop, down)) return false;
     const auto& target = cfg->upstreams[uid];
     if (!target.addr_count) return false;
     const u64 now = monotonic_us();
