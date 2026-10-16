@@ -604,6 +604,27 @@ TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     CHECK_EQ(select_backend(0, 2, now + 3), 1u);
     loop->shutdown();
 }
+TEST(grpc_proxy, successful_connect_clears_consecutive_failures) {
+    GrpcBackendHealthReset health_reset{};
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    for (u32 i = 0; i < 2; i++) {
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->upstream_idx = 0;
+        conn->upstream_backend_idx = 0;
+        record_backend_result(0, 0, false, monotonic_us());
+        loop->close_conn(*conn);
+    }
+    CHECK_EQ(health->fails, 2u);
+    record_backend_result(0, 0, true, monotonic_us());
+    CHECK_EQ(health->fails, 0u);
+    record_backend_result(0, 0, false, monotonic_us());
+    CHECK_EQ(health->fails, 1u);
+    loop->shutdown();
+}
 TEST(grpc_proxy, deferred_cancel_flushes_after_full_control_buffer) {
     Http2Conn h{};
     h.grpc.init();
