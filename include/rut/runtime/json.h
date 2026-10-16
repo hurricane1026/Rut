@@ -130,7 +130,8 @@ inline bool scalar(Str s, u32& p, u32& cp) {
 }
 
 inline bool decode(Str s, u32& p, Writer& out) {
-    if (p >= s.len || s.ptr[p++] != '"') return false;
+    if (p >= s.len || s.ptr[p] != '"') return false;
+    ++p;
     while (p < s.len) {
         if (s.ptr[p] == '"') {
             ++p;
