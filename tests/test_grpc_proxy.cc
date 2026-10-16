@@ -662,6 +662,31 @@ TEST(grpc_proxy, request_header_filter_preserves_only_trailers_te) {
     for (const auto& h : allowed) CHECK(grpc_request_header_allowed(h));
     for (const auto& h : blocked) CHECK(!grpc_request_header_allowed(h));
 }
+TEST(grpc_proxy, response_header_filter_strips_content_length_only) {
+    const hpack::Header headers[] = {{Str{"content-length", 14}, Str{"0", 1}},
+                                     {Str{"grpc-status", 11}, Str{"0", 1}},
+                                     {Str{"x-meta", 6}, Str{"ok", 2}}};
+    CHECK(!grpc_response_header_allowed(headers[0]));
+    CHECK(grpc_response_header_allowed(headers[1]));
+    CHECK(grpc_response_header_allowed(headers[2]));
+}
+TEST(grpc_proxy, handshake_timestamp_is_immutable_when_joining) {
+    GrpcProxyState g{};
+    g.init();
+    grpc_begin_handshake(g, 100);
+    grpc_begin_handshake(g, 200);
+    CHECK_EQ(g.connected_at_us, 100u);
+}
+TEST(grpc_proxy, idle_upstream_close_policy_respects_drain_and_activity) {
+    GrpcProxyState g{};
+    g.init();
+    g.connected_at_us = 100;
+    CHECK(grpc_idle_upstream_should_close(g, false, true, 101, 1000));
+    g.active = 1;
+    CHECK(!grpc_idle_upstream_should_close(g, false, true, 101, 1000));
+    g.active = 0;
+    CHECK(!grpc_idle_upstream_should_close(g, false, false, 101, 1000));
+}
 TEST(grpc_proxy, tls_downstream_jit_epoll) {
     streaming_case<EpollEventLoop>(_tc, true);
 }

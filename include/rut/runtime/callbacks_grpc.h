@@ -202,6 +202,16 @@ inline bool grpc_request_header_allowed(const hpack::Header& h) {
     if (h.name.eq({"te", 2}) && !h.value.eq({"trailers", 8})) return false;
     return true;
 }
+inline bool grpc_response_header_allowed(const hpack::Header& h) {
+    return !h.name.eq({"content-length", 14});
+}
+inline void grpc_begin_handshake(GrpcProxyState& g, u64 now_us) {
+    if (!g.connected_at_us) g.connected_at_us = now_us;
+}
+inline bool grpc_idle_upstream_should_close(
+    const GrpcProxyState& g, bool peer_goaway, bool draining, u64 now_us, u64 keepalive_us) {
+    return g.active == 0 && (draining || peer_goaway || now_us - g.connected_at_us >= keepalive_us);
+}
 template <typename Loop>
 void grpc_response_headers(
     void* ctx, Http2Conn& h, u32 sid, const hpack::Header* hs, u32 n, bool end) {
@@ -252,7 +262,7 @@ void grpc_response_headers(
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
     u32 filtered_n = 0;
     for (u32 i = 0; i < n; i++) {
-        if (hs[i].name.eq({"content-length", 14})) continue;
+        if (!grpc_response_header_allowed(hs[i])) continue;
         if (filtered_n < Http2Conn::kMaxHeadersPerReq) filtered[filtered_n++] = hs[i];
     }
     x->response_headers_len = http2_write_headers(x->response_headers,
@@ -272,7 +282,7 @@ void grpc_response_trailers(void*, Http2Conn& h, u32 sid, const hpack::Header* h
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
     u32 filtered_n = 0;
     for (u32 i = 0; i < n; i++) {
-        if (hs[i].name.eq({"content-length", 14})) continue;
+        if (!grpc_response_header_allowed(hs[i])) continue;
         if (filtered_n < Http2Conn::kMaxHeadersPerReq) filtered[filtered_n++] = hs[i];
     }
     x->response_trailers_len = http2_write_headers(x->response_trailers,
@@ -575,7 +585,7 @@ bool grpc_start_impl(Loop* loop,
         up->upstream_backend_idx = static_cast<u8>(backend);
         up->h2->grpc.upstream = true;
         up->h2->grpc.connecting = true;
-        up->h2->grpc.connected_at_us = now;
+        grpc_begin_handshake(up->h2->grpc, now);
         up->h2->grpc.pool_next = loop->grpc_upstreams;
         loop->grpc_upstreams = up;
         up->on_close = &grpc_connection_closed<Loop>;
@@ -826,9 +836,11 @@ void grpc_tick(Loop* loop, Connection& conn) {
     if (h.grpc.upstream) {
         if (((h.grpc.connecting || !h.peer_settings_seen) &&
              now - h.grpc.connected_at_us >= static_cast<u64>(loop->upstream_timeout) * 1000000) ||
-            (h.grpc.active == 0 && (loop->is_draining() || h.peer_goaway ||
-                                    now - h.grpc.connected_at_us >=
-                                        static_cast<u64>(loop->keepalive_timeout) * 1000000))) {
+            grpc_idle_upstream_should_close(h.grpc,
+                                            h.peer_goaway,
+                                            loop->is_draining(),
+                                            now,
+                                            static_cast<u64>(loop->keepalive_timeout) * 1000000)) {
             loop->close_conn(conn);
             return;
         }
