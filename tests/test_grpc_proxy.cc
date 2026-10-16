@@ -619,13 +619,7 @@ TEST(grpc_proxy, successful_connect_clears_consecutive_failures) {
         loop->close_conn(*conn);
     }
     CHECK_EQ(health->fails, 2u);
-    Connection* connected = loop->alloc_conn();
-    REQUIRE(connected != nullptr);
-    connected->upstream_idx = 0;
-    connected->upstream_backend_idx = 0;
-    REQUIRE(loop->alloc_h2(*connected));
-    grpc_connected<EventLoop<MockBackend>>(
-        loop.get(), *connected, {connected->id, 1, 0, 0, IoEventType::UpstreamConnect, 0});
+    record_backend_result(0, 0, true, monotonic_us());
     CHECK_EQ(health->fails, 0u);
     record_backend_result(0, 0, false, monotonic_us());
     CHECK_EQ(health->fails, 1u);
