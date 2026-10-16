@@ -58,6 +58,7 @@ inline void grpc_detach(Http2Conn& h, GrpcExchange* x) {
         if (entry != x) continue;
         entry = nullptr;
         h.grpc.active--;
+        if (!h.grpc.active) h.grpc.idle_since_us = monotonic_us();
         return;
     }
 }
@@ -215,8 +216,7 @@ inline void grpc_record_connect_result(const Connection& conn, bool success, u64
 }
 inline bool grpc_idle_upstream_should_close(
     const GrpcProxyState& g, bool peer_goaway, bool draining, u64 now_us, u64 keepalive_us) {
-    return g.active == 0 &&
-           (draining || peer_goaway || now_us - g.last_activity_us >= keepalive_us);
+    return g.active == 0 && (draining || peer_goaway || now_us - g.idle_since_us >= keepalive_us);
 }
 template <typename Loop>
 void grpc_response_headers(
@@ -493,7 +493,8 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     }
     for (auto* x : g.streams) {
         if (!x) continue;
-        if (h.peer_goaway && x->upstream_stream > h.peer_last_stream) x->failure = 14;
+        if (h.peer_goaway && (!x->request_headers_sent || x->upstream_stream > h.peer_last_stream))
+            x->failure = 14;
         grpc_kick_downstream(loop, *x->downstream);
     }
     g.busy = false;
