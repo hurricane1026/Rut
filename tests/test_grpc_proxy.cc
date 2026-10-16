@@ -614,7 +614,100 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
     shard->shutdown();
     if (tls_server) destroy_tls_server_context(tls_server);
 }
+
+struct GrpcDriveFixture {
+    Connection* grpc_upstreams = nullptr;
+    const RouteConfig** config_ptr = nullptr;
+    TimerWheel timer;
+    u32 keepalive_timeout = 60;
+    u32 sends = 0;
+    u32 last_send_len = 0;
+    bool closed = false;
+    GrpcDriveFixture() { timer.init(); }
+    bool submit_send(Connection&, const u8*, u32 len) {
+        sends++;
+        last_send_len = len;
+        return true;
+    }
+    bool submit_recv(Connection&) { return true; }
+    bool submit_connect(Connection&, const void*, u32) { return true; }
+    bool submit_send_upstream(Connection&, const u8*, u32) { return true; }
+    bool submit_recv_upstream(Connection&) { return true; }
+    bool alloc_upstream_buf(Connection&) { return true; }
+    void clear_upstream_fd(u32) {}
+    bool alloc_response_header_buf(Connection&) { return true; }
+    bool schedule_yield_timer(Connection&, u32) { return true; }
+    bool is_draining() const { return false; }
+    void epoch_enter() {}
+    void epoch_leave() {}
+    void close_conn(Connection&) { closed = true; }
+};
 }  // namespace
+
+TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    u8 send_storage[SlicePool::kSliceSize];
+    upstream.send_slice = send_storage;
+    upstream.send_buf.bind(send_storage, sizeof(send_storage));
+    Http2Conn h2;
+    h2.init();
+    h2.client = true;
+    h2.grpc.upstream = true;
+    h2.grpc.preface_sent = true;
+    h2.preface_seen = true;
+    h2.our_settings_sent = true;
+    h2.peer_settings_seen = true;
+    upstream.h2 = &h2;
+
+    Connection downstream;
+    downstream.reset();
+    GrpcExchange retained;
+    GrpcExchange queued;
+    GrpcExchange newest;
+    retained.init();
+    queued.init();
+    newest.init();
+    retained.downstream = queued.downstream = newest.downstream = &downstream;
+    retained.upstream = queued.upstream = newest.upstream = &upstream;
+    retained.upstream_stream = 1;
+    queued.upstream_stream = 3;
+    newest.upstream_stream = 5;
+    retained.request_headers_sent = true;
+    queued.request_headers_len = newest.request_headers_len = 1;
+    queued.request_headers[0] = newest.request_headers[0] = 0;
+    REQUIRE(h2.open_stream(1) != nullptr);
+    REQUIRE(h2.open_stream(3) != nullptr);
+    REQUIRE(h2.open_stream(5) != nullptr);
+    h2.peer_settings.has_max_concurrent_streams = true;
+    h2.peer_settings.max_concurrent_streams = 1;
+    h2.grpc.streams[0] = &retained;
+    h2.grpc.streams[1] = &queued;
+    h2.grpc.streams[2] = &newest;
+    h2.grpc.active = 3;
+    loop.grpc_upstreams = &upstream;
+
+    // The response on stream 1 has ended, but its exchange remains attached
+    // while slowdown cleanup drains it.  Its sent HEADERS still count as an
+    // opened peer stream until the exchange is retired, so queued RPCs wait.
+    CHECK_EQ(h2.grpc.control_len, 0u);
+    CHECK_EQ(h2.conn_recv_credit, 0u);
+    CHECK(h2.peer_settings_seen);
+    grpc_drive_upstream(&loop, upstream);
+    CHECK_EQ(loop.sends, 0u);
+    CHECK_FALSE(queued.request_headers_sent);
+    CHECK_FALSE(newest.request_headers_sent);
+    CHECK_EQ(loop.grpc_upstreams, &upstream);
+
+    retained.response_end = true;
+    grpc_drive_upstream(&loop, upstream);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK(queued.request_headers_sent);
+    CHECK_FALSE(newest.request_headers_sent);
+    CHECK_EQ(h2.grpc.active, 3u);
+    CHECK_EQ(h2.peer_settings.max_concurrent_streams, 1u);
+}
 
 TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_data) {
     EpollEventLoop loop;

@@ -4,6 +4,7 @@
 // built with the engine's own response writers (HPACK encoder), fed through
 // process(), and the decoded callbacks + emitted control frames are asserted.
 
+#include "rut/runtime/callbacks_grpc.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http2_frame.h"
@@ -1651,14 +1652,26 @@ TEST(h2_serving, inject_content_length_rejects_overflow) {
 
 namespace {
 struct FakeH2Loop {
+    SlicePool pool;
+    Http2Conn owned_h2;
     u8 response_headers[4096]{};
     u32 epoch_enters = 0;
     u32 epoch_leaves = 0;
     bool closed = false;
+    bool recv_submitted = false;
+    bool send_submitted = false;
     TimerWheel timer;
     u32 keepalive_timeout = 60;
     const RouteConfig** config_ptr = nullptr;
-    FakeH2Loop() { timer.init(); }
+    FakeH2Loop() {
+        timer.init();
+        if (!pool.init(16, 0, SlicePool::kMaxCachedSlices, 2).has_value()) __builtin_trap();
+    }
+    ~FakeH2Loop() { pool.destroy(); }
+    bool alloc_h2(Connection& conn) {
+        conn.h2 = &owned_h2;
+        return true;
+    }
     bool alloc_response_header_buf(Connection& conn) {
         conn.response_header_slice = response_headers;
         conn.response_header_buf.bind(response_headers, sizeof(response_headers));
@@ -1666,13 +1679,83 @@ struct FakeH2Loop {
     }
     void epoch_enter() { epoch_enters++; }
     void epoch_leave() { epoch_leaves++; }
-    bool submit_recv(Connection&) { return true; }
-    bool submit_send(Connection&, const u8*, u32) { return true; }
+    bool submit_recv(Connection&) {
+        recv_submitted = true;
+        return true;
+    }
+    bool submit_send(Connection&, const u8*, u32) {
+        send_submitted = true;
+        return true;
+    }
     bool submit_connect(Connection&, const void*, u32) { return true; }
     bool schedule_yield_timer(Connection&, u32) { return true; }
     void close_conn(Connection&) { closed = true; }
 };
 }  // namespace
+
+TEST(h2_serving, lazy_receive_promotion_happens_after_process_releases_input) {
+    FakeH2Loop loop;
+
+    Connection small;
+    small.reset();
+    small.bind_request_receive_buffer(loop.pool.alloc(), SlicePool::kSliceSize);
+    small.send_slice = loop.pool.alloc();
+    small.send_buf.bind(small.send_slice, SlicePool::kSliceSize);
+    REQUIRE(small.recv_slice != nullptr);
+    REQUIRE(small.send_slice != nullptr);
+    u8 settings[64];
+    Http2Settings empty_settings;
+    empty_settings.set_defaults();
+    const u32 settings_len = write_settings_frame(settings, empty_settings);
+    small.recv_buf.write(kClientPreface, kClientPrefaceLen);
+    small.recv_buf.write(settings, settings_len);
+    enter_h2(&loop, small, {small.id, 1, 0, 0, IoEventType::Recv, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_FALSE(loop.pool.is_bulk(small.recv_slice));
+    loop.pool.free(small.recv_slice);
+    loop.pool.free(small.send_slice);
+
+    loop.closed = false;
+    loop.recv_submitted = false;
+    Connection partial;
+    partial.reset();
+    partial.bind_request_receive_buffer(loop.pool.alloc(), SlicePool::kSliceSize);
+    partial.send_slice = loop.pool.alloc();
+    partial.send_buf.bind(partial.send_slice, SlicePool::kSliceSize);
+    REQUIRE(partial.recv_slice != nullptr);
+    REQUIRE(partial.send_slice != nullptr);
+    REQUIRE(loop.alloc_h2(partial));
+    partial.h2->init();
+    partial.h2->preface_seen = true;
+    partial.h2->our_settings_sent = true;
+
+    u8* input = partial.recv_buf.write_ptr();
+    input[0] = 0;
+    input[1] = 0x40;
+    input[2] = 0;
+    input[3] = 0xff;
+    input[4] = 0;
+    input[5] = 0;
+    input[6] = 0;
+    input[7] = 0;
+    input[8] = 0;
+    for (u32 i = kFrameHeaderSize; i < SlicePool::kSliceSize; i++) input[i] = 0;
+    partial.recv_buf.commit(SlicePool::kSliceSize);
+    on_h2_data<FakeH2Loop>(&loop, partial, {partial.id, 1, 0, 0, IoEventType::Recv, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK(loop.pool.is_bulk(partial.recv_slice));
+    CHECK_EQ(partial.recv_buf.len(), SlicePool::kSliceSize);
+    CHECK_EQ(partial.recv_buf.data()[3], 0xff);
+
+    for (u32 i = 0; i < 9; i++) partial.recv_buf.write_ptr()[i] = 0;
+    partial.recv_buf.commit(9);
+    on_h2_data<FakeH2Loop>(&loop, partial, {partial.id, 1, 0, 0, IoEventType::Recv, 0});
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(partial.recv_buf.len(), 0u);
+    CHECK(loop.recv_submitted);
+    loop.pool.free(partial.recv_slice);
+    loop.pool.free(partial.send_slice);
+}
 
 namespace {
 u32 g_h2_grpc_jit_calls = 0;
