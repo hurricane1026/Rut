@@ -623,6 +623,18 @@ TEST(grpc_proxy, deferred_cancel_flushes_after_full_control_buffer) {
     h.grpc.init();
     CHECK_EQ(h.grpc.pending_cancel_count, 0u);
 }
+TEST(grpc_proxy, request_header_filter_preserves_only_trailers_te) {
+    const hpack::Header allowed[] = {{Str{"te", 2}, Str{"trailers", 8}},
+                                     {Str{"x-meta", 6}, Str{"value", 5}}};
+    const hpack::Header blocked[] = {{Str{"connection", 10}, Str{"close", 5}},
+                                     {Str{"keep-alive", 10}, Str{"timeout=5", 8}},
+                                     {Str{"proxy-connection", 16}, Str{"keep-alive", 10}},
+                                     {Str{"transfer-encoding", 17}, Str{"chunked", 7}},
+                                     {Str{"upgrade", 7}, Str{"h2c", 3}},
+                                     {Str{"te", 2}, Str{"gzip", 4}}};
+    for (const auto& h : allowed) CHECK(grpc_request_header_allowed(h));
+    for (const auto& h : blocked) CHECK(!grpc_request_header_allowed(h));
+}
 TEST(grpc_proxy, tls_downstream_jit_epoll) {
     streaming_case<EpollEventLoop>(_tc, true);
 }
