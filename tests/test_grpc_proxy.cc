@@ -1206,6 +1206,64 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     loop.shutdown();
 }
 
+TEST(grpc_proxy, upstream_session_close_releases_slots_with_blocked_downstream) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection upstream;
+    upstream.reset();
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    loop.grpc_upstreams = &upstream;
+    Connection downstream;
+    downstream.reset();
+    u8 downstream_send[SlicePool::kSliceSize];
+    u8 downstream_recv[SlicePool::kSliceSize];
+    downstream.send_slice = downstream_send;
+    downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+    downstream.bind_request_receive_buffer(downstream_recv, sizeof(downstream_recv));
+    downstream.on_send = &pending_send;
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(3) != nullptr);
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(3) != nullptr);
+    GrpcExchange* exchanges[2];
+    for (u32 i = 0; i < 2; i++) {
+        exchanges[i] = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+        REQUIRE(exchanges[i] != nullptr);
+        exchanges[i]->init();
+        exchanges[i]->downstream = &downstream;
+        exchanges[i]->upstream = &upstream;
+        exchanges[i]->downstream_stream = exchanges[i]->upstream_stream = 1 + i * 2;
+        exchanges[i]->slot_held = true;
+        exchanges[i]->upstream_id = 7 + i;
+        downstream_h2.grpc.streams[i] = exchanges[i];
+        upstream_h2.grpc.streams[i] = exchanges[i];
+    }
+    downstream_h2.grpc.active = upstream_h2.grpc.active = 2;
+    grpc_connection_closed<GrpcDriveFixture>(&loop, upstream);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(loop.grpc_upstreams, nullptr);
+    CHECK_EQ(loop.released, 2u);
+    for (auto* x : exchanges) {
+        CHECK(x->upstream == nullptr);
+        CHECK_FALSE(x->slot_held);
+        CHECK_EQ(x->failure, 14u);
+        CHECK(x->response_end);
+    }
+    CHECK_EQ(downstream_h2.grpc.active, 2u);
+    grpc_connection_closed<GrpcDriveFixture>(&loop, upstream);
+    CHECK_EQ(loop.released, 2u);
+    for (auto* x : exchanges) {
+        grpc_detach(downstream_h2, x);
+        loop.pool.free(reinterpret_cast<u8*>(x));
+    }
+}
+
 TEST(grpc_proxy, timer_resume_expired_grpc_timeout_is_cancelled_before_forward) {
     EpollEventLoop loop;
     REQUIRE(loop.init(0, -1).has_value());
