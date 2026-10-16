@@ -336,10 +336,14 @@ struct Client {
         nghttp2_submit_settings(session, 0, nullptr, 0);
         return rc == 0;
     }
-    int request(u32 index, u32 bytes, bool end, const char* timeout = nullptr) {
+    int request(u32 index,
+                u32 bytes,
+                bool end,
+                const char* timeout = nullptr,
+                bool jit_forward = false) {
         rpcs[index].size = bytes;
         rpcs[index].end = end;
-        nghttp2_nv headers[] = {nv(":method", "POST"),
+        nghttp2_nv headers[8] = {nv(":method", "POST"),
                                 nv(":scheme", "http"),
                                 nv(":authority", "grpc.test"),
                                 nv(":path", "/test.Echo/Call"),
