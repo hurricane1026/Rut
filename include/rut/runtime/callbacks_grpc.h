@@ -227,12 +227,18 @@ void grpc_response_headers(
         x->response_end = true;
         return;
     }
+    hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
+    u32 filtered_n = 0;
+    for (u32 i = 0; i < n; i++) {
+        if (hs[i].name.eq({"content-length", 14})) continue;
+        if (filtered_n < Http2Conn::kMaxHeadersPerReq) filtered[filtered_n++] = hs[i];
+    }
     x->response_headers_len = http2_write_headers(x->response_headers,
                                                   sizeof(x->response_headers),
                                                   x->downstream_stream,
-                                                  hs,
-                                                  n,
-                                                  end && grpc_has_status(hs, n));
+                                                  filtered,
+                                                  filtered_n,
+                                                  end && grpc_has_status(filtered, filtered_n));
     if (!x->response_headers_len) x->failure = 8;
     x->response_end = end;
     if (end && !grpc_has_status(hs, n)) x->failure = 2;
@@ -241,8 +247,18 @@ template <typename Loop>
 void grpc_response_trailers(void*, Http2Conn& h, u32 sid, const hpack::Header* hs, u32 n, bool) {
     auto* x = grpc_find(h, sid);
     if (!x) return;
-    x->response_trailers_len = http2_write_headers(
-        x->response_trailers, sizeof(x->response_trailers), x->downstream_stream, hs, n, true);
+    hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
+    u32 filtered_n = 0;
+    for (u32 i = 0; i < n; i++) {
+        if (hs[i].name.eq({"content-length", 14})) continue;
+        if (filtered_n < Http2Conn::kMaxHeadersPerReq) filtered[filtered_n++] = hs[i];
+    }
+    x->response_trailers_len = http2_write_headers(x->response_trailers,
+                                                   sizeof(x->response_trailers),
+                                                   x->downstream_stream,
+                                                   filtered,
+                                                   filtered_n,
+                                                   true);
     if (!x->response_trailers_len) x->failure = 8;
     if (!grpc_has_status(hs, n)) x->failure = 2;
     x->response_end = true;
@@ -781,12 +797,12 @@ void grpc_tick(Loop* loop, Connection& conn) {
     if (h.grpc.upstream) {
         if (((h.grpc.connecting || !h.peer_settings_seen) &&
              now - h.grpc.connected_at_us >= static_cast<u64>(loop->upstream_timeout) * 1000000) ||
-            (h.grpc.active == 0 &&
-             (loop->is_draining() || h.peer_goaway ||
-              now - h.grpc.connected_at_us >= static_cast<u64>(loop->keepalive_timeout) * 1000000)))) {
-                loop->close_conn(conn);
-                return;
-            }
+            (h.grpc.active == 0 && (loop->is_draining() || h.peer_goaway ||
+                                    now - h.grpc.connected_at_us >=
+                                        static_cast<u64>(loop->keepalive_timeout) * 1000000))) {
+            loop->close_conn(conn);
+            return;
+        }
     } else {
         for (auto* x : h.grpc.streams)
             if (x && x->deadline_us && now >= x->deadline_us) x->failure = 4;
