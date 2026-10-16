@@ -36,6 +36,23 @@ inline bool grpc_attach(Http2Conn& h, GrpcExchange* x) {
     }
     return false;
 }
+inline void grpc_queue_cancel(Http2Conn& h, u32 stream_id) {
+    auto& g = h.grpc;
+    if (g.control_len + 13 <= sizeof(g.control)) {
+        g.control_len += write_rst_stream(g.control + g.control_len, stream_id, Http2Error::Cancel);
+        return;
+    }
+    for (u32 i = 0; i < g.pending_cancel_count; i++)
+        if (g.pending_cancels[i] == stream_id) return;
+    if (g.pending_cancel_count < 64) g.pending_cancels[g.pending_cancel_count++] = stream_id;
+}
+inline void grpc_flush_pending_cancels(Http2Conn& h) {
+    auto& g = h.grpc;
+    while (g.pending_cancel_count && sizeof(g.control) - g.control_len >= 13) {
+        const u32 stream_id = g.pending_cancels[--g.pending_cancel_count];
+        g.control_len += write_rst_stream(g.control + g.control_len, stream_id, Http2Error::Cancel);
+    }
+}
 inline void grpc_detach(Http2Conn& h, GrpcExchange* x) {
     for (auto& entry : h.grpc.streams) {
         if (entry != x) continue;
@@ -105,10 +122,7 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
         auto& h = *up->h2;
         h.consume_data(x->upstream_stream, x->download_len);
         if (auto* s = h.find_stream(x->upstream_stream)) {
-            if (cancel && x->request_headers_sent &&
-                h.grpc.control_len + 13 <= sizeof(h.grpc.control))
-                h.grpc.control_len += write_rst_stream(
-                    h.grpc.control + h.grpc.control_len, x->upstream_stream, Http2Error::Cancel);
+            if (cancel && x->request_headers_sent) grpc_queue_cancel(h, x->upstream_stream);
             s->state = Http2StreamState::Closed;
         }
         grpc_detach(h, x);
@@ -340,6 +354,7 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
     auto& g = h.grpc;
     if (g.connecting || conn.on_send || g.busy) return;
     g.busy = true;
+    grpc_flush_pending_cancels(h);
     if (h.conn_recv_credit && sizeof(g.control) - g.control_len >= 26) {
         u32 written = 0;
         h.process(
@@ -449,6 +464,7 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
                                   sizeof(g.control) - g.control_len,
                                   &written);
     g.control_len += written;
+    grpc_flush_pending_cancels(h);
     const u32 remaining = conn.recv_buf.len() - result.consumed;
     if (remaining) __builtin_memmove(conn.recv_slice, conn.recv_slice + result.consumed, remaining);
     conn.reset_request_receive_buffer();

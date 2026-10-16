@@ -604,6 +604,25 @@ TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     CHECK_EQ(select_backend(0, 2, now + 3), 1u);
     loop->shutdown();
 }
+TEST(grpc_proxy, deferred_cancel_flushes_after_full_control_buffer) {
+    Http2Conn h{};
+    h.grpc.init();
+    h.grpc.control_len = sizeof(h.grpc.control) - 6;
+    grpc_queue_cancel(h, 17);
+    CHECK_EQ(h.grpc.pending_cancel_count, 1u);
+    CHECK_EQ(h.grpc.control_len, sizeof(h.grpc.control) - 6);
+    grpc_queue_cancel(h, 17);
+    CHECK_EQ(h.grpc.pending_cancel_count, 1u);
+    h.grpc.control_len = 0;
+    grpc_flush_pending_cancels(h);
+    CHECK_EQ(h.grpc.pending_cancel_count, 0u);
+    CHECK_EQ(h.grpc.control_len, 13u);
+    CHECK_EQ(h.grpc.control[3], 0x3u);
+    CHECK_EQ(h.grpc.control[8], 17u);
+    CHECK_EQ(h.grpc.control[12], static_cast<u8>(Http2Error::Cancel));
+    h.grpc.init();
+    CHECK_EQ(h.grpc.pending_cancel_count, 0u);
+}
 TEST(grpc_proxy, tls_downstream_jit_epoll) {
     streaming_case<EpollEventLoop>(_tc, true);
 }
