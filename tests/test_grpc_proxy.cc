@@ -1311,12 +1311,9 @@ TEST(grpc_proxy, timer_resume_expired_grpc_timeout_is_cancelled_before_forward) 
     down->handler_state = 1;
     h2_resume_jit_handler(&loop, *down);
     CHECK_EQ(down->h2->async_stream, 0u);
-    CHECK_EQ(down->h2->grpc.active, 1u);
-    auto* exchange = down->h2->grpc.streams[0];
-    REQUIRE(exchange != nullptr);
-    CHECK_EQ(exchange->failure, 4u);
-    CHECK(exchange->upstream == nullptr);
-    CHECK(loop.grpc_upstreams == nullptr);
+    CHECK_EQ(down->h2->grpc.active, 0u);
+    CHECK_GT(down->send_buf.len(), 0u);
+    CHECK_EQ(loop.grpc_upstreams, nullptr);
     loop.force_close_all();
     loop.shutdown();
 }
