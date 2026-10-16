@@ -1559,6 +1559,8 @@ TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
 
     auto loop0 = std::make_unique<EpollEventLoop>();
     auto loop1 = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop0->pool.init(8));
+    REQUIRE(loop1->pool.init(8));
     loop0->shard_id = 0;
     loop1->shard_id = 1;
     const RouteConfig* active = &cfg;
@@ -1572,6 +1574,8 @@ TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
     loop1->fire_due_timers();
     CHECK_EQ(loop0->timer_fire_count[0], 0u);  // wrong shard: never fires
     CHECK_GE(loop1->timer_fire_count[0], 1u);  // pinned shard fires
+    loop0->pool.destroy();
+    loop1->pool.destroy();
 }
 
 TEST(timer, event_loop_fires_due_timer) {
@@ -1590,6 +1594,7 @@ TEST(timer, event_loop_fires_due_timer) {
     loop->fire_due_timers();  // now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
+    loop->pool.destroy();
 }
 
 TEST(timer, event_loop_timer_json_allocates_scratch_and_counts_invocation) {
@@ -1608,6 +1613,7 @@ TEST(timer, event_loop_timer_json_allocates_scratch_and_counts_invocation) {
     CHECK_EQ(g_timer_json_calls, 1u);
     CHECK_EQ(g_timer_json_successes, 1u);
     CHECK_EQ(loop->timer_fire_count[0], 1u);
+    loop->pool.destroy();
 }
 
 TEST(timer, event_loop_timer_pool_failure_skips_and_reschedules) {
@@ -1649,6 +1655,7 @@ TEST(timer, io_uring_loop_fires_due_timer) {
     RouteConfig cfg{};
     REQUIRE(cfg.add_timer("t", 1, /*interval_ms=*/1, &timer_probe_fn));
     auto loop = std::make_unique<IoUringEventLoop>();
+    REQUIRE(loop->pool.init(8));
     const RouteConfig* active = &cfg;
     loop->config_ptr = &active;
     g_timer_probe_calls = 0;
@@ -1659,6 +1666,7 @@ TEST(timer, io_uring_loop_fires_due_timer) {
     loop->fire_due_timers();  // now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
+    loop->pool.destroy();
 }
 
 // A hot reload swapping *config_ptr must re-arm timer deadlines for the new
@@ -1672,6 +1680,7 @@ TEST(timer, rearms_on_config_swap) {
     REQUIRE(cfg_b.add_timer("b", 1, /*interval_ms=*/1, &timer_probe_fn));
 
     auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->pool.init(8));
     const RouteConfig* active = &cfg_a;
     loop->config_ptr = &active;
     loop->fire_due_timers();  // arm for config A
@@ -1685,6 +1694,7 @@ TEST(timer, rearms_on_config_swap) {
     usleep(5000);
     loop->fire_due_timers();  // B's timer now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
+    loop->pool.destroy();
 }
 
 // The `by:` clause compiles to a composite metering-key spec on the RIR function.
