@@ -450,7 +450,7 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                      "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
                      "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
                      "route POST \"/jit.Echo/Call\" { return forward(grpc) }\n"
-                     "route POST \"/jitwait.Echo/Call\" { return forward(grpc) }\n",
+                     "route POST \"/jitwait.Echo/Call\" { wait(100) return forward(grpc) }\n",
                      get_port(server->listen_fd));
         const bool written = write(file, source, len) == len;
         close(file);
@@ -573,31 +573,31 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                 CHECK(a.until(13, true));
                 CHECK(a.rpcs[13].ok);
                 CHECK_EQ(a.rpcs[13].received, 4096u);
-                CHECK_EQ(a.request(15, 0, true, nullptr, true, true), 29);
+                CHECK_EQ(a.request(14, 0, true, nullptr, true, true), 29);
+                CHECK(a.until(14, true));
+                CHECK(a.rpcs[14].ok);
+                CHECK_EQ(a.request(15, 128, false, nullptr, true, true), 31);
+                CHECK(a.until(15, false));
+                a.rpcs[15].size = 128;
+                a.rpcs[15].end = true;
+                CHECK_EQ(nghttp2_session_resume_data(a.session, 31), 0);
                 CHECK(a.until(15, true));
                 CHECK(a.rpcs[15].ok);
-                CHECK_EQ(a.request(16, 128, false, nullptr, true, true), 31);
+                CHECK_EQ(a.rpcs[15].received, 128u);
+                CHECK_EQ(a.request(16, 128, false), 33);
                 CHECK(a.until(16, false));
-                a.rpcs[16].size = 128;
-                a.rpcs[16].end = true;
-                CHECK_EQ(nghttp2_session_resume_data(a.session, 31), 0);
-                CHECK(a.until(16, true));
-                CHECK(a.rpcs[16].ok);
-                CHECK_EQ(a.rpcs[16].received, 128u);
-                CHECK_EQ(a.request(14, 128, false), 33);
-                CHECK(a.until(14, false));
                 shard->loop->drain(5);
                 const u64 drain_deadline = monotonic_us() + 2500000;
                 while (!a.goaway && monotonic_us() < drain_deadline) {
                     if (!a.step()) break;
                 }
                 CHECK(a.goaway);
-                a.rpcs[14].size = 32768;
-                a.rpcs[14].end = true;
+                a.rpcs[16].size = 32768;
+                a.rpcs[16].end = true;
                 CHECK_EQ(nghttp2_session_resume_data(a.session, 33), 0);
-                CHECK(a.until(14, true));
-                CHECK(a.rpcs[14].ok);
-                CHECK_EQ(a.rpcs[14].received, 32768u);
+                CHECK(a.until(16, true));
+                CHECK(a.rpcs[16].ok);
+                CHECK_EQ(a.rpcs[16].received, 32768u);
             }
         }
     }
