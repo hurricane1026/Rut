@@ -3668,7 +3668,7 @@ set_tests_properties(test_runtime_state_model PROPERTIES LABELS "unit;model")
 
 if(APPLE)
     include(macos.cmake)
-elseif(RUT_ENABLE_JIT AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+elseif(RUT_ENABLE_JIT)
     add_custom_target(check
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/check_runtime_state_model.py
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py

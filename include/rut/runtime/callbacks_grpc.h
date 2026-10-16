@@ -18,6 +18,8 @@ void grpc_drive_upstream(Loop*, Connection&);
 template <typename Loop>
 void grpc_kick_downstream(Loop*, Connection&);
 template <typename Loop>
+void grpc_deadline_fired(Loop*, Connection&);
+template <typename Loop>
 void grpc_on_upstream_data(void*, Connection&, IoEvent);
 template <typename Loop>
 void grpc_on_upstream_sent(void*, Connection&, IoEvent);

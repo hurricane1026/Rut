@@ -629,6 +629,7 @@ struct GrpcDriveFixture {
     u32 upstream_timeout = 1;
     u32 sends = 0;
     u32 last_send_len = 0;
+    u32 released = 0;
     bool closed = false;
     GrpcDriveFixture() { timer.init(); }
     bool submit_send(Connection&, const u8*, u32 len) {
@@ -648,8 +649,60 @@ struct GrpcDriveFixture {
     void epoch_enter() {}
     void epoch_leave() {}
     void close_conn(Connection&) { closed = true; }
+    bool upstream_acquire(u16, u32) { return true; }
+    void upstream_release(u16) { released++; }
 };
+void pending_send(void*, Connection&, IoEvent) {}
 }  // namespace
+
+TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    u8 up_storage[SlicePool::kSliceSize];
+    upstream.send_slice = up_storage;
+    upstream.send_buf.bind(up_storage, sizeof(up_storage));
+    Http2Conn up_h2;
+    up_h2.init_client();
+    up_h2.grpc.upstream = true;
+    up_h2.grpc.preface_sent = true;
+    up_h2.peer_settings_seen = true;
+    upstream.h2 = &up_h2;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn down_h2;
+    down_h2.init_client();
+    downstream.h2 = &down_h2;
+    downstream.on_send = &pending_send;
+    auto* down_stream = down_h2.open_stream(1);
+    REQUIRE(down_stream != nullptr);
+    auto* up_stream = up_h2.open_stream(1);
+    REQUIRE(up_stream != nullptr);
+    GrpcExchange x;
+    x.init();
+    x.downstream = &downstream;
+    x.upstream = &upstream;
+    x.downstream_stream = 1;
+    x.upstream_stream = 1;
+    x.request_headers_sent = true;
+    x.deadline_us = monotonic_us() - 1;
+    x.slot_held = true;
+    x.upstream_id = 7;
+    down_h2.grpc.streams[0] = &x;
+    down_h2.grpc.active = 1;
+    up_h2.grpc.streams[0] = &x;
+    up_h2.grpc.active = 1;
+    grpc_deadline_fired(&loop, downstream);
+    CHECK_EQ(x.failure, 4u);
+    CHECK(x.upstream == nullptr);
+    CHECK_FALSE(x.slot_held);
+    CHECK_EQ(loop.released, 1u);
+    CHECK_EQ(down_h2.grpc.active, 1u);
+    CHECK_EQ(up_h2.grpc.active, 0u);
+    CHECK_EQ(up_stream->state, Http2StreamState::Closed);
+    CHECK_GT(loop.sends, 0u);
+    CHECK(downstream.on_send == &pending_send);
+}
 
 TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {
     GrpcDriveFixture loop;
