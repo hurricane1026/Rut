@@ -587,7 +587,7 @@ TEST(grpc_proxy, streaming_and_pooling_iouring) {
 }
 TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     GrpcBackendHealthReset health_reset{};
-    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    auto loop = std::make_unique<EpollEventLoop>();
     REQUIRE(loop->init(0, -1).has_value());
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
@@ -610,17 +610,29 @@ TEST(grpc_proxy, successful_connect_clears_consecutive_failures) {
     REQUIRE(loop->init(0, -1).has_value());
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
-    Connection* conn = loop->alloc_conn();
-    REQUIRE(conn != nullptr);
-    conn->upstream_idx = 0;
-    conn->upstream_backend_idx = 0;
     for (u32 i = 0; i < 2; i++) {
-        grpc_record_connect_result(*conn, false, monotonic_us());
+        Connection* conn = loop->alloc_conn();
+        REQUIRE(conn != nullptr);
+        conn->upstream_idx = 0;
+        conn->upstream_backend_idx = 0;
+        grpc_connected<EpollEventLoop>(
+            loop.get(), *conn, {conn->id, -ECONNREFUSED, 0, 0, IoEventType::UpstreamConnect, 0});
     }
     CHECK_EQ(health->fails, 2u);
-    grpc_record_connect_result(*conn, true, monotonic_us());
+    Connection* connected = loop->alloc_conn();
+    REQUIRE(connected != nullptr);
+    connected->upstream_idx = 0;
+    connected->upstream_backend_idx = 0;
+    REQUIRE(loop->alloc_h2(*connected));
+    connected->h2->grpc.connecting = true;
+    grpc_connected<EpollEventLoop>(
+        loop.get(), *connected, {connected->id, 1, 0, 0, IoEventType::UpstreamConnect, 0});
     CHECK_EQ(health->fails, 0u);
-    grpc_record_connect_result(*conn, false, monotonic_us());
+    Connection* final_attempt = loop->alloc_conn();
+    REQUIRE(final_attempt != nullptr);
+    final_attempt->upstream_idx = 0;
+    final_attempt->upstream_backend_idx = 0;
+    grpc_record_connect_result(*final_attempt, false, monotonic_us());
     CHECK_EQ(health->fails, 1u);
     loop->shutdown();
 }
