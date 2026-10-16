@@ -5,7 +5,10 @@
 #include "rut/compiler/parser.h"
 #include "rut/compiler/rir_builder.h"
 #include "rut/harness/handler_execution.h"
+#include "rut/jit/runtime_helpers.h"
+#include "rut/runtime/json.h"
 #include "rut/runtime/route_method.h"
+#include "rut/runtime/slice_pool.h"
 #include "rut/sim/simulate_engine.h"
 #include "test.h"
 #include <memory>
@@ -22,6 +25,32 @@ using namespace rut;
 using namespace rut::sim;
 
 namespace {
+
+static u64 json_allocating_handler(void* conn, jit::HandlerCtx*, const u8*, u32, void*) {
+    u8 has_value = 0;
+    const char* out = nullptr;
+    u32 out_len = 0;
+    i64 out_number = 0;
+    rut_helper_json(conn,
+                    nullptr,
+                    static_cast<u32>(json::Op::EmptyObject),
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    0,
+                    &has_value,
+                    &out,
+                    &out_len,
+                    &out_number);
+    return jit::HandlerResult::make_status(has_value == 1 && out != nullptr && out_len == 2 &&
+                                                   out[0] == '{' && out[1] == '}'
+                                               ? 200
+                                               : 500)
+        .pack();
+}
 
 static CaptureEntry make_entry(const char* req, u16 status, const char* upstream = nullptr) {
     CaptureEntry entry{};
@@ -415,6 +444,23 @@ TEST(simulate_engine, wait_handler_drives_state_machine_to_terminal_status) {
     CHECK_EQ(result.action, jit::HandlerAction::ReturnStatus);
     CHECK_EQ(result.actual_status, 204u);
     CHECK_EQ(result.yield_count, 1u);
+
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(simulate_engine, json_response_body_allocates_in_offline_connection) {
+    const char* src = "route GET \"/json\" { return 200 }\n";
+    FrontendRirModule rir{};
+    REQUIRE(compile_to_rir(src, rir));
+
+    Engine engine;
+    REQUIRE(engine.init(rir.module, nullptr, 0));
+    engine.routes[0].fn = &json_allocating_handler;
+    const auto result =
+        simulate_one(engine, make_entry("GET /json HTTP/1.1\r\nHost: x\r\n\r\n", 200));
+    CHECK_EQ(result.verdict, Verdict::Match);
+    CHECK_EQ(result.actual_status, 200u);
 
     engine.shutdown();
     rir.destroy();

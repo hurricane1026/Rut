@@ -280,6 +280,12 @@ ScenarioResult drive_scenario(const ScenarioSpec& scenario, const HarnessSpec& h
     }
 
     ConnectionExecution connection{};
+    if (!connection.json_pool_ready) {
+        out.harness.outcome = Outcome::Failed;
+        out.harness.cleanup = CleanupOutcome::Clean;
+        copy_detail(out.harness, "scenario JSON arena pool initialization failed");
+        return out;
+    }
     connection.reset(scenario.peer_addr, scenario.peer_port, scenario.shard_id);
     for (u32 i = 0; i < routing_path.len; i++)
         connection.connection.req_path[i] = routing_path.ptr[i];

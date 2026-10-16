@@ -33,6 +33,12 @@
 #include <unistd.h>
 
 namespace rut {
+inline void release_completed_jit_json(Connection& conn) {
+    conn.json_arena.destroy();
+    conn.jit_response_body = {};
+    conn.jit_response_body_valid = false;
+}
+
 // --- Upstream backend selection + passive health (circuit breaking) ---
 //
 // Shards are share-nothing — one OS thread each — so per-shard state lives in
@@ -3196,6 +3202,8 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.clear_slots();
     const u32 response_size =
         conn.local_response_size ? conn.local_response_size : conn.send_buf.len();
+    // Response bytes no longer borrow the request-local JSON arena.
+    release_completed_jit_json(conn);
     conn.local_body_cursor = nullptr;
     conn.local_body_base = nullptr;
     conn.local_body_file_fd = -1;
@@ -3690,6 +3698,7 @@ void handle_jit_outcome(Loop* loop,
                     conn.keep_alive = false;
                     format_static_response(conn, 500, false);
                 }
+                release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -3732,6 +3741,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.keep_alive = false;
                 format_static_response(
                     conn, 500, false, is_head, ordinary_local_response_version(conn));
+                release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -3808,6 +3818,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.local_body_base = reinterpret_cast<const u8*>(body.data);
                 conn.local_body_file_fd = body.file_fd();
             }
+            release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
@@ -3831,6 +3842,7 @@ void handle_jit_outcome(Loop* loop,
             conn.resp_status =
                 config->redirect_policies[outcome.redirect_policy_id - 1].status_code;
             conn.keep_alive = false;
+            release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;

@@ -1271,6 +1271,39 @@ TEST(target_transform, h1_forward_rejects_before_upstream_side_effects) {
     }
 }
 
+TEST(jit_response, h1_json_body_is_copied_before_send_and_arena_reclaimed) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->json_arena.backend.pool = &pool;
+    REQUIRE(conn->json_arena.init(&pool));
+    const char body[] = "{\"ok\":true}";
+    auto* storage = static_cast<char*>(conn->json_arena.alloc(sizeof(body) - 1));
+    REQUIRE(storage != nullptr);
+    memcpy(storage, body, sizeof(body) - 1);
+    conn->jit_response_body = {storage, sizeof(body) - 1};
+    conn->jit_response_body_valid = true;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Get);
+    conn->keep_alive = true;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 0xffffu;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    REQUIRE_GT(conn->send_buf.len(), sizeof(body) - 1);
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), body));
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    conn->reset();
+    pool.destroy();
+}
+
 TEST(response_policy, suppress_body_metadata_fails_closed_before_upstream_connect) {
     SmallLoop loop;
     loop.setup();
@@ -10369,6 +10402,43 @@ TEST(http2, flow_controlled_route_body_boundaries_and_window_resume) {
         CHECK_EQ(body_seen, body_len);
         CHECK_EQ(h2.outbound_body_offset, body_len);
     }
+}
+
+TEST(http2, json_owned_body_survives_flow_control_stall_after_arena_release) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1, Http2StreamState::Open, 0, 0, true};
+    h2.conn_send_window = 0;
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    const char json_bytes[] = "{\"ok\":true}";
+    conn->json_arena.backend.pool = &pool;
+    REQUIRE(conn->json_arena.init(&pool));
+    auto* stored = static_cast<char*>(conn->json_arena.alloc(sizeof(json_bytes) - 1));
+    REQUIRE(stored != nullptr);
+    memcpy(stored, json_bytes, sizeof(json_bytes) - 1);
+    conn->jit_response_body = {stored, sizeof(json_bytes) - 1};
+    conn->jit_response_body_valid = true;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 0xffffu;
+    u8 response[4096]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    REQUIRE_EQ(h2.outbound_body_len, sizeof(json_bytes) - 1);
+    CHECK_EQ(memcmp(h2.outbound_body, json_bytes, sizeof(json_bytes) - 1), 0);
+    CHECK_EQ(h2.outbound_body, h2.json_outbound_body);
+    conn->reset();
+    pool.destroy();
 }
 
 TEST(http2, proxy_synth_owner_is_transactional_and_pinned) {

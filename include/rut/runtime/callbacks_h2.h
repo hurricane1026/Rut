@@ -53,6 +53,12 @@ inline void h2_reset_request_mutations(Connection& conn) {
     if (conn.response_header_buf.valid()) conn.response_header_buf.reset();
 }
 
+inline void h2_release_completed_jit_json(Connection& conn) {
+    conn.json_arena.destroy();
+    conn.jit_response_body = {};
+    conn.jit_response_body_valid = false;
+}
+
 inline bool h2_prepare_forward_request(
     Connection& conn, const u8* synth, u32 synth_len, u8* out, u32 out_cap, u32* out_len) {
     if (synth_len > out_cap) return false;
@@ -841,6 +847,13 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                      const JitDispatchOutcome& o,
                      const RouteConfig* cfg,
                      bool is_head) {
+    struct JsonArenaRelease {
+        Connection* conn;
+        bool enabled;
+        ~JsonArenaRelease() {
+            if (enabled) h2_release_completed_jit_json(*conn);
+        }
+    } json_release{d.conn, true};
     const u8* body = nullptr;
     u32 body_len = 0;
     if (o.response_body_idx == 0xffffu) {
