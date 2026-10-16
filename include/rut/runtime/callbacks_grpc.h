@@ -509,14 +509,23 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
         if (grpc_rejected_by_goaway(h, *x)) x->failure = 14;
         grpc_kick_downstream(loop, *x->downstream);
     }
-    g.busy = false;
     // RST/GOAWAY callbacks run while the H2 parser is busy, so the first kick
-    // above is intentionally suppressed. Kick again after releasing busy or a
-    // timer-arm failure can leave the downstream error parked indefinitely.
+    // above is intentionally suppressed. Snapshot downstream connections
+    // before releasing busy: the refresh/kick can retire and free exchanges.
+    Connection* downstreams[64];
+    u32 downstream_count = 0;
     for (auto* x : g.streams) {
         if (!x || !x->downstream) continue;
-        grpc_refresh_timer(loop, *x->downstream);
-        grpc_kick_downstream(loop, *x->downstream);
+        bool seen = false;
+        for (u32 i = 0; i < downstream_count; i++)
+            if (downstreams[i] == x->downstream) seen = true;
+        if (!seen) downstreams[downstream_count++] = x->downstream;
+    }
+    g.busy = false;
+    // A timer-arm failure can leave a downstream error parked indefinitely.
+    for (u32 i = 0; i < downstream_count; i++) {
+        grpc_refresh_timer(loop, *downstreams[i]);
+        grpc_kick_downstream(loop, *downstreams[i]);
     }
     grpc_drive_upstream(loop, conn);
     if (conn.h2 && !loop->submit_recv(conn)) loop->close_conn(conn);
@@ -851,10 +860,34 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
         return;
     } else if (!loop->arm_throttle_timer(conn, delay * 1000)) {
         g.timer_deadline_us = 0;
-        for (auto* x : g.streams)
-            if (x && x->deadline_us) x->failure = 8;
-        for (auto* x : g.streams)
-            if (x && x->downstream) grpc_kick_downstream(loop, *x->downstream);
+        for (auto* x : g.streams) {
+            if (!x || !x->deadline_us) continue;
+            x->failure = 8;
+            Connection* up = x->upstream;
+            if (!up || !up->h2) continue;
+            auto& uh = *up->h2;
+            uh.consume_data(x->upstream_stream, x->download_len);
+            if (auto* stream = uh.find_stream(x->upstream_stream)) {
+                if (x->request_headers_sent) grpc_queue_cancel(uh, x->upstream_stream);
+                stream->state = Http2StreamState::Closed;
+            }
+            grpc_detach(uh, x);
+            x->upstream = nullptr;
+            if (x->slot_held) {
+                loop->upstream_release(x->upstream_id);
+                x->slot_held = false;
+            }
+        }
+        Connection* downstreams[64];
+        u32 downstream_count = 0;
+        for (auto* x : g.streams) {
+            if (!x || !x->downstream) continue;
+            bool seen = false;
+            for (u32 i = 0; i < downstream_count; i++)
+                if (downstreams[i] == x->downstream) seen = true;
+            if (!seen) downstreams[downstream_count++] = x->downstream;
+        }
+        for (u32 i = 0; i < downstream_count; i++) grpc_kick_downstream(loop, *downstreams[i]);
         return;
     }
     conn.yield_armed = true;

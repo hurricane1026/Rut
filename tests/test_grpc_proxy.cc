@@ -631,18 +631,28 @@ struct GrpcDriveFixture {
     u32 upstream_timeout = 1;
     u32 sends = 0;
     u32 last_send_len = 0;
+    u32 downstream_sends = 0;
+    u32 downstream_last_send_len = 0;
+    bool complete_downstream_send = false;
     u32 released = 0;
     bool closed = false;
     GrpcDriveFixture() {
         timer.init();
-        pool_ready = pool.init(128, 0).has_value();
+        pool_ready = pool.init(128, 0, SlicePool::kMaxCachedSlices, 8).has_value();
     }
     ~GrpcDriveFixture() {
         if (pool_ready) pool.destroy();
     }
-    bool submit_send(Connection&, const u8*, u32 len) {
+    bool submit_send(Connection& conn, const u8*, u32 len) {
         sends++;
         last_send_len = len;
+        if (conn.h2 && !conn.h2->grpc.upstream) {
+            downstream_sends++;
+            downstream_last_send_len = len;
+            if (complete_downstream_send && conn.on_send)
+                conn.on_send(
+                    this, conn, {conn.id, 1, 0, 0, IoEventType::Send, static_cast<u8>(len)});
+        }
         return true;
     }
     bool submit_recv(Connection&) { return true; }
@@ -717,6 +727,7 @@ TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
 TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     GrpcDriveFixture loop;
     REQUIRE(loop.pool_ready);
+    loop.complete_downstream_send = true;
     Connection upstream;
     upstream.reset();
     u8 upstream_send[SlicePool::kSliceSize];
@@ -731,6 +742,8 @@ TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     upstream_h2.grpc.upstream = true;
     upstream_h2.peer_settings_seen = true;
     upstream_h2.grpc.preface_sent = true;
+    upstream_h2.preface_seen = true;
+    upstream_h2.our_settings_sent = true;
     upstream.h2 = &upstream_h2;
 
     Connection downstream;
@@ -745,33 +758,42 @@ TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     REQUIRE(downstream_h2.open_stream(3) != nullptr);
     REQUIRE(upstream_h2.open_stream(1) != nullptr);
     REQUIRE(upstream_h2.open_stream(3) != nullptr);
-    GrpcExchange reset_exchange;
-    GrpcExchange pending_exchange;
-    reset_exchange.init();
-    pending_exchange.init();
-    reset_exchange.downstream = pending_exchange.downstream = &downstream;
-    reset_exchange.upstream = pending_exchange.upstream = &upstream;
-    reset_exchange.downstream_stream = reset_exchange.upstream_stream = 1;
-    pending_exchange.downstream_stream = pending_exchange.upstream_stream = 3;
-    pending_exchange.deadline_us = monotonic_us() + 1000000;
-    downstream_h2.grpc.streams[0] = &reset_exchange;
-    downstream_h2.grpc.streams[1] = &pending_exchange;
+    auto* reset_exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    auto* pending_exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(reset_exchange != nullptr);
+    REQUIRE(pending_exchange != nullptr);
+    reset_exchange->init();
+    pending_exchange->init();
+    reset_exchange->downstream = pending_exchange->downstream = &downstream;
+    reset_exchange->upstream = pending_exchange->upstream = &upstream;
+    reset_exchange->downstream_stream = reset_exchange->upstream_stream = 1;
+    pending_exchange->downstream_stream = pending_exchange->upstream_stream = 3;
+    pending_exchange->deadline_us = monotonic_us() + 1000000;
+    pending_exchange->request_headers_sent = true;
+    pending_exchange->slot_held = true;
+    pending_exchange->upstream_id = 7;
+    downstream_h2.grpc.streams[0] = reset_exchange;
+    downstream_h2.grpc.streams[1] = pending_exchange;
     downstream_h2.grpc.active = 2;
-    upstream_h2.grpc.streams[0] = &reset_exchange;
-    upstream_h2.grpc.streams[1] = &pending_exchange;
+    upstream_h2.grpc.streams[0] = reset_exchange;
+    upstream_h2.grpc.streams[1] = pending_exchange;
     upstream_h2.grpc.active = 2;
-    // Model the completed upstream RST callback: the first exchange is ready
-    // to emit its failure while the second one is still deadline-pending.
-    reset_exchange.failure = 1;
-    reset_exchange.response_end = true;
-    grpc_refresh_timer(&loop, downstream);
-    u8 response[4096];
-    const u32 response_len = grpc_pump_downstream(&loop, downstream, response, sizeof(response));
-    CHECK_EQ(reset_exchange.failure, 1u);
-    CHECK_EQ(pending_exchange.failure, 8u);
-    CHECK_EQ(downstream_h2.grpc.active, 0u);
+
+    // Feed an actual upstream RST_STREAM through the production callback. The
+    // callback's first downstream kick is suppressed while the H2 parser is
+    // busy; the post-parser refresh must drain both exchanges when arming the
+    // deadline timer fails, without another caller pump.
+    upstream.bind_request_receive_buffer(upstream_recv, sizeof(upstream_recv));
+    const u32 rst_len = write_rst_stream(upstream_recv, 1, Http2Error::Cancel);
+    upstream.recv_buf.commit(rst_len);
+    grpc_on_upstream_data<GrpcDriveFixture>(
+        &loop, upstream, {upstream.id, 1, 0, 0, IoEventType::Recv, 1});
+
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(loop.released, 1u);
     CHECK_EQ(downstream_h2.grpc.timer_deadline_us, 0u);
-    CHECK_GT(response_len, 0u);
+    CHECK(loop.downstream_sends > 0);
+    CHECK_GT(loop.downstream_last_send_len, 0u);
 }
 
 TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {
