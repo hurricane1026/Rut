@@ -163,6 +163,10 @@ void grpc_connection_closed(void* lp, Connection& conn) {
             if (!x->response_end) x->failure = 14;
             x->response_end = true;
             Connection* down = x->downstream;
+            if (x->slot_held) {
+                loop->upstream_release(x->upstream_id);
+                x->slot_held = false;
+            }
             x = nullptr;
             if (down) grpc_kick_downstream(loop, *down);
         }
@@ -373,6 +377,8 @@ template <typename Loop>
 void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result <= 0 || static_cast<u32>(ev.result) > conn.send_buf.len() - conn.send_progress) {
+        if (conn.h2 && !conn.h2->peer_settings_seen)
+            grpc_record_handshake_result(conn, false, monotonic_us());
         loop->close_conn(conn);
         return;
     }
