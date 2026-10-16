@@ -510,6 +510,11 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
         grpc_kick_downstream(loop, *x->downstream);
     }
     g.busy = false;
+    // RST/GOAWAY callbacks run while the H2 parser is busy, so the first kick
+    // above is intentionally suppressed. Kick again after releasing busy or a
+    // timer-arm failure can leave the downstream error parked indefinitely.
+    for (auto* x : g.streams)
+        if (x && x->downstream) grpc_kick_downstream(loop, *x->downstream);
     grpc_drive_upstream(loop, conn);
     if (conn.h2 && !loop->submit_recv(conn)) loop->close_conn(conn);
 }
@@ -845,6 +850,8 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
         g.timer_deadline_us = 0;
         for (auto* x : g.streams)
             if (x && x->deadline_us) x->failure = 8;
+        for (auto* x : g.streams)
+            if (x && x->downstream) grpc_kick_downstream(loop, *x->downstream);
         return;
     }
     conn.yield_armed = true;

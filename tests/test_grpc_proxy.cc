@@ -1262,6 +1262,41 @@ TEST(grpc_proxy, io_uring_tls_h2_bulk_input_is_bounded_and_released) {
     loop.force_close_all();
     loop.shutdown();
 }
+TEST(grpc_proxy, io_uring_deferred_tls_reclaim_preserves_input_capacity) {
+    IoUringEventLoop loop;
+    auto initialized = loop.init(0, -1);
+    if (!initialized.has_value()) SKIP("io_uring unavailable");
+
+    Connection* normal = loop.alloc_conn();
+    REQUIRE(normal != nullptr);
+    void* normal_region =
+        mmap(nullptr, 16384, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(normal_region != MAP_FAILED);
+    normal->tls_in_slice = static_cast<u8*>(normal_region);
+    normal->tls_in_buf.bind(normal->tls_in_slice, 16384);
+    normal->pending_ops = 1;
+    normal->fd = -1;
+    loop.free_conn(*normal);
+    Connection& deferred_normal = loop.conns[normal->id];
+    CHECK_EQ(deferred_normal.tls_in_buf.capacity(), 16384u);
+    deferred_normal.pending_ops = 0;
+    loop.reclaim_pending();
+
+    Connection* bulk = loop.alloc_conn();
+    REQUIRE(bulk != nullptr);
+    u8* bulk_region = loop.pool.alloc_bulk();
+    REQUIRE(bulk_region != nullptr);
+    bulk->tls_in_slice = bulk_region;
+    bulk->tls_in_buf.bind(bulk_region, SlicePool::kBulkSliceSize);
+    bulk->pending_ops = 1;
+    bulk->fd = -1;
+    loop.free_conn(*bulk);
+    Connection& deferred_bulk = loop.conns[bulk->id];
+    CHECK_EQ(deferred_bulk.tls_in_buf.capacity(), SlicePool::kBulkSliceSize);
+    deferred_bulk.pending_ops = 0;
+    loop.reclaim_pending();
+    loop.shutdown();
+}
 TEST(grpc_proxy, idle_upstream_close_policy_respects_drain_and_activity) {
     GrpcProxyState g{};
     g.init();

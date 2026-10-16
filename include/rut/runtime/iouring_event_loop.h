@@ -3334,6 +3334,7 @@ public:
         u8* relay = c.upstream_relay_slice;
         u8* hs = c.response_header_slice;
         u8* tin = c.tls_in_slice;
+        const u32 tin_capacity = c.tls_in_buf.capacity();
         u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
         const u8 allocated_shard = c.shard_id;
@@ -3366,6 +3367,7 @@ public:
         conns[cid].upstream_relay_slice = relay;
         conns[cid].response_header_slice = hs;
         conns[cid].tls_in_slice = tin;
+        if (tin) conns[cid].tls_in_buf.bind(tin, tin_capacity);
         conns[cid].tls_out_slice = tout;
         conns[cid].pending_ops = ops;
         conns[cid].upstream_retiring_episode = retiring_episode;
