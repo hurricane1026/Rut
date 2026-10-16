@@ -606,8 +606,8 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
     h2.pending_local_is_head = is_head;
     h2.pending_local_cfg = cfg;
     h2.pending_local_mutation_count = 0;
-    h2.pending_local_mutation_overflow = d.conn->resp_header_mutation_overflow ||
-                                         d.conn->resp_header_mutation_pending_overflow;
+    h2.pending_local_mutation_overflow =
+        d.conn->resp_header_mutation_overflow || d.conn->resp_header_mutation_pending_overflow;
     h2.pending_local_mutation_bytes = 0;
     for (u32 i = 0; i < d.conn->resp_header_mutation_count; i++) {
         if (i >= 16) {
@@ -1238,12 +1238,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     // END_STREAM validates the length.
     if (open_request != nullptr && open_request->has_content_length &&
         grpc_request(*open_request)) {
-        if (!h2_park_local_outcome(d,
-                                   stream_id,
-                                   kOutcome,
-                                   cfg,
-                                   is_head,
-                                   open_request->content_length))
+        if (!h2_park_local_outcome(
+                d, stream_id, kOutcome, cfg, is_head, open_request->content_length))
             h2_emit_status(d, stream_id, 503);
         return;
     }
@@ -1287,8 +1283,9 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
             auto& dst = d.conn->resp_header_mutations[i];
             dst.name = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].name_offset),
                         mutations[i].name_len};
-            dst.value = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].value_offset),
-                         mutations[i].value_len};
+            dst.value = {
+                reinterpret_cast<const char*>(h2->pending_synth + mutations[i].value_offset),
+                mutations[i].value_len};
             dst.mode = static_cast<Connection::RespHeaderMutationMode>(mutations[i].mode);
         }
         d.conn->resp_header_mutation_count = mutation_count;

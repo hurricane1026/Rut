@@ -1662,12 +1662,12 @@ u32 g_h2_grpc_jit_calls = 0;
 u64 h2_grpc_local_status(void* conn, jit::HandlerCtx*, const u8*, u32, void*) {
     g_h2_grpc_jit_calls++;
     auto* c = static_cast<Connection*>(conn);
-    c->resp_header_mutations[0] = {{"x-local", 7}, {"kept", 4},
-                                    Connection::RespHeaderMutationMode::Set};
+    c->resp_header_mutations[0] = {
+        {"x-local", 7}, {"kept", 4}, Connection::RespHeaderMutationMode::Set};
     c->resp_header_mutation_count = 1;
     return jit::HandlerResult::make_status(207).pack();
 }
-}
+}  // namespace
 
 TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
     auto run = [&](u32 expected, u32 actual, bool mutate_concurrently) {
@@ -1695,24 +1695,14 @@ TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
         req.header_count = 1;
         const u8 synth[] = "POST /svc HTTP/1.1\r\n\r\n";
         g_h2_grpc_jit_calls = 0;
-        h2_invoke_emit(d,
-                       1,
-                       &route,
-                       nullptr,
-                       0,
-                       nullptr,
-                       synth,
-                       sizeof(synth) - 1,
-                       true,
-                       true,
-                       false,
-                       &req);
+        h2_invoke_emit(
+            d, 1, &route, nullptr, 0, nullptr, synth, sizeof(synth) - 1, true, true, false, &req);
         CHECK_EQ(g_h2_grpc_jit_calls, 1u);
         CHECK(h2.pending_local_outcome);
         CHECK_EQ(d.resp_len, 0u);
         if (mutate_concurrently) {
-            conn.resp_header_mutations[0] = {{"x-local", 7}, {"changed", 7},
-                                             Connection::RespHeaderMutationMode::Set};
+            conn.resp_header_mutations[0] = {
+                {"x-local", 7}, {"changed", 7}, Connection::RespHeaderMutationMode::Set};
             conn.resp_header_mutation_count = 1;
         }
         u8 body[8]{};
@@ -1720,20 +1710,21 @@ TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
         CHECK_FALSE(h2.pending_local_outcome);
         CHECK_EQ(g_h2_grpc_jit_calls, 1u);
         Http2FrameHeader frame;
-        if (d.resp_len != 0 && parse_frame_header(response, d.resp_len, &frame) == ParseStatus::Complete) {
+        if (d.resp_len != 0 &&
+            parse_frame_header(response, d.resp_len, &frame) == ParseStatus::Complete) {
             hpack::DynamicTable dyn;
             dyn.init(4096);
             hpack::Header decoded[16];
             u8 scratch[512];
             u32 decoded_count = 0;
             if (hpack::decode_header_block(dyn,
-                                          response + kFrameHeaderSize,
-                                          frame.length,
-                                          scratch,
-                                          sizeof(scratch),
-                                          decoded,
-                                          16,
-                                          &decoded_count)) {
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           16,
+                                           &decoded_count)) {
                 for (u32 i = 0; i < decoded_count; i++) {
                     if (decoded[i].name.eq({":status", 7}) && decoded[i].value.eq({"207", 3}))
                         result.status207 = true;
