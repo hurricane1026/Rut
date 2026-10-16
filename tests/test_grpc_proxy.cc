@@ -16,6 +16,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mman.h>
 
 using namespace rut;
 
@@ -625,6 +626,7 @@ struct GrpcDriveFixture {
     const RouteConfig** config_ptr = nullptr;
     TimerWheel timer;
     u32 keepalive_timeout = 60;
+    u32 upstream_timeout = 1;
     u32 sends = 0;
     u32 last_send_len = 0;
     bool closed = false;
@@ -956,6 +958,114 @@ TEST(grpc_proxy, handshake_timestamp_is_immutable_when_joining) {
     grpc_begin_handshake(g, 100);
     grpc_begin_handshake(g, 200);
     CHECK_EQ(g.connected_at_us, 100u);
+}
+TEST(grpc_proxy, settings_handshake_health_ejects_and_success_resets_once) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init();
+    h2.grpc.upstream = true;
+    conn.h2 = &h2;
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    GrpcDriveFixture loop;
+    for (u32 i = 0; i < kBackendFailThreshold; i++) {
+        h2.grpc.handshake_health_recorded = false;
+        h2.peer_settings_seen = false;
+        h2.grpc.connected_at_us = 1;
+        loop.closed = false;
+        grpc_tick(&loop, conn);
+        CHECK(loop.closed);
+    }
+    CHECK_EQ(health->fails, kBackendFailThreshold);
+    h2.grpc.handshake_health_recorded = false;
+    h2.peer_settings_seen = true;
+    grpc_record_handshake_result(conn, true, monotonic_us());
+    CHECK_EQ(health->fails, 0u);
+    grpc_record_handshake_result(conn, false, monotonic_us());
+    CHECK_EQ(health->fails, 0u);
+}
+TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init_client();
+    down->h2->open_stream(1);
+    down->request_config = &cfg;
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    req.has_content_length = true;
+    req.content_length = 5;
+    req.content_length_count = 1;
+    req.headers[0] = {Str{"content-type", 12}, Str{"application/grpc", 16}};
+    req.header_count = 1;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"content-type", 12}, {"application/grpc", 16}}};
+    REQUIRE(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 5, req, true));
+    REQUIRE(down->h2->grpc.streams[0] != nullptr);
+    CHECK_EQ(down->h2->grpc.streams[0]->failure, 13u);
+    CHECK_FALSE(down->h2->grpc.streams[0]->request_headers_sent);
+    loop.force_close_all();
+    loop.shutdown();
+}
+TEST(grpc_proxy, io_uring_tls_h2_bulk_input_is_bounded_and_released) {
+    IoUringEventLoop loop;
+    auto initialized = loop.init(0, -1);
+    if (!initialized.has_value()) SKIP("io_uring unavailable");
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    void* region = mmap(nullptr, 17408, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(region != MAP_FAILED);
+    conn->tls_in_slice = static_cast<u8*>(region);
+    conn->tls_in_buf.bind(conn->tls_in_slice, 17408);
+    for (u32 i = 0; i < 64; i++) conn->tls_in_buf.write_ptr()[i] = static_cast<u8>(i ^ 0x5a);
+    conn->tls_in_buf.commit(64);
+    const u32 before = loop.pool.bulk_available();
+    REQUIRE_GT(before, 0u);
+    REQUIRE(loop.grow_h2_tls_input(*conn));
+    CHECK(loop.pool.is_bulk(conn->tls_in_slice));
+    CHECK_EQ(loop.pool.bulk_available(), before - 1);
+    CHECK_EQ(conn->tls_in_buf.len(), 64u);
+    for (u32 i = 0; i < 64; i++) CHECK_EQ(conn->tls_in_buf.data()[i], static_cast<u8>(i ^ 0x5a));
+    loop.free_tls_in_buf(*conn);
+    CHECK_EQ(loop.pool.bulk_available(), before);
+    CHECK(conn->tls_in_slice == nullptr);
+
+    Connection exhausted;
+    exhausted.reset();
+    void* original =
+        mmap(nullptr, 17408, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    REQUIRE(original != MAP_FAILED);
+    exhausted.tls_in_slice = static_cast<u8*>(original);
+    exhausted.tls_in_buf.bind(exhausted.tls_in_slice, 17408);
+    exhausted.tls_in_buf.write_ptr()[0] = 0xa7;
+    exhausted.tls_in_buf.commit(1);
+    static u8* loans[65536];
+    u32 loan_count = 0;
+    while (loop.pool.bulk_available() != 0 && loan_count < 65536)
+        loans[loan_count++] = loop.pool.alloc_bulk();
+    CHECK_FALSE(loop.grow_h2_tls_input(exhausted));
+    CHECK_EQ(exhausted.tls_in_slice, static_cast<u8*>(original));
+    CHECK_EQ(exhausted.tls_in_buf.capacity(), 17408u);
+    CHECK_EQ(exhausted.tls_in_buf.data()[0], 0xa7u);
+    munmap(original, 17408);
+    exhausted.tls_in_slice = nullptr;
+    exhausted.tls_in_buf.bind(nullptr, 0);
+    for (u32 i = 0; i < loan_count; i++) loop.pool.free(loans[i]);
+    loop.force_close_all();
+    loop.shutdown();
 }
 TEST(grpc_proxy, idle_upstream_close_policy_respects_drain_and_activity) {
     GrpcProxyState g{};
