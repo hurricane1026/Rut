@@ -676,6 +676,24 @@ TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_d
     loop.shutdown();
 }
 
+TEST(grpc_proxy, h2_receive_promotion_replaces_full_ordinary_slice) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 ordinary = conn->recv_buf.capacity();
+    REQUIRE(ordinary < kDefaultMaxFrameSize + kFrameHeaderSize);
+    for (u32 i = 0; i < ordinary; i++) conn->recv_buf.write_ptr()[i] = static_cast<u8>(i);
+    conn->recv_buf.commit(ordinary);
+    u8* old = conn->recv_slice;
+    REQUIRE(grpc_grow_recv(&loop, *conn));
+    CHECK(conn->recv_slice != old);
+    CHECK(loop.pool.is_bulk(conn->recv_slice));
+    CHECK_EQ(conn->recv_buf.len(), ordinary);
+    loop.force_close_all();
+    loop.shutdown();
+}
+
 TEST(grpc_proxy, streaming_and_pooling_epoll) {
     streaming_case<EpollEventLoop>(_tc);
 }
