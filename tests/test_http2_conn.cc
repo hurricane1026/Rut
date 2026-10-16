@@ -1692,7 +1692,7 @@ u64 h2_resume_local_status(void* raw_conn, jit::HandlerCtx*, const u8* req, u32,
     auto* conn = static_cast<Connection*>(raw_conn);
     conn->resp_header_mutations[0] = {
         {"x-resumed", 9},
-        {reinterpret_cast<const char*>(req + 52), 4},
+        {reinterpret_cast<const char*>(req + 39), 4},
         Connection::RespHeaderMutationMode::Set};
     conn->resp_header_mutation_count = 1;
     return jit::HandlerResult::make_status(207).pack();
@@ -1701,18 +1701,19 @@ u64 h2_resume_local_status(void* raw_conn, jit::HandlerCtx*, const u8* req, u32,
 
 TEST(h2_serving, timer_resume_parks_grpc_local_result_and_preserves_mutation_alias) {
     for (const u32 actual : {3u, 2u, 4u}) {
-    Http2Conn h2;
-    h2.init();
-    Connection conn;
-    conn.reset();
-    FakeH2Loop loop;
-    u8 response[8192]{};
-    H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
-    conn.h2 = &h2;
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        FakeH2Loop loop;
+        u8 response[8192]{};
+        H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+        conn.h2 = &h2;
     const char* synth =
-        "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\ncontent-length: 3\r\n\r\n";
-    const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
-    for (u32 i = 0; i < synth_len; i++) h2.pending_synth[i] = static_cast<u8>(synth[i]);
+        "POST /svc HTTP/1.1\r\nhost: x\r\nx-source: on/g\r\ncontent-type: application/grpc\r\n"
+        "content-length: 3\r\n\r\n";
+        const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
+        for (u32 i = 0; i < synth_len; i++) h2.pending_synth[i] = static_cast<u8>(synth[i]);
     ParsedRequest open;
     open.reset();
     open.has_content_length = true;
@@ -1742,7 +1743,7 @@ TEST(h2_serving, timer_resume_parks_grpc_local_result_and_preserves_mutation_ali
     CHECK_EQ(h2.async_stream, 0u);
     CHECK_EQ(conn.resp_header_mutation_count, 1u);
     CHECK(conn.resp_header_mutations[0].value.ptr !=
-          reinterpret_cast<const char*>(h2.pending_synth + 52));
+          reinterpret_cast<const char*>(h2.pending_synth + 39));
 
     u8 body[4] = {'a', 'b', 'c', 'd'};
     H2Dispatch<FakeH2Loop> finish{&loop, &conn, response, sizeof(response), 0, false};
@@ -1766,10 +1767,15 @@ TEST(h2_serving, timer_resume_parks_grpc_local_result_and_preserves_mutation_ali
                                        8,
                                        &count));
     bool status = false;
+    bool resumed_header = false;
     const Str expected = actual == 3 ? Str{"207", 3} : Str{"400", 3};
-    for (u32 i = 0; i < count; i++)
+    for (u32 i = 0; i < count; i++) {
         if (decoded[i].name.eq({":status", 7}) && decoded[i].value.eq(expected)) status = true;
+        if (decoded[i].name.eq({"x-resumed", 9}) && decoded[i].value.eq({"on/g", 4}))
+            resumed_header = true;
+    }
     CHECK(status);
+    CHECK_EQ(resumed_header, actual == 3);
     }
 }
 
