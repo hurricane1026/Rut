@@ -2089,7 +2089,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
 
     const bool kClose = r.close || d.overflow;
 
-    if (!kClose && conn.h2->grpc.active && conn.h2->outbound_stream == 0) {
+    if (!kClose && conn.h2->grpc.active) {
         const u32 used = ctrl_len + d.resp_len;
         const u32 wire_room = used < conn.send_buf.capacity() ? conn.send_buf.capacity() - used : 0;
         const u32 storage_room = kRespStorageCap - d.resp_len;
