@@ -451,6 +451,10 @@ struct HirExpr {
     Span span{};
     bool may_nil = false;
     bool may_error = false;
+    // A Str produced by JSON serialization retains its media-type provenance
+    // so response lowering can select application/json without guessing from
+    // the carrier type alone.
+    bool is_json_encoded = false;
     bool bool_value = false;
     i64 int_value = 0;
     Str str_value{};

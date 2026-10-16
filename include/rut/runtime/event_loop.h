@@ -336,7 +336,9 @@ public:
                 (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, &scratch);
                 scratch.destroy();
             } else {
-                (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
+                timer_deadline_ns[i] =
+                    now + static_cast<u64>(cfg->timers[i].interval_ms) * 1'000'000ull;
+                continue;
             }
             timer_fire_count[i]++;
             // Reschedule from now (not the missed deadline) to avoid a catch-up

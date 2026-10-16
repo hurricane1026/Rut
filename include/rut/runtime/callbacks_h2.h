@@ -1290,10 +1290,7 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                                                    static_cast<u16>(kOutcome.upstream_id),
                                                    forward_synth,
                                                    forward_len);
-        if (!parked)
-            h2_emit_status(d, stream_id, 503);
-        else
-            retain_json = true;
+        if (!parked) h2_emit_status(d, stream_id, 503);
         return;
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {

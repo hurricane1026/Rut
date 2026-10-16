@@ -3837,6 +3837,118 @@ static FrontendResult<HirExpr> make_json_op(json::Op op,
     return out;
 }
 
+static u32 next_local_ref_index(const HirRoute* route, const HirLocal* locals, u32 local_count);
+
+// Convert an already analyzed value to JSON. Keeping the analyzed HIR value
+// here is significant for struct producers: rebuilding an AST field expression
+// would analyze (and therefore execute) the producer once per field.
+static FrontendResult<HirExpr> analyze_json_hir_value(const HirExpr& value,
+                                                      HirRoute* route,
+                                                      const HirModule& mod,
+                                                      u32 depth) {
+    if (depth > json::kMaxDepth) return frontend_error(FrontendError::TooManyItems, value.span);
+    if (value.type == HirTypeKind::Json) return value;
+    if (value.type == HirTypeKind::Struct) {
+        if (value.struct_index >= mod.structs.len)
+            return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+        HirExpr base = value;
+        if (base.kind != HirExprKind::LocalRef) {
+            if (route->locals.len >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, value.span);
+            HirLocal local{};
+            local.span = value.span;
+            local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+            local.type = value.type;
+            local.may_nil = value.may_nil;
+            local.may_error = value.may_error;
+            local.variant_index = value.variant_index;
+            local.struct_index = value.struct_index;
+            local.shape_index = value.shape_index;
+            local.tuple_len = value.tuple_len;
+            for (u32 ti = 0; ti < value.tuple_len; ++ti) {
+                local.tuple_types[ti] = value.tuple_types[ti];
+                local.tuple_variant_indices[ti] = value.tuple_variant_indices[ti];
+                local.tuple_struct_indices[ti] = value.tuple_struct_indices[ti];
+            }
+            local.init = value;
+            if (!route->locals.push(local))
+                return frontend_error(FrontendError::TooManyItems, value.span);
+            base = {};
+            base.kind = HirExprKind::LocalRef;
+            base.type = value.type;
+            base.span = value.span;
+            base.local_index = local.ref_index;
+            base.struct_index = value.struct_index;
+        }
+        auto result = make_json_op(json::Op::EmptyObject,
+                                   HirTypeKind::Json,
+                                   false,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   value.span,
+                                   route);
+        if (!result) return result;
+        const auto& decl = mod.structs[value.struct_index];
+        for (u32 i = 0; i < decl.fields.len; ++i) {
+            const auto& field = decl.fields[i];
+            HirExpr projected{};
+            projected.kind = HirExprKind::Field;
+            projected.type = field.type;
+            projected.span = value.span;
+            projected.str_value = field.name;
+            projected.generic_index = field.generic_index;
+            projected.generic_has_error_constraint = field.generic_has_error_constraint;
+            projected.generic_has_eq_constraint = field.generic_has_eq_constraint;
+            projected.generic_has_ord_constraint = field.generic_has_ord_constraint;
+            projected.generic_protocol_index = field.generic_protocol_index;
+            projected.generic_protocol_count = field.generic_protocol_count;
+            for (u32 pi = 0; pi < field.generic_protocol_count; ++pi)
+                projected.generic_protocol_indices[pi] = field.generic_protocol_indices[pi];
+            projected.variant_index = field.variant_index;
+            projected.struct_index = field.struct_index;
+            projected.shape_index = field.shape_index;
+            projected.tuple_len = field.tuple_len;
+            for (u32 ti = 0; ti < field.tuple_len; ++ti) {
+                projected.tuple_types[ti] = field.tuple_types[ti];
+                projected.tuple_variant_indices[ti] = field.tuple_variant_indices[ti];
+                projected.tuple_struct_indices[ti] = field.tuple_struct_indices[ti];
+            }
+            if (!route->exprs.push(base))
+                return frontend_error(FrontendError::TooManyItems, value.span);
+            projected.lhs = &route->exprs[route->exprs.len - 1];
+            auto child = analyze_json_hir_value(projected, route, mod, depth + 1);
+            if (!child) return child;
+            HirExpr key{};
+            key.kind = HirExprKind::StrLit;
+            key.type = HirTypeKind::Str;
+            key.str_value = field.name;
+            result = make_json_op(json::Op::Member,
+                                  HirTypeKind::Json,
+                                  false,
+                                  &result.value(),
+                                  &key,
+                                  &child.value(),
+                                  value.span,
+                                  route);
+            if (!result) return result;
+        }
+        return result;
+    }
+    if (value.may_nil || value.may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    json::Op op;
+    if (value.type == HirTypeKind::Str)
+        op = json::Op::Quote;
+    else if (value.type == HirTypeKind::I32 || value.type == HirTypeKind::I64)
+        op = json::Op::Integer;
+    else if (value.type == HirTypeKind::Bool)
+        op = json::Op::Boolean;
+    else
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    return make_json_op(op, HirTypeKind::Json, false, &value, nullptr, nullptr, value.span, route);
+}
+
 static FrontendResult<HirExpr> analyze_json_value(const AstExpr& ast,
                                                   HirRoute* route,
                                                   const HirModule& mod,
@@ -3898,42 +4010,8 @@ static FrontendResult<HirExpr> analyze_json_value(const AstExpr& ast,
             lit_str(
                 "unwrap optional/error values before constructing JSON; nil encodes JSON null"));
     if (value->type == HirTypeKind::Json) return value;
-    if (value->type == HirTypeKind::Struct) {
-        const auto& decl = mod.structs[value->struct_index];
-        auto result = make_json_op(json::Op::EmptyObject,
-                                   HirTypeKind::Json,
-                                   false,
-                                   nullptr,
-                                   nullptr,
-                                   nullptr,
-                                   ast.span,
-                                   route);
-        if (!result) return result;
-        for (u32 i = 0; i < decl.fields.len; ++i) {
-            AstExpr field{};
-            field.kind = AstExprKind::Field;
-            field.lhs = const_cast<AstExpr*>(&ast);
-            field.name = decl.fields[i].name;
-            field.span = ast.span;
-            auto child =
-                analyze_json_value(field, route, mod, locals, local_count, binding, depth + 1);
-            if (!child) return child;
-            HirExpr key{};
-            key.kind = HirExprKind::StrLit;
-            key.type = HirTypeKind::Str;
-            key.str_value = field.name;
-            result = make_json_op(json::Op::Member,
-                                  HirTypeKind::Json,
-                                  false,
-                                  &result.value(),
-                                  &key,
-                                  &child.value(),
-                                  ast.span,
-                                  route);
-            if (!result) return result;
-        }
-        return result;
-    }
+    if (value->type == HirTypeKind::Struct)
+        return analyze_json_hir_value(value.value(), route, mod, depth);
     json::Op op;
     if (value->type == HirTypeKind::Str)
         op = json::Op::Quote;
@@ -4064,14 +4142,16 @@ static FrontendResult<HirExpr> analyze_json_call(const AstExpr& expr,
         auto value = analyze_json_value(*expr.args[0], route, mod, locals, local_count, binding);
         if (!value) return value;
         const bool encode = name.eq(lit_str("encode"));
-        return make_json_op(encode ? json::Op::Stringify : json::Op::Parse,
-                            encode ? HirTypeKind::Str : HirTypeKind::Json,
-                            true,
-                            &value.value(),
-                            nullptr,
-                            nullptr,
-                            expr.span,
-                            route);
+        auto encoded = make_json_op(encode ? json::Op::Stringify : json::Op::Parse,
+                                    encode ? HirTypeKind::Str : HirTypeKind::Json,
+                                    true,
+                                    &value.value(),
+                                    nullptr,
+                                    nullptr,
+                                    expr.span,
+                                    route);
+        if (encoded && encode) encoded->is_json_encoded = true;
+        return encoded;
     }
     struct Entry {
         Str name;
@@ -4120,14 +4200,16 @@ static FrontendResult<HirExpr> analyze_json_call(const AstExpr& expr,
                     lit_str("JSON argument type mismatch; unwrap optional values first"));
             values[i] = value.value();
         }
-        return make_json_op(entry.op,
-                            entry.result,
-                            true,
-                            &values[0],
-                            entry.arity > 1 ? &values[1] : nullptr,
-                            entry.arity > 2 ? &values[2] : nullptr,
-                            expr.span,
-                            route);
+        auto result = make_json_op(entry.op,
+                                   entry.result,
+                                   true,
+                                   &values[0],
+                                   entry.arity > 1 ? &values[1] : nullptr,
+                                   entry.arity > 2 ? &values[2] : nullptr,
+                                   expr.span,
+                                   route);
+        if (result && entry.op == json::Op::Stringify) result->is_json_encoded = true;
+        return result;
     }
     return frontend_error(
         FrontendError::UnsupportedSyntax, expr.span, lit_str("unknown json operation"));
@@ -12347,7 +12429,7 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
                 stmt.span,
                 lit_str("dynamic response bodies cannot cross wait/for boundaries yet"));
         term->response_body_local_index = body->ref_index;
-        if (body->type == HirTypeKind::Json) {
+        if (body->type == HirTypeKind::Json || body->init.is_json_encoded) {
             bool has_type = false;
             for (u32 i = 0; i < term->response_headers.len; ++i)
                 if (http_header_name_eq_ci(term->response_headers[i].key.ptr,
