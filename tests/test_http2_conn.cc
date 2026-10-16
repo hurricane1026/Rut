@@ -1779,6 +1779,50 @@ TEST(h2_serving, grpc_local_jit_reset_clears_parked_outcome) {
     CHECK_FALSE(conn.epoch_held);
 }
 
+TEST(h2_serving, resumed_grpc_return_status_validates_declared_length) {
+    for (const auto& lengths :
+         {std::pair<u32, u32>{3, 3}, std::pair<u32, u32>{3, 2}, std::pair<u32, u32>{3, 4}}) {
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        FakeH2Loop loop;
+        u8 response[512]{};
+        H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = 207;
+        REQUIRE(h2_park_local_outcome(d, 1, outcome, nullptr, false, lengths.first));
+        u8 body[8]{};
+        h2_on_data_cb<FakeH2Loop>(&d, h2, 1, body, lengths.second, true);
+        h2_async_epoch_leave(&loop, conn);
+        Http2FrameHeader frame;
+        REQUIRE(parse_frame_header(response, d.resp_len, &frame) == ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[8];
+        u8 scratch[256];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           8,
+                                           &count));
+        bool status = false;
+        for (u32 i = 0; i < count; i++) {
+            if (decoded[i].name.eq({":status", 7}) &&
+                decoded[i].value.eq(lengths.first == lengths.second ? Str{"207", 3}
+                                                                    : Str{"400", 3}))
+                status = true;
+        }
+        CHECK(status);
+    }
+}
+
 TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_are_unchanged) {
     auto dispatch = [](RouteConfig* cfg, const char* path) {
         struct Result {

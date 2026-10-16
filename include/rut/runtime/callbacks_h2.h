@@ -595,6 +595,16 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
                            bool replace_owned_async = false) {
     Http2Conn& h2 = *d.conn->h2;
     if (h2.pending_stream != 0 || (h2.async_stream != 0 && !replace_owned_async)) return false;
+
+    // The timer-resume path is converting the occupied async slot into a
+    // deferred local response. Stabilize request-backed mutation values before
+    // publishing any pending state so allocation failure cannot leave two live
+    // owners of the same response.
+    if (replace_owned_async && d.conn->resp_header_mutation_count != 0 &&
+        (!d.loop->alloc_response_header_buf(*d.conn) ||
+         !d.conn->stabilize_response_mutations(h2.pending_synth, h2.async_synth_len)))
+        return false;
+
     h2_async_epoch_enter(d.loop, *d.conn);
     h2.pending_stream = stream_id;
     h2.pending_has_content_length = true;
@@ -611,10 +621,6 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
     h2.pending_local_mutation_overflow =
         d.conn->resp_header_mutation_overflow || d.conn->resp_header_mutation_pending_overflow;
     h2.pending_local_mutation_bytes = 0;
-    if (replace_owned_async && d.conn->resp_header_mutation_count != 0 &&
-        (!d.loop->alloc_response_header_buf(*d.conn) ||
-         !d.conn->stabilize_response_mutations(h2.pending_synth, h2.async_synth_len)))
-        return false;
     for (u32 i = 0; i < d.conn->resp_header_mutation_count; i++) {
         if (i >= 16) {
             h2.pending_local_mutation_overflow = true;
@@ -2460,8 +2466,18 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                         loop->submit_recv(conn);
                     }
                     return;
+                } else {
+                    // A failed stabilization/allocation must consume the
+                    // timer-owned async episode and fail closed. Falling
+                    // through would serialize the original outcome while the
+                    // old async owners remained live.
+                    kOutcome.status_code = 500;
+                    kOutcome.response_body_idx = 0;
+                    kOutcome.response_headers_idx = 0;
+                    h2_reset_request_mutations(conn);
                 }
             } else {
+                h2_reset_request_mutations(conn);
                 kOutcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
                 kOutcome.status_code = 400;
                 kOutcome.response_body_idx = 0;
