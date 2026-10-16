@@ -19,9 +19,25 @@ for development_checks in 0 1; do
     "$root/tests/simdjson/allocator_probe.cc" src/simdjson.cpp \
     -Wl,--gc-sections -nostdlib++ -o probe
   ./probe
-  if readelf -d probe | rg -q 'NEEDED.*(libstdc\+\+|libc\+\+)'; then
+  for tool in readelf rg; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "FAIL: required ELF inspection tool not found: $tool" >&2
+      exit 1
+    fi
+  done
+  if ! readelf -d probe > elf-dependencies.txt; then
+    echo 'FAIL: readelf could not inspect probe ELF dependencies' >&2
+    exit 1
+  fi
+  if rg -q 'NEEDED.*(libstdc\+\+|libc\+\+)' elf-dependencies.txt; then
     echo 'FAIL: C++ standard library dependency' >&2
     exit 1
+  else
+    rg_status=$?
+    if [[ $rg_status -ne 1 ]]; then
+      echo "FAIL: rg could not inspect probe ELF dependencies (status $rg_status)" >&2
+      exit 1
+    fi
   fi
   echo 'PASS: no libstdc++ / libc++ ELF dependency'
 done
