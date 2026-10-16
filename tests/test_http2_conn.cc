@@ -1656,6 +1656,88 @@ struct FakeH2Loop {
 };
 }  // namespace
 
+namespace {
+u32 g_h2_grpc_jit_calls = 0;
+
+u64 h2_grpc_local_status(void* conn, jit::HandlerCtx*, const u8*, u32, void*) {
+    g_h2_grpc_jit_calls++;
+    auto* c = static_cast<Connection*>(conn);
+    c->resp_header_mutations[0] = {{"x-local", 7}, {"kept", 4},
+                                    Connection::RespHeaderMutationMode::Set};
+    c->resp_header_mutation_count = 1;
+    return jit::HandlerResult::make_status(207).pack();
+}
+}
+
+TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
+    auto run = [&](u32 expected, u32 actual, bool mutate_concurrently) {
+        Http2Conn h2;
+        h2.init();
+        Connection conn;
+        conn.reset();
+        conn.h2 = &h2;
+        FakeH2Loop loop;
+        u8 response[512]{};
+        H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+        RouteEntry route{};
+        route.fn = &h2_grpc_local_status;
+        ParsedRequest req{};
+        req.method = HttpMethod::POST;
+        req.has_content_length = true;
+        req.content_length = expected;
+        req.headers[0] = {{"content-type", 12}, {"application/grpc", 16}};
+        req.header_count = 1;
+        const u8 synth[] = "POST /svc HTTP/1.1\r\n\r\n";
+        g_h2_grpc_jit_calls = 0;
+        h2_invoke_emit(d,
+                       1,
+                       &route,
+                       nullptr,
+                       0,
+                       nullptr,
+                       synth,
+                       sizeof(synth) - 1,
+                       true,
+                       true,
+                       false,
+                       &req);
+        CHECK_EQ(g_h2_grpc_jit_calls, 1u);
+        CHECK(h2.pending_local_outcome);
+        CHECK_EQ(d.resp_len, 0u);
+        if (mutate_concurrently) {
+            conn.resp_header_mutations[0] = {{"x-local", 7}, {"changed", 7},
+                                             Connection::RespHeaderMutationMode::Set};
+            conn.resp_header_mutation_count = 1;
+        }
+        u8 body[8]{};
+        h2_on_data_cb<FakeH2Loop>(&d, h2, 1, body, actual, true);
+        CHECK_FALSE(h2.pending_local_outcome);
+        CHECK_EQ(g_h2_grpc_jit_calls, 1u);
+        return d.resp_len;
+    };
+
+    CHECK_GT(run(3, 3, true), 0u);
+    CHECK_GT(run(3, 2, false), 0u);  // mismatch is a deferred 400 response
+    CHECK_GT(run(3, 4, false), 0u);  // mismatch is a deferred 400 response
+}
+
+TEST(h2_serving, grpc_local_jit_reset_clears_parked_outcome) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    FakeH2Loop loop;
+    u8 response[256]{};
+    H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+    h2.pending_stream = 7;
+    h2.pending_local_outcome = true;
+    h2.pending_has_content_length = true;
+    h2_on_reset_cb(&d, h2, 7, Http2Error::Cancel);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_FALSE(h2.pending_local_outcome);
+}
+
 TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_are_unchanged) {
     auto dispatch = [](RouteConfig* cfg, const char* path) {
         struct Result {

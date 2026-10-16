@@ -159,11 +159,12 @@ struct Http2Conn {
     // independent of Connection's scratch mutation log: another multiplexed
     // stream may invoke a handler before this one finishes.
     struct PendingRespMutation {
-        Str name;
-        Str value;
+        u16 name_offset;
+        u16 name_len;
+        u16 value_offset;
+        u16 value_len;
         u8 mode;
     };
-    static constexpr u32 kPendingRespMutationBytes = 4096;
     bool pending_local_outcome;
     u16 pending_local_status;
     u16 pending_local_body_idx;
@@ -174,7 +175,6 @@ struct Http2Conn {
     bool pending_local_mutation_overflow;
     u32 pending_local_mutation_bytes;
     PendingRespMutation pending_local_mutations[16];
-    u8 pending_local_mutation_storage[kPendingRespMutationBytes];
 
     // One suspended async (wait/timer) stream at a time, mirroring the
     // pending_stream body constraint. When a JIT handler yields on a timer the

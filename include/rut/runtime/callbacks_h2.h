@@ -592,7 +592,7 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
                            bool is_head,
                            u32 content_length) {
     Http2Conn& h2 = *d.conn->h2;
-    if (h2.pending_stream != 0 || h2.async_stream != 0 || h2.grpc.active != 0) return false;
+    if (h2.pending_stream != 0 || h2.async_stream != 0) return false;
     h2_async_epoch_enter(d.loop, *d.conn);
     h2.pending_stream = stream_id;
     h2.pending_has_content_length = true;
@@ -616,17 +616,19 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
         }
         const auto& src = d.conn->resp_header_mutations[i];
         const u32 need = src.name.len + src.value.len;
-        if (need > Http2Conn::kPendingRespMutationBytes - h2.pending_local_mutation_bytes) {
+        if (need > Http2Conn::kBodySynthCap - h2.pending_local_mutation_bytes) {
             h2.pending_local_mutation_overflow = true;
             break;
         }
         auto& dst = h2.pending_local_mutations[h2.pending_local_mutation_count++];
-        u8* storage = h2.pending_local_mutation_storage + h2.pending_local_mutation_bytes;
+        u8* storage = h2.pending_synth + h2.pending_local_mutation_bytes;
+        dst.name_offset = static_cast<u16>(h2.pending_local_mutation_bytes);
+        dst.name_len = static_cast<u16>(src.name.len);
         for (u32 j = 0; j < src.name.len; j++) storage[j] = static_cast<u8>(src.name.ptr[j]);
-        dst.name = {reinterpret_cast<const char*>(storage), src.name.len};
         storage += src.name.len;
+        dst.value_offset = static_cast<u16>(h2.pending_local_mutation_bytes + src.name.len);
+        dst.value_len = static_cast<u16>(src.value.len);
         for (u32 j = 0; j < src.value.len; j++) storage[j] = static_cast<u8>(src.value.ptr[j]);
-        dst.value = {reinterpret_cast<const char*>(storage), src.value.len};
         h2.pending_local_mutation_bytes += need;
         dst.mode = static_cast<u8>(src.mode);
     }
@@ -1283,8 +1285,10 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         h2_reset_request_mutations(*d.conn);
         for (u32 i = 0; i < mutation_count; i++) {
             auto& dst = d.conn->resp_header_mutations[i];
-            dst.name = mutations[i].name;
-            dst.value = mutations[i].value;
+            dst.name = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].name_offset),
+                        mutations[i].name_len};
+            dst.value = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].value_offset),
+                         mutations[i].value_len};
             dst.mode = static_cast<Connection::RespHeaderMutationMode>(mutations[i].mode);
         }
         d.conn->resp_header_mutation_count = mutation_count;
