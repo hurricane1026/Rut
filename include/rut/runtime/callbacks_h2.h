@@ -2277,6 +2277,14 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
     ctx->resume_event_result = conn.resume_event_result;
+    bool retain_json = false;
+    struct JsonLifetime {
+        Connection* conn;
+        bool* retain;
+        ~JsonLifetime() {
+            if (!*retain) h2_release_completed_jit_json(*conn);
+        }
+    } json_lifetime{&conn, &retain_json};
     JitDispatchOutcome kOutcome = invoke_jit_handler(conn.pending_handler_fn,
                                                      static_cast<void*>(&conn),
                                                      *ctx,
@@ -2326,6 +2334,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 
     // Another wait(): keep the stream parked and re-arm without flushing.
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
+        retain_json = true;
         h2->async_timer_ms = kOutcome.timer_ms;
         h2->async_state = static_cast<u16>(kOutcome.next_state);
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
