@@ -634,6 +634,7 @@ struct GrpcDriveFixture {
     u32 downstream_sends = 0;
     u32 downstream_last_send_len = 0;
     bool saw_downstream_stream3 = false;
+    bool saw_window_update = false;
     u32 released = 0;
     bool closed = false;
     GrpcDriveFixture() {
@@ -656,9 +657,14 @@ struct GrpcDriveFixture {
                                 (static_cast<u32>(data[off + 6]) << 16) |
                                 (static_cast<u32>(data[off + 7]) << 8) | data[off + 8];
                 if ((sid & 0x7fffffffu) == 3u) saw_downstream_stream3 = true;
+                if (data[off + 3] == static_cast<u8>(Http2FrameType::WindowUpdate))
+                    saw_window_update = true;
                 if (off + kFrameHeaderSize + frame_len > len) break;
                 off += kFrameHeaderSize + frame_len;
             }
+        } else if (len >= kFrameHeaderSize &&
+                   data[3] == static_cast<u8>(Http2FrameType::WindowUpdate)) {
+            saw_window_update = true;
         }
         return true;
     }
@@ -903,12 +909,17 @@ TEST(grpc_proxy, backend_reset_releases_slot_while_downstream_send_is_pending) {
     x->upstream = &upstream;
     x->downstream_stream = x->upstream_stream = 1;
     x->request_headers_sent = true;
+    x->download_len = 17;
     x->slot_held = true;
     x->upstream_id = 7;
     downstream_h2.grpc.streams[0] = x;
     downstream_h2.grpc.active = 1;
     upstream_h2.grpc.streams[0] = x;
     upstream_h2.grpc.active = 1;
+    auto* upstream_stream = upstream_h2.find_stream(1);
+    REQUIRE(upstream_stream != nullptr);
+    upstream_stream->manual_window = true;
+    upstream_stream->recv_unconsumed = x->download_len;
 
     const u32 rst_len = write_rst_stream(upstream_recv, 1, Http2Error::Cancel);
     upstream.recv_buf.commit(rst_len);
@@ -923,6 +934,7 @@ TEST(grpc_proxy, backend_reset_releases_slot_while_downstream_send_is_pending) {
     CHECK(x->upstream == nullptr);
     CHECK_FALSE(x->slot_held);
     CHECK_EQ(upstream_h2.grpc.control_len, 0u);
+    CHECK(loop.saw_window_update);
     CHECK_EQ(downstream_h2.grpc.timer_deadline_us, 0u);
     grpc_detach(downstream_h2, x);
     loop.pool.free(reinterpret_cast<u8*>(x));

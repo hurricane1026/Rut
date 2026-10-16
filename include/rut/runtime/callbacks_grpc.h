@@ -355,6 +355,7 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
         }
         x->response_end = true;
         auto* d = static_cast<GrpcClientDispatch<Loop>*>(ctx);
+        h.consume_data(x->upstream_stream, x->download_len);
         Connection* down = x->downstream;
         if (auto* stream = h.find_stream(x->upstream_stream))
             stream->state = Http2StreamState::Closed;
