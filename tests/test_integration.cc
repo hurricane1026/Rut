@@ -15571,7 +15571,16 @@ TEST(proxy_http2_rejection, static_proxy_preserves_head_and_http10) {
     i32 n = recv_timeout(c, response, sizeof(response), 2000);
     REQUIRE_GT(n, 0);
     CHECK(buf_contains(response, static_cast<u32>(n), "HTTP/1.0 503", 12));
-    CHECK_FALSE(buf_contains(response, static_cast<u32>(n), "Service Unavailable\r\n\r\n", 21));
+    u32 header_end = 0;
+    for (u32 i = 3; i < static_cast<u32>(n); i++) {
+        if (response[i - 3] == '\r' && response[i - 2] == '\n' && response[i - 1] == '\r' &&
+            response[i] == '\n') {
+            header_end = i + 1;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(static_cast<u32>(n), header_end);
     close(c);
     proxy.teardown();
 }

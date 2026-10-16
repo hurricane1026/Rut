@@ -1,5 +1,12 @@
 # Fault shims live in a dylib on macOS so dyld can interpose calls from LLVM.
 # Linux keeps the existing directly linked syscall overrides.
+set(CHECK_GRPC_COMMAND)
+set(CHECK_GRPC_DEPENDS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(CHECK_GRPC_COMMAND COMMAND $<TARGET_FILE:test_grpc_proxy>)
+    set(CHECK_GRPC_DEPENDS test_grpc_proxy)
+endif()
+
 if(APPLE)
     add_library(rut_test_fault SHARED ${PROJECT_SOURCE_DIR}/testing/fault_injection.cc)
 else()
@@ -3681,7 +3688,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_hpack>
         COMMAND $<TARGET_FILE:test_hpack_diff>
         COMMAND $<TARGET_FILE:test_http2_conn>
-        COMMAND $<TARGET_FILE:test_grpc_proxy>
+        ${CHECK_GRPC_COMMAND}
         COMMAND $<TARGET_FILE:test_buffer>
         COMMAND $<TARGET_FILE:test_cache_table>
         COMMAND $<TARGET_FILE:test_types>
@@ -3711,7 +3718,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_redirect_policy>
         COMMAND $<TARGET_FILE:test_iouring_idle_trim>
         COMMAND $<TARGET_FILE:test_splice>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_grpc_proxy test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice
         COMMENT "Running all tests..."
     )
 else()
