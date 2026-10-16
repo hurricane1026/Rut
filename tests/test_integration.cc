@@ -1509,6 +1509,7 @@ static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut
     return 0;
 }
 
+#if RUT_ENABLE_JIT_TESTS
 static rut::u32 g_timer_json_calls = 0;
 static rut::u32 g_timer_json_successes = 0;
 static rut::u64 timer_json_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut::u32, void* arena) {
@@ -1535,6 +1536,7 @@ static rut::u64 timer_json_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut:
     g_timer_json_successes++;
     return 0;
 }
+#endif
 
 // The event loop fires a registered timer once its interval elapses, invoking the
 // compiled handler with no Connection/Request and bumping the per-timer count.
@@ -1597,6 +1599,7 @@ TEST(timer, event_loop_fires_due_timer) {
     loop->pool.destroy();
 }
 
+#if RUT_ENABLE_JIT_TESTS
 TEST(timer, event_loop_timer_json_allocates_scratch_and_counts_invocation) {
     using namespace rut;
     RouteConfig cfg{};
@@ -1644,6 +1647,7 @@ TEST(timer, event_loop_timer_pool_failure_skips_and_reschedules) {
     CHECK_EQ(loop->timer_fire_count[0], 1u);
     loop->pool.destroy();
 }
+#endif
 
 // The same scheduler must drive timers on the io_uring backend: main.cc prefers
 // io_uring when available, so a timer wired only into epoll would never fire on
