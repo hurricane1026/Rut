@@ -17,6 +17,17 @@
 
 using namespace rut;
 
+static bool slice_is_in_use(const SlicePool& pool, const u8* ptr) {
+    if (!ptr || !pool.base || !pool.in_use_map || pool.count == 0) return false;
+    const u64 base = reinterpret_cast<u64>(pool.base);
+    const u64 address = reinterpret_cast<u64>(ptr);
+    const u64 bytes = static_cast<u64>(pool.count) * SlicePool::kSliceSize;
+    if (address < base || address - base >= bytes) return false;
+    const u64 offset = address - base;
+    if (offset % SlicePool::kSliceSize != 0) return false;
+    return pool.in_use_map[offset / SlicePool::kSliceSize] != 0;
+}
+
 static Str cstr(const char* value) {
     u32 len = 0;
     while (value[len] != '\0') ++len;
@@ -211,7 +222,7 @@ TEST(json_network, large_http2_dynamic_body_survives_flow_control) {
     REQUIRE(h2->jit_outbound_slice != nullptr);
     u8* owned_slice = h2->jit_outbound_slice;
     CHECK_EQ(h2->outbound_body, h2->jit_outbound_slice);
-    CHECK(pool.bound_slice_valid(owned_slice));
+    CHECK(slice_is_in_use(pool, owned_slice));
     __builtin_memset(source, 0, sizeof(source));
 
     std::unique_ptr<u8[]> received = std::make_unique<u8[]>(kBodySize);
@@ -241,7 +252,7 @@ TEST(json_network, large_http2_dynamic_body_survives_flow_control) {
     for (u32 i = 0; i < kBodySize; ++i) body_matches &= received[i] == static_cast<u8>(i % 251);
     CHECK(body_matches);
     CHECK(h2->jit_outbound_slice == nullptr);
-    CHECK_FALSE(pool.bound_slice_valid(owned_slice));
+    CHECK_FALSE(slice_is_in_use(pool, owned_slice));
     conn->h2 = nullptr;
     loop->free_conn(*conn);
     pool.destroy();
@@ -378,7 +389,7 @@ TEST(json_network, large_dynamic_body_allocation_failure_is_transactional) {
     for (u32 i = 0; i < decoded_count; ++i)
         saw_500 |= headers[i].name.eq(lit_str(":status")) && headers[i].value.eq(lit_str("500"));
     CHECK(saw_500);
-    CHECK(pool.bound_slice_valid(occupied));
+    CHECK(slice_is_in_use(pool, occupied));
     pool.free(occupied);
     conn->h2 = nullptr;
     loop->free_conn(*conn);
@@ -441,14 +452,14 @@ TEST(json_network, queued_large_dynamic_body_transfers_slice_ownership) {
     REQUIRE(queued_slice != nullptr);
     CHECK(first_slice != queued_slice);
     h2_promote_queued(*h2);
-    CHECK_FALSE(pool.bound_slice_valid(first_slice));
+    CHECK_FALSE(slice_is_in_use(pool, first_slice));
     CHECK_EQ(h2->outbound_stream, 3u);
     CHECK_EQ(h2->outbound_body, queued_slice);
-    CHECK(pool.bound_slice_valid(queued_slice));
+    CHECK(slice_is_in_use(pool, queued_slice));
     CHECK_EQ(memcmp(h2->outbound_body, body, sizeof(body)), 0);
     CHECK(h2->jit_queued_slice == nullptr);
     h2_clear_outbound(*h2);
-    CHECK_FALSE(pool.bound_slice_valid(queued_slice));
+    CHECK_FALSE(slice_is_in_use(pool, queued_slice));
     conn->h2 = nullptr;
     loop->free_conn(*conn);
     pool.destroy();

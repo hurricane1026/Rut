@@ -340,7 +340,9 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
             body = storage;
         } else {
             body_pool = d.conn->json_arena.backend.pool;
-            if (body_pool == nullptr || (body_slice = body_pool->alloc()) == nullptr) return false;
+            if (body_pool == nullptr) return false;
+            body_slice = body_pool->alloc();
+            if (body_slice == nullptr) return false;
             __builtin_memcpy(body_slice, body, body_len);
             body = body_slice;
         }
