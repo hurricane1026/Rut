@@ -218,10 +218,11 @@ inline bool grpc_snapshot_response_mutations(const Connection& down, GrpcExchang
         auto& target = x.response_mutations[i];
         target.name_offset = static_cast<u16>(x.response_mutation_bytes);
         target.name_len = static_cast<u16>(source.name.len);
-        if (source.name.len)
-            __builtin_memcpy(x.response_mutation_storage + x.response_mutation_bytes,
-                             source.name.ptr,
-                             source.name.len);
+        for (u32 j = 0; j < source.name.len; j++) {
+            char c = source.name.ptr[j];
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+            x.response_mutation_storage[x.response_mutation_bytes + j] = static_cast<u8>(c);
+        }
         x.response_mutation_bytes += source.name.len;
         target.value_offset = static_cast<u16>(x.response_mutation_bytes);
         target.value_len = static_cast<u16>(source.value.len);
@@ -510,12 +511,14 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
         u32 opened = 0;
         u32 next_header = 0x7fffffffu;
         for (auto* x : g.streams) {
-            if (!x || x->failure) continue;
+            if (!x) continue;
             auto* stream = h.find_stream(x->upstream_stream);
             if (x->request_headers_sent) {
                 if (stream && stream->state != Http2StreamState::Closed) opened++;
-            } else if (x->upstream_stream < next_header)
-                next_header = x->upstream_stream;
+                continue;
+            }
+            if (x->failure || x->response_end) continue;
+            if (x->upstream_stream < next_header) next_header = x->upstream_stream;
         }
         for (u32 step = 0; step < 64; step++) {
             const u32 i = (g.cursor + step) % 64;

@@ -1087,6 +1087,7 @@ TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retire
 
     auto* retained_stream = h2.find_stream(1);
     REQUIRE(retained_stream != nullptr);
+    retained.failure = 14;
     retained.response_end = true;
     retained_stream->state = Http2StreamState::HalfClosedRemote;
     downstream.on_send = &pending_send;
@@ -1409,18 +1410,50 @@ TEST(grpc_proxy, terminal_response_releases_slot_while_downstream_send_is_blocke
         {Str{":status", 7}, Str{"200", 3}},
         {Str{"content-type", 12}, Str{"application/grpc", 16}},
         {Str{"grpc-status", 11}, Str{"0", 1}},
+        {Str{"X-Old", 5}, Str{"gone", 4}},
+        {Str{"x-trace", 7}, Str{"upstream", 8}},
     };
     downstream.resp_header_mutations[0] = {
+        {"X-Trace", 7}, {"jit", 3}, Connection::RespHeaderMutationMode::Set};
+    downstream.resp_header_mutations[1] = {
+        {"X-Old", 5}, {nullptr, 0}, Connection::RespHeaderMutationMode::Remove};
+    downstream.resp_header_mutations[2] = {
         {"grpc-status", 11}, {nullptr, 0}, Connection::RespHeaderMutationMode::Remove};
-    downstream.resp_header_mutation_count = 1;
+    downstream.resp_header_mutation_count = 3;
     REQUIRE(grpc_snapshot_response_mutations(downstream, headers));
-    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 3, terminal_headers, 3, true);
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 3, terminal_headers, 5, true);
     CHECK_FALSE(headers.slot_held);
     CHECK_EQ(loop.released, 2u);
     CHECK_EQ(headers.failure, 2u);
     CHECK(headers.response_end);
     CHECK_GT(headers.response_headers_len, 0u);
     CHECK((headers.response_headers[4] & 0x1u) != 0);
+    Http2FrameHeader response_frame;
+    REQUIRE(parse_frame_header(headers.response_headers,
+                               headers.response_headers_len,
+                               &response_frame) == ParseStatus::Complete);
+    hpack::DynamicTable response_dyn;
+    response_dyn.init(4096);
+    hpack::Header decoded_headers[16];
+    u8 response_scratch[512];
+    u32 decoded_count = 0;
+    REQUIRE(hpack::decode_header_block(response_dyn,
+                                       headers.response_headers + kFrameHeaderSize,
+                                       response_frame.length,
+                                       response_scratch,
+                                       sizeof(response_scratch),
+                                       decoded_headers,
+                                       16,
+                                       &decoded_count));
+    bool saw_trace = false;
+    bool saw_old = false;
+    for (u32 i = 0; i < decoded_count; i++) {
+        if (decoded_headers[i].name.eq({"x-trace", 7}) && decoded_headers[i].value.eq({"jit", 3}))
+            saw_trace = true;
+        if (decoded_headers[i].name.eq({"x-old", 5})) saw_old = true;
+    }
+    CHECK(saw_trace);
+    CHECK_FALSE(saw_old);
     CHECK_EQ(upstream_h2.grpc.streams[1], &headers);
     CHECK_EQ(downstream_h2.grpc.streams[1], &headers);
     CHECK_EQ(upstream_h2.grpc.active, 2u);
