@@ -744,8 +744,10 @@ TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     Connection downstream;
     downstream.reset();
     u8 downstream_send[SlicePool::kSliceSize];
+    u8 downstream_recv[SlicePool::kSliceSize];
     downstream.send_slice = downstream_send;
     downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+    downstream.bind_request_receive_buffer(downstream_recv, sizeof(downstream_recv));
     Http2Conn downstream_h2;
     downstream_h2.init_client();
     downstream.h2 = &downstream_h2;
