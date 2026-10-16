@@ -373,6 +373,7 @@ struct AstUpstreamDecl {
     //      present; status defaults to 200. Config-only data threaded verbatim
     //      through HIR→MIR→RIR into RouteConfig::set_upstream_health_check; no
     //      runtime probing in this slice.
+    bool http2 = false;
     bool hc_enabled = false;
     Str hc_path_lit{};             // raw `path:` string literal
     u32 hc_interval_ms = 0;        // `interval:` DurLit converted to ms

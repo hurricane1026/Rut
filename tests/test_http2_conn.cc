@@ -2082,3 +2082,147 @@ TEST(http2_conn, connection_window_update_overflow_goaway) {
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
+
+TEST(http2_client, response_data_and_fragmented_trailers) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.init_client();
+    c.on_trailers = &on_headers;
+    REQUIRE(c.open_stream(1));
+    u8 in[1024], out[1024];
+    Http2Settings settings;
+    settings.set_defaults();
+    u32 n = write_settings_frame(in, settings), written = 0;
+    const hpack::Header hs[] = {{{":status", 7}, {"200", 3}},
+                                {{"content-type", 12}, {"application/grpc", 16}}};
+    n += http2_write_headers(in + n, sizeof(in) - n, 1, hs, 2, false);
+    n += http2_write_data(in + n, 1, reinterpret_cast<const u8*>("hello"), 5, false);
+    CHECK(!c.process(in, n, out, sizeof(out), &written).close);
+    CHECK_EQ(cap.data_len, 5u);
+    const hpack::Header trailer[] = {{{"grpc-status", 11}, {"0", 1}},
+                                     {{"x-meta-bin", 10}, {"AAEC/w==", 8}}};
+    u8 encoded[256];
+    const u32 full = http2_write_headers(encoded, sizeof(encoded), 1, trailer, 2, true);
+    REQUIRE(full > 10);
+    n = put_frame(in, Http2FrameType::Headers, http2_flag::kEndStream, 1, encoded + 9, 1);
+    n += put_frame(
+        in + n, Http2FrameType::Continuation, http2_flag::kEndHeaders, 1, encoded + 10, full - 10);
+    CHECK(!c.process(in, n, out, sizeof(out), &written).close);
+    CHECK_EQ(cap.headers_calls, 2u);
+    CHECK(name_is(cap, 0, "grpc-status"));
+    CHECK(cap.end_stream);
+}
+
+TEST(http2_client, manual_credit_and_closed_stream_custody) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.init_client();
+    auto* stream = c.open_stream(1);
+    REQUIRE(stream);
+    stream->manual_window = true;
+    u8 in[256], out[256];
+    Http2Settings settings;
+    settings.set_defaults();
+    u32 n = write_settings_frame(in, settings), written = 0;
+    const hpack::Header hs[] = {{{":status", 7}, {"200", 3}}};
+    n += http2_write_headers(in + n, sizeof(in) - n, 1, hs, 1, false);
+    n += http2_write_data(in + n, 1, reinterpret_cast<const u8*>("body"), 4, false);
+    CHECK(!c.process(in, n, out, sizeof(out), &written).close);
+    CHECK_EQ(c.conn_recv_window, 65531);
+    CHECK(!has_frame(out, written, Http2FrameType::WindowUpdate, 0, 0));
+    stream->state = Http2StreamState::Closed;
+    auto* second = c.open_stream(3);
+    REQUIRE(second);
+    CHECK(second != stream);  // closed does not imply the delivered bytes were released
+    CHECK(!c.consume_data(1, 5));
+    CHECK(c.consume_data(1, 4));
+    CHECK(!c.consume_data(1, 1));
+    CHECK(!c.process(nullptr, 0, out, sizeof(out), &written).close);
+    CHECK_EQ(c.conn_recv_window, 65535);
+    CHECK(has_frame(out, written, Http2FrameType::WindowUpdate, 0, 0));
+}
+
+TEST(http2_client, informational_response_and_goaway_drain) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.init_client();
+    REQUIRE(c.open_stream(1));
+    Http2Settings settings;
+    settings.set_defaults();
+    u8 in[512], out[512];
+    u32 n = write_settings_frame(in, settings), written = 0;
+    const hpack::Header info[] = {{{":status", 7}, {"103", 3}}};
+    const hpack::Header final[] = {{{":status", 7}, {"200", 3}}};
+    n += http2_write_headers(in + n, sizeof(in) - n, 1, info, 1, false);
+    n += write_goaway(in + n, 1, Http2Error::NoError);
+    n += http2_write_headers(in + n, sizeof(in) - n, 1, final, 1, true);
+    CHECK(!c.process(in, n, out, sizeof(out), &written).close);
+    CHECK_EQ(cap.headers_calls, 2u);
+    CHECK(c.peer_goaway);
+    CHECK_EQ(c.peer_last_stream, 1u);
+    CHECK(c.open_stream(3) == nullptr);
+}
+
+TEST(http2_client, late_cancelled_headers_do_not_close_other_rpcs) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.init_client();
+    auto* first = c.open_stream(1);
+    REQUIRE(first);
+    REQUIRE(c.open_stream(3));
+    first->state = Http2StreamState::Closed;
+    Http2Settings settings;
+    settings.set_defaults();
+    u8 in[512], out[512];
+    u32 n = write_settings_frame(in, settings), written = 0;
+    const hpack::Header hs[] = {{{":status", 7}, {"200", 3}}};
+    n += http2_write_headers(in + n, sizeof(in) - n, 1, hs, 1, true);
+    n += http2_write_headers(in + n, sizeof(in) - n, 3, hs, 1, true);
+    CHECK(!c.process(in, n, out, sizeof(out), &written).close);
+    CHECK_EQ(cap.headers_calls, 1u);
+    CHECK_EQ(cap.last_stream, 3u);
+}
+
+TEST(http2_client, rejects_malformed_response_headers) {
+    const hpack::Header bad[] = {
+        {{"Connection", 10}, {"close", 5}},
+        {{"connection", 10}, {"close", 5}},
+        {{"x-meta", 6}, {"bad\rvalue", 9}},
+        {{":path", 5}, {"/", 1}},
+    };
+    for (const auto& header : bad) {
+        Http2Conn c;
+        c.init_client();
+        REQUIRE(c.open_stream(1));
+        Http2Settings settings;
+        settings.set_defaults();
+        u8 in[512], out[512];
+        u32 n = write_settings_frame(in, settings), written = 0;
+        const hpack::Header hs[] = {{{":status", 7}, {"200", 3}}, header};
+        n += http2_write_headers(in + n, sizeof(in) - n, 1, hs, 2, false);
+        CHECK(c.process(in, n, out, sizeof(out), &written).close);
+    }
+}
+
+TEST(http2_conn, goaway_refuses_new_stream_without_interrupting_existing_stream) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    u8 in[512], out[512], block[256];
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/rpc", 4}}};
+    const u32 encoded = http2_write_headers(block, sizeof(block), 1, hs, 2, false);
+    u32 n = with_preface(in, block, encoded), written = 0;
+    CHECK(!c.process(in, n, out, sizeof(out), &written).close);
+    CHECK_EQ(cap.headers_calls, 1u);
+    c.goaway_sent = true;
+    n = http2_write_headers(in, sizeof(in), 3, hs, 2, true);
+    n += http2_write_data(in + n, 1, reinterpret_cast<const u8*>("body"), 4, true);
+    CHECK(!c.process(in, n, out, sizeof(out), &written).close);
+    CHECK_EQ(cap.headers_calls, 1u);
+    CHECK_EQ(cap.data_len, 4u);
+    CHECK(has_frame(out, written, Http2FrameType::RstStream, 3, 0));
+}

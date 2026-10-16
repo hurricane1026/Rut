@@ -15,6 +15,7 @@
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
+#include "rut/runtime/grpc_protocol.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
@@ -124,6 +125,32 @@ struct H2Dispatch {
           overflow(overflow_),
           close_after_process(close_after_process_) {}
 };
+
+inline GrpcExchange* grpc_find(Http2Conn&, u32);
+template <typename Loop>
+bool grpc_start(Loop*,
+                Connection&,
+                u32,
+                const RouteConfig*,
+                u16,
+                const hpack::Header*,
+                u32,
+                const ParsedRequest&,
+                bool);
+template <typename Loop>
+bool grpc_start_synth(H2Dispatch<Loop>&, u32, const RouteConfig*, u16, const u8*, u32, bool);
+template <typename Loop>
+u32 grpc_pump_downstream(Loop*, Connection&, u8*, u32);
+template <typename Loop>
+void grpc_release(Loop*, GrpcExchange*, bool);
+template <typename Loop>
+void grpc_request_data(Loop*, Connection&, GrpcExchange&, const u8*, u32, bool);
+template <typename Loop>
+void grpc_request_trailers(void*, Http2Conn&, u32, const hpack::Header*, u32, bool);
+template <typename Loop>
+bool grpc_grow_recv(Loop*, Connection&);
+template <typename Loop>
+void grpc_refresh_timer(Loop*, Connection&);
 
 // Append a response (HEADERS + optional DATA body) for a stream, encoded with
 // the connection's dynamic-indexing encoder. `hdrs[0..nhdrs)` are extra
@@ -852,7 +879,8 @@ void h2_async_epoch_enter(Loop* loop, Connection& conn) {
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
     if (conn.h2 != nullptr && (conn.h2->async_stream != 0 || conn.h2->pending_stream != 0 ||
-                               conn.h2->outbound_stream != 0 || conn.h2->queued_stream != 0))
+                               conn.h2->outbound_stream != 0 || conn.h2->queued_stream != 0 ||
+                               conn.h2->grpc.active != 0 || conn.h2->grpc.upstream))
         return;
     if (conn.epoch_held) {
         loop->epoch_leave();
@@ -912,7 +940,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     // Refuse if a stream is already suspended OR a body-reading request is deferred
     // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
     // while pending_synth is quarantined behind a draining io_uring upstream send.
-    if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
+    if (h2->async_stream != 0 || h2->pending_stream != 0 || h2->grpc.active != 0 ||
+        d.conn->h2_proxy_synth_quarantined)
         return false;
     // Pin the config epoch BEFORE storing cfg/route — a backpressured flush of the
     // suspending batch could otherwise let a hot reload reclaim them while parked.
@@ -961,7 +990,8 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // Refuse while another stream is suspended OR a body-reading request is
     // deferred — both reuse pending_synth (see h2_suspend_timer) — OR while
     // pending_synth is quarantined behind a draining io_uring upstream send.
-    if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
+    if (h2->async_stream != 0 || h2->pending_stream != 0 || h2->grpc.active != 0 ||
+        d.conn->h2_proxy_synth_quarantined)
         return false;
     // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
@@ -1105,6 +1135,17 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
         }
         if (cfg == nullptr || kOutcome.upstream_id >= cfg->upstream_count) {
             h2_emit_status(d, stream_id, 503);
+            return;
+        }
+        if (cfg->upstreams[kOutcome.upstream_id].http2) {
+            if (!grpc_start_synth(d,
+                                  stream_id,
+                                  cfg,
+                                  static_cast<u16>(kOutcome.upstream_id),
+                                  forward_synth,
+                                  forward_len,
+                                  !request_body_followed))
+                h2_emit_status(d, stream_id, 503);
             return;
         }
         const bool parked = open_request != nullptr
@@ -1485,7 +1526,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             // when the handler does not read req.body. Such handlers still
             // avoid buffering DATA; requests without a declared length retain
             // the immediate body-agnostic dispatch path below.
-            if (!end_stream && (route->needs_req_body || req.has_content_length)) {
+            if (!end_stream &&
+                (route->needs_req_body || (req.has_content_length && !grpc_request(req)))) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
@@ -1526,6 +1568,20 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         }
         case RouteAction::Proxy:
         default:
+            if (route->upstream_id < config->upstream_count &&
+                config->upstreams[route->upstream_id].http2) {
+                if (!grpc_start(d.loop,
+                                *d.conn,
+                                stream_id,
+                                config,
+                                route->upstream_id,
+                                headers,
+                                nheaders,
+                                req,
+                                end_stream))
+                    h2_emit_status(d, stream_id, 503);
+                return;
+            }
             // Any request body (DATA frames follow) blocks proxying: we'd forward
             // the synthesized headers immediately and silently drop the body
             // (it's never tied to pending_stream). Gate on end_stream, NOT just a
@@ -1585,6 +1641,15 @@ void h2_on_data_cb(
     void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
     if (d->close_after_process) return;
+    if constexpr (requires {
+                      d->loop->grpc_upstreams;
+                      d->loop->pool.alloc_bulk();
+                  }) {
+        if (auto* x = grpc_find(c, stream_id)) {
+            grpc_request_data(d->loop, *d->conn, *x, data, len, end_stream);
+            return;
+        }
+    }
     if (c.pending_stream != stream_id) return;
     if (c.pending_body_len > 0xffffffffu - len) {
         c.pending_overflow = true;
@@ -1623,6 +1688,12 @@ inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*
 template <typename Loop>
 void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error err) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if constexpr (requires {
+                      d->loop->grpc_upstreams;
+                      d->loop->pool.alloc_bulk();
+                  }) {
+        if (auto* x = grpc_find(c, stream_id)) grpc_release(d->loop, x, true);
+    }
     const bool kOutboundOwner = c.outbound_stream == stream_id;
     if (d->close_after_process) return;
     if (kOutboundOwner && d->owned_hpack_pending && d->owned_stream == stream_id) {
@@ -1785,7 +1856,7 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (conn.h2 && conn.h2->outbound_stream == 0) conn.h2->response_flush_pending = false;
-    if (!conn.keep_alive) {  // engine signalled GOAWAY / connection error
+    if (!conn.keep_alive) {  // engine signalled a connection error
         loop->close_conn(conn);
         return;
     }
@@ -1802,8 +1873,8 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
     // A just-resumed stream may have left coalesced frames buffered (process()
     // stops consuming once a stream parks). Drain them now rather than blocking
     // on a socket read the client may never make — they were already received.
-    if (conn.h2 && conn.recv_buf.len() > 0) {
-        IoEvent synth{conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
+    if (conn.h2 && (conn.recv_buf.len() > 0 || conn.h2->grpc.active || conn.h2->conn_recv_credit)) {
+        IoEvent synth{conn.id, 1, 0, 0, IoEventType::Recv, 0};
         on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
         return;
     }
@@ -1821,15 +1892,17 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    conn.h2->grpc.busy = true;
     // Control frames the engine emits (SETTINGS/ACK/WINDOW_UPDATE/PING/GOAWAY).
     u8 ctrl[8192];
     // Response frames produced by the dispatch callback.
-    static constexpr u32 kRespCap = 8192;
+    static constexpr u32 kRespCap = 16384;
     u8 resp[kRespCap];
     H2Dispatch<Loop> d{loop, &conn, resp, kRespCap, 0, false, false};
 
     conn.h2->cb_ctx = &d;
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
+    conn.h2->on_trailers = &grpc_request_trailers<Loop>;
     conn.h2->on_data = &h2_on_data_cb<Loop>;             // accumulates request bodies
     conn.h2->on_reset = &h2_on_reset_dispatch_cb<Loop>;  // cancels a parked stream on RST_STREAM
     // Pin the RCU config epoch BEFORE snapshotting and matching the config, so a
@@ -1842,8 +1915,19 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
 
     u32 ctrl_len = 0;
-    Http2Result r =
-        conn.h2->process(conn.recv_buf.data(), conn.recv_buf.len(), ctrl, sizeof(ctrl), &ctrl_len);
+    if constexpr (requires { loop->is_draining(); }) {
+        if (loop->is_draining() && !conn.h2->goaway_sent) {
+            ctrl_len = write_goaway(ctrl, conn.h2->last_stream_id, Http2Error::NoError);
+            conn.h2->goaway_sent = true;
+        }
+    }
+    u32 engine_written = 0;
+    Http2Result r = conn.h2->process(conn.recv_buf.data(),
+                                     conn.recv_buf.len(),
+                                     ctrl + ctrl_len,
+                                     sizeof(ctrl) - ctrl_len,
+                                     &engine_written);
+    ctrl_len += engine_written;
 
     if (d.close_after_process) {
         h2_clear_outbound(*conn.h2);
@@ -1863,6 +1947,19 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
 
     const bool kClose = r.close || d.overflow;
 
+    if (!kClose && conn.h2->grpc.active && conn.h2->outbound_stream == 0) {
+        const u32 used = ctrl_len + d.resp_len;
+        const u32 wire_room = used < conn.send_buf.capacity() ? conn.send_buf.capacity() - used : 0;
+        const u32 room = d.resp_cap - d.resp_len < wire_room ? d.resp_cap - d.resp_len : wire_room;
+        d.resp_len += grpc_pump_downstream(loop, conn, d.resp + d.resp_len, room);
+    }
+    conn.h2->grpc.busy = false;
+    if constexpr (requires {
+                      loop->grpc_upstreams;
+                      loop->pool.alloc_bulk();
+                  }) {
+        if (conn.h2->grpc.timer_deadline_us) grpc_refresh_timer(loop, conn);
+    }
     if (!kClose && conn.h2->outbound_stream != 0) {
         const u32 kUsed = ctrl_len + d.resp_len;
         const u32 kWireRoom =
@@ -1949,6 +2046,12 @@ void enter_h2(Loop* loop, Connection& conn, IoEvent ev) {
         conn.h2->on_data = nullptr;
         conn.h2->on_reset = nullptr;
         conn.h2->init();
+    }
+    if constexpr (requires { loop->pool.alloc_bulk(); }) {
+        if (!grpc_grow_recv(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
     }
     conn.transition_to_reading_header(&on_h2_data<Loop>);
     on_h2_data<Loop>(static_cast<void*>(loop), conn, ev);
@@ -2217,3 +2320,5 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 }
 
 }  // namespace rut
+
+#include "rut/runtime/callbacks_grpc.h"

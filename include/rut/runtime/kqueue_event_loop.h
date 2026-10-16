@@ -291,7 +291,10 @@ public:
         }
         // Reserve six ordinary slices and one complete bounded response chain
         // per admitted connection. Storage is lazy and VA-reserved.
-        TRY_VOID(pool.init(SlicePool::capacity_for_connections(kMaxConns), pool_prealloc));
+        TRY_VOID(pool.init(SlicePool::capacity_for_connections(kMaxConns),
+                           pool_prealloc,
+                           SlicePool::kMaxCachedSlices,
+                           SlicePool::bulk_capacity_for_connections(kMaxConns)));
         auto h2p = h2_pool.init();
         if (!h2p) {
             pool.destroy();
@@ -677,7 +680,7 @@ public:
         // throttle_paused, not pending_handler_fn, so a client that disconnects
         // behind a long low-rate throttle would otherwise leave a stale entry
         // until its deadline. Rearm in case this conn owned the heap's top.
-        if (c.pending_handler_fn || c.throttle_paused) {
+        if (c.pending_handler_fn || c.throttle_paused || c.yield_armed) {
             if (yield_heap.remove_by_conn(c.id) > 0) rearm_yield_timer();
         }
         if (c.fd >= 0) {
@@ -805,6 +808,10 @@ public:
             if (entry.conn_id >= kMaxConns) continue;
             auto& c = conns[entry.conn_id];
             if (c.handler_gen != entry.handler_gen) continue;  // stale
+            if (c.h2 && c.h2->grpc.timer_deadline_us) {
+                grpc_deadline_fired(this, c);
+                continue;
+            }
             if (c.throttle_paused) {
                 throttle_resume<KqueueEventLoop>(this, c);
                 continue;
@@ -912,6 +919,8 @@ public:
                             c->resume_event_kind = jit::YieldKind::Timer;
                             c->resume_event_result = 0;
                             resume_jit_handler<KqueueEventLoop>(this, *c);
+                        } else if (c->h2 && (c->h2->grpc.active || c->h2->grpc.upstream)) {
+                            grpc_tick<KqueueEventLoop>(this, *c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             // Upstream stalled before responding → 504. A genuine
                             // in-flight h2 proxy stream reframes as h2 (raw h1 504
@@ -951,6 +960,7 @@ public:
                     u64 now = monotonic_secs();
                     for (u32 i = 0; i < kMaxConns; i++) {
                         if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
+                            !(conns[i].h2 && conns[i].h2->grpc.active) &&
                             should_drain_close(i, start, now, period)) {
                             this->close_conn(conns[i]);
                         }

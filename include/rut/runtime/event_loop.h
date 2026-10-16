@@ -58,6 +58,7 @@ public:
     // Set once after the kernel listener has been bound and before shard
     // threads accept connections. It is copied into each allocated connection.
     ListenerContext listener_context{};
+    Connection* grpc_upstreams = nullptr;
 
     bool submit_recv(Connection& c) { return self().submit_recv_impl(c); }
     bool submit_send(Connection& c, const u8* buf, u32 len) {
@@ -66,7 +67,14 @@ public:
     bool submit_connect(Connection& c, const void* addr, u32 addr_len) {
         return self().submit_connect_impl(c, addr, addr_len);
     }
-    void close_conn(Connection& c) { self().close_conn_impl(c); }
+    void close_conn(Connection& c) {
+        if (c.on_close) {
+            auto cleanup = c.on_close;
+            c.on_close = nullptr;
+            cleanup(&self(), c);
+        }
+        self().close_conn_impl(c);
+    }
     Connection* alloc_conn() { return self().alloc_conn_impl(); }
     void free_conn(Connection& c) { self().free_conn_impl(c); }
 

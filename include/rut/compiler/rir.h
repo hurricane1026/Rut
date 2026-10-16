@@ -530,6 +530,7 @@ struct Module {
         // Active health-check config carried verbatim from MIR (data only; the
         // compile→config helper feeds it to set_upstream_health_check). hc_path
         // is a Str copied into UpstreamTarget::hc_path there.
+        bool http2 = false;
         bool hc_enabled = false;
         Str hc_path;
         u32 hc_interval_ms = 0;

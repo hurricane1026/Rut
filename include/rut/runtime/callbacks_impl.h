@@ -2765,6 +2765,15 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
     if (route && route->action == RouteAction::Proxy) {
         conn.state = ConnState::Proxying;
         auto& target = config->upstreams[route->upstream_id];
+        if (target.http2) {
+            conn.pending_handler_fn = nullptr;
+            conn.resp_status = 503;
+            format_static_response(conn, 503, false);
+            conn.keep_alive = false;
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+            return;
+        }
         // Upstream concurrency cap: if the backend is already at its in-flight
         // limit, shed this request with 503 before opening a connection to it.
         // Otherwise take a slot, released on every exit path (completion via
@@ -3903,6 +3912,15 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 auto& target = config->upstreams[upstream_id];
+                if (target.http2) {
+                    conn.pending_handler_fn = nullptr;
+                    conn.resp_status = 503;
+                    format_static_response(conn, 503, false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
                 const i32 kUpstreamFd = UpstreamPool::create_socket();
                 if (kUpstreamFd < 0) {
                     send_bad_gateway();
@@ -4402,6 +4420,15 @@ void handle_jit_outcome(Loop* loop,
                     return;
                 }
                 const auto& target = config->upstreams[outcome.upstream_id];
+                if (target.http2) {
+                    conn.pending_handler_fn = nullptr;
+                    conn.resp_status = 503;
+                    format_static_response(conn, 503, false);
+                    conn.keep_alive = false;
+                    conn.transition_to_sending(&on_response_sent<Loop>);
+                    client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                    return;
+                }
                 bool response_policy_request_connection = false;
                 if (target_response_policy_id != 0) {
                     response_policy_request_connection =
@@ -4524,6 +4551,15 @@ void handle_jit_outcome(Loop* loop,
                 return;
             }
             auto& target = config->upstreams[outcome.upstream_id];
+            if (target.http2) {
+                conn.pending_handler_fn = nullptr;
+                conn.resp_status = 503;
+                format_static_response(conn, 503, false);
+                conn.keep_alive = false;
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             if (strict_pipeline_successor) {
                 RouteParam params[kMaxRouteParams]{};
                 u32 param_count = 0;

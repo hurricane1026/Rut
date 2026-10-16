@@ -78,6 +78,7 @@ struct UpstreamTarget {
     // probing wired up yet). hc_enabled gates the rest; hc_path is the probe
     // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe
     // period, hc_expected_status the status that marks a backend healthy.
+    bool http2 = false;
     bool hc_enabled = false;
     char hc_path[64];
     u32 hc_path_len = 0;

@@ -1901,12 +1901,15 @@ struct ConnectionBase {
         upstream_send_len = 0;
     }
 
+    void (*on_close)(void*, ConnectionBase&);
+
     void reset() {
         response_body_tail = {};
         chain_direct_recv_owner = {};
         relay_owner = {};
         on_recv = nullptr;
         on_send = nullptr;
+        on_close = nullptr;
         on_upstream_recv = nullptr;
         on_upstream_send = nullptr;
         fd = -1;

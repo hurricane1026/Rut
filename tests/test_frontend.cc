@@ -39814,3 +39814,54 @@ TEST(frontend, workload_rejects_invalid_sizes_and_labels) {
         CHECK(!parse_file_heap(tokens.value()));
     }
 }
+
+TEST(frontend, upstream_http2_protocol_reaches_runtime_config) {
+    const char* src =
+        "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http2 }\n"
+        "upstream http { host: \"127.0.0.1\", port: 8080, protocol: .http11 }\n"
+        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK(rir.module.upstreams[0].http2);
+    CHECK(!rir.module.upstreams[1].http2);
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK(cfg.upstreams[0].http2);
+    CHECK(!cfg.upstreams[1].http2);
+    CHECK_EQ(cfg.upstreams[0].addr_count, 1u);
+    rir.destroy();
+}
+
+TEST(frontend, upstream_protocol_rejects_unknown_and_duplicate_values) {
+    const char* fields[] = {"protocol: .http3",
+                            "protocol: .http2, protocol: .http11",
+                            "protocol: \"http2\"",
+                            "protocol: .grpc",
+                            "protocol: .https"};
+    for (const char* field : fields) {
+        char src[256];
+        snprintf(src, sizeof(src), "upstream api { host: \"127.0.0.1\", port: 50051, %s }", field);
+        auto tokens = lex(lit(src));
+        REQUIRE(tokens);
+        CHECK(!parse_file_heap(tokens.value()));
+    }
+}
+
+TEST(frontend, upstream_http2_rejects_http1_health_probe) {
+    const char* src =
+        "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http2, "
+        "health_check: { path: \"/healthz\", interval: 2s } }\n";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(!analyze_file_heap(ast.value()));
+}

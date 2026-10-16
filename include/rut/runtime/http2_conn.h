@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/grpc_proxy_state.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/http_parser.h"
@@ -36,6 +37,10 @@ struct Http2Stream {
     i32 send_window;  // how much DATA we may send to the peer on this stream
     i32 recv_window;  // how much DATA the peer may send us on this stream
     bool got_headers;
+    // Streaming consumers return credit only after releasing buffered DATA.
+    bool manual_window;
+    u32 recv_credit;
+    u32 recv_unconsumed;
 };
 
 struct Http2Conn;
@@ -76,10 +81,19 @@ struct Http2Conn {
     // Delivered when a stream is reset by the peer (RST_STREAM).
     using OnReset = void (*)(void* ctx, Http2Conn& c, u32 stream_id, Http2Error error);
 
+    GrpcProxyState grpc;
+
     void* cb_ctx;
     OnHeaders on_headers;
     OnData on_data;
     OnReset on_reset;
+    // Like on_headers, views are valid only during the callback. Installed after init().
+    OnHeaders on_trailers;
+    bool client;
+    bool peer_settings_seen;
+    bool peer_goaway;
+    u32 peer_last_stream;
+    u32 conn_recv_credit;
 
     hpack::DynamicTable hpack_dec;
     hpack::Encoder hpack_enc;  // response-side encoder (dynamic indexing)
@@ -198,6 +212,11 @@ struct Http2Conn {
 
     // Set callbacks (any may be null) then call init().
     void init();
+    // HTTP/2 prior-knowledge client. Caller writes the preface + our SETTINGS.
+    void init_client();
+    Http2Stream* open_stream(u32 id);
+    // Return previously delivered DATA credit. False on double-consume/overflow.
+    bool consume_data(u32 stream_id, u32 len);
 
     // Consume as many complete frames (and the preface) as `in` holds, writing
     // any required control frames into out[0..out_cap). Partial trailing frames
