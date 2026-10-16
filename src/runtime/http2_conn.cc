@@ -71,6 +71,7 @@ void Http2Conn::init() {
     pending_local_mutation_overflow = false;
     pending_local_mutation_bytes = 0;
     async_stream = 0;
+    async_headers_received_us = 0;
     async_is_head = false;
     async_kind = H2AsyncKind::None;
     async_cfg = nullptr;

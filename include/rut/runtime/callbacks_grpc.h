@@ -563,7 +563,11 @@ bool grpc_start_impl(Loop* loop,
     const auto& target = cfg->upstreams[uid];
     if (!target.addr_count) return false;
     const u64 now = monotonic_us();
-    const u64 deadline_base = down.h2_headers_received_us ? down.h2_headers_received_us : now;
+    u64 deadline_base = now;
+    if (down.h2 && down.h2->async_stream == sid && down.h2->async_headers_received_us)
+        deadline_base = down.h2->async_headers_received_us;
+    else if (auto* stream = down.h2->find_stream(sid); stream && stream->headers_received_us)
+        deadline_base = stream->headers_received_us;
     u64 deadline = 0;
     for (u32 i = 0; i < nh; i++) {
         if (!hs[i].name.eq({"grpc-timeout", 12})) continue;
@@ -656,6 +660,11 @@ bool grpc_start_impl(Loop* loop,
     grpc_attach(*up->h2, x);
     stream->manual_window = down_stream->manual_window = true;
     down.on_close = &grpc_connection_closed<Loop>;
+    if (deadline && monotonic_us() >= deadline) {
+        grpc_deadline_fired(loop, down);
+        if (fresh) loop->close_conn(*up);
+        return true;
+    }
     if (fresh) {
         up->fd = up->upstream_fd = UpstreamPool::create_socket();
         up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);

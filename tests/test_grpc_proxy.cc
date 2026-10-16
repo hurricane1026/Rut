@@ -1072,6 +1072,39 @@ TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     loop.force_close_all();
     loop.shutdown();
 }
+TEST(grpc_proxy, expired_headers_deadline_is_cancelled_before_upstream_headers) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init_client();
+    down->request_config = &cfg;
+    auto* down_stream = down->h2->open_stream(1);
+    REQUIRE(down_stream != nullptr);
+    down_stream->headers_received_us = monotonic_us() - 1000;
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"grpc-timeout", 12}, {"1u", 2}},
+                                {{"content-type", 12}, {"application/grpc", 16}}};
+    REQUIRE(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 6, req, true));
+    auto* x = down->h2->grpc.streams[0];
+    REQUIRE(x != nullptr);
+    CHECK_EQ(x->failure, 4u);
+    CHECK_FALSE(x->request_headers_sent);
+    CHECK(x->upstream == nullptr);
+    CHECK_EQ(down->h2->grpc.active, 1u);
+    loop.force_close_all();
+    loop.shutdown();
+}
 TEST(grpc_proxy, io_uring_tls_h2_bulk_input_is_bounded_and_released) {
     IoUringEventLoop loop;
     auto initialized = loop.init(0, -1);

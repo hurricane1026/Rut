@@ -41,6 +41,7 @@ struct Http2Stream {
     bool manual_window;
     u32 recv_credit;
     u32 recv_unconsumed;
+    u64 headers_received_us;
 };
 
 struct Http2Conn;
@@ -190,6 +191,7 @@ struct Http2Conn {
     // the response flush resume (or close) the stream early. h2_arm_async_timer
     // transfers these to the Connection atomically with schedule_yield_timer.
     u32 async_stream;
+    u64 async_headers_received_us;
     bool async_is_head;
     H2AsyncKind async_kind;
     const RouteConfig* async_cfg;

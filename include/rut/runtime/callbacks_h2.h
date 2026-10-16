@@ -967,6 +967,7 @@ void h2_async_epoch_leave(Loop* loop, Connection& conn) {
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
     h2.async_stream = 0;
+    h2.async_headers_received_us = 0;
     h2.async_is_head = false;
     h2.async_kind = H2AsyncKind::None;
     h2.async_cfg = nullptr;
@@ -1036,6 +1037,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
         value = reinterpret_cast<const char*>(h2->pending_synth + (ptr - synth));
     }
     h2->async_stream = stream_id;
+    if (auto* stream = h2->find_stream(stream_id))
+        h2->async_headers_received_us = stream->headers_received_us;
     h2->async_is_head = is_head;
     h2->async_kind = H2AsyncKind::Timer;
     h2->async_cfg = cfg;
@@ -1401,7 +1404,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          u32 nheaders,
                          bool end_stream) {
     if (d.close_after_process) return;
-    d.conn->h2_headers_received_us = monotonic_us();
+    if (auto* stream = d.conn->h2->find_stream(stream_id))
+        stream->headers_received_us = monotonic_us();
     const RouteConfig* config = d.conn->request_config;
     const bool has_strict_inventory =
         config != nullptr && config->has_strict_local_response_table_inventory();
