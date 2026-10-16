@@ -1646,13 +1646,15 @@ TEST(h2_serving, inject_content_length_rejects_overflow) {
 namespace {
 struct FakeH2Loop {
     u8 response_headers[4096]{};
+    u32 epoch_enters = 0;
+    u32 epoch_leaves = 0;
     bool alloc_response_header_buf(Connection& conn) {
         conn.response_header_slice = response_headers;
         conn.response_header_buf.bind(response_headers, sizeof(response_headers));
         return true;
     }
-    void epoch_enter() {}
-    void epoch_leave() {}
+    void epoch_enter() { epoch_enters++; }
+    void epoch_leave() { epoch_leaves++; }
 };
 }  // namespace
 
@@ -1707,7 +1709,11 @@ TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
         }
         u8 body[8]{};
         h2_on_data_cb<FakeH2Loop>(&d, h2, 1, body, actual, true);
+        h2_async_epoch_leave(&loop, conn);
         CHECK_FALSE(h2.pending_local_outcome);
+        CHECK_FALSE(conn.epoch_held);
+        CHECK_EQ(loop.epoch_enters, 1u);
+        CHECK_EQ(loop.epoch_leaves, 1u);
         CHECK_EQ(g_h2_grpc_jit_calls, 1u);
         Http2FrameHeader frame;
         if (d.resp_len != 0 &&
@@ -1764,9 +1770,12 @@ TEST(h2_serving, grpc_local_jit_reset_clears_parked_outcome) {
     h2.pending_stream = 7;
     h2.pending_local_outcome = true;
     h2.pending_has_content_length = true;
+    h2_async_epoch_enter(&loop, conn);
     h2_on_reset_cb(&d, h2, 7, Http2Error::Cancel);
+    h2_async_epoch_leave(&loop, conn);
     CHECK_EQ(h2.pending_stream, 0u);
     CHECK_FALSE(h2.pending_local_outcome);
+    CHECK_FALSE(conn.epoch_held);
 }
 
 TEST(h2_serving, unmatched_metadata_miss_fail_closes_while_omitted_and_matched_are_unchanged) {
