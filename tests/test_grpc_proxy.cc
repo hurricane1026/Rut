@@ -801,10 +801,12 @@ TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_d
     down->h2->client = true;
     down->protocol = ConnProtocol::Http2;
     down->request_config = &cfg;
-    REQUIRE(down->h2->open_stream(1) != nullptr);
+    auto* timer_stream = down->h2->open_stream(1);
+    REQUIRE(timer_stream != nullptr);
+    timer_stream->headers_received_us = monotonic_us() - 1000;
     const char* synth =
-        "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\ncontent-length: "
-        "3\r\n\r\n";
+        "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\n"
+        "grpc-timeout: 1u\r\ncontent-length: 3\r\n\r\n";
     const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
     for (u32 i = 0; i < synth_len; i++) down->h2->pending_synth[i] = static_cast<u8>(synth[i]);
     ParsedRequest open;
@@ -837,14 +839,13 @@ TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_d
     h2_resume_jit_handler(&loop, *down);
     CHECK_EQ(down->h2->async_stream, 0u);
     CHECK_EQ(down->h2->grpc.active, 1u);
-    CHECK(loop.grpc_upstreams != nullptr);
+    CHECK(loop.grpc_upstreams == nullptr);
     GrpcExchange* exchange = nullptr;
     for (u32 i = 0; i < 64; i++)
         if (down->h2->grpc.streams[i]) exchange = down->h2->grpc.streams[i];
     REQUIRE(exchange != nullptr);
-    CHECK(exchange->upstream != nullptr);
-    CHECK(exchange->upstream->h2 != nullptr);
-    CHECK(exchange->upstream->h2->grpc.upstream);
+    CHECK_EQ(exchange->failure, 4u);
+    CHECK(exchange->upstream == nullptr);
     loop.force_close_all();
     loop.shutdown();
 }
