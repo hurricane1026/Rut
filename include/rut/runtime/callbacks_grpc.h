@@ -453,6 +453,8 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    record_backend_result(
+        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
     // Transfer the connected socket from the backend's connect registration to
     // ordinary full-duplex I/O on this dedicated upstream Connection slot.
     if constexpr (requires { loop->backend.detach_upstream(conn, &conn.fd); }) {
