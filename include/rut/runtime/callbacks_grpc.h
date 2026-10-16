@@ -362,6 +362,7 @@ void grpc_response_headers(
     }
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
     u32 filtered_n = 0;
+    const bool backend_terminal = end && grpc_has_status(hs, n);
     for (u32 i = 0; i < n; i++) {
         if (!grpc_response_header_allowed(hs[i])) continue;
         if (filtered_n < Http2Conn::kMaxHeadersPerReq) filtered[filtered_n++] = hs[i];
@@ -377,10 +378,10 @@ void grpc_response_headers(
                                                   x->downstream_stream,
                                                   filtered,
                                                   filtered_n,
-                                                  end && grpc_has_status(filtered, filtered_n));
+                                                  backend_terminal);
     if (!x->response_headers_len) x->failure = 8;
     x->response_end = end;
-    if (end && !grpc_has_status(hs, n)) x->failure = 2;
+    if (end && (!grpc_has_status(hs, n) || !grpc_has_status(filtered, filtered_n))) x->failure = 2;
     if (x->response_end) grpc_release_slot(dispatch->loop, *x);
 }
 template <typename Loop>

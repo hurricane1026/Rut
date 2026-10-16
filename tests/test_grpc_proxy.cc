@@ -1405,11 +1405,17 @@ TEST(grpc_proxy, terminal_response_releases_slot_while_downstream_send_is_blocke
         {Str{"content-type", 12}, Str{"application/grpc", 16}},
         {Str{"grpc-status", 11}, Str{"0", 1}},
     };
+    downstream.resp_header_mutations[0] = {
+        {"grpc-status", 11}, {nullptr, 0}, Connection::RespHeaderMutationMode::Remove};
+    downstream.resp_header_mutation_count = 1;
+    REQUIRE(grpc_snapshot_response_mutations(downstream, headers));
     grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 3, terminal_headers, 3, true);
     CHECK_FALSE(headers.slot_held);
     CHECK_EQ(loop.released, 2u);
+    CHECK_EQ(headers.failure, 2u);
     CHECK(headers.response_end);
     CHECK_GT(headers.response_headers_len, 0u);
+    CHECK((headers.response_headers[4] & 0x1u) != 0);
     CHECK_EQ(upstream_h2.grpc.streams[1], &headers);
     CHECK_EQ(downstream_h2.grpc.streams[1], &headers);
     CHECK_EQ(upstream_h2.grpc.active, 2u);
