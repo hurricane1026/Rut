@@ -387,6 +387,18 @@ upstream greeter {
 route POST "/helloworld.Greeter/SayHello" { return forward(greeter) }
 ```
 
+When the host application pre-binds an upstream endpoint, the declaration may
+carry protocol metadata without an address:
+
+```swift
+upstream greeter { protocol: .http2 }
+```
+
+This form requires a matching pre-bound upstream slot at load time. The
+compiler applies `.http2` to that slot while preserving its existing address;
+an empty upstream block and an addressless configuration with no pre-bound slot
+remain load errors.
+
 Downstream native gRPC requires HTTP/2, via h2c or a TLS listener offering `h2`.
 Unary, client-streaming, server-streaming and bidirectional RPCs use the same
 `forward`. Bodies (including compressed messages) and metadata are opaque;

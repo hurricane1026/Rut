@@ -1356,6 +1356,12 @@ let orders = upstream { "10.0.1.1:8080" }
 selectors are `.http11` (default) and `.http2` (prior-knowledge cleartext HTTP/2).
 This does not implement the target upstream TLS syntax above.
 
+The host application may pre-bind the endpoint and declare only
+`upstream greeter { protocol: .http2 }`. At publication, the declaration must
+match a pre-bound upstream slot in declaration order; protocol and health
+metadata are applied to that slot while its existing address remains intact.
+An addressless declaration without a matching pre-bound slot is rejected.
+
 The `.http2` forwarding path accepts native gRPC over downstream h2c or TLS/h2.
 It streams all four RPC shapes without decoding protobuf, preserving metadata,
 compressed payloads and trailers. A shard pools upstream HTTP/2 sessions by

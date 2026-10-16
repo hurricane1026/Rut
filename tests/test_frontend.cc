@@ -5492,6 +5492,47 @@ TEST(frontend, parse_upstream_health_check_only_name_only) {
     CHECK(hir->upstreams[0].hc_enabled);
 }
 
+TEST(frontend, parse_upstream_protocol_only_name_only) {
+    // `.http2` is protocol metadata for a host-bound upstream. The host
+    // application supplies the endpoint in the pre-bound RouteConfig.
+    const char* src =
+        "upstream api { protocol: .http2 }\n"
+        "route GET \"/u\" { return forward(api) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    const auto& up = ast->items[0].upstream;
+    CHECK(!up.has_address);
+    CHECK(up.http2);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->upstreams.len, 1u);
+    CHECK(!hir->upstreams[0].has_address);
+    CHECK(hir->upstreams[0].http2);
+}
+
+TEST(frontend, protocol_only_prebound_upstream_preserves_endpoint) {
+    rir::Module mod{};
+    mod.upstream_count = 1;
+    mod.upstreams[0].name = {"grpc", 4};
+    mod.upstreams[0].http2 = true;
+    REQUIRE(rir::verify_module(mod).ok);
+
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("grpc", 0x0a000001u, 50051).has_value());
+    REQUIRE_EQ(cfg.upstream_count, 1u);
+    REQUIRE_EQ(cfg.upstreams[0].addr_count, 1u);
+    const u32 ip_before = cfg.upstreams[0].addrs[0].sin_addr.s_addr;
+    const u16 port_before = cfg.upstreams[0].addrs[0].sin_port;
+
+    REQUIRE(populate_route_config(cfg, mod));
+    CHECK(cfg.upstreams[0].http2);
+    CHECK_EQ(cfg.upstreams[0].addr_count, 1u);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_addr.s_addr, ip_before);
+    CHECK_EQ(cfg.upstreams[0].addrs[0].sin_port, port_before);
+}
+
 TEST(frontend, parse_upstream_health_check_accepts_optional_commas) {
     const char* src =
         "upstream api {\n"

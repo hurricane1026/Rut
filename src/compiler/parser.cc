@@ -3675,12 +3675,12 @@ struct Parser {
                 if (seen_host || seen_port)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           item.upstream.addr_span);
-            } else if (!seen_host && !seen_port && item.upstream.hc_enabled) {
-                // Health-check-only, name-only upstream
-                // (`upstream api { health_check: {...} }`). The host
-                // application binds the address at runtime (pre-bound slot);
-                // populate_route_config copies the health-check metadata onto
-                // it. No address is required here.
+            } else if (!seen_host && !seen_port && (seen_protocol || item.upstream.hc_enabled)) {
+                // Protocol-only and health-check-only upstreams are
+                // addressless declarations. The host application binds the
+                // address at runtime (pre-bound slot); populate_route_config
+                // applies the protocol/health metadata without replacing the
+                // pre-bound endpoint.
             } else if (!seen_host || !seen_port) {
                 // Name the specific missing field in the detail so the
                 // diagnostic tells the user what to add. Point the
