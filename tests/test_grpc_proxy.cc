@@ -633,7 +633,6 @@ struct GrpcDriveFixture {
     u32 last_send_len = 0;
     u32 downstream_sends = 0;
     u32 downstream_last_send_len = 0;
-    bool complete_downstream_send = false;
     u32 released = 0;
     bool closed = false;
     GrpcDriveFixture() {
@@ -649,9 +648,6 @@ struct GrpcDriveFixture {
         if (conn.h2 && !conn.h2->grpc.upstream) {
             downstream_sends++;
             downstream_last_send_len = len;
-            if (complete_downstream_send && conn.on_send)
-                conn.on_send(
-                    this, conn, {conn.id, 1, 0, 0, IoEventType::Send, static_cast<u8>(len)});
         }
         return true;
     }
@@ -727,7 +723,6 @@ TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
 TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     GrpcDriveFixture loop;
     REQUIRE(loop.pool_ready);
-    loop.complete_downstream_send = true;
     Connection upstream;
     upstream.reset();
     u8 upstream_send[SlicePool::kSliceSize];
@@ -791,7 +786,12 @@ TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
 
     CHECK_EQ(upstream_h2.grpc.active, 0u);
     CHECK_EQ(loop.released, 1u);
+    CHECK_EQ(downstream_h2.grpc.active, 1u);
+    CHECK_EQ(pending_exchange->failure, 8u);
+    CHECK(pending_exchange->upstream == nullptr);
+    CHECK_FALSE(pending_exchange->slot_held);
     CHECK_EQ(downstream_h2.grpc.timer_deadline_us, 0u);
+    CHECK_GT(loop.sends, loop.downstream_sends);
     CHECK(loop.downstream_sends > 0);
     CHECK_GT(loop.downstream_last_send_len, 0u);
 }

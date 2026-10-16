@@ -877,6 +877,7 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
                 loop->upstream_release(x->upstream_id);
                 x->slot_held = false;
             }
+            if (!uh.grpc.busy) grpc_drive_upstream(loop, *up);
         }
         Connection* downstreams[64];
         u32 downstream_count = 0;
