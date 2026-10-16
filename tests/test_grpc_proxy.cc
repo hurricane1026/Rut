@@ -845,6 +845,71 @@ TEST(grpc_proxy, client_reset_restores_keepalive_after_grpc_release) {
     run(true);
 }
 
+TEST(grpc_proxy, backend_reset_releases_slot_while_downstream_send_is_pending) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[SlicePool::kSliceSize];
+    u8 upstream_recv[SlicePool::kSliceSize];
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    upstream.bind_request_receive_buffer(upstream_recv, sizeof(upstream_recv));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.peer_settings_seen = true;
+    upstream_h2.preface_seen = true;
+    upstream_h2.our_settings_sent = true;
+    upstream_h2.grpc.preface_sent = true;
+    upstream.h2 = &upstream_h2;
+
+    Connection downstream;
+    downstream.reset();
+    u8 downstream_send[SlicePool::kSliceSize];
+    u8 downstream_recv[SlicePool::kSliceSize];
+    downstream.send_slice = downstream_send;
+    downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+    downstream.bind_request_receive_buffer(downstream_recv, sizeof(downstream_recv));
+    downstream.on_send = &pending_send;
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+
+    auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(x != nullptr);
+    x->init();
+    x->downstream = &downstream;
+    x->upstream = &upstream;
+    x->downstream_stream = x->upstream_stream = 1;
+    x->request_headers_sent = true;
+    x->slot_held = true;
+    x->upstream_id = 7;
+    downstream_h2.grpc.streams[0] = x;
+    downstream_h2.grpc.active = 1;
+    upstream_h2.grpc.streams[0] = x;
+    upstream_h2.grpc.active = 1;
+
+    const u32 rst_len = write_rst_stream(upstream_recv, 1, Http2Error::Cancel);
+    upstream.recv_buf.commit(rst_len);
+    grpc_on_upstream_data<GrpcDriveFixture>(
+        &loop, upstream, {upstream.id, 1, 0, 0, IoEventType::Recv, 1});
+
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(loop.released, 1u);
+    CHECK_EQ(downstream_h2.grpc.active, 1u);
+    CHECK_EQ(x->failure, 1u);
+    CHECK(x->response_end);
+    CHECK(x->upstream == nullptr);
+    CHECK_FALSE(x->slot_held);
+    CHECK_EQ(upstream_h2.grpc.control_len, 0u);
+    CHECK_EQ(downstream_h2.grpc.timer_deadline_us, 0u);
+    grpc_detach(downstream_h2, x);
+    loop.pool.free(reinterpret_cast<u8*>(x));
+}
+
 TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {
     GrpcDriveFixture loop;
     Connection upstream;
