@@ -1401,6 +1401,7 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          u32 nheaders,
                          bool end_stream) {
     if (d.close_after_process) return;
+    d.conn->h2_headers_received_us = monotonic_us();
     const RouteConfig* config = d.conn->request_config;
     const bool has_strict_inventory =
         config != nullptr && config->has_strict_local_response_table_inventory();

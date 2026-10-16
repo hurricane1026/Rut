@@ -563,12 +563,13 @@ bool grpc_start_impl(Loop* loop,
     const auto& target = cfg->upstreams[uid];
     if (!target.addr_count) return false;
     const u64 now = monotonic_us();
+    const u64 deadline_base = down.h2_headers_received_us ? down.h2_headers_received_us : now;
     u64 deadline = 0;
     for (u32 i = 0; i < nh; i++) {
         if (!hs[i].name.eq({"grpc-timeout", 12})) continue;
         u64 timeout = 0;
         if (deadline || !grpc_timeout(hs[i].value, &timeout)) return false;
-        deadline = now + timeout;
+        deadline = deadline_base + timeout;
     }
     const u32 backend = select_backend(uid, target.addr_count, now);
     Connection* up = nullptr;
@@ -843,8 +844,25 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
     conn.yield_armed = false;
     conn.h2->grpc.timer_deadline_us = 0;
     const u64 now = monotonic_us();
-    for (auto* x : conn.h2->grpc.streams)
-        if (x && x->deadline_us && now >= x->deadline_us) x->failure = 4;
+    for (auto* x : conn.h2->grpc.streams) {
+        if (!x || !x->deadline_us || now < x->deadline_us) continue;
+        x->failure = 4;
+        Connection* up = x->upstream;
+        if (!up || !up->h2) continue;
+        auto& uh = *up->h2;
+        uh.consume_data(x->upstream_stream, x->download_len);
+        if (auto* stream = uh.find_stream(x->upstream_stream)) {
+            if (x->request_headers_sent) grpc_queue_cancel(uh, x->upstream_stream);
+            stream->state = Http2StreamState::Closed;
+        }
+        grpc_detach(uh, x);
+        x->upstream = nullptr;
+        if (x->slot_held) {
+            loop->upstream_release(x->upstream_id);
+            x->slot_held = false;
+        }
+        if (!uh.grpc.busy) grpc_drive_upstream(loop, *up);
+    }
     grpc_refresh_timer(loop, conn);
     grpc_kick_downstream(loop, conn);
 }

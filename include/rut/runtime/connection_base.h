@@ -590,6 +590,7 @@ struct ConnectionBase {
     // or close). `upstream_slot_uid` records which backend's gauge to decrement.
     bool upstream_slot_held;
     u16 upstream_slot_uid;
+    u64 h2_headers_received_us;
 
     // @throttle downstream pacing — per-connection token bucket (virtual-time /
     // GCRA) for sends to the client. Set per request from the matched route. The
@@ -1964,6 +1965,7 @@ struct ConnectionBase {
         response_header_buf.bind(nullptr, 0);
         upstream_slot_held = false;
         upstream_slot_uid = 0;
+        h2_headers_received_us = 0;
         throttle_down_bps = 0;
         throttle_tat_ns = 0;
         throttle_paused = false;
