@@ -917,6 +917,33 @@ TEST(grpc_proxy, backend_reset_releases_slot_while_downstream_send_is_pending) {
     loop.pool.free(reinterpret_cast<u8*>(x));
 }
 
+TEST(grpc_proxy, direct_http2_proxy_rejects_missing_scheme_before_upstream) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 50051).has_value());
+    cfg.upstreams[0].http2 = true;
+    REQUIRE(cfg.add_proxy("/svc", static_cast<u8>('P'), 0));
+    Connection downstream;
+    downstream.reset();
+    Http2Conn h2;
+    h2.init_client();
+    downstream.h2 = &h2;
+    REQUIRE(h2.open_stream(1) != nullptr);
+    downstream.request_config = &cfg;
+    u8 response[4096];
+    H2Dispatch<GrpcDriveFixture> d{&loop, &downstream, response, sizeof(response), 0, false};
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}},
+                                     {{":path", 5}, {"/svc", 4}},
+                                     {{":authority", 10}, {"backend", 7}},
+                                     {{"content-type", 12}, {"application/grpc", 16}}};
+    h2_dispatch_request(d, 1, headers, 4, true);
+    CHECK_GT(d.resp_len, 0u);
+    CHECK_EQ(h2.grpc.active, 0u);
+    CHECK(loop.grpc_upstreams == nullptr);
+    CHECK_EQ(downstream.send_buf.len(), 0u);
+}
+
 TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {
     GrpcDriveFixture loop;
     Connection upstream;
