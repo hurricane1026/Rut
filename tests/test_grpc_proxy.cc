@@ -858,6 +858,8 @@ TEST(grpc_proxy, successful_connect_clears_consecutive_failures) {
     connected->upstream_backend_idx = 0;
     REQUIRE(loop->alloc_h2(*connected));
     connected->h2->grpc.connecting = true;
+    connected->h2->peer_settings_seen = true;
+    grpc_record_handshake_result(*connected, true, monotonic_us());
     grpc_connected<EpollEventLoop>(
         loop.get(), *connected, {connected->id, 1, 0, 0, IoEventType::UpstreamConnect, 0});
     CHECK_EQ(health->fails, 0u);

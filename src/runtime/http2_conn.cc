@@ -145,11 +145,6 @@ void Http2Conn::init_client() {
 
 Http2Stream* Http2Conn::open_stream(u32 id) {
     if (!client || peer_goaway || id == 0 || (id & 1u) == 0 || id <= last_stream_id) return nullptr;
-    u32 active = 0;
-    for (u32 i = 0; i < nstreams; i++)
-        if (streams[i].state != Http2StreamState::Closed) active++;
-    if (peer_settings.has_max_concurrent_streams && active >= peer_settings.max_concurrent_streams)
-        return nullptr;
     Http2Stream* s = alloc_stream(*this, id);
     if (s) last_stream_id = id;
     return s;

@@ -215,6 +215,11 @@ inline void grpc_begin_handshake(GrpcProxyState& g, u64 now_us) {
 inline void grpc_record_connect_result(const Connection& conn, bool success, u64 now_us) {
     record_backend_result(conn.upstream_idx, conn.upstream_backend_idx, success, now_us);
 }
+inline void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
+    if (conn.h2 == nullptr || conn.h2->grpc.handshake_health_recorded) return;
+    conn.h2->grpc.handshake_health_recorded = true;
+    grpc_record_connect_result(conn, success, now_us);
+}
 inline bool grpc_idle_upstream_should_close(
     const GrpcProxyState& g, bool peer_goaway, bool draining, u64 now_us, u64 keepalive_us) {
     return g.active == 0 && (draining || peer_goaway || now_us - g.idle_since_us >= keepalive_us);
@@ -461,6 +466,8 @@ template <typename Loop>
 void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result <= 0 || !conn.h2) {
+        if (conn.h2 && !conn.h2->peer_settings_seen)
+            grpc_record_handshake_result(conn, false, monotonic_us());
         loop->close_conn(conn);
         return;
     }
@@ -473,6 +480,7 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     h.on_trailers = &grpc_response_trailers<Loop>;
     h.on_data = &grpc_response_data<Loop>;
     h.on_reset = &grpc_response_reset<Loop>;
+    const bool settings_seen_before = h.peer_settings_seen;
     g.busy = true;
     u32 written = 0;
     const auto result = h.process(conn.recv_buf.data(),
@@ -481,6 +489,8 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
                                   sizeof(g.control) - g.control_len,
                                   &written);
     g.control_len += written;
+    if (!settings_seen_before && h.peer_settings_seen)
+        grpc_record_handshake_result(conn, true, monotonic_us());
     grpc_flush_pending_cancels(h);
     const u32 remaining = conn.recv_buf.len() - result.consumed;
     if (remaining) __builtin_memmove(conn.recv_slice, conn.recv_slice + result.consumed, remaining);
@@ -509,7 +519,6 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
-    grpc_record_connect_result(conn, true, monotonic_us());
     // Transfer the connected socket from the backend's connect registration to
     // ordinary full-duplex I/O on this dedicated upstream Connection slot.
     if constexpr (requires { loop->backend.detach_upstream(conn, &conn.fd); }) {
@@ -572,6 +581,7 @@ bool grpc_start_impl(Loop* loop,
     if (!x) return false;
     static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize);
     x->init();
+    if (end && req.has_content_length && req.content_length != 0) x->failure = 13;
     bool fresh = false;
     if (!up) {
         up = loop->alloc_conn();
@@ -850,6 +860,7 @@ void grpc_tick(Loop* loop, Connection& conn) {
                                             loop->is_draining(),
                                             now,
                                             static_cast<u64>(loop->keepalive_timeout) * 1000000)) {
+            if (!h.peer_settings_seen) grpc_record_handshake_result(conn, false, now);
             loop->close_conn(conn);
             return;
         }

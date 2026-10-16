@@ -3068,17 +3068,12 @@ public:
     // application frames; the existing mmap ownership remains unchanged.
     bool grow_h2_tls_input(Connection& c) {
         if (c.tls_in_buf.capacity() >= SlicePool::kBulkSliceSize) return true;
-        void* region = mmap(nullptr,
-                            SlicePool::kBulkSliceSize,
-                            PROT_READ | PROT_WRITE,
-                            MAP_PRIVATE | MAP_ANONYMOUS,
-                            -1,
-                            0);
-        if (region == MAP_FAILED) return false;
+        u8* region = pool.alloc_bulk();
+        if (!region) return false;
         const u32 n = c.tls_in_buf.len();
         __builtin_memcpy(region, c.tls_in_buf.data(), n);
         munmap(c.tls_in_slice, c.tls_in_buf.capacity());
-        c.tls_in_slice = static_cast<u8*>(region);
+        c.tls_in_slice = region;
         c.tls_in_buf.bind(c.tls_in_slice, SlicePool::kBulkSliceSize);
         c.tls_in_buf.commit(n);
         return true;
@@ -3086,7 +3081,10 @@ public:
 
     void free_tls_in_buf(ConnectionBase& c) {
         if (!c.tls_in_slice) return;
-        munmap(c.tls_in_slice, c.tls_in_buf.capacity());
+        if (pool.is_bulk(c.tls_in_slice))
+            pool.free(c.tls_in_slice);
+        else
+            munmap(c.tls_in_slice, c.tls_in_buf.capacity());
         c.tls_in_slice = nullptr;
         c.tls_in_buf.bind(nullptr, 0);
     }

@@ -2523,6 +2523,16 @@ TEST(http2_client, informational_response_and_goaway_drain) {
     CHECK(c.open_stream(3) == nullptr);
 }
 
+TEST(http2_client, peer_stream_limit_queues_local_stream_slots) {
+    Http2Conn c;
+    c.init_client();
+    c.peer_settings_seen = true;
+    c.peer_settings.has_max_concurrent_streams = true;
+    c.peer_settings.max_concurrent_streams = 1;
+    REQUIRE(c.open_stream(1) != nullptr);
+    CHECK(c.open_stream(3) != nullptr);
+}
+
 TEST(http2_client, late_cancelled_headers_do_not_close_other_rpcs) {
     Http2Conn c;
     Capture cap;
