@@ -583,6 +583,7 @@ inline void h2_clear_pending(Http2Conn& h2) {
 
 template <typename Loop>
 void h2_async_epoch_enter(Loop* loop, Connection& conn);
+inline void h2_clear_async(Http2Conn& h2);
 
 template <typename Loop>
 bool h2_park_local_outcome(H2Dispatch<Loop>& d,
@@ -590,9 +591,10 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
                            const JitDispatchOutcome& o,
                            const RouteConfig* cfg,
                            bool is_head,
-                           u32 content_length) {
+                           u32 content_length,
+                           bool replace_owned_async = false) {
     Http2Conn& h2 = *d.conn->h2;
-    if (h2.pending_stream != 0 || h2.async_stream != 0) return false;
+    if (h2.pending_stream != 0 || (h2.async_stream != 0 && !replace_owned_async)) return false;
     h2_async_epoch_enter(d.loop, *d.conn);
     h2.pending_stream = stream_id;
     h2.pending_has_content_length = true;
@@ -632,6 +634,7 @@ bool h2_park_local_outcome(H2Dispatch<Loop>& d,
         h2.pending_local_mutation_bytes += need;
         dst.mode = static_cast<u8>(src.mode);
     }
+    if (replace_owned_async) h2_clear_async(h2);
     return true;
 }
 
@@ -2425,6 +2428,37 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     u8 resp[8192];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
+        if (h2->async_request_stream_open && h2->async_request_has_content_length) {
+            ParsedRequest request;
+            HttpParser parser;
+            parser.reset();
+            if (parser.parse(h2->pending_synth, h2->async_synth_len, &request) ==
+                    ParseStatus::Complete &&
+                grpc_request(request)) {
+                if (h2_park_local_outcome(d,
+                                          kStreamId,
+                                          kOutcome,
+                                          h2->async_cfg,
+                                          kIsHead,
+                                          h2->async_request_content_length,
+                                          true)) {
+                    conn.pending_handler_fn = nullptr;
+                    conn.transition_to_reading_header(&on_h2_data<Loop>);
+                    if (conn.recv_buf.len() > 0) {
+                        IoEvent synth{conn.id,
+                                      static_cast<i32>(conn.recv_buf.len()),
+                                      0,
+                                      0,
+                                      IoEventType::Recv,
+                                      0};
+                        on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
+                    } else {
+                        loop->submit_recv(conn);
+                    }
+                    return;
+                }
+            }
+        }
         h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kIsHead);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
