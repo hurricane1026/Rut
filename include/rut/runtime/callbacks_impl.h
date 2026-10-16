@@ -2529,7 +2529,8 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         format_static_response(conn,
                                400,
                                /*keep_alive=*/false,
-                               pre_req.method == HttpMethod::HEAD);
+                               pre_req.method == HttpMethod::HEAD,
+                               ordinary_local_response_version(conn));
         conn.keep_alive = false;
         conn.transition_to_sending(&on_response_sent<Loop>);
         if (!client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len()))

@@ -22310,6 +22310,74 @@ TEST(request_admission, h2_pending_prepared_forward_fragment_keeps_owner) {
     run_strict_fence(false, true);
 }
 
+template <typename Loop>
+static void check_transfer_encoding_rejection_response_version(rut::test::TestCase* _tc,
+                                                               const char* request,
+                                                               const char* status_line,
+                                                               u8 expected_request_version) {
+    auto loop = std::make_unique<Loop>();
+    loop->setup();
+    auto config = std::make_unique<RouteConfig>();
+    REQUIRE(config->add_upstream("backend", 0x7f000001, 9000).has_value());
+    REQUIRE(config->add_proxy("/", kRouteMethodAny, 0));
+    const RouteConfig* active = config.get();
+    loop->config_ptr = &active;
+
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    const u32 request_len = static_cast<u32>(strlen(request));
+    REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), request_len),
+               request_len);
+    on_header_received<Loop>(
+        loop.get(), *conn, make_ev(conn->id, IoEventType::Recv, static_cast<i32>(request_len)));
+
+    REQUIRE_EQ(conn->resp_status, 400u);
+    CHECK_FALSE(conn->keep_alive);
+    CHECK_EQ(conn->req_http_version, expected_request_version);
+    CHECK_EQ(conn->upstream_fd, -1);
+    CHECK_EQ(conn->upstream_attempts, 0u);
+    CHECK_FALSE(conn->upstream_slot_held);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Connect), 0u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Send), 1u);
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), status_line));
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), "Connection: close\r\n"));
+
+    const u32 conn_id = conn->id;
+    const u32 send_len = conn->send_buf.len();
+    loop->dispatch(make_ev(conn_id, IoEventType::Send, static_cast<i32>(send_len)));
+    CHECK_EQ(loop->conns[conn_id].fd, -1);
+    CHECK_EQ(loop->conns[conn_id].on_send, nullptr);
+    CHECK_EQ(loop->free_top, Loop::kMaxConns);
+    if constexpr (requires { loop->pending_free_count; }) CHECK_EQ(loop->pending_free_count, 0u);
+}
+
+TEST(request_admission, transfer_encoding_rejection_preserves_captured_http_version) {
+    static constexpr char kHttp10[] =
+        "GET / HTTP/1.0\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n";
+    static constexpr char kHttp11[] =
+        "GET / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n";
+    static constexpr char kParseErrorHttp10[] =
+        "GET / HTTP/1.0\r\nHost: x\r\nInvalid Header: value\r\n"
+        "Transfer-Encoding: gzip\r\n\r\n";
+    for (bool async_backend : {false, true}) {
+        if (async_backend) {
+            check_transfer_encoding_rejection_response_version<AsyncSmallLoop>(
+                _tc, kHttp10, "HTTP/1.0 400 Bad Request\r\n", 0u);
+            check_transfer_encoding_rejection_response_version<AsyncSmallLoop>(
+                _tc, kHttp11, "HTTP/1.1 400 Bad Request\r\n", 1u);
+            check_transfer_encoding_rejection_response_version<AsyncSmallLoop>(
+                _tc, kParseErrorHttp10, "HTTP/1.1 400 Bad Request\r\n", 255u);
+        } else {
+            check_transfer_encoding_rejection_response_version<SmallLoop>(
+                _tc, kHttp10, "HTTP/1.0 400 Bad Request\r\n", 0u);
+            check_transfer_encoding_rejection_response_version<SmallLoop>(
+                _tc, kHttp11, "HTTP/1.1 400 Bad Request\r\n", 1u);
+            check_transfer_encoding_rejection_response_version<SmallLoop>(
+                _tc, kParseErrorHttp10, "HTTP/1.1 400 Bad Request\r\n", 255u);
+        }
+    }
+}
+
 TEST(request_admission, unsupported_transfer_framing_rejected_before_route_or_upstream) {
     SmallLoop loop;
     loop.setup();
