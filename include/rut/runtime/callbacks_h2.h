@@ -1137,6 +1137,14 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     bool request_forwardable,
                     bool is_head = false,
                     const ParsedRequest* open_request = nullptr) {
+    bool retain_json = false;
+    struct JsonLifetime {
+        Connection* conn;
+        bool* retain;
+        ~JsonLifetime() {
+            if (!*retain) h2_release_completed_jit_json(*conn);
+        }
+    } json_lifetime{d.conn, &retain_json};
     if (route_requires_response_read_timeout_preflight_close(route, cfg)) {
         d.close_after_process = true;
         d.resp_len = 0;
@@ -1202,6 +1210,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                               is_head,
                               open_request))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
+        else
+            retain_json = true;
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
@@ -1280,7 +1290,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                                                    static_cast<u16>(kOutcome.upstream_id),
                                                    forward_synth,
                                                    forward_len);
-        if (!parked) h2_emit_status(d, stream_id, 503);
+        if (!parked)
+            h2_emit_status(d, stream_id, 503);
+        else
+            retain_json = true;
         return;
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {

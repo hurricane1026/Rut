@@ -331,7 +331,13 @@ public:
                 continue;
             if (now < timer_deadline_ns[i]) continue;
             jit::HandlerCtx ctx{};
-            (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
+            SliceArena scratch{};
+            if (scratch.init(&self().pool)) {
+                (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, &scratch);
+                scratch.destroy();
+            } else {
+                (void)cfg->timers[i].fn(nullptr, &ctx, nullptr, 0, nullptr);
+            }
             timer_fire_count[i]++;
             // Reschedule from now (not the missed deadline) to avoid a catch-up
             // burst after a long stall.
