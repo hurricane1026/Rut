@@ -20,6 +20,10 @@
 using namespace rut;
 
 namespace {
+u64 grpc_jit_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
+    return jit::HandlerResult::make_forward(0).pack();
+}
+
 struct GrpcBackendHealthReset {
     GrpcBackendHealthReset() { reset(); }
     ~GrpcBackendHealthReset() { reset(); }
@@ -336,20 +340,22 @@ struct Client {
         nghttp2_submit_settings(session, 0, nullptr, 0);
         return rc == 0;
     }
-    int request(u32 index,
-                u32 bytes,
-                bool end,
-                const char* timeout = nullptr,
-                bool jit_forward = false) {
+    int request(
+        u32 index, u32 bytes, bool end, const char* timeout = nullptr, bool jit_forward = false) {
         rpcs[index].size = bytes;
         rpcs[index].end = end;
+        static thread_local char content_length[16];
         nghttp2_nv headers[8] = {nv(":method", "POST"),
-                                nv(":scheme", "http"),
-                                nv(":authority", "grpc.test"),
-                                nv(":path", "/test.Echo/Call"),
-                                nv("content-type", "application/grpc+proto"),
-                                nv("te", "trailers"),
-                                nv("grpc-timeout", timeout ? timeout : "1H")};
+                                 nv(":scheme", "http"),
+                                 nv(":authority", "grpc.test"),
+                                 nv(":path", jit_forward ? "/jit.Echo/Call" : "/test.Echo/Call"),
+                                 nv("content-type", "application/grpc+proto"),
+                                 nv("te", "trailers"),
+                                 nv("grpc-timeout", timeout ? timeout : "1H")};
+        if (jit_forward) {
+            snprintf(content_length, sizeof(content_length), "%u", bytes);
+            headers[7] = nv("content-length", content_length);
+        }
         nghttp2_data_provider provider{};
         provider.source.ptr = &rpcs[index];
         provider.read_callback = &data;
@@ -416,6 +422,7 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
     REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)).has_value());
     cfg.upstreams[0].http2 = true;
     REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    REQUIRE(cfg.add_jit_handler("/jit.Echo/", 'P', &grpc_jit_forward, false));
     shard->route_config = &cfg;
 #if RUT_GRPC_JIT
     struct Program {
@@ -551,20 +558,24 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
                 CHECK(a.until(12, true));
                 CHECK(a.rpcs[12].ok);
                 // Draining sends GOAWAY but lets a bidirectional RPC finish.
-                CHECK_EQ(a.request(13, 128, false), 27);
-                CHECK(a.until(13, false));
+                CHECK_EQ(a.request(13, 4096, true, nullptr, true), 27);
+                CHECK(a.until(13, true));
+                CHECK(a.rpcs[13].ok);
+                CHECK_EQ(a.rpcs[13].received, 4096u);
+                CHECK_EQ(a.request(14, 128, false), 29);
+                CHECK(a.until(14, false));
                 shard->loop->drain(5);
                 const u64 drain_deadline = monotonic_us() + 2500000;
                 while (!a.goaway && monotonic_us() < drain_deadline) {
                     if (!a.step()) break;
                 }
                 CHECK(a.goaway);
-                a.rpcs[13].size = 32768;
-                a.rpcs[13].end = true;
-                CHECK_EQ(nghttp2_session_resume_data(a.session, 27), 0);
-                CHECK(a.until(13, true));
-                CHECK(a.rpcs[13].ok);
-                CHECK_EQ(a.rpcs[13].received, 32768u);
+                a.rpcs[14].size = 32768;
+                a.rpcs[14].end = true;
+                CHECK_EQ(nghttp2_session_resume_data(a.session, 29), 0);
+                CHECK(a.until(14, true));
+                CHECK(a.rpcs[14].ok);
+                CHECK_EQ(a.rpcs[14].received, 32768u);
             }
         }
     }
