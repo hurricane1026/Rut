@@ -3255,6 +3255,7 @@ public:
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
         conns[id].listener_context = this->listener_context;
+        conns[id].json_arena.backend.pool = &pool;
         conns[id].bind_request_receive_buffer(rs, SlicePool::kSliceSize);
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);

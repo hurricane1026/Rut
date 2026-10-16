@@ -1897,7 +1897,6 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     struct_index = 0xffffffffu;
     if (name.eq({"bool", 4})) return HirTypeKind::Bool;
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
-    if (name.eq({"i64", 3})) return HirTypeKind::I64;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
     if (name.eq({"Json", 4})) return HirTypeKind::Json;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
@@ -7161,9 +7160,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         return out;
     }
     if (expr.kind == AstExprKind::StrLit) {
+        auto decoded = decoded_expression_string(expr.str_value, mod, expr.span);
+        if (!decoded) return core::make_unexpected(decoded.error());
         out.kind = HirExprKind::StrLit;
         out.type = HirTypeKind::Str;
-        out.str_value = expr.str_value;
+        out.str_value = decoded.value();
         return out;
     }
     if (expr.kind == AstExprKind::ObjectLit) {

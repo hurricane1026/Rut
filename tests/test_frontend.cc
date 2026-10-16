@@ -39906,3 +39906,28 @@ TEST(frontend, upstream_http2_rejects_http1_health_probe) {
     REQUIRE(ast);
     CHECK(!analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, string_literals_decode_expression_escapes) {
+    auto valid = lex(lit("route GET \"/x\" { let s = \"a\\n\\u{41}\" return 200 }"));
+    REQUIRE(valid);
+    auto valid_ast = parse_file_heap(valid.value());
+    REQUIRE(valid_ast);
+    auto hir = analyze_file_heap(valid_ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("a\nA")));
+
+    auto invalid = lex(lit("route GET \"/x\" { let s = \"a\\q\" return 200 }"));
+    REQUIRE(invalid);
+    auto invalid_ast = parse_file_heap(invalid.value());
+    REQUIRE(invalid_ast);
+    CHECK(!analyze_file_heap(invalid_ast.value()));
+}
+
+TEST(frontend, user_declared_i64_type_is_rejected) {
+    auto tokens = lex(lit("struct User { value: i64 } route GET \"/x\" { return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(!analyze_file_heap(ast.value()));
+}
