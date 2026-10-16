@@ -10258,7 +10258,7 @@ TEST(http2, head_return_status_keeps_length_without_body_owners) {
     CHECK_EQ(h2.queued_stream, 0u);
     CHECK_EQ(h2.outbound_body, nullptr);
     CHECK_EQ(h2.queued_body, nullptr);
-    CHECK(h2.response_flush_pending);
+    CHECK_FALSE(h2.response_flush_pending);
     const Http2Stream* head_stream = h2.find_stream(1);
     REQUIRE(head_stream != nullptr);
     CHECK(head_stream->state == Http2StreamState::HalfClosedLocal);

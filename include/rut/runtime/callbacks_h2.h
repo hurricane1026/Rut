@@ -816,7 +816,6 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
         else
             d.conn->h2->hpack_enc = staged;
         d.resp_len += n;
-        d.conn->h2->response_flush_pending = true;
         h2_close_stream(d.conn->h2, stream_id);
     } else if (body_len != 0 && !bodyless_status) {
         if (!h2_stage_owned_response(d,
