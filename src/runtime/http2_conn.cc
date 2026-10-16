@@ -1,5 +1,7 @@
 #include "rut/runtime/http2_conn.h"
 
+#include "rut/runtime/slice_pool.h"
+
 namespace rut {
 
 namespace {
@@ -101,7 +103,37 @@ void Http2Conn::init() {
     queued_body_offset = 0;
     queued_final_staged = false;
     queued_source = H2OutboundBodySource::None;
+    jit_outbound_slice = nullptr;
+    jit_outbound_pool = nullptr;
+    jit_queued_slice = nullptr;
+    jit_queued_pool = nullptr;
     response_flush_pending = false;
+}
+
+void h2_clear_outbound(Http2Conn& h2) {
+    if (h2.jit_outbound_slice != nullptr && h2.jit_outbound_pool != nullptr)
+        h2.jit_outbound_pool->free(h2.jit_outbound_slice);
+    h2.jit_outbound_slice = nullptr;
+    h2.jit_outbound_pool = nullptr;
+    h2.outbound_stream = 0;
+    h2.outbound_config = nullptr;
+    h2.outbound_body = nullptr;
+    h2.outbound_body_len = 0;
+    h2.outbound_body_offset = 0;
+    h2.outbound_final_staged = false;
+    h2.outbound_source = H2OutboundBodySource::None;
+
+    if (h2.jit_queued_slice != nullptr && h2.jit_queued_pool != nullptr)
+        h2.jit_queued_pool->free(h2.jit_queued_slice);
+    h2.jit_queued_slice = nullptr;
+    h2.jit_queued_pool = nullptr;
+    h2.queued_stream = 0;
+    h2.queued_config = nullptr;
+    h2.queued_body = nullptr;
+    h2.queued_body_len = 0;
+    h2.queued_body_offset = 0;
+    h2.queued_final_staged = false;
+    h2.queued_source = H2OutboundBodySource::None;
 }
 
 Http2Stream* Http2Conn::find_stream(u32 id) {

@@ -10593,7 +10593,7 @@ TEST(http2, json_owned_body_survives_flow_control_stall_after_arena_release) {
     CHECK_EQ(conn->json_arena.current, nullptr);
     REQUIRE_EQ(h2.outbound_body_len, sizeof(json_bytes) - 1);
     CHECK_EQ(memcmp(h2.outbound_body, json_bytes, sizeof(json_bytes) - 1), 0);
-    CHECK_EQ(h2.outbound_body, h2.json_outbound_body);
+    CHECK_EQ(h2.outbound_body, h2.jit_outbound_body);
     conn->reset();
     pool.destroy();
 }

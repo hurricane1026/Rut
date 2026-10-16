@@ -3283,6 +3283,7 @@ public:
         // The h2 engine is a pool object, not a kernel buffer — safe to reclaim
         // now even with ops in flight (unlike the recv/send slices below).
         if (c.h2) {
+            h2_clear_outbound(*c.h2);
             h2_pool.free(c.h2);
             c.h2 = nullptr;
         }

@@ -1542,5 +1542,5 @@ extern "C" void rut_helper_resp_body(
     const auto& parsed = parse_cached(request, request_len);
     c.jit_response_head = parsed.ok && parsed.req.method == HttpMethod::HEAD;
     c.jit_response_body = {ptr, len};
-    c.jit_response_body_valid = ptr != nullptr && len <= json::kMaxBytes;
+    c.jit_response_body_valid = ptr != nullptr && len <= SlicePool::kSliceSize;
 }
