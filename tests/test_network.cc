@@ -38161,11 +38161,12 @@ static u64 state_invariant_wait_recv_then_status(
 
 template <typename Loop>
 static void check_event_yield_502_body(rut::test::TestCase* _tc,
-                                       Loop& loop,
                                        jit::YieldKind kind,
                                        u32 failure_case,
                                        bool is_head,
                                        bool request_http10 = false) {
+    auto loop_storage = std::make_unique<Loop>();
+    Loop& loop = *loop_storage;
     loop.setup();
     Connection* conn = loop.alloc_conn();
     REQUIRE(conn != nullptr);
@@ -38175,10 +38176,11 @@ static void check_event_yield_502_body(rut::test::TestCase* _tc,
         static_cast<u8>(request_http10 ? HttpVersion::Http10 : HttpVersion::Http11);
     loop.timer.add(conn, loop.keepalive_timeout);
 
-    RouteConfig cfg;
+    std::unique_ptr<RouteConfig> cfg;
     if (failure_case == 1 || failure_case == 4) {
-        REQUIRE(cfg.add_upstream("api", 0x7F000001, 9000).has_value());
-        conn->request_config = &cfg;
+        cfg = std::make_unique<RouteConfig>();
+        REQUIRE(cfg->add_upstream("api", 0x7F000001, 9000).has_value());
+        conn->request_config = cfg.get();
     }
     if (kind == jit::YieldKind::UpstreamSend || kind == jit::YieldKind::UpstreamRecv) {
         // The mock close_conn_impl only cancels and clears this descriptor;
@@ -38243,47 +38245,31 @@ static void check_event_yield_502_body(rut::test::TestCase* _tc,
 TEST(state_invariant, jit_event_yield_502_suppresses_head_body_on_both_backends) {
     // An invalid target follows the early UpstreamConnect failure arm. The GET
     // case keeps the reason body as a wire-contract control on both templates.
-    {
-        SmallLoop loop;
-        check_event_yield_502_body(
-            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, false);
-    }
-    {
-        SmallLoop loop;
-        check_event_yield_502_body(
-            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, true);
-    }
-    {
-        AsyncSmallLoop loop;
-        check_event_yield_502_body(
-            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, false);
-    }
-    {
-        AsyncSmallLoop loop;
-        check_event_yield_502_body(
-            _tc, loop, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, true);
-    }
+    check_event_yield_502_body<SmallLoop>(
+        _tc, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, false);
+    check_event_yield_502_body<SmallLoop>(
+        _tc, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, true);
+    check_event_yield_502_body<AsyncSmallLoop>(
+        _tc, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, false);
+    check_event_yield_502_body<AsyncSmallLoop>(
+        _tc, jit::YieldKind::UpstreamConnect, /*invalid target=*/0, true);
 
     // The invalid-local-target publisher opts into the captured HTTP/1.0
     // version, while the original HTTP/1.1 controls above remain unchanged.
     for (bool async_backend : {false, true}) {
         for (bool is_head : {false, true}) {
             if (async_backend) {
-                AsyncSmallLoop loop;
-                check_event_yield_502_body(_tc,
-                                           loop,
-                                           jit::YieldKind::UpstreamConnect,
-                                           /*invalid target=*/0,
-                                           is_head,
-                                           true);
+                check_event_yield_502_body<AsyncSmallLoop>(_tc,
+                                                           jit::YieldKind::UpstreamConnect,
+                                                           /*invalid target=*/0,
+                                                           is_head,
+                                                           true);
             } else {
-                SmallLoop loop;
-                check_event_yield_502_body(_tc,
-                                           loop,
-                                           jit::YieldKind::UpstreamConnect,
-                                           /*invalid target=*/0,
-                                           is_head,
-                                           true);
+                check_event_yield_502_body<SmallLoop>(_tc,
+                                                      jit::YieldKind::UpstreamConnect,
+                                                      /*invalid target=*/0,
+                                                      is_head,
+                                                      true);
             }
         }
     }
@@ -38295,11 +38281,9 @@ TEST(state_invariant, jit_event_yield_502_suppresses_head_body_on_both_backends)
                 i < 2 ? jit::YieldKind::UpstreamConnect
                       : (i == 2 ? jit::YieldKind::UpstreamSend : jit::YieldKind::UpstreamRecv);
             if (async_backend) {
-                AsyncSmallLoop loop;
-                check_event_yield_502_body(_tc, loop, kind, failure_cases[i], true);
+                check_event_yield_502_body<AsyncSmallLoop>(_tc, kind, failure_cases[i], true);
             } else {
-                SmallLoop loop;
-                check_event_yield_502_body(_tc, loop, kind, failure_cases[i], true);
+                check_event_yield_502_body<SmallLoop>(_tc, kind, failure_cases[i], true);
             }
         }
     }
@@ -38308,21 +38292,17 @@ TEST(state_invariant, jit_event_yield_502_suppresses_head_body_on_both_backends)
     // on the generic proxy-error HTTP/1.1 wire policy.
     for (bool async_backend : {false, true}) {
         if (async_backend) {
-            AsyncSmallLoop loop;
-            check_event_yield_502_body(_tc,
-                                       loop,
-                                       jit::YieldKind::UpstreamConnect,
-                                       /*connect submit failure=*/1,
-                                       false,
-                                       true);
+            check_event_yield_502_body<AsyncSmallLoop>(_tc,
+                                                       jit::YieldKind::UpstreamConnect,
+                                                       /*connect submit failure=*/1,
+                                                       false,
+                                                       true);
         } else {
-            SmallLoop loop;
-            check_event_yield_502_body(_tc,
-                                       loop,
-                                       jit::YieldKind::UpstreamConnect,
-                                       /*connect submit failure=*/1,
-                                       false,
-                                       true);
+            check_event_yield_502_body<SmallLoop>(_tc,
+                                                  jit::YieldKind::UpstreamConnect,
+                                                  /*connect submit failure=*/1,
+                                                  false,
+                                                  true);
         }
     }
 }
