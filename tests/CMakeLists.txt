@@ -3807,4 +3807,3 @@ if(RUT_TEST_SIMDJSON_PATCH)
     set_tests_properties(test_simdjson_allocator_patch PROPERTIES
         LABELS "dependency" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
-
