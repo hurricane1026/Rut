@@ -1671,6 +1671,12 @@ u64 h2_grpc_local_status(void* conn, jit::HandlerCtx*, const u8*, u32, void*) {
 
 TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
     auto run = [&](u32 expected, u32 actual, bool mutate_concurrently) {
+        struct Result {
+            bool status207;
+            bool status400;
+            bool kept;
+            bool changed;
+        } result{};
         Http2Conn h2;
         h2.init();
         Connection conn;
@@ -1713,12 +1719,46 @@ TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
         h2_on_data_cb<FakeH2Loop>(&d, h2, 1, body, actual, true);
         CHECK_FALSE(h2.pending_local_outcome);
         CHECK_EQ(g_h2_grpc_jit_calls, 1u);
-        return d.resp_len;
+        Http2FrameHeader frame;
+        if (d.resp_len != 0 && parse_frame_header(response, d.resp_len, &frame) == ParseStatus::Complete) {
+            hpack::DynamicTable dyn;
+            dyn.init(4096);
+            hpack::Header decoded[16];
+            u8 scratch[512];
+            u32 decoded_count = 0;
+            if (hpack::decode_header_block(dyn,
+                                          response + kFrameHeaderSize,
+                                          frame.length,
+                                          scratch,
+                                          sizeof(scratch),
+                                          decoded,
+                                          16,
+                                          &decoded_count)) {
+                for (u32 i = 0; i < decoded_count; i++) {
+                    if (decoded[i].name.eq({":status", 7}) && decoded[i].value.eq({"207", 3}))
+                        result.status207 = true;
+                    if (decoded[i].name.eq({":status", 7}) && decoded[i].value.eq({"400", 3}))
+                        result.status400 = true;
+                    if (decoded[i].name.eq({"x-local", 7}) && decoded[i].value.eq({"kept", 4}))
+                        result.kept = true;
+                    if (decoded[i].name.eq({"x-local", 7}) && decoded[i].value.eq({"changed", 7}))
+                        result.changed = true;
+                }
+            }
+        }
+        return result;
     };
 
-    CHECK_GT(run(3, 3, true), 0u);
-    CHECK_GT(run(3, 2, false), 0u);  // mismatch is a deferred 400 response
-    CHECK_GT(run(3, 4, false), 0u);  // mismatch is a deferred 400 response
+    const auto matched = run(3, 3, true);
+    CHECK(matched.status207);
+    CHECK(matched.kept);
+    CHECK_FALSE(matched.changed);
+    const auto short_body = run(3, 2, false);
+    CHECK(short_body.status400);
+    CHECK_FALSE(short_body.kept);
+    const auto long_body = run(3, 4, false);
+    CHECK(long_body.status400);
+    CHECK_FALSE(long_body.kept);
 }
 
 TEST(h2_serving, grpc_local_jit_reset_clears_parked_outcome) {
