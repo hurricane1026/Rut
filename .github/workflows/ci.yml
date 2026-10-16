@@ -731,6 +731,7 @@ jobs:
           LLVM_PROFILE_FILE=build/test_buffer.profraw ./build/tests/test_buffer
           LLVM_PROFILE_FILE=build/test_types.profraw ./build/tests/test_types
           LLVM_PROFILE_FILE=build/test_network.profraw ./build/tests/test_network
+          LLVM_PROFILE_FILE=build/test_grpc_proxy.profraw ./build/tests/test_grpc_proxy
           LLVM_PROFILE_FILE=build/test_integration.profraw ./build/tests/test_integration
           LLVM_PROFILE_FILE=build/test_arena.profraw ./build/tests/test_arena
           LLVM_PROFILE_FILE=build/test_expected.profraw ./build/tests/test_expected
@@ -788,6 +789,7 @@ jobs:
             build/tests/test_buffer \
             build/tests/test_types \
             build/tests/test_network \
+            build/tests/test_grpc_proxy \
             build/tests/test_integration \
             build/tests/test_arena \
             build/tests/test_http_parser \
