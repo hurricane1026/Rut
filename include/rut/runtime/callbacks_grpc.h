@@ -518,7 +518,7 @@ bool grpc_start_impl(Loop* loop,
             loop->pool.free(reinterpret_cast<u8*>(x));
             return false;
         }
-        up->metrics_client = false;
+        up->set_metrics_client(false);
         if (!loop->alloc_h2(*up) || !grpc_grow_recv(loop, *up)) {
             loop->close_conn(*up);
             loop->pool.free(reinterpret_cast<u8*>(x));

@@ -305,6 +305,7 @@ struct RelayOwner {
 };
 
 struct ConnectionBase {
+    static constexpr u16 kMetricsClientFlag = 1u;
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
     static constexpr u16 kMaxPipelineDepth = 16;
@@ -372,6 +373,13 @@ struct ConnectionBase {
     ConnState state;  // for debugging/metrics only
     u8 shard_id;
     u16 flags;
+    bool metrics_client() const { return (flags & kMetricsClientFlag) != 0; }
+    void set_metrics_client(bool client) {
+        if (client)
+            flags |= kMetricsClientFlag;
+        else
+            flags &= static_cast<u16>(~kMetricsClientFlag);
+    }
     u16 timer_slot;
     // Idle-buffer trim mark (io_uring sweep only; see IoUringEventLoop::
     // sweep_idle_trim): this connection's timer node has been examined since it
@@ -416,8 +424,6 @@ struct ConnectionBase {
     // desynced must never be reused (the next request would be parsed as leftover
     // body). Reset at the per-request boundary like the other reuse flags.
     bool upstream_request_incomplete;
-    // Internal pooled sessions must not affect accepted-client metrics.
-    bool metrics_client;
     // io_uring-only deferred idle-pool return: an upstream fd to park in the pool
     // once its cancelled multishot recv terminal drains (handing the fd out while a
     // recv is still draining on it would let two recvs race the same socket). -1 =
@@ -1918,7 +1924,7 @@ struct ConnectionBase {
         id = 0;
         state = ConnState::Idle;
         shard_id = 0;
-        flags = 0;
+        flags = kMetricsClientFlag;
         timer_slot = 0;
         timer_node.init();
         idle_node.init();
@@ -1935,7 +1941,6 @@ struct ConnectionBase {
         upstream_keep_alive = false;
         upstream_reused = false;
         upstream_request_incomplete = false;
-        metrics_client = true;
         idle_return_fd = -1;
         idle_return_uid = 0;
         idle_return_bidx = 0;

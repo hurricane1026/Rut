@@ -7522,7 +7522,7 @@ public:
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
             }
-            if (c.metrics_client) metrics->on_close();
+            if (c.metrics_client()) metrics->on_close();
         }
         // A deferred idle-pool return (return_idle_upstream parked a still-reusable
         // upstream fd in idle_return_fd) whose cancelled multishot recv has NOT yet

@@ -1014,7 +1014,7 @@ public:
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
             }
-            if (c.metrics_client) metrics->on_close();
+            if (c.metrics_client()) metrics->on_close();
         }
         this->free_conn(c);
     }
