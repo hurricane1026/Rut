@@ -1156,7 +1156,12 @@ TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_d
 }
 
 struct FailConnectLoop : EpollEventLoop {
+    u32 recv_submits = 0;
     bool submit_connect(Connection&, const void*, u32) { return false; }
+    bool submit_recv(Connection& conn) {
+        recv_submits++;
+        return EpollEventLoop::submit_recv(conn);
+    }
 };
 
 TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_input) {
@@ -1201,6 +1206,7 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     CHECK_EQ(down->h2->async_stream, 0u);
     CHECK_EQ(down->h2->grpc.active, 0u);
     CHECK_GT(down->send_buf.len(), 0u);
+    CHECK_EQ(loop.recv_submits, 0u);
     CHECK_EQ(loop.grpc_upstreams, nullptr);
     loop.force_close_all();
     loop.shutdown();

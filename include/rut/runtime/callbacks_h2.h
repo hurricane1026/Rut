@@ -2411,8 +2411,10 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                       0};
                         on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
                     } else {
-                        if (h2->grpc.active) grpc_kick_downstream(loop, conn);
-                        loop->submit_recv(conn);
+                        if (h2->grpc.active)
+                            grpc_kick_downstream(loop, conn);
+                        else
+                            loop->submit_recv(conn);
                     }
                     return;
                 }
