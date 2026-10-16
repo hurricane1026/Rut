@@ -13,7 +13,7 @@ git apply "$root/patches/simdjson/0001-ondemand-allocator-hooks.patch"
 for development_checks in 0 1; do
   "${CXX:-clang++}" -std=c++23 -O2 -fno-exceptions -fno-rtti \
     -fno-threadsafe-statics -DSIMDJSON_EXCEPTIONS=0 \
-    -DSIMDJSON_THREADS_ENABLED=0 -DSIMDJSON_RUT_ALLOCATOR=1 \
+    -DSIMDJSON_RUT_ALLOCATOR=1 \
     -DSIMDJSON_DEVELOPMENT_CHECKS="$development_checks" \
     -ffunction-sections -fdata-sections -I include -I src \
     "$root/tests/simdjson/allocator_probe.cc" src/simdjson.cpp \

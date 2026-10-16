@@ -1,5 +1,8 @@
 // Standalone patch probe, not a production C++ ABI implementation.
 #include "simdjson.h"
+#ifdef SIMDJSON_THREADS_ENABLED
+#error "allocator probe requires simdjson's non-threaded profile"
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <new>

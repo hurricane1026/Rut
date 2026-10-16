@@ -43,8 +43,14 @@ Compile all participating translation units with consistent definitions:
 ```text
 SIMDJSON_RUT_ALLOCATOR=1
 SIMDJSON_EXCEPTIONS=0
-SIMDJSON_THREADS_ENABLED=0
 ```
+
+Leave `SIMDJSON_THREADS_ENABLED` undefined for this profile. The pinned
+upstream headers use `#ifdef SIMDJSON_THREADS_ENABLED`, so defining it as `0`
+still enables the threaded interface and behavior. They also define it when
+`_REENTRANT` or `_MT` is set, so compile without `-pthread` or equivalent
+thread-enabled flags. The standalone probe checks the macro after including
+simdjson headers and fails to compile if either path enables threading.
 
 The embedding application supplies:
 
