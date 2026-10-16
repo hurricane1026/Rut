@@ -24,6 +24,18 @@ namespace {
 u64 grpc_jit_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_forward(0).pack();
 }
+u64 grpc_jit_mutating_forward(void* conn, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    if (ctx->state == 0) {
+        auto* c = static_cast<Connection*>(conn);
+        c->resp_header_mutations[0] = {
+            {"x-jit", 5}, {"first", 5}, Connection::RespHeaderMutationMode::Set};
+        c->resp_header_mutations[1] = {
+            {"x-remove", 8}, {nullptr, 0}, Connection::RespHeaderMutationMode::Remove};
+        c->resp_header_mutation_count = 2;
+        return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 1).pack();
+    }
+    return jit::HandlerResult::make_forward(0).pack();
+}
 u64 grpc_jit_timer_forward(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
     if (ctx->state == 0)
         return jit::HandlerResult::make_yield_payload(1, jit::YieldKind::Timer, 100).pack();
@@ -1212,6 +1224,68 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     loop.shutdown();
 }
 
+TEST(grpc_proxy, resumed_jit_forward_snapshots_response_mutations) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init();
+    down->h2->client = true;
+    down->protocol = ConnProtocol::Http2;
+    down->request_config = &cfg;
+    REQUIRE(down->h2->open_stream(1) != nullptr);
+    const char* synth = "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\n\r\n";
+    const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
+    for (u32 i = 0; i < synth_len; i++) down->h2->pending_synth[i] = static_cast<u8>(synth[i]);
+    ParsedRequest open;
+    open.reset();
+    u8 response[8192]{};
+    H2Dispatch<EpollEventLoop> d{&loop, down, response, sizeof(response), 0, false};
+    auto* initial_ctx = down->reset_jit_ctx();
+    grpc_jit_mutating_forward(down, initial_ctx, nullptr, 0, nullptr);
+    JitDispatchOutcome yielded{};
+    yielded.kind = JitDispatchOutcome::Kind::TimerYield;
+    yielded.next_state = 1;
+    yielded.timer_ms = 1;
+    REQUIRE(h2_suspend_timer(d,
+                             1,
+                             &grpc_jit_mutating_forward,
+                             yielded,
+                             &cfg,
+                             down->h2->pending_synth,
+                             synth_len,
+                             true,
+                             true,
+                             false,
+                             &open));
+    down->pending_handler_fn = &grpc_jit_mutating_forward;
+    down->handler_state = 1;
+    h2_resume_jit_handler(&loop, *down);
+    CHECK_EQ(down->h2->async_stream, 0u);
+    CHECK_EQ(down->h2->grpc.active, 1u);
+    auto* x = down->h2->grpc.streams[0];
+    REQUIRE(x != nullptr);
+    CHECK_EQ(x->response_mutation_count, 2u);
+    CHECK(x->response_mutations[0].mode ==
+          static_cast<u8>(Connection::RespHeaderMutationMode::Set));
+    CHECK(x->response_mutations[1].mode ==
+          static_cast<u8>(Connection::RespHeaderMutationMode::Remove));
+    const char* first_name = reinterpret_cast<const char*>(x->response_mutation_storage +
+                                                           x->response_mutations[0].name_offset);
+    const char* first_value = reinterpret_cast<const char*>(x->response_mutation_storage +
+                                                            x->response_mutations[0].value_offset);
+    const Str first_name_str{first_name, x->response_mutations[0].name_len};
+    const Str first_value_str{first_value, x->response_mutations[0].value_len};
+    CHECK(first_name_str.eq({"x-jit", 5}));
+    CHECK(first_value_str.eq({"first", 5}));
+    loop.force_close_all();
+    loop.shutdown();
+}
+
 TEST(grpc_proxy, upstream_session_close_releases_slots_with_blocked_downstream) {
     GrpcDriveFixture loop;
     REQUIRE(loop.pool_ready);
@@ -1717,6 +1791,52 @@ TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     loop.force_close_all();
     loop.shutdown();
 }
+TEST(grpc_proxy, grpc_response_mutations_snapshot_per_exchange) {
+    Connection downstream;
+    downstream.reset();
+    GrpcExchange first;
+    first.init();
+    downstream.resp_header_mutations[0] = {
+        {"x-first", 7}, {"one", 3}, Connection::RespHeaderMutationMode::Set};
+    downstream.resp_header_mutations[1] = {
+        {"x-remove", 8}, {nullptr, 0}, Connection::RespHeaderMutationMode::Remove};
+    downstream.resp_header_mutation_count = 2;
+    REQUIRE(grpc_snapshot_response_mutations(downstream, first));
+    downstream.resp_header_mutations[0] = {
+        {"x-first", 7}, {"two", 3}, Connection::RespHeaderMutationMode::Set};
+    GrpcExchange second;
+    second.init();
+    REQUIRE(grpc_snapshot_response_mutations(downstream, second));
+
+    hpack::Header headers[4] = {
+        {{"x-first", 7}, {"upstream", 8}},
+        {{"x-remove", 8}, {"gone", 4}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"grpc-status", 11}, {"0", 1}},
+    };
+    u32 count = 4;
+    REQUIRE(grpc_apply_response_mutations(first, headers, &count, 8));
+    CHECK_EQ(count, 3u);
+    CHECK(headers[0].name.eq({"content-type", 12}));
+    CHECK(headers[1].name.eq({"grpc-status", 11}));
+    CHECK(headers[2].name.eq({"x-first", 7}));
+    CHECK(headers[2].value.eq({"one", 3}));
+    count = 4;
+    headers[0].value = {"upstream", 8};
+    headers[1].value = {"gone", 4};
+    REQUIRE(grpc_apply_response_mutations(second, headers, &count, 8));
+    CHECK_EQ(count, 3u);
+    CHECK(headers[2].value.eq({"two", 3}));
+
+    u8 oversized_name[GrpcExchange::kHeaders]{};
+    downstream.resp_header_mutations[0].name = {reinterpret_cast<const char*>(oversized_name),
+                                                GrpcExchange::kHeaders};
+    downstream.resp_header_mutation_count = 1;
+    first.init();
+    CHECK_FALSE(grpc_snapshot_response_mutations(downstream, first));
+    CHECK(first.response_mutation_overflow);
+}
+
 TEST(grpc_proxy, expired_headers_deadline_is_cancelled_before_upstream_headers) {
     EpollEventLoop loop;
     REQUIRE(loop.init(0, -1).has_value());

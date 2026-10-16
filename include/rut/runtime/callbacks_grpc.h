@@ -202,6 +202,76 @@ struct GrpcClientDispatch {
     Connection* conn;
 };
 
+inline bool grpc_snapshot_response_mutations(const Connection& down, GrpcExchange& x) {
+    if (down.resp_header_mutation_overflow ||
+        down.resp_header_mutation_count > GrpcExchange::kMaxResponseMutations)
+        return false;
+    x.response_mutation_count = down.resp_header_mutation_count;
+    x.response_mutation_bytes = 0;
+    for (u32 i = 0; i < x.response_mutation_count; i++) {
+        const auto& source = down.resp_header_mutations[i];
+        const u32 needed = source.name.len + source.value.len;
+        if (needed > GrpcExchange::kHeaders - x.response_mutation_bytes) {
+            x.response_mutation_overflow = true;
+            return false;
+        }
+        auto& target = x.response_mutations[i];
+        target.name_offset = static_cast<u16>(x.response_mutation_bytes);
+        target.name_len = static_cast<u16>(source.name.len);
+        if (source.name.len)
+            __builtin_memcpy(x.response_mutation_storage + x.response_mutation_bytes,
+                             source.name.ptr,
+                             source.name.len);
+        x.response_mutation_bytes += source.name.len;
+        target.value_offset = static_cast<u16>(x.response_mutation_bytes);
+        target.value_len = static_cast<u16>(source.value.len);
+        if (source.value.len)
+            __builtin_memcpy(x.response_mutation_storage + x.response_mutation_bytes,
+                             source.value.ptr,
+                             source.value.len);
+        x.response_mutation_bytes += source.value.len;
+        target.mode = static_cast<u8>(source.mode);
+    }
+    return true;
+}
+
+inline bool grpc_apply_response_mutations(GrpcExchange& x,
+                                          hpack::Header* headers,
+                                          u32* count,
+                                          u32 capacity) {
+    for (u32 mi = 0; mi < x.response_mutation_count; mi++) {
+        const auto& mutation = x.response_mutations[mi];
+        const char* name =
+            reinterpret_cast<const char*>(x.response_mutation_storage + mutation.name_offset);
+        const char* value =
+            reinterpret_cast<const char*>(x.response_mutation_storage + mutation.value_offset);
+        const bool remove =
+            mutation.mode == static_cast<u8>(Connection::RespHeaderMutationMode::Remove);
+        if (validate_response_header(
+                name, mutation.name_len, remove ? "" : value, remove ? 0 : mutation.value_len) !=
+            HttpHeaderValidation::Ok)
+            return false;
+        if (mutation.mode != static_cast<u8>(Connection::RespHeaderMutationMode::Add)) {
+            for (u32 i = 0; i < *count;) {
+                if (!http_header_name_eq_ci(
+                        headers[i].name.ptr, headers[i].name.len, name, mutation.name_len)) {
+                    i++;
+                    continue;
+                }
+                for (u32 move = i + 1; move < *count; move++) headers[move - 1] = headers[move];
+                (*count)--;
+            }
+        }
+        if (!remove && !h2_is_prohibited_response_header(name, mutation.name_len)) {
+            if (*count >= capacity) return false;
+            headers[*count].name = {name, mutation.name_len};
+            headers[*count].value = {value, mutation.value_len};
+            (*count)++;
+        }
+    }
+    return true;
+}
+
 inline bool grpc_has_status(const hpack::Header* hs, u32 n) {
     for (u32 i = 0; i < n; i++)
         if (hs[i].name.eq({"grpc-status", 11})) return true;
@@ -295,6 +365,12 @@ void grpc_response_headers(
     for (u32 i = 0; i < n; i++) {
         if (!grpc_response_header_allowed(hs[i])) continue;
         if (filtered_n < Http2Conn::kMaxHeadersPerReq) filtered[filtered_n++] = hs[i];
+    }
+    if (!grpc_apply_response_mutations(*x, filtered, &filtered_n, Http2Conn::kMaxHeadersPerReq)) {
+        x->failure = 8;
+        x->response_end = true;
+        grpc_release_slot(dispatch->loop, *x);
+        return;
     }
     x->response_headers_len = http2_write_headers(x->response_headers,
                                                   sizeof(x->response_headers),
@@ -640,6 +716,10 @@ bool grpc_start_impl(Loop* loop,
     if (!x) return false;
     static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize);
     x->init();
+    if (!grpc_snapshot_response_mutations(down, *x)) {
+        loop->pool.free(reinterpret_cast<u8*>(x));
+        return false;
+    }
     if (end && req.has_content_length && req.content_length != 0) x->failure = 13;
     bool fresh = false;
     if (!up) {

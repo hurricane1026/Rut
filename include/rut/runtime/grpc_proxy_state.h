@@ -11,6 +11,14 @@ struct ConnectionBase;
 struct GrpcExchange {
     static constexpr u32 kWindow = 65535;
     static constexpr u32 kHeaders = 16384;
+    static constexpr u32 kMaxResponseMutations = 16;
+    struct ResponseMutation {
+        u16 name_offset;
+        u16 name_len;
+        u16 value_offset;
+        u16 value_len;
+        u8 mode;
+    };
     ConnectionBase* downstream;
     ConnectionBase* upstream;
     u32 downstream_stream;
@@ -34,12 +42,17 @@ struct GrpcExchange {
     u32 request_trailers_len;
     u32 response_headers_len;
     u32 response_trailers_len;
+    u32 response_mutation_bytes;
+    u8 response_mutation_count;
+    bool response_mutation_overflow;
+    ResponseMutation response_mutations[kMaxResponseMutations];
     u8 upload[kWindow];
     u8 download[kWindow];
     u8 request_headers[kHeaders];
     u8 request_trailers[kHeaders];
     u8 response_headers[kHeaders];
     u8 response_trailers[kHeaders];
+    u8 response_mutation_storage[kHeaders];
 
     void init() {
         downstream = upstream = nullptr;
@@ -53,6 +66,9 @@ struct GrpcExchange {
         upstream_id = 0;
         upload_len = download_len = request_headers_len = request_trailers_len = 0;
         response_headers_len = response_trailers_len = 0;
+        response_mutation_bytes = 0;
+        response_mutation_count = 0;
+        response_mutation_overflow = false;
     }
 };
 
