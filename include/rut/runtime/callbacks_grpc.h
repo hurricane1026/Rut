@@ -180,6 +180,14 @@ inline bool grpc_has_status(const hpack::Header* hs, u32 n) {
         if (hs[i].name.eq({"grpc-status", 11})) return true;
     return false;
 }
+inline bool grpc_request_header_allowed(const hpack::Header& h) {
+    if (h.name.eq({"connection", 10}) || h.name.eq({"keep-alive", 10}) ||
+        h.name.eq({"proxy-connection", 16}) || h.name.eq({"transfer-encoding", 17}) ||
+        h.name.eq({"upgrade", 7}))
+        return false;
+    if (h.name.eq({"te", 2}) && !h.value.eq({"trailers", 8})) return false;
+    return true;
+}
 template <typename Loop>
 void grpc_response_headers(
     void* ctx, Http2Conn& h, u32 sid, const hpack::Header* hs, u32 n, bool end) {
@@ -566,8 +574,13 @@ bool grpc_start_impl(Loop* loop,
         if (fresh) loop->close_conn(*up);
         return false;
     }
-    x->request_headers_len =
-        http2_write_headers(x->request_headers, sizeof(x->request_headers), usid, hs, nh, false);
+    hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
+    u32 filtered_n = 0;
+    for (u32 i = 0; i < nh; i++)
+        if (grpc_request_header_allowed(hs[i]) && filtered_n < Http2Conn::kMaxHeadersPerReq)
+            filtered[filtered_n++] = hs[i];
+    x->request_headers_len = http2_write_headers(
+        x->request_headers, sizeof(x->request_headers), usid, filtered, filtered_n, false);
     if (!x->request_headers_len) {
         stream->state = Http2StreamState::Closed;
         loop->pool.free(reinterpret_cast<u8*>(x));
