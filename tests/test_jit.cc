@@ -16,6 +16,7 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
+#include "rut/runtime/json.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
 #endif
@@ -21786,4 +21787,258 @@ TEST(jit, literal_boundary_overlap_keeps_art_dispatch) {
     auto config = std::make_unique<RouteConfig>();
     REQUIRE(configure_route_dispatch(*config, rir.module));
     CHECK(config->dispatch_kind() == RouteConfig::DispatchKind::ArtJit);
+}
+
+TEST(jit, json_nested_struct_field_access_and_decode_failures) {
+    const char* src = R"rut(
+struct Profile {
+    name: str
+    active: bool
+}
+struct User {
+    profile: Profile
+    age: i32
+    id: i32
+}
+route POST "/decode" {
+    guard let doc = req.bodyJson() else { return 400 }
+    guard let user = json.decode(User, doc) else { return 422 }
+    if user.profile.name == "Rut" && !user.profile.active &&
+       user.age == -2147483648 && user.id == 2147483647 {
+        return 200
+    } else { return 409 }
+}
+route POST "/body" {
+    guard let user = req.body(User) else { return 422 }
+    if user.profile.name == "Rut" && !user.profile.active &&
+       user.age == -2147483648 && user.id == 2147483647 {
+        return 200
+    } else { return 409 }
+}
+)rut";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered)
+        fprintf(stderr,
+                "JSON lowering error %u: %.*s\n",
+                static_cast<u32>(lowered.error().code),
+                lowered.error().detail.len,
+                lowered.error().detail.ptr);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+
+    struct Case {
+        const char* body;
+        u32 status;
+    };
+    const Case cases[] = {
+        // Field lookup must follow names, not input order; decode escaped names and values.
+        {R"({"id":2147483647,"extra":[null],"age":-2147483648,"profile":{"active":false,"na\u006de":"R\u0075t"}})",
+         200},
+        {R"({"profile":{"name":"Rut","active":true},"age":-2147483648,"id":2147483647})", 409},
+        {R"({"profile":{"name":"Other","active":false},"age":-2147483648,"id":2147483647})", 409},
+        {R"({"profile":{"name":"Rut","active":false},"age":0,"id":2147483647})", 409},
+        {R"({"profile":{"name":"Rut","active":false},"age":-2147483648,"id":-2147483648})", 409},
+        {R"({"profile":{"name":"Rut"},"age":0,"id":1})", 422},
+        {R"({"profile":{"name":null,"active":false},"age":0,"id":1})", 422},
+        {R"({"profile":{"name":"Rut","active":0},"age":0,"id":1})", 422},
+        {R"({"profile":null,"age":0,"id":1})", 422},
+        {R"({"profile":[],"age":0,"id":1})", 422},
+        {R"({"age":0,"id":1})", 422},
+        {R"({"profile":{"name":"Rut","active":false},"age":-2147483649,"id":1})", 422},
+        {R"({"profile":{"name":"Rut","active":false},"age":2147483648,"id":1})", 422},
+        {R"({"profile":{"name":"Rut","active":false},"age":0,"id":2147483648})", 422},
+        {R"({"profile":{"name":"Rut","active":false},"age":0,"id":-2147483649})", 422},
+        {R"({"profile":{"name":"Rut","active":false},"age":1.5,"id":1})", 422},
+        {R"({"profile":{"name":"Rut","active":false},"age":0,"id":"1"})", 422},
+        {"[]", 422},
+        {"null", 422},
+        {R"({"profile":{"name":"Rut","name":"Other","active":false},"age":0,"id":1})", 400},
+        {"{", 400},
+        // A failed decode must not poison a subsequent request using the same arena.
+        {R"({"profile":{"name":"Rut","active":false},"age":-2147483648,"id":2147483647})", 200},
+    };
+    for (u32 route = 0; route < 2; ++route) {
+        char name[32];
+        snprintf(name, sizeof(name), "handler_route_%u", route);
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup(name));
+        REQUIRE(handler);
+        for (const auto& c : cases) {
+            char request[512];
+            const int len = snprintf(request,
+                                     sizeof(request),
+                                     "POST / HTTP/1.1\r\nContent-Length: %u\r\n\r\n%s",
+                                     lit(c.body).len,
+                                     c.body);
+            REQUIRE(len > 0 && static_cast<u32>(len) < sizeof(request));
+            const auto result = HandlerResult::unpack(handler(nullptr,
+                                                              nullptr,
+                                                              reinterpret_cast<const u8*>(request),
+                                                              static_cast<u32>(len),
+                                                              &arena));
+            const u32 expected = route == 1 && c.status == 400 ? 422 : c.status;
+            if (result.status_code != expected)
+                fprintf(stderr, "JSON route %u, body: %s\n", route, c.body);
+            CHECK_EQ(result.status_code, expected);
+            arena.reset();
+        }
+    }
+    arena.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, json_helper_owned_strings_survive_workspace_reuse) {
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 has = 0;
+    const char* ptr = nullptr;
+    u32 len = 0;
+    i64 number = 0;
+    auto call = [&](json::Op op, Str input) {
+        rut_helper_json(nullptr,
+                        &arena,
+                        static_cast<u32>(op),
+                        input.ptr,
+                        input.len,
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &ptr,
+                        &len,
+                        &number);
+    };
+    char input[] = "\"a\\u0000b\"";
+    call(json::Op::AsString, {input, sizeof(input) - 1});
+    REQUIRE(has);
+    REQUIRE_EQ(len, 3u);
+    const Str saved{ptr, len};
+    CHECK_EQ(saved.ptr[1], '\0');
+    __builtin_memset(input, 'x', sizeof(input) - 1);
+    call(json::Op::Quote, lit_str("replacement"));
+    REQUIRE(has);
+    CHECK((Str{ptr, len}.eq(lit_str("\"replacement\""))));
+    CHECK(saved.eq(lit_str("a\0b")));
+    call(json::Op::AsString, lit_str("\"\""));
+    REQUIRE(has);
+    CHECK(ptr != nullptr);
+    CHECK_EQ(len, 0u);
+    call(json::Op::AsInt, lit_str("9223372036854775808"));
+    CHECK_EQ(has, 0u);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+    CHECK_EQ(number, 0);
+    CHECK(saved.eq(lit_str("a\0b")));
+    call(json::Op::AsBool, lit_str("false"));
+    REQUIRE(has);
+    CHECK_EQ(number, 0);
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(jit, json_helper_rejects_combined_depth_and_request_budget_overflow) {
+    SlicePool pool;
+    REQUIRE(pool.init(128));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    u8 has = 1;
+    const char* ptr = "stale";
+    u32 len = 5;
+    i64 number = 1;
+    char nested[2 * json::kMaxDepth + 1];
+    for (u32 i = 0; i < json::kMaxDepth; ++i) nested[i] = '[';
+    nested[json::kMaxDepth] = '0';
+    for (u32 i = 0; i < json::kMaxDepth; ++i) nested[json::kMaxDepth + 1 + i] = ']';
+    // Both operands are valid alone; their combination is one level too deep.
+    rut_helper_json(nullptr,
+                    &arena,
+                    static_cast<u32>(json::Op::Append),
+                    "[]",
+                    2,
+                    "",
+                    0,
+                    nested,
+                    sizeof(nested),
+                    0,
+                    &has,
+                    &ptr,
+                    &len,
+                    &number);
+    CHECK_EQ(has, 0u);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+    CHECK_EQ(number, 0);
+
+    char text[4096];
+    __builtin_memset(text, 'x', sizeof(text));
+    bool exhausted = false;
+    u32 successes = 0;
+    for (u32 i = 0; i < 100; ++i) {
+        rut_helper_json(nullptr,
+                        &arena,
+                        static_cast<u32>(json::Op::Quote),
+                        text,
+                        sizeof(text),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &ptr,
+                        &len,
+                        &number);
+        if (!has) {
+            exhausted = true;
+            CHECK(ptr == nullptr);
+            CHECK_EQ(len, 0u);
+            break;
+        }
+        ++successes;
+        CHECK_EQ(len, sizeof(text) + 2);
+        CHECK(arena.space_used() <= 262144u);
+    }
+    CHECK(successes > 0);
+    CHECK(exhausted);
+    arena.reset();
+    rut_helper_json(nullptr,
+                    &arena,
+                    static_cast<u32>(json::Op::Quote),
+                    "ok",
+                    2,
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    0,
+                    &has,
+                    &ptr,
+                    &len,
+                    &number);
+    REQUIRE(has);
+    CHECK((Str{ptr, len}.eq(lit_str("\"ok\""))));
+    arena.destroy();
+    pool.destroy();
 }

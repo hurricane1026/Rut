@@ -39931,3 +39931,33 @@ TEST(frontend, user_declared_i64_type_is_rejected) {
     REQUIRE(ast);
     CHECK(!analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, json_struct_decode_rejects_invalid_types_and_wrapped_inputs) {
+    const char* cases[] = {
+        "struct User { name: str }\nroute POST \"/\" { let x = json.decode(User) return 200 }",
+        "struct User { name: str }\nroute POST \"/\" { let x = json.decode(User, \"{}\") return "
+        "200 }",
+        "struct User { name: str }\nroute POST \"/\" { let d = req.bodyJson() let x = "
+        "json.decode(User, d) return 200 }",
+        "route POST \"/\" { guard let d = req.bodyJson() else { return 400 } let x = "
+        "json.decode(Unknown, d) return 200 }",
+        "route POST \"/\" { let x = req.body() return 200 }",
+        "route POST \"/\" { let x = req.body(Unknown) return 200 }",
+        "struct User { name: str }\nroute POST \"/\" { let x = req.body(User, User) return 200 }",
+        "route POST \"/\" { let x = req.bodyJson(1) return 200 }",
+        "route POST \"/\" { guard let d = req.bodyJson() else { return 400 } let x = json.at(d, "
+        "\"0\") return 200 }",
+        "route POST \"/\" { guard let d = req.bodyJson() else { return 400 } let x = json.set(d, "
+        "\"/a\", 1) return 200 }",
+    };
+    for (const char* source : cases) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "Unexpected JSON type-check success: %s\n", source);
+        CHECK(!hir);
+        if (!hir) CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
