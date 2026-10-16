@@ -1192,6 +1192,7 @@ TEST(grpc_proxy, expired_headers_deadline_is_cancelled_before_upstream_headers) 
     REQUIRE(down != nullptr);
     REQUIRE(loop.alloc_h2(*down));
     down->h2->init_client();
+    down->on_send = &pending_send;
     down->request_config = &cfg;
     auto* down_stream = down->h2->open_stream(1);
     REQUIRE(down_stream != nullptr);
