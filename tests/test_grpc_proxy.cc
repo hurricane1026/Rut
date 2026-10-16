@@ -703,8 +703,11 @@ TEST(grpc_proxy, goaway_rejects_unsent_and_above_last_stream) {
     x.init();
     x.upstream_stream = 5;
     CHECK(grpc_rejected_by_goaway(h, x));
+    h.peer_last_stream = 0x7fffffffu;
+    CHECK(grpc_rejected_by_goaway(h, x));
     x.request_headers_sent = true;
     CHECK(!grpc_rejected_by_goaway(h, x));
+    h.peer_last_stream = 5;
     x.upstream_stream = 7;
     CHECK(grpc_rejected_by_goaway(h, x));
 }
