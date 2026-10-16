@@ -1773,10 +1773,9 @@ u32 g_h2_resume_calls = 0;
 u64 h2_resume_local_status(void* raw_conn, jit::HandlerCtx*, const u8* req, u32, void*) {
     g_h2_resume_calls++;
     auto* conn = static_cast<Connection*>(raw_conn);
-    conn->resp_header_mutations[0] = {
-        {"x-resumed", 9},
-        {reinterpret_cast<const char*>(req + 39), 4},
-        Connection::RespHeaderMutationMode::Set};
+    conn->resp_header_mutations[0] = {{"x-resumed", 9},
+                                      {reinterpret_cast<const char*>(req + 39), 4},
+                                      Connection::RespHeaderMutationMode::Set};
     conn->resp_header_mutation_count = 1;
     return jit::HandlerResult::make_status(207).pack();
 }
@@ -1792,73 +1791,73 @@ TEST(h2_serving, timer_resume_parks_grpc_local_result_and_preserves_mutation_ali
         u8 response[8192]{};
         H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
         conn.h2 = &h2;
-    const char* synth =
-        "POST /svc HTTP/1.1\r\nhost: x\r\nx-source: on/g\r\ncontent-type: application/grpc\r\n"
-        "content-length: 3\r\n\r\n";
+        const char* synth =
+            "POST /svc HTTP/1.1\r\nhost: x\r\nx-source: on/g\r\ncontent-type: application/grpc\r\n"
+            "content-length: 3\r\n\r\n";
         const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
         for (u32 i = 0; i < synth_len; i++) h2.pending_synth[i] = static_cast<u8>(synth[i]);
-    ParsedRequest open;
-    open.reset();
-    open.has_content_length = true;
-    open.content_length = 3;
-    open.content_length_count = 1;
-    JitDispatchOutcome yielded{};
-    yielded.kind = JitDispatchOutcome::Kind::TimerYield;
-    yielded.timer_ms = 1;
-    yielded.next_state = 1;
-    REQUIRE(h2_suspend_timer(d,
-                             1,
-                             &h2_resume_local_status,
-                             yielded,
-                             nullptr,
-                             h2.pending_synth,
-                             synth_len,
-                             true,
-                             true,
-                             false,
-                             &open));
-    conn.pending_handler_fn = &h2_resume_local_status;
-    conn.handler_state = 1;
-    g_h2_resume_calls = 0;
-    h2_resume_jit_handler(&loop, conn);
-    CHECK_EQ(g_h2_resume_calls, 1u);
-    CHECK_EQ(h2.pending_stream, 1u);
-    CHECK_EQ(h2.async_stream, 0u);
-    CHECK_EQ(conn.resp_header_mutation_count, 1u);
-    CHECK(conn.resp_header_mutations[0].value.ptr !=
-          reinterpret_cast<const char*>(h2.pending_synth + 39));
+        ParsedRequest open;
+        open.reset();
+        open.has_content_length = true;
+        open.content_length = 3;
+        open.content_length_count = 1;
+        JitDispatchOutcome yielded{};
+        yielded.kind = JitDispatchOutcome::Kind::TimerYield;
+        yielded.timer_ms = 1;
+        yielded.next_state = 1;
+        REQUIRE(h2_suspend_timer(d,
+                                 1,
+                                 &h2_resume_local_status,
+                                 yielded,
+                                 nullptr,
+                                 h2.pending_synth,
+                                 synth_len,
+                                 true,
+                                 true,
+                                 false,
+                                 &open));
+        conn.pending_handler_fn = &h2_resume_local_status;
+        conn.handler_state = 1;
+        g_h2_resume_calls = 0;
+        h2_resume_jit_handler(&loop, conn);
+        CHECK_EQ(g_h2_resume_calls, 1u);
+        CHECK_EQ(h2.pending_stream, 1u);
+        CHECK_EQ(h2.async_stream, 0u);
+        CHECK_EQ(conn.resp_header_mutation_count, 1u);
+        CHECK(conn.resp_header_mutations[0].value.ptr !=
+              reinterpret_cast<const char*>(h2.pending_synth + 39));
 
-    u8 body[4] = {'a', 'b', 'c', 'd'};
-    H2Dispatch<FakeH2Loop> finish{&loop, &conn, response, sizeof(response), 0, false};
-    h2_on_data_cb<FakeH2Loop>(&finish, h2, 1, body, actual, true);
-    CHECK_EQ(h2.pending_stream, 0u);
-    if (actual == 3) CHECK_EQ(conn.resp_header_mutation_count, 0u);
-    CHECK_FALSE(loop.closed);
-    Http2FrameHeader frame;
-    REQUIRE(parse_frame_header(response, finish.resp_len, &frame) == ParseStatus::Complete);
-    hpack::DynamicTable dyn;
-    dyn.init(4096);
-    hpack::Header decoded[8];
-    u8 scratch[256];
-    u32 count = 0;
-    REQUIRE(hpack::decode_header_block(dyn,
-                                       response + kFrameHeaderSize,
-                                       frame.length,
-                                       scratch,
-                                       sizeof(scratch),
-                                       decoded,
-                                       8,
-                                       &count));
-    bool status = false;
-    bool resumed_header = false;
-    const Str expected = actual == 3 ? Str{"207", 3} : Str{"400", 3};
-    for (u32 i = 0; i < count; i++) {
-        if (decoded[i].name.eq({":status", 7}) && decoded[i].value.eq(expected)) status = true;
-        if (decoded[i].name.eq({"x-resumed", 9}) && decoded[i].value.eq({"on/g", 4}))
-            resumed_header = true;
-    }
-    CHECK(status);
-    CHECK_EQ(resumed_header, actual == 3);
+        u8 body[4] = {'a', 'b', 'c', 'd'};
+        H2Dispatch<FakeH2Loop> finish{&loop, &conn, response, sizeof(response), 0, false};
+        h2_on_data_cb<FakeH2Loop>(&finish, h2, 1, body, actual, true);
+        CHECK_EQ(h2.pending_stream, 0u);
+        if (actual == 3) CHECK_EQ(conn.resp_header_mutation_count, 0u);
+        CHECK_FALSE(loop.closed);
+        Http2FrameHeader frame;
+        REQUIRE(parse_frame_header(response, finish.resp_len, &frame) == ParseStatus::Complete);
+        hpack::DynamicTable dyn;
+        dyn.init(4096);
+        hpack::Header decoded[8];
+        u8 scratch[256];
+        u32 count = 0;
+        REQUIRE(hpack::decode_header_block(dyn,
+                                           response + kFrameHeaderSize,
+                                           frame.length,
+                                           scratch,
+                                           sizeof(scratch),
+                                           decoded,
+                                           8,
+                                           &count));
+        bool status = false;
+        bool resumed_header = false;
+        const Str expected = actual == 3 ? Str{"207", 3} : Str{"400", 3};
+        for (u32 i = 0; i < count; i++) {
+            if (decoded[i].name.eq({":status", 7}) && decoded[i].value.eq(expected)) status = true;
+            if (decoded[i].name.eq({"x-resumed", 9}) && decoded[i].value.eq({"on/g", 4}))
+                resumed_header = true;
+        }
+        CHECK(status);
+        CHECK_EQ(resumed_header, actual == 3);
     }
 }
 

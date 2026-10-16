@@ -345,7 +345,11 @@ struct Client {
         nghttp2_submit_settings(session, 0, nullptr, 0);
         return rc == 0;
     }
-    int request(u32 index, u32 bytes, bool end, const char* timeout = nullptr, bool jit_forward = false,
+    int request(u32 index,
+                u32 bytes,
+                bool end,
+                const char* timeout = nullptr,
+                bool jit_forward = false,
                 bool jit_timer_forward = false) {
         rpcs[index].size = bytes;
         rpcs[index].end = end;
@@ -353,9 +357,10 @@ struct Client {
         nghttp2_nv headers[8] = {nv(":method", "POST"),
                                  nv(":scheme", "http"),
                                  nv(":authority", "grpc.test"),
-                                 nv(":path", jit_timer_forward ? "/jitwait.Echo/Call"
-                                                                : jit_forward ? "/jit.Echo/Call"
-                                                                              : "/test.Echo/Call"),
+                                 nv(":path",
+                                    jit_timer_forward ? "/jitwait.Echo/Call"
+                                    : jit_forward     ? "/jit.Echo/Call"
+                                                      : "/test.Echo/Call"),
                                  nv("content-type", "application/grpc+proto"),
                                  nv("te", "trailers"),
                                  nv("grpc-timeout", timeout ? timeout : "1H")};
@@ -724,7 +729,8 @@ TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_d
     down->request_config = &cfg;
     REQUIRE(down->h2->open_stream(1) != nullptr);
     const char* synth =
-        "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\ncontent-length: 3\r\n\r\n";
+        "POST /svc HTTP/1.1\r\nhost: x\r\ncontent-type: application/grpc\r\ncontent-length: "
+        "3\r\n\r\n";
     const u32 synth_len = static_cast<u32>(__builtin_strlen(synth));
     for (u32 i = 0; i < synth_len; i++) down->h2->pending_synth[i] = static_cast<u8>(synth[i]);
     ParsedRequest open;
