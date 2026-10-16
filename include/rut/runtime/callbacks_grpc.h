@@ -122,8 +122,8 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
         if (!down->h2->grpc.busy) {
             grpc_refresh_timer(loop, *down);
             if (!down->h2->grpc.active && !down->h2->grpc.timer_deadline_us) {
-                if constexpr (requires { loop->timer.refresh(*down, loop->keepalive_timeout); })
-                    loop->timer.refresh(*down, loop->keepalive_timeout);
+                if constexpr (requires { loop->timer.refresh(down, loop->keepalive_timeout); })
+                    loop->timer.refresh(down, loop->keepalive_timeout);
             }
         }
     }

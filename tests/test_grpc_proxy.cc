@@ -656,7 +656,7 @@ struct GrpcDriveFixture {
     bool submit_send_upstream(Connection&, const u8*, u32) { return true; }
     bool submit_recv_upstream(Connection&) { return true; }
     bool arm_throttle_timer(Connection&, u64) { return false; }
-    void disarm_yield_timer(Connection&) {}
+    void disarm_yield_timer(Connection& conn) { conn.yield_armed = false; }
     bool alloc_upstream_buf(Connection&) { return true; }
     void clear_upstream_fd(u32) {}
     bool alloc_response_header_buf(Connection&) { return true; }
@@ -796,6 +796,53 @@ TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     CHECK_GT(loop.sends, loop.downstream_sends);
     CHECK(loop.downstream_sends > 0);
     CHECK_GT(loop.downstream_last_send_len, 0u);
+}
+
+TEST(grpc_proxy, client_reset_restores_keepalive_after_grpc_release) {
+    GrpcDriveFixture loop;
+    REQUIRE(loop.pool_ready);
+    auto run = [&](bool precise) {
+        Connection downstream;
+        downstream.reset();
+        u8 send[SlicePool::kSliceSize];
+        u8 recv[SlicePool::kSliceSize];
+        downstream.send_slice = send;
+        downstream.send_buf.bind(send, sizeof(send));
+        downstream.bind_request_receive_buffer(recv, sizeof(recv));
+        Http2Conn h2;
+        h2.init_client();
+        h2.preface_seen = true;
+        h2.our_settings_sent = true;
+        h2.peer_settings_seen = true;
+        downstream.h2 = &h2;
+        auto* stream = h2.open_stream(1);
+        REQUIRE(stream != nullptr);
+        stream->state = Http2StreamState::Open;
+        auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+        REQUIRE(x != nullptr);
+        x->init();
+        x->downstream = &downstream;
+        x->downstream_stream = 1;
+        h2.grpc.streams[0] = x;
+        h2.grpc.active = 1;
+        if (precise) {
+            h2.grpc.timer_deadline_us = monotonic_us() + 1000000;
+            downstream.yield_armed = true;
+        } else {
+            loop.timer.refresh(&downstream, 1);
+        }
+        const u32 rst_len = write_rst_stream(recv, 1, Http2Error::Cancel);
+        downstream.recv_buf.commit(rst_len);
+        on_h2_data<GrpcDriveFixture>(
+            &loop, downstream, {downstream.id, 1, 0, 0, IoEventType::Recv, 1});
+        CHECK_EQ(h2.grpc.active, 0u);
+        CHECK_EQ(h2.grpc.timer_deadline_us, 0u);
+        CHECK_FALSE(downstream.yield_armed);
+        CHECK(downstream.timer_node.next != &downstream.timer_node);
+        loop.timer.remove(&downstream);
+    };
+    run(false);
+    run(true);
 }
 
 TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {

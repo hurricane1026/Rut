@@ -2108,8 +2108,8 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         if (conn.h2->grpc.timer_deadline_us) grpc_refresh_timer(loop, conn);
         if (conn.h2->grpc.active == 0 && conn.h2->grpc.timer_deadline_us == 0 &&
             conn.h2->outbound_stream == 0 && !conn.send_armed) {
-            if constexpr (requires { loop->timer.refresh(conn, loop->keepalive_timeout); })
-                loop->timer.refresh(conn, loop->keepalive_timeout);
+            if constexpr (requires { loop->timer.refresh(&conn, loop->keepalive_timeout); })
+                loop->timer.refresh(&conn, loop->keepalive_timeout);
         }
     }
     if (!kClose && conn.h2->outbound_stream != 0) {
