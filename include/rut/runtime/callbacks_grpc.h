@@ -208,6 +208,9 @@ inline bool grpc_response_header_allowed(const hpack::Header& h) {
 inline void grpc_begin_handshake(GrpcProxyState& g, u64 now_us) {
     if (!g.connected_at_us) g.connected_at_us = now_us;
 }
+inline void grpc_record_connect_result(const Connection& conn, bool success, u64 now_us) {
+    record_backend_result(conn.upstream_idx, conn.upstream_backend_idx, success, now_us);
+}
 inline bool grpc_idle_upstream_should_close(
     const GrpcProxyState& g, bool peer_goaway, bool draining, u64 now_us, u64 keepalive_us) {
     return g.active == 0 && (draining || peer_goaway || now_us - g.connected_at_us >= keepalive_us);
@@ -498,13 +501,11 @@ template <typename Loop>
 void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result < 0) {
-        record_backend_result(
-            conn.upstream_idx, conn.upstream_backend_idx, /*success=*/false, monotonic_us());
+        grpc_record_connect_result(conn, false, monotonic_us());
         loop->close_conn(conn);
         return;
     }
-    record_backend_result(
-        conn.upstream_idx, conn.upstream_backend_idx, /*success=*/true, monotonic_us());
+    grpc_record_connect_result(conn, true, monotonic_us());
     // Transfer the connected socket from the backend's connect registration to
     // ordinary full-duplex I/O on this dedicated upstream Connection slot.
     if constexpr (requires { loop->backend.detach_upstream(conn, &conn.fd); }) {

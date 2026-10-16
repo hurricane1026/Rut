@@ -610,18 +610,17 @@ TEST(grpc_proxy, successful_connect_clears_consecutive_failures) {
     REQUIRE(loop->init(0, -1).has_value());
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->upstream_idx = 0;
+    conn->upstream_backend_idx = 0;
     for (u32 i = 0; i < 2; i++) {
-        Connection* conn = loop->alloc_conn();
-        REQUIRE(conn != nullptr);
-        conn->upstream_idx = 0;
-        conn->upstream_backend_idx = 0;
-        record_backend_result(0, 0, false, monotonic_us());
-        loop->close_conn(*conn);
+        grpc_record_connect_result(*conn, false, monotonic_us());
     }
     CHECK_EQ(health->fails, 2u);
-    record_backend_result(0, 0, true, monotonic_us());
+    grpc_record_connect_result(*conn, true, monotonic_us());
     CHECK_EQ(health->fails, 0u);
-    record_backend_result(0, 0, false, monotonic_us());
+    grpc_record_connect_result(*conn, false, monotonic_us());
     CHECK_EQ(health->fails, 1u);
     loop->shutdown();
 }
