@@ -3775,3 +3775,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND RUT_ENABLE_JIT)
     set_tests_properties(test_workload_handler_iouring PROPERTIES
         LABELS "cli;compiler;runtime" RUN_SERIAL TRUE TIMEOUT 45)
 endif()
+
+# Standalone dependency probe; opt in because it requires an initialized submodule
+# and a separate Clang compilation outside the normal runtime targets.
+option(RUT_TEST_SIMDJSON_PATCH "Test the pinned simdjson allocator patch" OFF)
+if(RUT_TEST_SIMDJSON_PATCH)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "RUT_TEST_SIMDJSON_PATCH requires Linux ELF tooling")
+    endif()
+    find_program(RUT_SIMDJSON_CLANGXX NAMES clang++ REQUIRED)
+    find_program(RUT_SIMDJSON_BASH NAMES bash REQUIRED)
+    add_test(NAME test_simdjson_allocator_patch
+        COMMAND ${CMAKE_COMMAND} -E env "CXX=${RUT_SIMDJSON_CLANGXX}"
+            ${RUT_SIMDJSON_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/simdjson/check_patch.sh)
+    set_tests_properties(test_simdjson_allocator_patch PROPERTIES
+        LABELS "dependency" TIMEOUT 180 RUN_SERIAL TRUE)
+endif()
