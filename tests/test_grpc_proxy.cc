@@ -641,6 +641,8 @@ struct GrpcDriveFixture {
     bool submit_connect(Connection&, const void*, u32) { return true; }
     bool submit_send_upstream(Connection&, const u8*, u32) { return true; }
     bool submit_recv_upstream(Connection&) { return true; }
+    bool arm_throttle_timer(Connection&, u64) { return false; }
+    void disarm_yield_timer(Connection&) {}
     bool alloc_upstream_buf(Connection&) { return true; }
     void clear_upstream_fd(u32) {}
     bool alloc_response_header_buf(Connection&) { return true; }
@@ -702,6 +704,27 @@ TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
     CHECK_EQ(up_stream->state, Http2StreamState::Closed);
     CHECK_GT(loop.sends, 0u);
     CHECK(downstream.on_send == &pending_send);
+}
+
+TEST(grpc_proxy, failed_deadline_arm_marks_exchange_for_immediate_wakeup) {
+    GrpcDriveFixture loop;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn h2;
+    h2.init_client();
+    downstream.h2 = &h2;
+    auto* stream = h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+    GrpcExchange x;
+    x.init();
+    x.downstream = &downstream;
+    x.downstream_stream = 1;
+    x.deadline_us = monotonic_us() + 1000000;
+    h2.grpc.streams[0] = &x;
+    h2.grpc.active = 1;
+    grpc_refresh_timer(&loop, downstream);
+    CHECK_EQ(x.failure, 8u);
+    CHECK_EQ(h2.grpc.timer_deadline_us, 0u);
 }
 
 TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retires) {
@@ -1276,12 +1299,24 @@ TEST(grpc_proxy, io_uring_deferred_tls_reclaim_preserves_input_capacity) {
     normal->tls_in_buf.bind(normal->tls_in_slice, 16384);
     normal->pending_ops = 1;
     normal->fd = -1;
+    const u32 normal_id = normal->id;
     loop.free_conn(*normal);
     Connection& deferred_normal = loop.conns[normal->id];
     CHECK_EQ(deferred_normal.tls_in_buf.capacity(), 16384u);
     deferred_normal.pending_ops = 0;
     loop.reclaim_pending();
+#ifdef __linux__
+    unsigned char normal_residency = 0;
+    errno = 0;
+    CHECK_EQ(mincore(normal_region, 4096, &normal_residency), -1);
+    CHECK_EQ(errno, ENOMEM);
+#endif
+    Connection* normal_reused = loop.alloc_conn();
+    REQUIRE(normal_reused != nullptr);
+    CHECK_EQ(normal_reused->id, normal_id);
+    loop.free_conn(*normal_reused);
 
+    const u32 bulk_before = loop.pool.bulk_available();
     Connection* bulk = loop.alloc_conn();
     REQUIRE(bulk != nullptr);
     u8* bulk_region = loop.pool.alloc_bulk();
@@ -1295,6 +1330,7 @@ TEST(grpc_proxy, io_uring_deferred_tls_reclaim_preserves_input_capacity) {
     CHECK_EQ(deferred_bulk.tls_in_buf.capacity(), SlicePool::kBulkSliceSize);
     deferred_bulk.pending_ops = 0;
     loop.reclaim_pending();
+    CHECK_EQ(loop.pool.bulk_available(), bulk_before);
     loop.shutdown();
 }
 TEST(grpc_proxy, idle_upstream_close_policy_respects_drain_and_activity) {
