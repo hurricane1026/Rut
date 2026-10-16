@@ -2353,6 +2353,36 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
 
         if (failure_status == 0) {
+            if (h2->async_cfg != nullptr && kOutcome.upstream_id < h2->async_cfg->upstream_count &&
+                h2->async_cfg->upstreams[kOutcome.upstream_id].http2) {
+                u8 resp[8192];
+                H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+                if (!grpc_start_synth(d,
+                                      kStreamId,
+                                      h2->async_cfg,
+                                      static_cast<u16>(kOutcome.upstream_id),
+                                      forward_synth,
+                                      forward_len,
+                                      !h2->async_request_stream_open)) {
+                    failure_status = 503;
+                } else {
+                    conn.pending_handler_fn = nullptr;
+                    h2_clear_async(*h2);
+                    conn.transition_to_reading_header(&on_h2_data<Loop>);
+                    if (conn.recv_buf.len() > 0) {
+                        IoEvent synth{conn.id,
+                                      static_cast<i32>(conn.recv_buf.len()),
+                                      0,
+                                      0,
+                                      IoEventType::Recv,
+                                      0};
+                        on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
+                    } else {
+                        loop->submit_recv(conn);
+                    }
+                    return;
+                }
+            }
             // The timer already owns the single async slot and its config epoch.
             // Convert it in place instead of calling h2_suspend_proxy (which
             // correctly refuses an occupied slot).
