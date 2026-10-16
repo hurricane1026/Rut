@@ -3671,6 +3671,13 @@ add_executable(test_json test_json.cc)
 target_include_directories(test_json PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
 add_test(NAME test_json COMMAND test_json)
 set_tests_properties(test_json PROPERTIES LABELS "unit")
+if(RUT_ENABLE_JIT)
+    add_executable(test_json_network test_json_network.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+    target_include_directories(test_json_network PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+    target_link_libraries(test_json_network PRIVATE rut_jit rut_compiler rut_test_fault)
+    add_test(NAME test_json_network COMMAND test_json_network)
+    set_tests_properties(test_json_network PROPERTIES LABELS "unit" RUN_SERIAL TRUE)
+endif()
 
 if(APPLE)
     include(macos.cmake)
@@ -3717,7 +3724,8 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_iouring_idle_trim>
         COMMAND $<TARGET_FILE:test_splice>
         COMMAND $<TARGET_FILE:test_json>
-        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
+        COMMAND $<TARGET_FILE:test_json_network>
+        DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
         COMMENT "Running all tests..."
     )
 else()
@@ -3800,15 +3808,3 @@ if(RUT_TEST_SIMDJSON_PATCH)
         LABELS "dependency" TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
 
-# JSON core has no LLVM, TLS, allocation or external-library dependencies.
-add_executable(test_json test_json.cc)
-target_include_directories(test_json PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
-add_test(NAME test_json COMMAND test_json)
-set_tests_properties(test_json PROPERTIES LABELS "unit")
-if(RUT_ENABLE_JIT)
-    add_executable(test_json_network test_json_network.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
-    target_include_directories(test_json_network PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
-    target_link_libraries(test_json_network PRIVATE rut_jit rut_compiler rut_test_fault)
-    add_test(NAME test_json_network COMMAND test_json_network)
-    set_tests_properties(test_json_network PROPERTIES LABELS "unit" RUN_SERIAL TRUE)
-endif()
