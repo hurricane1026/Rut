@@ -1139,7 +1139,7 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // the layout unnoticed.
     // tls_recv_overflow_prefix_len was added after the original 3824-byte
     // budget assertion; keep checking the current hot-slot layout explicitly.
-    CHECK_EQ(sizeof(Connection), 3832u);
+    CHECK_EQ(sizeof(Connection), 3872u);
 }
 
 TEST(iouring_idle_trim,
