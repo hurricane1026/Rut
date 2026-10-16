@@ -839,6 +839,13 @@ TEST(grpc_proxy, client_reset_restores_keepalive_after_grpc_release) {
         CHECK_EQ(h2.grpc.timer_deadline_us, 0u);
         CHECK_FALSE(downstream.yield_armed);
         CHECK(downstream.timer_node.next != &downstream.timer_node);
+        u32 timer_slot = TimerWheel::kSlots;
+        for (u32 i = 0; i < TimerWheel::kSlots; i++)
+            for (auto* node = loop.timer.slots[i].next; node != &loop.timer.slots[i];
+                 node = node->next)
+                if (node == &downstream.timer_node) timer_slot = i;
+        CHECK_EQ(timer_slot,
+                 (loop.timer.cursor + loop.keepalive_timeout) & (TimerWheel::kSlots - 1));
         loop.timer.remove(&downstream);
     };
     run(false);
