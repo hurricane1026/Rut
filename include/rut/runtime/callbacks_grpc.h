@@ -557,9 +557,7 @@ bool grpc_start_impl(Loop* loop,
     for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next) {
         if (c->request_config == cfg && c->upstream_idx == uid &&
             c->upstream_backend_idx == backend && !c->h2->peer_goaway && c->h2->grpc.active < 64 &&
-            c->h2->last_stream_id < 0x7ffffffdu &&
-            (!c->h2->peer_settings.has_max_concurrent_streams ||
-             c->h2->grpc.active < c->h2->peer_settings.max_concurrent_streams)) {
+            c->h2->last_stream_id < 0x7ffffffdu) {
             up = c;
             break;
         }
