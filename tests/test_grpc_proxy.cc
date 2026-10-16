@@ -997,9 +997,12 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
         Connection conn;
         conn.reset();
         u8 recv[512]{};
+        u8 send[512]{};
         REQUIRE(len <= sizeof(recv));
         for (u32 i = 0; i < len; i++) recv[i] = bytes[i];
         conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_slice = send;
+        conn.send_buf.bind(send, sizeof(send));
         conn.recv_buf.commit(len);
         Http2Conn h2;
         h2.init();
