@@ -439,7 +439,8 @@ void streaming_case(rut::test::TestCase* _tc, bool tls = false) {
             snprintf(source,
                      sizeof(source),
                      "upstream grpc { host: \"127.0.0.1\", port: %u, protocol: .http2 }\n"
-                     "route POST \"/test.Echo/Call\" { return forward(grpc) }\n",
+                     "route POST \"/test.Echo/Call\" { return forward(grpc) }\n"
+                     "route POST \"/jit.Echo/Call\" { return forward(grpc) }\n",
                      get_port(server->listen_fd));
         const bool written = write(file, source, len) == len;
         close(file);
@@ -692,6 +693,34 @@ TEST(grpc_proxy, response_header_filter_strips_content_length_only) {
     CHECK(!grpc_response_header_allowed(headers[0]));
     CHECK(grpc_response_header_allowed(headers[1]));
     CHECK(grpc_response_header_allowed(headers[2]));
+}
+TEST(grpc_proxy, goaway_rejects_unsent_and_above_last_stream) {
+    Http2Conn h{};
+    h.init();
+    h.peer_goaway = true;
+    h.peer_last_stream = 5;
+    GrpcExchange x{};
+    x.init();
+    x.upstream_stream = 5;
+    CHECK(grpc_rejected_by_goaway(h, x));
+    x.request_headers_sent = true;
+    CHECK(!grpc_rejected_by_goaway(h, x));
+    x.upstream_stream = 7;
+    CHECK(grpc_rejected_by_goaway(h, x));
+}
+TEST(grpc_proxy, idle_since_refreshes_after_long_active_session) {
+    Http2Conn h{};
+    h.init();
+    GrpcExchange x{};
+    x.init();
+    h.grpc.active = 1;
+    h.grpc.streams[0] = &x;
+    h.grpc.idle_since_us = 10;
+    grpc_detach(h, &x);
+    CHECK_EQ(h.grpc.active, 0u);
+    CHECK_GT(h.grpc.idle_since_us, 10u);
+    CHECK(!grpc_idle_upstream_should_close(h.grpc, false, false, h.grpc.idle_since_us + 999, 1000));
+    CHECK(grpc_idle_upstream_should_close(h.grpc, false, false, h.grpc.idle_since_us + 1000, 1000));
 }
 TEST(grpc_proxy, handshake_timestamp_is_immutable_when_joining) {
     GrpcProxyState g{};

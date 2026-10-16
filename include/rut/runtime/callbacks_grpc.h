@@ -206,6 +206,9 @@ inline bool grpc_request_header_allowed(const hpack::Header& h) {
 inline bool grpc_response_header_allowed(const hpack::Header& h) {
     return !h.name.eq({"content-length", 14});
 }
+inline bool grpc_rejected_by_goaway(const Http2Conn& h, const GrpcExchange& x) {
+    return h.peer_goaway && (!x.request_headers_sent || x.upstream_stream > h.peer_last_stream);
+}
 inline void grpc_begin_handshake(GrpcProxyState& g, u64 now_us) {
     if (!g.connected_at_us) g.connected_at_us = now_us;
 }
@@ -490,8 +493,7 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     }
     for (auto* x : g.streams) {
         if (!x) continue;
-        if (h.peer_goaway && (!x->request_headers_sent || x->upstream_stream > h.peer_last_stream))
-            x->failure = 14;
+        if (grpc_rejected_by_goaway(h, *x)) x->failure = 14;
         grpc_kick_downstream(loop, *x->downstream);
     }
     g.busy = false;
