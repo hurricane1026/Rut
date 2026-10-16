@@ -7084,12 +7084,15 @@ static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& m
                 text += '\'';
                 break;
             case 'u': {
-                if (++i == raw.len || raw.ptr[i] != '{')
+                ++i;
+                if (i == raw.len || raw.ptr[i] != '{')
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           span,
                                           lit_str("Swift Unicode escapes use \\u{hex}"));
                 u32 cp = 0, digits = 0;
-                while (++i < raw.len && raw.ptr[i] != '}') {
+                for (;;) {
+                    ++i;
+                    if (i >= raw.len || raw.ptr[i] == '}') break;
                     const char digit = raw.ptr[i];
                     u32 value;
                     if (digit >= '0' && digit <= '9')
