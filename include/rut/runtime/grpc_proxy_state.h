@@ -97,6 +97,7 @@ struct GrpcProxyState {
     bool busy;
     bool preface_sent;
     bool handshake_health_recorded;
+    bool session_failure_recorded;
     u8 control[4096];
 
     void init() {
@@ -104,7 +105,8 @@ struct GrpcProxyState {
         pool_next = nullptr;
         active = cursor = control_len = pending_cancel_count = 0;
         connected_at_us = idle_since_us = timer_deadline_us = 0;
-        upstream = connecting = busy = preface_sent = handshake_health_recorded = false;
+        upstream = connecting = busy = preface_sent = handshake_health_recorded =
+            session_failure_recorded = false;
     }
 };
 }  // namespace rut

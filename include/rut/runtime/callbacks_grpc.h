@@ -315,21 +315,32 @@ inline void grpc_record_connect_result(Loop* loop,
 }
 inline void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
     if (success) return;
-    if (conn.h2 == nullptr || conn.h2->grpc.handshake_health_recorded) return;
-    conn.h2->grpc.handshake_health_recorded = true;
+    if (conn.h2 == nullptr || conn.h2->grpc.session_failure_recorded) return;
+    conn.h2->grpc.session_failure_recorded = true;
     grpc_record_connect_result(conn, success, now_us);
 }
 template <typename Loop>
 inline void grpc_record_session_failure(Loop* loop, Connection& conn, u64 now_us) {
-    if (!conn.h2 || conn.h2->grpc.handshake_health_recorded || conn.h2->grpc.active == 0) return;
+    if (!conn.h2 || conn.h2->grpc.session_failure_recorded) return;
+    auto& h = *conn.h2;
+    if (h.peer_settings_seen) {
+        bool accepted_unfinished = false;
+        for (auto* x : h.grpc.streams) {
+            if (x && x->request_headers_sent && !x->response_end &&
+                !grpc_rejected_by_goaway(h, *x)) {
+                accepted_unfinished = true;
+                break;
+            }
+        }
+        if (!accepted_unfinished) return;
+    }
     grpc_record_handshake_result(loop, conn, false, now_us);
 }
 template <typename Loop>
 inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
-    if (!conn.h2 || conn.h2->grpc.handshake_health_recorded) return;
+    if (!conn.h2) return;
     const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (current != conn.request_config) return;
-    conn.h2->grpc.handshake_health_recorded = true;
     grpc_record_connect_result(conn, true, now_us);
 }
 template <typename Loop>
