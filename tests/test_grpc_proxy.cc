@@ -1742,8 +1742,11 @@ TEST(grpc_proxy, encoded_reset_skips_stale_downstream_snapshot_after_sync_close)
     Connection downstream;
     downstream.reset();
     u8 downstream_send_storage[512]{};
+    u8 downstream_recv_storage[512]{};
     downstream.send_slice = downstream_send_storage;
     downstream.send_buf.bind(downstream_send_storage, sizeof(downstream_send_storage));
+    downstream.bind_request_receive_buffer(downstream_recv_storage,
+                                           sizeof(downstream_recv_storage));
     Http2Conn downstream_h2;
     downstream_h2.init_client();
     downstream.h2 = &downstream_h2;
