@@ -1477,6 +1477,75 @@ TEST(grpc_proxy, terminal_response_releases_slot_while_downstream_send_is_blocke
     CHECK(downstream.on_send == &pending_send);
 }
 
+TEST(grpc_proxy, nonzero_grpc_status_clears_backend_health) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    health->fails = 2;
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    upstream.upstream_idx = 0;
+    upstream.upstream_backend_idx = 0;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    GrpcExchange x;
+    x.init();
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    x.slot_held = true;
+    x.upstream_id = 0;
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    upstream_h2.grpc.active = downstream_h2.grpc.active = 1;
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const hpack::Header response[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"grpc-status", 11}, {"7", 1}},
+    };
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, response, 3, true);
+    CHECK_EQ(health->fails, 0u);
+    CHECK_FALSE(x.failure);
+    CHECK(x.response_end);
+    CHECK_FALSE(x.slot_held);
+}
+
+TEST(grpc_proxy, parser_failure_records_active_session_once) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    GrpcDriveFixture loop;
+    Connection conn;
+    conn.reset();
+    u8 recv[32]{};
+    conn.bind_request_receive_buffer(recv, sizeof(recv));
+    conn.recv_buf.commit(sizeof(recv));
+    Http2Conn h2;
+    h2.init_client();
+    h2.grpc.upstream = true;
+    h2.grpc.active = 1;
+    conn.h2 = &h2;
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    grpc_on_upstream_data<GrpcDriveFixture>(
+        &loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 1});
+    CHECK(loop.closed);
+    CHECK_EQ(health->fails, 1u);
+    grpc_record_session_failure(&loop, conn, monotonic_us());
+    CHECK_EQ(health->fails, 1u);
+}
+
 TEST(grpc_proxy, timer_resume_expired_grpc_timeout_is_cancelled_before_forward) {
     EpollEventLoop loop;
     REQUIRE(loop.init(0, -1).has_value());
@@ -1574,7 +1643,7 @@ TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     CHECK_EQ(select_backend(0, 2, now + 3), 1u);
     loop->shutdown();
 }
-TEST(grpc_proxy, successful_connect_clears_consecutive_failures) {
+TEST(grpc_proxy, successful_rpc_clears_consecutive_failures) {
     GrpcBackendHealthReset health_reset{};
     auto loop = std::make_unique<EpollEventLoop>();
     REQUIRE(loop->init(0, -1).has_value());
@@ -1599,7 +1668,7 @@ TEST(grpc_proxy, successful_connect_clears_consecutive_failures) {
     grpc_record_handshake_result(*connected, true, monotonic_us());
     grpc_connected<EpollEventLoop>(
         loop.get(), *connected, {connected->id, 1, 0, 0, IoEventType::UpstreamConnect, 0});
-    CHECK_EQ(health->fails, 0u);
+    CHECK_EQ(health->fails, 2u);
     Connection* final_attempt = loop->alloc_conn();
     REQUIRE(final_attempt != nullptr);
     final_attempt->upstream_idx = 0;
@@ -1608,7 +1677,7 @@ TEST(grpc_proxy, successful_connect_clears_consecutive_failures) {
         loop.get(),
         *final_attempt,
         {final_attempt->id, -ECONNREFUSED, 0, 0, IoEventType::UpstreamConnect, 0});
-    CHECK_EQ(health->fails, 1u);
+    CHECK_EQ(health->fails, 3u);
     loop->shutdown();
 }
 TEST(grpc_proxy, deferred_cancel_flushes_after_full_control_buffer) {
@@ -1803,6 +1872,7 @@ TEST(grpc_proxy, deadline_cascade_handles_upstream_sync_close_safely) {
         downs[i].h2 = &down_h2[i];
         downs[i].on_close = &grpc_connection_closed<SyncCloseGrpcDriveFixture>;
         REQUIRE(down_h2[i].open_stream(1) != nullptr);
+        if (i == 0) REQUIRE(down_h2[i].open_stream(3) != nullptr);
     }
     REQUIRE(upstream_h2.open_stream(1) != nullptr);
     REQUIRE(upstream_h2.open_stream(3) != nullptr);
@@ -1816,21 +1886,21 @@ TEST(grpc_proxy, deadline_cascade_handles_upstream_sync_close_safely) {
     for (u32 i = 0; i < 2; i++) {
         auto* x = exchanges[i];
         x->upstream = &upstream;
-        x->downstream = &downs[i];
+        x->downstream = &downs[0];
         x->upstream_stream = i ? 3 : 1;
-        x->downstream_stream = 1;
+        x->downstream_stream = i ? 3 : 1;
         x->upstream_id = i;
         x->slot_held = true;
         x->request_headers_sent = true;
         REQUIRE(grpc_attach(upstream_h2, x));
-        REQUIRE(grpc_attach(*downs[i].h2, x));
+        REQUIRE(grpc_attach(*downs[0].h2, x));
     }
     expired->deadline_us = monotonic_us() - 1;
     active->deadline_us = monotonic_us() + 1000000;
     grpc_deadline_fired(&loop, downs[0]);
     CHECK(loop.closed);
     CHECK(downs[0].h2 == nullptr);
-    CHECK(downs[1].h2 == nullptr);
+    CHECK(downs[0].h2 == nullptr);
     CHECK_EQ(upstream_h2.grpc.active, 0u);
     CHECK_EQ(loop.released, 2u);
 }
@@ -1865,6 +1935,7 @@ TEST(grpc_proxy, timer_arm_failure_cascade_handles_upstream_sync_close_safely) {
         downs[i].h2 = &down_h2[i];
         downs[i].on_close = &grpc_connection_closed<SyncCloseGrpcDriveFixture>;
         REQUIRE(down_h2[i].open_stream(1) != nullptr);
+        if (i == 0) REQUIRE(down_h2[i].open_stream(3) != nullptr);
     }
     REQUIRE(upstream_h2.open_stream(1) != nullptr);
     REQUIRE(upstream_h2.open_stream(3) != nullptr);
@@ -1878,21 +1949,21 @@ TEST(grpc_proxy, timer_arm_failure_cascade_handles_upstream_sync_close_safely) {
     for (u32 i = 0; i < 2; i++) {
         auto* x = exchanges[i];
         x->upstream = &upstream;
-        x->downstream = &downs[i];
+        x->downstream = &downs[0];
         x->upstream_stream = i ? 3 : 1;
-        x->downstream_stream = 1;
+        x->downstream_stream = i ? 3 : 1;
         x->upstream_id = i;
         x->slot_held = true;
         x->request_headers_sent = true;
         REQUIRE(grpc_attach(upstream_h2, x));
-        REQUIRE(grpc_attach(*downs[i].h2, x));
+        REQUIRE(grpc_attach(*downs[0].h2, x));
     }
     expired->deadline_us = monotonic_us() + 1000000;
     active->deadline_us = monotonic_us() + 1000000;
     grpc_refresh_timer(&loop, downs[0]);
     CHECK(loop.closed);
     CHECK(downs[0].h2 == nullptr);
-    CHECK(downs[1].h2 == nullptr);
+    CHECK(downs[0].h2 == nullptr);
     CHECK_EQ(upstream_h2.grpc.active, 0u);
     CHECK_EQ(loop.released, 2u);
 }
@@ -1917,7 +1988,7 @@ TEST(grpc_proxy, handshake_timestamp_is_immutable_when_joining) {
     grpc_begin_handshake(g, 200);
     CHECK_EQ(g.connected_at_us, 100u);
 }
-TEST(grpc_proxy, settings_handshake_health_ejects_and_success_resets_once) {
+TEST(grpc_proxy, repeated_settings_success_does_not_clear_active_rpc_failures) {
     GrpcBackendHealthReset health_reset{};
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
@@ -1926,6 +1997,7 @@ TEST(grpc_proxy, settings_handshake_health_ejects_and_success_resets_once) {
     Http2Conn h2;
     h2.init();
     h2.grpc.upstream = true;
+    h2.grpc.active = 1;
     conn.h2 = &h2;
     conn.upstream_idx = 0;
     conn.upstream_backend_idx = 0;
@@ -1939,12 +2011,11 @@ TEST(grpc_proxy, settings_handshake_health_ejects_and_success_resets_once) {
         CHECK(loop.closed);
     }
     CHECK_EQ(health->fails, kBackendFailThreshold);
-    h2.grpc.handshake_health_recorded = false;
+    CHECK(backend_ejected(0, 0, monotonic_us()));
     h2.peer_settings_seen = true;
     grpc_record_handshake_result(conn, true, monotonic_us());
-    CHECK_EQ(health->fails, 0u);
-    grpc_record_handshake_result(conn, false, monotonic_us());
-    CHECK_EQ(health->fails, 0u);
+    grpc_record_handshake_result(conn, true, monotonic_us());
+    CHECK_EQ(health->fails, kBackendFailThreshold);
 }
 TEST(grpc_proxy, upstream_send_failure_records_handshake_health_once) {
     GrpcBackendHealthReset health_reset{};
@@ -1957,6 +2028,7 @@ TEST(grpc_proxy, upstream_send_failure_records_handshake_health_once) {
         Http2Conn h2;
         h2.init_client();
         h2.grpc.upstream = true;
+        h2.grpc.active = 1;
         h2.peer_settings_seen = false;
         conn.h2 = &h2;
         conn.upstream_idx = 0;
@@ -2291,6 +2363,7 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
         h2.preface_seen = true;
         h2.our_settings_sent = true;
         h2.grpc.upstream = true;
+        h2.grpc.active = 1;
         h2.grpc.preface_sent = true;
         conn.h2 = &h2;
         conn.upstream_idx = 0;
@@ -2320,7 +2393,7 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
     u8 good[64]{};
     const u32 good_len = write_settings_frame(good, settings);
     run(good, good_len, false);
-    CHECK_EQ(health->fails, 0u);
+    CHECK_EQ(health->fails, 2u);
 }
 TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     EpollEventLoop loop;

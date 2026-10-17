@@ -314,9 +314,23 @@ inline void grpc_record_connect_result(Loop* loop,
     grpc_record_connect_result(conn, success, now_us);
 }
 inline void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
+    if (success) return;
     if (conn.h2 == nullptr || conn.h2->grpc.handshake_health_recorded) return;
     conn.h2->grpc.handshake_health_recorded = true;
     grpc_record_connect_result(conn, success, now_us);
+}
+template <typename Loop>
+inline void grpc_record_session_failure(Loop* loop, Connection& conn, u64 now_us) {
+    if (!conn.h2 || conn.h2->grpc.handshake_health_recorded || conn.h2->grpc.active == 0) return;
+    grpc_record_handshake_result(loop, conn, false, now_us);
+}
+template <typename Loop>
+inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
+    if (!conn.h2 || conn.h2->grpc.handshake_health_recorded) return;
+    const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
+    if (current != conn.request_config) return;
+    conn.h2->grpc.handshake_health_recorded = true;
+    grpc_record_connect_result(conn, true, now_us);
 }
 template <typename Loop>
 inline void grpc_record_handshake_result(Loop* loop, Connection& conn, bool success, u64 now_us) {
@@ -437,6 +451,8 @@ void grpc_response_headers(
     if (end && (!grpc_has_status(hs, n) || !grpc_has_status(filtered, filtered_n))) x->failure = 2;
     if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
         x->failure = 13;
+    if (x->response_end && !x->failure && x->upstream && grpc_has_status(hs, n))
+        grpc_record_rpc_success(dispatch->loop, *x->upstream, monotonic_us());
     if (x->response_end) grpc_release_slot(dispatch->loop, *x);
 }
 template <typename Loop>
@@ -469,6 +485,8 @@ void grpc_response_trailers(
     if (!grpc_has_status(hs, n)) x->failure = 2;
     if (x->has_response_length && x->expected_response_bytes != x->response_bytes) x->failure = 13;
     x->response_end = true;
+    if (!x->failure && x->upstream && grpc_has_status(hs, n))
+        grpc_record_rpc_success(dispatch->loop, *x->upstream, monotonic_us());
     grpc_release_slot(dispatch->loop, *x);
 }
 template <typename Loop>
@@ -540,8 +558,7 @@ template <typename Loop>
 void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result <= 0 || static_cast<u32>(ev.result) > conn.send_buf.len() - conn.send_progress) {
-        if (conn.h2 && !conn.h2->peer_settings_seen)
-            grpc_record_handshake_result(loop, conn, false, monotonic_us());
+        if (conn.h2) grpc_record_session_failure(loop, conn, monotonic_us());
         loop->close_conn(conn);
         return;
     }
@@ -658,8 +675,7 @@ template <typename Loop>
 void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result <= 0 || !conn.h2) {
-        if (conn.h2 && !conn.h2->peer_settings_seen)
-            grpc_record_handshake_result(loop, conn, false, monotonic_us());
+        if (conn.h2) grpc_record_session_failure(loop, conn, monotonic_us());
         loop->close_conn(conn);
         return;
     }
@@ -702,7 +718,7 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     conn.reset_request_receive_buffer();
     conn.recv_buf.commit(remaining);
     if (result.close) {
-        grpc_record_handshake_result(loop, conn, false, monotonic_us());
+        grpc_record_session_failure(loop, conn, monotonic_us());
         g.busy = false;
         loop->close_conn(conn);
         return;
@@ -1205,7 +1221,7 @@ void grpc_tick(Loop* loop, Connection& conn) {
                                             loop->is_draining(),
                                             now,
                                             static_cast<u64>(loop->keepalive_timeout) * 1000000)) {
-            if (!h.peer_settings_seen) grpc_record_handshake_result(loop, conn, false, now);
+            grpc_record_session_failure(loop, conn, now);
             loop->close_conn(conn);
             return;
         }
