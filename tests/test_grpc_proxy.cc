@@ -1538,8 +1538,7 @@ TEST(grpc_proxy, parser_failure_records_active_session_once) {
     conn.h2 = &h2;
     conn.upstream_idx = 0;
     conn.upstream_backend_idx = 0;
-    grpc_on_upstream_data<GrpcDriveFixture>(
-        &loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 1});
+    grpc_on_upstream_data<GrpcDriveFixture>(&loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 1});
     CHECK(loop.closed);
     CHECK_EQ(health->fails, 1u);
     grpc_record_session_failure(&loop, conn, monotonic_us());
@@ -1900,7 +1899,6 @@ TEST(grpc_proxy, deadline_cascade_handles_upstream_sync_close_safely) {
     grpc_deadline_fired(&loop, downs[0]);
     CHECK(loop.closed);
     CHECK(downs[0].h2 == nullptr);
-    CHECK(downs[0].h2 == nullptr);
     CHECK_EQ(upstream_h2.grpc.active, 0u);
     CHECK_EQ(loop.released, 2u);
 }
@@ -1962,7 +1960,6 @@ TEST(grpc_proxy, timer_arm_failure_cascade_handles_upstream_sync_close_safely) {
     active->deadline_us = monotonic_us() + 1000000;
     grpc_refresh_timer(&loop, downs[0]);
     CHECK(loop.closed);
-    CHECK(downs[0].h2 == nullptr);
     CHECK(downs[0].h2 == nullptr);
     CHECK_EQ(upstream_h2.grpc.active, 0u);
     CHECK_EQ(loop.released, 2u);
