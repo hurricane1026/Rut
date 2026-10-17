@@ -1172,6 +1172,8 @@ TEST(http2_client, response_end_stream_keeps_open_request_half_closed_remote) {
     Http2Conn immediate;
     immediate.init_client();
     immediate.peer_settings_seen = true;
+    immediate.cb_ctx = nullptr;
+    immediate.on_headers = nullptr;
     REQUIRE(immediate.open_stream(1) != nullptr);
     CHECK_FALSE(immediate.process(frame, frame_len, out, sizeof(out), &written).close);
     auto* immediate_stream = immediate.find_stream(1);
@@ -1181,6 +1183,8 @@ TEST(http2_client, response_end_stream_keeps_open_request_half_closed_remote) {
     Http2Conn completed;
     completed.init_client();
     completed.peer_settings_seen = true;
+    completed.cb_ctx = nullptr;
+    completed.on_headers = nullptr;
     REQUIRE(completed.open_stream(1) != nullptr);
     completed.find_stream(1)->state = Http2StreamState::HalfClosedLocal;
     written = 0;
@@ -1190,6 +1194,8 @@ TEST(http2_client, response_end_stream_keeps_open_request_half_closed_remote) {
     Http2Conn fragmented;
     fragmented.init_client();
     fragmented.peer_settings_seen = true;
+    fragmented.cb_ctx = nullptr;
+    fragmented.on_headers = nullptr;
     REQUIRE(fragmented.open_stream(1) != nullptr);
     const u32 payload_len = frame_len - kFrameHeaderSize;
     const u32 first = payload_len / 2;
