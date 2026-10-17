@@ -790,7 +790,6 @@ TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     Http2Conn downstream_h2;
     downstream_h2.init_client();
     downstream.h2 = &downstream_h2;
-    downstream.on_send = &pending_send;
     REQUIRE(downstream_h2.open_stream(1) != nullptr);
     REQUIRE(downstream_h2.open_stream(3) != nullptr);
     REQUIRE(upstream_h2.open_stream(1) != nullptr);
@@ -2416,7 +2415,7 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
     auto* health = backend_health(0, 0);
     REQUIRE(health != nullptr);
     GrpcDriveFixture loop;
-    auto run = [&](u8* bytes, u32 len, bool expect_close) {
+    auto run = [&](u8* bytes, u32 len, bool expect_close, bool expect_settings_seen) {
         Connection conn;
         conn.reset();
         u8 recv[512]{};
@@ -2440,12 +2439,17 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
         loop.closed = false;
         grpc_on_upstream_data<GrpcDriveFixture>(
             &loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 1});
+        for (u32 pass = 0; pass < 2 && conn.recv_buf.len() && !loop.closed; pass++)
+            grpc_on_upstream_data<GrpcDriveFixture>(
+                &loop, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 1});
+        CHECK_EQ(loop.closed, expect_close);
+        CHECK_EQ(h2.peer_settings_seen, expect_settings_seen);
     };
     Http2FrameHeader invalid{1, static_cast<u8>(Http2FrameType::Settings), 0, 0};
     u8 bad[64]{};
     write_frame_header(bad, invalid);
     bad[9] = 0;
-    run(bad, 10, true);
+    run(bad, 10, true, false);
     CHECK_EQ(health->fails, 1u);
     u8 bad_value[64]{};
     Http2FrameHeader bad_value_header{6, static_cast<u8>(Http2FrameType::Settings), 0, 0};
@@ -2453,8 +2457,8 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
     bad_value[9] = 0;
     bad_value[10] = 2;
     bad_value[14] = 2;
-    run(bad_value, 15, true);
-    run(bad, 10, true);
+    run(bad_value, 15, true, false);
+    run(bad, 10, true, false);
     CHECK_EQ(health->fails, kBackendFailThreshold);
     CHECK(backend_ejected(0, 0, monotonic_us()));
 
@@ -2465,12 +2469,12 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
     write_frame_header(mixed + mixed_len, invalid);
     mixed[mixed_len + 9] = 0;
     mixed_len += 10;
-    run(mixed, mixed_len, true);
+    run(mixed, mixed_len, false, true);
     CHECK_EQ(health->fails, kBackendFailThreshold);
 
     u8 good[64]{};
     const u32 good_len = write_settings_frame(good, settings);
-    run(good, good_len, false);
+    run(good, good_len, false, true);
     CHECK_EQ(health->fails, kBackendFailThreshold);
 }
 

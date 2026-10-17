@@ -1178,6 +1178,15 @@ TEST(http2_client, response_end_stream_keeps_open_request_half_closed_remote) {
     REQUIRE(immediate_stream != nullptr);
     CHECK(immediate_stream->state == Http2StreamState::HalfClosedRemote);
 
+    Http2Conn completed;
+    completed.init_client();
+    completed.peer_settings_seen = true;
+    REQUIRE(completed.open_stream(1) != nullptr);
+    completed.find_stream(1)->state = Http2StreamState::HalfClosedLocal;
+    written = 0;
+    CHECK_FALSE(completed.process(frame, frame_len, out, sizeof(out), &written).close);
+    CHECK(completed.find_stream(1) == nullptr);
+
     Http2Conn fragmented;
     fragmented.init_client();
     fragmented.peer_settings_seen = true;
