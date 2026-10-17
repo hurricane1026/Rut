@@ -1663,6 +1663,52 @@ TEST(grpc_proxy, goaway_rejects_unsent_and_above_last_stream) {
     x.upstream_stream = 7;
     CHECK(grpc_rejected_by_goaway(h, x));
 }
+TEST(grpc_proxy, encoded_goaway_detaches_rejected_exchange_before_client_wakeup) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    u8 send_storage[512]{};
+    upstream.send_slice = send_storage;
+    upstream.send_buf.bind(send_storage, sizeof(send_storage));
+    u8 recv_storage[64]{};
+    upstream.recv_slice = recv_storage;
+    upstream.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.preface_seen = true;
+    upstream_h2.our_settings_sent = true;
+    upstream_h2.peer_settings_seen = true;
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    downstream.on_send = &pending_send;
+    auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(x != nullptr);
+    x->init();
+    x->upstream = &upstream;
+    x->downstream = &downstream;
+    x->upstream_stream = x->downstream_stream = 1;
+    x->upstream_id = 0;
+    x->slot_held = true;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(grpc_attach(upstream_h2, x));
+    REQUIRE(grpc_attach(downstream_h2, x));
+    const u32 frame_len = write_goaway(recv_storage, 0, Http2Error::NoError);
+    upstream.recv_buf.commit(frame_len);
+    grpc_on_upstream_data<GrpcDriveFixture>(
+        &loop, upstream, {upstream.id, static_cast<i32>(frame_len), 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(x->failure, 14u);
+    CHECK(x->response_end);
+    CHECK(x->upstream == nullptr);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(loop.released, 1u);
+    CHECK_EQ(downstream_h2.grpc.active, 1u);
+}
 TEST(grpc_proxy, idle_since_refreshes_after_long_active_session) {
     Http2Conn h{};
     h.init();
@@ -2056,6 +2102,7 @@ TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     REQUIRE(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 5, req, true));
     CHECK_EQ(down->h2->grpc.active, 0u);
     CHECK_GT(down->send_buf.len(), 0u);
+    CHECK(loop.grpc_upstreams == nullptr);
     loop.force_close_all();
     loop.shutdown();
 }
