@@ -2006,19 +2006,29 @@ TEST(grpc_proxy, response_header_staging_failure_detaches_exchange) {
     REQUIRE(grpc_attach(upstream_h2, &x));
     REQUIRE(grpc_attach(downstream_h2, &x));
 
-    static char names[8][32];
-    static char values[8][3000];
-    hpack::Header headers[8];
+    hpack::Header headers[2];
     headers[0] = {{":status", 7}, {"200", 3}};
     headers[1] = {{"content-type", 12}, {"application/grpc", 16}};
-    for (u32 i = 2; i < 8; i++) {
-        for (u32 j = 0; j < 32; j++) names[i][j] = static_cast<char>('a' + ((j + i * 3) % 26));
-        for (u32 j = 0; j < 3000; j++)
-            values[i][j] = static_cast<char>('0' + ((j * 17 + i * 13) % 62));
-        headers[i] = {{names[i], 32}, {values[i], 3000}};
+    static constexpr char alphabet[] =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    x.response_mutation_count = 16;
+    for (u32 i = 0; i < x.response_mutation_count; i++) {
+        const u32 offset = i * 1024;
+        for (u32 j = 0; j < 14; j++)
+            x.response_mutation_storage[offset + j] = static_cast<u8>('a' + ((j + i) % 26));
+        u32 state = i + 1;
+        for (u32 j = 0; j < 1008; j++) {
+            state = state * 1664525u + 1013904223u;
+            x.response_mutation_storage[offset + 14 + j] = alphabet[state % 62];
+        }
+        x.response_mutations[i] = {static_cast<u16>(offset),
+                                   14,
+                                   static_cast<u16>(offset + 14),
+                                   1010,
+                                   static_cast<u8>(Connection::RespHeaderMutationMode::Add)};
     }
     GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
-    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, headers, 8, false);
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, headers, 2, false);
     CHECK_EQ(x.failure, 8u);
     CHECK(x.response_end);
     CHECK(x.upstream == nullptr);
