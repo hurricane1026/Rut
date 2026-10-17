@@ -2445,14 +2445,18 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
         CHECK_EQ(loop.closed, expect_close);
         CHECK_EQ(h2.peer_settings_seen, expect_settings_seen);
     };
-    Http2FrameHeader invalid{1, static_cast<u8>(Http2FrameType::Settings), 0, 0};
+    Http2FrameHeader invalid{};
+    invalid.length = 1;
+    invalid.type = static_cast<u8>(Http2FrameType::Settings);
     u8 bad[64]{};
     write_frame_header(bad, invalid);
     bad[9] = 0;
     run(bad, 10, true, false);
     CHECK_EQ(health->fails, 1u);
     u8 bad_value[64]{};
-    Http2FrameHeader bad_value_header{6, static_cast<u8>(Http2FrameType::Settings), 0, 0};
+    Http2FrameHeader bad_value_header{};
+    bad_value_header.length = 6;
+    bad_value_header.type = static_cast<u8>(Http2FrameType::Settings);
     write_frame_header(bad_value, bad_value_header);
     bad_value[9] = 0;
     bad_value[10] = 2;
@@ -2469,7 +2473,7 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
     write_frame_header(mixed + mixed_len, invalid);
     mixed[mixed_len + 9] = 0;
     mixed_len += 10;
-    run(mixed, mixed_len, false, true);
+    run(mixed, mixed_len, true, true);
     CHECK_EQ(health->fails, kBackendFailThreshold);
 
     u8 good[64]{};

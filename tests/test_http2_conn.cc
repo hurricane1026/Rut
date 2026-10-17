@@ -1083,6 +1083,20 @@ TEST(http2_conn, settings_invalid_length_and_window_delta_do_not_establish_peer)
     r = c.process(frame, fn, out, sizeof(out), &ow);
     CHECK(r.close);
     CHECK_FALSE(c.peer_settings_seen);
+
+    c.init_client();
+    c.peer_settings_seen = false;
+    Http2Settings valid_settings;
+    valid_settings.set_defaults();
+    u8 mixed[64]{};
+    u32 mixed_len = write_settings_frame(mixed, valid_settings);
+    const u8 malformed[1] = {0};
+    mixed_len += put_frame(mixed + mixed_len, Http2FrameType::Settings, 0, 0, malformed, 1);
+    ow = 0;
+    r = c.process(mixed, mixed_len, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK_EQ(r.consumed, mixed_len);
+    CHECK(c.peer_settings_seen);
 }
 
 TEST(http2_conn, request_trailers_close_after_local_response) {
