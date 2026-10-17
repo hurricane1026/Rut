@@ -790,6 +790,7 @@ TEST(grpc_proxy, rst_failure_drains_other_exchange_when_deadline_arm_fails) {
     Http2Conn downstream_h2;
     downstream_h2.init_client();
     downstream.h2 = &downstream_h2;
+    downstream.on_send = &pending_send;
     REQUIRE(downstream_h2.open_stream(1) != nullptr);
     REQUIRE(downstream_h2.open_stream(3) != nullptr);
     REQUIRE(upstream_h2.open_stream(1) != nullptr);
@@ -2370,6 +2371,7 @@ TEST(grpc_proxy, encoded_terminal_response_releases_stream_slot_for_queued_rpc) 
     REQUIRE(downstream_h2.open_stream(3) != nullptr);
 
     upstream_h2.find_stream(1)->state = Http2StreamState::HalfClosedLocal;
+    downstream.on_send = &pending_send;
     auto* terminal = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
     auto* queued = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
     REQUIRE(terminal != nullptr);
@@ -2400,6 +2402,7 @@ TEST(grpc_proxy, encoded_terminal_response_releases_stream_slot_for_queued_rpc) 
     grpc_on_upstream_data<GrpcDriveFixture>(
         &loop, upstream, {upstream.id, static_cast<i32>(response_len), 0, 0, IoEventType::Recv, 1});
     CHECK(upstream_h2.find_stream(1) == nullptr);
+    CHECK_EQ(upstream_h2.grpc.active, 2u);
     CHECK_GT(loop.sends, 0u);
     grpc_on_upstream_sent<GrpcDriveFixture>(
         &loop,
