@@ -1080,6 +1080,12 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
         return;
     } else if (!loop->arm_throttle_timer(conn, delay * 1000)) {
         g.timer_deadline_us = 0;
+        struct UpstreamSnapshot {
+            Connection* conn;
+            Http2Conn* h2;
+            u32 handler_gen;
+        } upstreams[64];
+        u32 upstream_count = 0;
         for (auto* x : g.streams) {
             if (!x || !x->deadline_us) continue;
             x->failure = 8;
@@ -1097,18 +1103,40 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
                 loop->upstream_release(x->upstream_id);
                 x->slot_held = false;
             }
-            if (!uh.grpc.busy) grpc_drive_upstream(loop, *up);
+            bool seen_upstream = false;
+            for (u32 i = 0; i < upstream_count; i++)
+                if (upstreams[i].conn == up) seen_upstream = true;
+            if (!seen_upstream) upstreams[upstream_count++] = {up, &uh, up->handler_gen};
         }
-        Connection* downstreams[64];
+        for (u32 i = 0; i < upstream_count; i++) {
+            auto& snapshot = upstreams[i];
+            if (snapshot.conn->h2 != snapshot.h2 ||
+                snapshot.conn->handler_gen != snapshot.handler_gen || snapshot.h2->grpc.busy)
+                continue;
+            grpc_drive_upstream(loop, *snapshot.conn);
+        }
+        struct DownstreamSnapshot {
+            Connection* conn;
+            Http2Conn* h2;
+            u32 handler_gen;
+        } downstreams[64];
         u32 downstream_count = 0;
         for (auto* x : g.streams) {
             if (!x || !x->downstream) continue;
             bool seen = false;
             for (u32 i = 0; i < downstream_count; i++)
-                if (downstreams[i] == x->downstream) seen = true;
-            if (!seen) downstreams[downstream_count++] = x->downstream;
+                if (downstreams[i].conn == x->downstream) seen = true;
+            if (!seen)
+                downstreams[downstream_count++] = {
+                    x->downstream, x->downstream->h2, x->downstream->handler_gen};
         }
-        for (u32 i = 0; i < downstream_count; i++) grpc_kick_downstream(loop, *downstreams[i]);
+        for (u32 i = 0; i < downstream_count; i++) {
+            auto& snapshot = downstreams[i];
+            if (snapshot.conn->h2 != snapshot.h2 ||
+                snapshot.conn->handler_gen != snapshot.handler_gen)
+                continue;
+            grpc_kick_downstream(loop, *snapshot.conn);
+        }
         return;
     }
     conn.yield_armed = true;
@@ -1119,6 +1147,14 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
     conn.yield_armed = false;
     conn.h2->grpc.timer_deadline_us = 0;
     const u64 now = monotonic_us();
+    Http2Conn* downstream_h2 = conn.h2;
+    const u32 downstream_handler_gen = conn.handler_gen;
+    struct UpstreamSnapshot {
+        Connection* conn;
+        Http2Conn* h2;
+        u32 handler_gen;
+    } upstreams[64];
+    u32 upstream_count = 0;
     for (auto* x : conn.h2->grpc.streams) {
         if (!x || !x->deadline_us || now < x->deadline_us) continue;
         x->failure = 4;
@@ -1136,10 +1172,21 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
             loop->upstream_release(x->upstream_id);
             x->slot_held = false;
         }
-        if (!uh.grpc.busy) grpc_drive_upstream(loop, *up);
+        bool seen_upstream = false;
+        for (u32 i = 0; i < upstream_count; i++)
+            if (upstreams[i].conn == up) seen_upstream = true;
+        if (!seen_upstream) upstreams[upstream_count++] = {up, &uh, up->handler_gen};
+    }
+    for (u32 i = 0; i < upstream_count; i++) {
+        auto& snapshot = upstreams[i];
+        if (snapshot.conn->h2 != snapshot.h2 ||
+            snapshot.conn->handler_gen != snapshot.handler_gen || snapshot.h2->grpc.busy)
+            continue;
+        grpc_drive_upstream(loop, *snapshot.conn);
     }
     grpc_refresh_timer(loop, conn);
-    grpc_kick_downstream(loop, conn);
+    if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen)
+        grpc_kick_downstream(loop, conn);
 }
 
 template <typename Loop>
