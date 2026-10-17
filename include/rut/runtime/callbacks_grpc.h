@@ -1086,6 +1086,21 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
             u32 handler_gen;
         } upstreams[64];
         u32 upstream_count = 0;
+        struct DownstreamSnapshot {
+            Connection* conn;
+            Http2Conn* h2;
+            u32 handler_gen;
+        } downstreams[64];
+        u32 downstream_count = 0;
+        for (auto* x : g.streams) {
+            if (!x || !x->downstream) continue;
+            bool seen = false;
+            for (u32 i = 0; i < downstream_count; i++)
+                if (downstreams[i].conn == x->downstream) seen = true;
+            if (!seen)
+                downstreams[downstream_count++] = {
+                    x->downstream, x->downstream->h2, x->downstream->handler_gen};
+        }
         for (auto* x : g.streams) {
             if (!x || !x->deadline_us) continue;
             x->failure = 8;
@@ -1114,21 +1129,6 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
                 snapshot.conn->handler_gen != snapshot.handler_gen || snapshot.h2->grpc.busy)
                 continue;
             grpc_drive_upstream(loop, *snapshot.conn);
-        }
-        struct DownstreamSnapshot {
-            Connection* conn;
-            Http2Conn* h2;
-            u32 handler_gen;
-        } downstreams[64];
-        u32 downstream_count = 0;
-        for (auto* x : g.streams) {
-            if (!x || !x->downstream) continue;
-            bool seen = false;
-            for (u32 i = 0; i < downstream_count; i++)
-                if (downstreams[i].conn == x->downstream) seen = true;
-            if (!seen)
-                downstreams[downstream_count++] = {
-                    x->downstream, x->downstream->h2, x->downstream->handler_gen};
         }
         for (u32 i = 0; i < downstream_count; i++) {
             auto& snapshot = downstreams[i];

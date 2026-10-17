@@ -1834,6 +1834,68 @@ TEST(grpc_proxy, deadline_cascade_handles_upstream_sync_close_safely) {
     CHECK_EQ(upstream_h2.grpc.active, 0u);
     CHECK_EQ(loop.released, 2u);
 }
+TEST(grpc_proxy, timer_arm_failure_cascade_handles_upstream_sync_close_safely) {
+    SyncCloseGrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    u8 upstream_send[512]{};
+    u8 upstream_recv[512]{};
+    upstream.send_slice = upstream_send;
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    upstream.recv_slice = upstream_recv;
+    upstream.recv_buf.bind(upstream_recv, sizeof(upstream_recv));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.grpc.preface_sent = true;
+    upstream_h2.peer_settings_seen = true;
+    upstream.h2 = &upstream_h2;
+    upstream.on_close = &grpc_connection_closed<SyncCloseGrpcDriveFixture>;
+    Connection downs[2];
+    Http2Conn down_h2[2];
+    u8 down_send[2][512]{};
+    for (u32 i = 0; i < 2; i++) {
+        downs[i].reset();
+        downs[i].send_slice = down_send[i];
+        downs[i].send_buf.bind(down_send[i], sizeof(down_send[i]));
+        auto* recv = loop.pool.alloc();
+        REQUIRE(recv != nullptr);
+        downs[i].bind_request_receive_buffer(recv, SlicePool::kSliceSize);
+        down_h2[i].init_client();
+        downs[i].h2 = &down_h2[i];
+        downs[i].on_close = &grpc_connection_closed<SyncCloseGrpcDriveFixture>;
+        REQUIRE(down_h2[i].open_stream(1) != nullptr);
+    }
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(3) != nullptr);
+    auto* expired = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    auto* active = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(expired != nullptr);
+    REQUIRE(active != nullptr);
+    expired->init();
+    active->init();
+    GrpcExchange* exchanges[] = {expired, active};
+    for (u32 i = 0; i < 2; i++) {
+        auto* x = exchanges[i];
+        x->upstream = &upstream;
+        x->downstream = &downs[i];
+        x->upstream_stream = i ? 3 : 1;
+        x->downstream_stream = 1;
+        x->upstream_id = i;
+        x->slot_held = true;
+        x->request_headers_sent = true;
+        REQUIRE(grpc_attach(upstream_h2, x));
+        REQUIRE(grpc_attach(*downs[i].h2, x));
+    }
+    expired->deadline_us = monotonic_us() + 1000000;
+    active->deadline_us = monotonic_us() + 1000000;
+    grpc_refresh_timer(&loop, downs[0]);
+    CHECK(loop.closed);
+    CHECK(downs[0].h2 == nullptr);
+    CHECK(downs[1].h2 == nullptr);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(loop.released, 2u);
+}
 TEST(grpc_proxy, idle_since_refreshes_after_long_active_session) {
     Http2Conn h{};
     h.init();
