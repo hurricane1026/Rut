@@ -10,10 +10,14 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
+#include "rut/runtime/json.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <memory>
 #include <string>
+#include <utility>
+
+#include <stdlib.h>
 
 using namespace rut;
 
@@ -588,4 +592,102 @@ route GET "/custom" {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
+    const char* token =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    const char* payload = "{\"sub\":\"1234567890\",\"name\":\"John Doe\",\"iat\":1516239022}";
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+
+    auto decode = [&](const char* secret) {
+        u8 has = 0;
+        const char* out = nullptr;
+        u32 len = 0;
+        i64 number = 0;
+        rut_helper_json(nullptr,
+                        &arena,
+                        static_cast<u32>(json::Op::JwtDecode),
+                        token,
+                        static_cast<u32>(__builtin_strlen(token)),
+                        secret,
+                        static_cast<u32>(__builtin_strlen(secret)),
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &out,
+                        &len,
+                        &number);
+        return std::pair<bool, Str>{has != 0, Str{out, len}};
+    };
+
+    const auto ok = decode("your-256-bit-secret");
+    CHECK(ok.first);
+    CHECK(ok.second.eq({payload, static_cast<u32>(__builtin_strlen(payload))}));
+    CHECK_FALSE(decode("wrong-secret").first);
+    CHECK_FALSE(decode("").first);
+
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(json_network, jit_jwt_decode_returns_claims_subject) {
+    REQUIRE_EQ(setenv("RUT_TEST_JWT_SECRET", "your-256-bit-secret", 1), 0);
+    JsonProgram program;
+    REQUIRE(program.init(R"rut(
+route POST "/jwt" {
+    guard let token = req.header("Authorization") else { return 401 }
+    guard let claims = jwtDecode(token, env("RUT_TEST_JWT_SECRET")) else { return 401 }
+    guard let sub_json = json.get(claims, "/sub") else { return 400 }
+    guard let sub = json.string(sub_json) else { return 400 }
+    return response(200, body: sub)
+}
+)rut"));
+    unsetenv("RUT_TEST_JWT_SECRET");
+    const char* token =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->json_arena.backend.pool = &pool;
+
+    auto run = [&](const char* auth, u32 expected_status) {
+        const std::string request = std::string(
+                                        "POST /jwt HTTP/1.1\r\nHost: test\r\n"
+                                        "Authorization: ") +
+                                    auth + "\r\nContent-Length: 0\r\n\r\n";
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        CHECK_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+                 request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        auto outcome = invoke_jit_handler(
+            program.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        CHECK_EQ(outcome.status_code, expected_status);
+        handle_jit_outcome(loop.get(), *conn, outcome, program.handler(), true);
+        return std::string(reinterpret_cast<const char*>(conn->send_buf.data()),
+                           conn->send_buf.len());
+    };
+
+    const std::string good = run(token, 200);
+    CHECK(good.find("HTTP/1.1 200") == 0);
+    CHECK(good.ends_with("1234567890"));
+    const std::string bad = run("not-a-jwt", 401);
+    CHECK(bad.find("HTTP/1.1 401") == 0);
+
+    loop->free_conn(*conn);
+    pool.destroy();
 }

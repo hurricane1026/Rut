@@ -19,6 +19,8 @@
 #include <string>
 #include <vector>
 
+#include <stdlib.h>
+
 namespace rut {
 
 static u32 g_import_analysis_counter = 0;
@@ -9093,6 +9095,71 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return frontend_error(
                 FrontendError::UnsupportedSyntax, expr.span, lit_str("use json(value) directly"));
         return analyze_json_call(expr, lit_str("encode"), route, mod, locals, local_count, binding);
+    }
+    if (expr.name.eq(lit_str("env")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("env"))) {
+        if (pipe_lhs != nullptr)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, lit_str("use env(name) directly"));
+        if (expr.args.len != 1 || expr.args[0]->kind != AstExprKind::StrLit)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("env requires one literal string name"));
+        const Str name = expr.args[0]->str_value;
+        if (name.len == 0 || name.len > 255)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, lit_str("invalid environment name"));
+        char key[256];
+        for (u32 i = 0; i < name.len; ++i) {
+            if (name.ptr[i] == '\0' || name.ptr[i] == '=')
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("invalid environment name"));
+            key[i] = name.ptr[i];
+        }
+        key[name.len] = '\0';
+        const char* value = getenv(key);
+        if (value == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("environment variable is not set"));
+        auto interned = intern_analysis_string(mod, std::string(value));
+        if (!interned) return core::make_unexpected(interned.error());
+        HirExpr out{};
+        out.kind = HirExprKind::StrLit;
+        out.type = HirTypeKind::Str;
+        out.str_value = interned.value();
+        out.span = expr.span;
+        return out;
+    }
+    if (expr.name.eq(lit_str("jwtDecode")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("jwtDecode"))) {
+        if (pipe_lhs != nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("use jwtDecode(token, secret) directly"));
+        if (expr.args.len != 2)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("jwtDecode(token, secret) expects two arguments"));
+        auto token = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!token) return token;
+        auto secret = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!secret) return secret;
+        if (token->type != HirTypeKind::Str || token->may_nil || token->may_error ||
+            secret->type != HirTypeKind::Str || secret->may_nil || secret->may_error)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("jwtDecode requires unwrapped str token and secret values"));
+        return make_json_op(json::Op::JwtDecode,
+                            HirTypeKind::Json,
+                            true,
+                            &token.value(),
+                            &secret.value(),
+                            nullptr,
+                            expr.span,
+                            route);
     }
     const auto copy_hir_shape = [](HirExpr* dst, const HirExpr& src) {
         dst->type = src.type;

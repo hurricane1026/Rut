@@ -9,6 +9,9 @@
 #include "rut/runtime/http_parser.h"
 
 #include <hs.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1469,6 +1472,127 @@ void rut_helper_str_trim_prefix(
 // Persistent results belong to the caller's request arena or validated input.
 #include "rut/runtime/json.h"
 
+namespace {
+
+bool b64url_decode(Str in, char* out, u32 cap, u32& out_len) {
+    out_len = 0;
+    while (in.len > 0 && in.ptr[in.len - 1] == '=') --in.len;
+    if (in.len % 4 == 1) return false;
+    u32 acc = 0;
+    u32 bits = 0;
+    for (u32 i = 0; i < in.len; ++i) {
+        const char c = in.ptr[i];
+        u32 value = 0;
+        if (c >= 'A' && c <= 'Z')
+            value = static_cast<u32>(c - 'A');
+        else if (c >= 'a' && c <= 'z')
+            value = static_cast<u32>(c - 'a' + 26);
+        else if (c >= '0' && c <= '9')
+            value = static_cast<u32>(c - '0' + 52);
+        else if (c == '-')
+            value = 62;
+        else if (c == '_')
+            value = 63;
+        else
+            return false;
+        acc = (acc << 6) | value;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (out_len == cap) return false;
+            out[out_len++] = static_cast<char>((acc >> bits) & 0xff);
+        }
+    }
+    // A canonical unpadded base64url tail has its unused low bits cleared.
+    if (bits != 0 && (acc & ((1u << bits) - 1u)) != 0) return false;
+    return true;
+}
+
+// Verify an HS256/384/512 JWT and return its claims object. The payload bytes
+// are copied into payload_out so the caller can persist them after this
+// synchronous helper returns.
+bool jwt_decode_claims(
+    Str token, Str secret, json::Document& document, char* payload_out, u32& payload_len) {
+    payload_len = 0;
+    if (token.ptr == nullptr || secret.ptr == nullptr) return false;
+    if (token.len > json::kMaxBytes * 3) return false;
+    const char* first = nullptr;
+    const char* second = nullptr;
+    for (u32 i = 0; i < token.len; ++i) {
+        if (token.ptr[i] != '.') continue;
+        if (first == nullptr)
+            first = token.ptr + i;
+        else if (second == nullptr)
+            second = token.ptr + i;
+        else
+            return false;
+    }
+    if (first == nullptr || second == nullptr) return false;
+    const u32 header_b64_len = static_cast<u32>(first - token.ptr);
+    const u32 payload_b64_len = static_cast<u32>(second - first - 1);
+    const u32 signature_b64_len = token.len - static_cast<u32>(second - token.ptr) - 1;
+    if (header_b64_len == 0 || payload_b64_len == 0 || signature_b64_len == 0) return false;
+
+    char header_bytes[json::kMaxBytes];
+    u32 header_len = 0;
+    if (!b64url_decode({token.ptr, header_b64_len}, header_bytes, sizeof(header_bytes), header_len))
+        return false;
+    if (!document.parse({header_bytes, header_len})) return false;
+    if (document.nodes[0].kind != json::Kind::Object) return false;
+    Str alg{};
+    char key_bytes[16];
+    char value_bytes[16];
+    for (u32 node = document.nodes[0].child; node != json::kNone;
+         node = document.nodes[node].next) {
+        json::Writer key_writer{key_bytes};
+        if (!document.string(document.nodes[node].key, key_writer) || !key_writer.ok) return false;
+        if (!Str{key_bytes, key_writer.len}.eq(lit_str("alg"))) continue;
+        if (document.nodes[node].kind != json::Kind::String) return false;
+        json::Writer value_writer{value_bytes};
+        if (!document.string(node, value_writer) || !value_writer.ok) return false;
+        alg = {value_bytes, value_writer.len};
+        break;
+    }
+    const EVP_MD* digest = nullptr;
+    if (alg.eq(lit_str("HS256")))
+        digest = EVP_sha256();
+    else if (alg.eq(lit_str("HS384")))
+        digest = EVP_sha384();
+    else if (alg.eq(lit_str("HS512")))
+        digest = EVP_sha512();
+    else
+        return false;
+
+    char signature[EVP_MAX_MD_SIZE];
+    u32 signature_len = 0;
+    if (!b64url_decode(
+            {second + 1, signature_b64_len}, signature, sizeof(signature), signature_len))
+        return false;
+
+    unsigned char expected[EVP_MAX_MD_SIZE];
+    unsigned int expected_len = 0;
+    if (secret.len > 0x7fffffffu || token.len > 0x7fffffffu) return false;
+    const u32 signing_len = static_cast<u32>(second - token.ptr);
+    if (HMAC(digest,
+             secret.ptr,
+             static_cast<int>(secret.len),
+             reinterpret_cast<const unsigned char*>(token.ptr),
+             static_cast<int>(signing_len),
+             expected,
+             &expected_len) == nullptr)
+        return false;
+    if (signature_len != expected_len || CRYPTO_memcmp(signature, expected, expected_len) != 0)
+        return false;
+
+    if (!b64url_decode({first + 1, payload_b64_len}, payload_out, json::kMaxBytes, payload_len))
+        return false;
+    if (!document.parse({payload_out, payload_len})) return false;
+    if (document.nodes[0].kind != json::Kind::Object) return false;
+    return true;
+}
+
+}  // namespace
+
 extern "C" void rut_helper_json(void* conn,
                                 void* arena,
                                 u32 op,
@@ -1487,23 +1611,30 @@ extern "C" void rut_helper_json(void* conn,
     *out_ptr = nullptr;
     *out_len = 0;
     *out_number = 0;
-    if (op > static_cast<u32>(json::Op::Stringify)) return;
+    if (op > static_cast<u32>(json::Op::JwtDecode)) return;
     thread_local json::Document document;
     char bytes[json::kMaxBytes];
     json::Writer writer{bytes};
     Str view{};
     i64 scalar = 0;
-    if (!json::apply(document,
-                     static_cast<json::Op>(op),
-                     {a, a_len},
-                     {b, b_len},
-                     {c, c_len},
-                     number,
-                     writer,
-                     view,
-                     scalar))
-        return;
     const auto operation = static_cast<json::Op>(op);
+    if (operation == json::Op::JwtDecode) {
+        char payload[json::kMaxBytes];
+        u32 payload_len = 0;
+        if (!jwt_decode_claims({a, a_len}, {b, b_len}, document, payload, payload_len)) return;
+        writer.text({payload, payload_len});
+        if (!writer.ok) return;
+    } else if (!json::apply(document,
+                            operation,
+                            {a, a_len},
+                            {b, b_len},
+                            {c, c_len},
+                            number,
+                            writer,
+                            view,
+                            scalar)) {
+        return;
+    }
     const bool scalar_only = operation == json::Op::AsBool || operation == json::Op::AsInt ||
                              operation == json::Op::AsI32 || operation == json::Op::Count;
     if (scalar_only) view = {"", 0};

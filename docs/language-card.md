@@ -136,11 +136,15 @@ exceptions, no try/catch. `!` is logical not only.
   ordered header effects to a successful handler response.
 
 ```swift
+struct Claims { sub: str role: str }
+
 func auth(_ req: Request, role: str) -> User {
     let token = req.authorization.or("")
     guard token.hasPrefix("Bearer ") else { respond 401 }
-    let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { respond 401 }
+    guard let document = jwtDecode(token.trimPrefix("Bearer "), env("JWT_SECRET")) else {
+        respond 401
+    }
+    guard let claims = json.decode(Claims, document) else { respond 401 }
     guard claims.role == role else { respond 403 }
     return User(id: claims.sub, role: claims.role)   // normal value
 }
@@ -802,7 +806,8 @@ route GET "/api" {
 string:  s.len s.isEmpty s.hasPrefix/hasSuffix/contains s.upper()/lower()/trim()
          s.trimPrefix/trimSuffix/replace/split/slice s.matches(re"") s.match(re"")
 hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
-jwt:     jwtDecode(tok, secret:|publicKey:) jwtEncode(claims, ..., alg: .HS256)
+jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
+         decode with json.decode/json.get). ⏳ publicKey/RS/ES and jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
@@ -811,6 +816,11 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
 admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats()
 ```
+
+`env("NAME")` is resolved when the program is analyzed/loaded, not per
+request. The name must be a string literal and the variable must exist; a
+missing variable is a compile error. The resolved value is embedded as a
+constant, so changing the environment requires recompilation or reload.
 
 ## Do NOT write (compile errors — with the fix)
 

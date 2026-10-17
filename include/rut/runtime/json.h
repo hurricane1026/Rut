@@ -33,6 +33,10 @@ enum class Op : u8 {
     AsI32,
     RequireObject,
     Stringify,
+    // jwtDecode(token, secret): verifies an HS256/384/512 JWT and yields the
+    // decoded claims object. Kept in the JSON op family so the existing
+    // optional-Json carrier and arena lifetime apply unchanged.
+    JwtDecode,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;
