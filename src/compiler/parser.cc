@@ -3451,6 +3451,7 @@ struct Parser {
             // We extend addr_span.end to the closing brace below once
             // we've consumed it.
             item.upstream.addr_span = span_from(*lbrace.value());
+            bool seen_protocol = false;
             bool seen_host = false;
             bool seen_port = false;
             // Empty dict (`upstream foo {}`) is a parse error — omit
@@ -3459,12 +3460,28 @@ struct Parser {
                 return frontend_error(FrontendError::UnsupportedSyntax, span_from(cur()));
             }
             while (true) {
-                auto field = expect(TokenType::Ident);
+                const bool protocol_field = cur().type == TokenType::KwProtocol;
+                auto field = expect(protocol_field ? TokenType::KwProtocol : TokenType::Ident);
                 if (!field) return core::make_unexpected(field.error());
                 const Str field_name = field.value()->text;
                 auto colon = expect(TokenType::Colon);
                 if (!colon) return core::make_unexpected(colon.error());
-                if (field_name.eq({"host", 4})) {
+                if (field_name.eq({"protocol", 8})) {
+                    if (seen_protocol)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    seen_protocol = true;
+                    auto dot = expect(TokenType::Dot);
+                    if (!dot) return core::make_unexpected(dot.error());
+                    auto value = expect(TokenType::Ident);
+                    if (!value) return core::make_unexpected(value.error());
+                    if (value.value()->text.eq({"http2", 5}))
+                        item.upstream.http2 = true;
+                    else if (!value.value()->text.eq({"http11", 6}))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*value.value()),
+                                              value.value()->text);
+                } else if (field_name.eq({"host", 4})) {
                     if (seen_host)
                         return frontend_error(
                             FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
@@ -3658,12 +3675,12 @@ struct Parser {
                 if (seen_host || seen_port)
                     return frontend_error(FrontendError::UnsupportedSyntax,
                                           item.upstream.addr_span);
-            } else if (!seen_host && !seen_port && item.upstream.hc_enabled) {
-                // Health-check-only, name-only upstream
-                // (`upstream api { health_check: {...} }`). The host
-                // application binds the address at runtime (pre-bound slot);
-                // populate_route_config copies the health-check metadata onto
-                // it. No address is required here.
+            } else if (!seen_host && !seen_port && (seen_protocol || item.upstream.hc_enabled)) {
+                // Protocol-only and health-check-only upstreams are
+                // addressless declarations. The host application binds the
+                // address at runtime (pre-bound slot); populate_route_config
+                // applies the protocol/health metadata without replacing the
+                // pre-bound endpoint.
             } else if (!seen_host || !seen_port) {
                 // Name the specific missing field in the detail so the
                 // diagnostic tells the user what to add. Point the

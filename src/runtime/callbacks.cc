@@ -1199,6 +1199,8 @@ template void resume_jit_handler<NativeReactorEventLoop>(NativeReactorEventLoop*
 template void respond_upstream_timeout<NativeReactorEventLoop>(NativeReactorEventLoop*,
                                                                Connection&);
 template void h2_proxy_fail<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&, u16);
+template void grpc_tick<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
+template void grpc_deadline_fired<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 template void throttle_resume<NativeReactorEventLoop>(NativeReactorEventLoop*, Connection&);
 // Active health-check probes are EPOLL ONLY this slice (IoUringEventLoop's sweep
 // re-arms deadlines but issues no probes), so only the epoll instantiation is
@@ -1264,6 +1266,8 @@ template void resume_jit_handler<IoUringEventLoop>(IoUringEventLoop*, Connection
 template void respond_upstream_timeout<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void respond_request_body_overflow<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void h2_proxy_fail<IoUringEventLoop>(IoUringEventLoop*, Connection&, u16);
+template void grpc_tick<IoUringEventLoop>(IoUringEventLoop*, Connection&);
+template void grpc_deadline_fired<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 template void throttle_resume<IoUringEventLoop>(IoUringEventLoop*, Connection&);
 
 #endif

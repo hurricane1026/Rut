@@ -104,9 +104,11 @@ route GET "/proxy" {
 
 Notes:
 
-- An upstream used by `forward` must have a concrete address —
+- An upstream used by `forward` normally declares a concrete address —
   `upstream X at "host:port"` or `upstream X { host: "...", port: N }`.
-  A name-only upstream makes the program fail to load (fail-closed).
+  A name-only or protocol-only upstream is allowed only when the host
+  application pre-binds a matching slot in declaration order; the loader keeps
+  that slot's address and applies only the declared metadata.
 - Requests that match no route fall through to the default action
   (currently a `200`).
 - See `DESIGN.md` for the full language; not every documented construct

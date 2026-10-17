@@ -14,6 +14,13 @@ constexpr i64 kMaxWindow = 2147483647;  // 2^31 - 1
 }  // namespace
 
 void Http2Conn::init() {
+    grpc.init();
+    on_trailers = nullptr;
+    client = false;
+    peer_settings_seen = false;
+    peer_goaway = false;
+    peer_last_stream = 0x7fffffffu;
+    conn_recv_credit = 0;
     hpack_dec.init(kDefaultHeaderTableSize);
     hpack_enc.init(kDefaultHeaderTableSize);
     our_settings.set_defaults();
@@ -54,7 +61,17 @@ void Http2Conn::init() {
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         pending_route_params[i] = {};
     }
+    pending_local_outcome = false;
+    pending_local_status = 0;
+    pending_local_body_idx = 0;
+    pending_local_headers_idx = 0;
+    pending_local_is_head = false;
+    pending_local_cfg = nullptr;
+    pending_local_mutation_count = 0;
+    pending_local_mutation_overflow = false;
+    pending_local_mutation_bytes = 0;
     async_stream = 0;
+    async_headers_received_us = 0;
     async_is_head = false;
     async_kind = H2AsyncKind::None;
     async_cfg = nullptr;
@@ -98,28 +115,53 @@ namespace {
 // Reuse a Closed slot or grow; returns null when the table is full of live
 // streams (caller should RST_STREAM with REFUSED_STREAM).
 Http2Stream* alloc_stream(Http2Conn& c, u32 id) {
+    Http2Stream* s = nullptr;
     for (u32 i = 0; i < c.nstreams; i++) {
-        if (c.streams[i].state == Http2StreamState::Closed) {
-            Http2Stream& s = c.streams[i];
-            s.id = id;
-            s.state = Http2StreamState::Open;
-            s.send_window = static_cast<i32>(c.peer_settings.initial_window_size);
-            s.recv_window = static_cast<i32>(c.our_settings.initial_window_size);
-            s.got_headers = false;
-            return &s;
+        if (c.streams[i].state == Http2StreamState::Closed && c.streams[i].recv_unconsumed == 0) {
+            s = &c.streams[i];
+            break;
         }
     }
-    if (c.nstreams >= Http2Conn::kMaxStreams) return nullptr;
-    Http2Stream& s = c.streams[c.nstreams++];
-    s.id = id;
-    s.state = Http2StreamState::Open;
-    s.send_window = static_cast<i32>(c.peer_settings.initial_window_size);
-    s.recv_window = static_cast<i32>(c.our_settings.initial_window_size);
-    s.got_headers = false;
-    return &s;
+    if (!s) {
+        if (c.nstreams >= Http2Conn::kMaxStreams) return nullptr;
+        s = &c.streams[c.nstreams++];
+    }
+    *s = {};
+    s->id = id;
+    s->state = Http2StreamState::Open;
+    s->send_window = static_cast<i32>(c.peer_settings.initial_window_size);
+    s->recv_window = static_cast<i32>(c.our_settings.initial_window_size);
+    return s;
 }
 
 }  // namespace
+
+void Http2Conn::init_client() {
+    init();
+    client = true;
+    preface_seen = true;
+    our_settings_sent = true;
+    our_settings.enable_push = 0;
+}
+
+Http2Stream* Http2Conn::open_stream(u32 id) {
+    if (!client || peer_goaway || id == 0 || (id & 1u) == 0 || id <= last_stream_id) return nullptr;
+    Http2Stream* s = alloc_stream(*this, id);
+    if (s) last_stream_id = id;
+    return s;
+}
+
+bool Http2Conn::consume_data(u32 stream_id, u32 len) {
+    // A completed stream can still own delivered bytes awaiting downstream I/O.
+    Http2Stream* s = nullptr;
+    for (u32 i = 0; i < nstreams; i++)
+        if (streams[i].id == stream_id) s = &streams[i];
+    if (!s || !s->manual_window || len > s->recv_unconsumed) return false;
+    s->recv_unconsumed -= len;
+    s->recv_credit += len;
+    conn_recv_credit += len;
+    return true;
+}
 
 // --- Response serialization ---
 
@@ -383,9 +425,27 @@ bool h2_name_ok(Str n) {
     if (n.len == 0) return false;
     for (u32 i = 0; i < n.len; i++) {
         const auto kCh = static_cast<unsigned char>(n.ptr[i]);
-        if (kCh >= 'A' && kCh <= 'Z') return false;   // §8.1.2: names are lowercase
-        if (kCh < 0x21 || kCh == 0x7f) return false;  // controls, SP, DEL
-        if (kCh == ':') return false;                 // not a token char
+        if ((kCh >= 'a' && kCh <= 'z') || (kCh >= '0' && kCh <= '9')) continue;
+        switch (kCh) {
+            case '!':
+            case '#':
+            case '$':
+            case '%':
+            case '&':
+            case '\'':
+            case '*':
+            case '+':
+            case '-':
+            case '.':
+            case '^':
+            case '_':
+            case '`':
+            case '|':
+            case '~':
+                break;
+            default:
+                return false;
+        }
     }
     return true;
 }
@@ -509,6 +569,33 @@ Http2Error finish_headers(Http2Conn& c, u32 stream_id, bool end_stream, bool ref
         w.len += write_rst_stream(w.out + w.len, stream_id, Http2Error::RefusedStream);
         return Http2Error::NoError;
     }
+    if (c.client) {
+        u32 statuses = 0;
+        bool informational = false;
+        bool regular = false;
+        for (u32 i = 0; i < nh; i++) {
+            if (hs[i].name.eq({":status", 7})) {
+                if (regular) return Http2Error::ProtocolError;
+                statuses++;
+                if (hs[i].value.len != 3 || hs[i].value.ptr[0] < '1')
+                    return Http2Error::ProtocolError;
+                for (u32 j = 0; j < 3; j++)
+                    if (hs[i].value.ptr[j] < '0' || hs[i].value.ptr[j] > '9')
+                        return Http2Error::ProtocolError;
+                informational = hs[i].value.ptr[0] == '1';
+                if (hs[i].value.eq({"101", 3})) return Http2Error::ProtocolError;
+            } else {
+                regular = true;
+                if (!h2_name_ok(hs[i].name) || !h2_value_ok(hs[i].value) ||
+                    h2_is_connection_header(hs[i].name) || hs[i].name.eq({"te", 2}))
+                    return Http2Error::ProtocolError;
+            }
+        }
+        if (statuses != 1 || (informational && end_stream)) return Http2Error::ProtocolError;
+        if (informational) {
+            if (auto* stream = c.find_stream(stream_id)) stream->got_headers = false;
+        }
+    }
     if (c.on_headers) c.on_headers(c.cb_ctx, c, stream_id, hs, nh, end_stream);
     return Http2Error::NoError;
 }
@@ -533,12 +620,21 @@ Http2Error discard_headers(Http2Conn& c, bool* has_pseudo = nullptr) {
     if (has_pseudo) {
         *has_pseudo = false;
         for (u32 i = 0; i < nh; i++) {
-            if (hs[i].name.len > 0 && hs[i].name.ptr[0] == ':') {
-                *has_pseudo = true;
-                break;
+            if (!h2_name_ok(hs[i].name) || !h2_value_ok(hs[i].value) ||
+                h2_is_connection_header(hs[i].name) || hs[i].name.eq({"content-length", 14}) ||
+                hs[i].name.eq({"te", 2})) {
+                *has_pseudo = true;  // pseudo-header or malformed trailer: reset this stream
             }
         }
     }
+    const u32 stream_id = c.cont_stream;
+    const bool end_stream = c.cont_end_stream;
+    Http2Stream* stream = c.find_stream(stream_id);
+    if (has_pseudo && !*has_pseudo && end_stream && stream &&
+        (stream->state == Http2StreamState::Open ||
+         stream->state == Http2StreamState::HalfClosedLocal) &&
+        c.on_trailers)
+        c.on_trailers(c.cb_ctx, c, stream_id, hs, nh, true);
     c.hdr_block_len = 0;
     c.cont_stream = 0;
     c.cont_discard = false;
@@ -576,6 +672,15 @@ void clear_pending_upload(Http2Conn& c, u32 stream_id) {
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         c.pending_route_params[i] = {};
     }
+    c.pending_local_outcome = false;
+    c.pending_local_status = 0;
+    c.pending_local_body_idx = 0;
+    c.pending_local_headers_idx = 0;
+    c.pending_local_is_head = false;
+    c.pending_local_cfg = nullptr;
+    c.pending_local_mutation_count = 0;
+    c.pending_local_mutation_overflow = false;
+    c.pending_local_mutation_bytes = 0;
 }
 
 Http2Error reset_known_stream(Http2Conn& c, u32 stream_id, Http2Error error, OutWriter& w) {
@@ -614,23 +719,31 @@ static Http2Error handle_frame(Http2Conn& c,
                 return Http2Error::NoError;
             }
             const i64 kOldIws = c.peer_settings.initial_window_size;
-            const Http2Error kErr = parse_settings(payload, h.length, &c.peer_settings);
+            Http2Settings parsed_settings = c.peer_settings;
+            const Http2Error kErr = parse_settings(payload, h.length, &parsed_settings);
             if (kErr != Http2Error::NoError) return kErr;
-            // The peer's SETTINGS_HEADER_TABLE_SIZE bounds the dynamic table our
-            // encoder may index against. React (resize + arm a §6.3 update for the
-            // next response header block) so we never index into a table the peer
-            // shrank. No-op when the value is unchanged.
-            c.hpack_enc.set_table_size(c.peer_settings.header_table_size);
             // Adjust live stream send windows by the INITIAL_WINDOW_SIZE delta.
-            const i64 kDelta = static_cast<i64>(c.peer_settings.initial_window_size) - kOldIws;
+            const i64 kDelta = static_cast<i64>(parsed_settings.initial_window_size) - kOldIws;
             if (kDelta != 0) {
                 for (u32 i = 0; i < c.nstreams; i++) {
                     if (c.streams[i].state == Http2StreamState::Closed) continue;
                     const i64 kNw = static_cast<i64>(c.streams[i].send_window) + kDelta;
                     if (kNw > kMaxWindow) return Http2Error::FlowControlError;
-                    c.streams[i].send_window = static_cast<i32>(kNw);
                 }
             }
+            c.peer_settings = parsed_settings;
+            // The peer's SETTINGS_HEADER_TABLE_SIZE bounds the dynamic table our
+            // encoder may index against. React (resize + arm a §6.3 update for the
+            // next response header block) so we never index into a table the peer
+            // shrank. No-op when the value is unchanged.
+            c.hpack_enc.set_table_size(c.peer_settings.header_table_size);
+            if (kDelta != 0) {
+                for (u32 i = 0; i < c.nstreams; i++) {
+                    if (c.streams[i].state == Http2StreamState::Closed) continue;
+                    c.streams[i].send_window += static_cast<i32>(kDelta);
+                }
+            }
+            c.peer_settings_seen = true;
             if (w.room(kFrameHeaderSize)) w.len += write_settings_ack(w.out + w.len);
             return Http2Error::NoError;
         }
@@ -657,6 +770,22 @@ static Http2Error handle_frame(Http2Conn& c,
             Http2Stream* s = c.find_stream(h.stream_id);
             bool new_stream = false;
             if (!s) {
+                if (c.client) {
+                    if (h.stream_id > c.last_stream_id) return Http2Error::ProtocolError;
+                    // A response can race our RST_STREAM. Decode it to retain
+                    // HPACK synchronization, without resurrecting the RPC.
+                    const Http2Error err = append_fragment(c, p, n);
+                    if (err != Http2Error::NoError) return err;
+                    c.cont_stream = h.stream_id;
+                    c.cont_end_stream = false;
+                    c.cont_discard = true;
+                    if (h.flags & http2_flag::kEndHeaders) {
+                        const Http2Error decoded = discard_headers(c);
+                        if (decoded != Http2Error::NoError) return decoded;
+                        return reset_known_stream(c, h.stream_id, Http2Error::StreamClosed, w);
+                    }
+                    return Http2Error::NoError;
+                }
                 if (h.stream_id <= c.last_stream_id) return Http2Error::ProtocolError;
                 s = alloc_stream(c, h.stream_id);
                 c.last_stream_id = h.stream_id;
@@ -678,6 +807,8 @@ static Http2Error handle_frame(Http2Conn& c,
                 const Http2Error kAe = append_fragment(c, p, n);
                 if (kAe != Http2Error::NoError) return kAe;
                 if (h.flags & http2_flag::kEndHeaders) {
+                    c.cont_stream = h.stream_id;
+                    c.cont_end_stream = kEndStream;
                     bool has_pseudo = false;
                     const Http2Error kDe = discard_headers(c, &has_pseudo);
                     if (kDe != Http2Error::NoError) return kDe;
@@ -688,9 +819,9 @@ static Http2Error handle_frame(Http2Conn& c,
                          s->state == Http2StreamState::HalfClosedLocal)) {
                         // Valid request trailers end the peer's side: close fully if
                         // we already responded (HalfClosedLocal), else half-close remote.
-                        s->state = (s->state == Http2StreamState::HalfClosedLocal)
-                                       ? Http2StreamState::Closed
-                                       : Http2StreamState::HalfClosedRemote;
+                        s->state = (s->state == Http2StreamState::Open)
+                                       ? Http2StreamState::HalfClosedRemote
+                                       : Http2StreamState::Closed;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
@@ -707,18 +838,23 @@ static Http2Error handle_frame(Http2Conn& c,
             const Http2Error kAe = append_fragment(c, p, n);
             if (kAe != Http2Error::NoError) return kAe;
             if (h.flags & http2_flag::kEndHeaders) {
-                if (kEndStream) s->state = Http2StreamState::HalfClosedRemote;
+                if (kEndStream)
+                    s->state = (s->state == Http2StreamState::Open)
+                                   ? Http2StreamState::HalfClosedRemote
+                                   : Http2StreamState::Closed;
                 return finish_headers(
                     c,
                     h.stream_id,
                     kEndStream,
-                    new_stream && c.outbound_stream != 0 && h.stream_id != c.outbound_stream,
+                    new_stream && (c.goaway_sent ||
+                                   (c.outbound_stream != 0 && h.stream_id != c.outbound_stream)),
                     w);
             }
             c.cont_stream = h.stream_id;
             c.cont_end_stream = kEndStream;
             c.cont_refuse =
-                new_stream && c.outbound_stream != 0 && h.stream_id != c.outbound_stream;
+                new_stream &&
+                (c.goaway_sent || (c.outbound_stream != 0 && h.stream_id != c.outbound_stream));
             return Http2Error::NoError;
         }
 
@@ -738,16 +874,19 @@ static Http2Error handle_frame(Http2Conn& c,
                     if (kTrailerEnd && !has_pseudo && s &&
                         (s->state == Http2StreamState::Open ||
                          s->state == Http2StreamState::HalfClosedLocal)) {
-                        s->state = (s->state == Http2StreamState::HalfClosedLocal)
-                                       ? Http2StreamState::Closed
-                                       : Http2StreamState::HalfClosedRemote;
+                        s->state = (s->state == Http2StreamState::Open)
+                                       ? Http2StreamState::HalfClosedRemote
+                                       : Http2StreamState::Closed;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
                     }
                     return reset_known_stream(c, h.stream_id, Http2Error::ProtocolError, w);
                 }
-                if (s && c.cont_end_stream) s->state = Http2StreamState::HalfClosedRemote;
+                if (s && c.cont_end_stream)
+                    s->state = (s->state == Http2StreamState::Open)
+                                   ? Http2StreamState::HalfClosedRemote
+                                   : Http2StreamState::Closed;
                 return finish_headers(c, h.stream_id, c.cont_end_stream, c.cont_refuse, w);
             }
             return Http2Error::NoError;
@@ -782,25 +921,34 @@ static Http2Error handle_frame(Http2Conn& c,
             if (pad > n) return Http2Error::ProtocolError;
             n -= pad;
 
+            if (c.client && !s->got_headers) return Http2Error::ProtocolError;
             s->recv_window -= static_cast<i32>(h.length);
             if (s->recv_window < 0) {
                 const Http2Error kReset =
                     reset_known_stream(c, h.stream_id, Http2Error::FlowControlError, w);
-                c.conn_recv_window += static_cast<i64>(h.length);
+                c.conn_recv_credit += h.length;
                 return kReset;
             }
 
             const bool kEndStream = (h.flags & http2_flag::kEndStream) != 0;
+            if (s->manual_window) s->recv_unconsumed += n;
             if (c.on_data) c.on_data(c.cb_ctx, c, h.stream_id, p, n, kEndStream);
             // DATA on a HalfClosedLocal stream (we already responded; on_data above
             // discards it) completes the stream once the peer ends it — close fully
             // so the slot frees. An Open stream only half-closes its remote side.
-            if (kEndStream)
+            if (kEndStream && s->state != Http2StreamState::Closed)
                 s->state = (s->state == Http2StreamState::HalfClosedLocal)
                                ? Http2StreamState::Closed
                                : Http2StreamState::HalfClosedRemote;
 
-            // Auto-replenish: keep the peer's send windows open.
+            // Padding consumes flow-control credit but is never delivered.
+            if (s->manual_window) {
+                const u32 padding = h.length - n;
+                s->recv_credit += padding;
+                c.conn_recv_credit += padding;
+                return Http2Error::NoError;
+            }
+            // Auto-replenish for legacy body-buffering handlers.
             c.conn_recv_window += static_cast<i64>(h.length);
             s->recv_window += static_cast<i32>(h.length);
             if (h.length > 0) {
@@ -866,7 +1014,11 @@ static Http2Error handle_frame(Http2Conn& c,
         }
 
         case Http2FrameType::Goaway:
-            return Http2Error::NoError;  // peer is closing; let the loop drain
+            if (h.stream_id != 0) return Http2Error::ProtocolError;
+            if (h.length < 8) return Http2Error::FrameSizeError;
+            c.peer_goaway = true;
+            c.peer_last_stream = read_u32(payload) & 0x7fffffffu;
+            return Http2Error::NoError;  // Existing streams may drain.
 
         case Http2FrameType::PushPromise:
             return Http2Error::ProtocolError;  // clients may not push
@@ -903,6 +1055,22 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
     }
 
     while (true) {
+        if (conn_recv_credit && w.room(kFrameHeaderSize + 4)) {
+            w.len += write_window_update(w.out + w.len, 0, conn_recv_credit);
+            conn_recv_window += conn_recv_credit;
+            conn_recv_credit = 0;
+        }
+        for (u32 i = 0; i < nstreams; i++) {
+            Http2Stream& s = streams[i];
+            if (s.recv_credit && w.room(kFrameHeaderSize + 4)) {
+                if (s.state == Http2StreamState::Open ||
+                    s.state == Http2StreamState::HalfClosedLocal) {
+                    w.len += write_window_update(w.out + w.len, s.id, s.recv_credit);
+                    s.recv_window += static_cast<i32>(s.recv_credit);
+                }
+                s.recv_credit = 0;
+            }
+        }
         if (len - pos < kFrameHeaderSize) break;
         Http2FrameHeader h;
         parse_frame_header(in + pos, len - pos, &h);
@@ -915,15 +1083,22 @@ Http2Result Http2Conn::process(const u8* in, u32 len, u8* out, u32 out_cap, u32*
         }
         if (len - pos < kFrameHeaderSize + h.length) break;  // wait for full payload
 
+        if ((client || grpc.active) && !w.room(26)) break;
+        if (client && !peer_settings_seen &&
+            (h.type != static_cast<u8>(Http2FrameType::Settings) || (h.flags & http2_flag::kAck))) {
+            *out_written = w.len;
+            return {pos, true};
+        }
+
         // Refusing a stream is retryable: do not consume a new stream's
         // HEADERS, or the final CONTINUATION of a refused block, unless the
         // control writer can publish the mandatory RST_STREAM. The caller
         // compacts this untouched frame and retries it after flushing output.
         const auto kType = static_cast<Http2FrameType>(h.type);
-        const bool kNewOwnedConflict = outbound_stream != 0 && kType == Http2FrameType::Headers &&
-                                       h.stream_id > last_stream_id &&
-                                       h.stream_id != outbound_stream &&
-                                       find_stream(h.stream_id) == nullptr;
+        const bool kNewOwnedConflict =
+            (goaway_sent || outbound_stream != 0) && kType == Http2FrameType::Headers &&
+            h.stream_id > last_stream_id && h.stream_id != outbound_stream &&
+            find_stream(h.stream_id) == nullptr;
         const bool kFinalOwnedConflict = kType == Http2FrameType::Continuation && cont_refuse &&
                                          (h.flags & http2_flag::kEndHeaders) != 0;
         if ((kNewOwnedConflict || kFinalOwnedConflict) && !w.room(kFrameHeaderSize + 4)) break;

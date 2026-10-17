@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package example;
+
+service Echo {
+  rpc Unary(Message) returns (Message);
+  rpc ServerStream(Message) returns (stream Message);
+  rpc ClientStream(stream Message) returns (Message);
+  rpc Chat(stream Message) returns (stream Message);
+}
+
+message Message {
+  string text = 1;
+}

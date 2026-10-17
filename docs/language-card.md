@@ -371,6 +371,53 @@ route GET "/users" use chain observability { return forward(users) }
 `before` helpers may gate a route; `after` currently supports Response header
 effects only. Full buffered body/status middleware remains ⏳.
 
+## Native gRPC forwarding
+
+Use the currently implemented upstream declaration below (the upstream binding
+migration shown elsewhere on this card is not required). `protocol: .http2`
+selects **prior-knowledge h2c** to the upstream; omitted / `.http11` retains the
+existing HTTP/1 forwarding path. This field does not enable upstream TLS.
+
+```swift
+upstream greeter {
+    host: "127.0.0.1"
+    port: 50051
+    protocol: .http2
+}
+route POST "/helloworld.Greeter/SayHello" { return forward(greeter) }
+```
+
+When the host application pre-binds an upstream endpoint, the declaration may
+carry protocol metadata without an address:
+
+```swift
+upstream greeter { protocol: .http2 }
+```
+
+This form requires a matching pre-bound upstream slot at load time. The
+compiler applies `.http2` to that slot while preserving its existing address;
+an empty upstream block and an addressless configuration with no pre-bound slot
+remain load errors.
+
+Downstream native gRPC requires HTTP/2, via h2c or a TLS listener offering `h2`.
+Unary, client-streaming, server-streaming and bidirectional RPCs use the same
+`forward`. Bodies (including compressed messages) and metadata are opaque;
+trailers including `grpc-status` are preserved. Header-only middleware may run
+before forwarding; body-reading handlers and HTTP/1-specific forward policies
+are outside this streaming path. HTTP/1 requests cannot use an HTTP/2 upstream.
+No `.proto`, protobuf dependency, new route keyword or streaming modifier is
+needed. gRPC-Web, JSON transcoding, upstream TLS/mTLS and gRPC health probes are
+not implemented by this option; `health_check` with `.http2` is rejected.
+
+Upstream connections are shared per shard/config/upstream/backend and multiplex
+RPCs from different downstream clients. Each session is bounded to 64 active
+streams, header blocks to 16 KiB, and each direction of an RPC to a 65,535-byte
+pending DATA queue. Message/body length is not capped by that queue: flow control
+returns credit as bytes drain. Client cancellation resets only the mapped RPC.
+`grpc-timeout` is enforced with the existing precise timer mechanism (millisecond
+granularity); failures use gRPC status trailers. Calls are never automatically
+replayed. See [the complete example](../examples/grpc.rut).
+
 ## I/O
 
 HTTP policy selectors use contextual enum members (`.case`, lowerCamelCase).

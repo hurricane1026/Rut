@@ -1349,6 +1349,45 @@ let internalService = upstream {
 let orders = upstream { "10.0.1.1:8080" }
 ```
 
+**Implemented native gRPC gateway path:** the current frontend accepts
+`upstream greeter { host: "127.0.0.1", port: 50051, protocol: .http2 }` and
+`route POST "/package.Service/Method" { return forward(greeter) }`.
+`protocol` is an upstream configuration field, not a new keyword. Its closed
+selectors are `.http11` (default) and `.http2` (prior-knowledge cleartext HTTP/2).
+This does not implement the target upstream TLS syntax above.
+
+The host application may pre-bind the endpoint and declare only
+`upstream greeter { protocol: .http2 }`. At publication, the declaration must
+match a pre-bound upstream slot in declaration order; protocol and health
+metadata are applied to that slot while its existing address remains intact.
+An addressless declaration without a matching pre-bound slot is rejected.
+
+The `.http2` forwarding path accepts native gRPC over downstream h2c or TLS/h2.
+It streams all four RPC shapes without decoding protobuf, preserving metadata,
+compressed payloads and trailers. A shard pools upstream HTTP/2 sessions by
+pinned configuration, upstream and backend. Each RPC selects a backend and gets
+an independent upstream stream ID; multiple downstream connections may share a
+session. A connection that receives GOAWAY stops accepting new RPCs while
+accepted RPCs drain. Calls rejected or interrupted by an upstream are not
+silently replayed.
+
+Per-RPC queues use the existing bulk SlicePool. Each queue is bounded by the
+65,535-byte stream receive window; window credit returns when bytes move into
+owned send buffers. Kernel sends never borrow an RPC queue, so reset/deadline/
+close can reclaim RPC storage without an outstanding send referencing it.
+Sessions support up to 64 active streams and 16 KiB header blocks; streamed
+message length is independent of queue capacity. Cancellation maps to the
+upstream stream, and `grpc-timeout` uses the existing precise timers with
+millisecond resolution. Upstream connection failures map to UNAVAILABLE;
+expired deadlines to DEADLINE_EXCEEDED. Configuration epochs remain pinned by
+active/pooled sessions until teardown.
+
+Header-only route handlers can forward gRPC. Body-dependent handlers,
+HTTP/1-specific forwarding policies, gRPC-Web, JSON transcoding, upstream
+TLS/mTLS and gRPC health checks remain outside this path. The frontend rejects
+`.http2` combined with the HTTP/1 health-check configuration. See
+[examples/grpc.rut](examples/grpc.rut) and the language card.
+
 **Load balancing algorithms:**
 
 All standard algorithms are built-in. The runtime tracks per-target state
@@ -3838,10 +3877,10 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 
 | Feature | Requirement |
 |---------|------------|
-| gRPC proxy | HTTP/2 support |
+| Native gRPC proxy | Implemented over h2c upstream; see §3.4.1 |
 | gRPC-REST transcoding | HTTP/2 + protobuf definitions |
 | gRPC-Web | HTTP/2 + gRPC-Web protocol |
-| HTTP/2 upstream | HTTP/2 client implementation |
+| HTTP/2 upstream | Implemented for native gRPC forwarding over h2c |
 | mTLS (client certs) | OpenSSL client cert validation |
 | Dynamic SSL / ACME | ACME protocol + cert management |
 

@@ -1,0 +1,26 @@
+// Run with examples/grpc/server.py and examples/grpc/client.py.
+// See examples/grpc/README.md for setup, plaintext and TLS commands.
+// Select port and transport on the CLI to reuse these routes for h2c or TLS.
+
+upstream echo {
+    host: "127.0.0.1"
+    port: 50051
+    protocol: .http2
+}
+
+// The same forward operation supports all four RPC shapes.
+route POST "/example.Echo/Unary" {
+    return forward(echo)
+}
+
+route POST "/example.Echo/ServerStream" {
+    return forward(echo)
+}
+
+route POST "/example.Echo/ClientStream" {
+    return forward(echo)
+}
+
+route POST "/example.Echo/Chat" {
+    return forward(echo)
+}

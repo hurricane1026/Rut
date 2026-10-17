@@ -15,6 +15,7 @@
 
 #include "rut/runtime/access_log.h"  // monotonic_us
 #include "rut/runtime/connection.h"
+#include "rut/runtime/grpc_protocol.h"
 #include "rut/runtime/http2_conn.h"
 #include "rut/runtime/http_parser.h"  // http_method_str
 #include "rut/runtime/jit_dispatch.h"
@@ -124,6 +125,32 @@ struct H2Dispatch {
           overflow(overflow_),
           close_after_process(close_after_process_) {}
 };
+
+inline GrpcExchange* grpc_find(Http2Conn&, u32);
+template <typename Loop>
+bool grpc_start(Loop*,
+                Connection&,
+                u32,
+                const RouteConfig*,
+                u16,
+                const hpack::Header*,
+                u32,
+                const ParsedRequest&,
+                bool);
+template <typename Loop>
+bool grpc_start_synth(H2Dispatch<Loop>&, u32, const RouteConfig*, u16, const u8*, u32, bool);
+template <typename Loop>
+u32 grpc_pump_downstream(Loop*, Connection&, u8*, u32);
+template <typename Loop>
+void grpc_release(Loop*, GrpcExchange*, bool);
+template <typename Loop>
+void grpc_request_data(Loop*, Connection&, GrpcExchange&, const u8*, u32, bool);
+template <typename Loop>
+void grpc_request_trailers(void*, Http2Conn&, u32, const hpack::Header*, u32, bool);
+template <typename Loop>
+bool grpc_grow_recv(Loop*, Connection&);
+template <typename Loop>
+void grpc_refresh_timer(Loop*, Connection&);
 
 // Append a response (HEADERS + optional DATA body) for a stream, encoded with
 // the connection's dynamic-indexing encoder. `hdrs[0..nhdrs)` are extra
@@ -543,6 +570,82 @@ inline void h2_clear_pending(Http2Conn& h2) {
     for (u32 i = 0; i < kMaxRouteParams; i++) {
         h2.pending_route_params[i] = {};
     }
+    h2.pending_local_outcome = false;
+    h2.pending_local_status = 0;
+    h2.pending_local_body_idx = 0;
+    h2.pending_local_headers_idx = 0;
+    h2.pending_local_is_head = false;
+    h2.pending_local_cfg = nullptr;
+    h2.pending_local_mutation_count = 0;
+    h2.pending_local_mutation_overflow = false;
+    h2.pending_local_mutation_bytes = 0;
+}
+
+template <typename Loop>
+void h2_async_epoch_enter(Loop* loop, Connection& conn);
+inline void h2_clear_async(Http2Conn& h2);
+
+template <typename Loop>
+bool h2_park_local_outcome(H2Dispatch<Loop>& d,
+                           u32 stream_id,
+                           const JitDispatchOutcome& o,
+                           const RouteConfig* cfg,
+                           bool is_head,
+                           u32 content_length,
+                           bool replace_owned_async = false) {
+    Http2Conn& h2 = *d.conn->h2;
+    if (h2.pending_stream != 0 || (h2.async_stream != 0 && !replace_owned_async)) return false;
+
+    // The timer-resume path is converting the occupied async slot into a
+    // deferred local response. Stabilize request-backed mutation values before
+    // publishing any pending state so allocation failure cannot leave two live
+    // owners of the same response.
+    if (replace_owned_async && d.conn->resp_header_mutation_count != 0 &&
+        (!d.loop->alloc_response_header_buf(*d.conn) ||
+         !d.conn->stabilize_response_mutations(h2.pending_synth, h2.async_synth_len)))
+        return false;
+
+    h2_async_epoch_enter(d.loop, *d.conn);
+    h2.pending_stream = stream_id;
+    h2.pending_has_content_length = true;
+    h2.pending_content_length = content_length;
+    h2.pending_body_len = 0;
+    h2.pending_buffer_body = false;
+    h2.pending_local_outcome = true;
+    h2.pending_local_status = o.status_code;
+    h2.pending_local_body_idx = o.response_body_idx;
+    h2.pending_local_headers_idx = o.response_headers_idx;
+    h2.pending_local_is_head = is_head;
+    h2.pending_local_cfg = cfg;
+    h2.pending_local_mutation_count = 0;
+    h2.pending_local_mutation_overflow =
+        d.conn->resp_header_mutation_overflow || d.conn->resp_header_mutation_pending_overflow;
+    h2.pending_local_mutation_bytes = 0;
+    for (u32 i = 0; i < d.conn->resp_header_mutation_count; i++) {
+        if (i >= 16) {
+            h2.pending_local_mutation_overflow = true;
+            break;
+        }
+        const auto& src = d.conn->resp_header_mutations[i];
+        const u32 need = src.name.len + src.value.len;
+        if (need > Http2Conn::kBodySynthCap - h2.pending_local_mutation_bytes) {
+            h2.pending_local_mutation_overflow = true;
+            break;
+        }
+        auto& dst = h2.pending_local_mutations[h2.pending_local_mutation_count++];
+        u8* storage = h2.pending_synth + h2.pending_local_mutation_bytes;
+        dst.name_offset = static_cast<u16>(h2.pending_local_mutation_bytes);
+        dst.name_len = static_cast<u16>(src.name.len);
+        for (u32 j = 0; j < src.name.len; j++) storage[j] = static_cast<u8>(src.name.ptr[j]);
+        storage += src.name.len;
+        dst.value_offset = static_cast<u16>(h2.pending_local_mutation_bytes + src.name.len);
+        dst.value_len = static_cast<u16>(src.value.len);
+        for (u32 j = 0; j < src.value.len; j++) storage[j] = static_cast<u8>(src.value.ptr[j]);
+        h2.pending_local_mutation_bytes += need;
+        dst.mode = static_cast<u8>(src.mode);
+    }
+    if (replace_owned_async) h2_clear_async(h2);
+    return true;
 }
 
 // pending_body_start points just after the synthesized CRLFCRLF; DATA bytes are
@@ -852,7 +955,8 @@ void h2_async_epoch_enter(Loop* loop, Connection& conn) {
 template <typename Loop>
 void h2_async_epoch_leave(Loop* loop, Connection& conn) {
     if (conn.h2 != nullptr && (conn.h2->async_stream != 0 || conn.h2->pending_stream != 0 ||
-                               conn.h2->outbound_stream != 0 || conn.h2->queued_stream != 0))
+                               conn.h2->outbound_stream != 0 || conn.h2->queued_stream != 0 ||
+                               conn.h2->grpc.active != 0 || conn.h2->grpc.upstream))
         return;
     if (conn.epoch_held) {
         loop->epoch_leave();
@@ -863,6 +967,7 @@ void h2_async_epoch_leave(Loop* loop, Connection& conn) {
 // Release the single async-suspend slot.
 inline void h2_clear_async(Http2Conn& h2) {
     h2.async_stream = 0;
+    h2.async_headers_received_us = 0;
     h2.async_is_head = false;
     h2.async_kind = H2AsyncKind::None;
     h2.async_cfg = nullptr;
@@ -912,7 +1017,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
     // Refuse if a stream is already suspended OR a body-reading request is deferred
     // — both reuse pending_synth, so a second would corrupt the first's bytes — OR
     // while pending_synth is quarantined behind a draining io_uring upstream send.
-    if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
+    if (h2->async_stream != 0 || h2->pending_stream != 0 || h2->grpc.active != 0 ||
+        d.conn->h2_proxy_synth_quarantined)
         return false;
     // Pin the config epoch BEFORE storing cfg/route — a backpressured flush of the
     // suspending batch could otherwise let a hot reload reclaim them while parked.
@@ -931,6 +1037,8 @@ bool h2_suspend_timer(H2Dispatch<Loop>& d,
         value = reinterpret_cast<const char*>(h2->pending_synth + (ptr - synth));
     }
     h2->async_stream = stream_id;
+    if (auto* stream = h2->find_stream(stream_id))
+        h2->async_headers_received_us = stream->headers_received_us;
     h2->async_is_head = is_head;
     h2->async_kind = H2AsyncKind::Timer;
     h2->async_cfg = cfg;
@@ -961,7 +1069,8 @@ bool h2_suspend_proxy(H2Dispatch<Loop>& d,
     // Refuse while another stream is suspended OR a body-reading request is
     // deferred — both reuse pending_synth (see h2_suspend_timer) — OR while
     // pending_synth is quarantined behind a draining io_uring upstream send.
-    if (h2->async_stream != 0 || h2->pending_stream != 0 || d.conn->h2_proxy_synth_quarantined)
+    if (h2->async_stream != 0 || h2->pending_stream != 0 || h2->grpc.active != 0 ||
+        d.conn->h2_proxy_synth_quarantined)
         return false;
     // Pin the config epoch before storing cfg/route (see h2_suspend_timer).
     h2_async_epoch_enter(d.loop, *d.conn);
@@ -1107,6 +1216,17 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
             h2_emit_status(d, stream_id, 503);
             return;
         }
+        if (cfg->upstreams[kOutcome.upstream_id].http2) {
+            if (!grpc_start_synth(d,
+                                  stream_id,
+                                  cfg,
+                                  static_cast<u16>(kOutcome.upstream_id),
+                                  forward_synth,
+                                  forward_len,
+                                  !request_body_followed))
+                h2_emit_status(d, stream_id, 503);
+            return;
+        }
         const bool parked = open_request != nullptr
                                 ? h2_defer_prepared_forward(d,
                                                             stream_id,
@@ -1126,6 +1246,17 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     }
     if (kOutcome.kind != JitDispatchOutcome::Kind::ReturnStatus) {
         h2_emit_status(d, stream_id, 503);  // forward/event-yield over h2: follow-up
+        return;
+    }
+    // gRPC requests with a declared length must still be streamed into the
+    // exchange immediately when the handler chooses Forward.  A local response
+    // has no upstream side effect, so park its already-computed outcome until
+    // END_STREAM validates the length.
+    if (open_request != nullptr && open_request->has_content_length &&
+        grpc_request(*open_request)) {
+        if (!h2_park_local_outcome(
+                d, stream_id, kOutcome, cfg, is_head, open_request->content_length))
+            h2_emit_status(d, stream_id, 503);
         return;
     }
     h2_emit_outcome(d, stream_id, kOutcome, cfg, is_head);
@@ -1149,6 +1280,42 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
     if (h2->pending_has_content_length && h2->pending_content_length != h2->pending_body_len) {
         h2_clear_pending(*h2);
         h2_emit_status(d, stream_id, 400);
+        return;
+    }
+
+    if (h2->pending_local_outcome) {
+        const u16 status = h2->pending_local_status;
+        const u16 body_idx = h2->pending_local_body_idx;
+        const u16 headers_idx = h2->pending_local_headers_idx;
+        const bool is_head = h2->pending_local_is_head;
+        const RouteConfig* cfg = h2->pending_local_cfg;
+        const bool mutation_overflow = h2->pending_local_mutation_overflow;
+        const u8 mutation_count = h2->pending_local_mutation_count;
+        Http2Conn::PendingRespMutation mutations[16];
+        for (u32 i = 0; i < mutation_count; i++) mutations[i] = h2->pending_local_mutations[i];
+        h2_clear_pending(*h2);
+        h2_reset_request_mutations(*d.conn);
+        for (u32 i = 0; i < mutation_count; i++) {
+            auto& dst = d.conn->resp_header_mutations[i];
+            dst.name = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].name_offset),
+                        mutations[i].name_len};
+            dst.value = {
+                reinterpret_cast<const char*>(h2->pending_synth + mutations[i].value_offset),
+                mutations[i].value_len};
+            dst.mode = static_cast<Connection::RespHeaderMutationMode>(mutations[i].mode);
+        }
+        d.conn->resp_header_mutation_count = mutation_count;
+        d.conn->resp_header_mutation_overflow = mutation_overflow;
+        JitDispatchOutcome outcome{};
+        outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+        outcome.status_code = status;
+        outcome.response_body_idx = body_idx;
+        outcome.response_headers_idx = headers_idx;
+        if (mutation_overflow)
+            h2_emit_status(d, stream_id, 500);
+        else
+            h2_emit_outcome(d, stream_id, outcome, cfg, is_head);
+        h2_reset_request_mutations(*d.conn);
         return;
     }
 
@@ -1237,6 +1404,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
                          u32 nheaders,
                          bool end_stream) {
     if (d.close_after_process) return;
+    if (auto* stream = d.conn->h2->find_stream(stream_id))
+        stream->headers_received_us = monotonic_us();
     const RouteConfig* config = d.conn->request_config;
     const bool has_strict_inventory =
         config != nullptr && config->has_strict_local_response_table_inventory();
@@ -1485,7 +1654,8 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
             // when the handler does not read req.body. Such handlers still
             // avoid buffering DATA; requests without a declared length retain
             // the immediate body-agnostic dispatch path below.
-            if (!end_stream && (route->needs_req_body || req.has_content_length)) {
+            if (!end_stream &&
+                (route->needs_req_body || (req.has_content_length && !grpc_request(req)))) {
                 h2_defer_until_data_end(d,
                                         stream_id,
                                         headers,
@@ -1526,6 +1696,24 @@ void h2_dispatch_request(H2Dispatch<Loop>& d,
         }
         case RouteAction::Proxy:
         default:
+            if (route->upstream_id < config->upstream_count &&
+                config->upstreams[route->upstream_id].http2) {
+                if (!h2_proxy_request_forwardable(headers, nheaders)) {
+                    h2_emit_status(d, stream_id, 400);
+                    return;
+                }
+                if (!grpc_start(d.loop,
+                                *d.conn,
+                                stream_id,
+                                config,
+                                route->upstream_id,
+                                headers,
+                                nheaders,
+                                req,
+                                end_stream))
+                    h2_emit_status(d, stream_id, 503);
+                return;
+            }
             // Any request body (DATA frames follow) blocks proxying: we'd forward
             // the synthesized headers immediately and silently drop the body
             // (it's never tied to pending_stream). Gate on end_stream, NOT just a
@@ -1585,6 +1773,15 @@ void h2_on_data_cb(
     void* ctx, Http2Conn& c, u32 stream_id, const u8* data, u32 len, bool end_stream) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
     if (d->close_after_process) return;
+    if constexpr (requires {
+                      d->loop->grpc_upstreams;
+                      d->loop->pool.alloc_bulk();
+                  }) {
+        if (auto* x = grpc_find(c, stream_id)) {
+            grpc_request_data(d->loop, *d->conn, *x, data, len, end_stream);
+            return;
+        }
+    }
     if (c.pending_stream != stream_id) return;
     if (c.pending_body_len > 0xffffffffu - len) {
         c.pending_overflow = true;
@@ -1610,6 +1807,7 @@ void h2_on_data_cb(
 inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*err*/) {
     (void)ctx;
     if (c.async_stream != 0 && c.async_stream == stream_id) h2_clear_async(c);
+    if (c.pending_stream == stream_id) h2_clear_pending(c);
     if (c.outbound_stream == stream_id) {
         if (c.queued_stream != 0) {
             h2_clear_primary_outbound(c);
@@ -1623,6 +1821,12 @@ inline void h2_on_reset_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error /*
 template <typename Loop>
 void h2_on_reset_dispatch_cb(void* ctx, Http2Conn& c, u32 stream_id, Http2Error err) {
     auto* d = static_cast<H2Dispatch<Loop>*>(ctx);
+    if constexpr (requires {
+                      d->loop->grpc_upstreams;
+                      d->loop->pool.alloc_bulk();
+                  }) {
+        if (auto* x = grpc_find(c, stream_id)) grpc_release(d->loop, x, true);
+    }
     const bool kOutboundOwner = c.outbound_stream == stream_id;
     if (d->close_after_process) return;
     if (kOutboundOwner && d->owned_hpack_pending && d->owned_stream == stream_id) {
@@ -1785,7 +1989,7 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
         }
     }
     if (conn.h2 && conn.h2->outbound_stream == 0) conn.h2->response_flush_pending = false;
-    if (!conn.keep_alive) {  // engine signalled GOAWAY / connection error
+    if (!conn.keep_alive) {  // engine signalled a connection error
         loop->close_conn(conn);
         return;
     }
@@ -1802,8 +2006,8 @@ void on_h2_sent(void* lp, Connection& conn, IoEvent ev) {
     // A just-resumed stream may have left coalesced frames buffered (process()
     // stops consuming once a stream parks). Drain them now rather than blocking
     // on a socket read the client may never make — they were already received.
-    if (conn.h2 && conn.recv_buf.len() > 0) {
-        IoEvent synth{conn.id, static_cast<i32>(conn.recv_buf.len()), 0, 0, IoEventType::Recv, 0};
+    if (conn.h2 && (conn.recv_buf.len() > 0 || conn.h2->grpc.active || conn.h2->conn_recv_credit)) {
+        IoEvent synth{conn.id, 1, 0, 0, IoEventType::Recv, 0};
         on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
         return;
     }
@@ -1821,15 +2025,20 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         return;
     }
 
+    conn.h2->grpc.busy = true;
     // Control frames the engine emits (SETTINGS/ACK/WINDOW_UPDATE/PING/GOAWAY).
     u8 ctrl[8192];
     // Response frames produced by the dispatch callback.
+    // Keep control frames and staged response frames within the downstream
+    // send slice.  The control buffer can consume up to 8 KiB.
     static constexpr u32 kRespCap = 8192;
-    u8 resp[kRespCap];
+    static constexpr u32 kRespStorageCap = 16384;
+    u8 resp[kRespStorageCap];
     H2Dispatch<Loop> d{loop, &conn, resp, kRespCap, 0, false, false};
 
     conn.h2->cb_ctx = &d;
     conn.h2->on_headers = &h2_on_headers_cb<Loop>;
+    conn.h2->on_trailers = &grpc_request_trailers<Loop>;
     conn.h2->on_data = &h2_on_data_cb<Loop>;             // accumulates request bodies
     conn.h2->on_reset = &h2_on_reset_dispatch_cb<Loop>;  // cancels a parked stream on RST_STREAM
     // Pin the RCU config epoch BEFORE snapshotting and matching the config, so a
@@ -1842,8 +2051,19 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.request_config = loop->config_ptr ? *loop->config_ptr : nullptr;
 
     u32 ctrl_len = 0;
-    Http2Result r =
-        conn.h2->process(conn.recv_buf.data(), conn.recv_buf.len(), ctrl, sizeof(ctrl), &ctrl_len);
+    if constexpr (requires { loop->is_draining(); }) {
+        if (loop->is_draining() && !conn.h2->goaway_sent) {
+            ctrl_len = write_goaway(ctrl, conn.h2->last_stream_id, Http2Error::NoError);
+            conn.h2->goaway_sent = true;
+        }
+    }
+    u32 engine_written = 0;
+    Http2Result r = conn.h2->process(conn.recv_buf.data(),
+                                     conn.recv_buf.len(),
+                                     ctrl + ctrl_len,
+                                     sizeof(ctrl) - ctrl_len,
+                                     &engine_written);
+    ctrl_len += engine_written;
 
     if (d.close_after_process) {
         h2_clear_outbound(*conn.h2);
@@ -1861,8 +2081,37 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
     conn.reset_request_receive_buffer();
     if (kRemaining > 0) conn.recv_buf.commit(kRemaining);
 
+    // A partial frame can consume the ordinary request slice. Promote only
+    // after process has released its view of the input and the bytes have been
+    // compacted; rebinding while the engine is still processing is unsafe.
+    if constexpr (requires { loop->pool.alloc_bulk(); }) {
+        if (!r.close && conn.recv_buf.write_avail() == 0 && !grpc_grow_recv(loop, conn)) {
+            loop->close_conn(conn);
+            return;
+        }
+    }
+
     const bool kClose = r.close || d.overflow;
 
+    if (!kClose && conn.h2->grpc.active) {
+        const u32 used = ctrl_len + d.resp_len;
+        const u32 wire_room = used < conn.send_buf.capacity() ? conn.send_buf.capacity() - used : 0;
+        const u32 storage_room = kRespStorageCap - d.resp_len;
+        const u32 room = storage_room < wire_room ? storage_room : wire_room;
+        d.resp_len += grpc_pump_downstream(loop, conn, d.resp + d.resp_len, room);
+    }
+    conn.h2->grpc.busy = false;
+    if constexpr (requires {
+                      loop->grpc_upstreams;
+                      loop->pool.alloc_bulk();
+                  }) {
+        if (conn.h2->grpc.timer_deadline_us) grpc_refresh_timer(loop, conn);
+        if (conn.h2->grpc.active == 0 && conn.h2->grpc.timer_deadline_us == 0 &&
+            conn.h2->outbound_stream == 0 && !conn.send_armed) {
+            if constexpr (requires { loop->timer.refresh(&conn, loop->keepalive_timeout); })
+                loop->timer.refresh(&conn, loop->keepalive_timeout);
+        }
+    }
     if (!kClose && conn.h2->outbound_stream != 0) {
         const u32 kUsed = ctrl_len + d.resp_len;
         const u32 kWireRoom =
@@ -1871,7 +2120,7 @@ void on_h2_data(void* lp, Connection& conn, IoEvent ev) {
         const u32 kN = h2_pump_outbound(
             *conn.h2,
             d.resp + d.resp_len,
-            d.resp_cap - d.resp_len < kWireRoom ? d.resp_cap - d.resp_len : kWireRoom,
+            kRespStorageCap - d.resp_len < kWireRoom ? kRespStorageCap - d.resp_len : kWireRoom,
             pump_status);
         if (pump_status == H2PumpStatus::Invalid) {
             h2_clear_outbound(*conn.h2);
@@ -2102,7 +2351,9 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                 failure_status = 500;
         }
 
-        if (failure_status == 0 && h2->async_request_stream_open) {
+        if (failure_status == 0 && h2->async_request_stream_open &&
+            (h2->async_cfg == nullptr || kOutcome.upstream_id >= h2->async_cfg->upstream_count ||
+             !h2->async_cfg->upstreams[kOutcome.upstream_id].http2)) {
             ParsedRequest open_request;
             open_request.reset();
             open_request.has_content_length = h2->async_request_has_content_length;
@@ -2135,6 +2386,39 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
         }
 
         if (failure_status == 0) {
+            if (h2->async_cfg != nullptr && kOutcome.upstream_id < h2->async_cfg->upstream_count &&
+                h2->async_cfg->upstreams[kOutcome.upstream_id].http2) {
+                u8 resp[8192];
+                H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
+                if (!grpc_start_synth(d,
+                                      kStreamId,
+                                      h2->async_cfg,
+                                      static_cast<u16>(kOutcome.upstream_id),
+                                      forward_synth,
+                                      forward_len,
+                                      !h2->async_request_stream_open)) {
+                    failure_status = 503;
+                } else {
+                    conn.pending_handler_fn = nullptr;
+                    h2_clear_async(*h2);
+                    conn.transition_to_reading_header(&on_h2_data<Loop>);
+                    if (conn.recv_buf.len() > 0) {
+                        IoEvent synth{conn.id,
+                                      static_cast<i32>(conn.recv_buf.len()),
+                                      0,
+                                      0,
+                                      IoEventType::Recv,
+                                      0};
+                        on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
+                    } else {
+                        if (h2->grpc.active)
+                            grpc_kick_downstream(loop, conn);
+                        else
+                            loop->submit_recv(conn);
+                    }
+                    return;
+                }
+            }
             // The timer already owns the single async slot and its config epoch.
             // Convert it in place instead of calling h2_suspend_proxy (which
             // correctly refuses an occupied slot).
@@ -2177,6 +2461,52 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     u8 resp[8192];
     H2Dispatch<Loop> d{loop, &conn, resp, sizeof(resp), 0, false};
     if (kOutcome.kind == JitDispatchOutcome::Kind::ReturnStatus) {
+        if (h2->async_request_stream_open && h2->async_request_has_content_length) {
+            ParsedRequest request;
+            HttpParser parser;
+            parser.reset();
+            if (parser.parse(h2->pending_synth, h2->async_synth_len, &request) ==
+                    ParseStatus::Complete &&
+                grpc_request(request)) {
+                if (h2_park_local_outcome(d,
+                                          kStreamId,
+                                          kOutcome,
+                                          h2->async_cfg,
+                                          kIsHead,
+                                          h2->async_request_content_length,
+                                          true)) {
+                    conn.pending_handler_fn = nullptr;
+                    conn.transition_to_reading_header(&on_h2_data<Loop>);
+                    if (conn.recv_buf.len() > 0) {
+                        IoEvent synth{conn.id,
+                                      static_cast<i32>(conn.recv_buf.len()),
+                                      0,
+                                      0,
+                                      IoEventType::Recv,
+                                      0};
+                        on_h2_data<Loop>(static_cast<void*>(loop), conn, synth);
+                    } else {
+                        loop->submit_recv(conn);
+                    }
+                    return;
+                } else {
+                    // A failed stabilization/allocation must consume the
+                    // timer-owned async episode and fail closed. Falling
+                    // through would serialize the original outcome while the
+                    // old async owners remained live.
+                    kOutcome.status_code = 500;
+                    kOutcome.response_body_idx = 0;
+                    kOutcome.response_headers_idx = 0;
+                    h2_reset_request_mutations(conn);
+                }
+            } else {
+                h2_reset_request_mutations(conn);
+                kOutcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+                kOutcome.status_code = 400;
+                kOutcome.response_body_idx = 0;
+                kOutcome.response_headers_idx = 0;
+            }
+        }
         h2_emit_outcome(d, kStreamId, kOutcome, h2->async_cfg, kIsHead);
     } else {
         h2_emit_status(d, kStreamId, 503);  // forward / event-yield over h2: follow-up
@@ -2217,3 +2547,5 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 }
 
 }  // namespace rut
+
+#include "rut/runtime/callbacks_grpc.h"

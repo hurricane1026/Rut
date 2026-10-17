@@ -2293,7 +2293,9 @@ public:
             c.response_read_deadline_state != ResponseReadDeadlineState::BatchPending &&
             c.response_read_deadline_state != ResponseReadDeadlineState::RefreshPending)
             timer.refresh(&c,
-                          c.state == ConnState::Proxying ? upstream_timeout : keepalive_timeout);
+                          c.h2 && (c.h2->grpc.active || c.h2->grpc.upstream) ? 1
+                          : c.state == ConnState::Proxying                   ? upstream_timeout
+                                                                             : keepalive_timeout);
         c.clear_recv_pause_for_send();
         if (!successful) {
             backend.send_state[c.id] = {};
@@ -3061,9 +3063,28 @@ public:
         return true;
     }
 
+    // HTTP/2 may receive a full connection window while a TLS send drains.
+    // The H1 ciphertext slice cannot hold that burst. Promote before accepting
+    // application frames; the existing mmap ownership remains unchanged.
+    bool grow_h2_tls_input(Connection& c) {
+        if (c.tls_in_buf.capacity() >= SlicePool::kBulkSliceSize) return true;
+        u8* region = pool.alloc_bulk();
+        if (!region) return false;
+        const u32 n = c.tls_in_buf.len();
+        __builtin_memcpy(region, c.tls_in_buf.data(), n);
+        munmap(c.tls_in_slice, c.tls_in_buf.capacity());
+        c.tls_in_slice = region;
+        c.tls_in_buf.bind(c.tls_in_slice, SlicePool::kBulkSliceSize);
+        c.tls_in_buf.commit(n);
+        return true;
+    }
+
     void free_tls_in_buf(ConnectionBase& c) {
         if (!c.tls_in_slice) return;
-        munmap(c.tls_in_slice, kTlsInputSize);
+        if (pool.is_bulk(c.tls_in_slice))
+            pool.free(c.tls_in_slice);
+        else
+            munmap(c.tls_in_slice, c.tls_in_buf.capacity());
         c.tls_in_slice = nullptr;
         c.tls_in_buf.bind(nullptr, 0);
     }
@@ -3313,6 +3334,7 @@ public:
         u8* relay = c.upstream_relay_slice;
         u8* hs = c.response_header_slice;
         u8* tin = c.tls_in_slice;
+        const u32 tin_capacity = c.tls_in_buf.capacity();
         u8* tout = c.tls_out_slice;
         u32 ops = c.pending_ops;
         const u8 allocated_shard = c.shard_id;
@@ -3345,6 +3367,7 @@ public:
         conns[cid].upstream_relay_slice = relay;
         conns[cid].response_header_slice = hs;
         conns[cid].tls_in_slice = tin;
+        if (tin) conns[cid].tls_in_buf.bind(tin, tin_capacity);
         conns[cid].tls_out_slice = tout;
         conns[cid].pending_ops = ops;
         conns[cid].upstream_retiring_episode = retiring_episode;
@@ -7499,7 +7522,7 @@ public:
             if (c.req_start_us != 0) {
                 if (metrics->requests_active > 0) metrics->requests_active--;
             }
-            metrics->on_close();
+            if (c.metrics_client()) metrics->on_close();
         }
         // A deferred idle-pool return (return_idle_upstream parked a still-reusable
         // upstream fd in idle_return_fd) whose cancelled multishot recv has NOT yet
@@ -8099,7 +8122,9 @@ public:
                         c.yield_armed = false;
                         c.yield_timeout_armed = false;
                     }
-                    if (c.throttle_paused && matching_generation) {
+                    if (matching_generation && c.h2 && c.h2->grpc.timer_deadline_us) {
+                        grpc_deadline_fired(this, c);
+                    } else if (c.throttle_paused && matching_generation) {
                         // @throttle pacing timer fired — resume the parked proxy
                         // pump (re-checks the byte budget; may re-park).
                         throttle_resume<IoUringEventLoop>(this, c);
@@ -8143,6 +8168,8 @@ public:
                             c->resume_event_kind = jit::YieldKind::Timer;
                             c->resume_event_result = 0;
                             resume_jit_handler<IoUringEventLoop>(this, *c);
+                        } else if (c->h2 && (c->h2->grpc.active || c->h2->grpc.upstream)) {
+                            grpc_tick<IoUringEventLoop>(this, *c);
                         } else if (c->state == ConnState::Proxying && !c->proxy_resp_started) {
                             // Upstream stalled before responding → 504. A genuine
                             // in-flight h2 proxy stream reframes as h2 (raw h1 504
@@ -8183,6 +8210,11 @@ public:
                     u64 now = monotonic_secs();
                     for (u32 i = 0; i < slots_initialized; i++) {
                         if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
+                            conns[i].h2 && conns[i].h2->grpc.active && !conns[i].h2->goaway_sent)
+                            on_h2_data<IoUringEventLoop>(
+                                this, conns[i], {i, 1, 0, 0, IoEventType::Recv, 0});
+                        if (conns[i].fd >= 0 && conns[i].state == ConnState::ReadingHeader &&
+                            !(conns[i].h2 && conns[i].h2->grpc.active) &&
                             should_drain_close(i, start, now, period)) {
                             this->close_conn(conns[i]);
                         }
@@ -8736,9 +8768,11 @@ public:
                                 ResponseReadDeadlineState::BatchPending &&
                             conn.response_read_deadline_state !=
                                 ResponseReadDeadlineState::RefreshPending)
-                            timer.refresh(&conn,
-                                          conn.state == ConnState::Proxying ? upstream_timeout
-                                                                            : keepalive_timeout);
+                            timer.refresh(
+                                &conn,
+                                conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1
+                                : conn.state == ConnState::Proxying ? upstream_timeout
+                                                                    : keepalive_timeout);
                         if (ev.type == IoEventType::Send) conn.clear_recv_pause_for_send();
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {

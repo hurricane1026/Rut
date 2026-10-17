@@ -1,0 +1,3 @@
+# Optional example SDK/code generator; not a Rut runtime or build dependency.
+grpcio==1.78.0
+grpcio-tools==1.78.0

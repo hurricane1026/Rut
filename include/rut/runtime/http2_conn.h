@@ -1,6 +1,7 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/grpc_proxy_state.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
 #include "rut/runtime/http_parser.h"
@@ -36,6 +37,11 @@ struct Http2Stream {
     i32 send_window;  // how much DATA we may send to the peer on this stream
     i32 recv_window;  // how much DATA the peer may send us on this stream
     bool got_headers;
+    // Streaming consumers return credit only after releasing buffered DATA.
+    bool manual_window;
+    u32 recv_credit;
+    u32 recv_unconsumed;
+    u64 headers_received_us;
 };
 
 struct Http2Conn;
@@ -76,10 +82,19 @@ struct Http2Conn {
     // Delivered when a stream is reset by the peer (RST_STREAM).
     using OnReset = void (*)(void* ctx, Http2Conn& c, u32 stream_id, Http2Error error);
 
+    GrpcProxyState grpc;
+
     void* cb_ctx;
     OnHeaders on_headers;
     OnData on_data;
     OnReset on_reset;
+    // Like on_headers, views are valid only during the callback. Installed after init().
+    OnHeaders on_trailers;
+    bool client;
+    bool peer_settings_seen;
+    bool peer_goaway;
+    u32 peer_last_stream;
+    u32 conn_recv_credit;
 
     hpack::DynamicTable hpack_dec;
     hpack::Encoder hpack_enc;  // response-side encoder (dynamic indexing)
@@ -139,6 +154,29 @@ struct Http2Conn {
     u32 pending_route_param_count;
     u8 pending_synth[kBodySynthCap];
 
+    // A local JIT ReturnStatus on a gRPC request with declared Content-Length
+    // runs at HEADERS time, but its response waits for END_STREAM so the
+    // declared length can be checked.  Keep the outcome and response mutations
+    // independent of Connection's scratch mutation log: another multiplexed
+    // stream may invoke a handler before this one finishes.
+    struct PendingRespMutation {
+        u16 name_offset;
+        u16 name_len;
+        u16 value_offset;
+        u16 value_len;
+        u8 mode;
+    };
+    bool pending_local_outcome;
+    u16 pending_local_status;
+    u16 pending_local_body_idx;
+    u16 pending_local_headers_idx;
+    bool pending_local_is_head;
+    const RouteConfig* pending_local_cfg;
+    u8 pending_local_mutation_count;
+    bool pending_local_mutation_overflow;
+    u32 pending_local_mutation_bytes;
+    PendingRespMutation pending_local_mutations[16];
+
     // One suspended async (wait/timer) stream at a time, mirroring the
     // pending_stream body constraint. When a JIT handler yields on a timer the
     // serving layer parks it here: the resume point lives on the Connection
@@ -153,6 +191,7 @@ struct Http2Conn {
     // the response flush resume (or close) the stream early. h2_arm_async_timer
     // transfers these to the Connection atomically with schedule_yield_timer.
     u32 async_stream;
+    u64 async_headers_received_us;
     bool async_is_head;
     H2AsyncKind async_kind;
     const RouteConfig* async_cfg;
@@ -198,6 +237,11 @@ struct Http2Conn {
 
     // Set callbacks (any may be null) then call init().
     void init();
+    // HTTP/2 prior-knowledge client. Caller writes the preface + our SETTINGS.
+    void init_client();
+    Http2Stream* open_stream(u32 id);
+    // Return previously delivered DATA credit. False on double-consume/overflow.
+    bool consume_data(u32 stream_id, u32 len);
 
     // Consume as many complete frames (and the preface) as `in` holds, writing
     // any required control frames into out[0..out_cap). Partial trailing frames

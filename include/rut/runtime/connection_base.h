@@ -305,6 +305,7 @@ struct RelayOwner {
 };
 
 struct ConnectionBase {
+    static constexpr u16 kMetricsClientFlag = 1u;
     static constexpr u32 kMaxReqPathLen = 64;
     static constexpr u32 kMaxUpstreamNameLen = 24;
     static constexpr u16 kMaxPipelineDepth = 16;
@@ -372,6 +373,13 @@ struct ConnectionBase {
     ConnState state;  // for debugging/metrics only
     u8 shard_id;
     u16 flags;
+    bool metrics_client() const { return (flags & kMetricsClientFlag) != 0; }
+    void set_metrics_client(bool client) {
+        if (client)
+            flags |= kMetricsClientFlag;
+        else
+            flags &= static_cast<u16>(~kMetricsClientFlag);
+    }
     u16 timer_slot;
     // Idle-buffer trim mark (io_uring sweep only; see IoUringEventLoop::
     // sweep_idle_trim): this connection's timer node has been examined since it
@@ -1901,19 +1909,22 @@ struct ConnectionBase {
         upstream_send_len = 0;
     }
 
+    void (*on_close)(void*, ConnectionBase&);
+
     void reset() {
         response_body_tail = {};
         chain_direct_recv_owner = {};
         relay_owner = {};
         on_recv = nullptr;
         on_send = nullptr;
+        on_close = nullptr;
         on_upstream_recv = nullptr;
         on_upstream_send = nullptr;
         fd = -1;
         id = 0;
         state = ConnState::Idle;
         shard_id = 0;
-        flags = 0;
+        flags = kMetricsClientFlag;
         timer_slot = 0;
         timer_node.init();
         idle_node.init();

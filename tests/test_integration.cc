@@ -15553,6 +15553,60 @@ bool wait_for_idle_pool_count(ShardT& shard, u32 expected, u32 timeout_ms = 1000
     return shard.upstream && shard.upstream->idle_count.load(std::memory_order_acquire) >= expected;
 }
 
+TEST(proxy_http2_rejection, static_proxy_preserves_head_and_http10) {
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 1);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_proxy("/api", 0, static_cast<u16>(uid.value())));
+    cfg.upstreams[uid.value()].http2 = true;
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/false));
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    const char request[] = "HEAD /api HTTP/1.0\r\nHost: x\r\n\r\n";
+    REQUIRE(send_all(c, request, sizeof(request) - 1));
+    char response[1024];
+    i32 n = recv_timeout(c, response, sizeof(response), 2000);
+    REQUIRE_GT(n, 0);
+    CHECK(buf_contains(response, static_cast<u32>(n), "HTTP/1.0 503", 12));
+    u32 header_end = 0;
+    for (u32 i = 3; i < static_cast<u32>(n); i++) {
+        if (response[i - 3] == '\r' && response[i - 2] == '\n' && response[i - 1] == '\r' &&
+            response[i] == '\n') {
+            header_end = i + 1;
+            break;
+        }
+    }
+    REQUIRE_GT(header_end, 0u);
+    CHECK_EQ(static_cast<u32>(n), header_end);
+    close(c);
+    proxy.teardown();
+}
+
+TEST(proxy_http2_rejection, jit_forward_preserves_http10) {
+    RouteConfig cfg{};
+    auto uid = cfg.add_upstream("api", 0x7F000001, 1);
+    REQUIRE(uid.has_value());
+    REQUIRE(cfg.add_jit_handler("/api", 'G', &forward_upstream_0_handler));
+    cfg.upstreams[uid.value()].http2 = true;
+    const RouteConfig* active = &cfg;
+    ScopedProxyLoop proxy;
+    REQUIRE(proxy.setup(&active, 4000, /*enable_reuse=*/false));
+    i32 c = connect_to(proxy.port);
+    REQUIRE(c >= 0);
+    set_socket_timeouts(c, 2);
+    const char request[] = "GET /api HTTP/1.0\r\nHost: x\r\n\r\n";
+    REQUIRE(send_all(c, request, sizeof(request) - 1));
+    char response[1024];
+    i32 n = recv_timeout(c, response, sizeof(response), 2000);
+    REQUIRE_GT(n, 0);
+    CHECK(buf_contains(response, static_cast<u32>(n), "HTTP/1.0 503", 12));
+    close(c);
+    proxy.teardown();
+}
+
 // End-to-end: three sequential keep-alive requests on ONE client connection to a
 // proxy route must share a SINGLE upstream connection — the gateway returns the
 // upstream fd to the per-shard idle pool after each response and borrows it back

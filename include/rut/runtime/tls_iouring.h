@@ -445,8 +445,15 @@ void tls_process(Self* loop, Connection& c) {
             if (!c.tls_out_inflight) loop->submit_recv(c);  // await the client's next flight
             return;
         }
-        if (tls_negotiated_protocol(c.tls_engine.ssl) == AlpnProtocol::H2)
+        if (tls_negotiated_protocol(c.tls_engine.ssl) == AlpnProtocol::H2) {
             c.protocol = ConnProtocol::Http2;
+            if constexpr (requires { loop->grow_h2_tls_input(c); }) {
+                if (!loop->grow_h2_tls_input(c)) {
+                    loop->close_conn(c);
+                    return;
+                }
+            }
+        }
         c.tls_handshake_complete = true;
         // The handshake-completion flight just queued (above) may include the
         // TLS 1.3 NewSessionTicket and is still draining tls_out_buf. Don't fall

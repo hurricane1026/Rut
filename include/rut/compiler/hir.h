@@ -53,6 +53,7 @@ struct HirUpstream {
     // this slice). hc_enabled gates the rest. path/interval required when set;
     // status defaults to 200. hc_path is a Str (like name) copied into a char
     // buffer at populate_route_config via set_upstream_health_check.
+    bool http2 = false;
     bool hc_enabled = false;
     Str hc_path{};
     u32 hc_interval_ms = 0;
