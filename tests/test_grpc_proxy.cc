@@ -1920,6 +1920,53 @@ TEST(grpc_proxy, invalid_initial_response_headers_detach_upstream_exchange) {
     CHECK_GT(sent, 0u);
 }
 
+TEST(grpc_proxy, response_header_staging_failure_detaches_exchange) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    downstream.on_send = &pending_send;
+    GrpcExchange x;
+    x.init();
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    x.slot_held = true;
+    x.request_headers_sent = true;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+
+    static char names[128][32];
+    static char values[128][4096];
+    hpack::Header headers[128];
+    headers[0] = {{":status", 7}, {"200", 3}};
+    headers[1] = {{"content-type", 12}, {"application/grpc", 16}};
+    for (u32 i = 2; i < 128; i++) {
+        for (u32 j = 0; j < 16; j++) names[i][j] = static_cast<char>('a' + ((j + i * 3) % 26));
+        for (u32 j = 0; j < sizeof(values[i]); j++)
+            values[i][j] = static_cast<char>('a' + ((j + i * 7) % 26));
+        headers[i] = {{names[i], 16}, {values[i], sizeof(values[i])}};
+    }
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, headers, 128, false);
+    CHECK_EQ(x.failure, 8u);
+    CHECK(x.response_end);
+    CHECK(x.upstream == nullptr);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(loop.released, 1u);
+    CHECK_EQ(upstream_h2.grpc.control_len, 13u);
+}
+
 TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
     auto run = [&_tc](const hpack::Header* headers,
                       u32 header_count,
