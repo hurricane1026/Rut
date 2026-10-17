@@ -8,6 +8,7 @@
 // slowed to 10 s so a stray real tick cannot perturb the tick arithmetic.
 
 #include "rut/runtime/iouring_event_loop.h"
+#include "rut/runtime/json.h"
 #include "rut/runtime/route_table.h"
 #include "rut/runtime/slice_pool.h"
 #include "test.h"
@@ -381,6 +382,22 @@ TEST(slice_pool_discard, refuses_free_misaligned_foreign_and_bulk_pointers) {
 // ---------------------------------------------------------------------------
 // Real loop: trim, reuse, activity, non-whitelisted states
 // ---------------------------------------------------------------------------
+
+TEST(iouring_idle_trim, connection_json_arena_uses_pool_and_quotes_escapes) {
+    TrimRig r;
+    if (!r.init(2, false)) SKIP("io_uring or process_madvise unavailable");
+    Connection* c = r.loop->alloc_conn();
+    REQUIRE(c != nullptr);
+    CHECK_EQ(c->json_arena.backend.pool, &r.loop->pool);
+    REQUIRE(c->json_arena.init(&r.loop->pool));
+    CHECK(c->json_arena.alloc(32) != nullptr);
+
+    char encoded[64]{};
+    json::Writer writer{encoded};
+    CHECK(json::quote(lit_str("a\n\""), writer));
+    const Str result{encoded, writer.len};
+    CHECK(result.eq(lit_str("\"a\\u000a\\\"\"")));
+}
 
 TEST(iouring_idle_trim, idle_keepalive_trimmed_once_then_serves_next_request) {
     TrimRig r;
@@ -1137,9 +1154,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // RelayOwner and BufferedSendVector are part of the hot connection slot.
     // Keep the slot-size assertion explicit so future owner fields cannot grow
     // the layout unnoticed.
-    // The per-connection close callback is part of the runtime callback ABI;
-    // keep checking the resulting hot-slot layout explicitly.
-    CHECK_EQ(sizeof(Connection), 3840u);
+    // tls_recv_overflow_prefix_len and the gRPC proxy state were added after
+    // the original 3824-byte budget assertion; keep checking the current
+    // hot-slot layout explicitly.
+    CHECK_EQ(sizeof(Connection), 3880u);
 }
 
 TEST(iouring_idle_trim,

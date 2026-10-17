@@ -202,6 +202,8 @@ enum class HirExprKind : u8 {
     WidenI64,
     // `time.nowMicros()` — monotonic microseconds, type I64, nullary.
     TimeNowMicros,
+    JsonOp,
+    JsonDecode,
     // `max(a, b)` / `min(a, b)` builtins — same-width {I32,I64} binary,
     // signed; single evaluation (real opcodes, not an IfElse desugar).
     MaxInt,
@@ -233,6 +235,7 @@ enum class HirTypeKind : u8 {
     // same-type ({I32,I64}) — no implicit mixing.
     I64,
     Str,
+    Json,
     Generic,
     Associated,
     Variant,
@@ -448,6 +451,10 @@ struct HirExpr {
     Span span{};
     bool may_nil = false;
     bool may_error = false;
+    // A Str produced by JSON serialization retains its media-type provenance
+    // so response lowering can select application/json without guessing from
+    // the carrier type alone.
+    bool is_json_encoded = false;
     bool bool_value = false;
     i64 int_value = 0;
     Str str_value{};
@@ -767,6 +774,7 @@ struct HirLocal {
     u32 error_variant_index = 0xffffffffu;
     bool is_wait_result = false;
     bool is_magic_request_proxy = false;
+    bool is_runtime_synthetic = false;
     WaitEventKind wait_event_kind = WaitEventKind::Timer;
     u32 wait_payload = 0;
     u8 wait_arm_mask = kWaitEventArmTimer;
@@ -812,6 +820,7 @@ struct HirTerminator {
     // had `has_response_body == true`, so the sentinel is preserved
     // end-to-end.
     Str response_body{};
+    u32 response_body_local_index = 0xffffffffu;
     // Optional response headers from `response(N, headers: {...})`.
     // Inline-stored so analyze doesn't need the AstFile handle, and
     // downstream passes don't need a module-level pool. len == 0
@@ -1140,7 +1149,9 @@ struct HirRoute {
     Str path{};
     static constexpr u32 kMaxLocals = 16;
     static constexpr u32 kMaxGuards = 8;
-    static constexpr u32 kMaxExprs = 64;
+    // JSON struct decoding materializes bounded pointer operations for each
+    // field; keep enough room for nested shapes and the route's final guards.
+    static constexpr u32 kMaxExprs = 128;
     static constexpr u32 kMaxDecorators = 8;
     static constexpr u32 kMaxWaits = kMaxRouteWaits;
     // 2 for-loops per route covers realistic DSL patterns (one allowlist

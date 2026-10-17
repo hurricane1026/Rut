@@ -52,7 +52,7 @@ route GET "/health" { return 200 } // zero or more top-level route declarations
 :8080                                   // Port
 re"^/api/v\d+"                          // Regex (compile-time validated)
 true  false  nil
-json({ users: [], total: 0 })           // object literal syntax ✅; json() lowering/runtime ⏳
+json({ users: [], total: 0 })           // bounded JSON construction; failure is optional
 
 // Operators — each symbol has exactly one meaning in expressions
 &&  ||  !                               // boolean (identical to Swift)
@@ -212,7 +212,7 @@ req.query("page")            // str? (first value)
 req.queryAll("tags")         // ⏳ [str]
 req.cookie("session")        // str?
 req.body(User)               // typed parse, error-capable → guard let
-req.bodyRaw                  // str, error-capable; assignable before forward
+req.body                     // raw body as str
 req.bodyJson()               // dynamic Json, error-capable
 req.ctx.userId               // typed per-request context (user declares struct Ctx)
 
@@ -264,8 +264,11 @@ the legacy fallback behavior.
 The literal `response(status, body: "...")` form is limited to 1 MiB. Its bytes
 are a non-owning view into the loaded program's RIR/module response-body
 storage; `LoadedProgram` keeps that storage alive through teardown and reload
-retirement. This documents the configured local/static response path and does
-not make dynamic `resp.body` mutation available.
+retirement. A runtime `str` body such as `req.body` is limited to one 16 KiB
+`SlicePool` slice; HTTP/1 response headers share the bounded output buffer, so
+the usable body limit can be lower. HTTP/2 copies a dynamic body into
+stream-owned storage so it survives flow-control stalls. JSON construction
+keeps its separate 8 KiB limit. Dynamic `resp.body` mutation remains ⏳.
 
 For HTTP/2, the current bounded `HEAD` support applies to ordinary local JIT
 `ReturnStatus` responses with a configured representation body, including

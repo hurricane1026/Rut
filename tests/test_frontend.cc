@@ -4816,6 +4816,53 @@ route GET "/x" { let code = require(req.http11) if code == 7 { return 200 } else
     rir.destroy();
 }
 
+TEST(frontend, imported_json_generated_strings_survive_module_teardown) {
+    // Escaped literal decoding and JSON-pointer field paths are synthesized
+    // during analysis. They must live in the shared HIR store rather than the
+    // imported module's owned_strings, which is destroyed before lowering.
+    const std::string dir = "/tmp/rut_import_json_strings_frontend";
+    std::filesystem::remove_all(dir);
+    REQUIRE(std::filesystem::create_directories(dir));
+    {
+        std::ofstream out(dir + "/helper.rut", std::ios::binary);
+        out << "struct User { name: str }\n"
+               "func payload() -> i32 { let s = json(\"a\\n\") 7 }\n"
+               "func user_name(d: Json) -> i32 {\n"
+               "    guard let user = json.decode(User, d) else { respond 400, \"?\" }\n"
+               "    let ignored = user.name\n"
+               "    1\n"
+               "}\n";
+        out.flush();
+        REQUIRE(out.good());
+    }
+    const auto src = R"rut(
+import "helper.rut"
+route GET "/x" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE(hir->generated_names != nullptr);
+    bool found_decoded_newline = false;
+    bool found_pointer_path = false;
+    for (const auto* node = hir->generated_names->head; node != nullptr; node = node->next) {
+        const Str text{node->text, node->len};
+        if (text.eq(lit_str("a\n"))) found_decoded_newline = true;
+        if (text.eq(lit_str("/name"))) found_pointer_path = true;
+    }
+    CHECK(found_decoded_newline);
+    CHECK(found_pointer_path);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(frontend, copied_hir_keeps_byte_body_after_original_destroyed) {
     // Body bytes live in a refcounted HIR-owned store shared across copies, so
     // a copy remains valid after the original module is destroyed.
@@ -33138,6 +33185,42 @@ TEST(frontend, parse_object_literal_as_call_argument) {
     CHECK_EQ(object.field_inits[1].value->int_value, 0);
 }
 
+TEST(frontend, serialized_json_body_provenance_survives_local_alias) {
+    const char* src =
+        "route GET \"/x\" { "
+        "guard let encoded = json({ name: \"Ada\" }) else { return 500 } "
+        "let alias = encoded return response(200, body: alias) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].control.direct_term.response_body_local_index != 0xffffffffu);
+    CHECK_EQ(hir->routes[0].control.direct_term.response_headers.len, 1u);
+    CHECK(hir->routes[0].control.direct_term.response_headers[0].key.eq(lit_str("Content-Type")));
+    CHECK(hir->routes[0].control.direct_term.response_headers[0].value.eq(
+        lit_str("application/json")));
+}
+
+TEST(frontend, serialized_json_body_explicit_content_type_wins) {
+    const char* src =
+        "route GET \"/x\" { guard let encoded = json({ value: 1 }) else { return 500 } "
+        "let alias = encoded return response(200, body: alias, "
+        "headers: { \"Content-Type\": \"text/custom\" }) }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    const auto& term = hir->routes[0].control.direct_term;
+    CHECK(term.response_body_local_index != 0xffffffffu);
+    REQUIRE_EQ(term.response_headers.len, 1u);
+    CHECK(term.response_headers[0].key.eq(lit_str("Content-Type")));
+    CHECK(term.response_headers[0].value.eq(lit_str("text/custom")));
+}
+
 TEST(frontend, parse_empty_object_literal_as_method_call_argument) {
     const char* src = "route GET \"/x\" { let payload = encoder.encode({}) return 200 }\n";
     auto lexed = lex(lit(src));
@@ -39905,4 +39988,59 @@ TEST(frontend, upstream_http2_rejects_http1_health_probe) {
     auto ast = parse_file_heap(tokens.value());
     REQUIRE(ast);
     CHECK(!analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, string_literals_decode_expression_escapes) {
+    auto valid = lex(lit("route GET \"/x\" { let s = \"a\\n\\u{41}\" return 200 }"));
+    REQUIRE(valid);
+    auto valid_ast = parse_file_heap(valid.value());
+    REQUIRE(valid_ast);
+    auto hir = analyze_file_heap(valid_ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("a\nA")));
+
+    auto invalid = lex(lit("route GET \"/x\" { let s = \"a\\q\" return 200 }"));
+    REQUIRE(invalid);
+    auto invalid_ast = parse_file_heap(invalid.value());
+    REQUIRE(invalid_ast);
+    CHECK(!analyze_file_heap(invalid_ast.value()));
+}
+
+TEST(frontend, user_declared_i64_type_is_rejected) {
+    auto tokens = lex(lit("struct User { value: i64 } route GET \"/x\" { return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(!analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, json_struct_decode_rejects_invalid_types_and_wrapped_inputs) {
+    const char* cases[] = {
+        "struct User { name: str }\nroute POST \"/\" { let x = json.decode(User) return 200 }",
+        "struct User { name: str }\nroute POST \"/\" { let x = json.decode(User, \"{}\") return "
+        "200 }",
+        "struct User { name: str }\nroute POST \"/\" { let d = req.bodyJson() let x = "
+        "json.decode(User, d) return 200 }",
+        "route POST \"/\" { guard let d = req.bodyJson() else { return 400 } let x = "
+        "json.decode(Unknown, d) return 200 }",
+        "route POST \"/\" { let x = req.body() return 200 }",
+        "route POST \"/\" { let x = req.body(Unknown) return 200 }",
+        "struct User { name: str }\nroute POST \"/\" { let x = req.body(User, User) return 200 }",
+        "route POST \"/\" { let x = req.bodyJson(1) return 200 }",
+        "route POST \"/\" { guard let d = req.bodyJson() else { return 400 } let x = json.at(d, "
+        "\"0\") return 200 }",
+        "route POST \"/\" { guard let d = req.bodyJson() else { return 400 } let x = json.set(d, "
+        "\"/a\", 1) return 200 }",
+    };
+    for (const char* source : cases) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "Unexpected JSON type-check success: %s\n", source);
+        CHECK(!hir);
+        if (!hir) CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
 }

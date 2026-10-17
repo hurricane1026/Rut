@@ -7,7 +7,9 @@
 #include "rut/harness/scenario_driver.h"
 #include "rut/harness/scripted_environment.h"
 #include "rut/harness/source_target.h"
+#include "rut/jit/runtime_helpers.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/json.h"
 #endif
 
 #include <cerrno>
@@ -68,6 +70,32 @@ TEST(harness_core, stable_names_cover_public_enums) {
 
 #if RUT_ENABLE_JIT_TESTS
 namespace {
+
+static u64 json_allocating_handler(void* conn, jit::HandlerCtx*, const u8*, u32, void*) {
+    u8 has_value = 0;
+    const char* out = nullptr;
+    u32 out_len = 0;
+    i64 out_number = 0;
+    rut_helper_json(conn,
+                    nullptr,
+                    static_cast<u32>(json::Op::EmptyObject),
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    0,
+                    &has_value,
+                    &out,
+                    &out_len,
+                    &out_number);
+    return jit::HandlerResult::make_status(has_value == 1 && out != nullptr && out_len == 2 &&
+                                                   out[0] == '{' && out[1] == '}'
+                                               ? 200
+                                               : 500)
+        .pack();
+}
 
 u64 immediate_handler(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_status(204).pack();
@@ -658,6 +686,27 @@ TEST(harness_scenario, static_terminal_is_published_to_observation_oracle) {
     CHECK_EQ(result.harness.virtual_time_us, scenario.now_us);
     REQUIRE(result.has_terminal);
     CHECK_EQ(result.terminal.status_code, 204);
+    CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
+}
+
+TEST(harness_scenario, json_response_body_allocates_in_offline_connection) {
+    harness::SourceTarget target{};
+    REQUIRE(
+        target.program.config.add_jit_handler("/json", kRouteMethodGet, &json_allocating_handler));
+    target.prepared = true;
+    const char request[] = "GET /json HTTP/1.1\r\nHost: test\r\n\r\n";
+    harness::ScenarioSpec scenario{};
+    scenario.target = &target;
+    scenario.path = {"/json", 5};
+    scenario.method = kRouteMethodGet;
+    scenario.request_data = reinterpret_cast<const u8*>(request);
+    scenario.request_len = sizeof(request) - 1;
+    scenario.expected = {true, jit::HandlerAction::ReturnStatus, 200};
+    const auto result = harness::drive_scenario(scenario, scripted_scenario_harness());
+    CHECK_EQ(result.harness.outcome, harness::Outcome::Passed);
+    REQUIRE(result.has_terminal);
+    CHECK_EQ(result.terminal.status_code, 200u);
+    CHECK_EQ(result.connection_invariant_violations, 0u);
     CHECK_EQ(target.destroy(), harness::CleanupOutcome::Clean);
 }
 

@@ -16,9 +16,12 @@ enum class ConnectionInvariant : u8 {
 
 struct ConnectionExecution {
     Connection connection{};
+    SlicePool json_pool{};
+    bool json_pool_ready = false;
     u8 send_storage[SlicePool::kSliceSize]{};
 
     ConnectionExecution();
+    ~ConnectionExecution();
     ConnectionExecution(const ConnectionExecution&) = delete;
     ConnectionExecution& operator=(const ConnectionExecution&) = delete;
     ConnectionExecution(ConnectionExecution&&) = delete;

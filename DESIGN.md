@@ -623,8 +623,11 @@ For a configured local/static response, `response(status, body: "...")` is the
 shipped literal-body form. The body is limited to 1 MiB and is published as a
 non-owning view into the loaded program's RIR response-body storage; the
 `LoadedProgram` keeps that RIR/module storage pinned through request dispatch,
-teardown, and reload retirement. This form does not imply a general mutable
-runtime response-body buffer: dynamic `resp.body` mutation remains a separate,
+teardown, and reload retirement. A runtime `str` body such as `req.body` is
+limited to one 16 KiB `SlicePool` slice. HTTP/1 headers share the bounded output
+buffer, so its effective body limit can be lower. HTTP/2 copies dynamic bodies
+into stream-owned storage so they survive flow-control stalls. JSON construction
+keeps its separate 8 KiB limit; dynamic `resp.body` mutation remains a separate,
 resumable runtime feature.
 
 Statuses that cannot carry a representation body — `1xx`, `204`, `205`, and
@@ -3422,6 +3425,9 @@ parseInt("42")                    // typed parse
 req.body(Type)                    // typed body parse, error-capable
 json(value)                       // serialize to JSON string
 resp.body                         // response body string
+// JSON serialization is limited to 8 KiB (with bounded request-local node storage).
+// Struct decoding supports str, bool, i32, nested structs, and Json fields;
+// i64 fields remain a documented follow-up until the language's i64 surface is complete.
 
 // --- Regex (Vectorscan) ---
 re"pattern"                       // compile-time validated regex literal

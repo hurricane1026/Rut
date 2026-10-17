@@ -20,6 +20,8 @@ void close_owned_descriptors(Connection& connection) {
 }  // namespace
 
 ConnectionExecution::ConnectionExecution() {
+    json_pool_ready = json_pool.init(64).has_value();
+    connection.json_arena.backend.pool = &json_pool;
     // The aggregate member is zero-initialized, including its descriptors.
     // Establish the descriptor sentinel before using the ownership-aware reset.
     connection.fd = -1;
@@ -28,9 +30,15 @@ ConnectionExecution::ConnectionExecution() {
     reset();
 }
 
+ConnectionExecution::~ConnectionExecution() {
+    destroy();
+    json_pool.destroy();
+}
+
 void ConnectionExecution::reset(u32 peer_addr, u16 peer_port, u32 shard_id) {
     close_owned_descriptors(connection);
     connection.reset();
+    connection.json_arena.backend.pool = &json_pool;
     connection.send_buf.bind(send_storage, sizeof(send_storage));
     connection.peer_addr = peer_addr;
     connection.peer_port = peer_port;

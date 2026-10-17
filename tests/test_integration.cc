@@ -13,6 +13,7 @@
 #if RUT_ENABLE_JIT_TESTS
 #include "rut/jit/codegen.h"
 #include "rut/jit/jit_engine.h"
+#include "rut/jit/runtime_helpers.h"
 #include "rut/serve_loader.h"
 #endif
 #include "rut/runtime/cache_table.h"
@@ -26,6 +27,7 @@
 #include "rut/runtime/io_uring_backend.h"
 #include "rut/runtime/io_uring_memlock.h"
 #include "rut/runtime/iouring_event_loop.h"
+#include "rut/runtime/json.h"
 #include "rut/runtime/shard.h"
 #include "rut/runtime/tls.h"
 #include "rut/runtime/tls_engine.h"
@@ -1507,6 +1509,35 @@ static rut::u64 timer_probe_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut
     return 0;
 }
 
+#if RUT_ENABLE_JIT_TESTS
+static rut::u32 g_timer_json_calls = 0;
+static rut::u32 g_timer_json_successes = 0;
+static rut::u64 timer_json_fn(void*, rut::jit::HandlerCtx*, const rut::u8*, rut::u32, void* arena) {
+    g_timer_json_calls++;
+    rut::u8 has_value = 0;
+    const char* out = nullptr;
+    rut::u32 out_len = 0;
+    rut::i64 out_number = 0;
+    rut_helper_json(nullptr,
+                    arena,
+                    static_cast<rut::u32>(rut::json::Op::EmptyObject),
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    nullptr,
+                    0,
+                    0,
+                    &has_value,
+                    &out,
+                    &out_len,
+                    &out_number);
+    if (!has_value || out == nullptr || out_len != 2 || out[0] != '{' || out[1] != '}') return 1;
+    g_timer_json_successes++;
+    return 0;
+}
+#endif
+
 // The event loop fires a registered timer once its interval elapses, invoking the
 // compiled handler with no Connection/Request and bumping the per-timer count.
 // A shard selector within the compile-time range can still exceed the
@@ -1530,6 +1561,8 @@ TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
 
     auto loop0 = std::make_unique<EpollEventLoop>();
     auto loop1 = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop0->pool.init(8));
+    REQUIRE(loop1->pool.init(8));
     loop0->shard_id = 0;
     loop1->shard_id = 1;
     const RouteConfig* active = &cfg;
@@ -1543,6 +1576,8 @@ TEST(timer, shard_pinned_timer_fires_on_matching_shard_only) {
     loop1->fire_due_timers();
     CHECK_EQ(loop0->timer_fire_count[0], 0u);  // wrong shard: never fires
     CHECK_GE(loop1->timer_fire_count[0], 1u);  // pinned shard fires
+    loop0->pool.destroy();
+    loop1->pool.destroy();
 }
 
 TEST(timer, event_loop_fires_due_timer) {
@@ -1550,6 +1585,7 @@ TEST(timer, event_loop_fires_due_timer) {
     RouteConfig cfg{};
     REQUIRE(cfg.add_timer("t", 1, /*interval_ms=*/1, &timer_probe_fn));
     auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->pool.init(8));
     const RouteConfig* active = &cfg;
     loop->config_ptr = &active;
     g_timer_probe_calls = 0;
@@ -1560,7 +1596,58 @@ TEST(timer, event_loop_fires_due_timer) {
     loop->fire_due_timers();  // now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
+    loop->pool.destroy();
 }
+
+#if RUT_ENABLE_JIT_TESTS
+TEST(timer, event_loop_timer_json_allocates_scratch_and_counts_invocation) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("json", 1, 1, &timer_json_fn));
+    auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->pool.init(8));
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    g_timer_json_calls = 0;
+    g_timer_json_successes = 0;
+    loop->fire_due_timers();
+    usleep(5000);
+    loop->fire_due_timers();
+    CHECK_EQ(g_timer_json_calls, 1u);
+    CHECK_EQ(g_timer_json_successes, 1u);
+    CHECK_EQ(loop->timer_fire_count[0], 1u);
+    loop->pool.destroy();
+}
+
+TEST(timer, event_loop_timer_pool_failure_skips_and_reschedules) {
+    using namespace rut;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_timer("json", 1, 1, &timer_json_fn));
+    auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->pool.init(8));
+    const RouteConfig* active = &cfg;
+    loop->config_ptr = &active;
+    g_timer_json_calls = 0;
+    g_timer_json_successes = 0;
+    loop->fire_due_timers();
+    usleep(5000);
+    u8* held[16]{};
+    u32 held_count = 0;
+    while (held_count < 16 && (held[held_count] = loop->pool.alloc()) != nullptr) held_count++;
+    REQUIRE_GT(held_count, 0u);
+    loop->fire_due_timers();
+    CHECK_EQ(g_timer_json_calls, 0u);
+    CHECK_EQ(g_timer_json_successes, 0u);
+    CHECK_EQ(loop->timer_fire_count[0], 0u);
+    for (u32 i = 0; i < held_count; ++i) loop->pool.free(held[i]);
+    usleep(5000);
+    loop->fire_due_timers();
+    CHECK_EQ(g_timer_json_calls, 1u);
+    CHECK_EQ(g_timer_json_successes, 1u);
+    CHECK_EQ(loop->timer_fire_count[0], 1u);
+    loop->pool.destroy();
+}
+#endif
 
 // The same scheduler must drive timers on the io_uring backend: main.cc prefers
 // io_uring when available, so a timer wired only into epoll would never fire on
@@ -1572,6 +1659,7 @@ TEST(timer, io_uring_loop_fires_due_timer) {
     RouteConfig cfg{};
     REQUIRE(cfg.add_timer("t", 1, /*interval_ms=*/1, &timer_probe_fn));
     auto loop = std::make_unique<IoUringEventLoop>();
+    REQUIRE(loop->pool.init(8));
     const RouteConfig* active = &cfg;
     loop->config_ptr = &active;
     g_timer_probe_calls = 0;
@@ -1582,6 +1670,7 @@ TEST(timer, io_uring_loop_fires_due_timer) {
     loop->fire_due_timers();  // now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
     CHECK_GE(g_timer_probe_calls, 1u);
+    loop->pool.destroy();
 }
 
 // A hot reload swapping *config_ptr must re-arm timer deadlines for the new
@@ -1595,6 +1684,7 @@ TEST(timer, rearms_on_config_swap) {
     REQUIRE(cfg_b.add_timer("b", 1, /*interval_ms=*/1, &timer_probe_fn));
 
     auto loop = std::make_unique<EpollEventLoop>();
+    REQUIRE(loop->pool.init(8));
     const RouteConfig* active = &cfg_a;
     loop->config_ptr = &active;
     loop->fire_due_timers();  // arm for config A
@@ -1608,6 +1698,7 @@ TEST(timer, rearms_on_config_swap) {
     usleep(5000);
     loop->fire_due_timers();  // B's timer now due → fire
     CHECK_GE(loop->timer_fire_count[0], 1u);
+    loop->pool.destroy();
 }
 
 // The `by:` clause compiles to a composite metering-key spec on the RIR function.

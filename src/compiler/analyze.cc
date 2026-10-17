@@ -4,7 +4,7 @@
 #include "rut/common/shard_limits.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
-#include "rut/runtime/mapped_array.h"
+#include "rut/runtime/json.h"
 #include "rut/runtime/route_method.h"
 #include "rut/runtime/ws_terminate.h"  // ws_valid_close_code (shared close-code predicate)
 #if RUT_VALIDATE_REGEX_WITH_VECTORSCAN
@@ -56,6 +56,20 @@ struct ScopedAnalyzeOwnedBuffers {
 static FrontendResult<Str> intern_owned_response_body(Str body) {
     if (g_analyze_owned_buffers == nullptr || body.ptr == nullptr) return body;
     const GeneratedNameSegment segment{body.ptr, body.len};
+    return store_generated_name(*g_analyze_owned_buffers, &segment, 1);
+}
+
+// Store analyzer-generated string bytes in the shared, refcounted HIR store.
+// A plain HirModule::owned_strings entry is destroyed with an imported module
+// before the copied HIR is lowered, leaving any Str view dangling.
+static FrontendResult<Str> intern_analysis_string(const HirModule& mod, std::string value) {
+    if (g_analyze_owned_buffers == nullptr) {
+        auto& storage = const_cast<HirModule&>(mod).owned_strings;
+        storage.push_back(std::move(value));
+        const auto& owned = storage.back();
+        return Str{owned.data(), static_cast<u32>(owned.size())};
+    }
+    const GeneratedNameSegment segment{value.data(), static_cast<u32>(value.size())};
     return store_generated_name(*g_analyze_owned_buffers, &segment, 1);
 }
 
@@ -210,6 +224,7 @@ static bool type_shape_is_simple_importable(const HirTypeKind type,
         case HirTypeKind::Bool:
         case HirTypeKind::I32:
         case HirTypeKind::Str:
+        case HirTypeKind::Json:
         case HirTypeKind::Generic:
         case HirTypeKind::Unknown:
             return true;
@@ -301,10 +316,10 @@ static FrontendResult<u32> intern_hir_type_shape(HirModule* mod,
     shape.tuple_len = tuple_len;
     shape.array_elem_shape_index =
         type == HirTypeKind::Array ? array_elem_shape_index : 0xffffffffu;
-    shape.is_concrete = type == HirTypeKind::Bool || type == HirTypeKind::I32 ||
-                        type == HirTypeKind::I64 || type == HirTypeKind::Str ||
-                        type == HirTypeKind::Method || type == HirTypeKind::ByteSize ||
-                        type == HirTypeKind::IP || type == HirTypeKind::Response;
+    shape.is_concrete =
+        type == HirTypeKind::Bool || type == HirTypeKind::I32 || type == HirTypeKind::I64 ||
+        type == HirTypeKind::Str || type == HirTypeKind::Json || type == HirTypeKind::Method ||
+        type == HirTypeKind::ByteSize || type == HirTypeKind::IP || type == HirTypeKind::Response;
     if (type == HirTypeKind::Variant) shape.is_concrete = variant_index != 0xffffffffu;
     if (type == HirTypeKind::Struct) shape.is_concrete = struct_index != 0xffffffffu;
     if (type == HirTypeKind::Array) {
@@ -1897,6 +1912,7 @@ static HirTypeKind resolve_named_type(const HirModule& mod,
     if (name.eq({"bool", 4})) return HirTypeKind::Bool;
     if (name.eq({"i32", 3})) return HirTypeKind::I32;
     if (name.eq({"str", 3})) return HirTypeKind::Str;
+    if (name.eq({"Json", 4})) return HirTypeKind::Json;
     if (name.eq({"Response", 8})) return HirTypeKind::Response;
     const u32 idx = find_variant_index(mod, name);
     if (idx < mod.variants.len) {
@@ -3809,6 +3825,435 @@ static FrontendResult<HirExpr> analyze_arith_expr(const AstExpr& expr,
     return out;
 }
 
+// JSON is a distinct frontend type. Its internal carrier is a validated text
+// view; callers cannot manufacture a Json from an arbitrary str cast.
+static FrontendResult<HirExpr> make_json_op(json::Op op,
+                                            HirTypeKind type,
+                                            bool optional,
+                                            const HirExpr* a,
+                                            const HirExpr* b,
+                                            const HirExpr* c,
+                                            Span span,
+                                            HirRoute* route) {
+    HirExpr out{};
+    out.kind = HirExprKind::JsonOp;
+    out.type = type;
+    out.may_nil = optional;
+    out.int_value = static_cast<i64>(op);
+    out.span = span;
+    const HirExpr* values[] = {a, b, c};
+    for (const HirExpr* value : values) {
+        if (value == nullptr) continue;
+        if (!route->exprs.push(*value)) return frontend_error(FrontendError::TooManyItems, span);
+        if (!out.args.push(&route->exprs[route->exprs.len - 1]))
+            return frontend_error(FrontendError::TooManyItems, span);
+    }
+    return out;
+}
+
+static u32 next_local_ref_index(const HirRoute* route, const HirLocal* locals, u32 local_count);
+
+// Convert an already analyzed value to JSON. Keeping the analyzed HIR value
+// here is significant for struct producers: rebuilding an AST field expression
+// would analyze (and therefore execute) the producer once per field.
+static FrontendResult<HirExpr> analyze_json_hir_value(const HirExpr& value,
+                                                      HirRoute* route,
+                                                      const HirModule& mod,
+                                                      u32 depth) {
+    if (depth > json::kMaxDepth) return frontend_error(FrontendError::TooManyItems, value.span);
+    if (value.type == HirTypeKind::Json) return value;
+    if (value.type == HirTypeKind::Struct) {
+        if (value.struct_index >= mod.structs.len)
+            return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+        HirExpr base = value;
+        if (base.kind != HirExprKind::LocalRef) {
+            if (route->locals.len >= HirRoute::kMaxLocals)
+                return frontend_error(FrontendError::TooManyItems, value.span);
+            HirLocal local{};
+            local.span = value.span;
+            local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+            local.type = value.type;
+            local.may_nil = value.may_nil;
+            local.may_error = value.may_error;
+            local.variant_index = value.variant_index;
+            local.struct_index = value.struct_index;
+            local.shape_index = value.shape_index;
+            local.is_runtime_synthetic = true;
+            local.tuple_len = value.tuple_len;
+            for (u32 ti = 0; ti < value.tuple_len; ++ti) {
+                local.tuple_types[ti] = value.tuple_types[ti];
+                local.tuple_variant_indices[ti] = value.tuple_variant_indices[ti];
+                local.tuple_struct_indices[ti] = value.tuple_struct_indices[ti];
+            }
+            local.init = value;
+            if (!route->locals.push(local))
+                return frontend_error(FrontendError::TooManyItems, value.span);
+            base = {};
+            base.kind = HirExprKind::LocalRef;
+            base.type = value.type;
+            base.span = value.span;
+            base.local_index = local.ref_index;
+            base.struct_index = value.struct_index;
+        }
+        auto result = make_json_op(json::Op::EmptyObject,
+                                   HirTypeKind::Json,
+                                   false,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   value.span,
+                                   route);
+        if (!result) return result;
+        const auto& decl = mod.structs[value.struct_index];
+        for (u32 i = 0; i < decl.fields.len; ++i) {
+            const auto& field = decl.fields[i];
+            HirExpr projected{};
+            projected.kind = HirExprKind::Field;
+            projected.type = field.type;
+            projected.span = value.span;
+            projected.str_value = field.name;
+            projected.generic_index = field.generic_index;
+            projected.generic_has_error_constraint = field.generic_has_error_constraint;
+            projected.generic_has_eq_constraint = field.generic_has_eq_constraint;
+            projected.generic_has_ord_constraint = field.generic_has_ord_constraint;
+            projected.generic_protocol_index = field.generic_protocol_index;
+            projected.generic_protocol_count = field.generic_protocol_count;
+            for (u32 pi = 0; pi < field.generic_protocol_count; ++pi)
+                projected.generic_protocol_indices[pi] = field.generic_protocol_indices[pi];
+            projected.variant_index = field.variant_index;
+            projected.struct_index = field.struct_index;
+            projected.shape_index = field.shape_index;
+            projected.tuple_len = field.tuple_len;
+            for (u32 ti = 0; ti < field.tuple_len; ++ti) {
+                projected.tuple_types[ti] = field.tuple_types[ti];
+                projected.tuple_variant_indices[ti] = field.tuple_variant_indices[ti];
+                projected.tuple_struct_indices[ti] = field.tuple_struct_indices[ti];
+            }
+            if (!route->exprs.push(base))
+                return frontend_error(FrontendError::TooManyItems, value.span);
+            projected.lhs = &route->exprs[route->exprs.len - 1];
+            auto child = analyze_json_hir_value(projected, route, mod, depth + 1);
+            if (!child) return child;
+            HirExpr key{};
+            key.kind = HirExprKind::StrLit;
+            key.type = HirTypeKind::Str;
+            key.str_value = field.name;
+            result = make_json_op(json::Op::Member,
+                                  HirTypeKind::Json,
+                                  false,
+                                  &result.value(),
+                                  &key,
+                                  &child.value(),
+                                  value.span,
+                                  route);
+            if (!result) return result;
+        }
+        return result;
+    }
+    if (value.may_nil || value.may_error)
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    json::Op op;
+    if (value.type == HirTypeKind::Str)
+        op = json::Op::Quote;
+    else if (value.type == HirTypeKind::I32 || value.type == HirTypeKind::I64)
+        op = json::Op::Integer;
+    else if (value.type == HirTypeKind::Bool)
+        op = json::Op::Boolean;
+    else
+        return frontend_error(FrontendError::UnsupportedSyntax, value.span);
+    return make_json_op(op, HirTypeKind::Json, false, &value, nullptr, nullptr, value.span, route);
+}
+
+static FrontendResult<HirExpr> analyze_json_value(const AstExpr& ast,
+                                                  HirRoute* route,
+                                                  const HirModule& mod,
+                                                  const HirLocal* locals,
+                                                  u32 local_count,
+                                                  const MatchPayloadBinding* binding,
+                                                  u32 depth = 0) {
+    if (depth > json::kMaxDepth) return frontend_error(FrontendError::TooManyItems, ast.span);
+    if (ast.kind == AstExprKind::ObjectLit || ast.kind == AstExprKind::ArrayLit) {
+        const bool object = ast.kind == AstExprKind::ObjectLit;
+        auto result = make_json_op(object ? json::Op::EmptyObject : json::Op::EmptyArray,
+                                   HirTypeKind::Json,
+                                   false,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   ast.span,
+                                   route);
+        if (!result) return result;
+        const u32 count = object ? ast.field_inits.len : ast.args.len;
+        for (u32 i = 0; i < count; ++i) {
+            const AstExpr* child = object ? ast.field_inits[i].value : ast.args[i];
+            auto value =
+                analyze_json_value(*child, route, mod, locals, local_count, binding, depth + 1);
+            if (!value) return value;
+            HirExpr key{};
+            key.kind = HirExprKind::StrLit;
+            key.type = HirTypeKind::Str;
+            if (object) {
+                key.str_value = ast.field_inits[i].name;
+                for (u32 j = 0; j < i; ++j) {
+                    if (key.str_value.eq(ast.field_inits[j].name))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              child->span,
+                                              lit_str("duplicate JSON member name"));
+                }
+            }
+            result = make_json_op(object ? json::Op::Member : json::Op::Element,
+                                  HirTypeKind::Json,
+                                  false,
+                                  &result.value(),
+                                  object ? &key : &value.value(),
+                                  object ? &value.value() : nullptr,
+                                  ast.span,
+                                  route);
+            if (!result) return result;
+        }
+        return result;
+    }
+    if (ast.kind == AstExprKind::Nil)
+        return make_json_op(
+            json::Op::Null, HirTypeKind::Json, false, nullptr, nullptr, nullptr, ast.span, route);
+    auto value = analyze_expr(ast, route, mod, locals, local_count, binding);
+    if (!value) return value;
+    if (value->may_nil || value->may_error)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax,
+            ast.span,
+            lit_str(
+                "unwrap optional/error values before constructing JSON; nil encodes JSON null"));
+    if (value->type == HirTypeKind::Json) return value;
+    if (value->type == HirTypeKind::Struct)
+        return analyze_json_hir_value(value.value(), route, mod, depth);
+    json::Op op;
+    if (value->type == HirTypeKind::Str)
+        op = json::Op::Quote;
+    else if (value->type == HirTypeKind::I32 || value->type == HirTypeKind::I64)
+        op = json::Op::Integer;
+    else if (value->type == HirTypeKind::Bool)
+        op = json::Op::Boolean;
+    else
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              ast.span,
+                              lit_str("JSON construction requires Json, str, integer, bool, nil, "
+                                      "object, array or struct"));
+    return make_json_op(
+        op, HirTypeKind::Json, false, &value.value(), nullptr, nullptr, ast.span, route);
+}
+
+static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
+                                                   u32 index,
+                                                   HirRoute* route,
+                                                   const HirModule& mod,
+                                                   Span span,
+                                                   u32 depth = 0) {
+    if (depth > json::kMaxDepth || index >= mod.structs.len)
+        return frontend_error(
+            FrontendError::UnsupportedSyntax, span, lit_str("recursive JSON decoding shape"));
+    HirExpr stable_source = source;
+    if (stable_source.kind != HirExprKind::LocalRef) {
+        // Decoding references the source for the object check and each field.
+        // Materialize it once so effectful JSON expressions are not repeated.
+        if (route->locals.len >= HirRoute::kMaxLocals)
+            return frontend_error(FrontendError::TooManyItems, span);
+        HirLocal local{};
+        local.span = span;
+        local.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
+        local.type = source.type;
+        local.is_runtime_synthetic = true;
+        local.init = source;
+        if (!route->locals.push(local)) return frontend_error(FrontendError::TooManyItems, span);
+        stable_source = {};
+        stable_source.kind = HirExprKind::LocalRef;
+        stable_source.type = source.type;
+        stable_source.span = span;
+        stable_source.local_index = local.ref_index;
+    }
+    const auto& decl = mod.structs[index];
+    HirExpr result{};
+    result.kind = HirExprKind::JsonDecode;
+    result.type = HirTypeKind::Struct;
+    result.struct_index = index;
+    result.may_nil = true;
+    result.span = span;
+    auto object = make_json_op(json::Op::RequireObject,
+                               HirTypeKind::Json,
+                               true,
+                               &stable_source,
+                               nullptr,
+                               nullptr,
+                               span,
+                               route);
+    if (!object) return object;
+    if (!route->exprs.push(object.value()))
+        return frontend_error(FrontendError::TooManyItems, span);
+    result.lhs = &route->exprs[route->exprs.len - 1];
+    for (u32 i = 0; i < decl.fields.len; ++i) {
+        const auto& field = decl.fields[i];
+        // JSON Pointer field names are compiler-owned and escaped, not pasted
+        // into generated Rut source.
+        std::string path = "/";
+        for (u32 j = 0; j < field.name.len; ++j) {
+            const char c = field.name.ptr[j];
+            if (c == '~')
+                path += "~0";
+            else if (c == '/')
+                path += "~1";
+            else
+                path += c;
+        }
+        auto key_str = intern_analysis_string(mod, std::move(path));
+        if (!key_str) return core::make_unexpected(key_str.error());
+        HirExpr key{};
+        key.kind = HirExprKind::StrLit;
+        key.type = HirTypeKind::Str;
+        key.str_value = key_str.value();
+        auto selected = make_json_op(
+            json::Op::Get, HirTypeKind::Json, false, &stable_source, &key, nullptr, span, route);
+        if (!selected) return selected;
+        FrontendResult<HirExpr> decoded = selected;
+        if (field.type == HirTypeKind::Struct) {
+            decoded = analyze_json_decode(
+                selected.value(), field.struct_index, route, mod, span, depth + 1);
+        } else {
+            json::Op op;
+            if (field.type == HirTypeKind::Str)
+                op = json::Op::AsString;
+            else if (field.type == HirTypeKind::Bool)
+                op = json::Op::AsBool;
+            else if (field.type == HirTypeKind::I32)
+                op = json::Op::AsI32;
+            else if (field.type == HirTypeKind::I64)
+                op = json::Op::AsInt;
+            else if (field.type == HirTypeKind::Json)
+                op = json::Op::Parse;
+            else
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    span,
+                    lit_str(
+                        "JSON decode fields require str, bool, integer, Json or nested structs"));
+            decoded = make_json_op(
+                op, field.type, true, &selected.value(), nullptr, nullptr, span, route);
+        }
+        if (!decoded) return decoded;
+        if (!route->exprs.push(decoded.value()))
+            return frontend_error(FrontendError::TooManyItems, span);
+        if (!result.field_inits.push({field.name, &route->exprs[route->exprs.len - 1]}))
+            return frontend_error(FrontendError::TooManyItems, span);
+    }
+    return result;
+}
+
+static FrontendResult<HirExpr> analyze_json_call(const AstExpr& expr,
+                                                 Str name,
+                                                 HirRoute* route,
+                                                 const HirModule& mod,
+                                                 const HirLocal* locals,
+                                                 u32 local_count,
+                                                 const MatchPayloadBinding* binding) {
+    if (name.eq(lit_str("decode"))) {
+        if (expr.args.len != 2 || expr.args[0]->kind != AstExprKind::Ident)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("json.decode(Type, value) expects a struct type and Json"));
+        const u32 index = find_struct_index(mod, expr.args[0]->name);
+        if (index >= mod.structs.len || mod.structs[index].type_params.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("JSON decoding requires a concrete struct type"));
+        auto value = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!value) return value;
+        if (value->type != HirTypeKind::Json || value->may_nil || value->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("unwrap Json before decoding"));
+        return analyze_json_decode(value.value(), index, route, mod, expr.span);
+    }
+    if (name.eq(lit_str("encode")) || name.eq(lit_str("value"))) {
+        if (expr.args.len != 1)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("JSON construction expects one argument"));
+        auto value = analyze_json_value(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!value) return value;
+        const bool encode = name.eq(lit_str("encode"));
+        auto encoded = make_json_op(encode ? json::Op::Stringify : json::Op::Parse,
+                                    encode ? HirTypeKind::Str : HirTypeKind::Json,
+                                    true,
+                                    &value.value(),
+                                    nullptr,
+                                    nullptr,
+                                    expr.span,
+                                    route);
+        if (encoded && encode) encoded->is_json_encoded = true;
+        return encoded;
+    }
+    struct Entry {
+        Str name;
+        json::Op op;
+        u32 arity;
+        HirTypeKind result;
+    };
+    static constexpr Entry entries[] = {
+        {lit_str("parse"), json::Op::Parse, 1, HirTypeKind::Json},
+        {lit_str("number"), json::Op::Number, 1, HirTypeKind::Json},
+        {lit_str("stringify"), json::Op::Stringify, 1, HirTypeKind::Str},
+        {lit_str("get"), json::Op::Get, 2, HirTypeKind::Json},
+        {lit_str("set"), json::Op::Set, 3, HirTypeKind::Json},
+        {lit_str("remove"), json::Op::Remove, 2, HirTypeKind::Json},
+        {lit_str("append"), json::Op::Append, 3, HirTypeKind::Json},
+        {lit_str("member"), json::Op::Member, 3, HirTypeKind::Json},
+        {lit_str("at"), json::Op::At, 2, HirTypeKind::Json},
+        {lit_str("string"), json::Op::AsString, 1, HirTypeKind::Str},
+        {lit_str("numberText"), json::Op::AsNumber, 1, HirTypeKind::Str},
+        {lit_str("bool"), json::Op::AsBool, 1, HirTypeKind::Bool},
+        {lit_str("int"), json::Op::AsInt, 1, HirTypeKind::I64},
+        {lit_str("count"), json::Op::Count, 1, HirTypeKind::I32},
+        {lit_str("kind"), json::Op::KindName, 1, HirTypeKind::Str},
+        {lit_str("keys"), json::Op::Keys, 1, HirTypeKind::Json},
+    };
+    for (const Entry& entry : entries) {
+        if (!name.eq(entry.name)) continue;
+        if (expr.args.len != entry.arity)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, lit_str("wrong JSON argument count"));
+        HirExpr values[3]{};
+        for (u32 i = 0; i < entry.arity; ++i) {
+            auto value = analyze_expr(*expr.args[i], route, mod, locals, local_count, binding);
+            if (!value) return value;
+            HirTypeKind expected = HirTypeKind::Json;
+            if (i == 0 && (entry.op == json::Op::Parse || entry.op == json::Op::Number))
+                expected = HirTypeKind::Str;
+            if (i == 1) expected = entry.op == json::Op::At ? value->type : HirTypeKind::Str;
+            const bool valid_index = entry.op != json::Op::At || i != 1 ||
+                                     value->type == HirTypeKind::I32 ||
+                                     value->type == HirTypeKind::I64;
+            if (value->may_nil || value->may_error || value->type != expected || !valid_index)
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax,
+                    expr.args[i]->span,
+                    lit_str("JSON argument type mismatch; unwrap optional values first"));
+            values[i] = value.value();
+        }
+        auto result = make_json_op(entry.op,
+                                   entry.result,
+                                   true,
+                                   &values[0],
+                                   entry.arity > 1 ? &values[1] : nullptr,
+                                   entry.arity > 2 ? &values[2] : nullptr,
+                                   expr.span,
+                                   route);
+        if (result && entry.op == json::Op::Stringify) result->is_json_encoded = true;
+        return result;
+    }
+    return frontend_error(
+        FrontendError::UnsupportedSyntax, expr.span, lit_str("unknown json operation"));
+}
+
 static FrontendResult<HirExpr> analyze_method_call_expr(
     const AstExpr& expr,
     HirRoute* route,
@@ -3818,6 +4263,43 @@ static FrontendResult<HirExpr> analyze_method_call_expr(
     const MatchPayloadBinding* binding,
     const HirExpr* receiver_override = nullptr) {
     if (expr.lhs == nullptr) return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq(lit_str("req")) && expr.name.eq(lit_str("body")) &&
+        !user_bound_req_name(mod, locals, local_count, binding)) {
+        if (expr.args.len != 1 || expr.args[0]->kind != AstExprKind::Ident)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("req.body(Type) expects a concrete struct type"));
+        const u32 index = find_struct_index(mod, expr.args[0]->name);
+        if (index >= mod.structs.len || mod.structs[index].type_params.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("req.body(Type) expects a concrete struct type"));
+        HirExpr body{};
+        body.kind = HirExprKind::ReqBody;
+        body.type = HirTypeKind::Str;
+        body.span = expr.span;
+        return analyze_json_decode(body, index, route, mod, expr.span);
+    }
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq(lit_str("req")) && expr.name.eq(lit_str("bodyJson")) &&
+        !user_bound_req_name(mod, locals, local_count, binding)) {
+        if (expr.args.len != 0)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("req.bodyJson() expects no arguments"));
+        HirExpr body{};
+        body.kind = HirExprKind::ReqBody;
+        body.type = HirTypeKind::Str;
+        body.span = expr.span;
+        return make_json_op(
+            json::Op::Parse, HirTypeKind::Json, true, &body, nullptr, nullptr, expr.span, route);
+    }
+    if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
+        expr.lhs->name.eq(lit_str("json")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("json")))
+        return analyze_json_call(expr, expr.name, route, mod, locals, local_count, binding);
+
     if (receiver_override == nullptr && expr.lhs->kind == AstExprKind::Ident &&
         has_import_namespace(mod, expr.lhs->name)) {
         Str qualified_member{};
@@ -4582,6 +5064,7 @@ static FrontendResult<HirExpr> make_guard_bound_init(HirRoute* route,
     HirExpr init{};
     init.kind = HirExprKind::ValueOf;
     init.type = bound.type;
+    init.is_json_encoded = bound.is_json_encoded;
     init.generic_index = bound.generic_index;
     init.generic_has_error_constraint = bound.generic_has_error_constraint;
     init.generic_has_eq_constraint = bound.generic_has_eq_constraint;
@@ -4649,6 +5132,7 @@ static FrontendResult<HirLocal> make_if_let_local(
     local.shape_index = bound.shape_index;
     auto init = make_guard_bound_init(route, bound, span);
     if (!init) return core::make_unexpected(init.error());
+    init->is_json_encoded = bound.is_json_encoded;
     local.init = init.value();
     return local;
 }
@@ -6684,6 +7168,90 @@ static FrontendResult<HirExpr> analyze_wait_result_expr(const AstExpr& expr, con
     return out;
 }
 
+static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& mod, Span span) {
+    bool escaped = false;
+    for (u32 i = 0; i < raw.len; ++i)
+        if (raw.ptr[i] == '\\') escaped = true;
+    if (!escaped) return raw;
+    std::string text;
+    for (u32 i = 0; i < raw.len; ++i) {
+        char c = raw.ptr[i];
+        if (c != '\\') {
+            text += c;
+            continue;
+        }
+        if (++i == raw.len)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, span, lit_str("incomplete string escape"));
+        c = raw.ptr[i];
+        switch (c) {
+            case '0':
+                text += '\0';
+                break;
+            case 't':
+                text += '\t';
+                break;
+            case 'n':
+                text += '\n';
+                break;
+            case 'r':
+                text += '\r';
+                break;
+            case '\\':
+                text += '\\';
+                break;
+            case '"':
+                text += '"';
+                break;
+            case '\'':
+                text += '\'';
+                break;
+            case 'u': {
+                ++i;
+                if (i == raw.len || raw.ptr[i] != '{')
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span,
+                                          lit_str("Swift Unicode escapes use \\u{hex}"));
+                u32 cp = 0, digits = 0;
+                for (;;) {
+                    ++i;
+                    if (i >= raw.len || raw.ptr[i] == '}') break;
+                    const char digit = raw.ptr[i];
+                    u32 value;
+                    if (digit >= '0' && digit <= '9')
+                        value = static_cast<u32>(digit - '0');
+                    else if (digit >= 'a' && digit <= 'f')
+                        value = static_cast<u32>(digit - 'a' + 10);
+                    else if (digit >= 'A' && digit <= 'F')
+                        value = static_cast<u32>(digit - 'A' + 10);
+                    else
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span,
+                                              lit_str("invalid Unicode scalar escape"));
+                    if (++digits > 8)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span,
+                                              lit_str("invalid Unicode scalar escape"));
+                    cp = (cp << 4) | value;
+                }
+                if (i == raw.len || digits == 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff))
+                    return frontend_error(FrontendError::UnsupportedSyntax,
+                                          span,
+                                          lit_str("invalid Unicode scalar escape"));
+                char bytes[4];
+                json::Writer out{bytes};
+                out.utf8(cp);
+                text.append(bytes, out.len);
+                break;
+            }
+            default:
+                return frontend_error(
+                    FrontendError::UnsupportedSyntax, span, lit_str("unsupported string escape"));
+        }
+    }
+    return intern_analysis_string(mod, std::move(text));
+}
+
 static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                                                  HirRoute* route,
                                                  const HirModule& mod,
@@ -6715,9 +7283,11 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
         return out;
     }
     if (expr.kind == AstExprKind::StrLit) {
+        auto decoded = decoded_expression_string(expr.str_value, mod, expr.span);
+        if (!decoded) return core::make_unexpected(decoded.error());
         out.kind = HirExprKind::StrLit;
         out.type = HirTypeKind::Str;
-        out.str_value = expr.str_value;
+        out.str_value = decoded.value();
         return out;
     }
     if (expr.kind == AstExprKind::ObjectLit) {
@@ -8417,6 +8987,7 @@ static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
                 out.generic_protocol_indices[cpi] = locals[i].generic_protocol_indices[cpi];
             out.may_nil = locals[i].may_nil;
             out.may_error = locals[i].may_error;
+            out.is_json_encoded = locals[i].init.is_json_encoded;
             out.local_index = locals[i].ref_index;
             out.variant_index = locals[i].variant_index;
             out.shape_index = locals[i].shape_index;
@@ -8516,6 +9087,13 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
+    if (expr.name.eq(lit_str("json")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("json"))) {
+        if (pipe_lhs != nullptr)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, lit_str("use json(value) directly"));
+        return analyze_json_call(expr, lit_str("encode"), route, mod, locals, local_count, binding);
+    }
     const auto copy_hir_shape = [](HirExpr* dst, const HirExpr& src) {
         dst->type = src.type;
         dst->generic_index = src.generic_index;
@@ -9751,6 +10329,10 @@ static FrontendResult<HirTerminator> analyze_response_local_term(const AstStatem
 
 static FrontendResult<HirTerminator> analyze_term(const AstStatement& stmt, const HirModule& mod) {
     HirTerminator term{};
+    if (stmt.response_body_local.len != 0)
+        return frontend_error(FrontendError::UnsupportedSyntax,
+                              stmt.span,
+                              lit_str("dynamic response bodies require a direct route terminator"));
     term.span = stmt.span;
     if (stmt.kind == AstStmtKind::ReturnStatus || stmt.kind == AstStmtKind::RespondStatus) {
         if (stmt.returns_response_local)
@@ -10600,14 +11182,14 @@ static FrontendResult<void> analyze_match_arm_body(const AstStatement& stmt,
                 auto bound = analyze_expr(
                     inner.expr, route, mod, scoped_locals.data, scoped_locals.len, binding);
                 if (!bound) return core::make_unexpected(bound.error());
-                auto cond = analyze_guard_cond(inner.expr,
-                                               route,
-                                               mod,
-                                               scoped_locals.data,
-                                               scoped_locals.len,
-                                               binding,
-                                               inner.bind_value,
-                                               inner.match_arms.len != 0);
+                auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                           inner.expr.span,
+                                                           route,
+                                                           scoped_locals.data,
+                                                           scoped_locals.len,
+                                                           inner.bind_value,
+                                                           inner.match_arms.len != 0,
+                                                           kGuardBoolDetail);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard.cond = cond.value();
                 if (inner.match_arms.len != 0) {
@@ -11862,8 +12444,43 @@ static FrontendResult<void> analyze_control_stmt(const AstStatement& stmt,
         route->control.direct_term = term.value();
         return {};
     }
-    auto term = analyze_term(stmt, mod);
+    AstStatement terminal = stmt;
+    terminal.response_body_local = {};
+    auto term = analyze_term(terminal, mod);
     if (!term) return core::make_unexpected(term.error());
+    if (stmt.response_body_local.len != 0) {
+        const HirLocal* body = nullptr;
+        for (u32 i = route->locals.len; i > 0; --i) {
+            if (route->locals[i - 1].name.eq(stmt.response_body_local)) {
+                body = &route->locals[i - 1];
+                break;
+            }
+        }
+        if (body == nullptr || body->may_nil || body->may_error ||
+            (body->type != HirTypeKind::Str && body->type != HirTypeKind::Json))
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("response body must name an unwrapped str or Json local"));
+        if (route->waits.len != 0 || route->for_loops.len != 0)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                stmt.span,
+                lit_str("dynamic response bodies cannot cross wait/for boundaries yet"));
+        term->response_body_local_index = body->ref_index;
+        if (body->type == HirTypeKind::Json || body->init.is_json_encoded) {
+            bool has_type = false;
+            for (u32 i = 0; i < term->response_headers.len; ++i)
+                if (http_header_name_eq_ci(term->response_headers[i].key.ptr,
+                                           term->response_headers[i].key.len,
+                                           "Content-Type",
+                                           12))
+                    has_type = true;
+            if (!has_type && !term->response_headers.push(
+                                 {lit_str("Content-Type"), lit_str("application/json")}))
+                return frontend_error(FrontendError::TooManyItems, stmt.span);
+        }
+    }
     route->control.direct_term = term.value();
     return {};
 }
@@ -13461,14 +14078,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
             auto bound = analyze_expr(
                 bstmt.expr, route, mod, route->locals.data, route->locals.len, nullptr);
             if (!bound) return core::make_unexpected(bound.error());
-            auto cond = analyze_guard_cond(bstmt.expr,
-                                           route,
-                                           mod,
-                                           route->locals.data,
-                                           route->locals.len,
-                                           nullptr,
-                                           bstmt.bind_value,
-                                           bstmt.match_arms.len != 0);
+            auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                       bstmt.expr.span,
+                                                       route,
+                                                       route->locals.data,
+                                                       route->locals.len,
+                                                       bstmt.bind_value,
+                                                       bstmt.match_arms.len != 0,
+                                                       kGuardBoolDetail);
             if (!cond) return core::make_unexpected(cond.error());
             guard.cond = cond.value();
             if (bstmt.match_arms.len != 0) {
@@ -14116,14 +14733,14 @@ static FrontendResult<u32> analyze_for_stmt(const AstStatement& stmt,
                                                       arm_scoped_locals.len,
                                                       arm_binding_ptr);
                             if (!bound) return core::make_unexpected(bound.error());
-                            auto cond = analyze_guard_cond(inner.expr,
-                                                           route,
-                                                           mod,
-                                                           arm_scoped_locals.data,
-                                                           arm_scoped_locals.len,
-                                                           arm_binding_ptr,
-                                                           inner.bind_value,
-                                                           inner.match_arms.len != 0);
+                            auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                                       inner.expr.span,
+                                                                       route,
+                                                                       arm_scoped_locals.data,
+                                                                       arm_scoped_locals.len,
+                                                                       inner.bind_value,
+                                                                       inner.match_arms.len != 0,
+                                                                       kGuardBoolDetail);
                             if (!cond) return core::make_unexpected(cond.error());
                             guard.cond = cond.value();
                             if (inner.match_arms.len != 0) {
@@ -19132,14 +19749,14 @@ static FrontendResult<HirModule*> analyze_file_internal(
                 auto bound = analyze_expr(
                     stmt.expr, &route, mod, route.locals.data, route.locals.len, nullptr);
                 if (!bound) return core::make_unexpected(bound.error());
-                auto cond = analyze_guard_cond(stmt.expr,
-                                               &route,
-                                               mod,
-                                               route.locals.data,
-                                               route.locals.len,
-                                               nullptr,
-                                               stmt.bind_value,
-                                               stmt.match_arms.len != 0);
+                auto cond = build_guard_cond_from_analyzed(bound.value(),
+                                                           stmt.expr.span,
+                                                           &route,
+                                                           route.locals.data,
+                                                           route.locals.len,
+                                                           stmt.bind_value,
+                                                           stmt.match_arms.len != 0,
+                                                           kGuardBoolDetail);
                 if (!cond) return core::make_unexpected(cond.error());
                 guard.cond = cond.value();
                 if (stmt.match_arms.len != 0) {

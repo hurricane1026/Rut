@@ -34,7 +34,12 @@ namespace rut {
 // semantics without making this standalone header depend on callbacks_impl.h.
 bool h2_apply_forward_request_overrides(Connection& conn);
 
-inline void h2_reset_request_mutations(Connection& conn) {
+inline void h2_reset_request_mutations(Connection& conn, bool release_json_body = true) {
+    if (release_json_body) {
+        conn.json_arena.destroy();
+        conn.jit_response_body = {};
+        conn.jit_response_body_valid = false;
+    }
     conn.clear_raw_request_target_witness();
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
@@ -48,6 +53,12 @@ inline void h2_reset_request_mutations(Connection& conn) {
     conn.resp_header_mutation_count = 0;
     conn.resp_header_mutation_overflow = false;
     if (conn.response_header_buf.valid()) conn.response_header_buf.reset();
+}
+
+inline void h2_release_completed_jit_json(Connection& conn) {
+    conn.json_arena.destroy();
+    conn.jit_response_body = {};
+    conn.jit_response_body_valid = false;
 }
 
 inline bool h2_prepare_forward_request(
@@ -179,6 +190,10 @@ inline void h2_close_stream(Http2Conn* h2, u32 stream_id) {
 }
 
 inline void h2_promote_queued(Http2Conn& h2) {
+    if (h2.jit_outbound_slice != nullptr && h2.jit_outbound_pool != nullptr)
+        h2.jit_outbound_pool->free(h2.jit_outbound_slice);
+    h2.jit_outbound_slice = nullptr;
+    h2.jit_outbound_pool = nullptr;
     h2.outbound_stream = h2.queued_stream;
     h2.outbound_config = h2.queued_config;
     h2.outbound_body = h2.queued_body;
@@ -186,6 +201,18 @@ inline void h2_promote_queued(Http2Conn& h2) {
     h2.outbound_body_offset = h2.queued_body_offset;
     h2.outbound_final_staged = h2.queued_final_staged;
     h2.outbound_source = h2.queued_source;
+    if (h2.outbound_source == H2OutboundBodySource::JitDynamic) {
+        if (h2.jit_queued_slice != nullptr) {
+            h2.jit_outbound_slice = h2.jit_queued_slice;
+            h2.jit_outbound_pool = h2.jit_queued_pool;
+            h2.outbound_body = h2.jit_outbound_slice;
+            h2.jit_queued_slice = nullptr;
+            h2.jit_queued_pool = nullptr;
+        } else {
+            __builtin_memcpy(h2.jit_outbound_body, h2.jit_queued_body, h2.outbound_body_len);
+            h2.outbound_body = h2.jit_outbound_body;
+        }
+    }
     h2.queued_stream = 0;
     h2.queued_config = nullptr;
     h2.queued_body = nullptr;
@@ -196,6 +223,10 @@ inline void h2_promote_queued(Http2Conn& h2) {
 }
 
 inline void h2_clear_primary_outbound(Http2Conn& h2) {
+    if (h2.jit_outbound_slice != nullptr && h2.jit_outbound_pool != nullptr)
+        h2.jit_outbound_pool->free(h2.jit_outbound_slice);
+    h2.jit_outbound_slice = nullptr;
+    h2.jit_outbound_pool = nullptr;
     h2.outbound_stream = 0;
     h2.outbound_config = nullptr;
     h2.outbound_body = nullptr;
@@ -206,6 +237,10 @@ inline void h2_clear_primary_outbound(Http2Conn& h2) {
 }
 
 inline void h2_clear_queued_outbound(Http2Conn& h2) {
+    if (h2.jit_queued_slice != nullptr && h2.jit_queued_pool != nullptr)
+        h2.jit_queued_pool->free(h2.jit_queued_slice);
+    h2.jit_queued_slice = nullptr;
+    h2.jit_queued_pool = nullptr;
     h2.queued_stream = 0;
     h2.queued_config = nullptr;
     h2.queued_body = nullptr;
@@ -213,11 +248,6 @@ inline void h2_clear_queued_outbound(Http2Conn& h2) {
     h2.queued_body_offset = 0;
     h2.queued_final_staged = false;
     h2.queued_source = H2OutboundBodySource::None;
-}
-
-inline void h2_clear_outbound(Http2Conn& h2) {
-    h2_clear_primary_outbound(h2);
-    h2_clear_queued_outbound(h2);
 }
 
 enum class H2PumpStatus : u8 { Blocked, Produced, Invalid };
@@ -293,19 +323,36 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
     Http2Conn& h2 = *d.conn->h2;
     if (body_len == 0 || !d.conn->epoch_held || h2.find_stream(stream_id) == nullptr) return false;
     const bool queued = h2.outbound_stream != 0;
-    if (queued && (h2.queued_stream != 0 || source != H2OutboundBodySource::RouteConfig))
+    if (d.resp_len > d.resp_cap) {
+        d.overflow = true;
         return false;
+    }
+    if (queued && (h2.queued_stream != 0 || (source != H2OutboundBodySource::RouteConfig &&
+                                             source != H2OutboundBodySource::JitDynamic)))
+        return false;
+    SlicePool* body_pool = nullptr;
+    u8* body_slice = nullptr;
     if (source == H2OutboundBodySource::RouteConfig) {
         if (cfg == nullptr || body == nullptr) return false;
+    } else if (source == H2OutboundBodySource::JitDynamic) {
+        if (body == nullptr || body_len > SlicePool::kSliceSize) return false;
+        if (body_len <= sizeof(h2.jit_outbound_body)) {
+            u8* storage = queued ? h2.jit_queued_body : h2.jit_outbound_body;
+            __builtin_memcpy(storage, body, body_len);
+            body = storage;
+        } else {
+            body_pool = d.conn->json_arena.backend.pool;
+            if (body_pool == nullptr) return false;
+            body_slice = body_pool->alloc();
+            if (body_slice == nullptr) return false;
+            __builtin_memcpy(body_slice, body, body_len);
+            body = body_slice;
+        }
     } else if (source == H2OutboundBodySource::ProxySynth) {
         if (body != h2.pending_synth || body_len > Http2Conn::kBodySynthCap ||
             d.conn->h2_proxy_synth_quarantined)
             return false;
     } else {
-        return false;
-    }
-    if (d.resp_len > d.resp_cap) {
-        d.overflow = true;
         return false;
     }
     if (queued) {
@@ -327,6 +374,7 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
                                                body_len,
                                                false);
     if (n == 0) {
+        if (body_slice != nullptr) body_pool->free(body_slice);
         if (d.resp_len != 0) d.overflow = true;
         return false;
     }
@@ -340,6 +388,8 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         h2.queued_body_offset = 0;
         h2.queued_final_staged = false;
         h2.queued_source = source;
+        h2.jit_queued_slice = body_slice;
+        h2.jit_queued_pool = body_pool;
     } else {
         d.owned_resp_end = d.resp_len;
         h2.outbound_stream = stream_id;
@@ -349,6 +399,8 @@ bool h2_stage_owned_response(H2Dispatch<Loop>& d,
         h2.outbound_body_offset = 0;
         h2.outbound_final_staged = false;
         h2.outbound_source = source;
+        h2.jit_outbound_slice = body_slice;
+        h2.jit_outbound_pool = body_pool;
     }
     d.owned_hpack_pending = true;
     h2.response_flush_pending = true;
@@ -828,8 +880,23 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                      const JitDispatchOutcome& o,
                      const RouteConfig* cfg,
                      bool is_head) {
+    struct JsonArenaRelease {
+        Connection* conn;
+        bool enabled;
+        ~JsonArenaRelease() {
+            if (enabled) h2_release_completed_jit_json(*conn);
+        }
+    } json_release{d.conn, true};
     const u8* body = nullptr;
     u32 body_len = 0;
+    if (o.response_body_idx == 0xffffu) {
+        if (!d.conn->jit_response_body_valid) {
+            h2_emit_status(d, stream_id, 500);
+            return;
+        }
+        body = reinterpret_cast<const u8*>(d.conn->jit_response_body.ptr);
+        body_len = d.conn->jit_response_body.len;
+    }
     if (o.response_body_idx != 0 && cfg != nullptr &&
         o.response_body_idx <= cfg->response_body_count) {
         const auto& b = cfg->response_bodies[o.response_body_idx - 1];
@@ -928,7 +995,9 @@ void h2_emit_outcome(H2Dispatch<Loop>& d,
                                      nhdrs,
                                      body,
                                      body_len,
-                                     H2OutboundBodySource::RouteConfig,
+                                     o.response_body_idx == 0xffffu
+                                         ? H2OutboundBodySource::JitDynamic
+                                         : H2OutboundBodySource::RouteConfig,
                                      cfg)) {
             if (!d.overflow) h2_emit_status(d, stream_id, 500);
         }
@@ -1099,14 +1168,25 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                     u32 synth_len,
                     bool request_body_followed,
                     bool request_forwardable,
-                    bool is_head,
+                    bool is_head = false,
                     const ParsedRequest* open_request = nullptr) {
+    bool retain_json = false;
+    struct JsonLifetime {
+        Connection* conn;
+        bool* retain;
+        ~JsonLifetime() {
+            if (!*retain) h2_release_completed_jit_json(*conn);
+        }
+    } json_lifetime{d.conn, &retain_json};
     if (route_requires_response_read_timeout_preflight_close(route, cfg)) {
         d.close_after_process = true;
         d.resp_len = 0;
         d.overflow = false;
         return;
     }
+    d.conn->json_arena.destroy();
+    d.conn->jit_response_body = {};
+    d.conn->jit_response_body_valid = false;
     auto* ctx = d.conn->reset_jit_ctx();
     d.conn->resp_header_mutation_pending_count = 0;
     d.conn->resp_header_mutation_pending_overflow = false;
@@ -1163,6 +1243,8 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
                               is_head,
                               open_request))
             h2_emit_status(d, stream_id, 503);  // a stream is already suspended
+        else
+            retain_json = true;
         return;
     }
     if (kOutcome.kind == JitDispatchOutcome::Kind::Forward) {
@@ -1254,8 +1336,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     // END_STREAM validates the length.
     if (open_request != nullptr && open_request->has_content_length &&
         grpc_request(*open_request)) {
-        if (!h2_park_local_outcome(
+        if (h2_park_local_outcome(
                 d, stream_id, kOutcome, cfg, is_head, open_request->content_length))
+            retain_json = true;
+        else
             h2_emit_status(d, stream_id, 503);
         return;
     }
@@ -1294,7 +1378,9 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         Http2Conn::PendingRespMutation mutations[16];
         for (u32 i = 0; i < mutation_count; i++) mutations[i] = h2->pending_local_mutations[i];
         h2_clear_pending(*h2);
-        h2_reset_request_mutations(*d.conn);
+        // The parked outcome may own a dynamic JSON body; keep its arena alive
+        // until h2_emit_outcome has staged the bytes.
+        h2_reset_request_mutations(*d.conn, false);
         for (u32 i = 0; i < mutation_count; i++) {
             auto& dst = d.conn->resp_header_mutations[i];
             dst.name = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].name_offset),
@@ -2228,6 +2314,14 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
     ctx->state = conn.handler_state;
     ctx->resume_event_kind = static_cast<u32>(conn.resume_event_kind);
     ctx->resume_event_result = conn.resume_event_result;
+    bool retain_json = false;
+    struct JsonLifetime {
+        Connection* conn;
+        bool* retain;
+        ~JsonLifetime() {
+            if (!*retain) h2_release_completed_jit_json(*conn);
+        }
+    } json_lifetime{&conn, &retain_json};
     JitDispatchOutcome kOutcome = invoke_jit_handler(conn.pending_handler_fn,
                                                      static_cast<void*>(&conn),
                                                      *ctx,
@@ -2277,6 +2371,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
 
     // Another wait(): keep the stream parked and re-arm without flushing.
     if (kOutcome.kind == JitDispatchOutcome::Kind::TimerYield) {
+        retain_json = true;
         h2->async_timer_ms = kOutcome.timer_ms;
         h2->async_state = static_cast<u16>(kOutcome.next_state);
         if (!h2_arm_async_timer<Loop>(loop, conn)) loop->close_conn(conn);
@@ -2475,6 +2570,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                           kIsHead,
                                           h2->async_request_content_length,
                                           true)) {
+                    retain_json = true;
                     conn.pending_handler_fn = nullptr;
                     conn.transition_to_reading_header(&on_h2_data<Loop>);
                     if (conn.recv_buf.len() > 0) {

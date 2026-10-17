@@ -955,7 +955,13 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     }
 
     Connection conn;
+    SlicePool json_pool;
+    if (!json_pool.init(64)) {
+        result.verdict = Verdict::Failed;
+        return result;
+    }
     conn.reset();
+    conn.json_arena.backend.pool = &json_pool;
     harness::HandlerExecution execution{};
     execution.init(route->fn, &conn, entry.raw_headers, entry.raw_header_len);
     execution.frame.context.route_param_count = route_param_count;
@@ -975,8 +981,11 @@ SimulateResult simulate_one(Engine& engine, const CaptureEntry& entry) {
     // per spec (submit + wait batches, not loops).
     static constexpr u32 kMaxHandlerYields = 32;
     harness::DeterministicEnvironment environment{};
-    return drive_handler_to_completion(
+    result = drive_handler_to_completion(
         engine, *route, entry, conn, execution, environment, result, kMaxHandlerYields);
+    conn.reset();
+    json_pool.destroy();
+    return result;
 }
 
 SimulateSummary simulate_file(Engine& engine, ReplayReader& reader) {

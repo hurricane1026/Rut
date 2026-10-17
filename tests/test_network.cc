@@ -561,16 +561,57 @@ bool buf_has(const u8* buf, u32 len, const char* needle) {
     return count_occurrences(buf, len, needle) > 0;
 }
 
+static bool h2_alloc_json(Connection* conn);
+static bool h2_json_allocated = false;
+
 u64 h2_target_transform_handler(void* opaque, jit::HandlerCtx*, const u8*, u32, void*) {
     auto* conn = static_cast<Connection*>(opaque);
+    h2_alloc_json(conn);
     conn->target_transform_id = 1;
     conn->target_transform_recorded = true;
     return jit::HandlerResult::make_forward(0).pack();
 }
 
-static u64 h2_timer_then_redirect_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+static u64 h2_timer_then_redirect_handler(
+    void* opaque, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    (void)h2_alloc_json(static_cast<Connection*>(opaque));
     if (ctx != nullptr && ctx->state == 7) return jit::HandlerResult::make_redirect(1).pack();
     return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
+}
+
+static bool h2_alloc_json(Connection* conn) {
+    if (conn->json_arena.current == nullptr && conn->json_arena.backend.pool != nullptr &&
+        !conn->json_arena.init(conn->json_arena.backend.pool))
+        return false;
+    auto* bytes = static_cast<char*>(conn->json_arena.alloc(2));
+    if (bytes != nullptr) {
+        bytes[0] = '{';
+        bytes[1] = '}';
+        h2_json_allocated = true;
+        return true;
+    }
+    return false;
+}
+
+static u64 h2_alloc_forward_handler(void* opaque, jit::HandlerCtx*, const u8*, u32, void*) {
+    (void)h2_alloc_json(static_cast<Connection*>(opaque));
+    return jit::HandlerResult::make_forward(0).pack();
+}
+
+static u64 h2_alloc_redirect_handler(void* opaque, jit::HandlerCtx*, const u8*, u32, void*) {
+    (void)h2_alloc_json(static_cast<Connection*>(opaque));
+    return jit::HandlerResult::make_redirect(1).pack();
+}
+
+static u64 h2_alloc_timer_handler(void* opaque, jit::HandlerCtx*, const u8*, u32, void*) {
+    (void)h2_alloc_json(static_cast<Connection*>(opaque));
+    return jit::HandlerResult::make_yield(7, jit::YieldKind::Timer).pack();
+}
+
+static u64 h2_rearm_fail_timer_handler(void* opaque, jit::HandlerCtx* ctx, const u8*, u32, void*) {
+    (void)h2_alloc_json(static_cast<Connection*>(opaque));
+    const u32 delay = ctx != nullptr && ctx->state == 7 ? 64'000u : 1u;
+    return jit::HandlerResult::make_yield_payload(7, jit::YieldKind::Timer, delay).pack();
 }
 
 static u64 h2_timer_then_body_handler(void*, jit::HandlerCtx* ctx, const u8*, u32, void*) {
@@ -1269,6 +1310,39 @@ TEST(target_transform, h1_forward_rejects_before_upstream_side_effects) {
         CHECK_FALSE(conn->target_transform_recorded);
         CHECK_EQ(conn->target_transform_id, 0u);
     }
+}
+
+TEST(jit_response, h1_json_body_is_copied_before_send_and_arena_reclaimed) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    conn->json_arena.backend.pool = &pool;
+    REQUIRE(conn->json_arena.init(&pool));
+    const char body[] = "{\"ok\":true}";
+    auto* storage = static_cast<char*>(conn->json_arena.alloc(sizeof(body) - 1));
+    REQUIRE(storage != nullptr);
+    memcpy(storage, body, sizeof(body) - 1);
+    conn->jit_response_body = {storage, sizeof(body) - 1};
+    conn->jit_response_body_valid = true;
+    conn->req_method = static_cast<u8>(LogHttpMethod::Get);
+    conn->keep_alive = true;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 0xffffu;
+    handle_jit_outcome<SmallLoop>(&loop, *conn, outcome, nullptr, true);
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    REQUIRE_GT(conn->send_buf.len(), sizeof(body) - 1);
+    CHECK(buf_has(conn->send_buf.data(), conn->send_buf.len(), body));
+    CHECK_EQ(conn->on_send, &on_response_sent<SmallLoop>);
+    loop.inject_and_dispatch(
+        make_ev(conn->id, IoEventType::Send, static_cast<i32>(conn->send_buf.len())));
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    conn->reset();
+    pool.destroy();
 }
 
 TEST(response_policy, suppress_body_metadata_fails_closed_before_upstream_connect) {
@@ -7480,6 +7554,9 @@ TEST(target_transform, h2_forward_rejects_recorded_effect_before_proxy) {
     loop.setup();
     auto* conn = loop.alloc_conn();
     REQUIRE(conn != nullptr);
+    SlicePool json_pool;
+    REQUIRE(json_pool.init(8));
+    conn->json_arena.backend.pool = &json_pool;
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
     Http2Conn h2{};
@@ -7487,6 +7564,7 @@ TEST(target_transform, h2_forward_rejects_recorded_effect_before_proxy) {
     conn->h2 = &h2;
     RouteEntry route{};
     route.fn = &h2_target_transform_handler;
+    h2_json_allocated = false;
     const u8 synth[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     u8 response[8192]{};
     H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
@@ -7496,9 +7574,50 @@ TEST(target_transform, h2_forward_rejects_recorded_effect_before_proxy) {
         dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
 
     CHECK(conn->target_transform_recorded);
+    CHECK(h2_json_allocated);
+    CHECK_EQ(conn->json_arena.current, nullptr);
     CHECK(dispatch.resp_len > 0);  // local 400 is staged, never proxied
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    loop.free_conn(*conn);
+    json_pool.destroy();
+}
+
+TEST(http2, h2_forward_copies_synth_before_json_arena_release) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    SlicePool json_pool;
+    REQUIRE(json_pool.init(8));
+    conn->json_arena.backend.pool = &json_pool;
+    RouteConfig cfg{};
+    REQUIRE(cfg.add_upstream("backend", 0x7F000001, 8080).has_value());
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1,
+                     Http2StreamState::Open,
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     static_cast<i32>(kDefaultInitialWindowSize),
+                     true};
+    conn->h2 = &h2;
+    RouteEntry route{};
+    route.fn = &h2_alloc_forward_handler;
+    const u8 synth[] = "GET /forward HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    h2_json_allocated = false;
+    h2_invoke_emit(
+        dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
+    CHECK_EQ(h2.async_stream, 1u);
+    CHECK_EQ(h2.async_kind, H2AsyncKind::Proxy);
+    CHECK(h2_json_allocated);
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    CHECK_EQ(h2.async_synth_len, sizeof(synth) - 1);
+    CHECK_EQ(memcmp(h2.pending_synth, synth, sizeof(synth) - 1), 0);
+    loop.free_conn(*conn);
+    json_pool.destroy();
 }
 
 TEST(response_read_timeout, h2_forged_outcomes_set_sticky_close_without_local_status_or_work) {
@@ -7730,6 +7849,9 @@ TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
     loop.setup();
     auto* conn = loop.alloc_conn();
     REQUIRE(conn != nullptr);
+    SlicePool json_pool;
+    REQUIRE(json_pool.init(8));
+    conn->json_arena.backend.pool = &json_pool;
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     RedirectPolicySpec policy{};
@@ -7760,6 +7882,7 @@ TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
         dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
     CHECK_EQ(h2.async_stream, 1u);
     CHECK_EQ(dispatch.resp_len, 0u);
+    CHECK_NE(conn->json_arena.current, nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
 
@@ -7777,7 +7900,9 @@ TEST(redirect, h2_initial_and_timer_resume_reject_without_proxy) {
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 1u);
     CHECK_EQ(h2_staged_status(conn->send_buf.data(), conn->send_buf.len(), 1), 400u);
+    CHECK_EQ(conn->json_arena.current, nullptr);
     loop.free_conn(*conn);
+    json_pool.destroy();
 }
 
 TEST(http2, timer_resume_owned_body_commits_hpack_for_next_response) {
@@ -7910,6 +8035,9 @@ TEST(redirect, h2_immediate_rejects_before_async_or_proxy) {
     loop.setup();
     auto* conn = loop.alloc_conn();
     REQUIRE(conn != nullptr);
+    SlicePool json_pool;
+    REQUIRE(json_pool.init(8));
+    conn->json_arena.backend.pool = &json_pool;
     RouteConfig cfg{};
     REQUIRE(cfg.add_upstream("backend", 0x7F000001, 9000).has_value());
     REQUIRE_EQ(cfg.add_redirect_policy(make_test_fixed_redirect_policy()), 1u);
@@ -7917,7 +8045,8 @@ TEST(redirect, h2_immediate_rejects_before_async_or_proxy) {
     h2.init();
     conn->h2 = &h2;
     RouteEntry route{};
-    route.fn = &h2_immediate_redirect_handler;
+    route.fn = &h2_alloc_redirect_handler;
+    h2_json_allocated = false;
     const u8 synth[] = "GET /api HTTP/1.1\r\nHost: x\r\n\r\n";
     u8 response[8192]{};
     H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
@@ -7927,6 +8056,8 @@ TEST(redirect, h2_immediate_rejects_before_async_or_proxy) {
         dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
 
     CHECK_EQ(h2_staged_status(dispatch.resp, dispatch.resp_len, 1), 400u);
+    CHECK(h2_json_allocated);
+    CHECK_EQ(conn->json_arena.current, nullptr);
     CHECK_EQ(h2.async_stream, 0u);
     CHECK_EQ(h2.pending_stream, 0u);
     CHECK_EQ(h2.async_kind, H2AsyncKind::None);
@@ -7936,7 +8067,66 @@ TEST(redirect, h2_immediate_rejects_before_async_or_proxy) {
     CHECK_EQ(conn->pending_handler_fn, nullptr);
     CHECK_EQ(loop.backend.count_ops(MockOp::Connect), 0u);
     CHECK_EQ(loop.backend.count_ops(MockOp::Send), 0u);
+    CHECK_EQ(conn->json_arena.current, nullptr);
     loop.free_conn(*conn);
+    json_pool.destroy();
+}
+
+TEST(http2, h2_failed_timer_suspension_releases_json_arena) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    SlicePool json_pool;
+    REQUIRE(json_pool.init(8));
+    conn->json_arena.backend.pool = &json_pool;
+    RouteConfig cfg{};
+    Http2Conn h2{};
+    h2.init();
+    h2.async_stream = 3;
+    conn->h2 = &h2;
+    RouteEntry route{};
+    route.fn = &h2_alloc_timer_handler;
+    h2_json_allocated = false;
+    const u8 synth[] = "GET /timer HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    h2_invoke_emit(
+        dispatch, 1, &route, nullptr, 0, &cfg, synth, sizeof(synth) - 1, false, true, false);
+    CHECK(h2_json_allocated);
+    CHECK_EQ(h2_staged_status(dispatch.resp, dispatch.resp_len, 1), 503u);
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    loop.free_conn(*conn);
+    json_pool.destroy();
+}
+
+TEST(http2, h2_timer_rearm_failure_closes_and_releases_json_arena) {
+    SmallLoop loop;
+    loop.setup();
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    SlicePool json_pool;
+    REQUIRE(json_pool.init(8));
+    conn->json_arena.backend.pool = &json_pool;
+    Http2Conn h2{};
+    h2.init();
+    conn->h2 = &h2;
+    RouteEntry route{};
+    route.fn = &h2_rearm_fail_timer_handler;
+    h2_json_allocated = false;
+    const u8 synth[] = "GET /timer HTTP/1.1\r\nHost: x\r\n\r\n";
+    u8 response[8192]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false};
+    h2_invoke_emit(
+        dispatch, 1, &route, nullptr, 0, nullptr, synth, sizeof(synth) - 1, false, true, false);
+    REQUIRE(h2_json_allocated);
+    REQUIRE_EQ(h2.async_stream, 1u);
+    conn->pending_handler_fn = &h2_rearm_fail_timer_handler;
+    conn->handler_state = 7;
+    h2_resume_jit_handler(&loop, *conn);
+    CHECK_EQ(loop.free_top, SmallLoop::kMaxConns);
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    json_pool.destroy();
 }
 
 TEST(redirect, h1_timer_resume_rejects_without_proxy) {
@@ -10369,6 +10559,43 @@ TEST(http2, flow_controlled_route_body_boundaries_and_window_resume) {
         CHECK_EQ(body_seen, body_len);
         CHECK_EQ(h2.outbound_body_offset, body_len);
     }
+}
+
+TEST(http2, json_owned_body_survives_flow_control_stall_after_arena_release) {
+    SmallLoop loop;
+    loop.setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    Http2Conn h2{};
+    h2.init();
+    h2.nstreams = 1;
+    h2.streams[0] = {1, Http2StreamState::Open, 0, 0, true};
+    h2.conn_send_window = 0;
+    conn->h2 = &h2;
+    conn->epoch_held = true;
+    const char json_bytes[] = "{\"ok\":true}";
+    conn->json_arena.backend.pool = &pool;
+    REQUIRE(conn->json_arena.init(&pool));
+    auto* stored = static_cast<char*>(conn->json_arena.alloc(sizeof(json_bytes) - 1));
+    REQUIRE(stored != nullptr);
+    memcpy(stored, json_bytes, sizeof(json_bytes) - 1);
+    conn->jit_response_body = {stored, sizeof(json_bytes) - 1};
+    conn->jit_response_body_valid = true;
+    JitDispatchOutcome outcome{};
+    outcome.kind = JitDispatchOutcome::Kind::ReturnStatus;
+    outcome.status_code = 200;
+    outcome.response_body_idx = 0xffffu;
+    u8 response[4096]{};
+    H2Dispatch<SmallLoop> dispatch{&loop, conn, response, sizeof(response), 0, false, false};
+    h2_emit_outcome(dispatch, 1, outcome, nullptr, false);
+    CHECK_EQ(conn->json_arena.current, nullptr);
+    REQUIRE_EQ(h2.outbound_body_len, sizeof(json_bytes) - 1);
+    CHECK_EQ(memcmp(h2.outbound_body, json_bytes, sizeof(json_bytes) - 1), 0);
+    CHECK_EQ(h2.outbound_body, h2.jit_outbound_body);
+    conn->reset();
+    pool.destroy();
 }
 
 TEST(http2, proxy_synth_owner_is_transactional_and_pinned) {

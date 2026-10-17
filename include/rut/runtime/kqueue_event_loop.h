@@ -581,6 +581,7 @@ public:
         conns[id].id = id;
         conns[id].shard_id = static_cast<u8>(shard_id);
         conns[id].listener_context = this->listener_context;
+        conns[id].json_arena.backend.pool = &pool;
         conns[id].bind_request_receive_buffer(rs, SlicePool::kSliceSize);
         conns[id].send_slice = ss;
         conns[id].send_buf.bind(ss, SlicePool::kSliceSize);
@@ -609,7 +610,10 @@ public:
         if (c.response_header_slice) pool.free(c.response_header_slice);
         if (c.ws_c2u_msg) pool.free(c.ws_c2u_msg);
         if (c.ws_u2c_msg) pool.free(c.ws_u2c_msg);
-        if (c.h2) h2_pool.free(c.h2);
+        if (c.h2) {
+            h2_clear_outbound(*c.h2);
+            h2_pool.free(c.h2);
+        }
         backend.quarantine_upstream_episode_on_slot_release(cid);
         c.reset();
         free_stack[free_top++] = cid;

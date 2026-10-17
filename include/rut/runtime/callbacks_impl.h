@@ -33,6 +33,12 @@
 #include <unistd.h>
 
 namespace rut {
+inline void release_completed_jit_json(Connection& conn) {
+    conn.json_arena.destroy();
+    conn.jit_response_body = {};
+    conn.jit_response_body_valid = false;
+}
+
 // --- Upstream backend selection + passive health (circuit breaking) ---
 //
 // Shards are share-nothing — one OS thread each — so per-shard state lives in
@@ -2387,6 +2393,9 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.http1_pipeline_request_generation = conn.handler_gen;
     }
     conn.req_start_us = monotonic_us();
+    conn.json_arena.destroy();
+    conn.jit_response_body = {};
+    conn.jit_response_body_valid = false;
     // Per-request proxy state must start clean on EVERY request. reset() runs
     // only at connection alloc, so on a keep-alive-reused connection these flags
     // would otherwise leak from the previous request: a prior forward(set_path:)
@@ -3193,6 +3202,8 @@ void on_response_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.clear_slots();
     const u32 response_size =
         conn.local_response_size ? conn.local_response_size : conn.send_buf.len();
+    // Response bytes no longer borrow the request-local JSON arena.
+    release_completed_jit_json(conn);
     conn.local_body_cursor = nullptr;
     conn.local_body_base = nullptr;
     conn.local_body_file_fd = -1;
@@ -3653,6 +3664,45 @@ void handle_jit_outcome(Loop* loop,
             // status-reason body). Out-of-range indices fall back to
             // the default rather than rendering garbage.
             const RouteConfig* cfg = conn.request_config;
+            if (outcome.response_body_idx == 0xffffu) {
+                constexpr u32 kMaxHeaders =
+                    RouteConfig::kMaxHeadersPerSet + Connection::kMaxRespHeaderMutations;
+                ResponseHeaderKV headers[kMaxHeaders];
+                u32 count = 0;
+                bool suppress_type = false;
+                const bool ok = conn.jit_response_body_valid &&
+                                collect_effective_response_headers(conn,
+                                                                   cfg,
+                                                                   outcome.response_headers_idx,
+                                                                   headers,
+                                                                   kMaxHeaders,
+                                                                   &count,
+                                                                   &suppress_type) &&
+                                format_response_with_body_and_headers(
+                                    conn,
+                                    outcome.status_code,
+                                    conn.jit_response_body.ptr,
+                                    conn.jit_response_body.len,
+                                    headers,
+                                    count,
+                                    effective_keep_alive,
+                                    false,
+                                    suppress_type,
+                                    conn.jit_response_head,
+                                    false,
+                                    conn.req_http_version == static_cast<u8>(HttpVersion::Http10)
+                                        ? HttpVersion::Http10
+                                        : HttpVersion::Http11);
+                if (!ok) {
+                    conn.resp_status = 500;
+                    conn.keep_alive = false;
+                    format_static_response(conn, 500, false);
+                }
+                release_completed_jit_json(conn);
+                conn.transition_to_sending(&on_response_sent<Loop>);
+                client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
+                return;
+            }
             const bool has_body = outcome.response_body_idx != 0 && cfg != nullptr &&
                                   outcome.response_body_idx <= cfg->response_body_count;
             const bool segmented_body = has_body && outcome.status_code >= 200 &&
@@ -3691,6 +3741,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.keep_alive = false;
                 format_static_response(
                     conn, 500, false, is_head, ordinary_local_response_version(conn));
+                release_completed_jit_json(conn);
                 conn.transition_to_sending(&on_response_sent<Loop>);
                 client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
                 return;
@@ -3767,6 +3818,7 @@ void handle_jit_outcome(Loop* loop,
                 conn.local_body_base = reinterpret_cast<const u8*>(body.data);
                 conn.local_body_file_fd = body.file_fd();
             }
+            release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
@@ -3790,6 +3842,7 @@ void handle_jit_outcome(Loop* loop,
             conn.resp_status =
                 config->redirect_policies[outcome.redirect_policy_id - 1].status_code;
             conn.keep_alive = false;
+            release_completed_jit_json(conn);
             conn.transition_to_sending(&on_response_sent<Loop>);
             client_send(loop, conn, conn.send_buf.data(), conn.send_buf.len());
             return;
