@@ -718,25 +718,32 @@ static Http2Error handle_frame(Http2Conn& c,
                 if (h.length != 0) return Http2Error::FrameSizeError;
                 return Http2Error::NoError;
             }
-            c.peer_settings_seen = true;
             const i64 kOldIws = c.peer_settings.initial_window_size;
-            const Http2Error kErr = parse_settings(payload, h.length, &c.peer_settings);
+            Http2Settings parsed_settings = c.peer_settings;
+            const Http2Error kErr = parse_settings(payload, h.length, &parsed_settings);
             if (kErr != Http2Error::NoError) return kErr;
-            // The peer's SETTINGS_HEADER_TABLE_SIZE bounds the dynamic table our
-            // encoder may index against. React (resize + arm a §6.3 update for the
-            // next response header block) so we never index into a table the peer
-            // shrank. No-op when the value is unchanged.
-            c.hpack_enc.set_table_size(c.peer_settings.header_table_size);
             // Adjust live stream send windows by the INITIAL_WINDOW_SIZE delta.
-            const i64 kDelta = static_cast<i64>(c.peer_settings.initial_window_size) - kOldIws;
+            const i64 kDelta = static_cast<i64>(parsed_settings.initial_window_size) - kOldIws;
             if (kDelta != 0) {
                 for (u32 i = 0; i < c.nstreams; i++) {
                     if (c.streams[i].state == Http2StreamState::Closed) continue;
                     const i64 kNw = static_cast<i64>(c.streams[i].send_window) + kDelta;
                     if (kNw > kMaxWindow) return Http2Error::FlowControlError;
-                    c.streams[i].send_window = static_cast<i32>(kNw);
                 }
             }
+            c.peer_settings = parsed_settings;
+            // The peer's SETTINGS_HEADER_TABLE_SIZE bounds the dynamic table our
+            // encoder may index against. React (resize + arm a §6.3 update for the
+            // next response header block) so we never index into a table the peer
+            // shrank. No-op when the value is unchanged.
+            c.hpack_enc.set_table_size(c.peer_settings.header_table_size);
+            if (kDelta != 0) {
+                for (u32 i = 0; i < c.nstreams; i++) {
+                    if (c.streams[i].state == Http2StreamState::Closed) continue;
+                    c.streams[i].send_window += static_cast<i32>(kDelta);
+                }
+            }
+            c.peer_settings_seen = true;
             if (w.room(kFrameHeaderSize)) w.len += write_settings_ack(w.out + w.len);
             return Http2Error::NoError;
         }
@@ -812,9 +819,9 @@ static Http2Error handle_frame(Http2Conn& c,
                          s->state == Http2StreamState::HalfClosedLocal)) {
                         // Valid request trailers end the peer's side: close fully if
                         // we already responded (HalfClosedLocal), else half-close remote.
-                        s->state = (s->state == Http2StreamState::HalfClosedLocal)
-                                       ? Http2StreamState::Closed
-                                       : Http2StreamState::HalfClosedRemote;
+                        s->state = (s->state == Http2StreamState::Open)
+                                       ? Http2StreamState::HalfClosedRemote
+                                       : Http2StreamState::Closed;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
@@ -864,16 +871,19 @@ static Http2Error handle_frame(Http2Conn& c,
                     if (kTrailerEnd && !has_pseudo && s &&
                         (s->state == Http2StreamState::Open ||
                          s->state == Http2StreamState::HalfClosedLocal)) {
-                        s->state = (s->state == Http2StreamState::HalfClosedLocal)
-                                       ? Http2StreamState::Closed
-                                       : Http2StreamState::HalfClosedRemote;
+                        s->state = (s->state == Http2StreamState::Open)
+                                       ? Http2StreamState::HalfClosedRemote
+                                       : Http2StreamState::Closed;
                         if (c.pending_stream == h.stream_id && c.on_data)
                             c.on_data(c.cb_ctx, c, h.stream_id, nullptr, 0, /*end_stream=*/true);
                         return Http2Error::NoError;
                     }
                     return reset_known_stream(c, h.stream_id, Http2Error::ProtocolError, w);
                 }
-                if (s && c.cont_end_stream) s->state = Http2StreamState::HalfClosedRemote;
+                if (s && c.cont_end_stream)
+                    s->state = (s->state == Http2StreamState::Open)
+                                   ? Http2StreamState::HalfClosedRemote
+                                   : Http2StreamState::Closed;
                 return finish_headers(c, h.stream_id, c.cont_end_stream, c.cont_refuse, w);
             }
             return Http2Error::NoError;

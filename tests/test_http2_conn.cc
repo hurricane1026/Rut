@@ -1045,7 +1045,163 @@ TEST(http2_conn, settings_invalid_value_goaway) {
     u32 ow = 0;
     Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
     CHECK(r.close);
+    CHECK_FALSE(c.peer_settings_seen);
     CHECK(has_frame(out, ow, Http2FrameType::Goaway, 0, 0));
+}
+
+TEST(http2_conn, settings_invalid_length_and_window_delta_do_not_establish_peer) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    u8 frame[64];
+    const u8 odd_payload[1] = {0};
+    u32 fn = put_frame(frame, Http2FrameType::Settings, 0, 0, odd_payload, 1);
+    u8 in[128];
+    u32 inlen = with_preface(in, frame, fn);
+    u8 out[256];
+    u32 ow = 0;
+    Http2Result r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK_FALSE(c.peer_settings_seen);
+
+    c.init();
+    setup(c, cap);
+    hpack::Header hs[] = {{{":method", 7}, {"GET", 3}}, {{":path", 5}, {"/", 1}}};
+    fn = http2_write_headers(frame, sizeof(frame), 1, hs, 2, false);
+    inlen = with_preface(in, frame, fn);
+    ow = 0;
+    r = c.process(in, inlen, out, sizeof(out), &ow);
+    CHECK_FALSE(r.close);
+    Http2Stream* stream = c.find_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->send_window = static_cast<i32>(kMaxWindowSize);
+    Http2Settings settings;
+    settings.set_defaults();
+    settings.initial_window_size = kMaxWindowSize;
+    fn = write_settings_frame(frame, settings);
+    ow = 0;
+    r = c.process(frame, fn, out, sizeof(out), &ow);
+    CHECK(r.close);
+    CHECK_FALSE(c.peer_settings_seen);
+}
+
+TEST(http2_conn, request_trailers_close_after_local_response) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header request[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/", 1}}};
+    hpack::Header trailers[] = {{{"grpc-status", 11}, {"0", 1}}};
+    u8 request_frame[256];
+    u8 trailer_frame[256];
+    const u32 request_len =
+        http2_write_headers(request_frame, sizeof(request_frame), 1, request, 2, false);
+    const u32 trailer_len =
+        http2_write_headers(trailer_frame, sizeof(trailer_frame), 1, trailers, 1, true);
+    u8 wire[640];
+    u8 out[256];
+    u32 ow = 0;
+    const u32 request_wire_len = with_preface(wire, request_frame, request_len);
+    CHECK_FALSE(c.process(wire, request_wire_len, out, sizeof(out), &ow).close);
+    Http2Stream* stream = c.find_stream(1);
+    REQUIRE(stream != nullptr);
+    h2_close_stream(&c, 1);
+    CHECK(stream->state == Http2StreamState::HalfClosedLocal);
+    const u32 trailer_len_without_header =
+        put_frame(wire,
+                  Http2FrameType::Headers,
+                  http2_flag::kEndHeaders | http2_flag::kEndStream,
+                  1,
+                  trailer_frame + kFrameHeaderSize,
+                  trailer_len - kFrameHeaderSize);
+    ow = 0;
+    CHECK_FALSE(c.process(wire, trailer_len_without_header, out, sizeof(out), &ow).close);
+    CHECK(stream->state == Http2StreamState::Closed);
+}
+
+TEST(http2_conn, fragmented_request_trailers_close_after_local_response) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    hpack::Header request[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/", 1}}};
+    hpack::Header trailers[] = {{{"grpc-status", 11}, {"0", 1}}};
+    u8 request_frame[256];
+    u8 trailer_frame[256];
+    const u32 request_len =
+        http2_write_headers(request_frame, sizeof(request_frame), 1, request, 2, false);
+    const u32 trailer_len =
+        http2_write_headers(trailer_frame, sizeof(trailer_frame), 1, trailers, 1, true);
+    const u32 trailer_payload = trailer_len - kFrameHeaderSize;
+    u8 wire[640];
+    u32 wire_len = with_preface(wire, request_frame, request_len);
+    u8 out[256];
+    u32 ow = 0;
+    CHECK_FALSE(c.process(wire, wire_len, out, sizeof(out), &ow).close);
+    Http2Stream* stream = c.find_stream(1);
+    REQUIRE(stream != nullptr);
+    h2_close_stream(&c, 1);
+    CHECK(stream->state == Http2StreamState::HalfClosedLocal);
+    u8 in[512];
+    u32 inlen = 0;
+    const u32 first = trailer_payload / 2;
+    inlen += put_frame(in + inlen,
+                       Http2FrameType::Headers,
+                       http2_flag::kEndStream,
+                       1,
+                       trailer_frame + kFrameHeaderSize,
+                       first);
+    inlen += put_frame(in + inlen,
+                       Http2FrameType::Continuation,
+                       http2_flag::kEndHeaders,
+                       1,
+                       trailer_frame + kFrameHeaderSize + first,
+                       trailer_payload - first);
+    ow = 0;
+    CHECK_FALSE(c.process(in, inlen, out, sizeof(out), &ow).close);
+    CHECK(stream->state == Http2StreamState::Closed);
+}
+
+TEST(http2_client, response_end_stream_keeps_open_request_half_closed_remote) {
+    const hpack::Header response[] = {{{":status", 7}, {"200", 3}},
+                                      {{"content-type", 12}, {"application/grpc", 16}},
+                                      {{"grpc-status", 11}, {"0", 1}}};
+    u8 frame[256];
+    const u32 frame_len = http2_write_headers(frame, sizeof(frame), 1, response, 3, true);
+    u8 out[256];
+    u32 written = 0;
+
+    Http2Conn immediate;
+    immediate.init_client();
+    immediate.peer_settings_seen = true;
+    REQUIRE(immediate.open_stream(1) != nullptr);
+    CHECK_FALSE(immediate.process(frame, frame_len, out, sizeof(out), &written).close);
+    auto* immediate_stream = immediate.find_stream(1);
+    REQUIRE(immediate_stream != nullptr);
+    CHECK(immediate_stream->state == Http2StreamState::HalfClosedRemote);
+
+    Http2Conn fragmented;
+    fragmented.init_client();
+    fragmented.peer_settings_seen = true;
+    REQUIRE(fragmented.open_stream(1) != nullptr);
+    const u32 payload_len = frame_len - kFrameHeaderSize;
+    const u32 first = payload_len / 2;
+    u8 fragments[256];
+    u32 fragments_len = put_frame(fragments,
+                                  Http2FrameType::Headers,
+                                  http2_flag::kEndStream,
+                                  1,
+                                  frame + kFrameHeaderSize,
+                                  first);
+    fragments_len += put_frame(fragments + fragments_len,
+                               Http2FrameType::Continuation,
+                               http2_flag::kEndHeaders,
+                               1,
+                               frame + kFrameHeaderSize + first,
+                               payload_len - first);
+    written = 0;
+    CHECK_FALSE(fragmented.process(fragments, fragments_len, out, sizeof(out), &written).close);
+    auto* fragmented_stream = fragmented.find_stream(1);
+    REQUIRE(fragmented_stream != nullptr);
+    CHECK(fragmented_stream->state == Http2StreamState::HalfClosedRemote);
 }
 
 TEST(http2_conn, headers_on_stream_zero_goaway) {
