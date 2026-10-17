@@ -2003,7 +2003,7 @@ TEST(grpc_proxy, repeated_settings_success_does_not_clear_active_rpc_failures) {
     conn.upstream_backend_idx = 0;
     GrpcDriveFixture loop;
     for (u32 i = 0; i < kBackendFailThreshold; i++) {
-        h2.grpc.handshake_health_recorded = false;
+        h2.grpc.session_failure_recorded = false;
         h2.peer_settings_seen = false;
         h2.grpc.connected_at_us = 1;
         loop.closed = false;
@@ -2388,12 +2388,183 @@ TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
     mixed[mixed_len + 9] = 0;
     mixed_len += 10;
     run(mixed, mixed_len, true);
-    CHECK_EQ(health->fails, 2u);
+    CHECK_EQ(health->fails, 1u);
 
     u8 good[64]{};
     const u32 good_len = write_settings_frame(good, settings);
     run(good, good_len, false);
-    CHECK_EQ(health->fails, 2u);
+    CHECK_EQ(health->fails, 1u);
+}
+
+TEST(grpc_proxy, accepted_unfinished_rpc_eof_ejects_fresh_sessions) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    GrpcDriveFixture loop;
+    Http2Settings settings;
+    settings.set_defaults();
+
+    for (u32 attempt = 0; attempt < kBackendFailThreshold; attempt++) {
+        Connection conn;
+        conn.reset();
+        u8 recv[128]{};
+        u8 send[512]{};
+        conn.bind_request_receive_buffer(recv, sizeof(recv));
+        conn.send_slice = send;
+        conn.send_buf.bind(send, sizeof(send));
+        const u32 settings_len = write_settings_frame(recv, settings);
+        conn.recv_buf.commit(settings_len);
+        Http2Conn h2;
+        h2.init_client();
+        h2.preface_seen = true;
+        h2.our_settings_sent = true;
+        h2.grpc.upstream = true;
+        h2.grpc.preface_sent = true;
+        conn.h2 = &h2;
+        conn.upstream_idx = 0;
+        conn.upstream_backend_idx = 0;
+        REQUIRE(h2.open_stream(1) != nullptr);
+        GrpcExchange exchange;
+        exchange.init();
+        exchange.upstream = &conn;
+        exchange.upstream_stream = 1;
+        exchange.request_headers_sent = true;
+        REQUIRE(grpc_attach(h2, &exchange));
+
+        loop.closed = false;
+        grpc_on_upstream_data<GrpcDriveFixture>(
+            &loop, conn, {conn.id, static_cast<i32>(settings_len), 0, 0, IoEventType::Recv, 1});
+        CHECK_FALSE(loop.closed);
+        CHECK(h2.peer_settings_seen);
+        grpc_on_upstream_data<GrpcDriveFixture>(
+            &loop, conn, {conn.id, 0, 0, 0, IoEventType::Recv, 0});
+        CHECK(loop.closed);
+        CHECK_EQ(health->fails, attempt + 1);
+    }
+    CHECK_EQ(health->fails, kBackendFailThreshold);
+    CHECK(backend_ejected(0, 0, monotonic_us()));
+}
+
+TEST(grpc_proxy, terminal_rpc_clears_then_accepted_eof_counts_once) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    health->fails = 2;
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    upstream.upstream_idx = 0;
+    upstream.upstream_backend_idx = 0;
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.peer_settings_seen = true;
+    upstream.h2 = &upstream_h2;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    auto* first = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(first != nullptr);
+    first->init();
+    first->upstream = &upstream;
+    first->downstream = &downstream;
+    first->upstream_stream = first->downstream_stream = 1;
+    first->request_headers_sent = true;
+    REQUIRE(grpc_attach(upstream_h2, first));
+    REQUIRE(grpc_attach(downstream_h2, first));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const hpack::Header terminal[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"grpc-status", 11}, {"7", 1}},
+    };
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, terminal, 3, true);
+    CHECK_EQ(health->fails, 0u);
+    CHECK(first->response_end);
+
+    REQUIRE(upstream_h2.open_stream(3) != nullptr);
+    auto* second = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(second != nullptr);
+    second->init();
+    second->upstream = &upstream;
+    second->upstream_stream = 3;
+    second->request_headers_sent = true;
+    REQUIRE(grpc_attach(upstream_h2, second));
+    loop.closed = false;
+    grpc_on_upstream_data<GrpcDriveFixture>(
+        &loop, upstream, {upstream.id, 0, 0, 0, IoEventType::Recv, 0});
+    CHECK(loop.closed);
+    CHECK_EQ(health->fails, 1u);
+}
+
+TEST(grpc_proxy, session_failure_excludes_idle_goaway_and_stale_config) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    GrpcDriveFixture loop;
+    RouteConfig current_config;
+    RouteConfig stale_config;
+    const RouteConfig* active = &current_config;
+    loop.config_ptr = &active;
+
+    Connection idle;
+    idle.reset();
+    Http2Conn idle_h2;
+    idle_h2.init_client();
+    idle_h2.grpc.upstream = true;
+    idle_h2.peer_settings_seen = true;
+    idle.h2 = &idle_h2;
+    idle.request_config = &current_config;
+    idle.upstream_idx = 0;
+    idle.upstream_backend_idx = 0;
+    grpc_record_session_failure(&loop, idle, monotonic_us());
+    CHECK_EQ(health->fails, 0u);
+
+    Connection rejected;
+    rejected.reset();
+    Http2Conn rejected_h2;
+    rejected_h2.init_client();
+    rejected_h2.grpc.upstream = true;
+    rejected_h2.peer_settings_seen = true;
+    rejected.h2 = &rejected_h2;
+    rejected.request_config = &current_config;
+    rejected.upstream_idx = 0;
+    rejected.upstream_backend_idx = 0;
+    REQUIRE(rejected_h2.open_stream(3) != nullptr);
+    rejected_h2.peer_goaway = true;
+    rejected_h2.peer_last_stream = 1;
+    GrpcExchange rejected_exchange;
+    rejected_exchange.init();
+    rejected_exchange.upstream = &rejected;
+    rejected_exchange.upstream_stream = 3;
+    rejected_exchange.request_headers_sent = true;
+    REQUIRE(grpc_attach(rejected_h2, &rejected_exchange));
+    grpc_record_session_failure(&loop, rejected, monotonic_us());
+    CHECK_EQ(health->fails, 0u);
+
+    Connection stale;
+    stale.reset();
+    Http2Conn stale_h2;
+    stale_h2.init_client();
+    stale_h2.grpc.upstream = true;
+    stale_h2.peer_settings_seen = true;
+    stale.h2 = &stale_h2;
+    stale.request_config = &stale_config;
+    stale.upstream_idx = 0;
+    stale.upstream_backend_idx = 0;
+    REQUIRE(stale_h2.open_stream(1) != nullptr);
+    GrpcExchange stale_exchange;
+    stale_exchange.init();
+    stale_exchange.upstream = &stale;
+    stale_exchange.upstream_stream = 1;
+    stale_exchange.request_headers_sent = true;
+    REQUIRE(grpc_attach(stale_h2, &stale_exchange));
+    grpc_record_session_failure(&loop, stale, monotonic_us());
+    CHECK_EQ(health->fails, 0u);
 }
 TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     EpollEventLoop loop;
