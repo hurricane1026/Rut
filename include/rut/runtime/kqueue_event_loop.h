@@ -996,9 +996,11 @@ public:
                         // the proxy-timeout 504 / traffic-capture paths that key off
                         // Proxying stay untouched for a probe with fd == -1).
                         if (!conn.throttle_paused && !conn.is_health_probe) {
-                            timer.refresh(&conn,
-                                          conn.state == ConnState::Proxying ? upstream_timeout
-                                                                            : keepalive_timeout);
+                            timer.refresh(
+                                &conn,
+                                conn.h2 && (conn.h2->grpc.active || conn.h2->grpc.upstream) ? 1
+                                : conn.state == ConnState::Proxying ? upstream_timeout
+                                                                    : keepalive_timeout);
                         }
                         this->dispatch_event(conn, ev);
                     } else if (conn.pending_handler_fn) {

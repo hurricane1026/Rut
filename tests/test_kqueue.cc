@@ -57,6 +57,8 @@ bool ready(KqueueBackend& backend, int timeout_ms = 1000) {
     struct pollfd fd{backend.kqueue_fd, POLLIN, 0};
     return poll(&fd, 1, timeout_ms) == 1;
 }
+
+void consume_recv(void*, ConnectionBase&, IoEvent) {}
 }  // namespace
 
 TEST(kqueue, pause_resume_and_half_close) {
@@ -115,6 +117,41 @@ TEST(kqueue, periodic_ticks_precise_yield_and_wakeup) {
     REQUIRE_EQ(b.wait(&event, 1, nullptr, 0), 1u);
     CHECK_EQ(event.type, IoEventType::Timeout);
     CHECK(event.result >= 1);
+}
+
+TEST(kqueue, grpc_io_completion_keeps_one_second_timer) {
+    void* storage = mmap(nullptr,
+                         sizeof(KqueueEventLoop),
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1,
+                         0);
+    REQUIRE(storage != MAP_FAILED);
+    auto* loop = new (storage) KqueueEventLoop();
+    REQUIRE(loop->init(0, -1).has_value());
+    auto& conn = loop->conns[0];
+    conn.reset();
+    conn.id = 0;
+    Http2Conn h2;
+    h2.init();
+    h2.grpc.active = 1;
+    conn.h2 = &h2;
+    conn.set_slots(&consume_recv, nullptr, nullptr, nullptr);
+
+    // Seed the connection with the ordinary keepalive deadline. A gRPC I/O
+    // completion must move it to the one-second slot, matching epoll and
+    // io_uring, so grpc_tick can run promptly.
+    loop->timer.add(&conn, 60);
+    IoEvent event{0, 1, 0, 0, IoEventType::Recv, 0};
+    loop->dispatch(event);
+
+    CHECK_EQ(loop->timer.slots[(loop->timer.cursor + 1u) & (TimerWheel::kSlots - 1u)].next,
+             &conn.timer_node);
+    loop->timer.remove(&conn);
+    loop->force_close_all();
+    loop->shutdown();
+    loop->~KqueueEventLoop();
+    munmap(storage, sizeof(KqueueEventLoop));
 }
 
 TEST(kqueue, closed_socket_does_not_raise_sigpipe) {
