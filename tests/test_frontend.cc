@@ -4816,6 +4816,53 @@ route GET "/x" { let code = require(req.http11) if code == 7 { return 200 } else
     rir.destroy();
 }
 
+TEST(frontend, imported_json_generated_strings_survive_module_teardown) {
+    // Escaped literal decoding and JSON-pointer field paths are synthesized
+    // during analysis. They must live in the shared HIR store rather than the
+    // imported module's owned_strings, which is destroyed before lowering.
+    const std::string dir = "/tmp/rut_import_json_strings_frontend";
+    std::filesystem::remove_all(dir);
+    REQUIRE(std::filesystem::create_directories(dir));
+    {
+        std::ofstream out(dir + "/helper.rut", std::ios::binary);
+        out << "struct User { name: str }\n"
+               "func payload() -> i32 { let s = json(\"a\\n\") 7 }\n"
+               "func user_name(d: Json) -> i32 {\n"
+               "    guard let user = json.decode(User, d) else { respond 400, \"?\" }\n"
+               "    let ignored = user.name\n"
+               "    1\n"
+               "}\n";
+        out.flush();
+        REQUIRE(out.good());
+    }
+    const auto src = R"rut(
+import "helper.rut"
+route GET "/x" { return 200 }
+)rut";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    REQUIRE(hir->generated_names != nullptr);
+    bool found_decoded_newline = false;
+    bool found_pointer_path = false;
+    for (const auto* node = hir->generated_names->head; node != nullptr; node = node->next) {
+        const Str text{node->text, node->len};
+        if (text.eq(lit_str("a\n"))) found_decoded_newline = true;
+        if (text.eq(lit_str("/name"))) found_pointer_path = true;
+    }
+    CHECK(found_decoded_newline);
+    CHECK(found_pointer_path);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(frontend, copied_hir_keeps_byte_body_after_original_destroyed) {
     // Body bytes live in a refcounted HIR-owned store shared across copies, so
     // a copy remains valid after the original module is destroyed.

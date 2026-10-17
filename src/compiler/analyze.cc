@@ -59,6 +59,20 @@ static FrontendResult<Str> intern_owned_response_body(Str body) {
     return store_generated_name(*g_analyze_owned_buffers, &segment, 1);
 }
 
+// Store analyzer-generated string bytes in the shared, refcounted HIR store.
+// A plain HirModule::owned_strings entry is destroyed with an imported module
+// before the copied HIR is lowered, leaving any Str view dangling.
+static FrontendResult<Str> intern_analysis_string(const HirModule& mod, std::string value) {
+    if (g_analyze_owned_buffers == nullptr) {
+        auto& storage = const_cast<HirModule&>(mod).owned_strings;
+        storage.push_back(std::move(value));
+        const auto& owned = storage.back();
+        return Str{owned.data(), static_cast<u32>(owned.size())};
+    }
+    const GeneratedNameSegment segment{value.data(), static_cast<u32>(value.size())};
+    return store_generated_name(*g_analyze_owned_buffers, &segment, 1);
+}
+
 static Str intern_generated_name(const std::string& value) {
     g_stable_generated_names.push_back(value);
     const auto& kept = g_stable_generated_names.back();
@@ -4090,13 +4104,12 @@ static FrontendResult<HirExpr> analyze_json_decode(const HirExpr& source,
             else
                 path += c;
         }
-        auto* mutable_mod = const_cast<HirModule*>(&mod);
-        mutable_mod->owned_strings.push_back(path);
-        auto& owned = mutable_mod->owned_strings.back();
+        auto key_str = intern_analysis_string(mod, std::move(path));
+        if (!key_str) return core::make_unexpected(key_str.error());
         HirExpr key{};
         key.kind = HirExprKind::StrLit;
         key.type = HirTypeKind::Str;
-        key.str_value = {owned.data(), static_cast<u32>(owned.size())};
+        key.str_value = key_str.value();
         auto selected = make_json_op(
             json::Op::Get, HirTypeKind::Json, false, &stable_source, &key, nullptr, span, route);
         if (!selected) return selected;
@@ -7236,10 +7249,7 @@ static FrontendResult<Str> decoded_expression_string(Str raw, const HirModule& m
                     FrontendError::UnsupportedSyntax, span, lit_str("unsupported string escape"));
         }
     }
-    auto& storage = const_cast<HirModule&>(mod).owned_strings;
-    storage.push_back(std::move(text));
-    const auto& owned = storage.back();
-    return Str{owned.data(), static_cast<u32>(owned.size())};
+    return intern_analysis_string(mod, std::move(text));
 }
 
 static FrontendResult<HirExpr> analyze_expr_impl(const AstExpr& expr,
