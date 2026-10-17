@@ -38,10 +38,13 @@ struct GrpcExchange {
     u16 upstream_id;
     u32 upload_len;
     u32 download_len;
+    u64 response_bytes;
+    u32 expected_response_bytes;
     u32 request_headers_len;
     u32 request_trailers_len;
     u32 response_headers_len;
     u32 response_trailers_len;
+    bool has_response_length;
     u32 response_mutation_bytes;
     u8 response_mutation_count;
     bool response_mutation_overflow;
@@ -64,8 +67,10 @@ struct GrpcExchange {
         failure = 0;
         slot_held = false;
         upstream_id = 0;
-        upload_len = download_len = request_headers_len = request_trailers_len = 0;
+        upload_len = download_len = response_bytes = expected_response_bytes = 0;
+        request_headers_len = request_trailers_len = 0;
         response_headers_len = response_trailers_len = 0;
+        has_response_length = false;
         response_mutation_bytes = 0;
         response_mutation_count = 0;
         response_mutation_overflow = false;

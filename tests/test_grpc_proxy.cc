@@ -1183,6 +1183,9 @@ struct FailConnectLoop : EpollEventLoop {
 };
 
 TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_input) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
     FailConnectLoop loop;
     REQUIRE(loop.init(0, -1).has_value());
     RouteConfig cfg;
@@ -1226,6 +1229,7 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     CHECK_GT(down->send_buf.len(), 0u);
     CHECK_EQ(loop.recv_submits, 0u);
     CHECK_EQ(loop.grpc_upstreams, nullptr);
+    CHECK_EQ(health->fails, 0u);
     loop.force_close_all();
     loop.shutdown();
 }
@@ -1749,6 +1753,202 @@ TEST(grpc_proxy, upstream_send_failure_records_handshake_health_once) {
         &loop, settings_conn, {settings_conn.id, -EPIPE, 0, 0, IoEventType::Send, 0});
     CHECK(loop.closed);
     CHECK_EQ(health->fails, kBackendFailThreshold);
+}
+
+TEST(grpc_proxy, stale_handshake_result_does_not_touch_reloaded_backend) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    RouteConfig old_config;
+    RouteConfig current_config;
+    const RouteConfig* active = &current_config;
+    GrpcDriveFixture loop;
+    loop.config_ptr = &active;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    h2.grpc.upstream = true;
+    conn.h2 = &h2;
+    conn.request_config = &old_config;
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    grpc_record_handshake_result(&loop, conn, false, monotonic_us());
+    CHECK_EQ(health->fails, 0u);
+    active = &old_config;
+    grpc_record_handshake_result(&loop, conn, false, monotonic_us());
+    CHECK_EQ(health->fails, 1u);
+}
+
+TEST(grpc_proxy, stale_connect_failure_does_not_touch_reloaded_backend) {
+    GrpcBackendHealthReset health_reset{};
+    auto* health = backend_health(0, 0);
+    REQUIRE(health != nullptr);
+    RouteConfig old_config;
+    RouteConfig current_config;
+    const RouteConfig* active = &current_config;
+    GrpcDriveFixture loop;
+    loop.config_ptr = &active;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    h2.grpc.upstream = true;
+    conn.h2 = &h2;
+    conn.request_config = &old_config;
+    conn.upstream_idx = 0;
+    conn.upstream_backend_idx = 0;
+    grpc_connected<GrpcDriveFixture>(&loop, conn, {conn.id, -111, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(health->fails, 0u);
+    active = &old_config;
+    loop.closed = false;
+    grpc_connected<GrpcDriveFixture>(&loop, conn, {conn.id, -111, 0, 0, IoEventType::Recv, 0});
+    CHECK_EQ(health->fails, 1u);
+}
+
+TEST(grpc_proxy, invalid_initial_response_headers_detach_upstream_exchange) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    GrpcExchange x;
+    x.init();
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = 1;
+    x.downstream_stream = 1;
+    x.slot_held = true;
+    x.upstream_id = 7;
+    x.request_headers_sent = true;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const hpack::Header headers[] = {
+        {{":status", 7}, {"503", 3}},
+        {{"content-type", 12}, {"text/plain", 10}},
+    };
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, headers, 2, false);
+    CHECK_EQ(x.failure, 14u);
+    CHECK(x.response_end);
+    CHECK(x.upstream == nullptr);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(loop.released, 1u);
+    CHECK_EQ(upstream_h2.grpc.control_len, 13u);
+    u8 out[512];
+    const u32 sent = grpc_pump_downstream(&loop, downstream, out, sizeof(out));
+    CHECK_GT(sent, 0u);
+}
+
+TEST(grpc_proxy, response_content_length_is_validated_across_grpc_end_states) {
+    auto run = [&_tc](const hpack::Header* headers,
+                      u32 header_count,
+                      bool header_end,
+                      const u8* data,
+                      u32 data_len,
+                      bool data_end,
+                      const hpack::Header* trailers,
+                      u32 trailer_count,
+                      u8 expected_failure,
+                      bool expect_detached) {
+        GrpcDriveFixture loop;
+        Connection upstream;
+        upstream.reset();
+        Http2Conn upstream_h2;
+        upstream_h2.init_client();
+        upstream_h2.grpc.upstream = true;
+        upstream.h2 = &upstream_h2;
+        Connection downstream;
+        downstream.reset();
+        Http2Conn downstream_h2;
+        downstream_h2.init_client();
+        downstream.h2 = &downstream_h2;
+        GrpcExchange x;
+        x.init();
+        x.upstream = &upstream;
+        x.downstream = &downstream;
+        x.upstream_stream = x.downstream_stream = 1;
+        x.slot_held = true;
+        x.upstream_id = 7;
+        REQUIRE(upstream_h2.open_stream(1) != nullptr);
+        REQUIRE(downstream_h2.open_stream(1) != nullptr);
+        REQUIRE(grpc_attach(upstream_h2, &x));
+        REQUIRE(grpc_attach(downstream_h2, &x));
+        GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+        grpc_response_headers<GrpcDriveFixture>(
+            &dispatch, upstream_h2, 1, headers, header_count, header_end);
+        if (data_len)
+            grpc_response_data<GrpcDriveFixture>(
+                &dispatch, upstream_h2, 1, data, data_len, data_end);
+        if (trailers)
+            grpc_response_trailers<GrpcDriveFixture>(
+                &dispatch, upstream_h2, 1, trailers, trailer_count, true);
+        CHECK_EQ(x.failure, expected_failure);
+        if (expect_detached) CHECK(x.upstream == nullptr);
+    };
+    const hpack::Header exact_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"3", 1}},
+    };
+    const hpack::Header status_trailers[] = {{{"grpc-status", 11}, {"0", 1}}};
+    const u8 abc[] = {'a', 'b', 'c'};
+    run(exact_headers, 3, false, abc, 3, false, status_trailers, 1, 0, false);
+    run(exact_headers, 3, false, abc, 3, false, nullptr, 0, 0, false);
+    run(exact_headers, 3, false, abc, 3, true, nullptr, 0, 2, false);
+
+    const hpack::Header short_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"4", 1}},
+    };
+    run(short_headers, 3, false, abc, 3, false, status_trailers, 1, 13, false);
+
+    const hpack::Header long_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"2", 1}},
+    };
+    run(long_headers, 3, false, abc, 3, false, nullptr, 0, 13, false);
+
+    const hpack::Header malformed_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"nope", 4}},
+    };
+    run(malformed_headers, 3, false, nullptr, 0, false, nullptr, 0, 13, true);
+
+    const hpack::Header duplicate_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"3", 1}},
+        {{"content-length", 14}, {"3", 1}},
+    };
+    run(duplicate_headers, 4, false, nullptr, 0, false, nullptr, 0, 13, true);
+
+    const hpack::Header overflow_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"4294967296", 10}},
+    };
+    run(overflow_headers, 3, false, nullptr, 0, false, nullptr, 0, 13, true);
+
+    const hpack::Header terminal_headers[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"content-length", 14}, {"1", 1}},
+        {{"grpc-status", 11}, {"0", 1}},
+    };
+    run(terminal_headers, 4, true, nullptr, 0, false, nullptr, 0, 13, false);
 }
 
 TEST(grpc_proxy, upstream_settings_health_uses_actual_h2_processing_order) {
