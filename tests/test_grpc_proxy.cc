@@ -1227,6 +1227,8 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     CHECK_EQ(down->h2->async_stream, 0u);
     CHECK_EQ(down->h2->grpc.active, 0u);
     CHECK_GT(down->send_buf.len(), 0u);
+    CHECK(down->h2->grpc.streams[0] == nullptr);
+    CHECK(loop.grpc_upstreams == nullptr);
     CHECK_EQ(loop.recv_submits, 0u);
     CHECK_EQ(loop.grpc_upstreams, nullptr);
     CHECK_EQ(health->fails, 0u);
@@ -1805,6 +1807,29 @@ TEST(grpc_proxy, stale_connect_failure_does_not_touch_reloaded_backend) {
     grpc_connected<GrpcDriveFixture>(&loop, conn, {conn.id, -111, 0, 0, IoEventType::Recv, 0});
     CHECK_EQ(health->fails, 1u);
 }
+TEST(grpc_proxy, stale_idle_upstream_closes_but_active_old_config_drains) {
+    RouteConfig old_config;
+    RouteConfig current_config;
+    const RouteConfig* active = &current_config;
+    GrpcDriveFixture loop;
+    loop.config_ptr = &active;
+    Connection conn;
+    conn.reset();
+    Http2Conn h2;
+    h2.init_client();
+    h2.grpc.upstream = true;
+    h2.grpc.idle_since_us = monotonic_us();
+    h2.grpc.connected_at_us = h2.grpc.idle_since_us;
+    conn.h2 = &h2;
+    conn.request_config = &old_config;
+    grpc_tick(&loop, conn);
+    CHECK(loop.closed);
+
+    loop.closed = false;
+    h2.grpc.active = 1;
+    grpc_tick(&loop, conn);
+    CHECK_FALSE(loop.closed);
+}
 
 TEST(grpc_proxy, invalid_initial_response_headers_detach_upstream_exchange) {
     GrpcDriveFixture loop;
@@ -2029,9 +2054,8 @@ TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
                                 {{":authority", 10}, {"x", 1}},
                                 {{"content-type", 12}, {"application/grpc", 16}}};
     REQUIRE(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 5, req, true));
-    REQUIRE(down->h2->grpc.streams[0] != nullptr);
-    CHECK_EQ(down->h2->grpc.streams[0]->failure, 13u);
-    CHECK_FALSE(down->h2->grpc.streams[0]->request_headers_sent);
+    CHECK_EQ(down->h2->grpc.active, 0u);
+    CHECK_GT(down->send_buf.len(), 0u);
     loop.force_close_all();
     loop.shutdown();
 }

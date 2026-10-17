@@ -418,7 +418,7 @@ void grpc_response_headers(
     if (!grpc_apply_response_mutations(*x, filtered, &filtered_n, Http2Conn::kMaxHeadersPerReq)) {
         x->failure = 8;
         x->response_end = true;
-        grpc_release_slot(dispatch->loop, *x);
+        grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
     x->response_headers_len = http2_write_headers(x->response_headers,
@@ -427,7 +427,12 @@ void grpc_response_headers(
                                                   filtered,
                                                   filtered_n,
                                                   backend_terminal);
-    if (!x->response_headers_len) x->failure = 8;
+    if (!x->response_headers_len) {
+        x->failure = 8;
+        x->response_end = true;
+        grpc_detach_upstream_exchange(dispatch->loop, h, *x);
+        return;
+    }
     x->response_end = end;
     if (end && (!grpc_has_status(hs, n) || !grpc_has_status(filtered, filtered_n))) x->failure = 2;
     if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
@@ -455,7 +460,12 @@ void grpc_response_trailers(
                                                    filtered,
                                                    filtered_n,
                                                    true);
-    if (!x->response_trailers_len) x->failure = 8;
+    if (!x->response_trailers_len) {
+        x->failure = 8;
+        x->response_end = true;
+        grpc_detach_upstream_exchange(dispatch->loop, h, *x);
+        return;
+    }
     if (!grpc_has_status(hs, n)) x->failure = 2;
     if (x->has_response_length && x->expected_response_bytes != x->response_bytes) x->failure = 13;
     x->response_end = true;
@@ -471,6 +481,8 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     }
     if (len > sizeof(x->download) - x->download_len) {
         x->failure = 8;
+        x->response_end = true;
+        grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
     if (len) __builtin_memcpy(x->download + x->download_len, data, len);
@@ -663,14 +675,20 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     const bool settings_seen_before = h.peer_settings_seen;
     g.busy = true;
     u32 written = 0;
-    Connection* downstreams[64];
+    struct DownstreamSnapshot {
+        Connection* conn;
+        Http2Conn* h2;
+        u32 handler_gen;
+    } downstreams[64];
     u32 downstream_count = 0;
     for (auto* x : g.streams) {
         if (!x || !x->downstream) continue;
         bool seen = false;
         for (u32 i = 0; i < downstream_count; i++)
-            if (downstreams[i] == x->downstream) seen = true;
-        if (!seen) downstreams[downstream_count++] = x->downstream;
+            if (downstreams[i].conn == x->downstream) seen = true;
+        if (!seen)
+            downstreams[downstream_count++] = {
+                x->downstream, x->downstream->h2, x->downstream->handler_gen};
     }
     const auto result = h.process(conn.recv_buf.data(),
                                   conn.recv_buf.len(),
@@ -691,19 +709,27 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     }
     if (!settings_seen_before && h.peer_settings_seen)
         grpc_record_handshake_result(loop, conn, true, monotonic_us());
-    for (auto* x : g.streams) {
+    for (u32 i = 0; i < 64; i++) {
+        auto* x = g.streams[i];
         if (!x) continue;
-        if (grpc_rejected_by_goaway(h, *x)) x->failure = 14;
-        grpc_kick_downstream(loop, *x->downstream);
+        if (grpc_rejected_by_goaway(h, *x)) {
+            x->failure = 14;
+            x->response_end = true;
+            grpc_detach_upstream_exchange(loop, h, *x);
+        }
     }
-    // RST/GOAWAY callbacks run while the H2 parser is busy, so the first kick
-    // above is intentionally suppressed. Snapshot downstream connections
-    // before parsing because callbacks may detach the exchange.
+    // RST/GOAWAY callbacks run while the H2 parser is busy. Snapshot
+    // downstream connections before parsing because callbacks may detach the
+    // exchange, then kick each connection once after releasing busy.
     g.busy = false;
     // A timer-arm failure can leave a downstream error parked indefinitely.
     for (u32 i = 0; i < downstream_count; i++) {
-        grpc_refresh_timer(loop, *downstreams[i]);
-        grpc_kick_downstream(loop, *downstreams[i]);
+        auto& snapshot = downstreams[i];
+        if (!snapshot.conn || snapshot.conn->h2 != snapshot.h2 ||
+            snapshot.conn->handler_gen != snapshot.handler_gen)
+            continue;
+        grpc_refresh_timer(loop, *snapshot.conn);
+        grpc_kick_downstream(loop, *snapshot.conn);
     }
     grpc_drive_upstream(loop, conn);
     if (conn.h2 && !loop->submit_recv(conn)) loop->close_conn(conn);
@@ -861,6 +887,14 @@ bool grpc_start_impl(Loop* loop,
     grpc_attach(*up->h2, x);
     stream->manual_window = down_stream->manual_window = true;
     down.on_close = &grpc_connection_closed<Loop>;
+    if (x->failure) {
+        x->response_end = true;
+        grpc_detach_upstream_exchange(loop, *up->h2, *x);
+        grpc_refresh_timer(loop, down);
+        grpc_kick_downstream(loop, down);
+        if (fresh) loop->close_conn(*up);
+        return true;
+    }
     if (deadline && monotonic_us() >= deadline) {
         grpc_deadline_fired(loop, down);
         if (fresh) loop->close_conn(*up);
@@ -995,6 +1029,7 @@ void grpc_request_data(
                                   (end && x.request_bytes != x.expected_request_bytes)))) {
         down.h2->consume_data(x.downstream_stream, len);
         x.failure = 13;
+        grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
     if (len) __builtin_memcpy(x.upload + x.upload_len, data, len);
@@ -1014,7 +1049,11 @@ void grpc_request_trailers(void* ctx, Http2Conn& h, u32 sid, const hpack::Header
         if (!x || !x->upstream) return;
         x->request_trailers_len = http2_write_headers(
             x->request_trailers, sizeof(x->request_trailers), x->upstream_stream, hs, n, true);
-        if (!x->request_trailers_len) x->failure = 8;
+        if (!x->request_trailers_len) {
+            x->failure = 8;
+            grpc_detach_upstream_exchange(d->loop, *x->upstream->h2, *x);
+            return;
+        }
         grpc_request_data(d->loop, *d->conn, *x, nullptr, 0, true);
     }
 }
@@ -1108,8 +1147,11 @@ void grpc_tick(Loop* loop, Connection& conn) {
     auto& h = *conn.h2;
     const u64 now = monotonic_us();
     if (h.grpc.upstream) {
+        const bool stale_config =
+            h.grpc.active == 0 && loop->config_ptr && *loop->config_ptr != conn.request_config;
         if (((h.grpc.connecting || !h.peer_settings_seen) &&
              now - h.grpc.connected_at_us >= static_cast<u64>(loop->upstream_timeout) * 1000000) ||
+            stale_config ||
             grpc_idle_upstream_should_close(h.grpc,
                                             h.peer_goaway,
                                             loop->is_draining(),
