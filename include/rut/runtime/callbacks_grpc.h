@@ -1184,6 +1184,7 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
             continue;
         grpc_drive_upstream(loop, *snapshot.conn);
     }
+    if (conn.h2 != downstream_h2 || conn.handler_gen != downstream_handler_gen) return;
     grpc_refresh_timer(loop, conn);
     if (conn.h2 == downstream_h2 && conn.handler_gen == downstream_handler_gen)
         grpc_kick_downstream(loop, conn);
