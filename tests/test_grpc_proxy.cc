@@ -697,6 +697,16 @@ struct GrpcDriveFixture {
     bool upstream_acquire(u16, u32) { return true; }
     void upstream_release(u16) { released++; }
 };
+struct SyncCloseGrpcDriveFixture : GrpcDriveFixture {
+    bool submit_send(Connection&, const u8*, u32) { return false; }
+    void close_conn(Connection& conn) {
+        if (conn.on_close) conn.on_close(this, conn);
+        conn.on_close = nullptr;
+        conn.h2 = nullptr;
+        conn.handler_gen++;
+        closed = true;
+    }
+};
 void pending_send(void*, Connection&, IoEvent) {}
 }  // namespace
 
@@ -1682,6 +1692,9 @@ TEST(grpc_proxy, encoded_goaway_detaches_rejected_exchange_before_client_wakeup)
     upstream.h2 = &upstream_h2;
     Connection downstream;
     downstream.reset();
+    u8 downstream_send_storage[512]{};
+    downstream.send_slice = downstream_send_storage;
+    downstream.send_buf.bind(downstream_send_storage, sizeof(downstream_send_storage));
     Http2Conn downstream_h2;
     downstream_h2.init_client();
     downstream.h2 = &downstream_h2;
@@ -1708,6 +1721,53 @@ TEST(grpc_proxy, encoded_goaway_detaches_rejected_exchange_before_client_wakeup)
     CHECK_EQ(upstream_h2.grpc.active, 0u);
     CHECK_EQ(loop.released, 1u);
     CHECK_EQ(downstream_h2.grpc.active, 1u);
+}
+TEST(grpc_proxy, encoded_reset_skips_stale_downstream_snapshot_after_sync_close) {
+    SyncCloseGrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    u8 send_storage[512]{};
+    upstream.send_slice = send_storage;
+    upstream.send_buf.bind(send_storage, sizeof(send_storage));
+    u8 recv_storage[64]{};
+    upstream.recv_slice = recv_storage;
+    upstream.recv_buf.bind(recv_storage, sizeof(recv_storage));
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.preface_seen = true;
+    upstream_h2.our_settings_sent = true;
+    upstream_h2.peer_settings_seen = true;
+    upstream_h2.grpc.upstream = true;
+    upstream.h2 = &upstream_h2;
+    Connection downstream;
+    downstream.reset();
+    u8 downstream_send_storage[512]{};
+    downstream.send_slice = downstream_send_storage;
+    downstream.send_buf.bind(downstream_send_storage, sizeof(downstream_send_storage));
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    downstream.on_close = &grpc_connection_closed<SyncCloseGrpcDriveFixture>;
+    auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(x != nullptr);
+    x->init();
+    x->upstream = &upstream;
+    x->downstream = &downstream;
+    x->upstream_stream = x->downstream_stream = 1;
+    x->upstream_id = 0;
+    x->slot_held = true;
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(grpc_attach(upstream_h2, x));
+    REQUIRE(grpc_attach(downstream_h2, x));
+    const u32 frame_len = write_rst_stream(recv_storage, 1, Http2Error::Cancel);
+    upstream.recv_buf.commit(frame_len);
+    grpc_on_upstream_data<SyncCloseGrpcDriveFixture>(
+        &loop, upstream, {upstream.id, static_cast<i32>(frame_len), 0, 0, IoEventType::Recv, 0});
+    CHECK(loop.closed);
+    CHECK(downstream.h2 == nullptr);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    CHECK_EQ(loop.released, 1u);
 }
 TEST(grpc_proxy, idle_since_refreshes_after_long_active_session) {
     Http2Conn h{};
@@ -1946,19 +2006,19 @@ TEST(grpc_proxy, response_header_staging_failure_detaches_exchange) {
     REQUIRE(grpc_attach(upstream_h2, &x));
     REQUIRE(grpc_attach(downstream_h2, &x));
 
-    static char names[128][32];
-    static char values[128][4096];
-    hpack::Header headers[128];
+    static char names[8][32];
+    static char values[8][3000];
+    hpack::Header headers[8];
     headers[0] = {{":status", 7}, {"200", 3}};
     headers[1] = {{"content-type", 12}, {"application/grpc", 16}};
-    for (u32 i = 2; i < 128; i++) {
-        for (u32 j = 0; j < 16; j++) names[i][j] = static_cast<char>('a' + ((j + i * 3) % 26));
-        for (u32 j = 0; j < sizeof(values[i]); j++)
-            values[i][j] = static_cast<char>('a' + ((j + i * 7) % 26));
-        headers[i] = {{names[i], 16}, {values[i], sizeof(values[i])}};
+    for (u32 i = 2; i < 8; i++) {
+        for (u32 j = 0; j < 32; j++) names[i][j] = static_cast<char>('a' + ((j + i * 3) % 26));
+        for (u32 j = 0; j < 3000; j++)
+            values[i][j] = static_cast<char>('0' + ((j * 17 + i * 13) % 62));
+        headers[i] = {{names[i], 32}, {values[i], 3000}};
     }
     GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
-    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, headers, 128, false);
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, headers, 8, false);
     CHECK_EQ(x.failure, 8u);
     CHECK(x.response_end);
     CHECK(x.upstream == nullptr);
