@@ -1154,9 +1154,10 @@ TEST(iouring_idle_trim, every_arm_clears_the_examined_mark_and_connection_stays_
     // RelayOwner and BufferedSendVector are part of the hot connection slot.
     // Keep the slot-size assertion explicit so future owner fields cannot grow
     // the layout unnoticed.
-    // tls_recv_overflow_prefix_len was added after the original 3824-byte
-    // budget assertion; keep checking the current hot-slot layout explicitly.
-    CHECK_EQ(sizeof(Connection), 3872u);
+    // tls_recv_overflow_prefix_len and the gRPC proxy state were added after
+    // the original 3824-byte budget assertion; keep checking the current
+    // hot-slot layout explicitly.
+    CHECK_EQ(sizeof(Connection), 3880u);
 }
 
 TEST(iouring_idle_trim,
