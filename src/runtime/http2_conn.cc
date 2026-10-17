@@ -838,7 +838,10 @@ static Http2Error handle_frame(Http2Conn& c,
             const Http2Error kAe = append_fragment(c, p, n);
             if (kAe != Http2Error::NoError) return kAe;
             if (h.flags & http2_flag::kEndHeaders) {
-                if (kEndStream) s->state = Http2StreamState::HalfClosedRemote;
+                if (kEndStream)
+                    s->state = (s->state == Http2StreamState::Open)
+                                   ? Http2StreamState::HalfClosedRemote
+                                   : Http2StreamState::Closed;
                 return finish_headers(
                     c,
                     h.stream_id,
