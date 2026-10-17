@@ -1954,6 +1954,22 @@ u64 h2_grpc_local_status(void* conn, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_status(207).pack();
 }
 
+u64 h2_grpc_dynamic_local_status(void* raw_conn, jit::HandlerCtx*, const u8*, u32, void*) {
+    auto* conn = static_cast<Connection*>(raw_conn);
+    static constexpr char kBody[] = "{\"ok\":true}";
+    if (conn->json_arena.current == nullptr &&
+        !conn->json_arena.init(conn->json_arena.backend.pool))
+        return jit::HandlerResult::make_status(500).pack();
+    auto* storage = static_cast<char*>(conn->json_arena.alloc(sizeof(kBody) - 1));
+    if (storage == nullptr) return jit::HandlerResult::make_status(500).pack();
+    __builtin_memcpy(storage, kBody, sizeof(kBody) - 1);
+    conn->jit_response_body = {storage, sizeof(kBody) - 1};
+    conn->jit_response_body_valid = true;
+    return jit::HandlerResult{
+        jit::HandlerAction::ReturnStatus, 200, 0xffff, 0, jit::YieldKind::HttpGet}
+        .pack();
+}
+
 u32 g_h2_resume_calls = 0;
 u64 h2_resume_local_status(void* raw_conn, jit::HandlerCtx*, const u8* req, u32, void*) {
     g_h2_resume_calls++;
@@ -2132,6 +2148,66 @@ TEST(h2_serving, grpc_local_jit_validates_content_length_after_single_invoke) {
     const auto long_body = run(3, 4, false);
     CHECK(long_body.status400);
     CHECK_FALSE(long_body.kept);
+}
+
+TEST(h2_serving, grpc_parked_dynamic_json_body_survives_until_end_stream) {
+    Http2Conn h2;
+    h2.init();
+    Connection conn;
+    conn.reset();
+    conn.h2 = &h2;
+    h2.nstreams = 1;
+    h2.streams[0] = {1, Http2StreamState::Open, 0, 0, true};
+    FakeH2Loop loop;
+    REQUIRE(conn.json_arena.init(&loop.pool));
+    u8 response[8192]{};
+    H2Dispatch<FakeH2Loop> d{&loop, &conn, response, sizeof(response), 0, false};
+    RouteEntry route{};
+    route.fn = &h2_grpc_dynamic_local_status;
+    ParsedRequest req{};
+    req.method = HttpMethod::POST;
+    req.has_content_length = true;
+    req.content_length = 3;
+    req.headers[0] = {{"content-type", 12}, {"application/grpc", 16}};
+    req.header_count = 1;
+    const u8 synth[] = "POST /svc HTTP/1.1\r\n\r\n";
+    h2_invoke_emit(
+        d, 1, &route, nullptr, 0, nullptr, synth, sizeof(synth) - 1, true, true, false, &req);
+    CHECK(h2.pending_local_outcome);
+    CHECK(conn.jit_response_body_valid);
+    CHECK(conn.json_arena.current != nullptr);
+    CHECK_EQ(conn.jit_response_body.len, sizeof("{\"ok\":true}") - 1);
+    CHECK(conn.epoch_held);
+    CHECK(h2.find_stream(1) != nullptr);
+
+    u8 body[3] = {'a', 'b', 'c'};
+    h2_on_data_cb<FakeH2Loop>(&d, h2, 1, body, 3, true);
+    h2_async_epoch_leave(&loop, conn);
+    CHECK_EQ(h2.pending_stream, 0u);
+    CHECK_EQ(h2.outbound_stream, 1u);
+    CHECK_EQ(h2.queued_stream, 0u);
+    CHECK_EQ(h2.outbound_body_len, sizeof("{\"ok\":true}") - 1);
+    CHECK_EQ(memcmp(h2.outbound_body, "{\"ok\":true}", h2.outbound_body_len), 0);
+
+    Http2FrameHeader frame;
+    REQUIRE(parse_frame_header(response, d.resp_len, &frame) == ParseStatus::Complete);
+    hpack::DynamicTable dyn;
+    dyn.init(4096);
+    hpack::Header decoded[8];
+    u8 scratch[256];
+    u32 count = 0;
+    REQUIRE(hpack::decode_header_block(dyn,
+                                       response + kFrameHeaderSize,
+                                       frame.length,
+                                       scratch,
+                                       sizeof(scratch),
+                                       decoded,
+                                       8,
+                                       &count));
+    bool status_ok = false;
+    for (u32 i = 0; i < count; i++)
+        if (decoded[i].name.eq({":status", 7}) && decoded[i].value.eq({"200", 3})) status_ok = true;
+    CHECK(status_ok);
 }
 
 TEST(h2_serving, grpc_local_jit_reset_clears_parked_outcome) {

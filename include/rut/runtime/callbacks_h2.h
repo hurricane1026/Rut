@@ -34,10 +34,12 @@ namespace rut {
 // semantics without making this standalone header depend on callbacks_impl.h.
 bool h2_apply_forward_request_overrides(Connection& conn);
 
-inline void h2_reset_request_mutations(Connection& conn) {
-    conn.json_arena.destroy();
-    conn.jit_response_body = {};
-    conn.jit_response_body_valid = false;
+inline void h2_reset_request_mutations(Connection& conn, bool release_json_body = true) {
+    if (release_json_body) {
+        conn.json_arena.destroy();
+        conn.jit_response_body = {};
+        conn.jit_response_body_valid = false;
+    }
     conn.clear_raw_request_target_witness();
     conn.req_path_overridden = false;
     conn.req_path_override = {nullptr, 0};
@@ -1334,8 +1336,10 @@ void h2_invoke_emit(H2Dispatch<Loop>& d,
     // END_STREAM validates the length.
     if (open_request != nullptr && open_request->has_content_length &&
         grpc_request(*open_request)) {
-        if (!h2_park_local_outcome(
+        if (h2_park_local_outcome(
                 d, stream_id, kOutcome, cfg, is_head, open_request->content_length))
+            retain_json = true;
+        else
             h2_emit_status(d, stream_id, 503);
         return;
     }
@@ -1374,7 +1378,9 @@ void h2_finish_body(H2Dispatch<Loop>& d, u32 stream_id) {
         Http2Conn::PendingRespMutation mutations[16];
         for (u32 i = 0; i < mutation_count; i++) mutations[i] = h2->pending_local_mutations[i];
         h2_clear_pending(*h2);
-        h2_reset_request_mutations(*d.conn);
+        // The parked outcome may own a dynamic JSON body; keep its arena alive
+        // until h2_emit_outcome has staged the bytes.
+        h2_reset_request_mutations(*d.conn, false);
         for (u32 i = 0; i < mutation_count; i++) {
             auto& dst = d.conn->resp_header_mutations[i];
             dst.name = {reinterpret_cast<const char*>(h2->pending_synth + mutations[i].name_offset),
@@ -2564,6 +2570,7 @@ void h2_resume_jit_handler(Loop* loop, Connection& conn) {
                                           kIsHead,
                                           h2->async_request_content_length,
                                           true)) {
+                    retain_json = true;
                     conn.pending_handler_fn = nullptr;
                     conn.transition_to_reading_header(&on_h2_data<Loop>);
                     if (conn.recv_buf.len() > 0) {
