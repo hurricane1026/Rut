@@ -1434,11 +1434,11 @@ void grpc_tick(Loop* loop, Connection& conn) {
         if (((h.grpc.connecting || !h.peer_settings_seen) &&
              now - h.grpc.connected_at_us >= static_cast<u64>(loop->upstream_timeout) * 1000000) ||
             stale_config ||
-            grpc_keepalive_tick(h,
-                                now,
-                                static_cast<u64>(loop->upstream_timeout) * 1000000,
-                                !conn.on_send && !h.grpc.busy &&
-                                    (!h.grpc.client_tls.ssl_ctx || h.grpc.tls_verified)) ||
+            grpc_keepalive_tick(
+                h,
+                now,
+                static_cast<u64>(loop->upstream_timeout) * 1000000,
+                !h.grpc.busy && (!h.grpc.client_tls.ssl_ctx || h.grpc.tls_verified)) ||
             grpc_idle_upstream_should_close(h.grpc,
                                             h.peer_goaway,
                                             loop->is_draining(),
