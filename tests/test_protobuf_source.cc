@@ -218,9 +218,7 @@ TEST(protobuf_source, imported_package_namespace_shadows_outer_type_fallback) {
     Files files;
     REQUIRE(files.ok);
     REQUIRE(files.write_file("types.proto", "syntax='proto3'; package p.x; message A {}"));
-    const char* packages[] = {"p.q.x", "p.q.y"};
     for (u32 index = 0; index < 2; ++index) {
-        const char* package = packages[index];
         REQUIRE(files.write_file(
             "extra.proto",
             index == 0 ? "syntax='proto3'; package p.q.x;" : "syntax='proto3'; package p.q.y;"));

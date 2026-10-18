@@ -311,17 +311,14 @@ struct Compiler {
                         shadowed = true;
                 }
                 for (const Source* package = sources; package; package = package->next) {
-                    const Str package_symbol = join({}, '.', package->package);
-                    if (!package_symbol.ptr)
-                        return fail(SourceError::Kind::Allocation,
-                                    item->file->name,
-                                    item->line,
-                                    item->column,
-                                    {});
-                    if (package_symbol.eq(kFirst) ||
-                        (package_symbol.len > kFirst.len && package_symbol.ptr[kFirst.len] == '.' &&
-                         Str{package_symbol.ptr, kFirst.len}.eq(kFirst)))
-                        shadowed = true;
+                    if (kFirst.len > 1) {
+                        const Str package_prefix{kFirst.ptr + 1, kFirst.len - 1};
+                        if (package->package.eq(package_prefix) ||
+                            (package->package.len > package_prefix.len &&
+                             package->package.ptr[package_prefix.len] == '.' &&
+                             Str{package->package.ptr, package_prefix.len}.eq(package_prefix)))
+                            shadowed = true;
+                    }
                 }
                 if (found.ptr || shadowed || item->name.ptr[0] == '.' || !scope.len) break;
                 u32 n = scope.len;
