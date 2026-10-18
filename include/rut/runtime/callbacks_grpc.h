@@ -294,6 +294,19 @@ void grpc_connection_closed(void* lp, Connection& conn) {
                 grpc_detach_retry_attempt(loop, *x);
                 continue;
             }
+            if (g.c5_exhausted && !g.preface_sent && grpc_retry_can_schedule(*x, 14, false)) {
+                const u64 now = monotonic_us();
+                const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
+                if (!x->deadline_us || retry_at < x->deadline_us) {
+                    x->retry_pending = true;
+                    x->retry_at_us = retry_at > now ? retry_at : now + 1;
+                    x->retry_reason = 14;
+                    Connection* down = x->downstream;
+                    grpc_detach_retry_attempt(loop, *x);
+                    if (down && down->h2) grpc_refresh_timer(loop, *down);
+                    continue;
+                }
+            }
             x->upstream = nullptr;
             if (!x->response_end) x->failure = 14;
             x->response_end = true;
@@ -1323,6 +1336,7 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
         if (conn.h2 && conn.h2->grpc.connecting && !conn.h2->grpc.preface_sent &&
             grpc_submit_next_connect(loop, conn))
             return;
+        if (conn.h2) conn.h2->grpc.c5_exhausted = true;
         loop->close_conn(conn);
         return;
     }
@@ -1710,10 +1724,18 @@ bool grpc_bind_retry_attempt(Loop* loop, GrpcExchange& x, u64 now) {
             auto& g = up->h2->grpc;
             g.connect_attempts = 1;
             g.connect_tried_mask = static_cast<u8>(1u << backend);
+            g.c5_exhausted = false;
             up->fd = up->upstream_fd = UpstreamPool::create_socket();
             up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);
-            if (up->fd < 0 ||
-                !loop->submit_connect(*up, &target.addrs[backend], sizeof(target.addrs[backend]))) {
+            bool submitted =
+                up->fd >= 0 &&
+                loop->submit_connect(*up, &target.addrs[backend], sizeof(target.addrs[backend]));
+            if (!submitted && grpc_submit_next_connect(loop, *up)) {
+                loop->timer.refresh(up, 1);
+                return true;
+            }
+            if (!submitted) {
+                g.c5_exhausted = true;
                 loop->close_conn(*up);
                 return false;
             }
@@ -1942,6 +1964,7 @@ bool grpc_start_impl(Loop* loop,
         auto& g = up->h2->grpc;
         g.connect_attempts = 1;
         g.connect_tried_mask = static_cast<u8>(1u << backend);
+        g.c5_exhausted = false;
         up->fd = up->upstream_fd = UpstreamPool::create_socket();
         up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);
         if (up->fd < 0) {
@@ -1951,11 +1974,13 @@ bool grpc_start_impl(Loop* loop,
                 grpc_refresh_timer(loop, down);
                 return true;
             }
+            g.c5_exhausted = true;
             loop->close_conn(*up);
             return true;
         }
         if (!loop->submit_connect(*up, &target.addrs[backend], sizeof(target.addrs[backend]))) {
             if (!grpc_submit_next_connect(loop, *up)) {
+                g.c5_exhausted = true;
                 loop->close_conn(*up);
                 return true;
             }

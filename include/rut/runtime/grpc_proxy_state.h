@@ -195,6 +195,7 @@ struct GrpcProxyState {
     bool upstream;
     bool connecting;
     bool busy;
+    bool c5_exhausted;
     bool preface_sent;
     bool session_failure_recorded;
     u8 control[4096];
@@ -208,7 +209,8 @@ struct GrpcProxyState {
         active = cursor = control_len = pending_cancel_count = 0;
         connect_attempts = connect_tried_mask = 0;
         connected_at_us = idle_since_us = timer_deadline_us = last_ping_us = keepalive_due_us = 0;
-        upstream = connecting = busy = preface_sent = session_failure_recorded = false;
+        upstream = connecting = busy = c5_exhausted = preface_sent = session_failure_recorded =
+            false;
     }
 };
 }  // namespace rut

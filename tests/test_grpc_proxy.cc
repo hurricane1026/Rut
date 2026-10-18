@@ -571,6 +571,27 @@ struct Client {
         provider.read_callback = &data;
         return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
     }
+    int request_native_raw(u32 index, const u8* body, u32 body_len) {
+        auto& rpc = rpcs[index];
+        if (body_len > Rpc::kWebBufferCap) return -1;
+        if (!rpc.raw) rpc.raw = std::make_unique<u8[]>(Rpc::kWebBufferCap);
+        memcpy(rpc.raw.get(), body, body_len);
+        rpc.raw_len = body_len;
+        rpc.raw_request = true;
+        rpc.compare_pattern = false;
+        rpc.end = true;
+        nghttp2_nv headers[] = {nv(":method", "POST"),
+                                nv(":scheme", "http"),
+                                nv(":authority", "grpc.test"),
+                                nv(":path", "/test.Echo/Call"),
+                                nv("content-type", "application/grpc+proto"),
+                                nv("te", "trailers"),
+                                nv("grpc-timeout", "1H")};
+        nghttp2_data_provider provider{};
+        provider.source.ptr = &rpc;
+        provider.read_callback = &data;
+        return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
+    }
     int request_web(u32 index,
                     const u8* body,
                     u32 body_len,
@@ -2317,6 +2338,74 @@ TEST(grpc_proxy, refused_stream_retry_survives_protocol_close_in_same_process) {
     CHECK_EQ(loop.released, 0u);
 }
 
+TEST(grpc_proxy, c5_exhaustion_retries_only_complete_logical_exchanges) {
+    RetryCloseGrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    Http2Conn up_h2;
+    up_h2.init_client();
+    up_h2.grpc.upstream = true;
+    up_h2.grpc.connecting = true;
+    up_h2.grpc.c5_exhausted = true;
+    upstream.h2 = &up_h2;
+    loop.grpc_upstreams = &upstream;
+    Connection down_complete, down_incomplete;
+    down_complete.reset();
+    down_incomplete.reset();
+    down_complete.on_send = down_incomplete.on_send = &pending_send;
+    Http2Conn complete_h2, incomplete_h2;
+    complete_h2.init_client();
+    incomplete_h2.init_client();
+    down_complete.h2 = &complete_h2;
+    down_incomplete.h2 = &incomplete_h2;
+    REQUIRE(complete_h2.open_stream(1) != nullptr);
+    REQUIRE(incomplete_h2.open_stream(1) != nullptr);
+    REQUIRE(up_h2.open_stream(1) != nullptr);
+    REQUIRE(up_h2.open_stream(3) != nullptr);
+    GrpcExchange complete, incomplete;
+    complete.init();
+    incomplete.init();
+    complete.downstream = &down_complete;
+    incomplete.downstream = &down_incomplete;
+    complete.upstream = incomplete.upstream = &upstream;
+    complete.downstream_stream = complete.upstream_stream = 1;
+    incomplete.downstream_stream = 1;
+    incomplete.upstream_stream = 3;
+    complete.slot_held = incomplete.slot_held = true;
+    complete.retry_enabled = incomplete.retry_enabled = true;
+    complete.retry_policy = incomplete.retry_policy = {2, 16, 1u << 7, 10};
+    complete.retry_attempts = incomplete.retry_attempts = 1;
+    REQUIRE(complete.replay_body.init(16));
+    REQUIRE(complete.replay_body.seal());
+    REQUIRE(incomplete.replay_body.init(16));  // Streaming body is not sealed.
+    const hpack::Header request[] = {{{":method", 7}, {"POST", 4}}};
+    REQUIRE(complete.replay_headers.capture(request, 1));
+    REQUIRE(complete.replay_trailers.capture(nullptr, 0));
+    REQUIRE(incomplete.replay_headers.capture(request, 1));
+    REQUIRE(incomplete.replay_trailers.capture(nullptr, 0));
+    up_h2.grpc.streams[0] = &complete;
+    up_h2.grpc.streams[1] = &incomplete;
+    up_h2.grpc.active = 2;
+    complete_h2.grpc.streams[0] = &complete;
+    complete_h2.grpc.active = 1;
+    incomplete_h2.grpc.streams[0] = &incomplete;
+    incomplete_h2.grpc.active = 1;
+
+    grpc_connection_closed(&loop, upstream);
+    CHECK(complete.retry_pending);
+    CHECK(complete.upstream == nullptr);
+    CHECK(complete.slot_held);
+    CHECK_EQ(complete_h2.grpc.active, 1u);
+    CHECK_EQ(incomplete.failure, 14u);
+    CHECK(incomplete.response_end);
+    CHECK(incomplete.upstream == nullptr);
+    CHECK_FALSE(incomplete.slot_held);
+    CHECK_EQ(loop.released, 1u);
+    CHECK_EQ(up_h2.grpc.active, 0u);
+    complete.replay_body.release();
+    incomplete.replay_body.release();
+}
+
 TEST(grpc_proxy, parser_failure_records_active_session_once) {
     GrpcBackendHealthReset health_reset{};
     auto* health = backend_health(0, 0);
@@ -2826,6 +2915,80 @@ TEST(grpc_proxy, grpc_web_h2_epoll) {
 }
 TEST(grpc_proxy, grpc_web_h2_iouring) {
     grpc_web_h2_case<IoUringEventLoop>(_tc);
+}
+
+template <typename Loop>
+void grpc_retry_trailers_only_case(rut::test::TestCase* _tc, u8 mode) {
+    (void)_tc;
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = 1;  // First request gets trailers-only UNAUTHENTICATED.
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log().has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)).has_value());
+    cfg.upstreams[0].http2 = true;
+    if (mode != 0) cfg.upstreams[0].grpc_retry = {2, 1024, mode == 1 ? (1u << 7) : (1u << 14), 0};
+    REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &cfg;
+    REQUIRE(shard->spawn(-1).has_value());
+    {
+        Client client;
+        CHECK(client.init(get_port(lfd)));
+        if (client.fd >= 0) {
+            const u8 request[] = {0, 0, 0, 0, 3, 0xfa, 0xfb, 0xfc};
+            CHECK(client.request_native_raw(0, request, sizeof(request)) > 0);
+            CHECK(client.until(0, true));
+            const auto& rpc = client.rpcs[0];
+            const bool retried = mode == 1;
+            CHECK_EQ(server->requests.load(), retried ? 2u : 1u);
+            CHECK_EQ(rpc.status, retried ? 0u : 7u);
+            CHECK_EQ(rpc.ok, retried);
+            if (retried) {
+                CHECK(rpc.trailer);
+                CHECK_EQ(rpc.response_len, sizeof(request));
+                if (rpc.response_len == sizeof(request))
+                    CHECK(memcmp(rpc.response.get(), request, sizeof(request)) == 0);
+            }
+        }
+    }
+    shard->stop();
+    shard->join();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[0], mode == 1 ? 1u : 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[7], mode == 1 ? 0u : 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 1u);
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+TEST(grpc_proxy, grpc_retry_trailers_only_epoll) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 1);
+}
+TEST(grpc_proxy, grpc_retry_trailers_only_iouring) {
+    grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 1);
+}
+TEST(grpc_proxy, grpc_retry_default_off_epoll) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 0);
+}
+TEST(grpc_proxy, grpc_retry_default_off_iouring) {
+    grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 0);
+}
+TEST(grpc_proxy, grpc_retry_nonlisted_status_epoll) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 2);
+}
+TEST(grpc_proxy, grpc_retry_nonlisted_status_iouring) {
+    grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 2);
 }
 
 TEST(grpc_proxy, streaming_and_pooling_epoll) {
