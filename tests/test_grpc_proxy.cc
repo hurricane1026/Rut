@@ -2391,7 +2391,7 @@ TEST(grpc_proxy, c5_exhaustion_retries_only_complete_logical_exchanges) {
     incomplete_h2.grpc.streams[0] = &incomplete;
     incomplete_h2.grpc.active = 1;
 
-    grpc_connection_closed(&loop, upstream);
+    grpc_connection_closed<RetryCloseGrpcDriveFixture>(&loop, upstream);
     CHECK(complete.retry_pending);
     CHECK(complete.upstream == nullptr);
     CHECK(complete.slot_held);
