@@ -1,5 +1,8 @@
 import http.server
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 import threading
@@ -18,6 +21,20 @@ class Tests(unittest.TestCase):
             bad = Path(tmp) / 'cost$bucket'
             with self.assertRaises(ValueError):
                 bench.config(bad, 64, None, 8087, 1)
+
+    def test_server_manifest_coordinates_and_required_fields(self):
+        manifest = dict(schema=1, engine='rut', cpus='2', workers=1, body_size=1024,
+                        listen_port=8087, config_sha256='a' * 64,
+                        binary_sha256='b' * 64, run_id='rut-run')
+        self.assertIs(bench.validate_server_manifest(manifest, 'rut', 8087, 1024), manifest)
+        with self.assertRaises(ValueError):
+            bench.validate_server_manifest(dict(manifest, engine='nginx'), 'rut', 8087, 1024)
+        with self.assertRaises(ValueError):
+            bench.validate_server_manifest(dict(manifest, listen_port=9087), 'rut', 8087, 1024)
+        missing = dict(manifest)
+        del missing['binary_sha256']
+        with self.assertRaises(ValueError):
+            bench.validate_server_manifest(missing, 'rut', 8087, 1024)
 
     def test_wrk_errors_and_units(self):
         text = ('  99% 2.50ms\nRequests/sec: 1000.25\n'
@@ -60,6 +77,50 @@ class Tests(unittest.TestCase):
             server.server_close()
             t.join()
 
+    def test_wrk_status_counter_across_threads(self):
+        wrk = os.environ.get('WRK') or shutil.which('wrk')
+        if not wrk:
+            self.skipTest('wrk is not installed; set WRK to a local binary for integration coverage')
+        class Handler(http.server.BaseHTTPRequestHandler):
+            requests = 0
+            all_ok = False
+            def do_GET(self):
+                type(self).requests += 1
+                status = 200 if type(self).all_ok else (201 if type(self).requests % 2 else 200)
+                self.send_response(status)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                script = Path(tmp) / 'status.lua'
+                script.write_text(bench.STATUS_SCRIPT)
+                r = subprocess.run(
+                    [wrk, '-s', str(script), '-t', '2', '-c', '2', '-d', '1s',
+                     '--latency', f'http://127.0.0.1:{server.server_port}/'],
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                parsed = bench.parse_wrk(r.stdout)
+                self.assertGreater(parsed['errors']['timed_status'], 0, r.stdout)
+                self.assertFalse(parsed['valid'])
+                Handler.all_ok = True
+                r = subprocess.run(
+                    [wrk, '-s', str(script), '-t', '2', '-c', '2', '-d', '1s',
+                     '--latency', f'http://127.0.0.1:{server.server_port}/'],
+                    capture_output=True, text=True, timeout=15)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                parsed = bench.parse_wrk(r.stdout)
+                self.assertEqual(parsed['errors']['timed_status'], 0, r.stdout)
+                self.assertTrue(parsed['valid'])
+        finally:
+            server.shutdown()
+            server.server_close()
+            t.join()
+
     def test_config_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'config'
@@ -82,7 +143,10 @@ class Tests(unittest.TestCase):
                     p.mkdir()
                     bench.save(p / 'result.json', dict(engine=engine, repetition=rep,
                         host='192.0.2.2', body_size=1024, connections=128, duration=30,
-                        warmup=5, port=8087, threads=4, cpus='2-5', valid=True,
+                        warmup=5, port=8087, threads=4, cpus='2-5', server_cpus='2',
+                        server_workers=1, server_config_sha256='config-a', server_binary_sha256='binary-a',
+                        server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
+                        server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=rps_values[rep - 1], p99_us=100)]))
             for engine in ('rut', 'nginx'):
                 for rep in range(1, 4):
@@ -92,6 +156,21 @@ class Tests(unittest.TestCase):
             self.assertAlmostEqual(summarize.summarize(root)[0]['per_repetition_gain_percent'][1], 1)
             self.assertEqual(summarize.summarize(root)[0]['rut_gain_percent'], 100)
             self.assertEqual(summarize.summarize(root)[0]['cpus'], '2-5')
+            self.assertEqual(summarize.summarize(root)[0]['server_cpus'], '2')
+            mismatch = root / 'mismatch'
+            for engine, server_cpus in [('rut', '2'), ('nginx', '3')]:
+                for rep in range(1, 4):
+                    p = mismatch / f'{engine}{rep}'
+                    p.mkdir(parents=True)
+                    bench.save(p / 'result.json', dict(engine=engine, repetition=rep,
+                        host='192.0.2.2', body_size=1024, connections=128, duration=30,
+                        warmup=5, port=8087, threads=4, cpus='2-5', server_cpus=server_cpus,
+                        server_workers=1, server_config_sha256='config-a', server_binary_sha256='binary-a',
+                        server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
+                        server_run_id=f'{engine}-{rep}', valid=True,
+                        results=[dict(phase='measurement', rps=100, p99_us=100)]))
+            with self.assertRaises(ValueError):
+                summarize.summarize(root)
             unfinished = root / 'unfinished'
             unfinished.mkdir()
             (unfinished / 'environment.json').write_text('{}')

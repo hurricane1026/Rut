@@ -34,6 +34,9 @@ python3 bench.py prepare --output /tmp/origin-1m --port 9087 --workers 4 --body-
 python3 bench.py serve --engine origin --config /tmp/origin-1m --binary /absolute/path/nginx --cpus 2-5
 ```
 
+`serve` writes `/tmp/origin-1m/server-manifest.json`; keep the manifest from the
+currently running proxy together with each client result.
+
 保持前台运行。响应是确定性二进制文件，URL 为 `/proxy`，允许上游连接复用。
 仅在受信任测试网络开放 P 的 8087 与 O 的 9087 端口；服务监听所有 IPv4 地址。
 
@@ -59,13 +62,15 @@ python3 bench.py serve --engine nginx --config /tmp/proxy-1m --binary /absolute/
 先等待代理启动，再执行一轮：
 
 ```bash
-python3 bench.py client --host 192.0.2.20 --engine rut --rep 1 --cpus 2-5 --threads 4 --connections 128 --body-size 1048576 --warmup 5 --duration 30 --wrk /absolute/path/wrk --output results/1m/rut-1
+python3 bench.py client --host 192.0.2.20 --engine rut --rep 1 --cpus 2-5 --threads 4 --connections 128 --body-size 1048576 --warmup 5 --duration 30 --wrk /absolute/path/wrk --server-manifest /tmp/proxy-1m/server-manifest.json --output results/1m/rut-1
 ```
 
 每次换代理后执行同样命令，只改 `--engine`、`--rep` 和 `--output`。
 **顺序：Rut 1 → nginx 1 → nginx 2 → Rut 2 → Rut 3 → nginx 3。**
 每个引擎实例只测一轮，下一轮重启服务，即便引擎没变也重启。
-客户端 `--engine` 是人工标记，务必与 P 当前运行的进程对应；它不会远程切换服务器。
+客户端 `--engine` 是人工标记，务必与 P 当前运行的进程对应；`--server-manifest` 必须来自当前
+服务进程，脚本会把服务端 CPU、worker 数作为配对坐标，并保留配置、binary 和 run identity
+供审计；它不会远程切换服务器。
 客户端命令通过 `taskset -c <cpus>` 固定 wrk 的 CPU 集合；代理服务命令也使用同一选项，
 因此比较坐标会记录并校验规范化后的客户端 CPU 集合。
 保存每轮服务端日志（启动命令可用 shell 重定向），不能依赖 HTTP Server 头识别 Rut。

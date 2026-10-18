@@ -14,12 +14,20 @@ import sys
 import time
 
 STATUS_SCRIPT = '''
-bad = 0
+threads = {}
+function setup(thread)
+  threads[#threads + 1] = thread
+  thread:set("bad", 0)
+end
 function response(status, headers, body)
   if status ~= 200 then bad = bad + 1 end
 end
 function done(summary, latency, requests)
-  print("Timed non-200 responses: " .. bad)
+  local total = 0
+  for _, thread in ipairs(threads) do
+    total = total + (thread:get("bad") or 0)
+  end
+  print("Timed non-200 responses: " .. total)
 end
 '''
 
@@ -113,6 +121,24 @@ def config(out, body_size, origin, port, workers):
                                  port=port, workers=workers))
 
 
+def config_identity(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def validate_server_manifest(manifest, engine, port, body_size):
+    required = ('schema', 'engine', 'cpus', 'workers', 'body_size', 'listen_port',
+                'config_sha256', 'binary_sha256', 'run_id')
+    if any(key not in manifest for key in required):
+        raise ValueError('incomplete server manifest')
+    if manifest['schema'] != 1 or manifest['engine'] != engine:
+        raise ValueError('server manifest does not match client engine')
+    if manifest['workers'] <= 0 or not manifest['cpus']:
+        raise ValueError('incomplete server manifest')
+    if manifest['listen_port'] != port or manifest['body_size'] != body_size:
+        raise ValueError('server manifest does not match client coordinates')
+    return manifest
+
+
 def serve(a):
     out = a.config.resolve()
     c = json.loads((out / 'config.json').read_text())
@@ -134,6 +160,18 @@ def serve(a):
     argv = ['taskset', '-c', a.cpus] + argv
     save(out / f'{run_id}-command.json', {'argv': argv,
          'study_environment': {k: v for k, v in env.items() if k.startswith('RUT_STUDY_')}})
+    save(out / 'server-manifest.json', {
+        'schema': 1,
+        'run_id': run_id,
+        'engine': a.engine,
+        'cpus': normalize_cpus(a.cpus),
+        'workers': c['workers'],
+        'body_size': c['body_size'],
+        'listen_port': c['port'],
+        'config_sha256': config_identity(out / 'config.json'),
+        'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
+        'command': str(out / f'{run_id}-command.json'),
+    })
     # Foreground execution: Ctrl-C stops this server, never unrelated processes.
     os.execvpe(argv[0], argv, env)
 
@@ -183,6 +221,8 @@ def client(a):
     ipaddress.IPv4Address(a.host)
     a.output.mkdir(parents=True, exist_ok=False)
     a.output_created = True
+    manifest = json.loads(a.server_manifest.read_text())
+    validate_server_manifest(manifest, a.engine, a.port, a.body_size)
     snapshot(a.output / 'environment.json', [a.wrk])
     cpus = normalize_cpus(a.cpus)
     preflight(a.host, a.port, a.body_size)
@@ -204,6 +244,10 @@ def client(a):
     result = dict(engine=a.engine, repetition=a.rep, host=a.host, cpus=cpus,
                   body_size=a.body_size, connections=a.connections,
                   duration=a.duration, warmup=a.warmup, port=a.port, threads=a.threads, results=results,
+                  server_cpus=manifest['cpus'], server_workers=manifest['workers'],
+                  server_config_sha256=manifest['config_sha256'], server_binary_sha256=manifest['binary_sha256'],
+                  server_manifest=str(a.server_manifest.resolve()), server_listen_port=manifest['listen_port'],
+                  server_run_id=manifest['run_id'],
                   valid=all(r['valid'] for r in results))
     save(a.output / 'result.json', result)
     print(json.dumps(result, indent=2))
@@ -234,6 +278,7 @@ def main():
     c.add_argument('--threads', type=positive, default=4)
     c.add_argument('--cpus', required=True)
     c.add_argument('--wrk', default='wrk')
+    c.add_argument('--server-manifest', type=Path, required=True)
     c.add_argument('--warmup', type=positive, default=5)
     c.add_argument('--duration', type=positive, default=30)
     c.add_argument('--output', type=Path, required=True)
