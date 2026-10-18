@@ -102,6 +102,7 @@ struct EchoServer {
         int id;
         u32 len;
         bool end;
+        bool response_hold_open;
         bool trailer;
         bool saw_grpc_content_type;
         bool saw_te_trailers;
@@ -153,11 +154,11 @@ struct EchoServer {
                              void*) {
         auto* s = static_cast<Stream*>(source->ptr);
         const u32 n = s->len < len ? s->len : static_cast<u32>(len);
-        if (!n && !s->end) return NGHTTP2_ERR_DEFERRED;
+        if (!n && (!s->end || s->response_hold_open)) return NGHTTP2_ERR_DEFERRED;
         memcpy(buf, s->data, n);
         s->len -= n;
         memmove(s->data, s->data + n, s->len);
-        if (!s->len && s->end) {
+        if (!s->len && s->end && !s->response_hold_open) {
             *flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
             nghttp2_nv trailers[] = {nv("grpc-status", "0"), nv("x-trailer", "present")};
             if (nghttp2_submit_trailer(session, id, trailers, 2) != 0)
@@ -186,6 +187,7 @@ struct EchoServer {
             if (mode == 8) self->duplicate_content_type_order = 1;
             if (mode == 9) self->duplicate_content_type_order = 2;
             if (mode == 5) {
+                s->response_hold_open = true;
                 const u32 message_len = self->stream_response_len.load();
                 if (message_len < 5 || message_len > sizeof(s->data))
                     return NGHTTP2_ERR_CALLBACK_FAILURE;
