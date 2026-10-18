@@ -214,6 +214,28 @@ TEST(protobuf_source, field_and_nested_message_symbols_collide_in_both_orders) {
         CHECK(result.error().kind == SourceError::Kind::Schema);
     }
 }
+TEST(protobuf_source, imported_package_namespace_shadows_outer_type_fallback) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; package p.x; message A {}"));
+    const char* packages[] = {"p.q.x", "p.q.y"};
+    for (u32 index = 0; index < 2; ++index) {
+        const char* package = packages[index];
+        REQUIRE(files.write_file(
+            "extra.proto",
+            index == 0 ? "syntax='proto3'; package p.q.x;" : "syntax='proto3'; package p.q.y;"));
+        REQUIRE(files.write_file("root.proto",
+                                 "syntax='proto3'; package p.q; import 'types.proto'; import "
+                                 "'extra.proto'; message M { x.A value=1; }"));
+        Storage storage;
+        auto result = files.load(storage);
+        if (index == 0) {
+            REQUIRE_FALSE(result.has_value());
+            CHECK(result.error().kind == SourceError::Kind::Schema);
+        } else
+            REQUIRE(result.has_value());
+    }
+}
 TEST(protobuf_source, transitive_import_does_not_grant_type_visibility) {
     Files files;
     REQUIRE(files.ok);
