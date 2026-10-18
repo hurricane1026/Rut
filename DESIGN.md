@@ -1453,6 +1453,14 @@ health checks remain outside this path. The frontend rejects
 `.http2` combined with the HTTP/1 health-check configuration. See
 [examples/grpc.rut](examples/grpc.rut) and the language card.
 
+The gRPC-Web protocol primitives provide strict incremental base64 encoding
+and decoding, gRPC-Web content-type classification, and bounded trailer-frame
+encoding without protobuf decoding. The decoder accepts arbitrary input chunk
+boundaries and multiple independently padded flush blocks, and rejects invalid
+alphabet, padding, and non-canonical pad bits. These helpers do not by
+themselves enable HTTP/1 or HTTP/2 gRPC-Web forwarding; the runtime bridge,
+flow-control accounting, and browser-facing CORS policy remain separate work.
+
 **Load balancing algorithms:**
 
 All standard algorithms are built-in. The runtime tracks per-target state
