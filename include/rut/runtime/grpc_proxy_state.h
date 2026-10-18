@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/grpc_message.h"
+#include "rut/runtime/grpc_web.h"
 #include "rut/runtime/tls.h"
 
 namespace rut {
@@ -35,6 +36,8 @@ struct GrpcExchange {
     u64 request_bytes;
     GrpcMessageLimit request_message;
     GrpcMessageLimit response_message;
+    GrpcWebBase64Decoder request_base64;
+    GrpcWebBase64Encoder response_base64;
     u32 expected_request_bytes;
     bool has_request_length;
     bool request_end;
@@ -44,6 +47,7 @@ struct GrpcExchange {
     bool response_headers_sent;
     bool response_end_sent;
     u8 failure;
+    GrpcWebContentType web_mode;
     bool slot_held;
     u16 upstream_id;
     u32 upload_len;
@@ -54,6 +58,12 @@ struct GrpcExchange {
     u32 request_trailers_len;
     u32 response_headers_len;
     u32 response_trailers_len;
+    u32 response_trailers_offset;
+    u32 upload_raw_credit;
+    bool web_trailer_queued;
+    bool web_body_flushed;
+    bool web_trailer_flushed;
+    bool web_h1;
     bool has_response_length;
     u32 response_mutation_bytes;
     u8 response_mutation_count;
@@ -77,15 +87,21 @@ struct GrpcExchange {
         deadline_us = request_bytes = 0;
         request_message.init();
         response_message.init();
+        request_base64.init();
+        response_base64.init();
         expected_request_bytes = 0;
         has_request_length = request_end = request_headers_sent = request_end_sent = false;
         response_end = response_headers_sent = response_end_sent = false;
         failure = 0;
+        web_mode = GrpcWebContentType::Native;
         slot_held = false;
         upstream_id = 0;
         upload_len = download_len = response_bytes = expected_response_bytes = 0;
         request_headers_len = request_trailers_len = 0;
         response_headers_len = response_trailers_len = 0;
+        response_trailers_offset = upload_raw_credit = 0;
+        web_trailer_queued = web_body_flushed = web_trailer_flushed = false;
+        web_h1 = false;
         has_response_length = false;
         response_mutation_bytes = 0;
         response_mutation_count = 0;

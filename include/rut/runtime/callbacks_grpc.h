@@ -749,7 +749,13 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 grpc_pop(x->upload, x->upload_len, amount);
                 stream->send_window -= static_cast<i32>(amount);
                 h.conn_send_window -= amount;
-                x->downstream->h2->consume_data(x->downstream_stream, amount);
+                if (x->web_mode == GrpcWebContentType::Text) {
+                    if (!x->upload_len && x->upload_raw_credit) {
+                        x->downstream->h2->consume_data(x->downstream_stream, x->upload_raw_credit);
+                        x->upload_raw_credit = 0;
+                    }
+                } else
+                    x->downstream->h2->consume_data(x->downstream_stream, amount);
             } else if (!x->upload_len && x->request_end && !x->request_end_sent) {
                 if (x->request_trailers_len) {
                     n = x->request_trailers_len;
@@ -960,8 +966,12 @@ bool grpc_start_impl(Loop* loop,
                      u32 nh,
                      const ParsedRequest& req,
                      bool end) {
+    const GrpcWebContentType web_mode = grpc_request_mode(req);
     if (!cfg || uid >= cfg->upstream_count || !cfg->upstreams[uid].http2 ||
-        req.method != HttpMethod::POST || !grpc_request(req) || down.h2->grpc.active >= 64)
+        req.method != HttpMethod::POST ||
+        (web_mode != GrpcWebContentType::Native && web_mode != GrpcWebContentType::Binary &&
+         web_mode != GrpcWebContentType::Text) ||
+        down.h2->grpc.active >= 64)
         return false;
     const auto& target = cfg->upstreams[uid];
     if (!target.addr_count) return false;
@@ -990,6 +1000,7 @@ bool grpc_start_impl(Loop* loop,
     if (!x) return false;
     static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize);
     x->init();
+    x->web_mode = web_mode;
     x->request_message.init(target.max_request_message_bytes);
     x->response_message.init(target.max_response_message_bytes);
     if (!grpc_snapshot_response_mutations(down, *x)) {
@@ -1039,9 +1050,12 @@ bool grpc_start_impl(Loop* loop,
     for (u32 i = 0; i < nh; i++) {
         if (!grpc_request_header_allowed(hs[i]) || filtered_n >= Http2Conn::kMaxHeadersPerReq)
             continue;
+        if (web_mode == GrpcWebContentType::Text && hs[i].name.eq({"content-length", 14})) continue;
         filtered[filtered_n] = hs[i];
         if (hs[i].name.eq({":scheme", 7}))
             filtered[filtered_n].value = target.tls.enabled ? Str{"https", 5} : Str{"http", 4};
+        if (web_mode != GrpcWebContentType::Native && hs[i].name.eq({"content-type", 12}))
+            filtered[filtered_n].value = {"application/grpc", 16};
         filtered_n++;
     }
     x->request_headers_len = http2_write_headers(
@@ -1234,24 +1248,68 @@ void grpc_request_data(
         down.h2->consume_data(x.downstream_stream, len);
         return;
     }
-    const u8 framing_status = x.request_message.feed(data, len, end);
+    const u32 upload_before = x.upload_len;
+    const u8* upload_data = data;
+    u32 upload_len = len;
+    if (x.web_mode == GrpcWebContentType::Text) {
+        if (len > UINT32_MAX - x.upload_raw_credit) {
+            down.h2->consume_data(x.downstream_stream, x.upload_raw_credit + len);
+            x.upload_raw_credit = 0;
+            x.failure = 8;
+            grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
+            return;
+        }
+        x.upload_raw_credit += len;
+        u32 consumed = 0;
+        const auto status = x.request_base64.feed(data,
+                                                  len,
+                                                  consumed,
+                                                  x.upload + x.upload_len,
+                                                  sizeof(x.upload) - x.upload_len,
+                                                  upload_len);
+        if (status == GrpcWebCodecStatus::Invalid || consumed != len) {
+            down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+            x.upload_raw_credit = 0;
+            x.failure = status == GrpcWebCodecStatus::Invalid ? 13 : 8;
+            grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
+            return;
+        }
+        if (end && x.request_base64.finish() != GrpcWebCodecStatus::Ok) {
+            down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+            x.upload_raw_credit = 0;
+            x.failure = 13;
+            grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
+            return;
+        }
+        upload_data = x.upload + upload_before;
+    }
+    const u8 framing_status = x.request_message.feed(upload_data, upload_len, end);
     if (framing_status) {
-        down.h2->consume_data(x.downstream_stream, len);
+        down.h2->consume_data(x.downstream_stream,
+                              x.web_mode == GrpcWebContentType::Text ? x.upload_raw_credit : len);
+        x.upload_raw_credit = 0;
         x.failure = framing_status;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
-    if (len > sizeof(x.upload) - x.upload_len ||
+    if ((x.web_mode != GrpcWebContentType::Text && len > sizeof(x.upload) - x.upload_len) ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
                                   (end && x.request_bytes != x.expected_request_bytes)))) {
-        down.h2->consume_data(x.downstream_stream, len);
+        down.h2->consume_data(x.downstream_stream,
+                              x.web_mode == GrpcWebContentType::Text ? x.upload_raw_credit : len);
+        x.upload_raw_credit = 0;
         x.failure = 13;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
-    if (len) __builtin_memcpy(x.upload + x.upload_len, data, len);
-    x.upload_len += len;
+    if (x.web_mode != GrpcWebContentType::Text && len)
+        __builtin_memcpy(x.upload + x.upload_len, data, len);
+    x.upload_len += upload_len;
     x.request_end = end;
+    if (x.web_mode == GrpcWebContentType::Text && !x.upload_len && x.upload_raw_credit) {
+        down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+        x.upload_raw_credit = 0;
+    }
     grpc_drive_upstream(loop, *x.upstream);
 }
 

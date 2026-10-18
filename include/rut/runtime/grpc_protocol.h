@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rut/runtime/grpc_web.h"
 #include "rut/runtime/http_parser.h"
 
 namespace rut {
@@ -27,5 +28,11 @@ inline bool grpc_request(const ParsedRequest& req) {
         if (grpc_header_name(req.headers[i].name, {"content-type", 12}))
             return grpc_content_type(req.headers[i].value);
     return false;
+}
+inline GrpcWebContentType grpc_request_mode(const ParsedRequest& req) {
+    for (u32 i = 0; i < req.header_count; i++)
+        if (grpc_header_name(req.headers[i].name, {"content-type", 12}))
+            return grpc_web_content_type(req.headers[i].value);
+    return GrpcWebContentType::Other;
 }
 }  // namespace rut
