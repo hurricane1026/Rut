@@ -719,9 +719,7 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
         }
         return out;
     };
-    auto signed_header = [&](size_t target_size) {
-        std::string header = R"({"alg":"HS256","x":""})";
-        header.insert(header.size() - 2, target_size - header.size(), 'x');
+    auto sign_header = [&](const std::string& header) {
         const std::string encoded_header = b64url(header);
         const std::string signing_input = encoded_header + ".e30";
         unsigned char digest[EVP_MAX_MD_SIZE];
@@ -736,14 +734,18 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
         return signing_input + "." +
                b64url(std::string(reinterpret_cast<const char*>(digest), digest_len));
     };
-    CHECK(signed_header(1024).size() > 0);
+    auto signed_header = [&](size_t target_size) {
+        std::string header = R"({"alg":"HS256","x":""})";
+        header.insert(header.size() - 2, target_size - header.size(), 'x');
+        return sign_header(header);
+    };
     CHECK(decode(hs256_key.c_str(), signed_header(1024).c_str()).first);
     CHECK_FALSE(decode(hs256_key.c_str(), signed_header(1025).c_str()).first);
     std::string flood = R"({"alg":"HS256")";
     for (u32 i = 0; i < 700; ++i) flood += ",\"x" + std::to_string(i) + "\":0";
     flood += '}';
     CHECK(flood.size() > 5000);
-    const std::string flood_token = b64url(flood) + ".e30.AA";
+    const std::string flood_token = sign_header(flood);
     CHECK_FALSE(decode(hs256_key.c_str(), flood_token.c_str()).first);
     std::string oversized = R"({"alg":"HS256","x":")" + std::string(1010, 'x') + "\"}";
     CHECK(oversized.size() > 1024);

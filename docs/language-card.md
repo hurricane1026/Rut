@@ -802,8 +802,9 @@ route GET "/api" {
 ## Built-ins (call them, never reimplement)
 
 ```
-string:  s.len s.isEmpty s.hasPrefix/hasSuffix/contains s.upper()/lower()/trim()
-         s.trimPrefix/trimSuffix/replace/split/slice s.matches(re"") s.match(re"") ⏳
+string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
+         s.replace/split/slice s.matches(re"") s.match(re"")
+         ⏳ s.hasPrefix/hasSuffix/trimPrefix/trimSuffix
 hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
 jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
          decode with json.decode/json.get). ⏳ publicKey/RS/ES and jwtEncode
