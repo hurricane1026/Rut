@@ -3400,7 +3400,7 @@ TEST(grpc_proxy, grpc_web_response_mutations_survive_content_type_rewrite) {
     }
 }
 
-TEST(grpc_proxy, grpc_web_incomplete_native_message_marks_response_unusable) {
+TEST(grpc_proxy, grpc_web_incomplete_unstaged_message_becomes_status_trailer) {
     GrpcDriveFixture loop;
     Connection upstream, downstream;
     upstream.reset();
@@ -3426,9 +3426,26 @@ TEST(grpc_proxy, grpc_web_incomplete_native_message_marks_response_unusable) {
     const u8 partial[] = {0, 0, 0, 0, 4, 0xaa, 0xbb};
     grpc_response_data<GrpcDriveFixture>(&dispatch, upstream_h2, 1, partial, sizeof(partial), true);
     CHECK_EQ(x.failure, 13u);
-    CHECK(x.web_response_invalid);
+    CHECK(!x.web_response_invalid);
     CHECK(x.response_end);
     CHECK_EQ(x.download_len, 0u);
+    u8 output[1024];
+    u32 output_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+    for (u32 i = 0; i < 4 && output_len < sizeof(output); i++)
+        output_len += grpc_pump_downstream(&loop, downstream, output + output_len,
+                                           sizeof(output) - output_len);
+    CHECK_GT(output_len, 0u);
+    CHECK(x.web_failure_prepared);
+    CHECK_EQ(x.download_len, 0u);
+    CHECK_GT(x.response_trailers_len, 0u);
+    CHECK(x.response_headers_sent);
+    CHECK(!x.web_response_invalid);
+    constexpr char status[] = "grpc-status: 13";
+    bool has_status = false;
+    for (u32 i = 0; i + sizeof(status) - 1 <= x.response_trailers_len; i++) {
+        if (memcmp(x.response_trailers + i, status, sizeof(status) - 1) == 0) has_status = true;
+    }
+    CHECK(has_status);
 }
 
 TEST(grpc_proxy, grpc_web_reset_uses_downstream_staged_message_boundary) {
