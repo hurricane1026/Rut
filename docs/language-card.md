@@ -156,11 +156,11 @@ func f(_ req: Request, limit: ByteSize) { ... }   // first param unlabeled, rest
 f(req, limit: 1mb)                // ⏳ mixed positional+named call args (parser rejects the label)
 req.f(limit: 1mb)                 // UFCS: t.f(a) == f(t, a) — use when value
                                   // flows into the FIRST parameter
-req.path.trimPrefix("/api").split("/")          // UFCS chaining
+// ⏳ String prefix built-ins are planned; use the X-JWT extraction above today.
 
 // Pipeline | — use when the value lands in a NON-first position.
 // RHS must be a call with an explicit _ / _N placeholder (else compile error).
-let parts = req.path | trimPrefix("/api", _) | split(_, "/")
+// ⏳ Prefix pipeline built-ins are planned; this syntax is not currently supported.
 ```
 
 No closures, no function values (`let g = f` is an error), no recursion, no FFI.
@@ -803,7 +803,7 @@ route GET "/api" {
 
 ```
 string:  s.len s.isEmpty s.hasPrefix/hasSuffix/contains s.upper()/lower()/trim()
-         s.trimPrefix/trimSuffix/replace/split/slice s.matches(re"") s.match(re"")
+         s.trimPrefix/trimSuffix/replace/split/slice s.matches(re"") s.match(re"") ⏳
 hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
 jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
          decode with json.decode/json.get). ⏳ publicKey/RS/ES and jwtEncode

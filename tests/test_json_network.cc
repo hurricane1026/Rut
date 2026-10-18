@@ -17,6 +17,7 @@
 #include <string>
 #include <utility>
 
+#include <openssl/hmac.h>
 #include <stdlib.h>
 
 using namespace rut;
@@ -718,6 +719,26 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
         }
         return out;
     };
+    auto signed_header = [&](size_t target_size) {
+        std::string header = R"({"alg":"HS256","x":""})";
+        header.insert(header.size() - 2, target_size - header.size(), 'x');
+        const std::string encoded_header = b64url(header);
+        const std::string signing_input = encoded_header + ".e30";
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int digest_len = 0;
+        HMAC(EVP_sha256(),
+             hs256_key.data(),
+             static_cast<int>(hs256_key.size()),
+             reinterpret_cast<const unsigned char*>(signing_input.data()),
+             signing_input.size(),
+             digest,
+             &digest_len);
+        return signing_input + "." +
+               b64url(std::string(reinterpret_cast<const char*>(digest), digest_len));
+    };
+    CHECK(signed_header(1024).size() > 0);
+    CHECK(decode(hs256_key.c_str(), signed_header(1024).c_str()).first);
+    CHECK_FALSE(decode(hs256_key.c_str(), signed_header(1025).c_str()).first);
     std::string flood = R"({"alg":"HS256")";
     for (u32 i = 0; i < 700; ++i) flood += ",\"x" + std::to_string(i) + "\":0";
     flood += '}';
