@@ -690,6 +690,7 @@ void grpc_response_headers(
             x->failure = 8;
         }
     }
+    const bool filtered_has_status = grpc_has_status(filtered, filtered_n);
     const u8 observed_status = end ? grpc_observed_status(filtered, filtered_n) : 2;
     if (web && backend_terminal) {
         for (u32 i = 0; i < filtered_n;) {
@@ -722,7 +723,7 @@ void grpc_response_headers(
     // mutations apply to those headers, so telemetry must observe the same
     // filtered grpc-status that the downstream receives.
     if (end) x->response_status = observed_status;
-    if (end && (!grpc_has_status(hs, n) || !grpc_has_status(filtered, filtered_n))) x->failure = 2;
+    if (end && (!grpc_has_status(hs, n) || !filtered_has_status)) x->failure = 2;
     if (web && end && !backend_terminal && !x->failure) x->failure = 2;
     if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
         x->failure = 13;
