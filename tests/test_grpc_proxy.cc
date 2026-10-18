@@ -3448,6 +3448,56 @@ TEST(grpc_proxy, grpc_web_incomplete_unstaged_message_becomes_status_trailer) {
     CHECK(has_status);
 }
 
+TEST(grpc_proxy, grpc_web_text_batches_independently_padded_messages) {
+    GrpcDriveFixture loop;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn h;
+    h.init_client();
+    downstream.h2 = &h;
+    REQUIRE(h.open_stream(1) != nullptr);
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Text;
+    x.downstream = &downstream;
+    x.downstream_stream = 1;
+    x.response_headers_sent = true;
+    REQUIRE(grpc_attach(h, &x));
+    constexpr u32 messages = 128;
+    constexpr u32 native_size = 7;
+    for (u32 j = 0; j < messages; j++) {
+        const u8 message[] = {0, 0, 0, 0, 2, static_cast<u8>(j), 0xaa};
+        memcpy(x.download + j * native_size, message, sizeof(message));
+    }
+    x.download_len = messages * native_size;
+    u8 expected[messages * native_size];
+    memcpy(expected, x.download, sizeof(expected));
+    u8 output[kDefaultMaxFrameSize + kFrameHeaderSize];
+    const u32 n = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+    Http2FrameHeader frame;
+    REQUIRE(parse_frame_header(output, n, &frame) == ParseStatus::Complete);
+    CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK_EQ(frame.length, messages * 12u);
+    CHECK_EQ(n, kFrameHeaderSize + frame.length);
+    CHECK_EQ(x.download_len, 0u);
+    CHECK_EQ(x.response_base64.pending_len, 0u);
+    u8 decoded[sizeof(expected)];
+    GrpcWebBase64Decoder decoder;
+    decoder.init();
+    u32 consumed = 0, written = 0;
+    CHECK_EQ(
+        decoder.feed(
+            output + kFrameHeaderSize, frame.length, consumed, decoded, sizeof(decoded), written),
+        GrpcWebCodecStatus::Ok);
+    CHECK_EQ(consumed, frame.length);
+    CHECK_EQ(written, sizeof(expected));
+    CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+    CHECK(memcmp(expected, decoded, sizeof(expected)) == 0);
+    CHECK_EQ(x.staged_response_message.header_bytes, 0u);
+    CHECK_EQ(x.staged_response_message.remaining, 0u);
+    grpc_detach(h, &x);
+}
+
 TEST(grpc_proxy, grpc_web_text_large_message_batches_data_frames) {
     GrpcDriveFixture loop;
     Connection downstream;
