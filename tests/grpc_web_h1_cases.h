@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,130 @@ inline bool grpc_web_test_ssl_call(SSL* ssl,
         if (!interrupted) return false;
         if (retry_count) retry_count->fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+struct GrpcWebTestResponseFraming {
+    bool headers_complete = false;
+    bool valid = true;
+    bool has_content_length = false;
+    bool web = false;
+    bool text = false;
+    size_t body_offset = 0;
+    size_t content_length = 0;
+};
+
+inline GrpcWebTestResponseFraming grpc_web_test_response_framing(const u8* bytes, size_t length) {
+    GrpcWebTestResponseFraming result;
+    if (length == 0) return result;
+    const auto* boundary = std::search(bytes, bytes + length, "\r\n\r\n", "\r\n\r\n" + 4);
+    if (boundary == bytes + length) return result;
+    result.headers_complete = true;
+    result.body_offset = static_cast<size_t>(boundary - bytes) + 4;
+    const u8* line = static_cast<const u8*>(std::memchr(bytes, '\n', result.body_offset));
+    if (!line) {
+        result.valid = false;
+        return result;
+    }
+    line++;
+    while (line < boundary) {
+        const u8* line_end = static_cast<const u8*>(std::memchr(line, '\n', boundary - line));
+        if (!line_end || line_end == line || line_end[-1] != '\r') {
+            result.valid = false;
+            return result;
+        }
+        const u32 line_len = static_cast<u32>(line_end - line - 1);
+        const u8* colon = static_cast<const u8*>(std::memchr(line, ':', line_len));
+        if (!colon) {
+            result.valid = false;
+            return result;
+        }
+        Str name{reinterpret_cast<const char*>(line), static_cast<u32>(colon - line)};
+        const u8* value = colon + 1;
+        const u8* line_limit = line + line_len;
+        while (value < line_limit && (*value == ' ' || *value == '\t')) value++;
+        while (line_limit > value && (line_limit[-1] == ' ' || line_limit[-1] == '\t'))
+            line_limit--;
+        Str header_value{reinterpret_cast<const char*>(value),
+                         static_cast<u32>(line_limit - value)};
+        if (http_header_name_eq_ci(name.ptr, name.len, "content-length", 14)) {
+            if (result.has_content_length || !header_value.len) {
+                result.valid = false;
+                return result;
+            }
+            size_t parsed = 0;
+            for (u32 i = 0; i < header_value.len; i++) {
+                const char c = header_value.ptr[i];
+                if (c < '0' || c > '9' ||
+                    parsed > (static_cast<size_t>(-1) - static_cast<size_t>(c - '0')) / 10) {
+                    result.valid = false;
+                    return result;
+                }
+                parsed = parsed * 10 + static_cast<size_t>(c - '0');
+            }
+            result.has_content_length = true;
+            result.content_length = parsed;
+        } else if (http_header_name_eq_ci(name.ptr, name.len, "content-type", 12)) {
+            const auto mode = grpc_web_content_type(header_value);
+            result.web = mode == GrpcWebContentType::Binary || mode == GrpcWebContentType::Text;
+            result.text = mode == GrpcWebContentType::Text;
+        }
+        line = line_end + 1;
+    }
+    return result;
+}
+
+inline bool grpc_web_test_complete_envelope(const u8* body, size_t length, bool text) {
+    std::vector<u8> decoded;
+    if (text) {
+        decoded.resize(length);
+        GrpcWebBase64Decoder decoder;
+        decoder.init();
+        u32 consumed = 0, written = 0;
+        if (decoder.feed(body,
+                         static_cast<u32>(length),
+                         consumed,
+                         decoded.data(),
+                         static_cast<u32>(decoded.size()),
+                         written) != GrpcWebCodecStatus::Ok ||
+            consumed != length || decoder.finish() != GrpcWebCodecStatus::Ok)
+            return false;
+        decoded.resize(written);
+        body = decoded.data();
+        length = decoded.size();
+    }
+    size_t offset = 0;
+    while (offset < length) {
+        if (length - offset < 5) return false;
+        const u8 flags = body[offset];
+        const u32 message_len = (static_cast<u32>(body[offset + 1]) << 24) |
+                                (static_cast<u32>(body[offset + 2]) << 16) |
+                                (static_cast<u32>(body[offset + 3]) << 8) |
+                                static_cast<u32>(body[offset + 4]);
+        if (message_len > length - offset - 5) return false;
+        if (flags == 0x80) {
+            const u8* trailer = body + offset + 5;
+            const u8* trailer_end = trailer + message_len;
+            bool has_status = false;
+            while (trailer < trailer_end) {
+                const u8* line_end = static_cast<const u8*>(
+                    std::memchr(trailer, '\n', static_cast<size_t>(trailer_end - trailer)));
+                if (!line_end || line_end == trailer || line_end[-1] != '\r') return false;
+                const u32 line_len = static_cast<u32>(line_end - trailer - 1);
+                const u8* colon = static_cast<const u8*>(std::memchr(trailer, ':', line_len));
+                if (!colon) return false;
+                if (http_header_name_eq_ci(reinterpret_cast<const char*>(trailer),
+                                           static_cast<u32>(colon - trailer),
+                                           "grpc-status",
+                                           11))
+                    has_status = true;
+                trailer = line_end + 1;
+            }
+            return has_status && offset + 5 + message_len == length;
+        }
+        if (flags > 1) return false;
+        offset += 5 + message_len;
+    }
+    return false;
 }
 
 inline std::vector<u8> grpc_web_test_base64(const std::vector<u8>& input) {
@@ -356,15 +481,39 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                                        tls_retry_count,
                                        [&] { return SSL_read(ssl, buf, sizeof(buf)); });
             if (!read_ok) {
-                if (ssl_error == SSL_ERROR_ZERO_RETURN ||
-                    (ssl_error == SSL_ERROR_SYSCALL && error_number == 0))
-                    break;
+                if (ssl_error == SSL_ERROR_ZERO_RETURN) break;
+                if ((ssl_error == SSL_ERROR_SSL &&
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+                     ERR_GET_REASON(openssl_error) == SSL_R_UNEXPECTED_EOF_WHILE_READING
+#else
+                     false
+#endif
+                     ) ||
+                    (ssl_error == SSL_ERROR_SYSCALL && error_number == 0)) {
+                    const auto framing =
+                        grpc_web_test_response_framing(response.data(), response.size());
+                    if (framing.headers_complete && framing.valid && framing.web &&
+                        !framing.has_content_length && response.size() >= framing.body_offset &&
+                        grpc_web_test_complete_envelope(response.data() + framing.body_offset,
+                                                        response.size() - framing.body_offset,
+                                                        framing.text))
+                        break;
+                }
                 return fail("read", error_number, result, ssl_error, openssl_error);
             }
             n = result;
         }
         response.insert(response.end(), buf, buf + n);
         bytes_read += static_cast<size_t>(n);
+        const auto framing = grpc_web_test_response_framing(response.data(), response.size());
+        if (framing.headers_complete) {
+            if (!framing.valid) return fail("response_headers", 0, 0, 0, 0);
+            if (framing.has_content_length) {
+                if (response.size() - framing.body_offset > framing.content_length)
+                    return fail("response_length", 0, static_cast<int>(response.size()), 0, 0);
+                if (response.size() - framing.body_offset == framing.content_length) break;
+            }
+        }
         if (expected_body && std::search(response.begin(),
                                          response.end(),
                                          expected_body->begin(),
@@ -374,6 +523,10 @@ inline bool grpc_web_test_h1_exchange(u16 port,
             return fail("sizecap", 0, static_cast<int>(response.size()), 0, 0);
         }
     }
+    const auto final_framing = grpc_web_test_response_framing(response.data(), response.size());
+    if (final_framing.headers_complete && final_framing.valid && final_framing.has_content_length &&
+        response.size() - final_framing.body_offset != final_framing.content_length)
+        return fail("response_truncated", 0, static_cast<int>(response.size()), 0, 0);
     if (ssl) SSL_free(ssl);
     if (tls_context) SSL_CTX_free(tls_context);
     close(fd);
@@ -388,6 +541,7 @@ struct GrpcWebTlsGateServer {
     pthread_t thread{};
     std::atomic<bool> client_hello_waiting{false};
     std::atomic<bool> served{false};
+    bool truncate_response = false;
     bool started = false;
 
     static void* run(void* ptr) {
@@ -437,7 +591,7 @@ struct GrpcWebTlsGateServer {
                                                 "HTTP/1.1 200 OK\r\nConnection: close\r\n"
                                                 "Content-Type: application/grpc-web\r\n"
                                                 "Content-Length: %zu\r\n\r\n",
-                                                sizeof(body));
+                                                sizeof(body) + (self->truncate_response ? 7 : 0));
                 bool ok = header_len > 0 && static_cast<size_t>(header_len) < sizeof(headers);
                 for (size_t offset = 0; ok && offset < static_cast<size_t>(header_len);) {
                     const int n = SSL_write(ssl, headers + offset, header_len - offset);
@@ -446,15 +600,17 @@ struct GrpcWebTlsGateServer {
                     else
                         offset += static_cast<size_t>(n);
                 }
-                for (size_t offset = 0; ok && offset < sizeof(body);) {
-                    const int n = SSL_write(ssl, body + offset, sizeof(body) - offset);
+                const size_t body_to_send =
+                    self->truncate_response ? sizeof(body) / 2 : sizeof(body);
+                for (size_t offset = 0; ok && offset < body_to_send;) {
+                    const int n = SSL_write(ssl, body + offset, body_to_send - offset);
                     if (n <= 0)
                         ok = false;
                     else
                         offset += static_cast<size_t>(n);
                 }
                 self->served.store(ok, std::memory_order_release);
-                SSL_shutdown(ssl);
+                if (!self->truncate_response) SSL_shutdown(ssl);
             }
         }
         if (ssl) SSL_free(ssl);
@@ -1305,6 +1461,15 @@ TEST(grpc_proxy, h1_binary_tls_handshake_retries_eintr) {
         CHECK(client.rpc_ok);
     }
     sigaction(SIGUSR1, &old_action, nullptr);
+    CHECK(server.served.load(std::memory_order_acquire));
+}
+TEST(grpc_proxy, h1_binary_tls_truncated_content_length_fails) {
+    GrpcWebTlsGateServer server;
+    server.truncate_response = true;
+    REQUIRE(server.start());
+    const std::vector<u8> body{0, 0, 0, 0, 1, 0};
+    std::vector<u8> response;
+    CHECK(!grpc_web_test_h1_exchange(server.port, false, false, body, response, true));
     CHECK(server.served.load(std::memory_order_acquire));
 }
 TEST(grpc_proxy, h1_text_tls_epoll) {
