@@ -36,6 +36,7 @@ struct GrpcExchange {
     u64 request_bytes;
     GrpcMessageLimit request_message;
     GrpcMessageLimit response_message;
+    GrpcMessageLimit staged_response_message;
     GrpcWebBase64Decoder request_base64;
     GrpcWebBase64Encoder response_base64;
     u32 expected_request_bytes;
@@ -70,6 +71,8 @@ struct GrpcExchange {
     u8 web_pending_output[4];
     u8 web_pending_output_len;
     u8 web_pending_output_offset;
+    u8 web_pending_native[3];
+    u8 web_pending_native_len;
     bool has_response_length;
     u32 response_mutation_bytes;
     u8 response_mutation_count;
@@ -93,6 +96,7 @@ struct GrpcExchange {
         deadline_us = request_bytes = 0;
         request_message.init();
         response_message.init();
+        staged_response_message.init(0xffffffffu);
         request_base64.init();
         response_base64.init();
         expected_request_bytes = 0;
@@ -112,6 +116,7 @@ struct GrpcExchange {
         skip_rpc_log = false;
         web_h1_kick = nullptr;
         web_pending_output_len = web_pending_output_offset = 0;
+        web_pending_native_len = 0;
         has_response_length = false;
         response_mutation_bytes = 0;
         response_mutation_count = 0;

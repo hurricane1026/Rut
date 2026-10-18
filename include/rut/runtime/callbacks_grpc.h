@@ -424,7 +424,9 @@ inline bool grpc_web_is_trailer_only(const hpack::Header& h) {
            h.name.eq({"grpc-status-details-bin", 23});
 }
 inline bool grpc_web_response_boundary(const GrpcExchange& x) {
-    return !x.response_message.header_bytes && !x.response_message.remaining;
+    if (x.staged_response_message.header_bytes || x.staged_response_message.remaining) return false;
+    return x.web_mode != GrpcWebContentType::Text || !x.web_pending_output_offset ||
+           x.web_pending_output_offset == x.web_pending_output_len;
 }
 inline bool grpc_web_queue_h1_headers(GrpcExchange& x,
                                       const hpack::Header* headers,
@@ -762,7 +764,7 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     const u8 framing_status = x->response_message.feed(data, len, end);
     if (framing_status) {
         x->failure = framing_status;
-        if (web) x->web_response_invalid = true;
+        if (web) x->web_response_invalid = !grpc_web_response_boundary(*x);
         x->response_end = true;
         h.consume_data(sid, len);
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
@@ -818,6 +820,10 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
                 break;
         }
         x->response_end = true;
+        if (x->web_mode == GrpcWebContentType::Binary || x->web_mode == GrpcWebContentType::Text) {
+            x->web_response_invalid = !grpc_web_response_boundary(*x);
+            if (!x->web_response_invalid) x->download_len = 0;
+        }
         auto* d = static_cast<GrpcClientDispatch<Loop>*>(ctx);
         h.consume_data(x->upstream_stream, x->download_len);
         Connection* down = x->downstream;
@@ -1388,6 +1394,11 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                              x->web_mode == GrpcWebContentType::Text;
             if (web && x->failure && !x->web_response_invalid) {
                 x->response_end = true;
+                if (x->download_len) {
+                    if (x->upstream)
+                        x->upstream->h2->consume_data(x->upstream_stream, x->download_len);
+                    x->download_len = 0;
+                }
                 if (!x->web_trailer_queued && !grpc_web_queue_status_trailer(*x, x->failure))
                     x->web_response_invalid = true;
                 if (!x->response_headers_len) {
@@ -1473,6 +1484,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     n = http2_write_data(out + total, x->downstream_stream, payload, amount, final);
                     if (amount) {
                         if (consume_download) {
+                            (void)x->staged_response_message.feed(payload, amount, false);
                             grpc_pop(x->download, x->download_len, amount);
                             if (x->upstream)
                                 x->upstream->h2->consume_data(x->upstream_stream, amount);
@@ -1486,13 +1498,24 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     if (x->web_pending_output_offset == x->web_pending_output_len) {
                         x->web_pending_output_offset = x->web_pending_output_len = 0;
                         u32 consumed = 0, written = 0;
-                        if (x->download_len) {
+                        if (x->download_len || x->response_base64.pending_len == 3) {
+                            const u8 previous_len = x->response_base64.pending_len;
+                            u8 native[3]{};
+                            for (u8 i = 0; i < previous_len; i++)
+                                native[i] = x->response_base64.pending[i];
+                            const u32 needed = previous_len < 3 ? 3u - previous_len : 0u;
+                            for (u32 i = 0; i < needed && i < x->download_len; i++)
+                                native[previous_len + i] = x->download[i];
                             (void)x->response_base64.feed(x->download,
                                                           x->download_len,
                                                           consumed,
                                                           x->web_pending_output,
                                                           sizeof(x->web_pending_output),
                                                           written);
+                            if (written == 4) {
+                                __builtin_memcpy(x->web_pending_native, native, 3);
+                                x->web_pending_native_len = 3;
+                            }
                             if (consumed) {
                                 grpc_pop(x->download, x->download_len, consumed);
                                 if (x->upstream)
@@ -1509,8 +1532,12 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                                 written);
                             x->response_trailers_offset += consumed;
                         } else if (x->response_end) {
+                            const u8 native_len = x->response_base64.pending_len;
+                            for (u8 i = 0; i < native_len; i++)
+                                x->web_pending_native[i] = x->response_base64.pending[i];
                             (void)x->response_base64.flush(
                                 x->web_pending_output, sizeof(x->web_pending_output), written);
+                            if (written == 4) x->web_pending_native_len = native_len;
                             x->web_body_flushed = true;
                         }
                         x->web_pending_output_len = static_cast<u8>(written);
@@ -1530,6 +1557,12 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     n = http2_write_data(out + total, x->downstream_stream, payload, amount, final);
                     if (amount) {
                         x->staged_response_bytes += amount;
+                        if (x->web_pending_output_offset == x->web_pending_output_len &&
+                            x->web_pending_native_len) {
+                            (void)x->staged_response_message.feed(
+                                x->web_pending_native, x->web_pending_native_len, false);
+                            x->web_pending_native_len = 0;
+                        }
                         stream->send_window -= static_cast<i32>(amount);
                         h.conn_send_window -= amount;
                     }

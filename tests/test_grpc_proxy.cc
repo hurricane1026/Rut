@@ -103,6 +103,11 @@ struct EchoServer {
         u32 len;
         bool end;
         bool trailer;
+        bool saw_grpc_content_type;
+        bool saw_te_trailers;
+        u8 te_count;
+        bool saw_text_test_marker;
+        u8 content_length_count;
         u8 data[256 * 1024];
     } streams[64]{};
     int listen_fd = -1;
@@ -114,6 +119,11 @@ struct EchoServer {
     std::atomic<u32> accepts{0};
     std::atomic<u32> reply_mode{0};
     std::atomic<u32> request_trailers{0};
+    std::atomic<u32> grpc_content_type_requests{0};
+    std::atomic<u32> te_trailers_requests{0};
+    std::atomic<u32> bad_web_request_headers{0};
+    std::atomic<u32> text_marker_requests{0};
+    std::atomic<u32> text_content_length_requests{0};
     bool started = false;
     TlsServerContext* tls_context = nullptr;
     std::atomic<u32> handshake_failures{0};
@@ -159,6 +169,12 @@ struct EchoServer {
         if (!s) return NGHTTP2_ERR_CALLBACK_FAILURE;
         if (f->hd.type == NGHTTP2_HEADERS && f->headers.cat == NGHTTP2_HCAT_REQUEST) {
             self->requests++;
+            if (s->saw_text_test_marker) {
+                self->text_marker_requests++;
+                if (s->content_length_count) self->text_content_length_requests++;
+            }
+            if (s->saw_grpc_content_type && (!s->saw_te_trailers || s->te_count != 1))
+                self->bad_web_request_headers++;
             const u32 mode = self->reply_mode.exchange(0);
             if (mode == 2) return NGHTTP2_ERR_CALLBACK_FAILURE;
             if (mode == 1) {
@@ -207,15 +223,32 @@ struct EchoServer {
         return 0;
     }
     static int header(nghttp2_session*,
-                      const nghttp2_frame*,
+                      const nghttp2_frame* frame,
                       const uint8_t* name,
                       size_t name_len,
                       const uint8_t* value,
                       size_t value_len,
                       uint8_t,
                       void* user) {
-        if (name_len != 7 || memcmp(name, ":scheme", 7) != 0) return 0;
         auto* server = static_cast<EchoServer*>(user);
+        auto* stream = frame && frame->hd.stream_id ? server->get(frame->hd.stream_id) : nullptr;
+        if (stream && name_len == 12 && memcmp(name, "content-type", 12) == 0 && value_len == 16 &&
+            memcmp(value, "application/grpc", 16) == 0) {
+            stream->saw_grpc_content_type = true;
+            server->grpc_content_type_requests++;
+        }
+        if (stream && name_len == 2 && memcmp(name, "te", 2) == 0 && value_len == 8 &&
+            memcmp(value, "trailers", 8) == 0) {
+            stream->saw_te_trailers = true;
+            stream->te_count++;
+            server->te_trailers_requests++;
+        }
+        if (stream && name_len == 15 && memcmp(name, "x-test-web-mode", 15) == 0 &&
+            value_len == 4 && memcmp(value, "text", 4) == 0)
+            stream->saw_text_test_marker = true;
+        if (stream && name_len == 14 && memcmp(name, "content-length", 14) == 0)
+            stream->content_length_count++;
+        if (name_len != 7 || memcmp(name, ":scheme", 7) != 0) return 0;
         const char* expected = server->tls_context ? "https" : "http";
         if (value_len != strlen(expected) || memcmp(value, expected, value_len) != 0)
             server->bad_schemes++;
@@ -321,10 +354,15 @@ struct Client {
     SSL_CTX* tls_context = nullptr;
     SSL* ssl = nullptr;
     struct Rpc {
+        static constexpr u32 kWebBufferCap = 131072;
         u32 sent = 0, received = 0, size = 0;
         u32 status = 99;
+        u32 raw_len = 0, max_chunk = 0, response_len = 0;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
-             meta = false, trailer = false;
+             meta = false, trailer = false, raw_request = false, compare_pattern = true,
+             web_content_type = false;
+        std::unique_ptr<u8[]> raw;
+        std::unique_ptr<u8[]> response;
     } rpcs[17];
     nghttp2_session* session = nullptr;
     bool goaway = false;
@@ -338,12 +376,16 @@ struct Client {
                         nghttp2_data_source* source,
                         void*) {
         auto* rpc = static_cast<Rpc*>(source->ptr);
-        u32 n = rpc->size - rpc->sent;
+        u32 n = rpc->raw_request ? rpc->raw_len - rpc->sent : rpc->size - rpc->sent;
         if (n > cap) n = static_cast<u32>(cap);
+        if (rpc->max_chunk && n > rpc->max_chunk) n = rpc->max_chunk;
         if (!n && !rpc->end) return NGHTTP2_ERR_DEFERRED;
-        for (u32 i = 0; i < n; i++) out[i] = byte_at(rpc->sent + i);
+        if (rpc->raw_request)
+            memcpy(out, rpc->raw.get() + rpc->sent, n);
+        else
+            for (u32 i = 0; i < n; i++) out[i] = byte_at(rpc->sent + i);
         rpc->sent += n;
-        if (rpc->sent == rpc->size && rpc->end) {
+        if (rpc->sent == (rpc->raw_request ? rpc->raw_len : rpc->size) && rpc->end) {
             *flags |= NGHTTP2_DATA_FLAG_EOF;
             if (rpc->request_trailer) {
                 *flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
@@ -357,8 +399,16 @@ struct Client {
     static int receive(
         nghttp2_session*, uint8_t, int32_t sid, const uint8_t* data, size_t len, void* ctx) {
         auto& rpc = static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2];
-        for (u32 i = 0; i < len; i++)
-            if (data[i] != byte_at(rpc.received + i)) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (rpc.compare_pattern) {
+            for (u32 i = 0; i < len; i++)
+                if (data[i] != byte_at(rpc.received + i)) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        } else if (len > Rpc::kWebBufferCap - rpc.response_len) {
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        } else {
+            if (!rpc.response) rpc.response = std::make_unique<u8[]>(Rpc::kWebBufferCap);
+            memcpy(rpc.response.get() + rpc.response_len, data, len);
+            rpc.response_len += static_cast<u32>(len);
+        }
         rpc.received += static_cast<u32>(len);
         return 0;
     }
@@ -380,6 +430,8 @@ struct Client {
             rpc.meta = v == 8 && memcmp(value, "AAEC/w==", 8) == 0;
         if (n == 9 && memcmp(name, "x-trailer", n) == 0)
             rpc.trailer = v == 7 && memcmp(value, "present", 7) == 0;
+        if (n == 12 && memcmp(name, "content-type", n) == 0)
+            rpc.web_content_type = (v >= 20 && memcmp(value, "application/grpc-web", 20) == 0);
         return 0;
     }
     static int frame(nghttp2_session*, const nghttp2_frame* f, void* ctx) {
@@ -444,6 +496,40 @@ struct Client {
         provider.source.ptr = &rpcs[index];
         provider.read_callback = &data;
         return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
+    }
+    int request_web(u32 index,
+                    const u8* body,
+                    u32 body_len,
+                    bool text,
+                    u32 chunk,
+                    bool content_length = false) {
+        auto& rpc = rpcs[index];
+        if (body_len > Rpc::kWebBufferCap) return -1;
+        if (!rpc.raw) rpc.raw = std::make_unique<u8[]>(Rpc::kWebBufferCap);
+        memcpy(rpc.raw.get(), body, body_len);
+        rpc.raw_len = body_len;
+        rpc.raw_request = true;
+        rpc.compare_pattern = false;
+        rpc.end = true;
+        rpc.max_chunk = chunk;
+        static thread_local char content_length_value[16];
+        nghttp2_nv headers[8] = {
+            nv(":method", "POST"),
+            nv(":scheme", "http"),
+            nv(":authority", "grpc.test"),
+            nv(":path", "/test.Echo/Call"),
+            nv("content-type", text ? "application/grpc-web-text" : "application/grpc-web"),
+            nv("grpc-timeout", "1H")};
+        size_t count = 6;
+        if (text) headers[count++] = nv("x-test-web-mode", "text");
+        if (content_length) {
+            snprintf(content_length_value, sizeof(content_length_value), "%u", body_len);
+            headers[count++] = nv("content-length", content_length_value);
+        }
+        nghttp2_data_provider provider{};
+        provider.source.ptr = &rpc;
+        provider.read_callback = &data;
+        return nghttp2_submit_request(session, nullptr, headers, count, &provider, nullptr);
     }
     bool step() {
         if (!flush_session(session, fd, ssl)) return false;
@@ -1852,6 +1938,239 @@ TEST(grpc_proxy, h2_receive_promotion_replaces_full_ordinary_slice) {
     loop.shutdown();
 }
 
+template <typename Loop>
+void grpc_web_h2_case(rut::test::TestCase* _tc) {
+    (void)_tc;
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log().has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)).has_value());
+    cfg.upstreams[0].http2 = true;
+    REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &cfg;
+    REQUIRE(shard->spawn(-1).has_value());
+    {
+        Client client;
+        const bool connected = client.init(get_port(lfd));
+        CHECK(connected);
+        if (connected) {
+            const u8 grpc_body[] = {0, 0, 0, 0, 3, 0xff, 0xfe, 0xfd};
+            u8 text_body[64];
+            GrpcWebBase64Encoder encoder{};
+            encoder.init();
+            u32 consumed = 0, written = 0, flush_written = 0;
+            CHECK_EQ(
+                encoder.feed(
+                    grpc_body, sizeof(grpc_body), consumed, text_body, sizeof(text_body), written),
+                GrpcWebCodecStatus::Ok);
+            CHECK_EQ(consumed, sizeof(grpc_body));
+            CHECK_EQ(encoder.flush(text_body + written, sizeof(text_body) - written, flush_written),
+                     GrpcWebCodecStatus::Ok);
+            const u32 text_len = written + flush_written;
+            GrpcWebTrailer trailers[] = {{{"grpc-status", 11}, {"0", 1}},
+                                         {{"x-trailer", 9}, {"present", 7}}};
+            u8 expected_trailer[128];
+            u32 expected_trailer_len = 0;
+            REQUIRE(grpc_web_encode_trailer_envelope(
+                trailers, 2, expected_trailer, sizeof(expected_trailer), expected_trailer_len));
+            for (u32 i = 0; i < 6; i++) {
+                const bool text = i >= 3;
+                const u32 window_size = (i % 3) + 1;
+                nghttp2_settings_entry window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, window_size};
+                CHECK_EQ(nghttp2_submit_settings(client.session, 0, &window, 1), 0);
+                const u8* request_body = text ? text_body : grpc_body;
+                const u32 request_len = text ? text_len : sizeof(grpc_body);
+                CHECK_EQ(
+                    client.request_web(i, request_body, request_len, text, i % 2 ? 1 : 2, true),
+                    static_cast<int>(i * 2 + 1));
+                CHECK(client.until(i, true));
+                const auto& rpc = client.rpcs[i];
+                CHECK(rpc.web_content_type);
+                CHECK(rpc.meta);
+                u8 decoded[256];
+                u32 decoded_len = 0;
+                if (text) {
+                    GrpcWebBase64Decoder decoder{};
+                    decoder.init();
+                    u32 input_consumed = 0, output_written = 0;
+                    CHECK_EQ(decoder.feed(rpc.response.get(),
+                                          rpc.response_len,
+                                          input_consumed,
+                                          decoded,
+                                          sizeof(decoded),
+                                          output_written),
+                             GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(input_consumed, rpc.response_len);
+                    CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+                    decoded_len = output_written;
+                } else {
+                    CHECK_LE(rpc.response_len, sizeof(decoded));
+                    decoded_len = rpc.response_len;
+                    memcpy(decoded, rpc.response.get(), decoded_len);
+                }
+                CHECK_EQ(decoded_len, sizeof(grpc_body) + expected_trailer_len);
+                if (decoded_len == sizeof(grpc_body) + expected_trailer_len) {
+                    CHECK(memcmp(decoded, grpc_body, sizeof(grpc_body)) == 0);
+                    CHECK(memcmp(decoded + sizeof(grpc_body),
+                                 expected_trailer,
+                                 expected_trailer_len) == 0);
+                }
+            }
+            auto decode_text = [](const Client::Rpc& rpc, u8* output, u32 capacity) {
+                GrpcWebBase64Decoder decoder{};
+                decoder.init();
+                u32 consumed = 0, written = 0;
+                if (decoder.feed(rpc.response.get(),
+                                 rpc.response_len,
+                                 consumed,
+                                 output,
+                                 capacity,
+                                 written) != GrpcWebCodecStatus::Ok ||
+                    consumed != rpc.response_len || decoder.finish() != GrpcWebCodecStatus::Ok)
+                    return 0u;
+                return written;
+            };
+            auto contains = [](const u8* bytes, u32 size, const char* value, u32 value_len) {
+                if (value_len > size) return false;
+                for (u32 i = 0; i <= size - value_len; i++)
+                    if (memcmp(bytes + i, value, value_len) == 0) return true;
+                return false;
+            };
+            u8 multi_frames[14] = {0, 0, 0, 0, 2, 0xaa, 0xbb, 0, 0, 0, 0, 2, 0xcc, 0xdd};
+            u8 multi_text[32];
+            u32 multi_text_len = 0;
+            for (u32 offset = 0; offset < sizeof(multi_frames); offset += 7) {
+                GrpcWebBase64Encoder block{};
+                block.init();
+                u32 block_consumed = 0, block_written = 0, block_flush = 0;
+                CHECK_EQ(block.feed(multi_frames + offset,
+                                    7,
+                                    block_consumed,
+                                    multi_text + multi_text_len,
+                                    sizeof(multi_text) - multi_text_len,
+                                    block_written),
+                         GrpcWebCodecStatus::Ok);
+                CHECK_EQ(block_consumed, 7u);
+                CHECK_EQ(block.flush(multi_text + multi_text_len + block_written,
+                                     sizeof(multi_text) - multi_text_len - block_written,
+                                     block_flush),
+                         GrpcWebCodecStatus::Ok);
+                multi_text_len += block_written + block_flush;
+            }
+            CHECK_EQ(multi_text_len, 24u);
+            CHECK_EQ(client.request_web(6, multi_text, multi_text_len, true, 1, true), 13);
+            CHECK(client.until(6, true));
+            u8 multi_decoded[256];
+            const u32 multi_decoded_len =
+                decode_text(client.rpcs[6], multi_decoded, sizeof(multi_decoded));
+            CHECK_EQ(multi_decoded_len, sizeof(multi_frames) + expected_trailer_len);
+            if (multi_decoded_len == sizeof(multi_frames) + expected_trailer_len) {
+                CHECK(memcmp(multi_decoded, multi_frames, sizeof(multi_frames)) == 0);
+                CHECK(memcmp(multi_decoded + sizeof(multi_frames),
+                             expected_trailer,
+                             expected_trailer_len) == 0);
+            }
+            server->reply_mode = 1;
+            CHECK_EQ(client.request_web(7, grpc_body, sizeof(grpc_body), false, 2), 15);
+            CHECK(client.until(7, true));
+            u8 error_envelope[256];
+            u32 error_len = client.rpcs[7].response_len;
+            CHECK(error_len <= sizeof(error_envelope));
+            if (error_len <= sizeof(error_envelope))
+                memcpy(error_envelope, client.rpcs[7].response.get(), error_len);
+            CHECK(error_len >= 5);
+            if (error_len >= 5) {
+                CHECK_EQ(error_envelope[0], 0x80u);
+                const u32 payload_len = (static_cast<u32>(error_envelope[1]) << 24) |
+                                        (static_cast<u32>(error_envelope[2]) << 16) |
+                                        (static_cast<u32>(error_envelope[3]) << 8) |
+                                        error_envelope[4];
+                CHECK_EQ(payload_len, error_len - 5);
+                CHECK(contains(error_envelope + 5, payload_len, "grpc-status: 7", 14));
+            }
+            server->reply_mode = 2;
+            CHECK_EQ(client.request_web(8, grpc_body, sizeof(grpc_body), false, 2), 17);
+            CHECK(client.until(8, true));
+            CHECK(client.rpcs[8].response_len >= 5);
+            if (client.rpcs[8].response_len >= 5) {
+                CHECK_EQ(client.rpcs[8].response[0], 0x80u);
+                CHECK(contains(client.rpcs[8].response.get() + 5,
+                               client.rpcs[8].response_len - 5,
+                               "grpc-status: 14",
+                               15));
+            }
+            CHECK_EQ(server->grpc_content_type_requests.load(), 9u);
+            CHECK_EQ(server->te_trailers_requests.load(), 9u);
+            CHECK_EQ(server->bad_web_request_headers.load(), 0u);
+            CHECK_EQ(server->text_marker_requests.load(), 4u);
+            CHECK_EQ(server->text_content_length_requests.load(), 0u);
+            const u8 invalid_base64[] = {'A', 'B', '=', 'C'};
+            CHECK_EQ(client.request_web(9, invalid_base64, sizeof(invalid_base64), true, 1, true),
+                     19);
+            CHECK(client.until(9, true));
+            u8 invalid_response[256];
+            const u32 invalid_response_len =
+                decode_text(client.rpcs[9], invalid_response, sizeof(invalid_response));
+            CHECK(invalid_response_len >= 5);
+            if (invalid_response_len >= 5) {
+                CHECK_EQ(invalid_response[0], 0x80u);
+                CHECK(contains(
+                    invalid_response + 5, invalid_response_len - 5, "grpc-status: 13", 15));
+            }
+            nghttp2_settings_entry full_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535};
+            CHECK_EQ(nghttp2_submit_settings(client.session, 0, &full_window, 1), 0);
+            u8 large_request[70005] = {0, 0, 1, 0x11, 0x70};
+            for (u32 i = 5; i < sizeof(large_request); i++)
+                large_request[i] = static_cast<u8>((i * 31u + i / 251u) & 255u);
+            CHECK_EQ(
+                client.request_web(10, large_request, sizeof(large_request), false, 16384, true),
+                21);
+            CHECK(client.until(10, true));
+            CHECK_EQ(client.rpcs[10].response_len, sizeof(large_request) + expected_trailer_len);
+            if (client.rpcs[10].response_len == sizeof(large_request) + expected_trailer_len) {
+                CHECK(memcmp(client.rpcs[10].response.get(),
+                             large_request,
+                             sizeof(large_request)) == 0);
+                CHECK(memcmp(client.rpcs[10].response.get() + sizeof(large_request),
+                             expected_trailer,
+                             expected_trailer_len) == 0);
+            }
+            AccessLogEntry log_entry{};
+            bool found_large_log = false;
+            while (shard->log_ring->pop(log_entry)) {
+                if (log_entry.req_size == sizeof(large_request)) {
+                    found_large_log = true;
+                    CHECK_EQ(log_entry.resp_size, sizeof(large_request) + expected_trailer_len);
+                }
+            }
+            CHECK(found_large_log);
+        }
+    }
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+TEST(grpc_proxy, grpc_web_h2_epoll) {
+    grpc_web_h2_case<EpollEventLoop>(_tc);
+}
+TEST(grpc_proxy, grpc_web_h2_iouring) {
+    grpc_web_h2_case<IoUringEventLoop>(_tc);
+}
+
 TEST(grpc_proxy, streaming_and_pooling_epoll) {
     streaming_case<EpollEventLoop>(_tc);
 }
@@ -1956,6 +2275,18 @@ TEST(grpc_proxy, content_type_prefix_is_ascii_case_insensitive) {
     CHECK(grpc_content_type({"APPLICATION/grpc+proto", 22}));
     CHECK(grpc_content_type({"application/grpc; charset=utf-8", 32}));
     CHECK(!grpc_content_type({"application/grpcx", 17}));
+}
+TEST(grpc_proxy, request_classifier_accepts_web_modes_for_body_dispatch) {
+    ParsedRequest req{};
+    req.headers[0] = {lit_str("content-type"), lit_str("application/grpc-web")};
+    req.header_count = 1;
+    CHECK(grpc_request(req));
+    CHECK_EQ(grpc_request_mode(req), GrpcWebContentType::Binary);
+    req.headers[0].value = lit_str("application/grpc-web-text+proto");
+    CHECK(grpc_request(req));
+    CHECK_EQ(grpc_request_mode(req), GrpcWebContentType::Text);
+    req.headers[0].value = lit_str("application/grpcx");
+    CHECK(!grpc_request(req));
 }
 TEST(grpc_proxy, response_header_filter_strips_content_length_only) {
     const hpack::Header headers[] = {{Str{"content-length", 14}, Str{"0", 1}},
@@ -2969,6 +3300,265 @@ TEST(grpc_proxy, grpc_response_mutations_snapshot_per_exchange) {
     first.init();
     CHECK_FALSE(grpc_snapshot_response_mutations(downstream, first));
     CHECK(first.response_mutation_overflow);
+}
+
+TEST(grpc_proxy, grpc_web_response_mutations_survive_content_type_rewrite) {
+    GrpcDriveFixture loop;
+    Connection upstream, downstream;
+    upstream.reset();
+    downstream.reset();
+    Http2Conn upstream_h2, downstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    downstream_h2.init_client();
+    upstream.h2 = &upstream_h2;
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1));
+    REQUIRE(downstream_h2.open_stream(1));
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    downstream.resp_header_mutations[0] = {{"access-control-allow-origin", 27},
+                                           {"https://example.test", 20},
+                                           Connection::RespHeaderMutationMode::Set};
+    downstream.resp_header_mutation_count = 1;
+    REQUIRE(grpc_snapshot_response_mutations(downstream, x));
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    const hpack::Header headers[] = {{{":status", 7}, {"200", 3}},
+                                     {{"content-type", 12}, {"application/grpc", 16}}};
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, headers, 2, false);
+    CHECK_GT(x.response_headers_len, 9u);
+    if (x.response_headers_len > 9) {
+        hpack::DynamicTable dynamic;
+        dynamic.init(0);
+        u8 decoded_storage[1024];
+        hpack::Header decoded[8];
+        u32 decoded_count = 0;
+        const u32 block_len = x.response_headers_len - 9;
+        CHECK(hpack::decode_header_block(dynamic,
+                                         x.response_headers + 9,
+                                         block_len,
+                                         decoded_storage,
+                                         sizeof(decoded_storage),
+                                         decoded,
+                                         8,
+                                         &decoded_count));
+        bool web_type = false, cors = false;
+        for (u32 i = 0; i < decoded_count; i++) {
+            if (decoded[i].name.eq({"content-type", 12}))
+                web_type = decoded[i].value.eq({"application/grpc-web", 20});
+            if (decoded[i].name.eq({"access-control-allow-origin", 27}))
+                cors = decoded[i].value.eq({"https://example.test", 20});
+        }
+        CHECK(web_type);
+        CHECK(cors);
+    }
+}
+
+TEST(grpc_proxy, grpc_web_incomplete_native_message_marks_response_unusable) {
+    GrpcDriveFixture loop;
+    Connection upstream, downstream;
+    upstream.reset();
+    downstream.reset();
+    Http2Conn upstream_h2, downstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    downstream_h2.init_client();
+    upstream.h2 = &upstream_h2;
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1));
+    REQUIRE(downstream_h2.open_stream(1));
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    x.response_message.init(0xffffffffu);
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const u8 partial[] = {0, 0, 0, 0, 4, 0xaa, 0xbb};
+    grpc_response_data<GrpcDriveFixture>(&dispatch, upstream_h2, 1, partial, sizeof(partial), true);
+    CHECK_EQ(x.failure, 13u);
+    CHECK(x.web_response_invalid);
+    CHECK(x.response_end);
+    CHECK_EQ(x.download_len, 0u);
+}
+
+TEST(grpc_proxy, grpc_web_reset_uses_downstream_staged_message_boundary) {
+    auto run = [=](const u8* staged,
+                   u32 staged_len,
+                   u32 send_window,
+                   GrpcWebContentType mode,
+                   const u8* received,
+                   u32 received_len,
+                   Http2Error reset_error,
+                   bool size_failure,
+                   bool expect_invalid) {
+        GrpcDriveFixture loop;
+        Connection upstream, downstream;
+        upstream.reset();
+        downstream.reset();
+        u8 upstream_recv[SlicePool::kSliceSize];
+        upstream.bind_request_receive_buffer(upstream_recv, sizeof(upstream_recv));
+        u8 downstream_send[SlicePool::kSliceSize];
+        downstream.send_slice = downstream_send;
+        downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+        downstream.on_send = &pending_send;
+        Http2Conn upstream_h2, downstream_h2;
+        upstream_h2.init_client();
+        upstream_h2.grpc.upstream = true;
+        downstream_h2.init_client();
+        upstream.h2 = &upstream_h2;
+        downstream.h2 = &downstream_h2;
+        auto* up_stream = upstream_h2.open_stream(1);
+        auto* down_stream = downstream_h2.open_stream(1);
+        REQUIRE(up_stream != nullptr);
+        REQUIRE(down_stream != nullptr);
+        down_stream->send_window = static_cast<i32>(send_window);
+        GrpcExchange x;
+        x.init();
+        x.web_mode = mode;
+        x.upstream = &upstream;
+        x.downstream = &downstream;
+        x.upstream_stream = x.downstream_stream = 1;
+        x.response_headers_sent = true;
+        x.response_headers_len = 0;
+        if (staged_len) {
+            memcpy(x.download, staged, staged_len);
+            x.download_len = staged_len;
+        }
+        if (received_len) {
+            memcpy(x.download, received, received_len);
+            x.download_len = received_len;
+            (void)x.response_message.feed(received, received_len, false);
+        }
+        if (size_failure) x.response_message.init(2);
+        REQUIRE(grpc_attach(upstream_h2, &x));
+        REQUIRE(grpc_attach(downstream_h2, &x));
+        u8 output[128];
+        if (staged_len) {
+            x.upstream = nullptr;
+            const u32 staged_output =
+                grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+            CHECK_GT(staged_output, 0u);
+            for (u32 i = 0; mode == GrpcWebContentType::Text && i < 3 &&
+                            (x.download_len || x.response_base64.pending_len == 3);
+                 i++)
+                (void)grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+            x.upstream = &upstream;
+        }
+        GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+        if (size_failure) {
+            const u8 too_large[] = {0, 0, 0, 0, 3};
+            grpc_response_data<GrpcDriveFixture>(&dispatch, upstream_h2, 1, too_large, 5, false);
+            CHECK_EQ(x.failure, 8u);
+        } else {
+            grpc_response_reset<GrpcDriveFixture>(&dispatch, upstream_h2, 1, reset_error);
+        }
+        CHECK_EQ(x.web_response_invalid, expect_invalid);
+        if (expect_invalid && mode == GrpcWebContentType::Binary) {
+            CHECK_EQ(x.download_len, staged_len > send_window ? staged_len - send_window : 0u);
+        } else if (!expect_invalid) {
+            CHECK_EQ(x.download_len, 0u);
+        }
+        const u32 output_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+        CHECK_GT(output_len, 0u);
+        if (output_len >= 9) {
+            CHECK_EQ(output[3],
+                     expect_invalid ? static_cast<u8>(Http2FrameType::RstStream)
+                                    : static_cast<u8>(Http2FrameType::Data));
+        }
+        grpc_detach(downstream_h2, &x);
+    };
+    const u8 message[] = {0, 0, 0, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd};
+    run(message,
+        sizeof(message),
+        6,
+        GrpcWebContentType::Binary,
+        nullptr,
+        0,
+        Http2Error::Cancel,
+        false,
+        true);
+    run(message,
+        sizeof(message),
+        1000,
+        GrpcWebContentType::Binary,
+        nullptr,
+        0,
+        Http2Error::Cancel,
+        false,
+        false);
+    run(nullptr, 0, 65535, GrpcWebContentType::Binary, nullptr, 0, Http2Error::Cancel, true, false);
+    run(nullptr,
+        0,
+        65535,
+        GrpcWebContentType::Binary,
+        message,
+        7,
+        Http2Error::Cancel,
+        false,
+        false);
+    run(message,
+        sizeof(message),
+        2,
+        GrpcWebContentType::Text,
+        nullptr,
+        0,
+        Http2Error::Cancel,
+        false,
+        true);
+    run(message,
+        sizeof(message),
+        1000,
+        GrpcWebContentType::Text,
+        nullptr,
+        0,
+        Http2Error::Cancel,
+        false,
+        false);
+}
+
+TEST(grpc_proxy, grpc_web_message_limit_applies_after_text_decode) {
+    for (const bool text : {false, true}) {
+        GrpcDriveFixture loop;
+        Connection upstream, downstream;
+        upstream.reset();
+        downstream.reset();
+        Http2Conn upstream_h2, downstream_h2;
+        upstream_h2.init_client();
+        upstream_h2.grpc.upstream = true;
+        downstream_h2.init_client();
+        upstream.h2 = &upstream_h2;
+        downstream.h2 = &downstream_h2;
+        REQUIRE(upstream_h2.open_stream(1));
+        REQUIRE(downstream_h2.open_stream(1));
+        GrpcExchange x;
+        x.init();
+        x.web_mode = text ? GrpcWebContentType::Text : GrpcWebContentType::Binary;
+        x.upstream = &upstream;
+        x.downstream = &downstream;
+        x.upstream_stream = x.downstream_stream = 1;
+        x.request_headers_sent = true;
+        x.request_message.init(2);
+        REQUIRE(grpc_attach(upstream_h2, &x));
+        REQUIRE(grpc_attach(downstream_h2, &x));
+        const u8 binary[] = {0, 0, 0, 0, 3, 0xaa, 0xbb, 0xcc};
+        const u8 base64[] = {'A', 'A', 'A', 'A', 'A', 'A', 'O', 'q', 'u', '8', 'w', '='};
+        const u8* input = text ? base64 : binary;
+        const u32 input_len = text ? sizeof(base64) : sizeof(binary);
+        grpc_request_data(&loop, downstream, x, input, input_len, true);
+        CHECK_EQ(x.failure, 8u);
+        CHECK(x.upstream == nullptr);
+        CHECK_EQ(x.upload_len, 0u);
+    }
 }
 
 TEST(grpc_proxy, expired_headers_deadline_is_cancelled_before_upstream_headers) {

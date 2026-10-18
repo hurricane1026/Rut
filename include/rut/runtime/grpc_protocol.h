@@ -26,7 +26,7 @@ inline bool grpc_content_type(Str value) {
 inline bool grpc_request(const ParsedRequest& req) {
     for (u32 i = 0; i < req.header_count; i++)
         if (grpc_header_name(req.headers[i].name, {"content-type", 12}))
-            return grpc_content_type(req.headers[i].value);
+            return grpc_web_content_type(req.headers[i].value) != GrpcWebContentType::Other;
     return false;
 }
 inline GrpcWebContentType grpc_request_mode(const ParsedRequest& req) {
