@@ -200,6 +200,7 @@ struct GrpcProxyState {
     u64 keepalive_due_us;
     bool upstream;
     bool connecting;
+    bool connect_retry_pending;
     bool busy;
     bool c5_exhausted;
     bool preface_sent;
@@ -219,7 +220,7 @@ struct GrpcProxyState {
         connect_attempts = connect_tried_mask = 0;
         connected_at_us = idle_since_us = timer_deadline_us = last_ping_us = keepalive_due_us = 0;
         upstream = connecting = busy = c5_exhausted = preface_sent = session_failure_recorded =
-            false;
+            connect_retry_pending = false;
         header_continuation_len = 0;
         header_continuation_sending = false;
     }
