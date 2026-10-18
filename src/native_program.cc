@@ -145,7 +145,7 @@ void NativeProgram::destroy() {
     listener = {};
     access_log = {};
     has_ebpf_plan = false;
-    ebpf_plan = {};
+    ebpf_plan = ebpf::Plan{};
 }
 
 bool load_native_program(const char* source,

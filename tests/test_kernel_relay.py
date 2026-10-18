@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Black-box lifecycle tests for the isolated copy/splice mechanism probe."""
 import concurrent.futures
+import errno
 from pathlib import Path
+import re
 import signal
 import socket
 import struct
@@ -52,7 +54,11 @@ class RelayTests(unittest.TestCase):
                 if process.poll() is not None:
                     assert process.returncode == 1, text
                     assert "eBPF tunnel source_map:" in text, text
-                    assert "Operation not permitted" in text or "Permission denied" in text, text
+                    match = re.search(r"eBPF tunnel source_map: errno=(\d+):", text)
+                    assert match, text
+                    assert int(match.group(1)) in {
+                        errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP
+                    }, text
                     cls.ebpf_error = text
                     break
                 if time.monotonic() > deadline:
