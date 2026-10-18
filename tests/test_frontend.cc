@@ -8193,9 +8193,10 @@ route GET "/users" use chain access { return 200 }
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
-        CHECK(hir.error().detail.eq(lit(
-            "chain after Response header values cannot read time, cache, or response state until "
-            "effects execute at response time")));
+        CHECK(
+            hir.error().detail.eq(lit("chain after Response header values cannot read time, "
+                                      "randomness, cache, or response state until "
+                                      "effects execute at response time")));
     }
 }
 
@@ -39896,6 +39897,40 @@ route GET "/" {
         auto wrong_hir = analyze_file_heap(wrong_ast.value());
         REQUIRE_FALSE(wrong_hir.has_value());
     }
+}
+
+TEST(frontend, uuid_rejects_arguments_waits_and_unsafely_rematerialized_positions) {
+    const char* invalid[] = {
+        "route GET \"/\" { let id = uuid(1) return 200 }",
+        "route GET \"/\" { guard let id = uuid() else { return 503 } return 200 }",
+        "route GET \"/\" { if let id = uuid() { return 200 } else { return 503 } }",
+        "route GET \"/\" { let id = uuid().or(\"\") return 200 }",
+        "route GET \"/\" { let id = uuid() wait(1ms) return 200 }",
+        "func makeId() => uuid()\nroute GET \"/\" { let id = makeId() wait(1ms) return 200 }",
+        "route GET \"/\" { wait(1ms) let id = uuid() return 200 }",
+        "timer tick, every: 1s { let id = uuid() }",
+        ("func add(_ resp: Response) -> i32 { resp.set(\"X-ID\", uuid().or(\"\")) 0 }\n"
+         "chain trace { after add(resp) }\nroute GET \"/\" use chain trace { return 200 }"),
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "Unexpected UUID acceptance: %s\n", source);
+        CHECK(!hir);
+    }
+}
+
+TEST(frontend, uuid_user_function_can_shadow_the_builtin) {
+    auto tokens =
+        lex(lit("func uuid(_ n: i32) -> i32 => n\n"
+                "route GET \"/\" { if uuid(7) == 7 { return 200 } else { return 500 } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
 }
 
 int main(int argc, char** argv) {

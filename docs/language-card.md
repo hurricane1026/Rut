@@ -867,6 +867,24 @@ function/binding with the same name shadows the builtin. Equality alone is not
 authentication: credential policies must also reject missing/empty credentials
 and supply a trusted expected value.
 
+## UUID v4 (implemented)
+
+Runnable example: [examples/uuid.rut](../examples/uuid.rut).
+
+`uuid() -> str?` generates 36 lowercase ASCII bytes using the OS CSPRNG (RFC 9562, version 4 and RFC variant). Handle entropy failure, missing request arena, shared-budget exhaustion and SlicePool exhaustion explicitly:
+
+```swift
+route GET "/id" {
+    let pending = uuid()
+    guard let id = pending else { return 503 }
+    return response(200, body: id)
+}
+```
+
+Linux makes one nonblocking `getrandom` call; macOS uses `getentropy`. Failures, including short reads, return nil without fallback or retry. Each call is fresh; reusing a bound local preserves its value. Results use the existing request-owned JSON arena and share its 256 KiB used-byte budget (40 bytes per UUID after alignment). Views remain valid until request retirement/reset, and HTTP/2 local responses copy their body into stream-owned storage before that reset.
+
+The call must directly initialize a top-level route `let`, as above. Calls in `guard let`/`if let` expressions, inside helpers, and nested in larger expressions are rejected until single evaluation of fresh values is supported there. ID values already generated may be passed to ordinary helpers. No arguments or implicit pipe stage are accepted. User functions/bindings named `uuid` shadow it. `wait` routes reject UUID calls; timers and randomness inside `chain after` header effects are unsupported. Request set/add still require literal values, so UUID generation does not yet provide complete request-ID forwarding middleware. Random UUIDs do not promise absolute uniqueness or ordered IDs. `randomBytes(n)` remains a target API, not an alias for `uuid()`.
+
 ## Built-ins (call them, never reimplement)
 
 ```

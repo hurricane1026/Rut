@@ -591,6 +591,78 @@ route GET "/custom" {
     pool.destroy();
 }
 
+TEST(json_network, uuid_response_serialization_and_h2_request_arena_retirement) {
+    JsonProgram program;
+    REQUIRE(program.init(
+        "route GET \"/id\" { let pending = uuid() guard let id = pending else { return 503 } "
+        "return response(200, body: id) }"));
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->json_arena.backend.pool = &pool;
+    const char request[] = "GET /id HTTP/1.1\r\nHost: test\r\n\r\n";
+    for (u32 i = 0; i < 2; ++i) {
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        REQUIRE_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request), sizeof(request) - 1),
+                   sizeof(request) - 1);
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        auto outcome = invoke_jit_handler(
+            program.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        REQUIRE_EQ(outcome.status_code, 200u);
+        REQUIRE_EQ(conn->jit_response_body.len, 36u);
+        const std::string body(conn->jit_response_body.ptr, conn->jit_response_body.len);
+        handle_jit_outcome(loop.get(), *conn, outcome, program.handler(), true);
+        const std::string wire(reinterpret_cast<const char*>(conn->send_buf.data()),
+                               conn->send_buf.len());
+        CHECK(wire.find("HTTP/1.1 200") == 0);
+        CHECK(wire.find("Content-Length: 36") != std::string::npos);
+        CHECK(wire.ends_with(body));
+        conn->json_arena.destroy();
+    }
+    auto h2 = std::make_unique<Http2Conn>();
+    h2->init();
+    conn->h2 = h2.get();
+    conn->epoch_held = true;
+    h2->nstreams = 1;
+    h2->streams[0].id = 1;
+    h2->streams[0].state = Http2StreamState::HalfClosedRemote;
+    RouteEntry route{};
+    route.fn = program.handler();
+    u8 wire[4096]{};
+    H2Dispatch<SmallLoop> dispatch{loop.get(), conn, wire, sizeof(wire), 0, false};
+    h2_invoke_emit(dispatch,
+                   1,
+                   &route,
+                   nullptr,
+                   0,
+                   program.config.get(),
+                   reinterpret_cast<const u8*>(request),
+                   sizeof(request) - 1,
+                   false,
+                   true);
+    CHECK_FALSE(dispatch.overflow);
+    REQUIRE_EQ(h2->outbound_body_len, 36u);
+    REQUIRE(h2->outbound_body != nullptr);
+    char saved[36];
+    __builtin_memcpy(saved, h2->outbound_body, sizeof(saved));
+    conn->json_arena.destroy();
+    auto* recycled = pool.alloc();
+    REQUIRE(recycled);
+    __builtin_memset(recycled, 'x', SlicePool::kSliceSize);
+    CHECK_EQ(memcmp(h2->outbound_body, saved, sizeof(saved)), 0);
+    pool.free(recycled);
+    h2_clear_outbound(*h2);
+    conn->h2 = nullptr;
+    loop->free_conn(*conn);
+    pool.destroy();
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

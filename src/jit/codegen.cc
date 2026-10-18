@@ -1562,6 +1562,38 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, result);
             break;
         }
+        case rir::Opcode::Uuid: {
+            LLVMTypeRef params[] = {c.ptr_ty, c.ptr_ty, c.ptr_ty, c.ptr_ty, c.ptr_ty};
+            LLVMTypeRef ft = LLVMFunctionType(c.void_ty, params, 5, 0);
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_uuid");
+            if (!fn) fn = LLVMAddFunction(c.llvm_mod, "rut_helper_uuid", ft);
+            LLVMValueRef has = LLVMBuildAlloca(c.builder, c.i8_ty, "uuid.has");
+            LLVMValueRef ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "uuid.ptr");
+            LLVMValueRef len = LLVMBuildAlloca(c.builder, c.i32_ty, "uuid.len");
+            LLVMValueRef args[] = {c.param_conn, c.param_arena, has, ptr, len};
+            LLVMBuildCall2(c.builder, ft, fn, args, 5, "");
+            LLVMValueRef result = LLVMGetUndef(c.map_type(c.cur_fn->values[inst.result.id].type));
+            result =
+                LLVMBuildInsertValue(c.builder,
+                                     result,
+                                     LLVMBuildLoad2(c.builder, c.i8_ty, has, "uuid.result.has"),
+                                     0,
+                                     "");
+            result =
+                LLVMBuildInsertValue(c.builder,
+                                     result,
+                                     LLVMBuildLoad2(c.builder, c.ptr_ty, ptr, "uuid.result.ptr"),
+                                     1,
+                                     "");
+            result =
+                LLVMBuildInsertValue(c.builder,
+                                     result,
+                                     LLVMBuildLoad2(c.builder, c.i32_ty, len, "uuid.result.len"),
+                                     2,
+                                     "");
+            c.set_value(inst.result, result);
+            break;
+        }
         case rir::Opcode::TimeNowMicros: {
             LLVMValueRef v = LLVMBuildCall2(c.builder,
                                             LLVMGlobalGetValueType(c.get_time_now_micros()),

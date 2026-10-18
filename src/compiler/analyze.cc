@@ -134,6 +134,8 @@ constexpr Str kTimeWaitDetail = lit_str(
     "time.nowMicros() in routes containing wait is not supported yet — "
     "locals re-materialize on resume, so a pre-wait timestamp would be "
     "sampled after the wait");
+constexpr Str kUuidWaitDetail = lit_str(
+    "uuid() in routes containing wait is not supported yet; locals re-materialize on resume");
 constexpr Str kMinMaxDetail = lit_str(
     "max/min expect two plain integer values of the same width (i32 or i64; "
     "wrap an i32 side in i64(x); int literals adopt the i64 side)");
@@ -9090,6 +9092,27 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
+    if (expr.name.eq(lit_str("uuid")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 0 || pipe_lhs != nullptr || first_arg_override != nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("uuid() expects no arguments; use it directly"));
+        if (route->time_ops_blocked)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kUuidWaitDetail);
+        if (!route->uuid_init_ok)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("uuid() currently requires a direct route let initializer; "
+                        "bind its result before guard let"));
+        HirExpr out{};
+        out.kind = HirExprKind::Uuid;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.span = expr.span;
+        return out;
+    }
     if (expr.name.eq(lit_str("json")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, lit_str("json"))) {
         if (pipe_lhs != nullptr)
@@ -15263,6 +15286,7 @@ constexpr Str kTimerWaitDetail = lit_str(
 
 static bool hir_expr_uses_request(const HirExpr& e) {
     switch (e.kind) {
+        case HirExprKind::Uuid:
         case HirExprKind::ReqHeader:
         case HirExprKind::ReqParam:
         case HirExprKind::ReqCookie:
@@ -15542,8 +15566,9 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             fn.exprs[ei], route, mod, args.get(), fn.params.len, nullptr, 0);
         if (!effect) return core::make_unexpected(effect.error());
         const auto reads_response_time_state = [&](auto&& self, const HirExpr& expr) -> bool {
-            if (expr.kind == HirExprKind::TimeNowMicros || expr.kind == HirExprKind::CacheGet ||
-                expr.kind == HirExprKind::CacheSet || expr.kind == HirExprKind::RespHeader)
+            if (expr.kind == HirExprKind::Uuid || expr.kind == HirExprKind::TimeNowMicros ||
+                expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet ||
+                expr.kind == HirExprKind::RespHeader)
                 return true;
             if (expr.lhs != nullptr && self(self, *expr.lhs)) return true;
             if (expr.rhs != nullptr && self(self, *expr.rhs)) return true;
@@ -15556,11 +15581,11 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
         };
         if (effect->lhs != nullptr &&
             reads_response_time_state(reads_response_time_state, *effect->lhs))
-            return frontend_error(
-                FrontendError::UnsupportedSyntax,
-                effect->lhs->span,
-                lit_str("chain after Response header values cannot read time, cache, or response "
-                        "state until effects execute at response time"));
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  effect->lhs->span,
+                                  lit_str("chain after Response header values cannot read time, "
+                                          "randomness, cache, or response "
+                                          "state until effects execute at response time"));
         HirLocal carrier{};
         carrier.span = step.span;
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
@@ -19740,6 +19765,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     can_be_used_for_iter(can_be_used_for_iter, stmt.name, si + 1);
                 const bool saved_allow_respond_effects = route.allow_respond_effects;
                 route.allow_respond_effects = !used_for_iter;
+                route.uuid_init_ok = !used_for_iter && !seen_for && !seen_wait && !route.is_timer &&
+                                     !route.is_helper_scratch &&
+                                     stmt.expr.kind == AstExprKind::Call &&
+                                     stmt.expr.name.eq(lit_str("uuid"));
                 auto init =
                     stmt.expr.kind == AstExprKind::Wait
                         ? analyze_wait_result_expr(stmt.expr, mod)
@@ -19762,6 +19791,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                route.locals.data,
                                                                route.locals.len,
                                                                nullptr)));
+                route.uuid_init_ok = false;
                 route.allow_respond_effects = saved_allow_respond_effects;
                 if (!init) return core::make_unexpected(init.error());
                 if (init.value().type == HirTypeKind::Array) {
@@ -20366,6 +20396,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // by analyze_match_arm_body(); guard fail-body locals are separate.
         if (route.waits.len > 0) {
             auto blocked_kind = [](const HirExpr& e) -> Str {
+                if (e.kind == HirExprKind::Uuid) return kUuidWaitDetail;
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;

@@ -205,6 +205,7 @@ enum class HirExprKind : u8 {
     // `time.nowMicros()` — monotonic microseconds, type I64, nullary.
     TimeNowMicros,
     ConstantTimeEqual,
+    Uuid,
     JsonOp,
     JsonDecode,
     // `max(a, b)` / `min(a, b)` builtins — same-width {I32,I64} binary,
@@ -1133,6 +1134,9 @@ struct HirRoute {
     // time.nowMicros() is rejected — locals re-materialize on resume, and a
     // pre-wait timestamp binding would sample after the wait.
     bool time_ops_blocked = false;
+    // UUID generation is only supported in a direct route-let initializer.
+    // A raw guard-let expression is currently materialized twice.
+    bool uuid_init_ok = false;
     struct DecoratorRef {
         Span span{};
         Str name{};

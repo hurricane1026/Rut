@@ -222,6 +222,7 @@ enum class Opcode : u8 {
     SextI64,  // %r = sext.i64 %a → i64 (sign-extend i32; the `i64(x)` builtin)
 
     // ── Domain operations ──
+    Uuid,            // %r = uuid -> Optional(str), request-owned CSPRNG result
     TimeNowMicros,   // %r = time.now_micros        → i64 (monotonic µs; fresh clock read)
     IpInCidr,        // %r = ip.in_cidr %ip, cidr   → bool
     HashHmacSha256,  // %r = hash.hmac_sha256 %k,%d → Bytes

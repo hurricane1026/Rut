@@ -121,6 +121,13 @@ without presenting lossy or per-shard state as exact shared state.
   user shadowing are documented; this does not complete the remaining random,
   key-handle, signature or certificate interfaces in M1.
 
+- [x] Kong/APISIX plan #819 M1: request-owned `uuid() -> str?` uses OS CSPRNG
+  entropy, RFC 9562 v4 formatting, explicit failures and bounded SliceArena
+  storage. Direct-route-let and wait/timer/effect restrictions preserve evaluation and
+  lifetime semantics; general byte arrays/randomBytes and request-ID header
+  propagation remain separate follow-ups. Fresh expressions must gain single
+  evaluation in guards/helper-local lowering before widening UUID placement.
+
 - [x] Handler bodies reject `respond` with a `return` fix-it, while middleware
   functions reject status-`return` with a `respond` fix-it; valid helper
   `respond` propagation and ordinary function value expressions are unchanged.
