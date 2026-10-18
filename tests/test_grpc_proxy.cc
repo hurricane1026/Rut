@@ -1795,8 +1795,15 @@ TEST(grpc_proxy, pooled_session_respects_peer_stream_limit_while_exchange_retire
     queued.upstream_stream = 3;
     newest.upstream_stream = 5;
     retained.request_headers_sent = true;
-    queued.request_headers_len = newest.request_headers_len = 1;
-    queued.request_headers[0] = newest.request_headers[0] = 0;
+    const hpack::Header request_headers[] = {{{":method", 7}, {"POST", 4}},
+                                             {{":path", 5}, {"/svc", 4}},
+                                             {{"content-type", 12}, {"application/grpc", 16}}};
+    queued.request_headers_len = http2_write_headers(
+        queued.request_headers, GrpcExchange::kHeaders, 3, request_headers, 3, false);
+    newest.request_headers_len = http2_write_headers(
+        newest.request_headers, GrpcExchange::kHeaders, 5, request_headers, 3, false);
+    REQUIRE(queued.request_headers_len > kFrameHeaderSize);
+    REQUIRE(newest.request_headers_len > kFrameHeaderSize);
     REQUIRE(h2.open_stream(1) != nullptr);
     REQUIRE(h2.open_stream(3) != nullptr);
     REQUIRE(h2.open_stream(5) != nullptr);
@@ -3285,6 +3292,51 @@ TEST(grpc_proxy, request_timeout_is_materialized_at_send_time_and_continues_near
     CHECK_EQ(capture.timeout_count, 1u);
     CHECK_EQ(capture.encoding_count, 0u);
     CHECK_EQ(capture.padding_len, static_cast<u32>(sizeof(padding)));
+
+    exchange.deadline_us = 1'000'000 + 99'999'999ull * 3'600'000'000ull;
+    CHECK(grpc_build_request_headers_for_send(
+              exchange, 1'000'000, output, sizeof(output), output_len) ==
+          GrpcRequestHeaderBuild::Ready);
+    CHECK_GT(output_len, exchange.request_headers_len);
+    __builtin_memcpy(input, kClientPreface, kClientPrefaceLen);
+    __builtin_memcpy(input + kClientPrefaceLen, output, output_len);
+    parser.init();
+    capture = {};
+    parser.cb_ctx = &capture;
+    parser.on_headers = capture_grpc_request_headers;
+    control_len = 0;
+    const auto maximum_timeout = parser.process(
+        input, kClientPrefaceLen + output_len, control, sizeof(control), &control_len);
+    CHECK_FALSE(maximum_timeout.close);
+    CHECK_EQ(maximum_timeout.consumed, kClientPrefaceLen + output_len);
+    CHECK_EQ(capture.timeout_count, 1u);
+    CHECK_EQ(capture.timeout_len, 9u);
+    CHECK_EQ(memcmp(capture.timeout, "99999999H", 9), 0);
+
+    char oversized_value[16'380]{};
+    u8 oversized_block[Http2Conn::kHeaderBlockCap]{};
+    const u32 oversized_len = hpack::encode_header(
+        oversized_block, {"x-padding", 9}, {oversized_value, sizeof(oversized_value)});
+    CHECK_GT(oversized_len, Http2Conn::kHeaderScratchCap);
+    CHECK_LE(oversized_len, Http2Conn::kHeaderBlockCap);
+    u8 oversized_input[kClientPrefaceLen + kFrameHeaderSize + Http2Conn::kHeaderBlockCap]{};
+    __builtin_memcpy(oversized_input, kClientPreface, kClientPrefaceLen);
+    Http2FrameHeader oversized_headers{};
+    oversized_headers.length = oversized_len;
+    oversized_headers.type = static_cast<u8>(Http2FrameType::Headers);
+    oversized_headers.flags = http2_flag::kEndHeaders;
+    oversized_headers.stream_id = 1;
+    write_frame_header(oversized_input + kClientPrefaceLen, oversized_headers);
+    __builtin_memcpy(
+        oversized_input + kClientPrefaceLen + kFrameHeaderSize, oversized_block, oversized_len);
+    parser.init();
+    control_len = 0;
+    const auto overflow = parser.process(oversized_input,
+                                         kClientPrefaceLen + kFrameHeaderSize + oversized_len,
+                                         control,
+                                         sizeof(control),
+                                         &control_len);
+    CHECK(overflow.close);
 }
 
 TEST(grpc_proxy, request_timeout_waits_for_connect_tls_settings_and_stream_slot) {
@@ -3376,7 +3428,7 @@ TEST(grpc_proxy, request_timeout_waits_for_connect_tls_settings_and_stream_slot)
     loop.pool.free(reinterpret_cast<u8*>(exchange));
 }
 
-TEST(grpc_proxy, expired_request_timeout_returns_unavailable_and_releases_once) {
+TEST(grpc_proxy, expired_request_timeout_returns_deadline_exceeded_and_releases_once) {
     GrpcDriveFixture loop;
     REQUIRE(loop.pool_ready);
     Connection upstream;
@@ -3402,7 +3454,9 @@ TEST(grpc_proxy, expired_request_timeout_returns_unavailable_and_releases_once) 
     downstream_h2.init_client();
     downstream.h2 = &downstream_h2;
     REQUIRE(upstream_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(3) != nullptr);
     REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(downstream_h2.open_stream(3) != nullptr);
     auto* exchange = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
     REQUIRE(exchange != nullptr);
     exchange->init();
@@ -3421,14 +3475,47 @@ TEST(grpc_proxy, expired_request_timeout_returns_unavailable_and_releases_once) 
     REQUIRE(grpc_attach(upstream_h2, exchange));
     REQUIRE(grpc_attach(downstream_h2, exchange));
 
+    auto* queued = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(queued != nullptr);
+    queued->init();
+    queued->downstream = &downstream;
+    queued->upstream = &upstream;
+    queued->downstream_stream = queued->upstream_stream = 3;
+    queued->timeout_present = true;
+    queued->deadline_us = monotonic_us() + 60'000'000;
+    queued->request_end = true;
+    queued->slot_held = true;
+    queued->upstream_id = 3;
+    queued->request_headers_len =
+        http2_write_headers(queued->request_headers, GrpcExchange::kHeaders, 3, request, 2, false);
+    REQUIRE(queued->request_headers_len > kFrameHeaderSize);
+    u8 queued_output[GrpcExchange::kHeaders + GrpcExchange::kRequestHeadersSlack]{};
+    u32 queued_output_len = 0;
+    CHECK(grpc_build_request_headers_for_send(
+              *queued, monotonic_us(), queued_output, sizeof(queued_output), queued_output_len) ==
+          GrpcRequestHeaderBuild::Ready);
+    CHECK(upstream_h2.peer_settings_seen);
+    CHECK_FALSE(upstream_h2.grpc.connecting);
+    CHECK_FALSE(upstream_h2.grpc.busy);
+    CHECK(upstream.on_send == nullptr);
+    CHECK(upstream_h2.find_stream(3) != nullptr);
+    REQUIRE(grpc_attach(upstream_h2, queued));
+    REQUIRE(grpc_attach(downstream_h2, queued));
+
     grpc_drive_upstream(&loop, upstream);
 
-    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(loop.sends, 2u);
     CHECK_EQ(loop.downstream_sends, 1u);
-    CHECK_EQ(loop.sends - loop.downstream_sends, 0u);
+    CHECK_EQ(loop.sends - loop.downstream_sends, 1u);
+    CHECK(queued->request_headers_sent);
     CHECK_EQ(loop.released, 1u);
-    CHECK_EQ(upstream_h2.grpc.active, 0u);
-    CHECK_EQ(downstream_h2.grpc.active, 0u);
+    CHECK_EQ(upstream_h2.grpc.active, 1u);
+    CHECK_EQ(downstream_h2.grpc.active, 1u);
+    Http2FrameHeader sent_request{};
+    REQUIRE_EQ(parse_frame_header(upstream.send_buf.data(), upstream.send_buf.len(), &sent_request),
+               ParseStatus::Complete);
+    CHECK_EQ(sent_request.type, static_cast<u8>(Http2FrameType::Headers));
+    CHECK_EQ(sent_request.stream_id, 3u);
     Http2FrameHeader response{};
     REQUIRE_EQ(parse_frame_header(downstream.send_buf.data(), downstream.send_buf.len(), &response),
                ParseStatus::Complete);
