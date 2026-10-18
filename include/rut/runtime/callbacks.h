@@ -256,6 +256,9 @@ bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 // upstream side. Defined in callbacks_impl.h.
 template <typename Loop>
 void grpc_tls_ready(Loop* loop, Connection& conn);
+void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us);
+template <typename Loop>
+void grpc_record_handshake_result(Loop* loop, Connection& conn, bool success, u64 now_us);
 template <typename Loop>
 void grpc_tick(Loop* loop, Connection& conn);
 template <typename Loop>
