@@ -51,13 +51,13 @@ inline std::vector<u8> grpc_web_test_base64(const std::vector<u8>& input) {
 }
 
 inline bool grpc_web_test_decode_text_response(const std::vector<u8>& response,
-                                              std::vector<u8>& decoded) {
+                                               std::vector<u8>& decoded) {
     static constexpr char kBoundary[] = "\r\n\r\n";
-    const auto boundary = std::search(response.begin(), response.end(),
-                                      kBoundary, kBoundary + sizeof(kBoundary) - 1);
+    const auto boundary =
+        std::search(response.begin(), response.end(), kBoundary, kBoundary + sizeof(kBoundary) - 1);
     if (boundary == response.end()) return false;
-    const auto body_offset = static_cast<size_t>(boundary - response.begin()) +
-                             sizeof(kBoundary) - 1;
+    const auto body_offset =
+        static_cast<size_t>(boundary - response.begin()) + sizeof(kBoundary) - 1;
     if (body_offset > response.size()) return false;
     const u8* body = response.data() + body_offset;
     const u32 body_len = static_cast<u32>(response.size() - body_offset);
@@ -92,8 +92,9 @@ inline bool grpc_web_test_h1_abort_partial_upload(EchoServer& server, u16 port) 
         "Content-Length: 12\r\n"
         "Connection: close\r\n\r\n";
     static constexpr u8 kPartialBody[] = {0, 0, 0, 0, 7, 0xaa};
-    const bool sent = write_all_fd(fd, reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1) &&
-                      write_all_fd(fd, kPartialBody, sizeof(kPartialBody));
+    const bool sent =
+        write_all_fd(fd, reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1) &&
+        write_all_fd(fd, kPartialBody, sizeof(kPartialBody));
     const u64 deadline = monotonic_us() + 3000000;
     while (sent && !server.requests.load() && monotonic_us() < deadline) usleep(1000);
     const bool reached_backend = server.requests.load() != 0;
@@ -222,9 +223,10 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                 return false;
             }
             response.insert(response.end(), buf, buf + n);
-            if (expected_body &&
-                std::search(response.begin(), response.end(), expected_body->begin(),
-                            expected_body->end()) != response.end())
+            if (expected_body && std::search(response.begin(),
+                                             response.end(),
+                                             expected_body->begin(),
+                                             expected_body->end()) != response.end())
                 break;
             if (response.size() > 256 * 1024) {
                 close(fd);
@@ -320,8 +322,9 @@ void grpc_web_h1_trailers_only_case(rut::test::TestCase* _tc) {
                                 (static_cast<u32>(decoded[2]) << 16) |
                                 (static_cast<u32>(decoded[3]) << 8) | decoded[4];
         CHECK_EQ(payload_len, decoded.size() - 5);
-        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 7",
-                          "grpc-status: 7" + 14) != decoded.end());
+        CHECK(std::search(
+                  decoded.begin() + 5, decoded.end(), "grpc-status: 7", "grpc-status: 7" + 14) !=
+              decoded.end());
     }
     CHECK_EQ(server->requests.load(), 1u);
 
@@ -363,8 +366,9 @@ void grpc_web_h1_decoded_request_limit_case(rut::test::TestCase* _tc) {
     if (decoded.size() >= 5) {
         CHECK_EQ(decoded[0], 0x80u);
         CHECK_EQ(decoded[4], 16u);
-        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 8",
-                          "grpc-status: 8" + 14) != decoded.end());
+        CHECK(std::search(
+                  decoded.begin() + 5, decoded.end(), "grpc-status: 8", "grpc-status: 8" + 14) !=
+              decoded.end());
     }
     CHECK_EQ(server->requests.load(), 0u);
 
@@ -399,15 +403,22 @@ void grpc_web_h1_deadline_case(rut::test::TestCase* _tc) {
     const std::vector<u8> native_request{0, 0, 0, 0, 1, 0};
     const auto request_body = grpc_web_test_base64(native_request);
     std::vector<u8> response;
-    CHECK(grpc_web_test_h1_exchange(get_port(listener), true, false, request_body, response,
-                                   false, nullptr, "grpc-timeout: 1n\r\n"));
+    CHECK(grpc_web_test_h1_exchange(get_port(listener),
+                                    true,
+                                    false,
+                                    request_body,
+                                    response,
+                                    false,
+                                    nullptr,
+                                    "grpc-timeout: 1n\r\n"));
     std::vector<u8> decoded;
     CHECK(grpc_web_test_decode_text_response(response, decoded));
     CHECK_GE(decoded.size(), 5u);
     if (decoded.size() >= 5) {
         CHECK_EQ(decoded[0], 0x80u);
-        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 4",
-                          "grpc-status: 4" + 14) != decoded.end());
+        CHECK(std::search(
+                  decoded.begin() + 5, decoded.end(), "grpc-status: 4", "grpc-status: 4" + 14) !=
+              decoded.end());
     }
 
     shard->stop();
@@ -448,8 +459,9 @@ void grpc_web_h1_decoded_response_limit_case(rut::test::TestCase* _tc) {
     if (decoded.size() >= 5) {
         CHECK_EQ(decoded[0], 0x80u);
         CHECK_EQ(decoded[4], 16u);
-        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 8",
-                          "grpc-status: 8" + 14) != decoded.end());
+        CHECK(std::search(
+                  decoded.begin() + 5, decoded.end(), "grpc-status: 8", "grpc-status: 8" + 14) !=
+              decoded.end());
     }
     CHECK_EQ(server->requests.load(), 1u);
 
@@ -490,8 +502,9 @@ void grpc_web_h1_json_response_rejected_case(rut::test::TestCase* _tc, u32 respo
     CHECK_GE(decoded.size(), 5u);
     if (decoded.size() >= 5) {
         CHECK_EQ(decoded[0], 0x80u);
-        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 13",
-                          "grpc-status: 13" + 15) != decoded.end());
+        CHECK(std::search(
+                  decoded.begin() + 5, decoded.end(), "grpc-status: 13", "grpc-status: 13" + 15) !=
+              decoded.end());
     }
     CHECK_EQ(server->requests.load(), 1u);
 
@@ -763,8 +776,9 @@ void grpc_web_h1_local_failure_case(rut::test::TestCase* _tc, bool invalid_base6
     if (decoded.size() >= 5) {
         CHECK_EQ(decoded[0], 0x80u);
         CHECK_EQ(decoded[4], 17u);
-        CHECK(std::search(decoded.begin() + 5, decoded.end(), "grpc-status: 13",
-                          "grpc-status: 13" + 15) != decoded.end());
+        CHECK(std::search(
+                  decoded.begin() + 5, decoded.end(), "grpc-status: 13", "grpc-status: 13" + 15) !=
+              decoded.end());
     }
     CHECK_EQ(server->requests.load(), 0u);
     CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
