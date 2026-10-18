@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import bench
 import summarize
@@ -149,6 +150,12 @@ class Tests(unittest.TestCase):
             child.terminate()
             child.wait()
 
+    def test_main_propagates_serve_exit_status(self):
+        with mock.patch.object(bench, 'serve', return_value=7):
+            with mock.patch.object(bench.sys, 'argv', ['bench.py', 'serve', '--config', 'x',
+                                                       '--engine', 'rut', '--binary', 'x', '--cpus', '0']):
+                self.assertEqual(bench.main(), 7)
+
     def test_summary_pairs_and_failed_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -174,12 +181,56 @@ class Tests(unittest.TestCase):
                     order = {('rut', 1): 1, ('nginx', 1): 2, ('nginx', 2): 3,
                              ('rut', 2): 4, ('rut', 3): 5, ('nginx', 3): 6}
                     (root / f'{engine}{rep}' / 'environment.json').write_text(
-                        json.dumps({'time': order[(engine, rep)]}))
+                        json.dumps({'time': order[(engine, rep)],
+                                    'binaries': {'/opt/wrk': 'a' * 64}}))
             self.assertEqual(summarize.summarize(root)[0]['throughput_classification'],
                              'inconclusive-lua-body-callback')
             self.assertEqual(summarize.summarize(root)[0]['rut']['instrumented_rps'], [2, 101, 202])
             self.assertEqual(summarize.summarize(root)[0]['cpus'], '2-5')
             self.assertEqual(summarize.summarize(root)[0]['server_cpus'], '2')
+
+            client_changed = root / 'client-changed'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, client_changed / name)
+            client_env = client_changed / 'rut2' / 'environment.json'
+            client_data = json.loads(client_env.read_text())
+            client_data['binaries']['/opt/wrk'] = 'b' * 64
+            client_env.write_text(json.dumps(client_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(client_changed)
+            versioned = root / 'versioned-wrk'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, versioned / name)
+                env_path = versioned / name / 'environment.json'
+                env = json.loads(env_path.read_text())
+                env['binaries'] = {'/opt/wrk-4.2.0': 'a' * 64}
+                env_path.write_text(json.dumps(env))
+            self.assertEqual(len(summarize.summarize(versioned)), 1)
+
+            four = root / 'four-pair'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, four / name)
+            for engine in ('rut', 'nginx'):
+                target = four / f'{engine}4'
+                shutil.copytree(four / f'{engine}3', target)
+                result = json.loads((target / 'result.json').read_text())
+                result['repetition'] = 4
+                result['server_run_id'] = f'{engine}-4'
+                (target / 'result.json').write_text(json.dumps(result))
+            for engine, time_value in [('nginx', 7), ('rut', 8)]:
+                env_path = four / f'{engine}4' / 'environment.json'
+                env = json.loads(env_path.read_text())
+                env['time'] = time_value
+                env_path.write_text(json.dumps(env))
+            self.assertEqual(len(summarize.summarize(four)[0]['rut']['instrumented_rps']), 4)
+            four_bad = root / 'four-pair-misordered'
+            shutil.copytree(four, four_bad)
+            env_path = four_bad / 'rut4' / 'environment.json'
+            env = json.loads(env_path.read_text())
+            env['time'] = 6
+            env_path.write_text(json.dumps(env))
+            with self.assertRaises(ValueError):
+                summarize.summarize(four_bad)
             duplicate = root / 'duplicate-run'
             for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
                 shutil.copytree(root / name, duplicate / name)
@@ -218,8 +269,11 @@ class Tests(unittest.TestCase):
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=100, p99_us=100)]))
+                    (p / 'environment.json').write_text(json.dumps(
+                        {'time': (rep - 1) * 2 + (1 if engine == 'rut' else 2),
+                         'binaries': {'/opt/wrk': 'a' * 64}}))
             with self.assertRaises(ValueError):
-                summarize.summarize(root)
+                summarize.summarize(mismatch)
             config_mismatch = root / 'config-mismatch'
             for engine, config_hash in [('rut', 'config-a'), ('nginx', 'config-b')]:
                 for rep in range(1, 4):
@@ -234,8 +288,11 @@ class Tests(unittest.TestCase):
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=100, p99_us=100)]))
+                    (p / 'environment.json').write_text(json.dumps(
+                        {'time': (rep - 1) * 2 + (1 if engine == 'rut' else 2),
+                         'binaries': {'/opt/wrk': 'a' * 64}}))
             with self.assertRaises(ValueError):
-                summarize.summarize(root)
+                summarize.summarize(config_mismatch)
             unfinished = root / 'unfinished'
             unfinished.mkdir()
             (unfinished / 'environment.json').write_text('{}')

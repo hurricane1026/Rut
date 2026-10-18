@@ -490,6 +490,14 @@ set_tests_properties(test_proxy_benchmark_tools PROPERTIES LABELS "unit;benchmar
 
 add_test(NAME test_routing_corpus
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME test_cross_machine_benchmark
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/cross_machine_benchmark/test_tools.py)
+    set_tests_properties(test_cross_machine_benchmark PROPERTIES
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/scripts/cross_machine_benchmark
+        LABELS "unit")
+endif()
 set_tests_properties(test_routing_corpus PROPERTIES LABELS "unit;routing" TIMEOUT 120)
 
 # Verify the shipped runtime does not import a C++ standard/ABI library.

@@ -141,7 +141,10 @@ def port_is_free(port):
 
 def process_owns_port(pid, port):
     pids = [pid]
-    for current in list(pids):
+    index = 0
+    while index < len(pids):
+        current = pids[index]
+        index += 1
         try:
             children = Path(f'/proc/{current}/task/{current}/children').read_text().split()
             pids.extend(int(child) for child in children)
@@ -365,7 +368,7 @@ def main():
     if a.action == 'prepare':
         config(a.output, a.body_size, a.origin, a.port, a.workers)
     elif a.action == 'serve':
-        serve(a)
+        return serve(a)
     else:
         try:
             return client(a)

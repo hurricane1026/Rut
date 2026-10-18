@@ -6,6 +6,14 @@ from pathlib import Path
 import statistics
 
 
+def wrk_hash(environment):
+    binaries = environment.get('binaries', {})
+    hashes = list(binaries.values())
+    if len(binaries) != 1 or len(hashes) != 1 or len(hashes[0]) != 64 or any(c not in '0123456789abcdef' for c in hashes[0].lower()):
+        raise ValueError('client environment must contain exactly one valid wrk binary hash')
+    return hashes[0]
+
+
 def summarize(root):
     failures = list(root.rglob('failure.json'))
     if failures:
@@ -17,6 +25,7 @@ def summarize(root):
         raise ValueError(f'unfinished attempts present: {unfinished}')
     groups = {}
     timestamps = {}
+    client_hashes = {}
     for p in sorted(root.rglob('result.json')):
         d = json.loads(p.read_text())
         if not d['valid']:
@@ -28,21 +37,29 @@ def summarize(root):
             raise ValueError(f'missing client environment: {p}')
         key = (d['host'], d['body_size'], d['connections'], d['duration'], d['threads'], d['warmup'], d['port'], d['cpus'],
                d['server_cpus'], d['server_workers'])
-        timestamps.setdefault(key, []).append((json.loads(env.read_text())['time'], d['engine'], d['repetition']))
+        environment = json.loads(env.read_text())
+        timestamps.setdefault(key, []).append((environment['time'], d['engine'], d['repetition']))
+        client_hashes.setdefault(key, []).append(wrk_hash(environment))
         rows = groups.setdefault(key, {'rut': {}, 'nginx': {}})[d['engine']]
         if d['repetition'] in rows:
             raise ValueError(f'duplicate engine/repetition: {p}')
         rows[d['repetition']] = (d, next(r for r in d['results'] if r['phase'] == 'measurement'))
     if not groups:
         raise ValueError('no results')
-    expected_order = [('rut', 1), ('nginx', 1), ('nginx', 2),
-                      ('rut', 2), ('rut', 3), ('nginx', 3)]
     output = []
     for key, engines in groups.items():
-        if set(engines['rut']) != set(engines['nginx']) or len(engines['rut']) < 3:
+        repetitions = sorted(engines['rut'])
+        if (repetitions != sorted(engines['nginx']) or repetitions != list(range(1, len(repetitions) + 1))
+                or len(repetitions) < 3):
             raise ValueError(f'need at least three matching repetitions for both engines: {key}')
+        expected_order = []
+        for rep in repetitions:
+            expected_order.extend((('rut', rep), ('nginx', rep)) if rep % 2 else
+                                  (('nginx', rep), ('rut', rep)))
         if [(engine, rep) for _, engine, rep in sorted(timestamps[key])] != expected_order:
             raise ValueError(f'runs are not in documented interleaved order: {key}')
+        if len(set(client_hashes[key])) != 1:
+            raise ValueError(f'client wrk binary changed between paired runs: {key}')
         for engine, runs in engines.items():
             run_ids = [d['server_run_id'] for d, _ in runs.values()]
             if len(set(run_ids)) != len(run_ids):
