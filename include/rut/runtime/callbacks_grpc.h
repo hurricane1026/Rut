@@ -4,6 +4,7 @@
 // send slice: retiring an RPC never frees memory referenced by an async SQE.
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/grpc_protocol.h"
+#include "rut/runtime/receive_headroom.h"
 #include "rut/runtime/slice_pool.h"
 #include "rut/runtime/upstream_pool.h"
 
@@ -241,15 +242,8 @@ void grpc_connection_closed(void* lp, Connection& conn) {
 
 template <typename Loop>
 bool grpc_grow_recv(Loop* loop, Connection& conn) {
-    if (conn.recv_buf.capacity() >= kDefaultMaxFrameSize + kFrameHeaderSize) return true;
-    u8* storage = loop->pool.alloc_bulk();
-    if (!storage) return false;
-    const u32 n = conn.recv_buf.len();
-    __builtin_memcpy(storage, conn.recv_buf.data(), n);
-    loop->pool.free(conn.recv_slice);
-    conn.bind_request_receive_buffer(storage, SlicePool::kBulkSliceSize);
-    conn.recv_buf.commit(n);
-    return true;
+    return reserve_request_receive_headroom(
+        loop->pool, conn, kDefaultMaxFrameSize + kFrameHeaderSize);
 }
 
 // Client session callbacks only stage owned bytes. They never close a session
