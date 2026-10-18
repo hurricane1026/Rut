@@ -1,0 +1,9 @@
+// Exact wire Host comparison: configure the port and casing explicitly.
+// An empty configuration fails closed. This does not validate duplicate Hosts.
+func requireHost(_ host: str, _ expected: str) -> bool => expected != "" && host == expected
+
+// Presence check for non-authentication metadata. Not a credential validator.
+func requireHeader(_ value: str) -> bool => value != ""
+
+// Put this step first so maintenance also bypasses later policy work.
+func maintenance(_ enabled: bool) -> bool => !enabled

@@ -1,0 +1,83 @@
+[
+  {
+    "size": 65536,
+    "mode": "copy",
+    "n": 12,
+    "cpu_ns": 371500.0,
+    "elapsed_ns": 203286.5,
+    "redirected_body_bytes": 0.0,
+    "commit_retries": 0.0
+  },
+  {
+    "size": 65536,
+    "mode": "splice",
+    "n": 12,
+    "cpu_ns": 388500.0,
+    "elapsed_ns": 206712.5,
+    "redirected_body_bytes": 0.0,
+    "commit_retries": 0.0
+  },
+  {
+    "size": 65536,
+    "mode": "ebpf",
+    "n": 12,
+    "cpu_ns": 422000.0,
+    "elapsed_ns": 229914.5,
+    "redirected_body_bytes": 0.0,
+    "commit_retries": 16.0
+  },
+  {
+    "size": 1048576,
+    "mode": "copy",
+    "n": 12,
+    "cpu_ns": 3640000.0,
+    "elapsed_ns": 1547874.0,
+    "redirected_body_bytes": 0.0,
+    "commit_retries": 0.0
+  },
+  {
+    "size": 1048576,
+    "mode": "splice",
+    "n": 12,
+    "cpu_ns": 3572000.0,
+    "elapsed_ns": 1569766.0,
+    "redirected_body_bytes": 0.0,
+    "commit_retries": 0.0
+  },
+  {
+    "size": 1048576,
+    "mode": "ebpf",
+    "n": 12,
+    "cpu_ns": 3242000.0,
+    "elapsed_ns": 2452825.5,
+    "redirected_body_bytes": 833536.0,
+    "commit_retries": 51.5
+  },
+  {
+    "size": 16777216,
+    "mode": "copy",
+    "n": 12,
+    "cpu_ns": 52506500.0,
+    "elapsed_ns": 21709636.5,
+    "redirected_body_bytes": 0.0,
+    "commit_retries": 0.0
+  },
+  {
+    "size": 16777216,
+    "mode": "splice",
+    "n": 12,
+    "cpu_ns": 51181000.0,
+    "elapsed_ns": 21726714.5,
+    "redirected_body_bytes": 0.0,
+    "commit_retries": 0.0
+  },
+  {
+    "size": 16777216,
+    "mode": "ebpf",
+    "n": 12,
+    "cpu_ns": 47843500.0,
+    "elapsed_ns": 38659157.0,
+    "redirected_body_bytes": 16467968.0,
+    "commit_retries": 74.5
+  }
+]

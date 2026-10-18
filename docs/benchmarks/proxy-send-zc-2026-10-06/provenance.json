@@ -1,0 +1,10 @@
+{
+  "base_commit": "5b8392577f52886deda2a62743d84fc4eb8b27b3",
+  "binary_sha256": "e6e9530b93e945be172858b4c67c2381623c8a38af7c6d4649ca430ae8508bd3",
+  "experiment_patch_sha256": "3d82d48fad0d13ea25d667d2ac72d6fedc073209f2a2e5085ee1ef9a0496ee71",
+  "switch": "RUT_EXPERIMENTAL_SEND_ZC=1",
+  "min_bytes": 32768,
+  "build": "Clang22 Release actual O2 JIT ON IPO OFF",
+  "full_network": "1576 passed / 350659 checks",
+  "decision": "rejected; restoring ordinary SEND; high concurrency read errors; all observed ZC notifications copied"
+}

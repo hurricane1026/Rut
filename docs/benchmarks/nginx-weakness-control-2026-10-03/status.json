@@ -1,0 +1,50 @@
+[
+  {
+    "body": 65536,
+    "index": 0,
+    "variant": "baseline",
+    "returncode": 0
+  },
+  {
+    "body": 65536,
+    "index": 1,
+    "variant": "candidate",
+    "returncode": 0
+  },
+  {
+    "body": 65536,
+    "index": 2,
+    "variant": "candidate",
+    "returncode": 0
+  },
+  {
+    "body": 65536,
+    "index": 3,
+    "variant": "baseline",
+    "returncode": 0
+  },
+  {
+    "body": 1048576,
+    "index": 0,
+    "variant": "baseline",
+    "returncode": 0
+  },
+  {
+    "body": 1048576,
+    "index": 1,
+    "variant": "candidate",
+    "returncode": 0
+  },
+  {
+    "body": 1048576,
+    "index": 2,
+    "variant": "candidate",
+    "returncode": 0
+  },
+  {
+    "body": 1048576,
+    "index": 3,
+    "variant": "baseline",
+    "returncode": 0
+  }
+]

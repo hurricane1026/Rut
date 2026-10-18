@@ -1,0 +1,11 @@
+Final commit: 28b05945349ae36affd6f38a17ba6aa1b4dcc0d2
+Workspace: /tmp/rut-perf-next-work
+Build: cmake --build /tmp/rut-perf-next-build --target rut test_network -j 6 (PASS; existing warnings)
+Network: 1574 passed, 0 failed, 350615 checks, 0 failed checks
+CLI adversarial: 7 PASS
+clang-format affected header: PASS
+git diff --check: PASS
+Final binary SHA256: cc0ff7508dc76091712a34a8e02075c0d4f0df96e333c100372ee377b9d74a52
+Final compiler SHA256: ccdc4e516d510fff291fa4af9f9e19facbcad21e83e0eafae77b4e4c85014bd8
+No throughput/p99 benchmark of final syscall-only patch; 96 samples cover the rejected candidate.
+No new sanitizer or clang-tidy run. Not pushed or merged.

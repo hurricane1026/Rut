@@ -1,0 +1,144 @@
+diff --git a/include/rut/runtime/response_read_deadline.h b/include/rut/runtime/response_read_deadline.h
+index e50e97ab..d126bb4d 100644
+--- a/include/rut/runtime/response_read_deadline.h
++++ b/include/rut/runtime/response_read_deadline.h
+@@ -292,16 +292,49 @@ inline bool complete_content_length_pinned_header_matches(
+     u32 declared_body,
+     CompleteContentLengthResponseClassification* out_classification = nullptr) {
+     if (c.response_header_buf.data() == nullptr || c.response_header_buf.len() == 0) return false;
++    // Strict headers are normally checked several times while one response is
++    // delivered. Reuse only the syntax parse: compare every byte so a changed
++    // header is reparsed, and recheck all connection/policy fields below.
++    struct ParsedHeaderCache {
++        const u8* data;
++        u32 length;
++        u8 bytes[256];
++        ParsedResponse parsed;
++        bool valid;
++    };
++    static thread_local ParsedHeaderCache cache{};
++    const u8* data = c.response_header_buf.data();
++    const u32 length = c.response_header_buf.len();
++    const bool cacheable = length <= sizeof(cache.bytes);
++    const bool cache_hit = cacheable && cache.valid && cache.data == data &&
++                           cache.length == length &&
++                           __builtin_memcmp(cache.bytes, data, length) == 0;
+     HttpResponseParser parser;
+-    ParsedResponse parsed;
+-    parser.reset();
+-    parsed.reset();
+-    if (parser.parse(c.response_header_buf.data(), c.response_header_buf.len(), &parsed) !=
+-            ParseStatus::Complete ||
+-        parser.header_end != c.response_header_buf.len() || parsed.version != HttpVersion::Http11)
+-        return false;
++    ParsedResponse local_parsed;
++    const ParsedResponse* parsed = nullptr;
++    if (cache_hit) {
++        parsed = &cache.parsed;
++    } else {
++        cache.valid = false;
++        parser.reset();
++        ParsedResponse* destination = cacheable ? &cache.parsed : &local_parsed;
++        destination->reset();
++        if (parser.parse(data, length, destination) != ParseStatus::Complete ||
++            parser.header_end != length || destination->version != HttpVersion::Http11)
++            return false;
++        if (cacheable) {
++            __builtin_memcpy(cache.bytes, data, length);
++            cache.data = data;
++            cache.length = length;
++            cache.valid = true;
++            parsed = &cache.parsed;
++        } else {
++            parsed = &local_parsed;
++        }
++    }
++    if (parsed == nullptr) return false;
+     return complete_content_length_parsed_header_matches(
+-        c, parsed, declared_body, out_classification);
++        c, *parsed, declared_body, out_classification);
+ }
+ 
+ inline bool complete_content_length_raw_origin_matches_pinned(
+diff --git a/tests/test_network.cc b/tests/test_network.cc
+index f8421cb6..658eeda3 100644
+--- a/tests/test_network.cc
++++ b/tests/test_network.cc
+@@ -63037,6 +63037,77 @@ TEST(response_buffering_runtime, coherent_single_range_206_classifier_is_exact)
+              CompleteContentLengthResponseClass::Unsupported);
+ }
+ 
++TEST(response_buffering_runtime, pinned_parse_cache_rechecks_bytes_and_policy) {
++    RouteConfig config{};
++    REQUIRE(add_bodyless_non_head_response_read_deadline_bundle(
++        config, 5, ForwardResponseBufferingMode::CompleteContentLength));
++    config.response_policies[0].server = {"nginx/1.29.7", 12};
++    u8 storage[512]{};
++    Connection conn{};
++    conn.reset();
++    conn.request_config = &config;
++    conn.response_policy_id = 1;
++    conn.resp_status = 200;
++    conn.response_read_deadline_upload.downstream_close = false;
++    conn.response_header_buf.bind(storage, sizeof(storage));
++    static constexpr u8 kHeader[] =
++        "HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\nContent-Length: 4\r\n"
++        "Connection: keep-alive\r\n\r\n";
++    REQUIRE_EQ(conn.response_header_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 4));
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 4));
++
++    // Same address and length, but an invalid status line; restoration must
++    // also recover after the failed parse invalidates the cache.
++    storage[0] = 'X';
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 4));
++    storage[0] = 'H';
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 4));
++
++    // A valid changed Content-Length must be parsed again as well.
++    constexpr u32 kLengthAt =
++        sizeof("HTTP/1.1 200 OK\r\nServer: nginx/1.29.7\r\nContent-Length: ") - 1u;
++    storage[kLengthAt] = '5';
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 4));
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 5));
++    storage[kLengthAt] = '4';
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 4));
++
++    conn.resp_status = 201;
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 4));
++    conn.resp_status = 200;
++    conn.response_read_deadline_upload.downstream_close = true;
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 4));
++    conn.response_read_deadline_upload.downstream_close = false;
++    const Str server = config.response_policies[0].server;
++    config.response_policies[0].server = {"other", 5};
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 4));
++    config.response_policies[0].server = server;
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 4));
++
++    // Identical bytes at another address must not retain views into storage.
++    u8 other[512]{};
++    conn.response_header_buf.bind(other, sizeof(other));
++    REQUIRE_EQ(conn.response_header_buf.write(kHeader, sizeof(kHeader) - 1u), sizeof(kHeader) - 1u);
++    __builtin_memset(storage, 'X', sizeof(storage));
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 4));
++
++    // Large headers bypass the bounded cache, including repeated checks and
++    // in-place mutation, with exactly the same semantic validation.
++    conn.response_header_buf.reset();
++    REQUIRE_EQ(conn.response_header_buf.write(kHeader, sizeof(kHeader) - 3u), sizeof(kHeader) - 3u);
++    static constexpr u8 kExtra[] = "X-Padding: ";
++    conn.response_header_buf.write(kExtra, sizeof(kExtra) - 1u);
++    for (u32 i = 0; i < 256; ++i)
++        conn.response_header_buf.write(reinterpret_cast<const u8*>("a"), 1);
++    conn.response_header_buf.write(reinterpret_cast<const u8*>("\r\n\r\n"), 4);
++    REQUIRE_GT(conn.response_header_buf.len(), 256u);
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 4));
++    REQUIRE(complete_content_length_pinned_header_matches(conn, 4));
++    other[0] = 'X';
++    CHECK_FALSE(complete_content_length_pinned_header_matches(conn, 4));
++}
++
+ static constexpr u8 kStrictSingleRange206Response[] =
+     "HTTP/1.1 206 Partial Content\r\n"
+     "Server: stall-origin\r\n"

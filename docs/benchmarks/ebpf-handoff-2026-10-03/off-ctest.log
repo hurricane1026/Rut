@@ -1,0 +1,15 @@
+Test project /home/hurricane/private/code/Rut/build-recovery
+    Start 258: test_ebpf_compiler
+1/3 Test #258: test_ebpf_compiler ...............   Passed    0.04 sec
+    Start 259: test_native_program
+2/3 Test #259: test_native_program ..............   Passed    0.94 sec
+    Start 260: test_native_protocol
+3/3 Test #260: test_native_protocol .............   Passed    0.38 sec
+
+100% tests passed, 0 tests failed out of 3
+
+Label Time Summary:
+jit     =   1.37 sec*proc (3 tests)
+unit    =   1.37 sec*proc (3 tests)
+
+Total Test time (real) =   1.41 sec
