@@ -106,7 +106,7 @@ inline GrpcWebTestResponseFraming grpc_web_test_response_framing(const u8* bytes
     }
     line++;
     while (line < boundary) {
-        const u8* line_end = static_cast<const u8*>(std::memchr(line, '\n', boundary - line));
+        const u8* line_end = static_cast<const u8*>(std::memchr(line, '\n', boundary + 2 - line));
         if (!line_end || line_end == line || line_end[-1] != '\r') {
             result.valid = false;
             return result;
@@ -563,6 +563,7 @@ struct GrpcWebTlsGateServer {
     pthread_t thread{};
     std::atomic<bool> client_hello_waiting{false};
     std::atomic<bool> served{false};
+    bool pause_handshake = false;
     bool truncate_response = false;
     bool clean_close_truncated_response = false;
     bool unclean_close_response = false;
@@ -577,7 +578,7 @@ struct GrpcWebTlsGateServer {
         set_socket_timeouts(fd, 5);
         auto created = create_tls_server_ssl(self->tls_context, fd);
         SSL* ssl = created ? created.value() : nullptr;
-        if (ssl) {
+        if (ssl && self->pause_handshake) {
             pollfd hello{fd, POLLIN, 0};
             if (poll(&hello, 1, 5000) > 0 && (hello.revents & POLLIN)) {
                 u8 byte = 0;
@@ -1412,6 +1413,36 @@ TEST(grpc_proxy, h1_path_and_safe_header_overrides_remain_supported) {
     CHECK(found);
 }
 
+TEST(grpc_proxy, h1_tls_response_framing_single_header) {
+    static constexpr u8 response[] =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/grpc-web\r\n"
+        "Content-Length: 6\r\n\r\nabcdef";
+    const auto framing = grpc_web_test_response_framing(response, sizeof(response) - 1);
+    CHECK(framing.headers_complete);
+    CHECK(framing.valid);
+    CHECK(framing.web);
+    CHECK(framing.has_content_length);
+    CHECK_EQ(framing.content_length, 6u);
+    CHECK_EQ(sizeof(response) - 1 - framing.body_offset, 6u);
+}
+TEST(grpc_proxy, h1_tls_response_framing_multiple_headers) {
+    static constexpr u8 response[] =
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: "
+        "application/grpc-web-text\r\nContent-Length: 4\r\n\r\nAAAA";
+    const auto framing = grpc_web_test_response_framing(response, sizeof(response) - 1);
+    CHECK(framing.headers_complete);
+    CHECK(framing.valid);
+    CHECK(framing.web);
+    CHECK(framing.text);
+    CHECK(framing.has_content_length);
+    CHECK_EQ(framing.content_length, 4u);
+}
+TEST(grpc_proxy, h1_tls_response_framing_partial_headers) {
+    static constexpr u8 response[] = "HTTP/1.1 200 OK\r\nContent-Type: application/grpc-web\r\n";
+    const auto framing = grpc_web_test_response_framing(response, sizeof(response) - 1);
+    CHECK(!framing.headers_complete);
+    CHECK(framing.valid);
+}
 TEST(grpc_proxy, h1_binary_coalesced_content_length_epoll) {
     grpc_web_h1_roundtrip_case<EpollEventLoop>(_tc, false, false, 1);
 }
@@ -1441,6 +1472,7 @@ TEST(grpc_proxy, h1_binary_tls_epoll) {
 }
 TEST(grpc_proxy, h1_binary_tls_handshake_retries_eintr) {
     GrpcWebTlsGateServer server;
+    server.pause_handshake = true;
     REQUIRE(server.start());
 
     struct ClientCall {
