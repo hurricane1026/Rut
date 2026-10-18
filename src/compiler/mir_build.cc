@@ -752,6 +752,11 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
+    if (expr.kind == HirExprKind::Uuid) {
+        v.kind = MirValueKind::Uuid;
+        v.type = MirTypeKind::Str;
+        return v;
+    }
     if (expr.kind == HirExprKind::TimeNowMicros) {
         v.kind = MirValueKind::TimeNowMicros;
         v.type = MirTypeKind::I64;

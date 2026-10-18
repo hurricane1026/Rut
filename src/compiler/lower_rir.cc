@@ -1678,6 +1678,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
         return result.value();
     }
+    if (value.kind == MirValueKind::Uuid) {
+        auto result = b.emit_uuid({span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
+    }
     if (value.kind == MirValueKind::TimeNowMicros) {
         auto out = b.emit_time_now_micros({span.line, span.col});
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);

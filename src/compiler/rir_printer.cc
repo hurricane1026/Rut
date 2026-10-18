@@ -309,6 +309,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::JsonOp:
             buf.put_cstr("json.op");
             break;
+        case Opcode::Uuid:
+            buf.put_cstr("uuid");
+            break;
         case Opcode::TimeNowMicros:
             buf.put_cstr("time.now_micros");
             break;
@@ -712,6 +715,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ReqRemoteAddr:
         case Opcode::ReqContentLength:
+        case Opcode::Uuid:
         case Opcode::TimeNowMicros:
             // No operands.
             break;

@@ -2,12 +2,19 @@
 
 #include "core/placement_new.h"
 #include "rut/common/shard_limits.h"
+#include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/arena.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/uuid.h"
 
+#ifdef __linux__
+#include <sys/random.h>
+#else
+#include <unistd.h>
+#endif
 #include <hs.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -874,6 +881,36 @@ void rut_helper_cache_reset_local_state() {
         t_active_cache_state != nullptr ? t_active_cache_state : t_default_cache_state;
     if (state == nullptr) return;
     for (auto& shard : state->shards) shard.reset();
+}
+
+extern "C" void rut_helper_uuid(
+    void* conn, void* arena, u8* has_value, const char** out_ptr, u32* out_len) {
+    *has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    auto* storage = static_cast<SliceArena*>(arena);
+    if (storage == nullptr && conn != nullptr)
+        storage = &static_cast<ConnectionBase*>(conn)->json_arena;
+    if (storage == nullptr || storage->backend.pool == nullptr) return;
+    // Arena allocations are 8-byte aligned; account for the full 40 bytes.
+    constexpr u32 kStoredBytes = (kUuidTextLength + 7u) & ~7u;
+    if (storage->space_used() > kUuidRequestBudget - kStoredBytes) return;
+    char text[kUuidTextLength];
+    if (!generate_uuid(text, [](u8* bytes, u32 size) -> i32 {
+#ifdef __linux__
+            return static_cast<i32>(getrandom(bytes, size, GRND_NONBLOCK));
+#else
+        return getentropy(bytes, size) == 0 ? static_cast<i32>(size) : -1;
+#endif
+        }))
+        return;
+    if (storage->current == nullptr && !storage->init(storage->backend.pool)) return;
+    auto* result = static_cast<char*>(storage->alloc(kUuidTextLength));
+    if (result == nullptr) return;
+    __builtin_memcpy(result, text, kUuidTextLength);
+    *out_ptr = result;
+    *out_len = kUuidTextLength;
+    *has_value = 1;
 }
 
 // ── String Operations ──────────────────────────────────────────────

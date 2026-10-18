@@ -541,7 +541,8 @@ req.header("X-Timestamp")    // string?
 
 // Setting headers
 req.set("X-User-ID", "123")
-req.set("X-Request-ID", uuid())
+// Target only: unwrap uuid() with guard let, then set the ID.
+// Dynamic req.set/add values remain pending; do not emit uuid() directly here.
 
 // Route parameters — path captures live in the req.params namespace,
 // so a capture can never shadow a built-in property (req.path, req.host, ...)
@@ -1586,9 +1587,12 @@ func auth(_ req: Request, role: string) -> User {
 // over Cache<IP, i64> lands with the pending state/library stack; Counter is
 // deleted (§3.3.6).
 
+// Target sketch: generator helpers and dynamic request-header values are pending.
 func requestId(_ req: Request) {
     if req.header("X-Request-ID") == nil {
-        req.set("X-Request-ID", uuid())
+        let pending = uuid()
+        guard let id = pending else { respond 503 }
+        req.set("X-Request-ID", id)  // target only: dynamic request values pending
     }
 }
 
@@ -3474,7 +3478,23 @@ aesGcmDecrypt(key, ciphertext)              // error-capable decrypt + verify ta
 
 // --- Random ---
 randomBytes(n)                // [u8] — cryptographically secure random
-uuid()                        // string — UUID v4
+uuid()                        // implemented: str? — RFC 9562 UUID v4
+// Explicit guard-let / fallback required: entropy/context/capacity failure is nil.
+// Linux uses one nonblocking getrandom(16) call; macOS uses getentropy(16).
+// A failure or short read publishes no result; no time/PID/counter fallback.
+// Results are 36 lowercase ASCII bytes with 122 random bits, stored in the
+// existing request SliceArena. UUID and JSON share a 256 KiB used-byte budget;
+// UUID charges 40 bytes including 8-byte alignment, and fails if the pool is full.
+// Views survive until request retirement/reset; no thread-local output buffer.
+// Each direct route-let call is fresh; references retain that local's value.
+// No constant folding. User bindings/functions named uuid shadow the builtin.
+// The builtin must directly initialize a top-level route let. Bind that optional
+// local with guard let/if let before use; generation inside a guard-let/if-let
+// expression or helper is rejected to avoid re-materializing fresh values.
+// Wait routes, timer bodies, and response-time
+// chain-after random effects are rejected until their lifetime/evaluation model
+// can preserve freshness. Request-header set/add still require literal values;
+// uuid() alone does not complete request-ID propagation middleware.
 
 // --- Encoding / Decoding ---
 base64(data)                  // string
@@ -3848,6 +3868,12 @@ route {
 
 Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, APISIX, and common Lua patterns).
 
+#### Partial coverage (current implementation)
+
+| Feature | Current boundary |
+|---------|------------------|
+| Request ID / Correlation ID | Request-local `uuid() -> str?` generation is implemented in direct route-let initializers; dynamic request-header propagation and generator helpers remain pending. |
+
 #### Fully Covered (built-in)
 
 | Feature Category | DSL Capability |
@@ -3862,7 +3888,6 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | CORS | `guard` + header assignment |
 | Rate limiting | `@rateLimit` or Rut GCRA over `Cache<K, i64>` (`examples/ratelimit.rut`) |
 | Request size limiting | `req.contentLength` comparison |
-| Request ID / Correlation ID | `uuid()` built-in |
 | Header add/remove/modify | `req.Header = val` / `= nil` |
 | URL rewriting | `req.path` assignment |
 | Response header rewrite | `let resp = forward(x, buffered: true); resp.Header = val` |

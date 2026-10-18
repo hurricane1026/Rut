@@ -856,6 +856,12 @@ struct Builder {
         return vid;
     }
 
+    Result<ValueId> emit_uuid(SourceLoc loc = {}) {
+        auto* str = TRY(make_type(TypeKind::Str));
+        auto* optional = TRY(make_type(TypeKind::Optional, str));
+        return TRY(emit(Opcode::Uuid, optional, loc)).vid;
+    }
+
     Result<ValueId> emit_time_now_micros(SourceLoc loc = {}) {
         auto* ty = TRY(make_type(TypeKind::I64));
         return TRY(emit(Opcode::TimeNowMicros, ty, loc)).vid;

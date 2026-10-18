@@ -122,6 +122,11 @@ void rut_helper_parse_prime(const rut::u8* req_data, rut::u32 req_len);
 // call before each terminal return of a request-reading handler.
 void rut_helper_parse_unprime();
 
+// UUID v4 from the OS CSPRNG. Outputs nil on entropy, context, or capacity failure.
+// Storage shares the existing request-owned JSON arena/budget; no view is retained.
+void rut_helper_uuid(
+    void* conn, void* arena, rut::u8* has_value, const char** out_ptr, rut::u32* out_len);
+
 // ── String Operations ──────────────────────────────────────────────
 
 // Check if string s has prefix pfx. Returns 1 (true) or 0 (false).

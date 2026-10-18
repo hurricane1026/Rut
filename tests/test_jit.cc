@@ -17,6 +17,7 @@
 #include "rut/runtime/connection.h"
 #include "rut/runtime/jit_dispatch.h"
 #include "rut/runtime/json.h"
+#include "rut/runtime/uuid.h"
 #if RUT_ENABLE_WEBSOCKET
 #include "rut/runtime/ws_terminate.h"
 #endif
@@ -21644,6 +21645,123 @@ TEST(jit, guard_let_shorthand_over_pure_optional_local) {
     CHECK(r.action == HandlerAction::ReturnStatus);
     CHECK(r.status_code == 400);
 
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, uuid_storage_budget_failure_and_live_views) {
+    u8 has = 1;
+    const char* ptr = "stale";
+    u32 len = 99;
+    rut_helper_uuid(nullptr, nullptr, &has, &ptr, &len);
+    CHECK_EQ(has, 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    const char* first = nullptr;
+    char saved[kUuidTextLength];
+    u32 successes = 0;
+    for (u32 i = 0; i < 7000; ++i) {
+        rut_helper_uuid(nullptr, &arena, &has, &ptr, &len);
+        if (!has) break;
+        REQUIRE_EQ(len, kUuidTextLength);
+        if (successes == 0) {
+            first = ptr;
+            __builtin_memcpy(saved, ptr, sizeof(saved));
+        }
+        ++successes;
+    }
+    REQUIRE(successes > 0);
+    CHECK(successes <= kUuidRequestBudget / 40u);
+    CHECK_EQ(has, 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+    CHECK(arena.space_used() <= kUuidRequestBudget);
+    CHECK((Str{first, kUuidTextLength}.eq({saved, sizeof(saved)})));
+    arena.destroy();
+    pool.destroy();
+    // A one-slice arena cannot grow after its current slice is consumed.
+    REQUIRE(pool.init(1));
+    REQUIRE(arena.init(&pool));
+    REQUIRE(arena.alloc(arena.current->remaining()) != nullptr);
+    rut_helper_uuid(nullptr, &arena, &has, &ptr, &len);
+    CHECK_EQ(has, 0);
+    CHECK(ptr == nullptr);
+    CHECK_EQ(len, 0u);
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(jit, uuid_helper_inlining_single_evaluation_and_response_lifetime) {
+    const char* source = R"rut(
+func useId(_ id: str) -> str => id
+route GET "/id" {
+    let pending = uuid()
+    guard let id = pending else { return 503 }
+    let echoed = useId(id)
+    guard echoed == id else { return 500 }
+    return response(200, body: id)
+}
+)rut";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    REQUIRE(rir::verify_module(rir.module).ok);
+    u32 calls = 0;
+    for (u32 fi = 0; fi < rir.module.func_count; ++fi)
+        for (u32 bi = 0; bi < rir.module.functions[fi].block_count; ++bi)
+            for (u32 ii = 0; ii < rir.module.functions[fi].blocks[bi].inst_count; ++ii)
+                calls += rir.module.functions[fi].blocks[bi].insts[ii].op == Opcode::Uuid;
+    CHECK_EQ(calls, 1u);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    engine.opt_level = OptLevel::O3;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    const char request[] = "GET /id HTTP/1.1\r\nHost: test\r\n\r\n";
+    auto failed = HandlerResult::unpack(handler(
+        nullptr, nullptr, reinterpret_cast<const u8*>(request), sizeof(request) - 1, nullptr));
+    CHECK_EQ(failed.status_code, 503u);
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    auto connection = std::make_unique<Connection>();
+    for (u32 i = 0; i < 3; ++i) {
+        connection->reset();
+        connection->json_arena.backend.pool = &pool;
+        auto result = HandlerResult::unpack(handler(connection.get(),
+                                                    nullptr,
+                                                    reinterpret_cast<const u8*>(request),
+                                                    sizeof(request) - 1,
+                                                    nullptr));
+        CHECK_EQ(result.status_code, 200u);
+        REQUIRE(connection->jit_response_body_valid);
+        auto id = connection->jit_response_body;
+        REQUIRE_EQ(id.len, kUuidTextLength);
+        CHECK_EQ(id.ptr[14], '4');
+        CHECK(id.ptr[19] == '8' || id.ptr[19] == '9' || id.ptr[19] == 'a' || id.ptr[19] == 'b');
+        for (u32 j = 0; j < id.len; ++j) {
+            if (j == 8 || j == 13 || j == 18 || j == 23)
+                CHECK_EQ(id.ptr[j], '-');
+            else
+                CHECK((id.ptr[j] >= '0' && id.ptr[j] <= '9') ||
+                      (id.ptr[j] >= 'a' && id.ptr[j] <= 'f'));
+        }
+    }
+    connection->reset();
+    pool.destroy();
     engine.shutdown();
     rir.destroy();
 }

@@ -4,6 +4,7 @@
 #include "rut/native_program.h"
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/ebpf_plan.h"
+#include "rut/runtime/slice_pool.h"
 #include "test.h"
 
 #include <errno.h>
@@ -407,6 +408,40 @@ TEST(native_program, constant_time_equal_is_available_after_compiler_exit) {
                  403);
         CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\n\r\n").status_code, 401);
     }
+}
+
+TEST(native_program, uuid_is_available_after_compiler_exit_with_request_arena) {
+    Source source;
+    REQUIRE(source.append(
+        "route GET \"/\" { let pending = uuid() guard let id = pending else { return 503 } "
+        "guard id == id else { return 500 } return 200 }\n"
+        "route GET \"/two\" { let first = uuid() let second = uuid() guard let a = first else { "
+        "return 503 } "
+        "guard let b = second else { return 503 } "
+        "guard a == a && b == b else { return 500 } return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p, 3));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\n\r\n").status_code, 503u);
+    SlicePool pool;
+    REQUIRE(pool.init(2));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    jit::HandlerCtx ctx{};
+    const char req[] = "GET / HTTP/1.1\r\n\r\n";
+    auto result = jit::HandlerResult::unpack(
+        route.fn(nullptr, &ctx, reinterpret_cast<const u8*>(req), sizeof(req) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(arena.space_used(), 40u);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    result = jit::HandlerResult::unpack(owner.p->config.routes[1].fn(
+        nullptr, &ctx, reinterpret_cast<const u8*>(req), sizeof(req) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(arena.space_used(), 120u);
+    arena.destroy();
+    pool.destroy();
 }
 
 int main(int argc, char** argv) {
