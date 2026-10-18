@@ -53,16 +53,50 @@ struct Loader {
     SchemaError error = SchemaError::Malformed;
     u32 files = 0;
     Str file_names[128]{};
+    SchemaFile* schema_files[128]{};
+    SchemaFile* current_file = nullptr;
     struct ServiceName {
         Str name{};
         ServiceName* next = nullptr;
     };
     ServiceName* services = nullptr;
     u32 service_count = 0;
+    struct PackageName {
+        Str name{};
+        PackageName* next = nullptr;
+    };
+    PackageName* packages = nullptr;
+    bool declared_symbol(Str name) const {
+        if (schema.find_message(name)) return true;
+        for (const ServiceName* item = services; item; item = item->next)
+            if (item->name.eq(name)) return true;
+        return false;
+    }
+    bool package_used(Str name) const {
+        for (const PackageName* item = packages; item; item = item->next)
+            if (item->name.eq(name)) return true;
+        return false;
+    }
+    bool register_package(Str package) {
+        for (u32 i = 0; i <= package.len; ++i) {
+            if (i != package.len && package.ptr[i] != '.') continue;
+            Str part = {package.ptr, i};
+            Str symbol = join({}, '.', part);
+            if (!symbol.ptr || declared_symbol(symbol)) return false;
+            if (package_used(symbol)) continue;
+            auto* item = arena.alloc_t<PackageName>();
+            if (!item) return fail(SchemaError::Allocation);
+            item->name = symbol;
+            item->next = packages;
+            packages = item;
+        }
+        return true;
+    }
     bool symbol_used(Str name) const {
         if (schema.find_message(name)) return true;
         for (const ServiceName* item = services; item; item = item->next)
             if (item->name.eq(name)) return true;
+        if (package_used(name)) return true;
         return false;
     }
     bool fail(SchemaError reason) {
@@ -176,7 +210,8 @@ struct Loader {
         } else if (item->type_name.len)
             return malformed();
         item->repeated = label == 3;
-        if (explicit_packed && (!item->repeated || !packable(item->type))) return malformed();
+        if (explicit_packed && item->packed && (!item->repeated || !packable(item->type)))
+            return malformed();
         if (!explicit_packed) item->packed = item->repeated && packable(item->type);
         if (!item->json_name.ptr) {
             auto* name = static_cast<char*>(arena.alloc(item->name.len));
@@ -202,6 +237,7 @@ struct Loader {
                 old->json_name.eq(item->name))
                 return fail(SchemaError::Duplicate);
         item->next = owner.fields;
+        item->file = current_file;
         owner.fields = item;
         ++schema.field_count;
         return true;
@@ -229,6 +265,7 @@ struct Loader {
         auto* item = arena.alloc_t<Message>();
         if (!item) return fail(SchemaError::Allocation);
         item->full_name = kFullName;
+        item->file = current_file;
         item->next = schema.messages;
         schema.messages = item;
         ++schema.message_count;
@@ -299,6 +336,7 @@ struct Loader {
         if (!item->path.ptr) return false;
         if (schema.find_method(item->path)) return fail(SchemaError::Duplicate);
         item->next = schema.methods;
+        item->file = current_file;
         schema.methods = item;
         ++schema.method_count;
         return true;
@@ -318,7 +356,7 @@ struct Loader {
             }
         }
         if (status != Status::End || !identifier(name)) return malformed();
-        if (service_count >= 1024) return fail(SchemaError::Limit);
+        if (service_count >= limits.services) return fail(SchemaError::Limit);
         const Str kQualified = package.len ? join(package, '.', name) : name;
         if (!kQualified.ptr) return false;
         const Str kSymbol = join({}, '.', kQualified);
@@ -365,10 +403,51 @@ struct Loader {
         if (!syntax.eq(lit_str("proto3"))) return fail(SchemaError::Unsupported);
         for (u32 i = 0; i < files; ++i)
             if (file_names[i].eq(name)) return fail(SchemaError::Duplicate);
+        if (package.len) {
+            for (u32 i = 0; i <= package.len; ++i) {
+                if (i != package.len && package.ptr[i] != '.') continue;
+                Str part = {package.ptr, i};
+                Str symbol = join({}, '.', part);
+                if (!symbol.ptr) return false;
+                if (declared_symbol(symbol)) return fail(SchemaError::Duplicate);
+            }
+            // Register after checking all prefixes so a package's own prefixes
+            // are visible to declarations in this and later files.
+            if (!register_package(package)) return false;
+        }
+        auto* schema_file = arena.alloc_t<SchemaFile>();
+        if (!schema_file) return fail(SchemaError::Allocation);
+        schema_file->name = name;
+        schema_file->dependencies = static_cast<Str*>(arena.alloc(sizeof(Str) * limits.files));
+        schema_file->public_dependencies = static_cast<u8*>(arena.alloc(limits.files));
+        if (!schema_file->dependencies || !schema_file->public_dependencies)
+            return fail(SchemaError::Allocation);
+        for (u32 i = 0; i < limits.files; ++i) schema_file->public_dependencies[i] = 0;
+        schema_files[files] = schema_file;
         file_names[files++] = name;
         const Str kScope = package.len ? join({}, '.', package) : Str{};
         if (package.len && !kScope.ptr) return false;
         Reader reader(view.data, view.size);
+        u64 public_indexes[128]{};
+        u32 public_index_count = 0;
+        while ((status = reader.next(part)) == Status::Field) {
+            if (part.number == 3) {
+                if (!wire(part, 2) || schema_file->dependency_count >= limits.files)
+                    return fail(SchemaError::Limit);
+                schema_file->dependencies[schema_file->dependency_count++] = text(part);
+            } else if (part.number == 10) {
+                if (!wire(part, 0) || public_index_count >= limits.files)
+                    return fail(SchemaError::Limit);
+                public_indexes[public_index_count++] = part.value;
+            }
+        }
+        if (status != Status::End) return malformed();
+        for (u32 i = 0; i < public_index_count; ++i) {
+            if (public_indexes[i] >= schema_file->dependency_count) return malformed();
+            schema_file->public_dependencies[static_cast<u32>(public_indexes[i])] = 1;
+        }
+        current_file = schema_file;
+        reader = Reader(view.data, view.size);
         while ((status = reader.next(part)) == Status::Field) {
             switch (part.number) {
                 case 4:
@@ -380,7 +459,6 @@ struct Loader {
                     break;
                 case 5:
                 case 7:
-                case 10:
                 case 11:
                 case 14:
                     return fail(SchemaError::Unsupported);
@@ -388,19 +466,60 @@ struct Loader {
                     break;
             }
         }
+        current_file = nullptr;
         return status == Status::End || malformed();
     }
     bool resolve() {
+        auto find_file = [&](Str name) -> const SchemaFile* {
+            for (u32 i = 0; i < files; ++i)
+                if (schema_files[i]->name.eq(name)) return schema_files[i];
+            return nullptr;
+        };
+        bool visited[128]{};
+        auto public_visible =
+            [&](const SchemaFile* from, const SchemaFile* target, auto&& self, u32 depth) -> bool {
+            if (from == target) return true;
+            if (!from || !target || depth > files) return false;
+            for (u32 i = 0; i < files; ++i)
+                if (schema_files[i] == from) {
+                    if (visited[i]) return false;
+                    visited[i] = true;
+                    break;
+                }
+            for (u32 i = 0; i < from->dependency_count; ++i) {
+                if (!from->public_dependencies[i]) continue;
+                const SchemaFile* dependency = find_file(from->dependencies[i]);
+                if (dependency && self(dependency, target, self, depth + 1)) return true;
+            }
+            return false;
+        };
+        auto visible = [&](const SchemaFile* from, const SchemaFile* target, u32 depth) -> bool {
+            if (from == target) return true;
+            if (!from || !target || depth > files) return false;
+            for (u32 i = 0; i < files; ++i) visited[i] = false;
+            for (u32 i = 0; i < from->dependency_count; ++i) {
+                const SchemaFile* dependency = find_file(from->dependencies[i]);
+                if (dependency == target ||
+                    (dependency && public_visible(dependency, target, public_visible, depth + 1)))
+                    return true;
+            }
+            return false;
+        };
         for (auto* item = schema.messages; item; item = item->next)
             for (auto* member = item->fields; member; member = member->next) {
                 if (member->type != Type::Message) continue;
                 member->message = schema.find_message(member->type_name);
                 if (!member->message) return fail(SchemaError::Unresolved);
+                if (!visible(member->file, member->message->file, 0))
+                    return fail(SchemaError::Unresolved);
             }
         for (auto* item = schema.methods; item; item = item->next) {
             item->input = schema.find_message(item->input_name);
             item->output = schema.find_message(item->output_name);
             if (!item->input || !item->output) return fail(SchemaError::Unresolved);
+            if (!visible(item->file, item->input->file, 0) ||
+                !visible(item->file, item->output->file, 0))
+                return fail(SchemaError::Unresolved);
         }
         return true;
     }
@@ -413,7 +532,8 @@ core::Expected<Schema, SchemaError> load_descriptor_set(Arena<MmapBackend>& aren
     const SchemaLimits kCeiling{};
     if (limits.bytes > kCeiling.bytes || limits.files > kCeiling.files ||
         limits.messages > kCeiling.messages || limits.fields > kCeiling.fields ||
-        limits.methods > kCeiling.methods || limits.depth > kCeiling.depth)
+        limits.methods > kCeiling.methods || limits.services > kCeiling.services ||
+        limits.depth > kCeiling.depth)
         return core::make_unexpected(SchemaError::Limit);
     if (!size || !data) return core::make_unexpected(SchemaError::Malformed);
     if (size > limits.bytes) return core::make_unexpected(SchemaError::Limit);

@@ -4325,8 +4325,31 @@ static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
             }
             ordered[pos] = proto;
         }
-        char name[64];
-        const int length = snprintf(name, sizeof(name), "__rut_pb$%u", mod.structs.len);
+        // Keep inferred protobuf structs private to the module that loaded the
+        // schema. Local struct indexes collide when two imported Rut modules
+        // each infer their first protobuf type.
+        char name[8192];
+        u32 length = 0;
+        auto append_identity = [&](Str value) {
+            const int prefix = snprintf(name + length, sizeof(name) - length, "%u:", value.len);
+            if (prefix < 0 || static_cast<u32>(prefix) >= sizeof(name) - length ||
+                value.len >= sizeof(name) - length - static_cast<u32>(prefix))
+                return false;
+            length += static_cast<u32>(prefix);
+            __builtin_memcpy(name + length, value.ptr, value.len);
+            length += value.len;
+            name[length++] = '|';
+            return true;
+        };
+        __builtin_memcpy(name, "__rut_pb$", 9);
+        length = 9;
+        if (!append_identity(g_proto_source_path) || !append_identity(mod.package_name) ||
+            !append_identity(message->full_name))
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        const int suffix = snprintf(name + length, sizeof(name) - length, "%u", mod.structs.len);
+        if (suffix < 0 || static_cast<u32>(suffix) >= sizeof(name) - length)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span);
+        length += static_cast<u32>(suffix);
         auto kept_name = intern_owned_response_body({name, static_cast<u32>(length)});
         if (!kept_name) return core::make_unexpected(kept_name.error());
         generated.name = kept_name.value();

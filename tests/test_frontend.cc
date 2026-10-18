@@ -40416,3 +40416,22 @@ TEST(frontend, protobuf_missing_source_diagnostic_survives_failed_analysis) {
     CHECK(strstr(diagnostic.detail.ptr, "cannot open proto source") != nullptr);
     CHECK(strstr(diagnostic.detail.ptr, "__missing_schema_7c10b.proto:1:1") != nullptr);
 }
+
+TEST(frontend, protobuf_inferred_types_are_unique_across_imported_modules) {
+    const std::string dir = "/tmp/rut_protobuf_imported_modules_unique_frontend";
+    std::filesystem::create_directories(dir);
+    const std::string schema = std::string(RUT_PROTO_TEST_ROOT) + "/tests/protobuf/codec.proto";
+    for (const char* package : {"first", "second"}) {
+        std::ofstream out(dir + "/" + package + ".rut", std::ios::binary);
+        out << "package shared\n";
+        out << "route POST \"/" << package << "\" { guard let value = protobuf.decode(\"" << schema
+            << "\", \"example.CodecMessage\", req.body) else { return 400 } return 200 }\n";
+    }
+    auto lexed = lex(lit("import \"first.rut\"\nimport \"second.rut\"\n"));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap_with_path(ast.value(), dir + "/main.rut");
+    REQUIRE(hir);
+    CHECK_EQ(hir->imports.len, 2u);
+}

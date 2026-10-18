@@ -387,6 +387,153 @@ TEST(protobuf_schema, mutated_real_descriptors_preserve_valid_schema_invariants)
     }
 }
 
+TEST(protobuf_schema, review_limits_packing_namespaces_and_import_visibility) {
+    // Explicit false is legal even when the field cannot be packed; true remains
+    // legal only for repeated packable scalar fields.
+    Bytes false_options;
+    false_options.number(2, 0);
+    Bytes unpackable = member(lit_str("text"), 1, 9, 3);
+    unpackable.child(8, false_options);
+    Bytes input = descriptor(message(unpackable));
+    CompileArena storage;
+    auto result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->find_message(lit_str(".example.Item"))->fields->packed);
+
+    Bytes singular = member(lit_str("number"), 1, 5, 1);
+    singular.child(8, false_options);
+    input = descriptor(message(singular));
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE(result.has_value());
+
+    Bytes true_options;
+    true_options.number(2, 1);
+    Bytes invalid_true = member(lit_str("text"), 1, 9, 3);
+    invalid_true.child(8, true_options);
+    input = descriptor(message(invalid_true));
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == SchemaError::Malformed);
+
+    Bytes packed = member(lit_str("value"), 1, 5, 3);
+    packed.child(8, true_options);
+    input = descriptor(message(packed));
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE(result.has_value());
+    CHECK(result->find_message(lit_str(".example.Item"))->fields->packed);
+
+    Bytes empty_service;
+    empty_service.text(1, lit_str("Service"));
+    Bytes service_file;
+    service_file.text(1, lit_str("service.proto"));
+    service_file.text(12, lit_str("proto3"));
+    service_file.child(6, empty_service);
+    Bytes services;
+    services.child(1, service_file);
+    storage.arena.reset();
+    SchemaLimits no_services{};
+    no_services.services = 0;
+    result = load_descriptor_set(storage.arena, services.data, services.size, no_services);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == SchemaError::Limit);
+
+    auto make_file = [](Str name, Str package, Str message_name, Str dependency = {}) {
+        Bytes msg;
+        msg.text(1, message_name);
+        Bytes file;
+        file.text(1, name);
+        if (package.len) file.text(2, package);
+        if (dependency.len) file.text(3, dependency);
+        file.text(12, lit_str("proto3"));
+        file.child(4, msg);
+        return file;
+    };
+    auto make_set = [](const Bytes& first, const Bytes& second) {
+        Bytes set;
+        set.child(1, first);
+        set.child(1, second);
+        return set;
+    };
+    for (u32 order = 0; order < 2; ++order) {
+        Bytes one = make_file(lit_str("one.proto"), lit_str("a"), lit_str("b"));
+        Bytes two = make_file(lit_str("two.proto"), lit_str("a.b"), lit_str("c"));
+        input = order ? make_set(two, one) : make_set(one, two);
+        storage.arena.reset();
+        result = load_descriptor_set(storage.arena, input.data, input.size);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == SchemaError::Duplicate);
+    }
+
+    Bytes source_message;
+    source_message.text(1, lit_str("A"));
+    Bytes source_field = member(lit_str("other"), 1, 11);
+    source_field.text(6, lit_str(".q.B"));
+    source_message.child(2, source_field);
+    Bytes source_a = make_file(lit_str("a.proto"), lit_str("p"), lit_str("A"));
+    // Replace the generated message with the referenced-field message.
+    source_a = Bytes{};
+    source_a.text(1, lit_str("a.proto"));
+    source_a.text(2, lit_str("p"));
+    source_a.text(12, lit_str("proto3"));
+    source_a.child(4, source_message);
+    Bytes source_b = make_file(lit_str("b.proto"), lit_str("q"), lit_str("B"));
+    input = make_set(source_a, source_b);
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == SchemaError::Unresolved);
+
+    Bytes oversized_public;
+    oversized_public.text(1, lit_str("oversized.proto"));
+    oversized_public.text(3, lit_str("b.proto"));
+    oversized_public.text(12, lit_str("proto3"));
+    oversized_public.number(10, 0x100000000ULL);
+    Bytes oversized_message;
+    oversized_message.text(1, lit_str("Oversized"));
+    oversized_public.child(4, oversized_message);
+    input = make_set(source_b, oversized_public);
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == SchemaError::Malformed);
+
+    source_a.text(3, lit_str("b.proto"));
+    input = make_set(source_a, source_b);
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE(result.has_value());
+
+    Bytes public_a;
+    Bytes public_a_message;
+    public_a_message.text(1, lit_str("A"));
+    public_a.text(1, lit_str("a.proto"));
+    public_a.text(2, lit_str("p"));
+    public_a.text(12, lit_str("proto3"));
+    public_a.child(4, public_a_message);
+    Bytes public_b =
+        make_file(lit_str("public.proto"), lit_str("q"), lit_str("B"), lit_str("a.proto"));
+    public_b.number(10, 0);
+    Bytes public_c_message;
+    public_c_message.text(1, lit_str("C"));
+    Bytes public_c_field = member(lit_str("a"), 1, 11);
+    public_c_field.text(6, lit_str(".p.A"));
+    public_c_message.child(2, public_c_field);
+    Bytes public_c;
+    public_c.text(1, lit_str("consumer.proto"));
+    public_c.text(2, lit_str("r"));
+    public_c.text(3, lit_str("public.proto"));
+    public_c.text(12, lit_str("proto3"));
+    public_c.child(4, public_c_message);
+    input = make_set(public_a, public_b);
+    input.child(1, public_c);
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE(result.has_value());
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }

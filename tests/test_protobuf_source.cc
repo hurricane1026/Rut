@@ -167,6 +167,23 @@ TEST(protobuf_source, source_budgets_and_empty_files) {
     Storage storage;
     CHECK_FALSE(files.load(storage));
 }
+
+TEST(protobuf_source, service_budget_honors_zero_and_boundary) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("root.proto", "syntax='proto3'; service S {}"));
+    SchemaLimits zero{};
+    zero.services = 0;
+    Storage storage;
+    auto result = files.load(storage, zero);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Limit);
+    storage.arena.reset();
+    SchemaLimits one{};
+    one.services = 1;
+    result = files.load(storage, one);
+    REQUIRE(result.has_value());
+}
 TEST(protobuf_source, inner_type_name_shadows_outer_namespace) {
     Files files;
     REQUIRE(files.ok);

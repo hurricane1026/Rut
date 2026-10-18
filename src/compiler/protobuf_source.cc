@@ -589,7 +589,7 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
     return true;
 }
 bool Parser::service(Buffer& parent, Str scope) {
-    if (compiler.service_count++ >= 1024)
+    if (compiler.service_count++ >= compiler.limits.services)
         return fail(SourceError::Kind::Limit, lit_str("service count"));
     advance();
     Str service_name{};
@@ -735,7 +735,8 @@ core::Expected<Schema, SourceError> load_proto_source(Arena<MmapBackend>& arena,
     const SchemaLimits kCeiling{};
     if (limits.bytes > kCeiling.bytes || limits.files > kCeiling.files ||
         limits.messages > kCeiling.messages || limits.fields > kCeiling.fields ||
-        limits.methods > kCeiling.methods || limits.depth > kCeiling.depth)
+        limits.methods > kCeiling.methods || limits.services > kCeiling.services ||
+        limits.depth > kCeiling.depth)
         return core::make_unexpected(SourceError{SourceError::Kind::Limit, {}, 1, 1, {}});
     if (!path.len || path.len > 4095)
         return core::make_unexpected(SourceError{SourceError::Kind::Io, {}, 1, 1, {}});

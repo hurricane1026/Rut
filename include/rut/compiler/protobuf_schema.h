@@ -27,6 +27,7 @@ enum class Type : u8 {
     Sint64
 };
 struct Message;
+struct SchemaFile;
 struct SchemaField {
     Str name{};
     Str json_name{};
@@ -36,12 +37,14 @@ struct SchemaField {
     bool repeated = false;
     bool packed = false;
     const Message* message = nullptr;
+    const SchemaFile* file = nullptr;
     SchemaField* next = nullptr;
 };
 struct Message {
     Str full_name{};  // Leading dot, e.g. .example.Message
     SchemaField* fields = nullptr;
     Message* next = nullptr;
+    const SchemaFile* file = nullptr;
 };
 struct Method {
     Str path{};  // /package.Service/Method
@@ -52,6 +55,13 @@ struct Method {
     bool client_streaming = false;
     bool server_streaming = false;
     Method* next = nullptr;
+    const SchemaFile* file = nullptr;
+};
+struct SchemaFile {
+    Str name{};
+    Str* dependencies = nullptr;
+    u8* public_dependencies = nullptr;
+    u32 dependency_count = 0;
 };
 struct Schema {
     Message* messages = nullptr;
@@ -71,6 +81,7 @@ struct SchemaLimits {
     u32 fields = 16384;
     u32 methods = 1024;
     u32 depth = 32;
+    u32 services = 1024;
 };
 // Copies input into arena: output never borrows the supplied descriptor buffer.
 // Arena must be initialized and outlive the schema. Failure consumes arena space;
