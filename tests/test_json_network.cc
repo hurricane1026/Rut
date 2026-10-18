@@ -741,6 +741,12 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     };
     CHECK(decode(hs256_key.c_str(), signed_header(1024).c_str()).first);
     CHECK_FALSE(decode(hs256_key.c_str(), signed_header(1025).c_str()).first);
+    CHECK(decode(hs256_key.c_str(), sign_header(R"({"alg":"HS256","b64":true})").c_str()).first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), sign_header(R"({"alg":"HS256","b64":false})").c_str()).first);
+    CHECK_FALSE(decode(hs256_key.c_str(),
+                       sign_header(R"({"alg":"HS256","b64":false,"crit":["b64"]})").c_str())
+                    .first);
     std::string flood = R"({"alg":"HS256")";
     for (u32 i = 0; i < 700; ++i) flood += ",\"x" + std::to_string(i) + "\":0";
     flood += '}';

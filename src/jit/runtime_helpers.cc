@@ -1631,6 +1631,12 @@ bool jwt_decode_claims(
             has_crit = true;
             continue;
         }
+        if (key.eq(lit_str("b64"))) {
+            if (document.nodes[node].kind != json::Kind::Boolean ||
+                !document.raw(node).eq(lit_str("true")))
+                return false;
+            continue;
+        }
         if (!key.eq(lit_str("alg"))) continue;
         if (has_alg) return false;
         if (document.nodes[node].kind != json::Kind::String) return false;
