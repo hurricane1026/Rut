@@ -72,6 +72,7 @@ struct GrpcExchange {
     bool web_trailer_flushed;
     bool web_h1;
     bool web_response_invalid;
+    GrpcWebContentType web_response_mode;
     bool skip_rpc_log;
     void (*web_h1_kick)(void*, ConnectionBase&);
     u8 web_pending_output[4];
@@ -123,6 +124,7 @@ struct GrpcExchange {
         web_body_flushed = web_trailer_flushed = false;
         web_h1 = false;
         web_response_invalid = false;
+        web_response_mode = GrpcWebContentType::Native;
         skip_rpc_log = false;
         web_h1_kick = nullptr;
         web_pending_output_len = web_pending_output_offset = 0;

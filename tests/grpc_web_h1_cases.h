@@ -625,7 +625,8 @@ template <typename Loop>
 void grpc_web_h1_roundtrip_case(rut::test::TestCase* _tc,
                                 bool text,
                                 bool chunked,
-                                u32 payload_len) {
+                                u32 payload_len,
+                                i32 response_text_override = -1) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
     auto shard = std::make_unique<Shard<Loop>>();
@@ -651,8 +652,13 @@ void grpc_web_h1_roundtrip_case(rut::test::TestCase* _tc,
     for (u32 i = 0; i < payload_len; i++) rpc_body[5 + i] = static_cast<u8>((i * 17u) & 0xff);
     std::vector<u8> request_body = text ? grpc_web_test_base64(rpc_body) : rpc_body;
     std::vector<u8> response;
-    const bool exchanged =
-        grpc_web_test_h1_exchange(get_port(listener), text, chunked, request_body, response);
+    const bool response_text = response_text_override < 0 ? text : response_text_override != 0;
+    const char* accept = response_text_override < 0
+                             ? ""
+                             : (response_text ? "Accept: application/grpc-web-text\r\n"
+                                              : "Accept: application/grpc-web\r\n");
+    const bool exchanged = grpc_web_test_h1_exchange(
+        get_port(listener), text, chunked, request_body, response, false, nullptr, accept);
     if (!exchanged) {
         std::fprintf(stderr,
                      "H1 failed: text=%u chunked=%u len=%zu backend=%u response=%zu\n",
@@ -683,10 +689,10 @@ void grpc_web_h1_roundtrip_case(rut::test::TestCase* _tc,
                   boundary);
             const auto headers_end = boundary;
             const std::string headers(response.begin(), headers_end);
-            CHECK(headers.find(text ? "application/grpc-web-text" : "application/grpc-web") !=
-                  std::string::npos);
+            CHECK(headers.find(response_text ? "application/grpc-web-text"
+                                             : "application/grpc-web") != std::string::npos);
             std::vector<u8> decoded;
-            if (text) {
+            if (response_text) {
                 decoded.resize(response.size() - body_offset);
                 GrpcWebBase64Decoder decoder;
                 decoder.init();
@@ -1019,6 +1025,12 @@ TEST(grpc_proxy, h1_text_coalesced_content_length_epoll) {
 }
 TEST(grpc_proxy, h1_binary_chunked_large_epoll) {
     grpc_web_h1_roundtrip_case<EpollEventLoop>(_tc, false, true, 130000);
+}
+TEST(grpc_proxy, h1_binary_request_text_accept_response) {
+    grpc_web_h1_roundtrip_case<EpollEventLoop>(_tc, false, false, 17, 1);
+}
+TEST(grpc_proxy, h1_text_request_binary_accept_response) {
+    grpc_web_h1_roundtrip_case<EpollEventLoop>(_tc, true, false, 17, 0);
 }
 TEST(grpc_proxy, h1_binary_coalesced_content_length_iouring) {
     grpc_web_h1_roundtrip_case<IoUringEventLoop>(_tc, false, false, 1);
