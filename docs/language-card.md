@@ -416,12 +416,13 @@ Binary and base64-text gRPC-Web can use the same `.http2` upstream through
 HTTP/2 or HTTP/1.1 POST requests. Content types are `application/grpc-web` and
 `application/grpc-web-text`, optionally suffixed with `+proto`; `+json` is not
 supported. The bridge preserves opaque protobuf payloads and converts backend
-trailers into the final gRPC-Web body envelope. The incremental base64 request decoder
-accepts independently padded flush blocks. HTTP/1.1 accepts Content-Length or
-chunked uploads and closes after the response; it does not provide keep-alive
-or pipelining for these RPCs. Browser CORS requires explicit OPTIONS routes
-and response headers; see [the browser example](../examples/grpc-web.rut)
-and [its instructions](../examples/grpc/README.md#browser-grpc-web-example).
+trailers into the final gRPC-Web body envelope. The incremental base64 request
+decoder accepts independently padded flush blocks. HTTP/1.1 accepts
+Content-Length or chunked uploads and closes after the response; it does not
+provide keep-alive or pipelining for these RPCs. Browser CORS requires
+explicit OPTIONS routes and response headers; see [the browser
+example](../examples/grpc-web.rut) and [its
+instructions](../examples/grpc/README.md#browser-grpc-web-example).
 
 Native gRPC upstream sessions with active RPCs send an HTTP/2 PING every five
 minutes after connection establishment or the previous probe. Only an ACK with
