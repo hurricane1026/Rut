@@ -109,6 +109,9 @@ struct EchoServer {
         u8 te_count;
         bool saw_text_test_marker;
         u8 content_length_count;
+        u32 content_length_value;
+        u64 request_hash;
+        u32 received_len;
         u8 data[256 * 1024];
     } streams[64]{};
     int listen_fd = -1;
@@ -129,6 +132,10 @@ struct EchoServer {
     std::atomic<u32> bad_web_request_headers{0};
     std::atomic<u32> text_marker_requests{0};
     std::atomic<u32> text_content_length_requests{0};
+    std::atomic<u32> window_updates{0};
+    std::atomic<u32> last_completed_request_size{0};
+    std::atomic<u32> last_completed_content_length{0};
+    std::atomic<u64> last_completed_request_hash{0};
     bool started = false;
     TlsServerContext* tls_context = nullptr;
     std::atomic<u32> handshake_failures{0};
@@ -141,6 +148,7 @@ struct EchoServer {
         for (auto& s : streams)
             if (!s.id) {
                 s.id = id;
+                s.request_hash = 14695981039346656037ull;
                 return &s;
             }
         return nullptr;
@@ -169,6 +177,7 @@ struct EchoServer {
     }
     static int frame(nghttp2_session* session, const nghttp2_frame* f, void* user) {
         auto* self = static_cast<EchoServer*>(user);
+        if (f->hd.type == NGHTTP2_WINDOW_UPDATE) self->window_updates++;
         if (!f->hd.stream_id) return 0;
         auto* s = self->get(f->hd.stream_id);
         if (!s) return NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -257,6 +266,9 @@ struct EchoServer {
         if ((f->hd.type == NGHTTP2_HEADERS || f->hd.type == NGHTTP2_DATA) &&
             (f->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
             s->end = true;
+            self->last_completed_request_size = s->received_len;
+            self->last_completed_content_length = s->content_length_value;
+            self->last_completed_request_hash = s->request_hash;
             nghttp2_session_resume_data(session, s->id);
         }
         return 0;
@@ -285,8 +297,15 @@ struct EchoServer {
         if (stream && name_len == 15 && memcmp(name, "x-test-web-mode", 15) == 0 &&
             value_len == 4 && memcmp(value, "text", 4) == 0)
             stream->saw_text_test_marker = true;
-        if (stream && name_len == 14 && memcmp(name, "content-length", 14) == 0)
+        if (stream && name_len == 14 && memcmp(name, "content-length", 14) == 0) {
             stream->content_length_count++;
+            u32 parsed = 0;
+            for (size_t i = 0; i < value_len; i++) {
+                if (value[i] < '0' || value[i] > '9' || parsed > (0xffffffffu / 10)) return 0;
+                parsed = parsed * 10 + value[i] - '0';
+            }
+            stream->content_length_value = parsed;
+        }
         if (name_len != 7 || memcmp(name, ":scheme", 7) != 0) return 0;
         const char* expected = server->tls_context ? "https" : "http";
         if (value_len != strlen(expected) || memcmp(value, expected, value_len) != 0)
@@ -302,6 +321,11 @@ struct EchoServer {
         auto* s = static_cast<EchoServer*>(user)->get(id);
         if (!s || len > sizeof(s->data) - s->len) return NGHTTP2_ERR_CALLBACK_FAILURE;
         memcpy(s->data + s->len, data, len);
+        s->received_len += static_cast<u32>(len);
+        for (size_t i = 0; i < len; i++) {
+            s->request_hash ^= data[i];
+            s->request_hash *= 1099511628211ull;
+        }
         s->len += static_cast<u32>(len);
         nghttp2_session_resume_data(session, id);
         return 0;
@@ -393,7 +417,7 @@ struct Client {
     SSL_CTX* tls_context = nullptr;
     SSL* ssl = nullptr;
     struct Rpc {
-        static constexpr u32 kWebBufferCap = 131072;
+        static constexpr u32 kWebBufferCap = 262144;
         u32 sent = 0, received = 0, size = 0;
         u32 status = 99;
         u32 raw_len = 0, max_chunk = 0, response_len = 0;
@@ -405,6 +429,7 @@ struct Client {
     } rpcs[17];
     nghttp2_session* session = nullptr;
     bool goaway = false;
+    u32 window_updates = 0;
     int fd = -1;
     static u8 byte_at(u32 i) { return static_cast<u8>((i * 17 + i / 256) & 255); }
     static ssize_t data(nghttp2_session* session,
@@ -480,6 +505,10 @@ struct Client {
             static_cast<Client*>(ctx)->rpcs[(f->hd.stream_id - 1) / 2].response_end = true;
         return 0;
     }
+    static int frame_send(nghttp2_session*, const nghttp2_frame* f, void* ctx) {
+        if (f->hd.type == NGHTTP2_WINDOW_UPDATE) static_cast<Client*>(ctx)->window_updates++;
+        return 0;
+    }
     static int closed(nghttp2_session*, int32_t sid, uint32_t, void* ctx) {
         static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2].closed = true;
         return 0;
@@ -503,6 +532,7 @@ struct Client {
         nghttp2_session_callbacks_set_on_header_callback(cb, &header);
         nghttp2_session_callbacks_set_on_stream_close_callback(cb, &closed);
         nghttp2_session_callbacks_set_on_frame_recv_callback(cb, &frame);
+        nghttp2_session_callbacks_set_on_frame_send_callback(cb, &frame_send);
         const int rc = nghttp2_session_client_new(&session, cb, this);
         nghttp2_session_callbacks_del(cb);
         nghttp2_submit_settings(session, 0, nullptr, 0);
@@ -2186,6 +2216,7 @@ void grpc_web_h2_case(rut::test::TestCase* _tc) {
     REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
     shard->route_config = &cfg;
     REQUIRE(shard->spawn(-1).has_value());
+    u32 expected_trailer_size = 0;
     {
         Client client;
         const bool connected = client.init(get_port(lfd));
@@ -2210,6 +2241,7 @@ void grpc_web_h2_case(rut::test::TestCase* _tc) {
             u32 expected_trailer_len = 0;
             REQUIRE(grpc_web_encode_trailer_envelope(
                 trailers, 2, expected_trailer, sizeof(expected_trailer), expected_trailer_len));
+            expected_trailer_size = expected_trailer_len;
             for (u32 i = 0; i < 6; i++) {
                 const bool text = i >= 3;
                 const u32 window_size = (i % 3) + 1;
@@ -2372,19 +2404,144 @@ void grpc_web_h2_case(rut::test::TestCase* _tc) {
                              expected_trailer,
                              expected_trailer_len) == 0);
             }
-            AccessLogEntry log_entry{};
-            bool found_large_log = false;
-            while (shard->log_ring->pop(log_entry)) {
-                if (log_entry.req_size == sizeof(large_request)) {
-                    found_large_log = true;
-                    CHECK_EQ(log_entry.resp_size, sizeof(large_request) + expected_trailer_len);
-                }
+            constexpr u32 kPayloadLen = 130000;
+            constexpr u32 kNativeLen = kPayloadLen + 5;
+            auto native = std::make_unique<u8[]>(kNativeLen);
+            native[0] = 0;
+            native[1] = static_cast<u8>(kPayloadLen >> 24);
+            native[2] = static_cast<u8>(kPayloadLen >> 16);
+            native[3] = static_cast<u8>(kPayloadLen >> 8);
+            native[4] = static_cast<u8>(kPayloadLen);
+            for (u32 i = 5; i < kNativeLen; i++)
+                native[i] = static_cast<u8>((i * 73u + i / 127u + 19u) & 255u);
+            u64 native_hash = 14695981039346656037ull;
+            for (u32 i = 0; i < kNativeLen; i++) {
+                native_hash ^= native[i];
+                native_hash *= 1099511628211ull;
             }
-            CHECK(found_large_log);
+            auto native_to_text = [&](u8* output, u32 capacity) {
+                GrpcWebBase64Encoder large_encoder{};
+                large_encoder.init();
+                u32 native_consumed = 0, encoded = 0, padding = 0;
+                CHECK_EQ(large_encoder.feed(
+                             native.get(), kNativeLen, native_consumed, output, capacity, encoded),
+                         GrpcWebCodecStatus::Ok);
+                CHECK_EQ(native_consumed, kNativeLen);
+                CHECK_EQ(large_encoder.flush(output + encoded, capacity - encoded, padding),
+                         GrpcWebCodecStatus::Ok);
+                return encoded + padding;
+            };
+            auto base64_wire_size = [](u32 len) { return ((len + 2) / 3) * 4; };
+            const u32 content_types_before = server->grpc_content_type_requests.load();
+            const u32 te_trailers_before = server->te_trailers_requests.load();
+            const u32 text_markers_before = server->text_marker_requests.load();
+            u32 text_cases_completed = 0;
+            for (u32 case_index = 0; case_index < 4; case_index++) {
+                const bool text = (case_index & 1) != 0;
+                const u32 rpc_index = 11 + case_index;
+                std::unique_ptr<u8[]> text_body;
+                u32 request_len = kNativeLen;
+                const u8* request_body = native.get();
+                if (text) {
+                    text_body = std::make_unique<u8[]>(base64_wire_size(kNativeLen));
+                    request_len = native_to_text(text_body.get(), base64_wire_size(kNativeLen));
+                    request_body = text_body.get();
+                }
+                const u32 client_updates_before = client.window_updates;
+                const u32 server_updates_before = server->window_updates.load();
+                CHECK_EQ(
+                    client.request_web(rpc_index, request_body, request_len, text, 16384, text),
+                    static_cast<int>(rpc_index * 2 + 1));
+                CHECK(client.until(rpc_index, true));
+                const auto& large_rpc = client.rpcs[rpc_index];
+                CHECK(large_rpc.web_content_type);
+                CHECK(large_rpc.meta);
+                CHECK_EQ(large_rpc.sent, request_len);
+                CHECK(large_rpc.response_end);
+                const u32 decoded_size = kNativeLen + expected_trailer_len;
+                if (text) {
+                    CHECK_EQ(large_rpc.response_len,
+                             base64_wire_size(kNativeLen) + base64_wire_size(expected_trailer_len));
+                    auto decoded = std::make_unique<u8[]>(decoded_size);
+                    GrpcWebBase64Decoder large_decoder{};
+                    large_decoder.init();
+                    u32 raw_consumed = 0, raw_written = 0;
+                    CHECK_EQ(large_decoder.feed(large_rpc.response.get(),
+                                                large_rpc.response_len,
+                                                raw_consumed,
+                                                decoded.get(),
+                                                decoded_size,
+                                                raw_written),
+                             GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(raw_consumed, large_rpc.response_len);
+                    CHECK_EQ(large_decoder.finish(), GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(raw_written, decoded_size);
+                    if (raw_written == decoded_size) {
+                        CHECK_EQ(memcmp(decoded.get(), native.get(), kNativeLen), 0);
+                        CHECK_EQ(
+                            memcmp(
+                                decoded.get() + kNativeLen, expected_trailer, expected_trailer_len),
+                            0);
+                    }
+                } else {
+                    CHECK_EQ(large_rpc.response_len, decoded_size);
+                    if (large_rpc.response_len == decoded_size) {
+                        CHECK_EQ(memcmp(large_rpc.response.get(), native.get(), kNativeLen), 0);
+                        CHECK_EQ(memcmp(large_rpc.response.get() + kNativeLen,
+                                        expected_trailer,
+                                        expected_trailer_len),
+                                 0);
+                    }
+                }
+                CHECK_EQ(server->last_completed_request_size.load(), kNativeLen);
+                CHECK_EQ(server->last_completed_request_hash.load(), native_hash);
+                CHECK_EQ(server->last_completed_content_length.load(), 0u);
+                if (text) text_cases_completed++;
+                CHECK_EQ(server->grpc_content_type_requests.load(),
+                         content_types_before + case_index + 1);
+                CHECK_EQ(server->te_trailers_requests.load(), te_trailers_before + case_index + 1);
+                CHECK_EQ(server->text_marker_requests.load(),
+                         text_markers_before + text_cases_completed);
+                CHECK_GE(client.window_updates - client_updates_before, 2u);
+                CHECK_GE(server->window_updates.load() - server_updates_before, 2u);
+            }
+            CHECK_EQ(server->grpc_content_type_requests.load(), content_types_before + 4);
+            CHECK_EQ(server->te_trailers_requests.load(), te_trailers_before + 4);
+            CHECK_EQ(server->bad_web_request_headers.load(), 0u);
+            CHECK_EQ(server->text_marker_requests.load(), text_markers_before + 2);
+            CHECK_EQ(server->text_content_length_requests.load(), 0u);
         }
     }
     shard->stop();
     shard->join();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 15u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[0], 12u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[7], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[13], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[14], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 15u);
+    AccessLogEntry log_entry{};
+    u32 large_70k_logs = 0, large_binary_logs = 0, large_text_logs = 0;
+    while (shard->log_ring->pop(log_entry)) {
+        if (log_entry.req_size == 70005u) {
+            large_70k_logs++;
+            CHECK_EQ(log_entry.resp_size, 70005u + expected_trailer_size);
+        }
+        if (log_entry.req_size == 130005u) {
+            large_binary_logs++;
+            CHECK_EQ(log_entry.resp_size, 130005u + expected_trailer_size);
+            CHECK_EQ(log_entry.grpc_status_plus_one, 1u);
+        }
+        if (log_entry.req_size == 173340u) {
+            large_text_logs++;
+            CHECK_EQ(log_entry.resp_size, 173396u);
+            CHECK_EQ(log_entry.grpc_status_plus_one, 1u);
+        }
+    }
+    CHECK_EQ(large_70k_logs, 1u);
+    CHECK_EQ(large_binary_logs, 2u);
+    CHECK_EQ(large_text_logs, 2u);
     shard->loop->force_close_all();
     if (shard->loop->listen_fd >= 0) {
         close(shard->loop->listen_fd);
