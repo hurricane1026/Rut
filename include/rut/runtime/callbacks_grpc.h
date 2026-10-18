@@ -501,7 +501,11 @@ inline bool grpc_web_queue_h1_headers(GrpcExchange& x,
             header.name.eq({"connection", 10}))
             continue;
         const u32 needed = header.name.len + 2 + header.value.len + 2;
-        if (needed > sizeof(x.response_headers) - offset) return false;
+        // The H1 bridge prepends the fixed status/Connection lines and appends
+        // the terminating CRLF in the same send slice as this metadata.
+        constexpr u32 kH1FramingBytes = sizeof("HTTP/1.1 200 OK\r\nConnection: close\r\n") - 1 + 2;
+        static_assert(kH1FramingBytes == 38);
+        if (needed > sizeof(x.response_headers) - kH1FramingBytes - offset) return false;
         __builtin_memcpy(x.response_headers + offset, header.name.ptr, header.name.len);
         offset += header.name.len;
         x.response_headers[offset++] = ':';
@@ -1787,7 +1791,12 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                                               ? static_cast<u32>(stream->send_window)
                                               : static_cast<u32>(h.conn_send_window))
                                        : 0;
-                if (cap - total <= 9 || !window) continue;
+                const bool empty_terminal_ready =
+                    !x->download_len && x->response_trailers_offset >= x->response_trailers_len &&
+                    x->response_end &&
+                    (!text || (x->web_body_flushed &&
+                               x->web_pending_output_offset == x->web_pending_output_len));
+                if (cap - total < 9 || (!window && !empty_terminal_ready)) continue;
                 u32 amount = 0;
                 const u8* payload = nullptr;
                 bool final = false;

@@ -4575,6 +4575,101 @@ TEST(grpc_proxy, grpc_web_text_batches_independently_padded_messages) {
     grpc_detach(h, &x);
 }
 
+TEST(grpc_proxy, grpc_web_h1_headers_fit_framing_at_exact_slice_capacity) {
+    HeldSendGrpcDriveFixture loop;
+    Connection conn;
+    conn.reset();
+    conn.fd = 41;
+    u8 send_storage[SlicePool::kSliceSize];
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    static constexpr char kName[] = "x";
+    static constexpr u32 kMaxMetadata = GrpcExchange::kHeaders - 38;
+    static constexpr u32 kContentTypeWire = 12 + 2 + 20 + 2;
+    static constexpr u32 kLargeValueLen = kMaxMetadata - kContentTypeWire - 5;
+    u8 large_value[kLargeValueLen + 1]{};
+    hpack::Header exact[] = {
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{kName, 1}, {reinterpret_cast<const char*>(large_value), kLargeValueLen}}};
+    REQUIRE(grpc_web_queue_h1_headers(x, exact, 2, false));
+    CHECK_EQ(x.response_headers_len, kMaxMetadata);
+
+    x.init();
+    hpack::Header oversized[] = {
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{kName, 1}, {reinterpret_cast<const char*>(large_value), kLargeValueLen + 1}}};
+    CHECK_FALSE(grpc_web_queue_h1_headers(x, oversized, 2, false));
+
+    // The exact accepted metadata size plus the bridge framing occupies the
+    // full downstream send slice without truncation.
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    REQUIRE(grpc_web_queue_h1_headers(x, exact, 2, false));
+    grpc_web_h1_pump_response(&loop, conn, x);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(loop.pending_send_len, SlicePool::kSliceSize);
+    CHECK_FALSE(loop.closed);
+}
+
+TEST(grpc_proxy, grpc_web_terminal_data_can_end_with_zero_flow_control_credit) {
+    for (const auto mode : {GrpcWebContentType::Binary, GrpcWebContentType::Text}) {
+        GrpcDriveFixture loop;
+        Connection downstream;
+        downstream.reset();
+        Http2Conn h;
+        h.init_client();
+        downstream.h2 = &h;
+        auto* stream = h.open_stream(1);
+        REQUIRE(stream != nullptr);
+        stream->send_window = 0;
+        h.conn_send_window = 0;
+        GrpcExchange x;
+        x.init();
+        x.web_mode = mode;
+        x.downstream = &downstream;
+        x.downstream_stream = 1;
+        x.response_headers_sent = true;
+        x.response_end = true;
+        x.web_body_flushed = true;
+        REQUIRE(grpc_attach(h, &x));
+
+        u8 output[9];
+        CHECK_EQ(grpc_pump_downstream(&loop, downstream, output, sizeof(output)), 9u);
+        CHECK_EQ(output[3], static_cast<u8>(Http2FrameType::Data));
+        CHECK_EQ(output[4], http2_flag::kEndStream);
+        CHECK_EQ(output[0] | output[1] | output[2], 0u);
+        CHECK_EQ(stream->send_window, 0);
+        CHECK_EQ(h.conn_send_window, 0u);
+    }
+
+    GrpcDriveFixture loop;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn h;
+    h.init_client();
+    downstream.h2 = &h;
+    auto* stream = h.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->send_window = 0;
+    h.conn_send_window = 0;
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    x.downstream = &downstream;
+    x.downstream_stream = 1;
+    x.response_headers_sent = true;
+    x.response_end = true;
+    x.download[0] = 1;
+    x.download_len = 1;
+    REQUIRE(grpc_attach(h, &x));
+    u8 output[9];
+    CHECK_EQ(grpc_pump_downstream(&loop, downstream, output, sizeof(output)), 0u);
+    CHECK_EQ(x.download_len, 1u);
+}
+
 TEST(grpc_proxy, grpc_web_text_large_message_batches_data_frames) {
     GrpcDriveFixture loop;
     Connection downstream;
