@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rut gRPC-Web wire client</title>
+<style>
+body { max-width: 52rem; margin: 3rem auto; padding: 0 1rem; font: 16px system-ui; }
+label { display: block; margin: 1rem 0; }
+input, textarea, select, button { font: inherit; padding: .5rem; }
+input, textarea { box-sizing: border-box; width: 100%; }
+pre { padding: 1rem; background: #f2f4f6; white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+<h1>Rut gRPC-Web wire client</h1>
+<p>This client wraps an opaque message in the five-byte gRPC envelope. It displays
+response messages as hex and trailers as text; it does not load a proto or decode protobuf.</p>
+<form id="request">
+  <label>RPC URL <input id="url" value="http://127.0.0.1:50052/example.Echo/Unary" required></label>
+  <label>Wire format <select id="mode"><option value="binary">Binary</option><option value="text">Base64 text</option></select></label>
+  <label>Message bytes (hex; default is the example Message with text "hello")
+    <textarea id="message" rows="3">0a0568656c6c6f</textarea></label>
+  <button type="submit">Send</button> <button id="cancel" type="button" disabled>Cancel</button>
+</form>
+<pre id="output" aria-live="polite">Ready.</pre>
+<script type="module">
+const output = document.querySelector('#output');
+const cancel = document.querySelector('#cancel');
+let controller;
+const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+const append = (a, b) => { const joined = new Uint8Array(a.length + b.length); joined.set(a); joined.set(b, a.length); return joined; };
+const log = line => { output.textContent += `${line}\n`; };
+cancel.onclick = () => controller?.abort();
+
+document.querySelector('#request').onsubmit = async event => {
+  event.preventDefault();
+  controller?.abort();
+  const current = new AbortController();
+  controller = current;
+  cancel.disabled = false;
+  output.textContent = '';
+  try {
+    const raw = document.querySelector('#message').value.replace(/\s/g, '');
+    if (raw.length % 2 || /[^0-9a-f]/i.test(raw)) throw new Error('Message must contain complete hex bytes.');
+    const payload = Uint8Array.from(raw.match(/../g) ?? [], pair => parseInt(pair, 16));
+    const frame = new Uint8Array(5 + payload.length);
+    new DataView(frame.buffer).setUint32(1, payload.length);
+    frame.set(payload, 5);
+    const text = document.querySelector('#mode').value === 'text';
+    const body = text ? btoa(Array.from(frame, b => String.fromCharCode(b)).join('')) : frame;
+    const response = await fetch(document.querySelector('#url').value, {
+      method: 'POST', signal: current.signal,
+      headers: { 'content-type': text ? 'application/grpc-web-text+proto' : 'application/grpc-web+proto', 'x-grpc-web': '1' },
+      body,
+    });
+    log(`HTTP ${response.status}`);
+    if (!response.ok || !response.body) throw new Error('RPC HTTP response failed.');
+    const responseType = response.headers.get('content-type') ?? '';
+    const mediaType = responseType.split(';', 1)[0].trim().toLowerCase();
+    const expectedType = text ? 'application/grpc-web-text' : 'application/grpc-web';
+    if (mediaType !== expectedType && mediaType !== `${expectedType}+proto`)
+      throw new Error(`Unexpected content-type: ${responseType}`);
+    const reader = response.body.getReader();
+    let bytes = new Uint8Array(0), quartet = '', terminal = false;
+    const process = chunk => {
+      bytes = append(bytes, chunk);
+      while (bytes.length >= 5) {
+        if (terminal) throw new Error('Bytes after terminal trailers.');
+        const flag = bytes[0];
+        const length = new DataView(bytes.buffer, bytes.byteOffset, 5).getUint32(1);
+        if (length > 16 * 1024 * 1024) throw new Error('Demo frame limit is 16 MiB.');
+        if (bytes.length < 5 + length) break;
+        const message = bytes.subarray(5, 5 + length);
+        if (flag === 0x80) {
+          log(`Trailers:\n${new TextDecoder('ascii').decode(message)}`);
+          terminal = true;
+        } else if (flag === 0 || flag === 1) {
+          log(`Message (${length} bytes${flag ? ', compressed' : ''}): ${hex(message)}`);
+        } else throw new Error(`Invalid frame flags: ${flag}`);
+        bytes = bytes.slice(5 + length);
+      }
+    };
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!text) process(value);
+      else for (const character of value) {
+        quartet += String.fromCharCode(character);
+        if (quartet.length === 4) {
+          const decoded = atob(quartet);
+          process(Uint8Array.from(decoded, c => c.charCodeAt(0)));
+          quartet = '';
+        }
+      }
+    }
+    if (quartet || bytes.length || !terminal) throw new Error('Response ended before complete trailers.');
+    log('Complete.');
+  } catch (error) {
+    if (controller === current) log(`${error.name}: ${error.message}`);
+  } finally {
+    if (controller === current) { controller = undefined; cancel.disabled = true; }
+  }
+};
+</script>
+</html>

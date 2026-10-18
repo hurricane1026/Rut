@@ -1,0 +1,27 @@
+// Browser demo: serve examples/grpc on http://127.0.0.1:8080 and open web_client.html.
+// Requires the gRPC-Web bridge; see examples/grpc/README.md for the backend.
+upstream echo {
+    host: "127.0.0.1"
+    port: 50051
+    protocol: .http2
+}
+
+// Explicit demo origin, never reflected from an untrusted request header.
+func browser_headers(_ resp: Response) -> i32 {
+    resp.set("Access-Control-Allow-Origin", "http://127.0.0.1:8080")
+    resp.set("Access-Control-Expose-Headers", "grpc-status, grpc-message")
+    0
+}
+chain browser { after browser_headers(resp) }
+
+route OPTIONS "/example.Echo" {
+    let resp = response(204)
+    resp.set("Access-Control-Allow-Origin", "http://127.0.0.1:8080")
+    resp.set("Access-Control-Allow-Methods", "POST, OPTIONS")
+    resp.set("Access-Control-Allow-Headers", "content-type, x-grpc-web, grpc-timeout")
+    resp.set("Access-Control-Max-Age", "600")
+    return resp
+}
+
+route POST "/example.Echo/Unary" use chain browser { return forward(echo) }
+route POST "/example.Echo/ServerStream" use chain browser { return forward(echo) }
