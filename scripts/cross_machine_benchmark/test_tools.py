@@ -201,7 +201,7 @@ class Tests(unittest.TestCase):
                     order = {('rut', 1): 1, ('nginx', 1): 2, ('nginx', 2): 3,
                              ('rut', 2): 4, ('rut', 3): 5, ('nginx', 3): 6}
                     (root / f'{engine}{rep}' / 'environment.json').write_text(
-                        json.dumps({'time': order[(engine, rep)],
+                        json.dumps({'time': order[(engine, rep)], 'uname': ['Linux', 'fixture', '5.0', 'x86_64', 'fixture'],
                                     'binaries': {'/opt/wrk': 'a' * 64}}))
             self.assertEqual(summarize.summarize(root)[0]['throughput_classification'],
                              'inconclusive-lua-body-callback')
@@ -227,6 +227,15 @@ class Tests(unittest.TestCase):
             compiler_result.write_text(json.dumps(compiler_data))
             with self.assertRaises(ValueError):
                 summarize.summarize(compiler_changed)
+            machine_changed = root / 'machine-changed'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, machine_changed / name)
+            machine_env = machine_changed / 'nginx2' / 'environment.json'
+            machine_data = json.loads(machine_env.read_text())
+            machine_data['uname'] = ['Linux', 'different-client', '5.0', 'x86_64', 'fixture']
+            machine_env.write_text(json.dumps(machine_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(machine_changed)
             origin_changed = root / 'origin-changed'
             for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
                 shutil.copytree(root / name, origin_changed / name)
@@ -313,7 +322,7 @@ class Tests(unittest.TestCase):
                         server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=100, p99_us=100)]))
                     (p / 'environment.json').write_text(json.dumps(
-                        {'time': (rep - 1) * 2 + (1 if engine == 'rut' else 2),
+                        {'time': (rep - 1) * 2 + (1 if engine == 'rut' else 2), 'uname': ['Linux', 'fixture', '5.0', 'x86_64', 'fixture'],
                          'binaries': {'/opt/wrk': 'a' * 64}}))
             with self.assertRaises(ValueError):
                 summarize.summarize(mismatch)
@@ -337,7 +346,7 @@ class Tests(unittest.TestCase):
                         server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=100, p99_us=100)]))
                     (p / 'environment.json').write_text(json.dumps(
-                        {'time': (rep - 1) * 2 + (1 if engine == 'rut' else 2),
+                        {'time': (rep - 1) * 2 + (1 if engine == 'rut' else 2), 'uname': ['Linux', 'fixture', '5.0', 'x86_64', 'fixture'],
                          'binaries': {'/opt/wrk': 'a' * 64}}))
             with self.assertRaises(ValueError):
                 summarize.summarize(config_mismatch)

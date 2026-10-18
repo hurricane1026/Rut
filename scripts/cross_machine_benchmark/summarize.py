@@ -26,6 +26,7 @@ def summarize(root):
     groups = {}
     timestamps = {}
     client_hashes = {}
+    client_identities = {}
     for p in sorted(root.rglob('result.json')):
         d = json.loads(p.read_text())
         if not d['valid']:
@@ -40,6 +41,14 @@ def summarize(root):
         environment = json.loads(env.read_text())
         timestamps.setdefault(key, []).append((environment['time'], d['engine'], d['repetition']))
         client_hashes.setdefault(key, []).append(wrk_hash(environment))
+        try:
+            raw_identity = environment['uname']
+            identity = tuple(raw_identity)
+        except (KeyError, TypeError):
+            raise ValueError(f'client environment is missing uname identity: {p}')
+        if len(identity) != 5 or any(not isinstance(value, str) or not value for value in identity):
+            raise ValueError(f'client environment has malformed uname identity: {p}')
+        client_identities.setdefault(key, []).append(identity)
         rows = groups.setdefault(key, {'rut': {}, 'nginx': {}})[d['engine']]
         if d['repetition'] in rows:
             raise ValueError(f'duplicate engine/repetition: {p}')
@@ -60,6 +69,8 @@ def summarize(root):
             raise ValueError(f'runs are not in documented interleaved order: {key}')
         if len(set(client_hashes[key])) != 1:
             raise ValueError(f'client wrk binary changed between paired runs: {key}')
+        if len(set(client_identities[key])) != 1:
+            raise ValueError(f'client machine identity changed between paired runs: {key}')
         for engine, runs in engines.items():
             run_ids = [d['server_run_id'] for d, _ in runs.values()]
             if len(set(run_ids)) != len(run_ids):
