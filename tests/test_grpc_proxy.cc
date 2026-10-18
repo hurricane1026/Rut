@@ -2287,7 +2287,10 @@ TEST(grpc_proxy, refused_stream_retry_survives_protocol_close_in_same_process) {
     down_h2.init_client();
     downstream.h2 = &down_h2;
     REQUIRE(up_h2.open_stream(1) != nullptr);
-    REQUIRE(down_h2.open_stream(1) != nullptr);
+    auto* down_stream = down_h2.open_stream(1);
+    REQUIRE(down_stream != nullptr);
+    down_stream->manual_window = true;
+    down_stream->recv_unconsumed = 3;
     GrpcExchange x;
     x.init();
     x.upstream = &upstream;
@@ -2295,6 +2298,7 @@ TEST(grpc_proxy, refused_stream_retry_survives_protocol_close_in_same_process) {
     x.upstream_stream = x.downstream_stream = 1;
     x.slot_held = true;
     x.request_headers_sent = true;
+    x.upload_len = 3;
     x.retry_enabled = true;
     x.retry_policy = {2, 16, 1u << 14, 0};
     x.retry_attempts = 1;
@@ -2336,6 +2340,10 @@ TEST(grpc_proxy, refused_stream_retry_survives_protocol_close_in_same_process) {
     CHECK(x.slot_held);
     CHECK_EQ(x.failure, 0u);
     CHECK_EQ(loop.released, 0u);
+    CHECK_EQ(down_h2.conn_recv_credit, 3u);
+    CHECK_EQ(x.upload_len, 0u);
+    grpc_detach_retry_attempt(&loop, x);
+    CHECK_EQ(down_h2.conn_recv_credit, 3u);
 }
 
 TEST(grpc_proxy, c5_exhaustion_retries_only_complete_logical_exchanges) {
@@ -2918,7 +2926,10 @@ TEST(grpc_proxy, grpc_web_h2_iouring) {
 }
 
 template <typename Loop>
-void grpc_retry_trailers_only_case(rut::test::TestCase* _tc, u8 mode) {
+void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
+                                   u8 mode,
+                                   bool web = false,
+                                   bool text = false) {
     (void)_tc;
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
@@ -2943,18 +2954,70 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc, u8 mode) {
         CHECK(client.init(get_port(lfd)));
         if (client.fd >= 0) {
             const u8 request[] = {0, 0, 0, 0, 3, 0xfa, 0xfb, 0xfc};
-            CHECK(client.request_native_raw(0, request, sizeof(request)) > 0);
+            u8 text_request[32];
+            const u8* body = request;
+            u32 body_len = sizeof(request);
+            if (web && text) {
+                GrpcWebBase64Encoder encoder{};
+                encoder.init();
+                u32 consumed = 0, written = 0, flushed = 0;
+                CHECK_EQ(encoder.feed(request,
+                                      sizeof(request),
+                                      consumed,
+                                      text_request,
+                                      sizeof(text_request),
+                                      written),
+                         GrpcWebCodecStatus::Ok);
+                CHECK_EQ(
+                    encoder.flush(text_request + written, sizeof(text_request) - written, flushed),
+                    GrpcWebCodecStatus::Ok);
+                body = text_request;
+                body_len = written + flushed;
+            }
+            const int sid = web ? client.request_web(0, body, body_len, text, 2, true)
+                                : client.request_native_raw(0, body, body_len);
+            CHECK(sid > 0);
             CHECK(client.until(0, true));
             const auto& rpc = client.rpcs[0];
             const bool retried = mode == 1;
             CHECK_EQ(server->requests.load(), retried ? 2u : 1u);
-            CHECK_EQ(rpc.status, retried ? 0u : 7u);
-            CHECK_EQ(rpc.ok, retried);
-            if (retried) {
-                CHECK(rpc.trailer);
-                CHECK_EQ(rpc.response_len, sizeof(request));
-                if (rpc.response_len == sizeof(request))
-                    CHECK(memcmp(rpc.response.get(), request, sizeof(request)) == 0);
+            if (!web) {
+                CHECK_EQ(rpc.status, retried ? 0u : 7u);
+                CHECK_EQ(rpc.ok, retried);
+            } else if (retried) {
+                u8 decoded[256];
+                u32 decoded_len = 0;
+                if (text) {
+                    GrpcWebBase64Decoder decoder{};
+                    decoder.init();
+                    u32 consumed = 0, written = 0;
+                    CHECK_EQ(decoder.feed(rpc.response.get(),
+                                          rpc.response_len,
+                                          consumed,
+                                          decoded,
+                                          sizeof(decoded),
+                                          written),
+                             GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(consumed, rpc.response_len);
+                    CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+                    decoded_len = written;
+                } else {
+                    decoded_len = rpc.response_len;
+                    CHECK_LE(decoded_len, sizeof(decoded));
+                    if (decoded_len <= sizeof(decoded))
+                        memcpy(decoded, rpc.response.get(), decoded_len);
+                }
+                GrpcWebTrailer trailers[] = {{{"grpc-status", 11}, {"0", 1}},
+                                             {{"x-trailer", 9}, {"present", 7}}};
+                u8 expected[128];
+                u32 expected_len = 0;
+                REQUIRE(grpc_web_encode_trailer_envelope(
+                    trailers, 2, expected, sizeof(expected), expected_len));
+                CHECK_EQ(decoded_len, sizeof(request) + expected_len);
+                if (decoded_len == sizeof(request) + expected_len) {
+                    CHECK(memcmp(decoded, request, sizeof(request)) == 0);
+                    CHECK(memcmp(decoded + sizeof(request), expected, expected_len) == 0);
+                }
             }
         }
     }
@@ -2989,6 +3052,18 @@ TEST(grpc_proxy, grpc_retry_nonlisted_status_epoll) {
 }
 TEST(grpc_proxy, grpc_retry_nonlisted_status_iouring) {
     grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 2);
+}
+TEST(grpc_proxy, grpc_retry_web_binary_epoll) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 1, true, false);
+}
+TEST(grpc_proxy, grpc_retry_web_binary_iouring) {
+    grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 1, true, false);
+}
+TEST(grpc_proxy, grpc_retry_web_text_epoll) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 1, true, true);
+}
+TEST(grpc_proxy, grpc_retry_web_text_iouring) {
+    grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 1, true, true);
 }
 
 TEST(grpc_proxy, streaming_and_pooling_epoll) {
