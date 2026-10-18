@@ -1,0 +1,58 @@
+{
+  "source_head": "1e460cf7a9b0a5d69640de50b7ee5f8e7eddf730",
+  "dirty": true,
+  "arguments": {
+    "relay": "/home/hurricane/private/code/rut-ebpf-20261003/relay-ebpf",
+    "wrk": "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk",
+    "loader": "/home/hurricane/private/code/rut-ebpf-20261003/loader",
+    "libc": "/home/hurricane/private/code/rut-ebpf-20261003/libc.so.6",
+    "output": "/home/hurricane/private/code/rut-ebpf-20261003/sidecar-1m-r2",
+    "body_size": 1048576,
+    "concurrency": [
+      1,
+      32
+    ],
+    "first_engine": "copy",
+    "include_ebpf": true,
+    "front_port": 8087,
+    "origin_port": 9087,
+    "server_cpu": 2,
+    "server_cpus": "2",
+    "workers": 1,
+    "origin_cpu": 3,
+    "client_cpus": "4,5",
+    "profile": "acceptance",
+    "duration": 5,
+    "warmup": 1,
+    "repeats": 3,
+    "proxy_profile": "native-streaming",
+    "keepalive_header": "implicit",
+    "tls_cert": null,
+    "tls_key": null
+  },
+  "kernel": [
+    "Linux",
+    "leopard",
+    "6.19.10-300.fc44.x86_64",
+    "#1 SMP PREEMPT_DYNAMIC Wed Mar 25 18:23:49 UTC 2026",
+    "x86_64"
+  ],
+  "cpu_topology": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           39 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz\nCPU family:                              6\nModel:                                   165\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                5\nCPU(s) scaling MHz:                      92%\nCPU max MHz:                             4800.0000\nCPU min MHz:                             800.0000\nBogoMIPS:                                5799.77\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid mpx rdseed adx smap clflushopt intel_pt xsaveopt xsavec xgetbv1 xsaves dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp vnmi pku ospke md_clear flush_l1d arch_capabilities\nVirtualization:                          VT-x\nL1d cache:                               256 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                2 MiB (8 instances)\nL3 cache:                                16 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Mitigation; Microcode\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             KVM: Mitigation: Split huge pages\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Mitigation; Clear CPU buffers; SMT vulnerable\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Mitigation; Microcode\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace\n",
+  "nginx_image": "nginx@sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "nginx_image_id": "sha256:1854da86e82d5dfb49a8f3d78b099adcc7e36608b207146ed95cd47937938a40",
+  "sha256": {
+    "/home/hurricane/private/code/rut-ebpf-20261003/relay-ebpf": "a7ee19c7148644aed37547f4f7ce8386e89160f4a9b965d10ab3fecc26e009be",
+    "/tmp/pr-watchdog/hurricane1026_Rut_687/wrk-boringssl-src2/wrk": "d7866c40dcb47f67138cdc420c346272d06b7b5dfc2705161178c996b6e7cf30",
+    "/home/hurricane/private/code/rut-ebpf-20261003/loader": "4e5d39355699e90fa29313d3100e82af4a23290028c58c364d6a249ef6a78e5e",
+    "/home/hurricane/private/code/rut-ebpf-20261003/libc.so.6": "a5c5ad9d59d3c69eda93aa8f82930ba06cc4e893a113e66c85ad6e96243d53c8"
+  },
+  "topology": "relay joins origin container network namespace; client enters published port",
+  "relay_security": "uid/gid 0, BPF+NET_ADMIN only, label=disable, no-new-privileges, default seccomp",
+  "mode": "raw bidirectional TCP tunnel; no HTTP policy, routing, TLS, or body inspection",
+  "batch_bytes": 65536,
+  "tcp_nodelay": true,
+  "preflight": "exact body, delayed reader + successor, 100 sequential requests, exact origin reuse",
+  "note": "RSS excludes kernel pipe/socket memory; native preflight body override is local to this runner",
+  "ebpf_scope": "optional whole upstream L4 stream; no L7 body takeover or Rut serving-loop integration",
+  "machine_cpu_scope": "whole-host /proc/stat busy execution, includes background activity and both endpoints"
+}

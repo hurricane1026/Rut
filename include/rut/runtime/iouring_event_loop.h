@@ -3032,8 +3032,13 @@ public:
     // Initialize TLS termination on a freshly accepted connection: create the
     // engine, allocate the ciphertext in/out slices, and point on_recv at the
     // TLS driver. Returns false (and rolls back) if the engine or pool fails.
-    bool tls_setup(Connection& c) {
-        if (!tls_engine_init(c.tls_engine, tls_server)) return false;
+    bool tls_setup(Connection& c,
+                   TlsClientContext* client = nullptr,
+                   const char* server_name = nullptr) {
+        if (client) {
+            if (!tls_engine_init_client(c.tls_engine, *client, server_name)) return false;
+        } else if (!tls_engine_init(c.tls_engine, tls_server))
+            return false;
         void* in_region = mmap(
             nullptr, kTlsInputSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (in_region == MAP_FAILED) {

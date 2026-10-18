@@ -1,0 +1,373 @@
+16 warnings generated.
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:53:19: warning: invalid case style for constant 'sockets' [readability-identifier-naming]
+   53 |         const int sockets[] = {client, relay};
+      |                   ^~~~~~~
+      |                   kSockets
+   54 |         for (int fd : sockets) {
+      |                       ~~~~~~~
+      |                       kSockets
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:53:19: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:54:23: note: FIX-IT applied suggested code changes
+   54 |         for (int fd : sockets) {
+      |                       ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:55:27: warning: invalid case style for constant 'timeout' [readability-identifier-naming]
+   55 |             const timeval timeout{5, 0};
+      |                           ^~~~~~~
+      |                           kTimeout
+   56 |             const int one = 1;
+   57 |             if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+      |                                                          ~~~~~~~         ~~~~~~~
+      |                                                          kTimeout        kTimeout
+   58 |                 setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
+      |                                                          ~~~~~~~         ~~~~~~~
+      |                                                          kTimeout        kTimeout
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:55:27: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:57:58: note: FIX-IT applied suggested code changes
+   57 |             if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+      |                                                          ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:57:74: note: FIX-IT applied suggested code changes
+   57 |             if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+      |                                                                          ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:58:58: note: FIX-IT applied suggested code changes
+   58 |                 setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
+      |                                                          ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:58:74: note: FIX-IT applied suggested code changes
+   58 |                 setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
+      |                                                                          ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:56:23: warning: invalid case style for constant 'one' [readability-identifier-naming]
+   56 |             const int one = 1;
+      |                       ^~~
+      |                       kOne
+   57 |             if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+   58 |                 setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ||
+   59 |                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0)
+      |                                                           ~~~         ~~~
+      |                                                           kOne        kOne
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:56:23: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:59:59: note: FIX-IT applied suggested code changes
+   59 |                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0)
+      |                                                           ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:59:71: note: FIX-IT applied suggested code changes
+   59 |                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0)
+      |                                                                       ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:79:16: warning: invalid case style for constant 'license' [readability-identifier-naming]
+   79 |     const char license[] = "GPL";
+      |                ^~~~~~~
+      |                kLicense
+   80 |     union bpf_attr attr{};
+   81 |     attr.prog_type = BPF_PROG_TYPE_SK_SKB;
+   82 |     attr.expected_attach_type = attach;
+   83 |     attr.insn_cnt = count;
+   84 |     attr.insns = reinterpret_cast<uintptr_t>(program);
+   85 |     attr.license = reinterpret_cast<uintptr_t>(license);
+      |                                                ~~~~~~~
+      |                                                kLicense
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:79:16: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:85:48: note: FIX-IT applied suggested code changes
+   85 |     attr.license = reinterpret_cast<uintptr_t>(license);
+      |                                                ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:109:20: warning: invalid case style for constant 'instructions' [readability-identifier-naming]
+  109 |     const bpf_insn instructions[] = {insn(0x61, 3, 1, offsetof(__sk_buff, local_port), 0),
+      |                    ^~~~~~~~~~~~
+      |                    kInstructions
+  110 |                                      insn(0x15, 3, 0, 2, 0),
+  111 |                                      insn(0xb7, 3, 0, 0, 0),
+  112 |                                      insn(0x05, 0, 0, 1, 0),
+  113 |                                      insn(0xb7, 3, 0, 0, 1),
+  114 |                                      insn(0x18, 2, BPF_PSEUDO_MAP_FD, 0, 0),
+  115 |                                      insn(0, 0, 0, 0, 0),
+  116 |                                      insn(0xb7, 4, 0, 0, 0),
+  117 |                                      insn(0x85, 0, 0, 0, BPF_FUNC_sk_redirect_map),
+  118 |                                      insn(0x95, 0, 0, 0, 0)};
+  119 |     memcpy(verdict, instructions, sizeof(verdict));
+      |                     ~~~~~~~~~~~~
+      |                     kInstructions
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:109:20: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:119:21: note: FIX-IT applied suggested code changes
+  119 |     memcpy(verdict, instructions, sizeof(verdict));
+      |                     ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:122:20: warning: invalid case style for constant 'prefix' [readability-identifier-naming]
+  122 |     const bpf_insn prefix[] = {insn(0xbf, 6, 1, 0, 0),
+      |                    ^~~~~~
+      |                    kPrefix
+  123 |                                insn(0x61, 3, 6, offsetof(__sk_buff, local_port), 0),
+  124 |                                insn(0xb7, 7, 0, 0, 0),
+  125 |                                insn(0x15, 3, 0, 1, 0),
+  126 |                                insn(0xb7, 7, 0, 0, 1),
+  127 |                                insn(0x63, 10, 7, -4, 0),
+  128 |                                insn(0x18, 1, BPF_PSEUDO_MAP_FD, 0, 0),
+  129 |                                insn(0, 0, 0, 0, 0),
+  130 |                                insn(0xbf, 2, 10, 0, 0),
+  131 |                                insn(0x07, 2, 0, 0, -4),
+  132 |                                insn(0x85, 0, 0, 0, BPF_FUNC_map_lookup_elem),
+  133 |                                insn(0x15, 0, 0, 0, 0),
+  134 |                                insn(0x61, 8, 0, 0, 0)};
+  135 |     memcpy(parser, prefix, sizeof(prefix));
+      |                    ~~~~~~         ~~~~~~
+      |                    kPrefix        kPrefix
+  136 |     memcpy(verdict, prefix, sizeof(prefix));
+      |                     ~~~~~~         ~~~~~~
+      |                     kPrefix        kPrefix
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:122:20: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:135:20: note: FIX-IT applied suggested code changes
+  135 |     memcpy(parser, prefix, sizeof(prefix));
+      |                    ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:135:35: note: FIX-IT applied suggested code changes
+  135 |     memcpy(parser, prefix, sizeof(prefix));
+      |                                   ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:136:21: note: FIX-IT applied suggested code changes
+  136 |     memcpy(verdict, prefix, sizeof(prefix));
+      |                     ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:136:36: note: FIX-IT applied suggested code changes
+  136 |     memcpy(verdict, prefix, sizeof(prefix));
+      |                                    ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:140:20: warning: invalid case style for constant 'parse_tail' [readability-identifier-naming]
+  140 |     const bpf_insn parse_tail[] = {insn(0xb7, 0, 0, 0, 4096),
+      |                    ^~~~~~~~~~
+      |                    kParseTail
+  141 |                                    insn(0x15, 8, 0, 3, 0),
+  142 |                                    insn(0xbd, 0, 8, 1, 0),
+  143 |                                    insn(0xbf, 0, 8, 0, 0),
+  144 |                                    insn(0x95, 0, 0, 0, 0),
+  145 |                                    insn(0xb7, 0, 0, 0, 1),
+  146 |                                    insn(0x95, 0, 0, 0, 0),
+  147 |                                    insn(0xb7, 0, 0, 0, -1),
+  148 |                                    insn(0x95, 0, 0, 0, 0)};
+  149 |     memcpy(parser + 13, parse_tail, sizeof(parse_tail));
+      |                         ~~~~~~~~~~         ~~~~~~~~~~
+      |                         kParseTail         kParseTail
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:140:20: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:149:25: note: FIX-IT applied suggested code changes
+  149 |     memcpy(parser + 13, parse_tail, sizeof(parse_tail));
+      |                         ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:149:44: note: FIX-IT applied suggested code changes
+  149 |     memcpy(parser + 13, parse_tail, sizeof(parse_tail));
+      |                                            ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:151:20: warning: invalid case style for constant 'verdict_tail' [readability-identifier-naming]
+  151 |     const bpf_insn verdict_tail[] = {insn(0x15, 8, 0, 13, 0),
+      |                    ^~~~~~~~~~~~
+      |                    kVerdictTail
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:151:20: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:169:26: note: FIX-IT applied suggested code changes
+  169 |     memcpy(verdict + 13, verdict_tail, sizeof(verdict_tail));
+      |                          ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:169:47: note: FIX-IT applied suggested code changes
+  169 |     memcpy(verdict + 13, verdict_tail, sizeof(verdict_tail));
+      |                                               ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:194:16: warning: invalid case style for constant 'ok' [readability-identifier-naming]
+  194 |     const bool ok = writing || read(fd, &extra, 1) == 0;
+      |                ^~
+      |                kOk
+  195 |     int result = close(fd);
+  196 |     if (!ok) errno = EINVAL;
+      |          ~~
+      |          kOk
+  197 |     return ok && result == 0;
+      |            ~~
+      |            kOk
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:194:16: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:196:10: note: FIX-IT applied suggested code changes
+  196 |     if (!ok) errno = EINVAL;
+      |          ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:197:12: note: FIX-IT applied suggested code changes
+  197 |     return ok && result == 0;
+      |            ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:255:28: warning: invalid case style for constant 'value' [readability-identifier-naming]
+  255 |             const uint32_t value = 1048576;
+      |                            ^~~~~
+      |                            kValue
+  256 |             attr = {};
+  257 |             attr.map_fd = resources.fds[3];
+  258 |             attr.key = reinterpret_cast<uintptr_t>(&key);
+  259 |             attr.value = reinterpret_cast<uintptr_t>(&value);
+      |                                                       ~~~~~
+      |                                                       kValue
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:255:28: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:259:55: note: FIX-IT applied suggested code changes
+  259 |             attr.value = reinterpret_cast<uintptr_t>(&value);
+      |                                                       ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:363:22: warning: invalid case style for constant 'left' [readability-identifier-naming]
+  363 |         const size_t left = size - received;
+      |                      ^~~~
+      |                      kLeft
+  364 |         ssize_t n = recv(receiver, bytes, left < sizeof(bytes) ? left : sizeof(bytes), 0);
+      |                                           ~~~~                   ~~~~
+      |                                           kLeft                  kLeft
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:363:22: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:364:43: note: FIX-IT applied suggested code changes
+  364 |         ssize_t n = recv(receiver, bytes, left < sizeof(bytes) ? left : sizeof(bytes), 0);
+      |                                           ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:364:66: note: FIX-IT applied suggested code changes
+  364 |         ssize_t n = recv(receiver, bytes, left < sizeof(bytes) ? left : sizeof(bytes), 0);
+      |                                                                  ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:471:20: warning: invalid case style for constant 'original' [readability-identifier-naming]
+  471 |         const char original[] = "GET / HTTP/1.1\r\nHost: old\r\nContent-Length: 1048576\r\n\r\n";
+      |                    ^~~~~~~~
+      |                    kOriginal
+  472 |         const char rewritten[] =
+  473 |             "GET / HTTP/1.1\r\nHost: rewritten\r\nContent-Length: 1048576\r\n\r\n";
+  474 |         char received[sizeof(rewritten)]{};
+  475 |         char queued[sizeof(original) - 1 + 4096];
+      |                            ~~~~~~~~
+      |                            kOriginal
+  476 |         memcpy(queued, original, sizeof(original) - 1);
+      |                        ~~~~~~~~         ~~~~~~~~
+      |                        kOriginal        kOriginal
+  477 |         for (size_t i = 0; i < 4096; ++i)
+  478 |             queued[sizeof(original) - 1 + i] = static_cast<char>(i % 251);
+      |                           ~~~~~~~~
+      |                           kOriginal
+  479 |         if (!send_all(front.client, queued, sizeof(original) - 1 + (prequeued ? 4096 : 0)) ||
+      |                                                    ~~~~~~~~
+      |                                                    kOriginal
+  480 |             recv(front.relay, received, sizeof(original) - 1, MSG_WAITALL) !=
+      |                                                ~~~~~~~~
+      |                                                kOriginal
+  481 |                 sizeof(original) - 1 ||
+      |                        ~~~~~~~~
+      |                        kOriginal
+  482 |             memcmp(received, original, sizeof(original) - 1) != 0 ||
+      |                              ~~~~~~~~         ~~~~~~~~
+      |                              kOriginal        kOriginal
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:471:20: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:475:28: note: FIX-IT applied suggested code changes
+  475 |         char queued[sizeof(original) - 1 + 4096];
+      |                            ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:476:24: note: FIX-IT applied suggested code changes
+  476 |         memcpy(queued, original, sizeof(original) - 1);
+      |                        ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:476:41: note: FIX-IT applied suggested code changes
+  476 |         memcpy(queued, original, sizeof(original) - 1);
+      |                                         ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:478:27: note: FIX-IT applied suggested code changes
+  478 |             queued[sizeof(original) - 1 + i] = static_cast<char>(i % 251);
+      |                           ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:479:52: note: FIX-IT applied suggested code changes
+  479 |         if (!send_all(front.client, queued, sizeof(original) - 1 + (prequeued ? 4096 : 0)) ||
+      |                                                    ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:480:48: note: FIX-IT applied suggested code changes
+  480 |             recv(front.relay, received, sizeof(original) - 1, MSG_WAITALL) !=
+      |                                                ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:481:24: note: FIX-IT applied suggested code changes
+  481 |                 sizeof(original) - 1 ||
+      |                        ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:482:30: note: FIX-IT applied suggested code changes
+  482 |             memcmp(received, original, sizeof(original) - 1) != 0 ||
+      |                              ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:482:47: note: FIX-IT applied suggested code changes
+  482 |             memcmp(received, original, sizeof(original) - 1) != 0 ||
+      |                                               ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:488:31: note: FIX-IT applied suggested code changes
+  488 |         header_bytes = sizeof(original) - 1;
+      |                               ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:472:20: warning: invalid case style for constant 'rewritten' [readability-identifier-naming]
+  472 |         const char rewritten[] =
+      |                    ^~~~~~~~~
+      |                    kRewritten
+  473 |             "GET / HTTP/1.1\r\nHost: rewritten\r\nContent-Length: 1048576\r\n\r\n";
+  474 |         char received[sizeof(rewritten)]{};
+      |                              ~~~~~~~~~
+      |                              kRewritten
+  475 |         char queued[sizeof(original) - 1 + 4096];
+  476 |         memcpy(queued, original, sizeof(original) - 1);
+  477 |         for (size_t i = 0; i < 4096; ++i)
+  478 |             queued[sizeof(original) - 1 + i] = static_cast<char>(i % 251);
+  479 |         if (!send_all(front.client, queued, sizeof(original) - 1 + (prequeued ? 4096 : 0)) ||
+  480 |             recv(front.relay, received, sizeof(original) - 1, MSG_WAITALL) !=
+  481 |                 sizeof(original) - 1 ||
+  482 |             memcmp(received, original, sizeof(original) - 1) != 0 ||
+  483 |             !send_all(origin.relay, rewritten, sizeof(rewritten) - 1) ||
+      |                                     ~~~~~~~~~         ~~~~~~~~~
+      |                                     kRewritten        kRewritten
+  484 |             recv(origin.client, received, sizeof(rewritten) - 1, MSG_WAITALL) !=
+      |                                                  ~~~~~~~~~
+      |                                                  kRewritten
+  485 |                 sizeof(rewritten) - 1 ||
+      |                        ~~~~~~~~~
+      |                        kRewritten
+  486 |             memcmp(received, rewritten, sizeof(rewritten) - 1) != 0)
+      |                              ~~~~~~~~~         ~~~~~~~~~
+      |                              kRewritten        kRewritten
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:472:20: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:474:30: note: FIX-IT applied suggested code changes
+  474 |         char received[sizeof(rewritten)]{};
+      |                              ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:483:37: note: FIX-IT applied suggested code changes
+  483 |             !send_all(origin.relay, rewritten, sizeof(rewritten) - 1) ||
+      |                                     ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:483:55: note: FIX-IT applied suggested code changes
+  483 |             !send_all(origin.relay, rewritten, sizeof(rewritten) - 1) ||
+      |                                                       ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:484:50: note: FIX-IT applied suggested code changes
+  484 |             recv(origin.client, received, sizeof(rewritten) - 1, MSG_WAITALL) !=
+      |                                                  ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:485:24: note: FIX-IT applied suggested code changes
+  485 |                 sizeof(rewritten) - 1 ||
+      |                        ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:486:30: note: FIX-IT applied suggested code changes
+  486 |             memcmp(received, rewritten, sizeof(rewritten) - 1) != 0)
+      |                              ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:486:48: note: FIX-IT applied suggested code changes
+  486 |             memcmp(received, rewritten, sizeof(rewritten) - 1) != 0)
+      |                                                ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:499:24: warning: invalid case style for constant 'ineligible' [readability-identifier-naming]
+  499 |             const bool ineligible = !strcmp(failed, "prequeued_body");
+      |                        ^~~~~~~~~~
+      |                        kIneligible
+  500 |             fprintf(stderr,
+  501 |                     "eBPF %s at %s: %s\n%s\n",
+  502 |                     ineligible ? "ineligible" : "unavailable",
+      |                     ~~~~~~~~~~
+      |                     kIneligible
+  503 |                     failed,
+  504 |                     strerror(error),
+  505 |                     verifier);
+  506 |             printf("{\"mode\":\"%s\",\"backend\":\"%s\",\"stage\":\"%s\",\"errno\":%d}\n",
+  507 |                    mode,
+  508 |                    ineligible ? "ineligible" : "unavailable",
+      |                    ~~~~~~~~~~
+      |                    kIneligible
+  509 |                    failed,
+  510 |                    error);
+  511 |             if (!strcmp(mode, "required") && !ineligible) return 1;
+      |                                               ~~~~~~~~~~
+      |                                               kIneligible
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:499:24: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:502:21: note: FIX-IT applied suggested code changes
+  502 |                     ineligible ? "ineligible" : "unavailable",
+      |                     ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:508:20: note: FIX-IT applied suggested code changes
+  508 |                    ineligible ? "ineligible" : "unavailable",
+      |                    ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:511:47: note: FIX-IT applied suggested code changes
+  511 |             if (!strcmp(mode, "required") && !ineligible) return 1;
+      |                                               ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:532:16: warning: invalid case style for constant 'ok' [readability-identifier-naming]
+  532 |     const bool ok =
+      |                ^~
+      |                kOk
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:532:16: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:557:9: note: FIX-IT applied suggested code changes
+  557 |         ok && shutdown(front.client, SHUT_WR) == 0 && recv(front.relay, &eof, 1, 0) == 0 &&
+      |         ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:581:9: note: FIX-IT applied suggested code changes
+  581 |         ok ? "true" : "false",
+      |         ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:582:9: note: FIX-IT applied suggested code changes
+  582 |         ok ? 2097169u : 0u,
+      |         ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:590:12: note: FIX-IT applied suggested code changes
+  590 |     return ok && half_close_ok ? 0 : 1;
+      |            ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:556:16: warning: invalid case style for constant 'half_close_ok' [readability-identifier-naming]
+  556 |     const bool half_close_ok =
+      |                ^~~~~~~~~~~~~
+      |                kHalfCloseOk
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:556:16: note: FIX-IT applied suggested code changes
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:589:9: note: FIX-IT applied suggested code changes
+  589 |         half_close_ok ? "true" : "false");
+      |         ^
+/home/hurricane/private/code/Rut/bench/bench_sockmap_probe.cc:590:18: note: FIX-IT applied suggested code changes
+clang-tidy applied 64 of 64 suggested fixes.
+  590 |     return ok && half_close_ok ? 0 : 1;
+      |                  ^

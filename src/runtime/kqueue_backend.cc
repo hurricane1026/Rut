@@ -439,7 +439,7 @@ bool KqueueBackend::receive(Connection& conn, bool upstream, IoEvent& event) {
         if (!conn.tls_handshake_complete) {
             errno = 0;
             ERR_clear_error();
-            const int rc = SSL_accept(ssl);
+            const int rc = SSL_do_handshake(ssl);
             if (rc != 1) {
                 if (retry(rc)) return false;
                 event = completion(id, type, tls_error(ssl, rc));

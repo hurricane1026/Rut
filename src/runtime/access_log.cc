@@ -174,7 +174,7 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
     static constexpr char kInvalid[] = "<request-target-invalid>";
     static constexpr u32 kWorstCaseLine = 24u + 1u + 7u + 1u + kAccessLogCompleteTargetMax + 1u +
                                           5u + 1u + 10u + 3u + 10u + 1u + 10u + 1u + 15u + 1u +
-                                          24u + 1u + 10u + 2u + 3u + 3u + 1u;
+                                          24u + 1u + 10u + 2u + 3u + 3u + 16u + 1u;
     static_assert(kWorstCaseLine <= kAccessLogTextLineCapacity);
 
     char line[kAccessLogTextLineCapacity];
@@ -250,6 +250,10 @@ u32 format_access_log_text(const AccessLogEntry& entry, char* buf, u32 buf_size)
 
     w += copy_str(line + w, " s=");
     w += write_u64_dec(line + w, entry.shard_id);
+    if (entry.grpc_status_plus_one != 0 && entry.grpc_status_plus_one <= 17) {
+        w += copy_str(line + w, " grpc_status=");
+        w += write_u64_dec(line + w, entry.grpc_status_plus_one - 1u);
+    }
     line[w++] = '\n';
     if (w > sizeof(line) || buf == nullptr || buf_size < w) return 0;
     for (u32 i = 0; i < w; i++) buf[i] = line[i];

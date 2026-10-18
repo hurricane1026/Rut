@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <pthread.h>
+#include <stdlib.h>
 #include <unistd.h>
 using namespace rut;
 
@@ -8192,9 +8193,10 @@ route GET "/users" use chain access { return 200 }
         REQUIRE(ast);
         auto hir = analyze_file_heap(ast.value());
         REQUIRE_FALSE(hir.has_value());
-        CHECK(hir.error().detail.eq(lit(
-            "chain after Response header values cannot read time, cache, or response state until "
-            "effects execute at response time")));
+        CHECK(
+            hir.error().detail.eq(lit("chain after Response header values cannot read time, "
+                                      "randomness, cache, or response state until "
+                                      "effects execute at response time")));
     }
 }
 
@@ -39897,6 +39899,40 @@ route GET "/" {
     }
 }
 
+TEST(frontend, uuid_rejects_arguments_waits_and_unsafely_rematerialized_positions) {
+    const char* invalid[] = {
+        "route GET \"/\" { let id = uuid(1) return 200 }",
+        "route GET \"/\" { guard let id = uuid() else { return 503 } return 200 }",
+        "route GET \"/\" { if let id = uuid() { return 200 } else { return 503 } }",
+        "route GET \"/\" { let id = uuid().or(\"\") return 200 }",
+        "route GET \"/\" { let id = uuid() wait(1ms) return 200 }",
+        "func makeId() => uuid()\nroute GET \"/\" { let id = makeId() wait(1ms) return 200 }",
+        "route GET \"/\" { wait(1ms) let id = uuid() return 200 }",
+        "timer tick, every: 1s { let id = uuid() }",
+        ("func add(_ resp: Response) -> i32 { resp.set(\"X-ID\", uuid().or(\"\")) 0 }\n"
+         "chain trace { after add(resp) }\nroute GET \"/\" use chain trace { return 200 }"),
+    };
+    for (const char* source : invalid) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "Unexpected UUID acceptance: %s\n", source);
+        CHECK(!hir);
+    }
+}
+
+TEST(frontend, uuid_user_function_can_shadow_the_builtin) {
+    auto tokens =
+        lex(lit("func uuid(_ n: i32) -> i32 => n\n"
+                "route GET \"/\" { if uuid(7) == 7 { return 200 } else { return 500 } }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
@@ -40043,4 +40079,196 @@ TEST(frontend, json_struct_decode_rejects_invalid_types_and_wrapped_inputs) {
         CHECK(!hir);
         if (!hir) CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
     }
+}
+
+TEST(frontend, constant_time_equal_rejects_arity_types_and_wrapped_values) {
+    const char* cases[] = {
+        "route GET \"/\" { guard constantTimeEqual(\"x\") else { return 401 } return 200 }",
+        "route GET \"/\" { guard constantTimeEqual(1, 1) else { return 401 } return 200 }",
+        "route GET \"/\" { guard constantTimeEqual(\"x\", true) else { return 401 } return 200 }",
+        "route GET \"/\" { guard constantTimeEqual(req.header(\"X-Key\"), \"x\") else { return 401 "
+        "} return 200 }",
+        "route GET \"/\" { guard constantTimeEqual(\"x\", req.header(\"X-Key\")) else { return 401 "
+        "} return 200 }",
+    };
+    for (const char* source : cases) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        if (hir) fprintf(stderr, "Unexpected constantTimeEqual type-check success: %s\n", source);
+        CHECK(!hir);
+        if (!hir) CHECK_EQ(hir.error().code, FrontendError::UnsupportedSyntax);
+    }
+}
+
+TEST(frontend, constant_time_equal_user_function_shadows_builtin) {
+    auto tokens =
+        lex(lit("func constantTimeEqual(_ n: i32) -> bool => n == 7\n"
+                "route GET \"/\" { guard constantTimeEqual(7) else { return 401 } return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    REQUIRE(analyze_file_heap(ast.value()));
+}
+
+TEST(frontend, jwt_decode_requires_two_unwrapped_strings) {
+    const char* cases[] = {
+        "route POST \"/\" { let x = jwtDecode(\"t\") return 200 }",
+        "route POST \"/\" { let x = jwtDecode(1, \"s\") return 200 }",
+        "route POST \"/\" { let x = jwtDecode(\"t\", 1) return 200 }",
+        "route POST \"/\" { let x = jwtDecode(req.header(\"x\"), \"s\") return 200 }",
+    };
+    for (const char* source : cases) {
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        auto ast = parse_file_heap(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
+    auto tokens =
+        lex(lit("route POST \"/\" { let x = jwtDecode(\"t\", \"s\") guard let c = x else { "
+                "return 401 } return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+}
+
+TEST(frontend, jwt_auth_example_policy_lowers) {
+    const char* src = R"rut(
+listen :8080
+upstream api at "127.0.0.1:9000"
+struct Claims { sub: str role: str exp: Json }
+route GET "/admin" {
+    let token = req.header("X-JWT").or("")
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+        return 401
+    }
+    guard let claims = json.decode(Claims, document) else { return 401 }
+    guard let expires = json.int(claims.exp) else { return 401 }
+    guard expires * i64(1000000) > time.nowMicros() else { return 401 }
+    guard claims.role == "admin" else { return 403 }
+    return forward(api)
+}
+)rut";
+    REQUIRE_EQ(setenv("JWT_SECRET", "s3cr3t", 1), 0);
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    rir.destroy();
+    unsetenv("JWT_SECRET");
+}
+
+TEST(frontend, env_is_resolved_at_analysis_time) {
+    REQUIRE_EQ(setenv("RUT_TEST_ENV_SECRET", "s3cr3t", 1), 0);
+    const char* src = "route GET \"/x\" { let s = env(\"RUT_TEST_ENV_SECRET\") return 200 }\n";
+    auto lexed = lex(lit(src));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    REQUIRE_EQ(hir->routes[0].locals.len, 1u);
+    CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("s3cr3t")));
+    unsetenv("RUT_TEST_ENV_SECRET");
+}
+
+TEST(frontend, env_requires_a_literal_name_and_a_set_variable) {
+    const char* cases[] = {
+        "route GET \"/x\" { let name = \"RUT_TEST_ENV_MISSING\" let s = env(name) return 200 }",
+        "route GET \"/x\" { let s = env(\"RUT_TEST_ENV_MISSING\") return 200 }",
+        "route GET \"/x\" { let s = env(\"\") return 200 }",
+        "route GET \"/x\" { let s = env() return 200 }",
+    };
+    for (const char* source : cases) {
+        auto lexed = lex(lit(source));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap(ast.value());
+        CHECK(!hir);
+    }
+}
+
+TEST(frontend, env_decodes_literal_name_before_lookup) {
+    REQUIRE_EQ(setenv("RUT_TEST_ENV_SECRET", "decoded", 1), 0);
+    const char* source =
+        "route GET \"/x\" { let s = env(\"RUT_TEST\\u{5f}ENV\\u{5f}SECRET\") return 200 }";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("decoded")));
+    unsetenv("RUT_TEST_ENV_SECRET");
+}
+
+TEST(frontend, upstream_tls_options_reach_runtime_config) {
+    const char* source =
+        "upstream grpc { host: \"127.0.0.1\", port: 443, protocol: .http2, "
+        "tls: { ca: \"ca.pem\", server_name: \"backend.example\", "
+        "cert: \"client.pem\", key: \"client.key\" } }\n"
+        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    const auto& spec = cfg.upstreams[0].tls;
+    CHECK(spec.enabled);
+    CHECK(strcmp(spec.ca, "ca.pem") == 0);
+    CHECK(strcmp(spec.server_name, "backend.example") == 0);
+    CHECK(strcmp(spec.cert, "client.pem") == 0);
+    CHECK(strcmp(spec.key, "client.key") == 0);
+    rir.destroy();
+}
+
+TEST(frontend, upstream_tls_rejects_incomplete_duplicate_or_unsafe_options) {
+    const char* fields[] = {
+        "ca: \"ca.pem\"",
+        "server_name: \"localhost\"",
+        "ca: \"ca.pem\", server_name: \"localhost\", cert: \"client.pem\"",
+        "ca: \"ca.pem\", server_name: \"localhost\", key: \"client.key\"",
+        "ca: \"ca.pem\", ca: \"other.pem\", server_name: \"localhost\"",
+        "ca: \"ca.pem\", server_name: \"bad/name\"",
+        "ca: \"ca.pem\", server_name: \"localhost\", verify: false",
+        "ca: \"\", server_name: \"localhost\"",
+    };
+    for (const char* field : fields) {
+        char source[1024];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream grpc { host: \"127.0.0.1\", port: 443, protocol: .http2, tls: { %s } }",
+                 field);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK(!parse_file_heap(tokens.value()));
+    }
+    const char* source =
+        "upstream grpc { host: \"127.0.0.1\", port: 443, "
+        "tls: { ca: \"ca.pem\", server_name: \"localhost\" } }";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(!analyze_file_heap(ast.value()));
 }

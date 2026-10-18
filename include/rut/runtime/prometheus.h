@@ -102,6 +102,35 @@ inline u32 format_prometheus(const ShardMetrics& m, char* buf, u32 cap) {
     emit_scalar(
         w, "rut_connections_closed", "Total closed connections.", "counter", m.connections_closed);
 
+    emit_scalar(
+        w, "rut_grpc_started_total", "Total admitted native gRPC RPCs.", "counter", m.grpc_started);
+    emit_scalar(w, "rut_grpc_active", "Native gRPC RPCs currently active.", "gauge", m.grpc_active);
+    w.str("# HELP rut_grpc_completed_total Retired native gRPC RPCs by final status.\n");
+    w.str("# TYPE rut_grpc_completed_total counter\n");
+    for (u32 code = 0; code < 17; code++) {
+        w.str("rut_grpc_completed_total{grpc_status=\"");
+        w.u64v(code);
+        w.str("\"} ");
+        w.u64v(m.grpc_completed[code]);
+        w.ch('\n');
+    }
+    w.str("# HELP rut_grpc_duration_seconds Native gRPC RPC lifetime in seconds.\n");
+    w.str("# TYPE rut_grpc_duration_seconds histogram\n");
+    u64 grpc_cumulative = 0;
+    for (u32 i = 0; i < LatencyHistogram::kBucketCount; i++) {
+        grpc_cumulative += m.grpc_latency.buckets[i];
+        w.str("rut_grpc_duration_seconds_bucket{le=\"");
+        w.str(kPromLatencyLe[i]);
+        w.str("\"} ");
+        w.u64v(grpc_cumulative);
+        w.ch('\n');
+    }
+    w.str("rut_grpc_duration_seconds_sum ");
+    w.seconds_from_us(m.grpc_latency.sum_us);
+    w.str("\nrut_grpc_duration_seconds_count ");
+    w.u64v(m.grpc_latency.count);
+    w.ch('\n');
+
     // Request latency histogram (cumulative buckets, then _sum/_count).
     w.str("# HELP rut_request_duration_seconds Request duration in seconds.\n");
     w.str("# TYPE rut_request_duration_seconds histogram\n");

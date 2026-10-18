@@ -1,13 +1,21 @@
 #include "rut/runtime/tls.h"
 
+#include "core/expected.h"
+#include "rut/common/upstream_tls.h"
 #include "rut/platform/socket.h"
 #include "tls_internal.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
+#include <openssl/tls1.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 
 namespace rut {
 
@@ -72,6 +80,12 @@ BIO* new_nosigpipe_socket_bio(BIO_METHOD* method, i32 fd) {
                      static_cast<intptr_t>(fd)));
     BIO_set_init(bio, 1);
     return bio;
+}
+
+// Configuration has no passphrase source. Reject encrypted private keys rather
+// than invoking OpenSSL's interactive default password prompt on a shard.
+int no_client_key_password(char*, int, int, void*) {
+    return 0;
 }
 
 // Wire-format ALPN protocol names (1-byte length prefix per RFC 7301).
@@ -221,6 +235,85 @@ core::Expected<SSL*, Error> create_tls_server_ssl(TlsServerContext* ctx, i32 fd)
 
 void destroy_tls_server_ssl(SSL* ssl) {
     if (ssl) SSL_free(ssl);
+}
+
+void destroy_tls_client_context(TlsClientContext& ctx) {
+    if (ctx.ssl_ctx) SSL_CTX_free(ctx.ssl_ctx);
+    if (ctx.bridge_bio_method) BIO_meth_free(ctx.bridge_bio_method);
+    if (ctx.socket_bio_method) BIO_meth_free(ctx.socket_bio_method);
+    ctx = {};
+}
+
+core::Expected<void, Error> init_tls_client_context(TlsClientContext& ctx,
+                                                    const UpstreamTlsSpec& spec) {
+    if (ctx.ssl_ctx || !spec.enabled || !valid_upstream_tls(spec))
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    if (OPENSSL_init_ssl(OPENSSL_INIT_NO_LOAD_CONFIG, nullptr) != 1)
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    ctx.ssl_ctx = SSL_CTX_new(TLS_client_method());
+    ctx.socket_bio_method = make_nosigpipe_socket_method();
+    ctx.bridge_bio_method = make_tls_engine_bridge_method();
+    if (!ctx.ssl_ctx || !ctx.socket_bio_method || !ctx.bridge_bio_method) {
+        destroy_tls_client_context(ctx);
+        return core::make_unexpected(Error::make(ENOMEM, Error::Source::Socket));
+    }
+    SSL_CTX_set_verify(ctx.ssl_ctx, SSL_VERIFY_PEER, nullptr);
+    SSL_CTX_set_default_passwd_cb(ctx.ssl_ctx, no_client_key_password);
+    if (SSL_CTX_set_min_proto_version(ctx.ssl_ctx, TLS1_2_VERSION) != 1 ||
+        SSL_CTX_load_verify_locations(ctx.ssl_ctx, spec.ca, nullptr) != 1 ||
+        (spec.cert[0] &&
+         (SSL_CTX_use_certificate_chain_file(ctx.ssl_ctx, spec.cert) != 1 ||
+          SSL_CTX_use_PrivateKey_file(ctx.ssl_ctx, spec.key, SSL_FILETYPE_PEM) != 1 ||
+          SSL_CTX_check_private_key(ctx.ssl_ctx) != 1))) {
+        destroy_tls_client_context(ctx);
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    }
+    return {};
+}
+
+bool configure_tls_client_ssl(SSL* ssl, const char* server_name) {
+    if (!ssl || !server_name || !server_name[0]) return false;
+    in_addr address{};
+    const bool kIsIp = inet_pton(AF_INET, server_name, &address) == 1;
+    if (kIsIp) {
+        if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), server_name) != 1) return false;
+    } else if (SSL_set1_host(ssl, server_name) != 1 ||
+               SSL_set_tlsext_host_name(ssl, server_name) != 1) {
+        return false;
+    }
+    SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    SSL_set_connect_state(ssl);
+    SSL_set_mode(ssl,
+                 SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+                     SSL_MODE_RELEASE_BUFFERS);
+    return SSL_set_alpn_protos(ssl, kAlpnH2, sizeof(kAlpnH2)) == 0;
+}
+
+core::Expected<SSL*, Error> create_tls_client_ssl(TlsClientContext& ctx,
+                                                  i32 fd,
+                                                  const char* server_name) {
+    SSL* ssl = ctx.ssl_ctx ? SSL_new(ctx.ssl_ctx) : nullptr;
+    if (!ssl) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    BIO* bio = new_nosigpipe_socket_bio(ctx.socket_bio_method, fd);
+    if (!bio) {
+        SSL_free(ssl);
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    }
+    SSL_set_bio(ssl, bio, bio);
+    if (!configure_tls_client_ssl(ssl, server_name)) {
+        SSL_free(ssl);
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    }
+    return ssl;
+}
+
+bool tls_handshake_finished(SSL* ssl) {
+    return ssl && SSL_is_init_finished(ssl);
+}
+
+bool tls_client_peer_valid(SSL* ssl) {
+    return ssl && SSL_is_init_finished(ssl) && SSL_get_verify_result(ssl) == X509_V_OK &&
+           tls_negotiated_protocol(ssl) == AlpnProtocol::H2;
 }
 
 }  // namespace rut

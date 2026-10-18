@@ -10,6 +10,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_tls.h"
 #include "rut/common/wait_limits.h"
 #include "rut/compiler/ast.h"
 #include "rut/compiler/diagnostic.h"
@@ -53,6 +54,7 @@ struct HirUpstream {
     // this slice). hc_enabled gates the rest. path/interval required when set;
     // status defaults to 200. hc_path is a Str (like name) copied into a char
     // buffer at populate_route_config via set_upstream_health_check.
+    UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
     Str hc_path{};
@@ -202,6 +204,8 @@ enum class HirExprKind : u8 {
     WidenI64,
     // `time.nowMicros()` — monotonic microseconds, type I64, nullary.
     TimeNowMicros,
+    ConstantTimeEqual,
+    Uuid,
     JsonOp,
     JsonDecode,
     // `max(a, b)` / `min(a, b)` builtins — same-width {I32,I64} binary,
@@ -1130,6 +1134,9 @@ struct HirRoute {
     // time.nowMicros() is rejected — locals re-materialize on resume, and a
     // pre-wait timestamp binding would sample after the wait.
     bool time_ops_blocked = false;
+    // UUID generation is only supported in a direct route-let initializer.
+    // A raw guard-let expression is currently materialized twice.
+    bool uuid_init_ok = false;
     struct DecoratorRef {
         Span span{};
         Str name{};

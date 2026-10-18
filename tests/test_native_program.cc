@@ -3,6 +3,8 @@
 #include "rut/jit/runtime_helpers.h"
 #include "rut/native_program.h"
 #include "rut/runtime/cache_table.h"
+#include "rut/runtime/ebpf_plan.h"
+#include "rut/runtime/slice_pool.h"
 #include "test.h"
 
 #include <errno.h>
@@ -67,6 +69,26 @@ bool load(Source& source, NativeProgram& p, u8 opt = 2) {
     return ok;
 }
 }  // namespace
+
+TEST(native_program, upstream_tls_configuration_is_owned_after_compiler_exit) {
+    Source source;
+    REQUIRE(
+        source.append("upstream secure { host: \"127.0.0.1\", port: 443, protocol: .http2, "
+                      "tls: { ca: \"ca.pem\", server_name: \"backend.example\", "
+                      "cert: \"client.pem\", key: \"client.key\" } }\n"
+                      "route POST \"/test.Echo/Call\" { return forward(secure) }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& target = owner.p->config.upstreams[0];
+    CHECK(target.http2);
+    CHECK(target.tls.enabled);
+    CHECK_EQ(strcmp(target.tls.ca, "ca.pem"), 0);
+    CHECK_EQ(strcmp(target.tls.server_name, "backend.example"), 0);
+    CHECK_EQ(strcmp(target.tls.cert, "client.pem"), 0);
+    CHECK_EQ(strcmp(target.tls.key, "client.key"), 0);
+}
 
 TEST(native_program, code_and_views_survive_compiler_exit_and_source_removal) {
     Source source;
@@ -336,6 +358,110 @@ TEST(native_program, preserves_sigchld_disposition) {
         CHECK_EQ(observed.sa_flags, baseline.sa_flags);
         CHECK_EQ(sigismember(&observed.sa_mask, SIGUSR1), sigismember(&baseline.sa_mask, SIGUSR1));
     }
+}
+#if RUT_ENABLE_EBPF
+TEST(native_program, ebpf_body_plan_survives_compiler_exit_and_is_validated) {
+    Source source;
+    REQUIRE(source.append(
+        "upstream b at \"127.0.0.1:9999\"\n"
+        "route GET \"/plain\" { return forward(b) }\n"
+        "route GET \"/headers\" { return forward(b, request_policy: { version: .http11, "
+        "host: .upstream, connection: .omit, strip_headers: [.connection, .keepAlive, .te, "
+        ".expect, .upgrade] }) }\n"
+        "route GET \"/static\" { return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    char error[512];
+    REQUIRE(load_native_program(source.path, *owner.p, error, sizeof(error), 2, true));
+    REQUIRE_EQ(unlink(source.path), 0);
+    REQUIRE(owner.p->has_ebpf_plan);
+    auto& plan = owner.p->ebpf_plan;
+    CHECK_EQ(plan.route_count, 3u);
+    CHECK_EQ(plan.candidate_count, 2u);
+    CHECK_EQ(plan.routes[0].decision, ebpf::Decision::BodyCandidate);
+    CHECK_EQ(plan.routes[1].request_policy_id, 1u);
+    CHECK_EQ(plan.routes[2].reason, ebpf::Reason::NotForward);
+    CHECK(validate_ebpf_plan(plan, owner.p->config));
+    owner.p->config.upstreams[0].http2 = true;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    owner.p->config.upstreams[0].http2 = false;
+    CHECK(validate_ebpf_plan(plan, owner.p->config));
+    // Relocation placeholders must remain zero until an actual kernel load.
+    plan.bytecode.verdict[ebpf::kSocketMapRelocation].immediate = 99;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    plan.bytecode.verdict[ebpf::kSocketMapRelocation].immediate = 0;
+    plan.handoff.verdict[plan.handoff.verdict_ring_map].immediate = 99;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    plan.handoff.verdict[plan.handoff.verdict_ring_map].immediate = 0;
+    plan.routes[0].upstream_id = 99;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    plan.routes[0].upstream_id = 0;
+    plan.routes[0].request_policy_id = 99;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    plan.routes[0].request_policy_id = 0;
+    plan.candidate_count = 0;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    owner.p->destroy();
+    CHECK_FALSE(owner.p->has_ebpf_plan);
+    CHECK_EQ(owner.p->ebpf_plan.route_count, 0u);
+}
+#endif
+
+TEST(native_program, constant_time_equal_is_available_after_compiler_exit) {
+    const u8 levels[] = {0, 3};
+    for (u8 opt : levels) {
+        Source source;
+        REQUIRE(source.append(
+            "route GET \"/\" { guard let value = req.header(\"X-Key\") else { return 401 } "
+            "guard constantTimeEqual(value, \"native-secret\") else { return 403 } return 200 "
+            "}\n"));
+        Program owner;
+        REQUIRE(owner.p);
+        REQUIRE(load(source, *owner.p, opt));
+        REQUIRE_EQ(unlink(source.path), 0);
+        REQUIRE_EQ(owner.p->config.route_count, 1u);
+        const auto& route = owner.p->config.routes[0];
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Key: native-secret\r\n\r\n").status_code, 200);
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Key: Native-secret\r\n\r\n").status_code, 403);
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Key: native-secreT\r\n\r\n").status_code, 403);
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\nX-Key: native-secret-long\r\n\r\n").status_code,
+                 403);
+        CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\n\r\n").status_code, 401);
+    }
+}
+
+TEST(native_program, uuid_is_available_after_compiler_exit_with_request_arena) {
+    Source source;
+    REQUIRE(source.append(
+        "route GET \"/\" { let pending = uuid() guard let id = pending else { return 503 } "
+        "guard id == id else { return 500 } return 200 }\n"
+        "route GET \"/two\" { let first = uuid() let second = uuid() guard let a = first else { "
+        "return 503 } "
+        "guard let b = second else { return 503 } "
+        "guard a == a && b == b else { return 500 } return 200 }\n"));
+    Program owner;
+    REQUIRE(owner.p);
+    REQUIRE(load(source, *owner.p, 3));
+    REQUIRE_EQ(unlink(source.path), 0);
+    const auto& route = owner.p->config.routes[0];
+    CHECK_EQ(invoke(route, "GET / HTTP/1.1\r\n\r\n").status_code, 503u);
+    SlicePool pool;
+    REQUIRE(pool.init(2));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    jit::HandlerCtx ctx{};
+    const char req[] = "GET / HTTP/1.1\r\n\r\n";
+    auto result = jit::HandlerResult::unpack(
+        route.fn(nullptr, &ctx, reinterpret_cast<const u8*>(req), sizeof(req) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(arena.space_used(), 40u);
+    REQUIRE_EQ(owner.p->config.route_count, 2u);
+    result = jit::HandlerResult::unpack(owner.p->config.routes[1].fn(
+        nullptr, &ctx, reinterpret_cast<const u8*>(req), sizeof(req) - 1, &arena));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK_EQ(arena.space_used(), 120u);
+    arena.destroy();
+    pool.destroy();
 }
 
 int main(int argc, char** argv) {

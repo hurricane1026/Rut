@@ -53,6 +53,9 @@ struct TlsEngine {
 // Create the SSL object in server-accept state, wired to the custom BIO with
 // `eng` as the bridge state. On success `eng.ssl` is non-null.
 core::Expected<void, Error> tls_engine_init(TlsEngine& eng, TlsServerContext* ctx);
+core::Expected<void, Error> tls_engine_init_client(TlsEngine& eng,
+                                                   TlsClientContext& ctx,
+                                                   const char* server_name);
 void tls_engine_free(TlsEngine& eng);
 
 // Point the engine at the current ciphertext regions for the next crypto op.

@@ -1,0 +1,10 @@
+listen 127.0.0.1:0
+upstream b at "127.0.0.1:9000"
+route GET "/plain" { return forward(b) }
+route GET "/headers" {
+    return forward(b, request_policy: {
+        version: .http11, host: .upstream, connection: .omit,
+        strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade]
+    })
+}
+route GET "/static" { return 200 }

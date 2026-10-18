@@ -25,7 +25,7 @@ namespace {
 
 i32 default_ssl_accept(SSL* ssl) {
     ERR_clear_error();
-    return SSL_accept(ssl);
+    return SSL_do_handshake(ssl);
 }
 i32 default_ssl_read(SSL* ssl, void* buf, i32 len) {
     ERR_clear_error();
@@ -355,6 +355,24 @@ void EpollBackend::add_accept() {
     ev.events = EPOLLIN;
     ev.data.u64 = encode_data(kListenConnId, IoEventType::Accept, 0);
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
+}
+
+// SSL_write may finish the client handshake while retaining an application
+// record internally. Such plaintext has no corresponding kernel readiness.
+bool EpollBackend::add_recv_tls(Connection& c) {
+    if (!c.tls || SSL_pending(c.tls) <= 0) return add_recv(c.fd, c.id);
+    if (pending_count >= kPendingCap || !add_recv(c.fd, c.id)) return false;
+    if (!c.recv_buf.write_avail())
+        return queue_pending_completion(
+            pending_completions, pending_count, c.id, IoEventType::Recv, -ENOBUFS);
+    const i32 n = get_tls_hooks()->ssl_read(
+        c.tls, c.recv_buf.write_ptr(), static_cast<i32>(c.recv_buf.write_avail()));
+    if (n > 0) c.recv_buf.commit(static_cast<u32>(n));
+    return queue_pending_completion(pending_completions,
+                                    pending_count,
+                                    c.id,
+                                    IoEventType::Recv,
+                                    n > 0 ? n : map_tls_error(c.tls, n));
 }
 
 bool EpollBackend::add_recv(i32 fd, u32 conn_id) {

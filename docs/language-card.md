@@ -136,11 +136,14 @@ exceptions, no try/catch. `!` is logical not only.
   ordered header effects to a successful handler response.
 
 ```swift
+struct Claims { sub: str role: str }
+
 func auth(_ req: Request, role: str) -> User {
-    let token = req.authorization.or("")
-    guard token.hasPrefix("Bearer ") else { respond 401 }
-    let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { respond 401 }
+    let token = req.header("X-JWT").or("")
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+        respond 401
+    }
+    guard let claims = json.decode(Claims, document) else { respond 401 }
     guard claims.role == role else { respond 403 }
     return User(id: claims.sub, role: claims.role)   // normal value
 }
@@ -153,11 +156,11 @@ func f(_ req: Request, limit: ByteSize) { ... }   // first param unlabeled, rest
 f(req, limit: 1mb)                // ⏳ mixed positional+named call args (parser rejects the label)
 req.f(limit: 1mb)                 // UFCS: t.f(a) == f(t, a) — use when value
                                   // flows into the FIRST parameter
-req.path.trimPrefix("/api").split("/")            // UFCS chaining
+// ⏳ String prefix built-ins are planned; use the X-JWT extraction above today.
 
 // Pipeline | — use when the value lands in a NON-first position.
 // RHS must be a call with an explicit _ / _N placeholder (else compile error).
-let parts = req.path | trimPrefix("/api", _) | split(_, "/")
+// ⏳ Prefix pipeline built-ins are planned; this syntax is not currently supported.
 ```
 
 No closures, no function values (`let g = f` is an error), no recursion, no FFI.
@@ -378,8 +381,8 @@ effects only. Full buffered body/status middleware remains ⏳.
 
 Use the currently implemented upstream declaration below (the upstream binding
 migration shown elsewhere on this card is not required). `protocol: .http2`
-selects **prior-knowledge h2c** to the upstream; omitted / `.http11` retains the
-existing HTTP/1 forwarding path. This field does not enable upstream TLS.
+selects HTTP/2 to the upstream, using **prior-knowledge h2c** by default;
+omitted / `.http11` retains the existing HTTP/1 forwarding path.
 
 ```swift
 upstream greeter {
@@ -409,8 +412,36 @@ trailers including `grpc-status` are preserved. Header-only middleware may run
 before forwarding; body-reading handlers and HTTP/1-specific forward policies
 are outside this streaming path. HTTP/1 requests cannot use an HTTP/2 upstream.
 No `.proto`, protobuf dependency, new route keyword or streaming modifier is
-needed. gRPC-Web, JSON transcoding, upstream TLS/mTLS and gRPC health probes are
+needed. gRPC-Web, JSON transcoding and gRPC health probes are
 not implemented by this option; `health_check` with `.http2` is rejected.
+
+For a TLS upstream, add a `tls` field with explicit trust and identity:
+
+```swift
+upstream secureGreeter {
+    host: "127.0.0.1"
+    port: 5443
+    protocol: .http2
+    tls: {
+        ca: "/certs/ca.pem"
+        server_name: "backend.example.com"
+        cert: "/certs/client.pem"
+        key: "/certs/client.key"
+    }
+}
+```
+
+`ca` and `server_name` are required. Omit both `cert` and `key` for ordinary
+server-authenticated TLS; supply both for mTLS. Keys must be unencrypted PEM;
+encrypted keys are rejected without an interactive password prompt. Certificate-chain validation,
+DNS/IPv4 identity verification and h2 ALPN are mandatory. DNS identities also
+send SNI. There is no insecure verification mode, system-CA fallback or protocol
+downgrade. Paths are literal strings (maximum 255 bytes), relative to the
+process working directory when not absolute. `server_name` is at most 253 ASCII
+letters/digits/dots/hyphens; embedded controls and escaped literals are rejected.
+TLS is currently supported only with `.http2`. Files are loaded when a new
+pooled upstream session is established, and its TLS context remains alive until
+session teardown. TLS/configuration-file failures return UNAVAILABLE.
 
 Upstream connections are shared per shard/config/upstream/backend and multiplex
 RPCs from different downstream clients. Incomplete HTTP/2 input promotes the
@@ -423,6 +454,19 @@ returns credit as bytes drain. Client cancellation resets only the mapped RPC.
 `grpc-timeout` is enforced with the existing precise timer mechanism (millisecond
 granularity); failures use gRPC status trailers. Calls are never automatically
 replayed. See [the complete example](../examples/grpc.rut).
+
+Native gRPC exposes `rut_grpc_started_total`, `rut_grpc_active`,
+`rut_grpc_completed_total{grpc_status="..."}` and the
+`rut_grpc_duration_seconds` histogram through the existing metrics endpoint.
+The existing access log records each admitted RPC's method path, payload byte
+counts, lifetime and a separate `grpc_status` field (HTTP status remains 200).
+Cancellation/disconnection is recorded as CANCELLED; local deadlines as
+DEADLINE_EXCEEDED. RPC retirement means the final response was staged into owned
+output or the RPC was cancelled, not delivery acknowledgement. Metrics use
+bounded status labels; service/method paths are recorded in logs. Existing
+source live-log bytes-only output remains bytes-only. No protobuf decoding is
+involved.
+
 
 ## I/O
 
@@ -799,13 +843,57 @@ route GET "/api" {
   wait; branch writes in static-for routes remain unsupported. Per-shard state:
   effective limits ≈ limit × shard count.
 
+## Constant-time equality
+
+`constantTimeEqual(a, b) -> bool` accepts two unwrapped `str` values. Use
+`guard let` or `.or(default)` before passing optional/error-capable values.
+For equal public lengths up to 16 KiB it calls the existing static OpenSSL
+`CRYPTO_memcmp`, with no early exit based on contents. Different lengths or
+lengths above 16 KiB return false; lengths are not secret. Empty strings compare
+equal and embedded NULs are ordinary bytes. No normalization or encoding
+conversion occurs. The call allocates no storage and keeps no references.
+
+```swift
+route GET "/compare" {
+    guard let left = req.header("X-Left") else { return 400 }
+    guard let right = req.header("X-Right") else { return 400 }
+    guard constantTimeEqual(left, right) else { return 403 }
+    return 200
+}
+```
+
+Explicit-placeholder pipes work: `left | constantTimeEqual(_, right)`. A user
+function/binding with the same name shadows the builtin. Equality alone is not
+authentication: credential policies must also reject missing/empty credentials
+and supply a trusted expected value.
+
+## UUID v4 (implemented)
+
+Runnable example: [examples/uuid.rut](../examples/uuid.rut).
+
+`uuid() -> str?` generates 36 lowercase ASCII bytes using the OS CSPRNG (RFC 9562, version 4 and RFC variant). Handle entropy failure, missing request arena, shared-budget exhaustion and SlicePool exhaustion explicitly:
+
+```swift
+route GET "/id" {
+    let pending = uuid()
+    guard let id = pending else { return 503 }
+    return response(200, body: id)
+}
+```
+
+Linux makes one nonblocking `getrandom` call; macOS uses `getentropy`. Failures, including short reads, return nil without fallback or retry. Each call is fresh; reusing a bound local preserves its value. Results use the existing request-owned JSON arena and share its 256 KiB used-byte budget (40 bytes per UUID after alignment). Views remain valid until request retirement/reset, and HTTP/2 local responses copy their body into stream-owned storage before that reset.
+
+The call must directly initialize a top-level route `let`, as above. Calls in `guard let`/`if let` expressions, inside helpers, and nested in larger expressions are rejected until single evaluation of fresh values is supported there. ID values already generated may be passed to ordinary helpers. No arguments or implicit pipe stage are accepted. User functions/bindings named `uuid` shadow it. `wait` routes reject UUID calls; timers and randomness inside `chain after` header effects are unsupported. Request set/add still require literal values, so UUID generation does not yet provide complete request-ID forwarding middleware. Random UUIDs do not promise absolute uniqueness or ordered IDs. `randomBytes(n)` remains a target API, not an alias for `uuid()`.
+
 ## Built-ins (call them, never reimplement)
 
 ```
-string:  s.len s.isEmpty s.hasPrefix/hasSuffix/contains s.upper()/lower()/trim()
-         s.trimPrefix/trimSuffix/replace/split/slice s.matches(re"") s.match(re"")
+string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
+         s.replace/split/slice s.matches(re"") s.match(re"")
+         ⏳ s.hasPrefix/hasSuffix/trimPrefix/trimSuffix
 hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
-jwt:     jwtDecode(tok, secret:|publicKey:) jwtEncode(claims, ..., alg: .HS256)
+jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
+         decode with json.decode/json.get). ⏳ publicKey/RS/ES and jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
@@ -814,6 +902,11 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
 admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats()
 ```
+
+`env("NAME")` is resolved when the program is analyzed/loaded, not per
+request. The name must be a string literal and the variable must exist; a
+missing variable is a compile error. The resolved value is embedded as a
+constant, so changing the environment requires recompilation or reload.
 
 ## Do NOT write (compile errors — with the fix)
 
@@ -887,3 +980,13 @@ starting at zero after the index. The final block may be partial. Bodies are
 owned by the compiled program; generation performs no per-request allocation.
 Use existing `wait` for application delay. Timed response fragments are not
 provided by this builder.
+
+## Experimental compiler eBPF diagnostics
+
+Linux builds with `-DRUT_ENABLE_EBPF=ON` (and `RUT_ENABLE_JIT=ON`) support
+`rut app.rut --ebpf-plan` and `rut app.rut --emit-ebpf PREFIX`.
+These analyze verified, inlined RIR and optionally export raw body-transfer
+bytecode; they add no language syntax. Fixed terminal forwards can be body
+candidates while routing and headers stay in userspace. A candidate does not
+activate kernel forwarding: live socket handoff remains ⏳. `firewall {}`/XDP and
+kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).

@@ -9,6 +9,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_tls.h"
 #include "rut/runtime/arena.h"
 
 namespace rut {
@@ -189,10 +190,11 @@ enum class Opcode : u8 {
                             // is available, the write is ignored.
 
     // ── String operations ──
-    StrHasPrefix,    // %r = str.has_prefix %s, %pfx    → bool
-    StrTrimPrefix,   // %r = str.trim_prefix %s, %pfx   → str
-    StrRegexMatch,   // %r = str.regex_match %s, "re"   → bool
-    StrInterpolate,  // %r = str.interpolate [%a, %b..]  → str (variadic)
+    StrConstantTimeEqual,  // bounded byte equality; public lengths, secret contents
+    StrHasPrefix,          // %r = str.has_prefix %s, %pfx    → bool
+    StrTrimPrefix,         // %r = str.trim_prefix %s, %pfx   → str
+    StrRegexMatch,         // %r = str.regex_match %s, "re"   → bool
+    StrInterpolate,        // %r = str.interpolate [%a, %b..]  → str (variadic)
 
     // ── Comparisons ──
     CmpEq,  // %r = cmp.eq %a, %b  → bool
@@ -220,6 +222,7 @@ enum class Opcode : u8 {
     SextI64,  // %r = sext.i64 %a → i64 (sign-extend i32; the `i64(x)` builtin)
 
     // ── Domain operations ──
+    Uuid,            // %r = uuid -> Optional(str), request-owned CSPRNG result
     TimeNowMicros,   // %r = time.now_micros        → i64 (monotonic µs; fresh clock read)
     IpInCidr,        // %r = ip.in_cidr %ip, cidr   → bool
     HashHmacSha256,  // %r = hash.hmac_sha256 %k,%d → Bytes
@@ -532,6 +535,7 @@ struct Module {
         // Active health-check config carried verbatim from MIR (data only; the
         // compile→config helper feeds it to set_upstream_health_check). hc_path
         // is a Str copied into UpstreamTarget::hc_path there.
+        UpstreamTlsSpec tls{};
         bool http2 = false;
         bool hc_enabled = false;
         Str hc_path;

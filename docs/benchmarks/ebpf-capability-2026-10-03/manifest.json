@@ -1,0 +1,31 @@
+{
+  "kernel": [
+    "Linux",
+    "leopard",
+    "6.19.10-300.fc44.x86_64",
+    "#1 SMP PREEMPT_DYNAMIC Wed Mar 25 18:23:49 UTC 2026",
+    "x86_64"
+  ],
+  "uid": 1000,
+  "stage": "/home/hurricane/private/code/rut-ebpf-20261003",
+  "sha256": {
+    "probe": "cdc492c3a0dbf0ef8914c11aa70537a11f8bd0f12d1c93d78810ce2aad4bdc69",
+    "loader": "4e5d39355699e90fa29313d3100e82af4a23290028c58c364d6a249ef6a78e5e",
+    "libc.so.6": "a5c5ad9d59d3c69eda93aa8f82930ba06cc4e893a113e66c85ad6e96243d53c8",
+    "tunnel.parser.bpf": "8fc2e1a1eb573aef3ff402e638dfce1da5f30e975ce4ad0b2455740ef76d2f7f",
+    "tunnel.verdict.bpf": "560aa8e708702ce88a04d08c6fea529a485ad6671da3a951f61efeb4eb4bef0f",
+    "tunnel.body-parser.bpf": "b5454ac74cb91cf30ef0ffe773db7dae8e6ae340ebe9d927c25f34d2c1977d24",
+    "tunnel.body-verdict.bpf": "26da51dc0f879f27877e2015158a6bb5c1eec2ab6711d31fbd1e293d27b5b105"
+  },
+  "image": {
+    "command": [
+      "docker",
+      "image",
+      "inspect",
+      "nginx:latest"
+    ],
+    "returncode": 0,
+    "stdout": "[\n    {\n        \"Id\": \"sha256:abe47724e466aeab9a345d8e46a221c2fa8953c7848bb4a3bd9976a7199f8cf2\",\n        \"RepoTags\": [\n            \"nginx:latest\"\n        ],\n        \"RepoDigests\": [\n            \"nginx@sha256:abe47724e466aeab9a345d8e46a221c2fa8953c7848bb4a3bd9976a7199f8cf2\"\n        ],\n        \"Comment\": \"buildkit.dockerfile.v0\",\n        \"Created\": \"2026-09-19T00:20:21.403555998Z\",\n        \"Config\": {\n            \"ExposedPorts\": {\n                \"80/tcp\": {}\n            },\n            \"Env\": [\n                \"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\",\n                \"NGINX_VERSION=1.31.6\",\n                \"NJS_VERSION=1.0.1\",\n                \"NJS_RELEASE=1~trixie\",\n                \"ACME_VERSION=0.4.1\",\n                \"PKG_RELEASE=1~trixie\",\n                \"DYNPKG_RELEASE=1~trixie\"\n            ],\n            \"Entrypoint\": [\n                \"/docker-entrypoint.sh\"\n            ],\n            \"Cmd\": [\n                \"nginx\",\n                \"-g\",\n                \"daemon off;\"\n            ],\n            \"Labels\": {\n                \"maintainer\": \"NGINX Docker Maintainers <docker-maint@nginx.com>\"\n            },\n            \"StopSignal\": \"SIGQUIT\"\n        },\n        \"Architecture\": \"amd64\",\n        \"Os\": \"linux\",\n        \"Size\": 63422407,\n        \"RootFS\": {\n            \"Type\": \"layers\",\n            \"Layers\": [\n                \"sha256:a6dc765193a52cbaede3c93a9ff48b9540948dd0774bbe7031fcb5847606f9ac\",\n                \"sha256:95f7d993245419346c33f4b7a222e2e51c2a760230619fc18a1360f0cbc328aa\",\n                \"sha256:d774d1911b35ab757b6243a1d546d3f5c7cd57b0b8f103904013e87ac90d4466\",\n                \"sha256:ac17a1e2cff34e18d708bcf6058e3b22db72cfb22d0742b27715c1c8a405b08b\",\n                \"sha256:e7cd9cd646d491c07cffe4c55501a7342a7cd9dfcebb690def46cdb444f8e0c4\",\n                \"sha256:96cbf22739b165deb61982252d0eb77388042ce6db102e13fcd37b31bfba083b\",\n                \"sha256:b1b9300def4a24e65f82c343660241a8c8a229e80efe34094a4b83fe334051d9\"\n            ]\n        },\n        \"Metadata\": {\n            \"LastTagTime\": \"2026-09-23T23:33:02.706377897Z\"\n        },\n        \"Descriptor\": {\n            \"mediaType\": \"application/vnd.oci.image.index.v1+json\",\n            \"digest\": \"sha256:abe47724e466aeab9a345d8e46a221c2fa8953c7848bb4a3bd9976a7199f8cf2\",\n            \"size\": 10229\n        },\n        \"Identity\": {\n            \"Pull\": [\n                {\n                    \"Repository\": \"docker.io/library/nginx\"\n                }\n            ]\n        }\n    }\n]\n",
+    "stderr": ""
+  }
+}

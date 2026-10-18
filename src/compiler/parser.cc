@@ -3464,7 +3464,10 @@ struct Parser {
             }
             while (true) {
                 const bool protocol_field = cur().type == TokenType::KwProtocol;
-                auto field = expect(protocol_field ? TokenType::KwProtocol : TokenType::Ident);
+                const bool tls_field = cur().type == TokenType::KwTls;
+                auto field = expect(protocol_field ? TokenType::KwProtocol
+                                    : tls_field    ? TokenType::KwTls
+                                                   : TokenType::Ident);
                 if (!field) return core::make_unexpected(field.error());
                 const Str field_name = field.value()->text;
                 auto colon = expect(TokenType::Colon);
@@ -3484,6 +3487,72 @@ struct Parser {
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(*value.value()),
                                               value.value()->text);
+                } else if (field_name.eq({"tls", 3})) {
+                    auto& tls = item.upstream.tls;
+                    if (tls.enabled)
+                        return frontend_error(FrontendError::UnexpectedToken,
+                                              span_from(*field.value()));
+                    tls.enabled = true;
+                    auto brace = expect(TokenType::LBrace);
+                    if (!brace) return core::make_unexpected(brace.error());
+                    u32 seen = 0;
+                    while (true) {
+                        auto key = expect(TokenType::Ident);
+                        if (!key) return core::make_unexpected(key.error());
+                        auto separator = expect(TokenType::Colon);
+                        if (!separator) return core::make_unexpected(separator.error());
+                        auto value = expect(TokenType::StringLit);
+                        if (!value) return core::make_unexpected(value.error());
+                        char* dst = nullptr;
+                        u32 capacity = 0, bit = 0;
+                        if (key.value()->text.eq({"ca", 2})) {
+                            dst = tls.ca;
+                            capacity = sizeof(tls.ca);
+                            bit = 1;
+                        } else if (key.value()->text.eq({"server_name", 11})) {
+                            dst = tls.server_name;
+                            capacity = sizeof(tls.server_name);
+                            bit = 2;
+                        } else if (key.value()->text.eq({"cert", 4})) {
+                            dst = tls.cert;
+                            capacity = sizeof(tls.cert);
+                            bit = 4;
+                        } else if (key.value()->text.eq({"key", 3})) {
+                            dst = tls.key;
+                            capacity = sizeof(tls.key);
+                            bit = 8;
+                        } else {
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*key.value()));
+                        }
+                        const Str kText = value.value()->text;
+                        if ((seen & bit) || !kText.len || kText.len >= capacity)
+                            return frontend_error(FrontendError::UnsupportedSyntax,
+                                                  span_from(*value.value()));
+                        for (u32 i = 0; i < kText.len; i++) {
+                            const u8 kByte = static_cast<u8>(kText.ptr[i]);
+                            if (kByte < 32 || kByte == 127 || kByte == '\\')
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*value.value()));
+                            if (bit == 2 &&
+                                !((kByte >= 'a' && kByte <= 'z') ||
+                                  (kByte >= 'A' && kByte <= 'Z') ||
+                                  (kByte >= '0' && kByte <= '9') || kByte == '.' || kByte == '-'))
+                                return frontend_error(FrontendError::UnsupportedSyntax,
+                                                      span_from(*value.value()));
+                            dst[i] = kText.ptr[i];
+                        }
+                        dst[kText.len] = 0;
+                        seen |= bit;
+                        if (cur().type == TokenType::RBrace) break;
+                        (void)take(TokenType::Comma);
+                        if (cur().type == TokenType::RBrace) break;
+                    }
+                    auto end = expect(TokenType::RBrace);
+                    if (!end) return core::make_unexpected(end.error());
+                    if ((seen & 3) != 3 || ((seen & 12) != 0 && (seen & 12) != 12))
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*brace.value()));
                 } else if (field_name.eq({"host", 4})) {
                     if (seen_host)
                         return frontend_error(

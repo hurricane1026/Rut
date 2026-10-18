@@ -144,6 +144,7 @@ struct EpollBackend {
 
     // Register fd for EPOLLIN — actual recv happens inside wait().
     bool add_recv(i32 fd, u32 conn_id);
+    bool add_recv_tls(Connection& c);
     // A connection slot is closed or (re)allocated: forget its registrations.
     void forget_fd_interest(u32 conn_id) {
         if (conn_id >= connection_capacity) return;

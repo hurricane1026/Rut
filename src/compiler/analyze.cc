@@ -2,6 +2,7 @@
 
 #include "rut/common/http_header_validation.h"
 #include "rut/common/shard_limits.h"
+#include "rut/common/types.h"
 #include "rut/compiler/lexer.h"
 #include "rut/compiler/parser.h"
 #include "rut/runtime/json.h"
@@ -18,6 +19,8 @@
 #include <new>
 #include <string>
 #include <vector>
+
+#include <stdlib.h>
 
 namespace rut {
 
@@ -131,6 +134,8 @@ constexpr Str kTimeWaitDetail = lit_str(
     "time.nowMicros() in routes containing wait is not supported yet — "
     "locals re-materialize on resume, so a pre-wait timestamp would be "
     "sampled after the wait");
+constexpr Str kUuidWaitDetail = lit_str(
+    "uuid() in routes containing wait is not supported yet; locals re-materialize on resume");
 constexpr Str kMinMaxDetail = lit_str(
     "max/min expect two plain integer values of the same width (i32 or i64; "
     "wrap an i32 side in i64(x); int literals adopt the i64 side)");
@@ -9087,12 +9092,101 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
                                                  const MatchPayloadBinding* binding,
                                                  const HirExpr* pipe_lhs,
                                                  const HirExpr* first_arg_override) {
+    if (expr.name.eq(lit_str("uuid")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        if (expr.args.len != 0 || pipe_lhs != nullptr || first_arg_override != nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("uuid() expects no arguments; use it directly"));
+        if (route->time_ops_blocked)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kUuidWaitDetail);
+        if (!route->uuid_init_ok)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("uuid() currently requires a direct route let initializer; "
+                        "bind its result before guard let"));
+        HirExpr out{};
+        out.kind = HirExprKind::Uuid;
+        out.type = HirTypeKind::Str;
+        out.may_nil = true;
+        out.span = expr.span;
+        return out;
+    }
     if (expr.name.eq(lit_str("json")) &&
         !user_bound_ident_name(mod, locals, local_count, binding, lit_str("json"))) {
         if (pipe_lhs != nullptr)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, expr.span, lit_str("use json(value) directly"));
         return analyze_json_call(expr, lit_str("encode"), route, mod, locals, local_count, binding);
+    }
+    if (expr.name.eq(lit_str("env")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("env"))) {
+        if (pipe_lhs != nullptr)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, lit_str("use env(name) directly"));
+        if (expr.args.len != 1 || expr.args[0]->kind != AstExprKind::StrLit)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("env requires one literal string name"));
+        auto decoded_name =
+            decoded_expression_string(expr.args[0]->str_value, mod, expr.args[0]->span);
+        if (!decoded_name) return core::make_unexpected(decoded_name.error());
+        const Str name = decoded_name.value();
+        if (name.len == 0 || name.len > 255)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax, expr.span, lit_str("invalid environment name"));
+        char key[256];
+        for (u32 i = 0; i < name.len; ++i) {
+            if (name.ptr[i] == '\0' || name.ptr[i] == '=')
+                return frontend_error(FrontendError::UnsupportedSyntax,
+                                      expr.span,
+                                      lit_str("invalid environment name"));
+            key[i] = name.ptr[i];
+        }
+        key[name.len] = '\0';
+        const char* value = getenv(key);
+        if (value == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("environment variable is not set"));
+        auto interned = intern_analysis_string(mod, std::string(value));
+        if (!interned) return core::make_unexpected(interned.error());
+        HirExpr out{};
+        out.kind = HirExprKind::StrLit;
+        out.type = HirTypeKind::Str;
+        out.str_value = interned.value();
+        out.span = expr.span;
+        return out;
+    }
+    if (expr.name.eq(lit_str("jwtDecode")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, lit_str("jwtDecode"))) {
+        if (pipe_lhs != nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("use jwtDecode(token, secret) directly"));
+        if (expr.args.len != 2)
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  expr.span,
+                                  lit_str("jwtDecode(token, secret) expects two arguments"));
+        auto token = analyze_expr(*expr.args[0], route, mod, locals, local_count, binding);
+        if (!token) return token;
+        auto secret = analyze_expr(*expr.args[1], route, mod, locals, local_count, binding);
+        if (!secret) return secret;
+        if (token->type != HirTypeKind::Str || token->may_nil || token->may_error ||
+            secret->type != HirTypeKind::Str || secret->may_nil || secret->may_error)
+            return frontend_error(
+                FrontendError::UnsupportedSyntax,
+                expr.span,
+                lit_str("jwtDecode requires unwrapped str token and secret values"));
+        return make_json_op(json::Op::JwtDecode,
+                            HirTypeKind::Json,
+                            true,
+                            &token.value(),
+                            &secret.value(),
+                            nullptr,
+                            expr.span,
+                            route);
     }
     const auto copy_hir_shape = [](HirExpr* dst, const HirExpr& src) {
         dst->type = src.type;
@@ -9488,6 +9582,31 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
         // Reject here until the i64 error carrier exists.
         if (out.type == HirTypeKind::I64 && out.may_error)
             return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kI64FallibleDetail);
+        return out;
+    }
+
+    if (expr.name.eq(lit_str("constantTimeEqual")) &&
+        !user_bound_ident_name(mod, locals, local_count, binding, expr.name)) {
+        constexpr Str kDetail = lit_str("constantTimeEqual expects two unwrapped str values");
+        if (expr.args.len != 2 || expr.args[0] == nullptr || expr.args[1] == nullptr)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        auto lhs = analyze_builtin_arg(*expr.args[0]);
+        if (!lhs) return core::make_unexpected(lhs.error());
+        auto rhs = analyze_builtin_arg(*expr.args[1]);
+        if (!rhs) return core::make_unexpected(rhs.error());
+        if (lhs->type != HirTypeKind::Str || rhs->type != HirTypeKind::Str || lhs->may_nil ||
+            lhs->may_error || rhs->may_nil || rhs->may_error)
+            return frontend_error(FrontendError::UnsupportedSyntax, expr.span, kDetail);
+        HirExpr out{};
+        out.kind = HirExprKind::ConstantTimeEqual;
+        out.type = HirTypeKind::Bool;
+        out.span = expr.span;
+        if (!route->exprs.push(lhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.lhs = &route->exprs[route->exprs.len - 1];
+        if (!route->exprs.push(rhs.value()))
+            return frontend_error(FrontendError::TooManyItems, expr.span);
+        out.rhs = &route->exprs[route->exprs.len - 1];
         return out;
     }
 
@@ -15167,6 +15286,7 @@ constexpr Str kTimerWaitDetail = lit_str(
 
 static bool hir_expr_uses_request(const HirExpr& e) {
     switch (e.kind) {
+        case HirExprKind::Uuid:
         case HirExprKind::ReqHeader:
         case HirExprKind::ReqParam:
         case HirExprKind::ReqCookie:
@@ -15446,8 +15566,9 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
             fn.exprs[ei], route, mod, args.get(), fn.params.len, nullptr, 0);
         if (!effect) return core::make_unexpected(effect.error());
         const auto reads_response_time_state = [&](auto&& self, const HirExpr& expr) -> bool {
-            if (expr.kind == HirExprKind::TimeNowMicros || expr.kind == HirExprKind::CacheGet ||
-                expr.kind == HirExprKind::CacheSet || expr.kind == HirExprKind::RespHeader)
+            if (expr.kind == HirExprKind::Uuid || expr.kind == HirExprKind::TimeNowMicros ||
+                expr.kind == HirExprKind::CacheGet || expr.kind == HirExprKind::CacheSet ||
+                expr.kind == HirExprKind::RespHeader)
                 return true;
             if (expr.lhs != nullptr && self(self, *expr.lhs)) return true;
             if (expr.rhs != nullptr && self(self, *expr.rhs)) return true;
@@ -15460,11 +15581,11 @@ static FrontendResult<void> analyze_chain_after_response_step(const AstChainDecl
         };
         if (effect->lhs != nullptr &&
             reads_response_time_state(reads_response_time_state, *effect->lhs))
-            return frontend_error(
-                FrontendError::UnsupportedSyntax,
-                effect->lhs->span,
-                lit_str("chain after Response header values cannot read time, cache, or response "
-                        "state until effects execute at response time"));
+            return frontend_error(FrontendError::UnsupportedSyntax,
+                                  effect->lhs->span,
+                                  lit_str("chain after Response header values cannot read time, "
+                                          "randomness, cache, or response "
+                                          "state until effects execute at response time"));
         HirLocal carrier{};
         carrier.span = step.span;
         carrier.ref_index = next_local_ref_index(route, route->locals.data, route->locals.len);
@@ -15921,6 +16042,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   item.upstream.addr_span,
                                   {"HTTP/2 health checks are not supported", 37});
+        up.tls = item.upstream.tls;
+        if (up.tls.enabled && !item.upstream.http2)
+            return frontend_error(FrontendError::UnsupportedSyntax, item.upstream.addr_span);
         up.http2 = item.upstream.http2;
         up.hc_enabled = item.upstream.hc_enabled;
         up.hc_path = item.upstream.hc_path_lit;
@@ -19641,6 +19765,10 @@ static FrontendResult<HirModule*> analyze_file_internal(
                     can_be_used_for_iter(can_be_used_for_iter, stmt.name, si + 1);
                 const bool saved_allow_respond_effects = route.allow_respond_effects;
                 route.allow_respond_effects = !used_for_iter;
+                route.uuid_init_ok = !used_for_iter && !seen_for && !seen_wait && !route.is_timer &&
+                                     !route.is_helper_scratch &&
+                                     stmt.expr.kind == AstExprKind::Call &&
+                                     stmt.expr.name.eq(lit_str("uuid"));
                 auto init =
                     stmt.expr.kind == AstExprKind::Wait
                         ? analyze_wait_result_expr(stmt.expr, mod)
@@ -19663,6 +19791,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
                                                                route.locals.data,
                                                                route.locals.len,
                                                                nullptr)));
+                route.uuid_init_ok = false;
                 route.allow_respond_effects = saved_allow_respond_effects;
                 if (!init) return core::make_unexpected(init.error());
                 if (init.value().type == HirTypeKind::Array) {
@@ -20267,6 +20396,7 @@ static FrontendResult<HirModule*> analyze_file_internal(
         // by analyze_match_arm_body(); guard fail-body locals are separate.
         if (route.waits.len > 0) {
             auto blocked_kind = [](const HirExpr& e) -> Str {
+                if (e.kind == HirExprKind::Uuid) return kUuidWaitDetail;
                 if (e.kind == HirExprKind::TimeNowMicros) return kTimeWaitDetail;
                 if (e.kind == HirExprKind::CacheGet || e.kind == HirExprKind::CacheSet)
                     return kCacheWaitDetail;

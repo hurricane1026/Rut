@@ -1,0 +1,10 @@
+listen :8080
+
+// Generate once into an optional local before testing/unwrapping it.
+route GET "/id" {
+    let pending = uuid()
+    guard let id = pending else { return 503 }
+    return response(200, body: id)
+}
+
+route "/" { return 404 }

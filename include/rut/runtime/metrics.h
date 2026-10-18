@@ -29,7 +29,7 @@ struct LatencyHistogram {
     }
 
     // Record a duration in microseconds. O(1) — uses clz for fast bucket lookup.
-    void record(u32 duration_us) {
+    void record(u64 duration_us) {
         u32 bucket = find_bucket(duration_us);
         buckets[bucket]++;
         sum_us += duration_us;
@@ -38,7 +38,7 @@ struct LatencyHistogram {
 
     // Find bucket index for a given duration.
     // Uses binary-search-like approach with clz for the common fast path.
-    static u32 find_bucket(u32 duration_us) {
+    static u32 find_bucket(u64 duration_us) {
         // Fast path: most requests are <10ms (buckets 0-4).
         // Use the bit width to narrow down, then linear check.
         if (duration_us < 100) return 0;
@@ -64,6 +64,12 @@ struct ShardMetrics {
     u64 requests_total;   // completed requests
     u64 requests_active;  // currently processing (inc on recv, dec on response sent)
 
+    // Native gRPC RPC lifecycle, independent of connection-level HTTP accounting.
+    u64 grpc_started;
+    u64 grpc_active;
+    u64 grpc_completed[17];  // canonical grpc-status 0..16
+    LatencyHistogram grpc_latency;
+
     // --- Connection metrics ---
     u64 connections_total;   // total accepted
     u64 connections_active;  // currently open
@@ -81,6 +87,9 @@ struct ShardMetrics {
     void init() {
         requests_total = 0;
         requests_active = 0;
+        grpc_started = grpc_active = 0;
+        for (auto& count : grpc_completed) count = 0;
+        grpc_latency.init();
         connections_total = 0;
         connections_active = 0;
         connections_closed = 0;
@@ -103,6 +112,17 @@ struct ShardMetrics {
         connections_closed++;
     }
 
+    void on_grpc_start() {
+        grpc_started++;
+        grpc_active++;
+    }
+
+    void on_grpc_complete(u8 status, u64 duration_us) {
+        if (grpc_active > 0) grpc_active--;
+        grpc_completed[status <= 16 ? status : 2]++;
+        grpc_latency.record(duration_us);
+    }
+
     void on_request_start() { requests_active++; }
 
     void on_request_complete(u32 duration_us) {
@@ -123,6 +143,13 @@ inline ShardMetrics aggregate_metrics(ShardMetrics* const* shards, u32 count) {
         const auto& s = *shards[i];
         agg.requests_total += s.requests_total;
         agg.requests_active += s.requests_active;
+        agg.grpc_started += s.grpc_started;
+        agg.grpc_active += s.grpc_active;
+        for (u32 code = 0; code < 17; code++) agg.grpc_completed[code] += s.grpc_completed[code];
+        for (u32 b = 0; b < LatencyHistogram::kBucketCount; b++)
+            agg.grpc_latency.buckets[b] += s.grpc_latency.buckets[b];
+        agg.grpc_latency.sum_us += s.grpc_latency.sum_us;
+        agg.grpc_latency.count += s.grpc_latency.count;
         agg.connections_total += s.connections_total;
         agg.connections_active += s.connections_active;
         agg.connections_closed += s.connections_closed;

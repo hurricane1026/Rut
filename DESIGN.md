@@ -39,6 +39,7 @@ This is intentionally coarse-grained. It exists to separate "designed" from
 | RIR data model + builder + printer | **Implemented** | RIR is real and exercised by tests |
 | LLVM ORC JIT integration | **Implemented** | Userspace handler JIT engine and codegen paths exist |
 | `firewall {}` → eBPF / XDP compilation target | **Designed** | Packet-level kernel path is a first-class compilation target in this design |
+| RIR → eBPF body-transfer plans / bytecode export | **Experimental, implemented** | Opt-in `RUT_ENABLE_EBPF`; diagnostic/export only, no live socket offload; see [docs/ebpf.md](docs/ebpf.md) |
 | Offline manifest → RIR → JIT simulate flow | **Implemented** | Current compile-like path is intentionally narrow |
 | Full Rutlang lexer / parser / type checker | **Partial / in progress** | Token surface is declared, but the front-end is not yet complete |
 | Route conflict analysis and full diagnostics | **Designed** | Mentioned throughout this doc, not fully enforced end-to-end today |
@@ -540,7 +541,8 @@ req.header("X-Timestamp")    // string?
 
 // Setting headers
 req.set("X-User-ID", "123")
-req.set("X-Request-ID", uuid())
+// Target only: unwrap uuid() with guard let, then set the ID.
+// Dynamic req.set/add values remain pending; do not emit uuid() directly here.
 
 // Route parameters — path captures live in the req.params namespace,
 // so a capture can never shadow a built-in property (req.path, req.host, ...)
@@ -1356,8 +1358,10 @@ let orders = upstream { "10.0.1.1:8080" }
 `upstream greeter { host: "127.0.0.1", port: 50051, protocol: .http2 }` and
 `route POST "/package.Service/Method" { return forward(greeter) }`.
 `protocol` is an upstream configuration field, not a new keyword. Its closed
-selectors are `.http11` (default) and `.http2` (prior-knowledge cleartext HTTP/2).
-This does not implement the target upstream TLS syntax above.
+selectors are `.http11` (default) and `.http2`. HTTP/2 uses prior-knowledge
+h2c by default; the implemented `tls: { ca: "...", server_name: "..." }`
+configuration enables verified TLS with h2 ALPN. Adding paired `cert` and `key`
+paths enables mTLS. This does not implement the target `.mtls(...)` syntax above.
 
 The host application may pre-bind the endpoint and declare only
 `upstream greeter { protocol: .http2 }`. At publication, the declaration must
@@ -1366,6 +1370,20 @@ metadata are applied to that slot while its existing address remains intact.
 An addressless declaration without a matching pre-bound slot is rejected.
 
 The `.http2` forwarding path accepts native gRPC over downstream h2c or TLS/h2.
+Upstream TLS always verifies the certificate against the explicitly configured
+CA file and the DNS name or IPv4 address in `server_name`. DNS names also set
+SNI; h2 ALPN is mandatory, with no plaintext or HTTP/1 fallback. Client identity
+requires both a certificate chain and a matching private key. CA and identity
+files are loaded on the cold path when a new upstream session is established;
+the resulting OpenSSL context belongs to that session. Pooled sessions retain
+their context and pinned configuration epoch until teardown. Certificate/file/
+handshake/ALPN failures map to UNAVAILABLE without replay. io_uring uses the
+existing owned ciphertext buffers and client-state TlsEngine; readiness backends
+use the existing socket BIO with `SSL_do_handshake`. An epoll re-arm drains any
+plaintext retained inside OpenSSL after an SSL_write-driven client handshake,
+so buffered SETTINGS do not wait for a nonexistent socket readiness event.
+SSL is freed before its session-owned BIO methods; kernel send buffers retain
+the existing cancellation/retirement lifetime.
 It streams all four RPC shapes without decoding protobuf, preserving metadata,
 compressed payloads and trailers. A shard pools upstream HTTP/2 sessions by
 pinned configuration, upstream and backend. Each RPC selects a backend and gets
@@ -1394,9 +1412,34 @@ millisecond resolution. Upstream connection failures map to UNAVAILABLE;
 expired deadlines to DEADLINE_EXCEEDED. Configuration epochs remain pinned by
 active/pooled sessions until teardown.
 
+Native gRPC telemetry is per RPC, independent of the connection-level HTTP
+request counters. `rut_grpc_started_total` counts admitted exchanges,
+`rut_grpc_active` tracks exchanges until retirement, and
+`rut_grpc_completed_total{grpc_status="0"..."16"}` counts final statuses.
+`rut_grpc_duration_seconds` measures admission-to-retirement lifetime, including
+backpressure, with 64-bit microsecond samples for long-lived streams. Invalid,
+duplicate or missing backend status metadata is observed as UNKNOWN; metadata
+is still forwarded unchanged. Locally generated errors override backend status.
+Client resets and disconnects before completion are observed as CANCELLED.
+Completion here means final trailers have entered downstream-owned output,
+not that the remote client has acknowledged delivery.
+
+Each exchange owns its access-log path/upstream snapshot so HPACK reuse and
+multiplexing cannot overwrite another RPC's metadata. The existing access-log
+ring records HTTP status 200 plus a separate `grpc_status` text field, RPC
+lifetime (the separate upstream-latency field remains zero), received request
+DATA bytes and response DATA bytes staged downstream
+(including gRPC framing, excluding HTTP/2 frames). Paths over 128 bytes use the
+existing explicit over-limit marker. Logs share the existing overflow policy;
+RPC completion accounting does not depend on successful log publication.
+Metrics use bounded status labels, with service/method paths available in logs
+rather than unbounded client-controlled Prometheus labels. Pre-admission
+rejections retain the existing HTTP error path and are not counted as admitted
+RPCs. The source live-log writer retains its configured bytes-only output.
+
 Header-only route handlers can forward gRPC. Body-dependent handlers,
-HTTP/1-specific forwarding policies, gRPC-Web, JSON transcoding, upstream
-TLS/mTLS and gRPC health checks remain outside this path. The frontend rejects
+HTTP/1-specific forwarding policies, gRPC-Web, JSON transcoding and gRPC
+health checks remain outside this path. The frontend rejects
 `.http2` combined with the HTTP/1 health-check configuration. See
 [examples/grpc.rut](examples/grpc.rut) and the language card.
 
@@ -1575,13 +1618,14 @@ Two types of middleware, distinguished by whether the signature contains `Respon
 `guard ... else { respond ... }` is the idiomatic way to express "check or reject".
 
 ```swift
-func auth(_ req: Request, role: string) -> User {
-    let token = req.authorization.or("")
-    guard token.hasPrefix("Bearer ") else { respond 401 }
+struct Claims { sub: string, role: string }
 
-    let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { respond 401 }
-    guard claims.exp >= now() else { respond 401, "token expired" }
+func auth(_ req: Request, role: string) -> User {
+    let token = req.header("X-JWT").or("")
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+        respond 401
+    }
+    guard let claims = json.decode(Claims, document) else { respond 401 }
     guard claims.role == role else { respond 403 }
 
     req.set("X-User-ID", claims.sub)
@@ -1593,9 +1637,12 @@ func auth(_ req: Request, role: string) -> User {
 // over Cache<IP, i64> lands with the pending state/library stack; Counter is
 // deleted (§3.3.6).
 
+// Target sketch: generator helpers and dynamic request-header values are pending.
 func requestId(_ req: Request) {
     if req.header("X-Request-ID") == nil {
-        req.set("X-Request-ID", uuid())
+        let pending = uuid()
+        guard let id = pending else { respond 503 }
+        req.set("X-Request-ID", id)  // target only: dynamic request values pending
     }
 }
 
@@ -3453,16 +3500,27 @@ sha512(data)                  // string (hex)
 fnv32(data)                   // u32 (non-crypto, for load balancing)
 fnv64(data)                   // u64 (non-crypto, for hashing/sharding)
 
+// --- Constant-time equality (implemented) ---
+constantTimeEqual(a, b)       // (str, str) -> bool; direct call or explicit-placeholder pipe
+// Requires unwrapped strings. Uses static OpenSSL CRYPTO_memcmp for equal lengths
+// up to 16 KiB; no content-dependent early exit. Lengths are public: different
+// lengths or either length above 16 KiB return false without reading contents.
+// Two empty strings compare equal. Embedded NULs are compared as bytes.
+// This is byte equality, not Unicode normalization. It allocates no request
+// storage, has no shard/global state, and retains no input view after the call.
+// No constant folding to ordinary Eq; user functions/bindings can shadow the builtin.
+// Authentication policies must separately reject absent/empty credentials.
+
 // --- HMAC ---
 hmacSha256(key, data)         // string (hex)
 hmacSha384(key, data)         // string (hex)
 hmacSha512(key, data)         // string (hex)
 
-// --- JWT (multi-algorithm, backed by BoringSSL) ---
-jwtDecode(token, secret: key)               // error-capable Claims decode — HS256/384/512
-jwtDecode(token, publicKey: pem)            // error-capable Claims decode — RS256/384/512, ES256/384/512
-jwtEncode(claims, secret: key, alg: .HS256) // string — sign with HMAC
-jwtEncode(claims, privateKey: pem, alg: .RS256)  // string — sign with RSA/ECDSA
+// --- JWT (HMAC slice implemented; asymmetric forms are roadmap) ---
+jwtDecode(token, secret)                    // Json? — verified HS256/384/512 claims
+// ⏳ jwtDecode(token, publicKey: pem)       // RS256/384/512, ES256/384/512
+// ⏳ jwtEncode(claims, secret: key, alg: .HS256)
+// ⏳ jwtEncode(claims, privateKey: pem, alg: .RS256)
 
 // --- Encryption ---
 aesGcmEncrypt(key, plaintext, nonce)        // [u8] — AES-256-GCM authenticated encryption
@@ -3470,7 +3528,23 @@ aesGcmDecrypt(key, ciphertext)              // error-capable decrypt + verify ta
 
 // --- Random ---
 randomBytes(n)                // [u8] — cryptographically secure random
-uuid()                        // string — UUID v4
+uuid()                        // implemented: str? — RFC 9562 UUID v4
+// Explicit guard-let / fallback required: entropy/context/capacity failure is nil.
+// Linux uses one nonblocking getrandom(16) call; macOS uses getentropy(16).
+// A failure or short read publishes no result; no time/PID/counter fallback.
+// Results are 36 lowercase ASCII bytes with 122 random bits, stored in the
+// existing request SliceArena. UUID and JSON share a 256 KiB used-byte budget;
+// UUID charges 40 bytes including 8-byte alignment, and fails if the pool is full.
+// Views survive until request retirement/reset; no thread-local output buffer.
+// Each direct route-let call is fresh; references retain that local's value.
+// No constant folding. User bindings/functions named uuid shadow the builtin.
+// The builtin must directly initialize a top-level route let. Bind that optional
+// local with guard let/if let before use; generation inside a guard-let/if-let
+// expression or helper is rejected to avoid re-materializing fresh values.
+// Wait routes, timer bodies, and response-time
+// chain-after random effects are rejected until their lifetime/evaluation model
+// can preserve freshness. Request-header set/add still require literal values;
+// uuid() alone does not complete request-ID propagation middleware.
 
 // --- Encoding / Decoding ---
 base64(data)                  // string
@@ -3508,7 +3582,8 @@ time(string)                  // parse time string
 Duration arithmetic           // now() - req.ifModifiedSince > 1h
 
 // --- Utility ---
-env(key)                      // environment variable (compile-time resolved)
+env(key)                      // environment variable (compile-time resolved;
+                              // literal name, missing variable is a compile error)
 log.info(msg, key: val)       // structured logging (named parameters)
 log.warn(msg, key: val)
 log.error(msg, key: val)
@@ -3625,7 +3700,7 @@ removed from the language instead of documented as a variation.
 
 | Feature | Example | Why |
 |---------|---------|-----|
-| `guard let ... else` | `guard let claims = jwtDecode(token, secret: key) else { respond 401 }` | Middleware "reject or continue"; Swift-identical, incl. the `guard let x else` shorthand |
+| `guard let ... else` | `guard let claims = jwtDecode(token, key) else { respond 401 }` | Middleware "reject or continue"; Swift-identical, incl. the `guard let x else` shorthand |
 | `if let` | `if let cached = cache.get(key) { return 200, cached }` | Swift-identical optional binding |
 | Boolean operators | `a && b`, `a \|\| b`, `!a` | Identical to Swift — no `and`/`or`/`not` near-miss |
 | `break` / `continue` | loop control inside `for ... in` | Swift-identical; only shortens iteration, bound preserved |
@@ -3693,6 +3768,11 @@ struct User {
     role: string
 }
 
+struct Claims {
+    sub: string
+    role: string
+}
+
 struct Order {
     items: [OrderItem]
 }
@@ -3711,13 +3791,13 @@ let userCache = LRU<string, string>(capacity: 10000, ttl: 5m, coalesce: true)
 // ---------- Middleware ----------
 
 func auth(_ req: Request, role: string) {
-    let token = req.authorization.or("")
+    let token = req.header("X-JWT").or("")
     guard !token.isEmpty else { respond 401 }
-    guard token.hasPrefix("Bearer ") else { respond 401 }
 
-    let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { respond 401 }
-    guard claims.exp >= now() else { respond 401, "token expired" }
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+        respond 401
+    }
+    guard let claims = json.decode(Claims, document) else { respond 401 }
     guard claims.role == role else { respond 403 }
 
     req.ctx.userId = claims.sub
@@ -3838,11 +3918,17 @@ route {
 
 Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, APISIX, and common Lua patterns).
 
+#### Partial coverage (current implementation)
+
+| Feature | Current boundary |
+|---------|------------------|
+| Request ID / Correlation ID | Request-local `uuid() -> str?` generation is implemented in direct route-let initializers; dynamic request-header propagation and generator helpers remain pending. |
+
 #### Fully Covered (built-in)
 
 | Feature Category | DSL Capability |
 |-----------------|----------------|
-| JWT auth | `jwtDecode()` built-in |
+| JWT auth | `jwtDecode(tok, secret)` built-in (HS256/384/512); RS/ES and `jwtEncode` are roadmap |
 | HMAC auth | `hmacSha256()` built-in |
 | Basic auth | `base64` decode + string compare |
 | API key auth | header/query access + compare |
@@ -3852,7 +3938,6 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 | CORS | `guard` + header assignment |
 | Rate limiting | `@rateLimit` or Rut GCRA over `Cache<K, i64>` (`examples/ratelimit.rut`) |
 | Request size limiting | `req.contentLength` comparison |
-| Request ID / Correlation ID | `uuid()` built-in |
 | Header add/remove/modify | `req.Header = val` / `= nil` |
 | URL rewriting | `req.path` assignment |
 | Response header rewrite | `let resp = forward(x, buffered: true); resp.Header = val` |
@@ -3892,10 +3977,10 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 
 | Feature | Requirement |
 |---------|------------|
-| Native gRPC proxy | Implemented over h2c upstream; see §3.4.1 |
+| Native gRPC proxy | Implemented over h2c or TLS/mTLS upstream; see §3.4.1 |
 | gRPC-REST transcoding | HTTP/2 + protobuf definitions |
 | gRPC-Web | HTTP/2 + gRPC-Web protocol |
-| HTTP/2 upstream | Implemented for native gRPC forwarding over h2c |
+| HTTP/2 upstream | Implemented for native gRPC over h2c or TLS/mTLS |
 | mTLS (client certs) | OpenSSL client cert validation |
 | Dynamic SSL / ACME | ACME protocol + cert management |
 

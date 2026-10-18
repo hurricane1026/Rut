@@ -490,6 +490,14 @@ set_tests_properties(test_proxy_benchmark_tools PROPERTIES LABELS "unit;benchmar
 
 add_test(NAME test_routing_corpus
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME test_cross_machine_benchmark
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/cross_machine_benchmark/test_tools.py)
+    set_tests_properties(test_cross_machine_benchmark PROPERTIES
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/scripts/cross_machine_benchmark
+        LABELS "unit")
+endif()
 set_tests_properties(test_routing_corpus PROPERTIES LABELS "unit;routing" TIMEOUT 120)
 
 # Verify the shipped runtime does not import a C++ standard/ABI library.
@@ -3571,6 +3579,10 @@ if(RUT_ENABLE_JIT)
         target_link_options(test_native_program PRIVATE -Wl,-export_dynamic)
     endif()
     add_dependencies(test_native_program rut-compile)
+    add_test(NAME test_ebpf_compiler
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ebpf_compiler.py
+            --server $<TARGET_FILE:rut> --enabled $<BOOL:${RUT_ENABLE_EBPF}>)
+    set_tests_properties(test_ebpf_compiler PROPERTIES LABELS "unit;jit" TIMEOUT 90)
     add_test(NAME test_native_program COMMAND test_native_program)
     set_tests_properties(test_native_program PROPERTIES LABELS "unit;jit")
 
@@ -3731,6 +3743,7 @@ elseif(RUT_ENABLE_JIT)
         COMMAND $<TARGET_FILE:test_redirect_policy>
         COMMAND $<TARGET_FILE:test_iouring_idle_trim>
         COMMAND $<TARGET_FILE:test_splice>
+        COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
         COMMAND $<TARGET_FILE:test_json_network>
         DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_jit test_serve_loader test_traffic_capture test_traffic_replay test_sim rut-simulate test_simulate_engine test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json test_json_network
@@ -3782,6 +3795,7 @@ else()
         COMMAND $<TARGET_FILE:test_redirect_policy>
         COMMAND $<TARGET_FILE:test_iouring_idle_trim>
         COMMAND $<TARGET_FILE:test_splice>
+        COMMAND $<TARGET_FILE:test_uuid>
         COMMAND $<TARGET_FILE:test_json>
         DEPENDS test_network test_integration test_arena test_expected test_http_parser test_http2 test_hpack test_hpack_diff test_http2_conn ${CHECK_GRPC_DEPENDS} test_chunked_parser test_buffer test_cache_table test_types test_rir test_frontend test_nginx_parser test_envoy_parser test_envoy_convert test_drain test_access_log test_metrics test_debug test_fault_injection test_shard_control test_traffic_capture test_traffic_replay test_sim test_harness test_route_trie test_route_art test_route_select test_target_transform test_redirect_policy test_iouring_idle_trim test_splice test_json
         COMMENT "Running non-JIT tests..."
@@ -3834,4 +3848,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
     add_test(NAME test_grpc_proxy COMMAND test_grpc_proxy)
     set_tests_properties(test_grpc_proxy PROPERTIES LABELS "network" TIMEOUT 60)
+endif()
+
+# UUID formatting and entropy failure semantics have no LLVM/TLS dependencies.
+add_executable(test_uuid test_uuid.cc)
+target_include_directories(test_uuid PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/testing)
+add_test(NAME test_uuid COMMAND test_uuid)
+set_tests_properties(test_uuid PROPERTIES LABELS "unit")
+if(TARGET check)
+    add_dependencies(check test_uuid)
 endif()

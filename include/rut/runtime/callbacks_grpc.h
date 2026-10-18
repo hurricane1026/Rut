@@ -109,10 +109,52 @@ inline u32 grpc_error_headers(u8* out, u32 cap, u32 sid, u8 code, bool started) 
     return http2_write_headers(out, cap, sid, hs + (started ? 2 : 0), started ? 1 : 3, true);
 }
 
+inline void grpc_log_target(AccessLogEntry& entry, Str path) {
+    entry.target_length = static_cast<u16>(path.len);
+    entry.target_state = path.len > kAccessLogCompleteTargetMax ? AccessLogTargetState::OverLimit
+                                                                : AccessLogTargetState::Complete;
+    if (!path.len || path.ptr[0] != '/' || path.len > kAccessLogObservedStrictH1TargetMax)
+        entry.target_state = AccessLogTargetState::Invalid;
+    for (u32 j = 0; j < path.len; j++) {
+        const u8 kByte = static_cast<u8>(path.ptr[j]);
+        if (kByte <= 32 || kByte == 127) entry.target_state = AccessLogTargetState::Invalid;
+    }
+    if (entry.target_state == AccessLogTargetState::Complete)
+        __builtin_memcpy(entry.path, path.ptr, path.len);
+}
+
+// Record exactly once when the exchange retires. Completion means the final
+// trailers were staged into downstream-owned output, not acknowledged by peer.
+template <typename Loop>
+void grpc_observe(Loop* loop, GrpcExchange& x) {
+    if (!x.observed) return;
+    x.observed = false;
+    const u64 kElapsed = monotonic_us() - x.started_us;
+    const u8 kStatus = x.response_end_sent ? (x.failure ? x.failure : x.response_status) : 1;
+    if (loop->metrics) loop->metrics->on_grpc_complete(kStatus, kElapsed);
+    auto& entry = x.log_entry;
+    entry.timestamp_us = realtime_us();
+    entry.duration_us = kElapsed > 0xffffffffull ? 0xffffffffu : static_cast<u32>(kElapsed);
+    // No separate upstream latency sample: lifetime includes downstream backpressure.
+    entry.req_size =
+        x.request_bytes > 0xffffffffull ? 0xffffffffu : static_cast<u32>(x.request_bytes);
+    entry.resp_size = x.staged_response_bytes > 0xffffffffull
+                          ? 0xffffffffu
+                          : static_cast<u32>(x.staged_response_bytes);
+    entry.grpc_status_plus_one = kStatus + 1;
+    if (loop->access_log && loop->live_access_log)
+        loop->live_access_log->fail_protocol(EINVAL);
+    else if (loop->live_access_log)
+        (void)loop->live_access_log->publish(entry);
+    else if (loop->access_log)
+        (void)loop->access_log->push(entry);
+}
+
 // Return all buffered credit on retirement (including cancellation), so one
 // cancelled RPC cannot exhaust the connection window for unrelated RPCs.
 template <typename Loop>
 void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
+    grpc_observe(loop, *x);
     Connection* down = x->downstream;
     Connection* up = x->upstream;
     if (down && down->h2) {
@@ -155,6 +197,15 @@ void grpc_connection_closed(void* lp, Connection& conn) {
     // backend's connect operation. The ordinary close path must close it once.
     if (g.connecting && conn.fd == conn.upstream_fd) conn.fd = -1;
     if (g.upstream) {
+        // BIO methods belong to this session context and must outlive its SSL.
+        if (g.client_tls.ssl_ctx) {
+            if (conn.tls_engine.ssl) tls_engine_free(conn.tls_engine);
+            if (conn.tls) {
+                destroy_tls_server_ssl(conn.tls);
+                conn.tls = nullptr;
+            }
+            destroy_tls_client_context(g.client_tls);
+        }
         Connection** link = &loop->grpc_upstreams;
         while (*link && *link != &conn) link = &(*link)->h2->grpc.pool_next;
         if (*link) *link = g.pool_next;
@@ -272,6 +323,27 @@ inline bool grpc_has_status(const hpack::Header* hs, u32 n) {
         if (hs[i].name.eq({"grpc-status", 11})) return true;
     return false;
 }
+// Invalid or duplicate status metadata is reported as UNKNOWN in telemetry;
+// forwarding remains opaque and does not rewrite backend trailers.
+inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
+    bool seen = false;
+    u8 status = 2;
+    for (u32 i = 0; i < n; i++) {
+        if (!hs[i].name.eq({"grpc-status", 11})) continue;
+        if (seen) return 2;
+        seen = true;
+        const Str kValue = hs[i].value;
+        if (!kValue.len) return 2;
+        u32 parsed = 0;
+        for (u32 j = 0; j < kValue.len; j++) {
+            if (kValue.ptr[j] < '0' || kValue.ptr[j] > '9') return 2;
+            parsed = parsed * 10 + static_cast<u32>(kValue.ptr[j] - '0');
+            if (parsed > 16) return 2;
+        }
+        status = static_cast<u8>(parsed);
+    }
+    return status;
+}
 template <typename Loop>
 inline void grpc_release_slot(Loop* loop, GrpcExchange& x) {
     if (!x.slot_held) return;
@@ -307,12 +379,6 @@ inline void grpc_record_connect_result(Loop* loop,
     if (current != conn.request_config) return;
     grpc_record_connect_result(conn, success, now_us);
 }
-inline void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
-    if (success) return;
-    if (conn.h2 == nullptr || conn.h2->grpc.session_failure_recorded) return;
-    conn.h2->grpc.session_failure_recorded = true;
-    grpc_record_connect_result(conn, success, now_us);
-}
 template <typename Loop>
 inline void grpc_record_session_failure(Loop* loop, Connection& conn, u64 now_us) {
     if (!conn.h2 || conn.h2->grpc.session_failure_recorded) return;
@@ -336,12 +402,6 @@ inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
     const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (current != conn.request_config) return;
     grpc_record_connect_result(conn, true, now_us);
-}
-template <typename Loop>
-inline void grpc_record_handshake_result(Loop* loop, Connection& conn, bool success, u64 now_us) {
-    const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (current != conn.request_config) return;
-    grpc_record_handshake_result(conn, success, now_us);
 }
 inline bool grpc_parse_content_length(Str value, u32* out) {
     if (value.len == 0) return false;
@@ -453,6 +513,10 @@ void grpc_response_headers(
         return;
     }
     x->response_end = end;
+    // END_STREAM on the initial headers is a trailers-only response. Response
+    // mutations apply to those headers, so telemetry must observe the same
+    // filtered grpc-status that the downstream receives.
+    if (end) x->response_status = grpc_observed_status(filtered, filtered_n);
     if (end && (!grpc_has_status(hs, n) || !grpc_has_status(filtered, filtered_n))) x->failure = 2;
     if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
         x->failure = 13;
@@ -489,6 +553,7 @@ void grpc_response_trailers(
     }
     if (!grpc_has_status(hs, n)) x->failure = 2;
     if (x->has_response_length && x->expected_response_bytes != x->response_bytes) x->failure = 13;
+    x->response_status = grpc_observed_status(hs, n);
     x->response_end = true;
     if (!x->failure && x->upstream && grpc_has_status(hs, n))
         grpc_record_rpc_success(dispatch->loop, *x->upstream, monotonic_us());
@@ -567,6 +632,15 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    if (conn.h2->grpc.client_tls.ssl_ctx && !conn.h2->grpc.tls_verified) {
+        SSL* ssl = conn.tls_engine.ssl ? conn.tls_engine.ssl : conn.tls;
+        if (!tls_client_peer_valid(ssl)) {
+            grpc_record_handshake_result(loop, conn, false, monotonic_us());
+            loop->close_conn(conn);
+            return;
+        }
+        conn.h2->grpc.tls_verified = true;
+    }
     conn.send_progress += static_cast<u32>(ev.result);
     if (conn.send_progress < conn.send_buf.len()) {
         if (!loop->submit_send(conn,
@@ -586,6 +660,9 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
     auto& h = *conn.h2;
     auto& g = h.grpc;
     if (g.connecting || conn.on_send || g.busy) return;
+    // Readiness backends bootstrap SSL_connect through the preface write;
+    // never send an RPC header until peer identity and h2 ALPN are verified.
+    if (g.client_tls.ssl_ctx && !g.tls_verified && g.preface_sent) return;
     g.busy = true;
     grpc_flush_pending_cancels(h);
     if (h.conn_recv_credit && sizeof(g.control) - g.control_len >= 26) {
@@ -677,16 +754,40 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
 }
 
 template <typename Loop>
+void grpc_tls_ready(Loop* loop, Connection& conn) {
+    conn.h2->grpc.tls_verified = true;
+    conn.h2->grpc.connecting = false;
+    grpc_drive_upstream(loop, conn);
+}
+
+template <typename Loop>
 void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result <= 0 || !conn.h2) {
-        if (conn.h2) grpc_record_session_failure(loop, conn, monotonic_us());
+        if (conn.h2) {
+            if (conn.h2->grpc.client_tls.ssl_ctx && !conn.h2->grpc.tls_verified)
+                grpc_record_handshake_result(loop, conn, false, monotonic_us());
+            else
+                grpc_record_session_failure(loop, conn, monotonic_us());
+        }
         loop->close_conn(conn);
         return;
     }
     auto& h = *conn.h2;
     auto& g = h.grpc;
     if (g.connecting) return;
+    if (g.client_tls.ssl_ctx && !g.tls_verified) {
+        SSL* ssl = conn.tls_engine.ssl ? conn.tls_engine.ssl : conn.tls;
+        // Downstream window-credit pumps may call this without a network read.
+        // An in-progress client handshake has not produced a peer verdict yet.
+        if (ssl && !tls_handshake_finished(ssl)) return;
+        if (!tls_client_peer_valid(ssl)) {
+            grpc_record_handshake_result(loop, conn, false, monotonic_us());
+            loop->close_conn(conn);
+            return;
+        }
+        g.tls_verified = true;
+    }
     GrpcClientDispatch<Loop> dispatch{loop, &conn};
     h.cb_ctx = &dispatch;
     h.on_headers = &grpc_response_headers<Loop>;
@@ -776,6 +877,36 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
         conn.fd = fd;
     } else
         conn.upstream_fd = -1;
+    const auto& target = conn.request_config->upstreams[conn.upstream_idx];
+    if (target.tls.enabled) {
+        auto& context = conn.h2->grpc.client_tls;
+        if (!init_tls_client_context(context, target.tls)) {
+            grpc_record_handshake_result(loop, conn, false, monotonic_us());
+            loop->close_conn(conn);
+            return;
+        }
+        if constexpr (requires { loop->tls_setup(conn, &context, target.tls.server_name); }) {
+            if (!loop->tls_setup(conn, &context, target.tls.server_name) ||
+                !loop->grow_h2_tls_input(conn)) {
+                grpc_record_handshake_result(loop, conn, false, monotonic_us());
+                loop->close_conn(conn);
+                return;
+            }
+            conn.tls_pending_on_recv = &grpc_on_upstream_data<Loop>;
+            tls_process(loop, conn);
+            return;
+        } else {
+            auto ssl = create_tls_client_ssl(context, conn.fd, target.tls.server_name);
+            if (!ssl) {
+                grpc_record_handshake_result(loop, conn, false, monotonic_us());
+                loop->close_conn(conn);
+                return;
+            }
+            conn.tls = ssl.value();
+            conn.tls_active = true;
+            conn.tls_handshake_complete = false;
+        }
+    }
     conn.h2->grpc.connecting = false;
     conn.set_slots(&grpc_on_upstream_data<Loop>, nullptr, nullptr, nullptr);
     grpc_drive_upstream(loop, conn);
@@ -875,9 +1006,14 @@ bool grpc_start_impl(Loop* loop,
     }
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
     u32 filtered_n = 0;
-    for (u32 i = 0; i < nh; i++)
-        if (grpc_request_header_allowed(hs[i]) && filtered_n < Http2Conn::kMaxHeadersPerReq)
-            filtered[filtered_n++] = hs[i];
+    for (u32 i = 0; i < nh; i++) {
+        if (!grpc_request_header_allowed(hs[i]) || filtered_n >= Http2Conn::kMaxHeadersPerReq)
+            continue;
+        filtered[filtered_n] = hs[i];
+        if (hs[i].name.eq({":scheme", 7}))
+            filtered[filtered_n].value = target.tls.enabled ? Str{"https", 5} : Str{"http", 4};
+        filtered_n++;
+    }
     x->request_headers_len = http2_write_headers(
         x->request_headers, sizeof(x->request_headers), usid, filtered, filtered_n, false);
     if (!x->request_headers_len) {
@@ -903,6 +1039,25 @@ bool grpc_start_impl(Loop* loop,
             return false;
         }
         x->slot_held = true;
+    }
+    x->started_us = now;
+    x->observed = true;
+    if (loop->metrics) loop->metrics->on_grpc_start();
+    auto& entry = x->log_entry;
+    entry.status = 200;
+    entry.method = static_cast<u8>(LogHttpMethod::Post);
+    entry.shard_id = down.shard_id;
+    entry.addr = down.peer_addr;
+    entry.target_state = AccessLogTargetState::Unavailable;
+    for (u32 i = 0; i < nh; i++) {
+        if (!hs[i].name.eq({":path", 5})) continue;
+        const Str kPath = hs[i].value;
+        grpc_log_target(entry, kPath);
+        break;
+    }
+    for (u32 i = 0; i + 1 < sizeof(entry.upstream) && i < sizeof(target.name); i++) {
+        entry.upstream[i] = target.name[i];
+        if (!target.name[i]) break;
     }
     grpc_attach(*down.h2, x);
     grpc_attach(*up->h2, x);
@@ -951,6 +1106,8 @@ bool grpc_start(Loop* loop,
                       loop->grpc_upstreams;
                       loop->pool.alloc_bulk();
                       loop->alloc_conn();
+                      loop->disarm_yield_timer(down);
+                      loop->arm_throttle_timer(down, u64{1});
                   })
         return grpc_start_impl(loop, down, sid, cfg, uid, hs, nh, req, end);
     else
@@ -1001,6 +1158,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                 if (amount > static_cast<u32>(stream->send_window)) amount = stream->send_window;
                 if (amount > static_cast<u64>(h.conn_send_window)) amount = h.conn_send_window;
                 n = http2_write_data(out + total, x->downstream_stream, x->download, amount, false);
+                x->staged_response_bytes += amount;
                 grpc_pop(x->download, x->download_len, amount);
                 stream->send_window -= static_cast<i32>(amount);
                 h.conn_send_window -= amount;
@@ -1014,6 +1172,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             total += n;
             Connection* up = x->upstream;
             if (done) {
+                x->response_end_sent = true;
                 h2_close_stream(&h, x->downstream_stream);
                 grpc_release(loop, x, x->failure || !x->request_end_sent);
             }
@@ -1040,11 +1199,11 @@ void grpc_kick_downstream(Loop* loop, Connection& down) {
 template <typename Loop>
 void grpc_request_data(
     Loop* loop, Connection& down, GrpcExchange& x, const u8* data, u32 len, bool end) {
+    x.request_bytes += len;
     if (x.failure || !x.upstream) {
         down.h2->consume_data(x.downstream_stream, len);
         return;
     }
-    x.request_bytes += len;
     if (len > sizeof(x.upload) - x.upload_len ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
                                   (end && x.request_bytes != x.expected_request_bytes)))) {

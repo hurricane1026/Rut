@@ -1,6 +1,8 @@
 #pragma once
 
 #include "rut/common/types.h"
+#include "rut/runtime/access_log.h"
+#include "rut/runtime/tls.h"
 
 namespace rut {
 struct ConnectionBase;
@@ -23,6 +25,11 @@ struct GrpcExchange {
     ConnectionBase* upstream;
     u32 downstream_stream;
     u32 upstream_stream;
+    u64 started_us;
+    u64 staged_response_bytes;
+    AccessLogEntry log_entry;  // owned path/upstream; never borrow decoded HPACK storage
+    u8 response_status;
+    bool observed;
     u64 deadline_us;
     u64 request_bytes;
     u32 expected_request_bytes;
@@ -60,6 +67,10 @@ struct GrpcExchange {
     void init() {
         downstream = upstream = nullptr;
         downstream_stream = upstream_stream = 0;
+        started_us = staged_response_bytes = 0;
+        log_entry = {};
+        response_status = 2;
+        observed = false;
         deadline_us = request_bytes = 0;
         expected_request_bytes = 0;
         has_request_length = request_end = request_headers_sent = request_end_sent = false;
@@ -81,6 +92,8 @@ struct GrpcExchange {
 // Only upstream sessions join the shard-local pool; mappings keep stream IDs
 // independent on the two hops, allowing multiple downstream clients to share it.
 struct GrpcProxyState {
+    TlsClientContext client_tls;
+    bool tls_verified;
     GrpcExchange* streams[64];
     ConnectionBase* pool_next;
     u32 active;
@@ -100,6 +113,8 @@ struct GrpcProxyState {
     u8 control[4096];
 
     void init() {
+        client_tls = {};
+        tls_verified = false;
         for (auto& stream : streams) stream = nullptr;
         pool_next = nullptr;
         active = cursor = control_len = pending_cancel_count = 0;

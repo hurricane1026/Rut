@@ -231,6 +231,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
         case Opcode::CtxStoreSlotI32:
             buf.put_cstr("ctx.store_slot_i32");
             break;
+        case Opcode::StrConstantTimeEqual:
+            buf.put_cstr("str.constant_time_equal");
+            break;
         case Opcode::StrHasPrefix:
             buf.put_cstr("str.has_prefix");
             break;
@@ -305,6 +308,9 @@ void print_opcode(PrintBuf& buf, Opcode op) {
             break;
         case Opcode::JsonOp:
             buf.put_cstr("json.op");
+            break;
+        case Opcode::Uuid:
+            buf.put_cstr("uuid");
             break;
         case Opcode::TimeNowMicros:
             buf.put_cstr("time.now_micros");
@@ -709,6 +715,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             break;
         case Opcode::ReqRemoteAddr:
         case Opcode::ReqContentLength:
+        case Opcode::Uuid:
         case Opcode::TimeNowMicros:
             // No operands.
             break;
@@ -741,6 +748,7 @@ void print_instruction(PrintBuf& buf, const Instruction& inst, const Function& f
             buf.put_cstr(", ");
             print_value_ref(buf, inst.operands[0]);
             break;
+        case Opcode::StrConstantTimeEqual:
         case Opcode::StrHasPrefix:
         case Opcode::StrTrimPrefix:
         case Opcode::CmpEq:

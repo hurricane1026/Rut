@@ -752,6 +752,11 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
+    if (expr.kind == HirExprKind::Uuid) {
+        v.kind = MirValueKind::Uuid;
+        v.type = MirTypeKind::Str;
+        return v;
+    }
     if (expr.kind == HirExprKind::TimeNowMicros) {
         v.kind = MirValueKind::TimeNowMicros;
         v.type = MirTypeKind::I64;
@@ -800,14 +805,14 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
-    if (expr.kind == HirExprKind::Eq || expr.kind == HirExprKind::Lt ||
-        expr.kind == HirExprKind::Gt || expr.kind == HirExprKind::BitAnd ||
-        expr.kind == HirExprKind::BitOr || expr.kind == HirExprKind::BitXor ||
-        expr.kind == HirExprKind::BitShl || expr.kind == HirExprKind::BitShr ||
-        expr.kind == HirExprKind::Add || expr.kind == HirExprKind::Sub ||
-        expr.kind == HirExprKind::Mul || expr.kind == HirExprKind::Div ||
-        expr.kind == HirExprKind::Mod || expr.kind == HirExprKind::MaxInt ||
-        expr.kind == HirExprKind::MinInt) {
+    if (expr.kind == HirExprKind::ConstantTimeEqual || expr.kind == HirExprKind::Eq ||
+        expr.kind == HirExprKind::Lt || expr.kind == HirExprKind::Gt ||
+        expr.kind == HirExprKind::BitAnd || expr.kind == HirExprKind::BitOr ||
+        expr.kind == HirExprKind::BitXor || expr.kind == HirExprKind::BitShl ||
+        expr.kind == HirExprKind::BitShr || expr.kind == HirExprKind::Add ||
+        expr.kind == HirExprKind::Sub || expr.kind == HirExprKind::Mul ||
+        expr.kind == HirExprKind::Div || expr.kind == HirExprKind::Mod ||
+        expr.kind == HirExprKind::MaxInt || expr.kind == HirExprKind::MinInt) {
         auto lhs = mir_value(*expr.lhs, module, fn, ctx);
         if (!lhs) return core::make_unexpected(lhs.error());
         auto rhs = mir_value(*expr.rhs, module, fn, ctx);
@@ -819,6 +824,9 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
             return frontend_error(FrontendError::TooManyItems, expr.span);
         MirValue* rhs_ptr = &fn->values[fn->values.len - 1];
         switch (expr.kind) {
+            case HirExprKind::ConstantTimeEqual:
+                v.kind = MirValueKind::ConstantTimeEqual;
+                break;
             case HirExprKind::Eq:
                 v.kind = MirValueKind::Eq;
                 break;
@@ -1180,6 +1188,7 @@ static FrontendResult<MirModule*> build_mir_impl(const HirModule& module,
             up.extra_ips[b] = module.upstreams[i].extra_ips[b];
             up.extra_ports[b] = module.upstreams[i].extra_ports[b];
         }
+        up.tls = module.upstreams[i].tls;
         up.http2 = module.upstreams[i].http2;
         up.hc_enabled = module.upstreams[i].hc_enabled;
         up.hc_path = module.upstreams[i].hc_path;

@@ -1,0 +1,702 @@
+[
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-0",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-1",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-2",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-3",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-4",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-5",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-6",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-7",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-8",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-9",
+    "response_sha256": "ff31cd5339e90041b052a078a2e65bbf439d8eb0795f63a78cd38ca8a8ad8cf4",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-10",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-11",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-12",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-13",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-14",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-15",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-16",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-17",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-18",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-19",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-20",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-21",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-22",
+    "response_sha256": "164901195729463fafa82f5cf000471fa7b2b4af1aac2ab35a4ab8d06613f4ea",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-23",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-24",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-25",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-26",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-27",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-28",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-29",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-30",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-31",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-32",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-33",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-34",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-35",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-36",
+    "response_sha256": "300f26c042300f17345f90616a358efd45a25c2ce400af35743d23bbba528f2f",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-37",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-38",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-39",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-40",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-41",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-42",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-43",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-44",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-45",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-46",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-47",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-48",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-49",
+    "response_sha256": "2df062d97d8d59302cff0e91392edfa98a5b052ca609ad45bb114d17d8430e7e",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-50",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-51",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-52",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-53",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-54",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-55",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-56",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-57",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-58",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-59",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-60",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-61",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-62",
+    "response_sha256": "fcdac9c7628536612f27aafce14166aeb1254d567e1a128692bfda7874d78063",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-63",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-64",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-65",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-66",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-67",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-68",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-69",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-70",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-71",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-72",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-73",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-74",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-75",
+    "response_sha256": "6db23921b0af9d3d716e4a4fe5a2dc88117c24b88b1350b215dbdc5e4fa44dad",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-76",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-77",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-78",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-79",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-80",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-81",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-82",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-83",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-84",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-85",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-86",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-87",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-88",
+    "response_sha256": "39954c9df3f27af51abb150b33368db92b7a293ea8bbc787a7066f262607e6f7",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-89",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-90",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-91",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-92",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-93",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-94",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-95",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-96",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-97",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-98",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  },
+  {
+    "marker": "proxy-keepalive-rut-r2-keepalive-99",
+    "response_sha256": "f4504908cf2fd910a26448f34517e501960261219c7eb8bb45d42d51fc79ab80",
+    "body_sha256": "e9e48dd7ce11036c77b8e7de3b29580539c2070396edfdb3aa23fad921dffb5b",
+    "body_bytes": 1048576,
+    "status_line": "HTTP/1.1 200 OK"
+  }
+]

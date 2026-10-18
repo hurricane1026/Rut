@@ -1678,6 +1678,11 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
         return result.value();
     }
+    if (value.kind == MirValueKind::Uuid) {
+        auto result = b.emit_uuid({span.line, span.col});
+        if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+        return result.value();
+    }
     if (value.kind == MirValueKind::TimeNowMicros) {
         auto out = b.emit_time_now_micros({span.line, span.col});
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
@@ -2603,8 +2608,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!out) return frontend_error(FrontendError::OutOfMemory, span);
         return out.value();
     }
-    if (value.kind == MirValueKind::Eq || value.kind == MirValueKind::Lt ||
-        value.kind == MirValueKind::Gt) {
+    if (value.kind == MirValueKind::ConstantTimeEqual || value.kind == MirValueKind::Eq ||
+        value.kind == MirValueKind::Lt || value.kind == MirValueKind::Gt) {
         const MirValue& lhs_expr = *value.lhs;
         const auto lhs_shape = resolved_shape(mir, lhs_expr);
         auto lhs = materialize_value(*value.lhs,
@@ -2635,6 +2640,12 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                                      local_count,
                                      span);
         if (!rhs) return core::make_unexpected(rhs.error());
+        if (value.kind == MirValueKind::ConstantTimeEqual) {
+            auto result =
+                b.emit_str_constant_time_equal(lhs.value(), rhs.value(), {span.line, span.col});
+            if (!result) return frontend_error(FrontendError::OutOfMemory, span);
+            return result.value();
+        }
         if (value.kind == MirValueKind::Eq)
             return emit_eq_for_flat_shape(lhs_shape,
                                           lhs.value(),
@@ -3636,6 +3647,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         }
         // Active health-check config. hc_path is copied into arena memory (like
         // name) so the RIR module owns it independently of the AST/HIR/MIR.
+        out.module.upstreams[i].tls = mir.upstreams[i].tls;
         out.module.upstreams[i].http2 = mir.upstreams[i].http2;
         out.module.upstreams[i].hc_enabled = mir.upstreams[i].hc_enabled;
         const Str src_hc_path = mir.upstreams[i].hc_path;
