@@ -3,6 +3,7 @@
 #include "rut/compiler/protobuf_source.h"
 #include "rut/runtime/arena.h"
 #include "test.h"
+#include <string>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,6 +195,19 @@ TEST(protobuf_source, inner_type_name_shadows_outer_namespace) {
     auto result = files.load(storage);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().kind == SourceError::Kind::Schema);
+}
+TEST(protobuf_source, field_and_nested_message_symbols_collide_in_both_orders) {
+    Files files;
+    REQUIRE(files.ok);
+    const char* bodies[] = {"message M { string X=1; message X {} }",
+                            "message M { message X {} string X=1; }"};
+    for (const char* body : bodies) {
+        REQUIRE(files.write_file("root.proto", (std::string("syntax='proto3'; ") + body).c_str()));
+        Storage storage;
+        auto result = files.load(storage);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().kind == SourceError::Kind::Schema);
+    }
 }
 TEST(protobuf_source, transitive_import_does_not_grant_type_visibility) {
     Files files;

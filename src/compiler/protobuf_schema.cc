@@ -298,7 +298,13 @@ struct Loader {
                     break;
             }
         }
-        return status == Status::End || malformed();
+        if (status != Status::End) return malformed();
+        for (const auto* field = item->fields; field; field = field->next) {
+            const Str field_symbol = join(item->full_name, '.', field->name);
+            if (!field_symbol.ptr) return false;
+            if (schema.find_message(field_symbol)) return fail(SchemaError::Duplicate);
+        }
+        return true;
     }
     bool method(View view, Str service) {
         if (schema.method_count >= limits.methods) return fail(SchemaError::Limit);
@@ -475,6 +481,23 @@ struct Loader {
                 if (schema_files[i]->name.eq(name)) return schema_files[i];
             return nullptr;
         };
+        u8 colors[128]{};
+        auto acyclic = [&](const SchemaFile* file, auto&& self) -> bool {
+            u32 index = 0;
+            while (index < files && schema_files[index] != file) ++index;
+            if (index == files) return true;
+            if (colors[index] == 1) return false;
+            if (colors[index] == 2) return true;
+            colors[index] = 1;
+            for (u32 i = 0; i < file->dependency_count; ++i) {
+                const SchemaFile* dependency = find_file(file->dependencies[i]);
+                if (dependency && !self(dependency, self)) return false;
+            }
+            colors[index] = 2;
+            return true;
+        };
+        for (u32 i = 0; i < files; ++i)
+            if (!acyclic(schema_files[i], acyclic)) return fail(SchemaError::Malformed);
         bool visited[128]{};
         auto public_visible =
             [&](const SchemaFile* from, const SchemaFile* target, auto&& self, u32 depth) -> bool {

@@ -400,6 +400,21 @@ TEST(protobuf_schema, review_limits_packing_namespaces_and_import_visibility) {
     REQUIRE(result.has_value());
     CHECK_FALSE(result->find_message(lit_str(".example.Item"))->fields->packed);
 
+    for (u32 order = 0; order < 2; ++order) {
+        Bytes collision;
+        collision.text(1, lit_str("M"));
+        Bytes nested;
+        nested.text(1, lit_str("X"));
+        Bytes field = member(lit_str("X"));
+        collision.child(order ? 3 : 2, order ? nested : field);
+        collision.child(order ? 2 : 3, order ? field : nested);
+        input = descriptor(collision);
+        storage.arena.reset();
+        result = load_descriptor_set(storage.arena, input.data, input.size);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == SchemaError::Duplicate);
+    }
+
     Bytes singular = member(lit_str("number"), 1, 5, 1);
     singular.child(8, false_options);
     input = descriptor(message(singular));
@@ -457,6 +472,13 @@ TEST(protobuf_schema, review_limits_packing_namespaces_and_import_visibility) {
         set.child(1, second);
         return set;
     };
+    Bytes cycle_a = make_file(lit_str("cycle-a.proto"), {}, lit_str("A"), lit_str("cycle-b.proto"));
+    Bytes cycle_b = make_file(lit_str("cycle-b.proto"), {}, lit_str("B"), lit_str("cycle-a.proto"));
+    input = make_set(cycle_a, cycle_b);
+    storage.arena.reset();
+    result = load_descriptor_set(storage.arena, input.data, input.size);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == SchemaError::Malformed);
     for (u32 order = 0; order < 2; ++order) {
         Bytes one = make_file(lit_str("one.proto"), lit_str("a"), lit_str("b"));
         Bytes two = make_file(lit_str("two.proto"), lit_str("a.b"), lit_str("c"));

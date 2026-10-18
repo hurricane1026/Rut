@@ -22,26 +22,28 @@ struct Chunk {
     u32 tag = 0;
 };
 struct Buffer {
+    enum class Error : u8 { None, Limit, Allocation };
     Arena<MmapBackend>& arena;
     Chunk* head = nullptr;
     Chunk* tail = nullptr;
     u32 size = 0;
-    bool good = true;
+    Error error = Error::None;
     void add(Field field) {
         const u64 kCapacity = static_cast<u64>(field.size) + 20;
-        if (!good || kCapacity > 4ULL * 1024 * 1024) {
-            good = false;
+        if (error != Error::None) return;
+        if (kCapacity > 4ULL * 1024 * 1024) {
+            error = Error::Limit;
             return;
         }
         auto* bytes = static_cast<u8*>(arena.alloc(kCapacity));
         auto* chunk = arena.alloc_t<Chunk>();
         if (!bytes || !chunk) {
-            good = false;
+            error = Error::Allocation;
             return;
         }
         Writer writer(bytes, static_cast<u32>(kCapacity));
         if (!writer.write(field) || writer.size() > 4 * 1024 * 1024 - size) {
-            good = false;
+            error = Error::Limit;
             return;
         }
         chunk->data = bytes;
@@ -58,9 +60,12 @@ struct Buffer {
         add({tag, 2, 0, reinterpret_cast<const u8*>(value.ptr), value.len});
     }
     const u8* flatten() {
-        if (!good) return nullptr;
+        if (error != Error::None) return nullptr;
         auto* bytes = static_cast<u8*>(arena.alloc(size ? size : 1));
-        if (!bytes) return nullptr;
+        if (!bytes) {
+            error = Error::Allocation;
+            return nullptr;
+        }
         u32 offset = 0;
         for (const Chunk* item = head; item; item = item->next) {
             __builtin_memcpy(bytes + offset, item->data, item->size);
@@ -71,7 +76,7 @@ struct Buffer {
     void child(u32 tag, Buffer& value) {
         const u8* bytes = value.flatten();
         if (!bytes) {
-            good = false;
+            error = value.error == Error::Allocation ? Error::Allocation : Error::Limit;
             return;
         }
         add({tag, 2, 0, bytes, value.size});
@@ -708,7 +713,7 @@ bool Parser::file() {
 // Resolve deferred nested buffers bottom-up. Structural depth is bounded by the
 // parser's declaration limit; each buffer owns its list, so no shared mutation.
 bool finish(Buffer& buffer, u32 depth = 0) {
-    if (depth > 36 || !buffer.good) return false;
+    if (depth > 36 || buffer.error != Buffer::Error::None) return false;
     for (Chunk* chunk = buffer.head; chunk; chunk = chunk->next) {
         if (!chunk->child) continue;
         auto* child = chunk->child;
@@ -718,8 +723,11 @@ bool finish(Buffer& buffer, u32 depth = 0) {
         if (!bytes) return false;
         Buffer encoded{buffer.arena};
         encoded.add({kTag, 2, 0, bytes, child->size});
-        if (!encoded.good || !encoded.head || encoded.head->size > 4 * 1024 * 1024 - buffer.size)
+        if (encoded.error != Buffer::Error::None || !encoded.head ||
+            encoded.head->size > 4 * 1024 * 1024 - buffer.size) {
+            if (encoded.error == Buffer::Error::None) buffer.error = Buffer::Error::Limit;
             return false;
+        }
         chunk->child = nullptr;
         chunk->data = encoded.head->data;
         chunk->size = encoded.head->size;
@@ -756,8 +764,21 @@ core::Expected<Schema, SourceError> load_proto_source(Arena<MmapBackend>& arena,
     for (const Source* file = compiler.sources; file; file = file->next) {
         if (!finish(*file->descriptor))
             return core::make_unexpected(SourceError{
-                SourceError::Kind::Limit, file->name, 1, 1, lit_str("descriptor size")});
+                file->descriptor->error == Buffer::Error::Allocation ? SourceError::Kind::Allocation
+                                                                     : SourceError::Kind::Limit,
+                file->name,
+                1,
+                1,
+                lit_str("descriptor size")});
         set.child(1, *file->descriptor);
+        if (set.error != Buffer::Error::None)
+            return core::make_unexpected(SourceError{set.error == Buffer::Error::Allocation
+                                                         ? SourceError::Kind::Allocation
+                                                         : SourceError::Kind::Limit,
+                                                     file->name,
+                                                     1,
+                                                     1,
+                                                     lit_str("descriptor size")});
     }
     const u8* bytes = set.flatten();
     if (!bytes)

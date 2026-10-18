@@ -1379,8 +1379,10 @@ it is not interpreted per request. The source compiler below uses it internally.
 The initial subset accepts explicit `proto3` files, scalar and message fields,
 repeated fields and ordinary service signatures. Names and JSON names must be
 ASCII identifiers (qualified type names use dots). Enums, oneof/proto3 optional
-presence, maps, extensions/defaults, reserved declarations, public/weak imports,
-proto2 and editions fail closed rather than losing semantics. Unknown descriptor
+presence, maps, extensions/defaults, reserved declarations, proto2 and editions
+fail closed rather than losing semantics. The descriptor loader honors
+`public_dependency` re-export visibility; the source parser rejects `import
+public` and `import weak`. Unknown descriptor
 metadata/options are skipped; HTTP annotations are not converted into routes.
 Malformed wire data, duplicate field numbers/names/JSON aliases or type/service
 symbols, invalid packing and unresolved message references are errors.
