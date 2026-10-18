@@ -68,6 +68,16 @@ def summarize(root):
             effective_hashes = {d['server_effective_config_sha256'] for d, _ in runs.values()}
             if len(binary_hashes) != 1 or len(effective_hashes) != 1:
                 raise ValueError(f'{engine} server binary/config changed between repetitions')
+            compiler_hashes = {d.get('server_compiler_sha256') for d, _ in runs.values()}
+            if engine == 'rut' and len(compiler_hashes) != 1 or engine == 'rut' and None in compiler_hashes:
+                raise ValueError(f'{engine} compiler changed or was not recorded')
+        origin_fields = ('origin_endpoint', 'origin_run_id', 'origin_cpus', 'origin_workers',
+                         'origin_listen_port', 'origin_binary_sha256', 'origin_config_sha256',
+                         'origin_effective_config_sha256')
+        origin_identity = {tuple(d.get(field) for field in origin_fields)
+                           for runs in engines.values() for d, _ in runs.values()}
+        if len(origin_identity) != 1 or None in next(iter(origin_identity)):
+            raise ValueError(f'origin manifest changed or was not recorded: {key}')
         normalized = {d['server_config_sha256'] for runs in engines.values() for d, _ in runs.values()}
         if len(normalized) != 1:
             raise ValueError('normalized configuration changed between paired runs')

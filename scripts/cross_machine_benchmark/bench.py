@@ -188,6 +188,32 @@ def validate_server_manifest(manifest, engine, port, body_size):
     return manifest
 
 
+def validate_origin_manifest(manifest, endpoint):
+    required = ('schema', 'engine', 'body_size', 'listen_port', 'cpus', 'workers', 'binary_sha256',
+                'effective_config_sha256', 'config_sha256', 'run_id', 'endpoint')
+    if any(key not in manifest for key in required) or manifest['engine'] != 'origin':
+        raise ValueError('incomplete origin manifest')
+    try:
+        endpoint_port = int(endpoint.rsplit(':', 1)[1])
+    except (AttributeError, ValueError, IndexError):
+        raise ValueError('invalid proxy origin endpoint')
+    if manifest['endpoint'] != endpoint or manifest['listen_port'] != endpoint_port:
+        raise ValueError('origin manifest does not match proxy origin endpoint')
+    return manifest
+
+
+def validate_origin_provenance(proxy_manifest, origin_manifest):
+    fields = {
+        'origin_endpoint': 'endpoint', 'origin_run_id': 'run_id',
+        'origin_cpus': 'cpus', 'origin_workers': 'workers',
+        'origin_listen_port': 'listen_port', 'origin_binary_sha256': 'binary_sha256',
+        'origin_config_sha256': 'config_sha256',
+        'origin_effective_config_sha256': 'effective_config_sha256'}
+    if any(proxy_manifest.get(proxy_field) != origin_manifest[origin_field]
+           for proxy_field, origin_field in fields.items()):
+        raise ValueError('origin manifest differs from proxy provenance')
+
+
 def validate_rut_workers(workers):
     if workers > MAX_RUT_WORKERS:
         raise ValueError(f'Rut supports at most {MAX_RUT_WORKERS} workers')
@@ -197,6 +223,14 @@ def serve(a):
     out = a.config.resolve()
     c = json.loads((out / 'config.json').read_text())
     binary = str(Path(shutil.which(a.binary) or a.binary).resolve())
+    origin_manifest = None
+    if a.engine != 'origin':
+        if not a.origin_manifest:
+            raise ValueError('proxy requires --origin-manifest')
+        origin_manifest = json.loads(a.origin_manifest.read_text())
+        validate_origin_manifest(origin_manifest, c['origin'])
+        if origin_manifest['body_size'] != c['body_size']:
+            raise ValueError('origin manifest does not match body size')
     if a.engine == 'rut':
         validate_rut_workers(c['workers'])
     if not port_is_free(c['port']):
@@ -232,6 +266,22 @@ def serve(a):
         'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
         'command': str(out / f'{run_id}-command.json'),
     }
+    if a.engine == 'origin':
+        manifest['endpoint'] = a.endpoint or f'0.0.0.0:{c["port"]}'
+    if a.engine == 'rut':
+        compiler = Path(binary).with_name('rut-compile')
+        if not compiler.is_file():
+            raise ValueError('Rut compiler sibling rut-compile is missing')
+        manifest['compiler_sha256'] = hashlib.sha256(compiler.read_bytes()).hexdigest()
+    if origin_manifest:
+        manifest['origin_endpoint'] = c['origin']
+        manifest['origin_run_id'] = origin_manifest['run_id']
+        manifest['origin_cpus'] = origin_manifest['cpus']
+        manifest['origin_workers'] = origin_manifest['workers']
+        manifest['origin_listen_port'] = origin_manifest['listen_port']
+        manifest['origin_binary_sha256'] = origin_manifest['binary_sha256']
+        manifest['origin_config_sha256'] = origin_manifest['config_sha256']
+        manifest['origin_effective_config_sha256'] = origin_manifest['effective_config_sha256']
     child = subprocess.Popen(argv, env=env)
     try:
         deadline = time.monotonic() + 10
@@ -300,6 +350,15 @@ def client(a):
     a.output_created = True
     manifest = json.loads(a.server_manifest.read_text())
     validate_server_manifest(manifest, a.engine, a.port, a.body_size)
+    origin_manifest = None
+    if a.engine != 'origin':
+        if not a.origin_manifest:
+            raise ValueError('client requires --origin-manifest')
+        origin_manifest = json.loads(a.origin_manifest.read_text())
+        validate_origin_manifest(origin_manifest, manifest.get('origin_endpoint', ''))
+        if origin_manifest['body_size'] != a.body_size:
+            raise ValueError('origin manifest does not match body size')
+        validate_origin_provenance(manifest, origin_manifest)
     snapshot(a.output / 'environment.json', [a.wrk])
     cpus = normalize_cpus(a.cpus)
     preflight(a.host, a.port, a.body_size)
@@ -327,6 +386,15 @@ def client(a):
                   server_binary_sha256=manifest['binary_sha256'],
                   server_manifest=str(a.server_manifest.resolve()), server_listen_port=manifest['listen_port'],
                   server_run_id=manifest['run_id'],
+                  server_compiler_sha256=manifest.get('compiler_sha256'),
+                  origin_endpoint=origin_manifest.get('endpoint'),
+                  origin_run_id=origin_manifest.get('run_id'),
+                  origin_cpus=origin_manifest.get('cpus'),
+                  origin_workers=origin_manifest.get('workers'),
+                  origin_listen_port=origin_manifest.get('listen_port'),
+                  origin_binary_sha256=origin_manifest.get('binary_sha256'),
+                  origin_config_sha256=origin_manifest.get('config_sha256'),
+                  origin_effective_config_sha256=origin_manifest.get('effective_config_sha256'),
                   throughput_classification='instrumented-client-rps-full-body-lua',
                   valid=all(r['valid'] for r in results))
     save(a.output / 'result.json', result)
@@ -348,6 +416,8 @@ def main():
     s.add_argument('--engine', choices=['origin', 'nginx', 'rut'], required=True)
     s.add_argument('--binary', required=True)
     s.add_argument('--cpus', required=True)
+    s.add_argument('--origin-manifest', type=Path)
+    s.add_argument('--endpoint', help='origin endpoint advertised to proxy clients')
     c = sub.add_parser('client')
     c.add_argument('--host', required=True)
     c.add_argument('--port', type=positive, default=8087)
@@ -359,6 +429,7 @@ def main():
     c.add_argument('--cpus', required=True)
     c.add_argument('--wrk', default='wrk')
     c.add_argument('--server-manifest', type=Path, required=True)
+    c.add_argument('--origin-manifest', type=Path, required=True)
     c.add_argument('--warmup', type=positive, default=5)
     c.add_argument('--duration', type=positive, default=30)
     c.add_argument('--output', type=Path, required=True)

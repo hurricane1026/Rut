@@ -40,6 +40,21 @@ class Tests(unittest.TestCase):
         self.assertIsNone(bench.validate_rut_workers(64))
         with self.assertRaises(ValueError):
             bench.validate_rut_workers(65)
+        origin = dict(schema=1, engine='origin', body_size=1024, listen_port=9087,
+                      endpoint='192.0.2.30:9087', cpus='6-7', workers=4,
+                      config_sha256='d' * 64, effective_config_sha256='e' * 64,
+                      binary_sha256='f' * 64, run_id='origin-1')
+        self.assertIs(bench.validate_origin_manifest(origin, '192.0.2.30:9087'), origin)
+        with self.assertRaises(ValueError):
+            bench.validate_origin_manifest(origin, '192.0.2.30:9088')
+        proxy = {f'origin_{field}': origin[field] for field in
+                 ('endpoint', 'run_id', 'cpus', 'workers', 'listen_port',
+                  'binary_sha256', 'config_sha256', 'effective_config_sha256')}
+        bench.validate_origin_provenance(proxy, origin)
+        with self.assertRaises(ValueError):
+            bench.validate_origin_provenance(proxy, dict(origin, run_id='origin-2'))
+        with self.assertRaises(ValueError):
+            bench.validate_origin_provenance(proxy, dict(origin, binary_sha256='0' * 64))
 
     def test_wrk_errors_and_units(self):
         text = ('  99% 2.50ms\nRequests/sec: 1000.25\n'
@@ -172,6 +187,11 @@ class Tests(unittest.TestCase):
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus='2',
                         server_workers=1, server_config_sha256='config-a', server_effective_config_sha256='effective-a',
                         server_binary_sha256='binary-a',
+                        server_compiler_sha256=('compiler-a' if engine == 'rut' else None),
+                        origin_endpoint='192.0.2.30:9087', origin_run_id='origin-1',
+                        origin_cpus='6-7', origin_workers=4, origin_listen_port=9087,
+                        origin_binary_sha256='origin-binary-a', origin_config_sha256='origin-config-a',
+                        origin_effective_config_sha256='origin-effective-a',
                         throughput_classification='instrumented-client-rps-full-body-lua',
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,
@@ -198,6 +218,24 @@ class Tests(unittest.TestCase):
             client_env.write_text(json.dumps(client_data))
             with self.assertRaises(ValueError):
                 summarize.summarize(client_changed)
+            compiler_changed = root / 'compiler-changed'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, compiler_changed / name)
+            compiler_result = compiler_changed / 'rut2' / 'result.json'
+            compiler_data = json.loads(compiler_result.read_text())
+            compiler_data['server_compiler_sha256'] = 'compiler-b'
+            compiler_result.write_text(json.dumps(compiler_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(compiler_changed)
+            origin_changed = root / 'origin-changed'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, origin_changed / name)
+            origin_result = origin_changed / 'nginx2' / 'result.json'
+            origin_data = json.loads(origin_result.read_text())
+            origin_data['origin_run_id'] = 'origin-2'
+            origin_result.write_text(json.dumps(origin_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(origin_changed)
             versioned = root / 'versioned-wrk'
             for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
                 shutil.copytree(root / name, versioned / name)
@@ -265,6 +303,11 @@ class Tests(unittest.TestCase):
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus=server_cpus,
                         server_workers=1, server_config_sha256='config-a', server_effective_config_sha256='effective-a',
                         server_binary_sha256='binary-a',
+                        server_compiler_sha256=('compiler-a' if engine == 'rut' else None),
+                        origin_endpoint='192.0.2.30:9087', origin_run_id='origin-1',
+                        origin_cpus='6-7', origin_workers=4, origin_listen_port=9087,
+                        origin_binary_sha256='origin-binary-a', origin_config_sha256='origin-config-a',
+                        origin_effective_config_sha256='origin-effective-a',
                         throughput_classification='instrumented-client-rps-full-body-lua',
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,
@@ -284,6 +327,11 @@ class Tests(unittest.TestCase):
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus='2',
                         server_workers=1, server_config_sha256=config_hash, server_effective_config_sha256='effective-a',
                         server_binary_sha256='binary-a',
+                        server_compiler_sha256=('compiler-a' if engine == 'rut' else None),
+                        origin_endpoint='192.0.2.30:9087', origin_run_id='origin-1',
+                        origin_cpus='6-7', origin_workers=4, origin_listen_port=9087,
+                        origin_binary_sha256='origin-binary-a', origin_config_sha256='origin-config-a',
+                        origin_effective_config_sha256='origin-effective-a',
                         throughput_classification='instrumented-client-rps-full-body-lua',
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,

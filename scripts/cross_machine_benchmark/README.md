@@ -31,11 +31,11 @@ O 用 4 个 worker，避免单个上游 CPU 提前成为瓶颈；按机器核数
 
 ```bash
 python3 bench.py prepare --output /tmp/origin-1m --port 9087 --workers 4 --body-size 1048576
-python3 bench.py serve --engine origin --config /tmp/origin-1m --binary /absolute/path/nginx --cpus 2-5
+python3 bench.py serve --engine origin --config /tmp/origin-1m --binary /absolute/path/nginx --cpus 2-5 --endpoint 192.0.2.30:9087
 ```
 
-`serve` writes `/tmp/origin-1m/server-manifest.json`; keep the manifest from the
-currently running proxy together with each client result.
+`serve` writes `/tmp/origin-1m/server-manifest.json`; copy this one live origin
+manifest to C and use it for every proxy repetition.
 
 保持前台运行。响应是确定性二进制文件，URL 为 `/proxy`，允许上游连接复用。
 仅在受信任测试网络开放 P 的 8087 与 O 的 9087 端口；服务监听所有 IPv4 地址。
@@ -69,10 +69,11 @@ python3 bench.py serve --engine nginx --config /tmp/proxy-1m --binary /absolute/
 先等待代理启动，再执行一轮：
 
 ```bash
-python3 bench.py client --host 192.0.2.20 --engine rut --rep 1 --cpus 2-5 --threads 4 --connections 128 --body-size 1048576 --warmup 5 --duration 30 --wrk /absolute/path/wrk --server-manifest /tmp/proxy-1m-server-manifest.json --output results/1m/rut-1
+python3 bench.py client --host 192.0.2.20 --engine rut --rep 1 --cpus 2-5 --threads 4 --connections 128 --body-size 1048576 --warmup 5 --duration 30 --wrk /absolute/path/wrk --server-manifest /tmp/proxy-1m-server-manifest.json --origin-manifest /tmp/origin-1m-server-manifest.json --output results/1m/rut-1
 ```
 
-每次换代理后执行同样命令，只改 `--engine`、`--rep` 和 `--output`。
+每次换代理后执行同样命令，只改 `--engine`、`--rep` 和 `--output`。始终使用同一
+origin manifest；重启或改变 O 会使整组配对结果失效。
 **顺序：Rut 1 → nginx 1 → nginx 2 → Rut 2 → Rut 3 → nginx 3。**
 每个引擎实例只测一轮，下一轮重启服务，即便引擎没变也重启。
 客户端 `--engine` 是人工标记，务必与 P 当前运行的进程对应；`--server-manifest` 必须来自当前
@@ -91,8 +92,9 @@ python3 bench.py client --host 192.0.2.20 --engine rut --rep 1 --cpus 2-5 --thre
 python3 summarize.py results > summary.json
 ```
 
-汇总要求相同坐标下两种引擎至少三轮配对，输出 RPS、P99 的中位数、有效载荷 Gb/s
-及 Rut 相对收益。不要把不同构建、网络设置的实验放进同一 results 目录。
+汇总要求相同坐标下两种引擎至少三轮配对，输出 instrumented RPS 样本、RPS 中位数
+和 P99 中位数，并标记 `inconclusive-lua-body-callback`。汇总不输出代理吞吐或 Rut
+相对收益结论。不要把不同构建、网络设置的实验放进同一 results 目录。
 当前脚本的 wrk Lua `response()` 回调会接收完整响应正文；因此结果中的 RPS 是带
 客户端正文回调的端到端测量，汇总脚本将其标为 throughput-inconclusive，不得解释为
 代理容量或 Rut 性能收益。只有另有独立客户端余量证据并更新此契约后，才可作代理吞吐结论。
@@ -107,10 +109,7 @@ nginx 要包含 master/worker；RSS 不包含内核 socket/pipe 内存。不要�
 O/P 的目录、重启服务，并同步修改客户端 `--body-size`。先做 1 秒 quick smoke
 （`--duration 1 --warmup 1`），正式结论使用上面的 30 秒 × 3 轮。
 
-1 MiB × RPS × 8 是有效载荷吞吐；10 Gb/s 对应理论约 1192 RPS，实际还需扣除
-协议开销。这意味着先前 loopback 的 8528 RPS **不能直接在单条万兆链路重现**。
-如果两者都打满链路，报告“带宽受限，RPS 接近”，再比较 CPU、P99，以及小响应下
-的容量；不能据此证明运行时性能一样。全双工链路的收发带宽分别计算。
+不要把这些 RPS 换算为有效载荷吞吐，也不要从结果推导两个代理的相对性能。
 
 三机配置保持相同，改变 XDP 等设置必须作为新的实验组完整重跑。二机测试若把
 客户端和上游放一起，要明确标注共享 CPU/NIC 干扰，不能与三机结果混合。
