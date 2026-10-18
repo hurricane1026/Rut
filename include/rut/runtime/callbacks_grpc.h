@@ -238,7 +238,7 @@ bool grpc_grow_recv(Loop* loop, Connection& conn) {
     u8* storage = loop->pool.alloc_bulk();
     if (!storage) return false;
     const u32 n = conn.recv_buf.len();
-    __builtin_memcpy(storage, conn.recv_buf.data(), n);
+    if (n) __builtin_memcpy(storage, conn.recv_buf.data(), n);
     loop->pool.free(conn.recv_slice);
     conn.bind_request_receive_buffer(storage, SlicePool::kBulkSliceSize);
     conn.recv_buf.commit(n);
