@@ -95,6 +95,8 @@ struct Http2Conn {
     bool client;
     bool peer_settings_seen;
     bool peer_goaway;
+    bool ping_pending;
+    u64 ping_token;
     u32 peer_last_stream;
     u32 conn_recv_credit;
 
@@ -258,6 +260,10 @@ struct Http2Conn {
     // are left unconsumed for the next call. On a connection error a GOAWAY is
     // written and close=true is returned.
     Http2Result process(const u8* in, u32 len, u8* out, u32 out_cap, u32* out_written);
+
+    // Queue one locally initiated PING. Only an ACK with the same payload
+    // clears ping_pending; the caller owns transport flushing and its timeout.
+    u32 write_ping(u8* out, u32 cap, u64 token);
 
     // Look up a stream by id, or null.
     Http2Stream* find_stream(u32 id);

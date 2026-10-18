@@ -415,6 +415,14 @@ No `.proto`, protobuf dependency, new route keyword or streaming modifier is
 needed. gRPC-Web, JSON transcoding and gRPC health probes are
 not implemented by this option; `health_check` with `.http2` is rejected.
 
+Native gRPC upstream sessions with active RPCs send an HTTP/2 PING every five
+minutes after connection establishment or the previous probe. Only an ACK with
+the same eight-byte payload completes a probe. The existing upstream timeout
+(in seconds, checked by the one-second session timer) bounds the ACK wait;
+timeout closes the session and fails unfinished RPCs with UNAVAILABLE without
+replay. Idle pooled sessions, handshakes and GOAWAY-draining sessions do not
+start probes. PING does not implement the protobuf gRPC Health service.
+
 For a TLS upstream, add a `tls` field with explicit trust and identity:
 
 ```swift

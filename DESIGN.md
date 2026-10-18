@@ -1400,6 +1400,14 @@ slice. Input buffered while a downstream send is pending uses the same headroom
 guard without parsing or altering that send. Allocation failure closes the
 connection while its original compacted slice remains owned.
 
+Native gRPC upstream sessions with active RPCs send an HTTP/2 PING every five
+minutes after connection establishment or the previous probe. Only an ACK with
+the same eight-byte payload completes a probe. The existing upstream timeout
+(in seconds, checked by the one-second session timer) bounds the ACK wait;
+timeout closes the session and fails unfinished RPCs with UNAVAILABLE without
+replay. Idle pooled sessions, handshakes and GOAWAY-draining sessions do not
+start probes. PING does not implement the protobuf gRPC Health service.
+
 Per-RPC queues use the existing bulk SlicePool. Each queue is bounded by the
 65,535-byte stream receive window; window credit returns when bytes move into
 owned send buffers. Kernel sends never borrow an RPC queue, so reset/deadline/
