@@ -307,6 +307,7 @@ void grpc_connection_closed(void* lp, Connection& conn) {
                 grpc_detach_retry_attempt(loop, *x);
                 continue;
             }
+            if (g.c5_exhausted && !g.preface_sent) x->retry_tried_mask |= g.connect_tried_mask;
             if (g.c5_exhausted && !g.preface_sent && grpc_retry_can_schedule(*x, 14, false)) {
                 const u64 now = monotonic_us();
                 const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
@@ -1896,7 +1897,7 @@ bool grpc_bind_retry_attempt(Loop* loop, GrpcExchange& x, u64 now) {
         if (fresh) {
             auto& g = up->h2->grpc;
             g.connect_attempts = 1;
-            g.connect_tried_mask = static_cast<u8>(1u << backend);
+            g.connect_tried_mask = x.retry_tried_mask;
             g.c5_exhausted = false;
             up->fd = up->upstream_fd = UpstreamPool::create_socket();
             up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);
@@ -2140,7 +2141,7 @@ bool grpc_start_impl(Loop* loop,
     if (fresh) {
         auto& g = up->h2->grpc;
         g.connect_attempts = 1;
-        g.connect_tried_mask = static_cast<u8>(1u << backend);
+        g.connect_tried_mask = x->retry_tried_mask;
         g.c5_exhausted = false;
         up->fd = up->upstream_fd = UpstreamPool::create_socket();
         up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);

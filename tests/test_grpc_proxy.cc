@@ -1086,6 +1086,24 @@ struct RetrySelectionFixture : GrpcDriveFixture {
 struct RetryCloseGrpcDriveFixture : SyncCloseGrpcDriveFixture {
     bool arm_throttle_timer(Connection&, u64) { return true; }
 };
+struct RetryCloseSelectionFixture : RetryCloseGrpcDriveFixture {
+    Connection retry_conn;
+    Http2Conn retry_h2;
+    Connection* alloc_conn() {
+        retry_conn.reset();
+        return &retry_conn;
+    }
+    bool alloc_h2(Connection& conn) {
+        retry_h2.init_client();
+        conn.h2 = &retry_h2;
+        return true;
+    }
+    bool submit_connect(Connection&, const void*, u32) { return true; }
+    void close_released_upstream(Connection& conn) {
+        if (conn.upstream_fd >= 0) close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+    }
+};
 struct HeldSendGrpcDriveFixture : GrpcDriveFixture {
     CaptureRing* capture_ring = nullptr;
     const u8* pending_send = nullptr;
@@ -2515,6 +2533,84 @@ TEST(grpc_proxy, c5_exhaustion_retries_only_complete_logical_exchanges) {
     CHECK_EQ(up_h2.grpc.active, 0u);
     complete.replay_body.release();
     incomplete.replay_body.release();
+}
+
+TEST(grpc_proxy, c5_exhaustion_carries_tried_backends_into_logical_retry) {
+    GrpcBackendHealthReset health_reset{};
+    RetryCloseSelectionFixture loop;
+    REQUIRE(loop.pool_ready);
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1));
+    for (u32 i = 1; i < 4; i++) REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, 1));
+    cfg.upstreams[0].http2 = true;
+    cfg.upstreams[0].grpc_retry = {3, 16, 1u << 14, 0};
+
+    Connection upstream;
+    upstream.reset();
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.grpc.connecting = true;
+    upstream_h2.grpc.c5_exhausted = true;
+    upstream_h2.grpc.connect_attempts = 3;
+    upstream_h2.grpc.connect_tried_mask = 0x07;
+    upstream.h2 = &upstream_h2;
+    loop.grpc_upstreams = &upstream;
+
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+    REQUIRE(upstream_h2.open_stream(1) != nullptr);
+
+    GrpcExchange exchange;
+    exchange.init();
+    exchange.downstream = &downstream;
+    exchange.upstream = &upstream;
+    exchange.downstream_stream = exchange.upstream_stream = 1;
+    exchange.config_epoch = &cfg;
+    exchange.upstream_id = 0;
+    exchange.retry_policy = cfg.upstreams[0].grpc_retry;
+    exchange.retry_enabled = true;
+    exchange.retry_attempts = 1;
+    exchange.retry_tried_mask = 1u;
+    exchange.slot_held = true;
+    REQUIRE(exchange.replay_body.init(16));
+    REQUIRE(exchange.replay_body.seal());
+    const hpack::Header request[] = {{{":method", 7}, {"POST", 4}}};
+    REQUIRE(exchange.replay_headers.capture(request, 1));
+    REQUIRE(exchange.replay_trailers.capture(nullptr, 0));
+    upstream_h2.grpc.streams[0] = &exchange;
+    upstream_h2.grpc.active = 1;
+    downstream_h2.grpc.streams[0] = &exchange;
+    downstream_h2.grpc.active = 1;
+
+    grpc_connection_closed<RetryCloseSelectionFixture>(&loop, upstream);
+
+    CHECK(exchange.retry_pending);
+    CHECK_EQ(exchange.retry_tried_mask, 0x07u);
+    CHECK(exchange.upstream == nullptr);
+    CHECK(exchange.slot_held);
+    CHECK_EQ(downstream_h2.grpc.active, 1u);
+    CHECK_EQ(upstream_h2.grpc.active, 0u);
+    REQUIRE(grpc_bind_retry_attempt(&loop, exchange, monotonic_us()));
+    CHECK_EQ(loop.retry_conn.upstream_backend_idx, 3u);
+    CHECK_EQ(exchange.retry_tried_mask, 0x0fu);
+    CHECK_EQ(exchange.retry_attempts, 2u);
+
+    const u32 fallback_start = select_backend(0, 4, monotonic_us());
+    CHECK_EQ(grpc_select_retry_backend(0, 4, 0x0f, monotonic_us()), (fallback_start + 1) % 4);
+    grpc_detach(loop.retry_h2, &exchange);
+    grpc_detach(downstream_h2, &exchange);
+    exchange.upstream = nullptr;
+    exchange.replay_body.release();
+    loop.grpc_upstreams = nullptr;
+    loop.retry_conn.on_close = nullptr;
+    if (loop.retry_conn.fd >= 0) close(loop.retry_conn.fd);
+    loop.retry_conn.fd = loop.retry_conn.upstream_fd = -1;
+    if (loop.retry_conn.recv_slice) loop.pool.free(loop.retry_conn.recv_slice);
 }
 
 TEST(grpc_proxy, parser_failure_records_active_session_once) {
@@ -4499,8 +4595,84 @@ TEST(grpc_proxy, grpc_retry_backend_selection_uses_round_robin_and_skips_tried_e
     REQUIRE(grpc_bind_retry_attempt(&loop, exchange, now));
     CHECK_EQ(loop.retry_conn.upstream_backend_idx, 1u);
     CHECK_EQ(exchange.retry_tried_mask, static_cast<u8>((1u << 0) | (1u << 1) | (1u << 2)));
-    CHECK_EQ(loop.retry_conn.h2->grpc.connect_tried_mask, static_cast<u8>(1u << 1));
+    CHECK_EQ(loop.retry_conn.h2->grpc.connect_tried_mask, static_cast<u8>(0x07));
     CHECK_EQ(exchange.retry_attempts, 4u);
+
+    grpc_detach(loop.retry_h2, &exchange);
+    grpc_detach(downstream_h2, &exchange);
+    exchange.upstream = nullptr;
+    exchange.replay_body.release();
+    loop.grpc_upstreams = nullptr;
+    loop.retry_conn.on_close = nullptr;
+    if (loop.retry_conn.fd >= 0) close(loop.retry_conn.fd);
+    loop.retry_conn.fd = loop.retry_conn.upstream_fd = -1;
+    if (loop.retry_conn.recv_slice) loop.pool.free(loop.retry_conn.recv_slice);
+}
+
+TEST(grpc_proxy, grpc_retry_connect_failover_skips_prior_rpc_backends) {
+    GrpcBackendHealthReset health_reset{};
+    RetryCloseSelectionFixture loop;
+    REQUIRE(loop.pool_ready);
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1));
+    for (u32 i = 1; i < 5; i++) REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, 1));
+    cfg.upstreams[0].http2 = true;
+    cfg.upstreams[0].grpc_retry = {3, 1024, 1u << 7, 0};
+
+    const u64 now = monotonic_us();
+    u32 selected;
+    do {
+        selected = select_backend(0, 5, now);
+    } while (selected != 1);
+
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    REQUIRE(downstream_h2.open_stream(1) != nullptr);
+
+    GrpcExchange exchange;
+    exchange.init();
+    exchange.downstream = &downstream;
+    exchange.downstream_stream = 1;
+    exchange.config_epoch = &cfg;
+    exchange.upstream_id = 0;
+    exchange.retry_policy = cfg.upstreams[0].grpc_retry;
+    exchange.retry_enabled = true;
+    exchange.retry_attempts = 1;
+    exchange.retry_pending = true;
+    exchange.retry_tried_mask = 0x03;
+    REQUIRE(exchange.replay_body.init(1024));
+    REQUIRE(exchange.replay_body.seal());
+    const hpack::Header headers[] = {{{":method", 7}, {"POST", 4}}, {{":path", 5}, {"/svc", 4}}};
+    REQUIRE(exchange.replay_headers.capture(headers, 2));
+    REQUIRE(exchange.replay_trailers.capture(nullptr, 0));
+    REQUIRE(grpc_attach(downstream_h2, &exchange));
+
+    REQUIRE(grpc_bind_retry_attempt(&loop, exchange, now));
+    CHECK_EQ(loop.retry_conn.upstream_backend_idx, 2u);
+    CHECK_EQ(loop.retry_conn.h2->grpc.connect_attempts, 1u);
+    CHECK_EQ(loop.retry_conn.h2->grpc.connect_tried_mask, 0x07u);
+    CHECK_EQ(exchange.retry_tried_mask, 0x07u);
+
+    grpc_connected<RetryCloseSelectionFixture>(
+        &loop,
+        loop.retry_conn,
+        {loop.retry_conn.id, -ECONNREFUSED, 0, 0, IoEventType::UpstreamConnect, 0});
+    CHECK_EQ(loop.retry_conn.h2->grpc.connect_attempts, 2u);
+    CHECK_EQ(loop.retry_conn.upstream_backend_idx, 3u);
+    CHECK_EQ(loop.retry_conn.h2->grpc.connect_tried_mask, 0x0fu);
+    CHECK_EQ(exchange.retry_tried_mask, 0x07u);
+
+    grpc_connected<RetryCloseSelectionFixture>(
+        &loop,
+        loop.retry_conn,
+        {loop.retry_conn.id, -ECONNREFUSED, 0, 0, IoEventType::UpstreamConnect, 0});
+    CHECK_EQ(loop.retry_conn.h2->grpc.connect_attempts, 3u);
+    CHECK_EQ(loop.retry_conn.upstream_backend_idx, 4u);
+    CHECK_EQ(loop.retry_conn.h2->grpc.connect_tried_mask, 0x1fu);
+    CHECK_EQ(exchange.retry_tried_mask, 0x07u);
 
     grpc_detach(loop.retry_h2, &exchange);
     grpc_detach(downstream_h2, &exchange);
