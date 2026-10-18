@@ -227,15 +227,23 @@ struct EchoServer {
             }
             if (mode == 4) nghttp2_submit_goaway(session, 0, s->id, NGHTTP2_NO_ERROR, nullptr, 0);
             const u32 duplicate_ct = self->duplicate_content_type_order.load();
-            nghttp2_nv headers[] = {
-                nv(":status", "200"),
-                duplicate_ct == 2 || (!duplicate_ct && self->json_response.load())
-                    ? nv("content-type", "application/grpc+json")
-                    : nv("content-type", "application/grpc"),
-                duplicate_ct == 1 ? nv("content-type", "application/grpc+json")
-                                  : nv("content-type", "application/grpc"),
-                nv("x-meta-bin", "AAEC/w==")};
-            const u32 header_count = duplicate_ct ? 4u : 3u;
+            nghttp2_nv headers[4];
+            headers[0] = nv(":status", "200");
+            u32 header_count = 0;
+            if (duplicate_ct) {
+                headers[1] = duplicate_ct == 2 ? nv("content-type", "application/grpc+json")
+                                              : nv("content-type", "application/grpc");
+                headers[2] = duplicate_ct == 1 ? nv("content-type", "application/grpc+json")
+                                              : nv("content-type", "application/grpc");
+                headers[3] = nv("x-meta-bin", "AAEC/w==");
+                header_count = 4;
+            } else {
+                headers[1] = self->json_response.load()
+                                 ? nv("content-type", "application/grpc+json")
+                                 : nv("content-type", "application/grpc");
+                headers[2] = nv("x-meta-bin", "AAEC/w==");
+                header_count = 3;
+            }
             nghttp2_data_provider provider{};
             provider.source.ptr = s;
             provider.read_callback = &read_data;
