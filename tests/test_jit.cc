@@ -22253,3 +22253,82 @@ TEST(jit, json_decode_source_respects_route_local_capacity) {
     CHECK_EQ(compile_with_preceding_locals(14),
              0x300u + static_cast<u32>(FrontendError::TooManyItems));
 }
+
+TEST(jit, gateway_access_module_import_and_policy_order) {
+    // Load the shipped example and its real import rather than duplicating helpers.
+    const auto source_path =
+        std::filesystem::path(__FILE__).parent_path().parent_path() / "examples/gateway-access.rut";
+    std::ifstream input(source_path, std::ios::binary);
+    REQUIRE(input.good());
+    std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    for (u32 scenario = 0; scenario < 3; ++scenario) {
+        const bool maintenance = scenario == 1;
+        const bool empty_host_config = scenario == 2;
+        auto src = source;
+        if (maintenance) {
+            auto pos = src.find("maintenance(false)");
+            REQUIRE(pos != std::string::npos);
+            src.replace(pos, sizeof("maintenance(false)") - 1, "maintenance(true)");
+        }
+        if (empty_host_config) {
+            auto pos = src.find("api.example.com");
+            REQUIRE(pos != std::string::npos);
+            src.erase(pos, sizeof("api.example.com") - 1);
+        }
+        auto lexed = lex(lit(src.c_str()));
+        REQUIRE(lexed);
+        auto ast = parse_file_heap(lexed.value());
+        REQUIRE(ast);
+        auto hir = analyze_file_heap_with_path(ast.value(), source_path.string());
+        if (!hir)
+            fprintf(stderr,
+                    "access analyze failed at %u:%u: %.*s\n",
+                    hir.inner.error().span.line,
+                    hir.inner.error().span.col,
+                    hir.inner.error().detail.len,
+                    hir.inner.error().detail.ptr);
+        REQUIRE(hir);
+        auto mir = build_mir_heap(hir.value());
+        REQUIRE(mir);
+        FrontendRirModule rir{};
+        REQUIRE(lower_to_rir(mir.value(), rir));
+        REQUIRE(rir::verify_module(rir.module).ok);
+        auto cg = codegen(rir.module);
+        REQUIRE(cg.ok);
+        JitEngine engine;
+        REQUIRE(engine.init());
+        REQUIRE(engine.compile(cg.mod, cg.ctx));
+        auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+        REQUIRE(handler != nullptr);
+        struct Case {
+            const char* headers;
+            u16 status;
+        } cases[] = {
+            {"Host: api.example.com\r\nX-Client-Version: 1\r\n", 200},
+            {"hOsT: api.example.com\r\nx-client-version: 1\r\n", 200},
+            {"Host: attacker.example\r\nX-Client-Version: 1\r\n", 403},
+            {"Host: api.example.com.attacker.example\r\nX-Client-Version: 1\r\n", 403},
+            {"Host: api.example.com:8080\r\nX-Client-Version: 1\r\n", 403},
+            {"X-Client-Version: 1\r\n", 403},
+            {"Host: api.example.com\r\n", 400},
+            {"Host: api.example.com\r\nX-Client-Version: \r\n", 400},
+            {"Host: attacker.example\r\n", 403},
+        };
+        for (const char* version : {"HTTP/1.1", "HTTP/1.0"}) {
+            for (const auto& test : cases) {
+                auto request = std::string("GET /api ") + version + "\r\n" + test.headers + "\r\n";
+                auto result =
+                    HandlerResult::unpack(handler(nullptr,
+                                                  nullptr,
+                                                  reinterpret_cast<const u8*>(request.data()),
+                                                  request.size(),
+                                                  nullptr));
+                CHECK_EQ(result.action, HandlerAction::ReturnStatus);
+                CHECK_EQ(result.status_code,
+                         maintenance ? 503 : (empty_host_config ? 403 : test.status));
+            }
+        }
+        engine.shutdown();
+        rir.destroy();
+    }
+}

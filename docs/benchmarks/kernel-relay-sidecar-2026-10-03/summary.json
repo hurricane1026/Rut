@@ -1,0 +1,176 @@
+[
+  {
+    "run": "1048576-copy-first",
+    "body_size": 1048576,
+    "concurrency": 1,
+    "engines": {
+      "copy": {
+        "rps": 2445.1130455824377,
+        "p50_us": 446.0,
+        "p95_us": 458.0,
+        "p99_us": 484.0,
+        "server_cpu_pct": 60.61694718979956,
+        "server_cpu_seconds_per_gib": 0.25438424640242363,
+        "origin_cpu_pct": 47.03802425483004,
+        "server_rss_bytes": 1994752
+      },
+      "splice": {
+        "rps": 3224.0258445536565,
+        "p50_us": 284.0,
+        "p95_us": 404.0,
+        "p99_us": 427.0,
+        "server_cpu_pct": 45.92699755586889,
+        "server_cpu_seconds_per_gib": 0.1458711802098491,
+        "origin_cpu_pct": 66.41983508621618,
+        "server_rss_bytes": 1921024
+      }
+    },
+    "rps_gain": 0.3185590132032845,
+    "cpu_per_gib_change": -0.4265714867457322
+  },
+  {
+    "run": "1048576-copy-first",
+    "body_size": 1048576,
+    "concurrency": 32,
+    "engines": {
+      "copy": {
+        "rps": 2813.690778957682,
+        "p50_us": 10573.0,
+        "p95_us": 14678.0,
+        "p99_us": 17320.0,
+        "server_cpu_pct": 67.61156220201235,
+        "server_cpu_seconds_per_gib": 0.24606200586301857,
+        "origin_cpu_pct": 50.98986576417935,
+        "server_rss_bytes": 6057984
+      },
+      "splice": {
+        "rps": 3998.2844389377055,
+        "p50_us": 8053.0,
+        "p95_us": 8444.0,
+        "p99_us": 8914.0,
+        "server_cpu_pct": 55.852512382202114,
+        "server_cpu_seconds_per_gib": 0.1432322608534552,
+        "origin_cpu_pct": 80.61754272297667,
+        "server_rss_bytes": 1921024
+      }
+    },
+    "rps_gain": 0.4210106060122394,
+    "cpu_per_gib_change": -0.4179017587412831
+  },
+  {
+    "run": "1048576-splice-first",
+    "body_size": 1048576,
+    "concurrency": 1,
+    "engines": {
+      "copy": {
+        "rps": 2673.891201838662,
+        "p50_us": 331.0,
+        "p95_us": 460.0,
+        "p99_us": 466.0,
+        "server_cpu_pct": 59.87797732439519,
+        "server_cpu_seconds_per_gib": 0.22931018561270664,
+        "origin_cpu_pct": 52.2234730066375,
+        "server_rss_bytes": 2039808
+      },
+      "splice": {
+        "rps": 3246.4578175926536,
+        "p50_us": 284.0,
+        "p95_us": 426.0,
+        "p99_us": 445.0,
+        "server_cpu_pct": 47.16284032403094,
+        "server_cpu_seconds_per_gib": 0.1493981762917933,
+        "origin_cpu_pct": 67.9053508058328,
+        "server_rss_bytes": 1904640
+      }
+    },
+    "rps_gain": 0.2141323533883035,
+    "cpu_per_gib_change": -0.34848870366308404
+  },
+  {
+    "run": "1048576-splice-first",
+    "body_size": 1048576,
+    "concurrency": 32,
+    "engines": {
+      "copy": {
+        "rps": 2727.0080144367334,
+        "p50_us": 10858.0,
+        "p95_us": 15356.0,
+        "p99_us": 17912.0,
+        "server_cpu_pct": 67.60970330462732,
+        "server_cpu_seconds_per_gib": 0.2538765409467944,
+        "origin_cpu_pct": 50.11366178402138,
+        "server_rss_bytes": 6103040
+      },
+      "splice": {
+        "rps": 3751.05692917769,
+        "p50_us": 8048.0,
+        "p95_us": 11481.0,
+        "p99_us": 12273.0,
+        "server_cpu_pct": 54.07329301539721,
+        "server_cpu_seconds_per_gib": 0.1476145339652449,
+        "origin_cpu_pct": 80.24703246473946,
+        "server_rss_bytes": 1904640
+      }
+    },
+    "rps_gain": 0.37552105066052577,
+    "cpu_per_gib_change": -0.4185578020925499
+  },
+  {
+    "run": "65536-copy-first",
+    "body_size": 65536,
+    "concurrency": 1,
+    "engines": {
+      "copy": {
+        "rps": 12257.683555889205,
+        "p50_us": 77.0,
+        "p95_us": 93.0,
+        "p99_us": 109.0,
+        "server_cpu_pct": 25.494350157839445,
+        "server_cpu_seconds_per_gib": 0.34076539101497505,
+        "origin_cpu_pct": 31.76988250438456,
+        "server_rss_bytes": 1888256
+      },
+      "splice": {
+        "rps": 13246.082404947349,
+        "p50_us": 74.0,
+        "p95_us": 81.0,
+        "p99_us": 99.0,
+        "server_cpu_pct": 18.432373679903794,
+        "server_cpu_seconds_per_gib": 0.2344383724293304,
+        "origin_cpu_pct": 34.120182656711194,
+        "server_rss_bytes": 1912832
+      }
+    },
+    "rps_gain": 0.08063504368925134,
+    "cpu_per_gib_change": -0.31202411215806847
+  },
+  {
+    "run": "65536-copy-first",
+    "body_size": 65536,
+    "concurrency": 32,
+    "engines": {
+      "copy": {
+        "rps": 34684.028779798384,
+        "p50_us": 908.0,
+        "p95_us": 1051.0,
+        "p99_us": 1153.0,
+        "server_cpu_pct": 66.99580606254047,
+        "server_cpu_seconds_per_gib": 0.31647398677283756,
+        "origin_cpu_pct": 81.79535402389145,
+        "server_rss_bytes": 5951488
+      },
+      "splice": {
+        "rps": 37124.415173059366,
+        "p50_us": 842.0,
+        "p95_us": 1049.0,
+        "p99_us": 1174.0,
+        "server_cpu_pct": 49.80266185423936,
+        "server_cpu_seconds_per_gib": 0.22066284627776167,
+        "origin_cpu_pct": 83.52919884714015,
+        "server_rss_bytes": 1912832
+      }
+    },
+    "rps_gain": 0.07036052267037607,
+    "cpu_per_gib_change": -0.3027457058069305
+  }
+]

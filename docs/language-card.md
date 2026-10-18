@@ -136,11 +136,14 @@ exceptions, no try/catch. `!` is logical not only.
   ordered header effects to a successful handler response.
 
 ```swift
+struct Claims { sub: str role: str }
+
 func auth(_ req: Request, role: str) -> User {
-    let token = req.authorization.or("")
-    guard token.hasPrefix("Bearer ") else { respond 401 }
-    let claims = jwtDecode(token.trimPrefix("Bearer "), secret: env("JWT_SECRET"))
-    guard let claims else { respond 401 }
+    let token = req.header("X-JWT").or("")
+    guard let document = jwtDecode(token, env("JWT_SECRET")) else {
+        respond 401
+    }
+    guard let claims = json.decode(Claims, document) else { respond 401 }
     guard claims.role == role else { respond 403 }
     return User(id: claims.sub, role: claims.role)   // normal value
 }
@@ -153,11 +156,11 @@ func f(_ req: Request, limit: ByteSize) { ... }   // first param unlabeled, rest
 f(req, limit: 1mb)                // ⏳ mixed positional+named call args (parser rejects the label)
 req.f(limit: 1mb)                 // UFCS: t.f(a) == f(t, a) — use when value
                                   // flows into the FIRST parameter
-req.path.trimPrefix("/api").split("/")            // UFCS chaining
+// ⏳ String prefix built-ins are planned; use the X-JWT extraction above today.
 
 // Pipeline | — use when the value lands in a NON-first position.
 // RHS must be a call with an explicit _ / _N placeholder (else compile error).
-let parts = req.path | trimPrefix("/api", _) | split(_, "/")
+// ⏳ Prefix pipeline built-ins are planned; this syntax is not currently supported.
 ```
 
 No closures, no function values (`let g = f` is an error), no recursion, no FFI.
@@ -851,10 +854,12 @@ route GET "/api" {
 ## Built-ins (call them, never reimplement)
 
 ```
-string:  s.len s.isEmpty s.hasPrefix/hasSuffix/contains s.upper()/lower()/trim()
-         s.trimPrefix/trimSuffix/replace/split/slice s.matches(re"") s.match(re"")
+string:  s.len s.isEmpty s.contains s.upper()/lower()/trim()
+         s.replace/split/slice s.matches(re"") s.match(re"")
+         ⏳ s.hasPrefix/hasSuffix/trimPrefix/trimSuffix
 hash:    md5 sha1 sha256 sha384 sha512 fnv32 fnv64 | hmacSha256/384/512
-jwt:     jwtDecode(tok, secret:|publicKey:) jwtEncode(claims, ..., alg: .HS256)
+jwt:     jwtDecode(tok, secret) -> Json? (HS256/384/512 verified claims;
+         decode with json.decode/json.get). ⏳ publicKey/RS/ES and jwtEncode
 crypto:  aesGcmEncrypt/Decrypt randomBytes(n) uuid()
 encode:  base64 base64url hex urlEncode urlDecode htmlDecode unicodeNormalize
 time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
@@ -863,6 +868,11 @@ time:    time.nowMicros() -> i64 (monotonic µs; latched per invocation — all
 misc:    env(k) json(v) log.info/warn/error(msg, key: val, ...)
 admin:   stats() metrics() reload() upstream_status() config_dump() shard_stats()
 ```
+
+`env("NAME")` is resolved when the program is analyzed/loaded, not per
+request. The name must be a string literal and the variable must exist; a
+missing variable is a compile error. The resolved value is embedded as a
+constant, so changing the environment requires recompilation or reload.
 
 ## Do NOT write (compile errors — with the fix)
 
@@ -936,3 +946,13 @@ starting at zero after the index. The final block may be partial. Bodies are
 owned by the compiled program; generation performs no per-request allocation.
 Use existing `wait` for application delay. Timed response fragments are not
 provided by this builder.
+
+## Experimental compiler eBPF diagnostics
+
+Linux builds with `-DRUT_ENABLE_EBPF=ON` (and `RUT_ENABLE_JIT=ON`) support
+`rut app.rut --ebpf-plan` and `rut app.rut --emit-ebpf PREFIX`.
+These analyze verified, inlined RIR and optionally export raw body-transfer
+bytecode; they add no language syntax. Fixed terminal forwards can be body
+candidates while routing and headers stay in userspace. A candidate does not
+activate kernel forwarding: live socket handoff remains ⏳. `firewall {}`/XDP and
+kTLS integration also remain unimplemented. See [ebpf.md](ebpf.md).

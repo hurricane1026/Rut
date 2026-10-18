@@ -21,6 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Key architectural layers:
 - **Compiler pipeline**: Hand-written recursive descent parser → type checker → inline expansion → Rutlang IR (RIR) → LLVM IR generation → ORC JIT
 - **Rutlang IR (RIR)**: Custom flat typed IR between AST and LLVM IR. Enables domain-specific optimizations, backend independence, and `--emit-rir` debugging.
+- **Experimental eBPF plans**: `RUT_ENABLE_EBPF=ON` enables RIR body-candidate analysis and direct bytecode export via `--ebpf-plan` / `--emit-ebpf`. No live socket offload is enabled; see [docs/ebpf.md](docs/ebpf.md).
 - **Runtime**: Template-parameterized on I/O backend (`IoUringBackend` / `EpollBackend`). Both produce the same `IoEvent` stream — upper layers are backend-agnostic.
 - **Memory**: Per-shard allocators — Arena (per-request temporaries, reset = one pointer write), SlicePool (16KB network buffers, free-list), SlabPool (fixed-size objects like Connection). No malloc/free on hot path.
 - **Hot reload**: RCU pattern — compile on background thread, atomic pointer swap of `CompiledConfig`, epoch-based reclamation of old JIT code.
