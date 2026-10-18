@@ -1476,7 +1476,6 @@ namespace {
 
 bool b64url_decode(Str in, char* out, u32 cap, u32& out_len) {
     out_len = 0;
-    while (in.len > 0 && in.ptr[in.len - 1] == '=') --in.len;
     if (in.len % 4 == 1) return false;
     u32 acc = 0;
     u32 bits = 0;
@@ -1625,7 +1624,7 @@ bool jwt_decode_claims(
     for (u32 node = document.nodes[0].child; node != json::kNone;
          node = document.nodes[node].next) {
         json::Writer key_writer{key_bytes, sizeof(key_bytes)};
-        if (!document.string(document.nodes[node].key, key_writer) || !key_writer.ok) return false;
+        if (!document.string(document.nodes[node].key, key_writer) || !key_writer.ok) continue;
         const Str key{key_bytes, key_writer.len};
         if (key.eq(lit_str("crit"))) {
             has_crit = true;

@@ -679,6 +679,24 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
             .first);
     CHECK_FALSE(decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsImNyaXQiOlsiZXhwIl19.e30.AA").first);
     CHECK_FALSE(decode(hs256_key.c_str(), "eyJjcml0IjpbImV4cCJdLCJhbGciOiJIUzI1NiJ9.e30.AA").first);
+    CHECK(decode(std::string(32, 'x').c_str(),
+                 "eyJodHRwczovL2V4YW1wbGUuY29tL3ZlcnktbG9uZy1wdWJsaWMtbmFtZSI6IngiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.GFhV-6WnIYxQ9t8-jqQFJ_9okmYFm8xj2_1F18Nchtk")
+              .first);
+    CHECK(decode(std::string(32, 'x').c_str(),
+                 "eyJhbGciOiJIUzI1NiIsImh0dHBzOi8vZXhhbXBsZS5jb20vdmVyeS1sb25nLXB1YmxpYy1uYW1lIjoieCJ9.eyJzdWIiOiJvayJ9.wDDSJKjj8zlcKW0-S4XMpfl10_xTTxWVWtCfZRaaO_I")
+              .first);
+    CHECK_FALSE(decode(hs256_key.c_str(),
+                       "eyJhbGciOiJIUzI1NiJ9=.eyJzdWIiOiJvayJ9.GFhV-6WnIYxQ9t8-jqQFJ_9okmYFm8xj2_1F18Nchtk")
+                    .first);
+    CHECK_FALSE(decode(hs256_key.c_str(),
+                       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9=.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U")
+                    .first);
+    CHECK_FALSE(decode(hs256_key.c_str(),
+                       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U=")
+                    .first);
+    CHECK_FALSE(decode(hs256_key.c_str(),
+                       "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U!")
+                    .first);
 
     arena.destroy();
     pool.destroy();
