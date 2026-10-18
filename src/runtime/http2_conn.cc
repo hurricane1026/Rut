@@ -15,12 +15,26 @@ constexpr i64 kMaxWindow = 2147483647;  // 2^31 - 1
 
 }  // namespace
 
+u32 Http2Conn::write_ping(u8* out, u32 cap, u64 token) {
+    if (ping_pending || cap < kFrameHeaderSize + 8) return 0;
+    Http2FrameHeader frame{};
+    frame.length = 8;
+    frame.type = static_cast<u8>(Http2FrameType::Ping);
+    write_frame_header(out, frame);
+    for (u32 i = 0; i < 8; i++) out[kFrameHeaderSize + i] = static_cast<u8>(token >> (56 - i * 8));
+    ping_token = token;
+    ping_pending = true;
+    return kFrameHeaderSize + 8;
+}
+
 void Http2Conn::init() {
     grpc.init();
     on_trailers = nullptr;
     client = false;
     peer_settings_seen = false;
     peer_goaway = false;
+    ping_pending = false;
+    ping_token = 0;
     peer_last_stream = 0x7fffffffu;
     conn_recv_credit = 0;
     hpack_dec.init(kDefaultHeaderTableSize);
@@ -1032,7 +1046,11 @@ static Http2Error handle_frame(Http2Conn& c,
 
         case Http2FrameType::Ping: {
             if (h.stream_id != 0 || h.length != 8) return Http2Error::FrameSizeError;
-            if (!(h.flags & http2_flag::kAck) && w.room(kFrameHeaderSize + 8)) {
+            if (h.flags & http2_flag::kAck) {
+                u64 token = 0;
+                for (u32 i = 0; i < 8; i++) token = (token << 8) | payload[i];
+                if (c.ping_pending && token == c.ping_token) c.ping_pending = false;
+            } else if (w.room(kFrameHeaderSize + 8)) {
                 Http2FrameHeader ack;
                 ack.length = 8;
                 ack.type = static_cast<u8>(Http2FrameType::Ping);

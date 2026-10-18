@@ -1376,16 +1376,38 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
         grpc_kick_downstream(loop, conn);
 }
 
+// Conservative active-session probes: no idle pool traffic, no probes during
+// handshake or GOAWAY drain. The caller flushes the queued control frame.
+inline bool grpc_keepalive_tick(Http2Conn& h, u64 now, u64 timeout_us, bool writable) {
+    auto& g = h.grpc;
+    if (h.ping_pending) return now - g.last_ping_us >= timeout_us;
+    constexpr u64 interval_us = 300000000;  // five minutes; avoid server ping strikes
+    const u64 since = g.last_ping_us ? g.last_ping_us : g.connected_at_us;
+    if (!g.active || g.connecting || !h.peer_settings_seen || h.peer_goaway || !writable ||
+        now - since < interval_us || sizeof(g.control) - g.control_len < kFrameHeaderSize + 8)
+        return false;
+    g.control_len +=
+        h.write_ping(g.control + g.control_len, sizeof(g.control) - g.control_len, now);
+    g.last_ping_us = now;
+    return false;
+}
+
 template <typename Loop>
 void grpc_tick(Loop* loop, Connection& conn) {
     auto& h = *conn.h2;
     const u64 now = monotonic_us();
     if (h.grpc.upstream) {
+        const u32 control_before = h.grpc.control_len;
         const bool stale_config =
             h.grpc.active == 0 && loop->config_ptr && *loop->config_ptr != conn.request_config;
         if (((h.grpc.connecting || !h.peer_settings_seen) &&
              now - h.grpc.connected_at_us >= static_cast<u64>(loop->upstream_timeout) * 1000000) ||
             stale_config ||
+            grpc_keepalive_tick(h,
+                                now,
+                                static_cast<u64>(loop->upstream_timeout) * 1000000,
+                                !conn.on_send && !h.grpc.busy &&
+                                    (!h.grpc.client_tls.ssl_ctx || h.grpc.tls_verified)) ||
             grpc_idle_upstream_should_close(h.grpc,
                                             h.peer_goaway,
                                             loop->is_draining(),
@@ -1395,6 +1417,7 @@ void grpc_tick(Loop* loop, Connection& conn) {
             loop->close_conn(conn);
             return;
         }
+        if (h.grpc.control_len > control_before) grpc_drive_upstream(loop, conn);
     } else {
         for (auto* x : h.grpc.streams)
             if (x && x->deadline_us && now >= x->deadline_us) x->failure = 4;

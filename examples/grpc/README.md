@@ -123,3 +123,11 @@ gRPC framing but exclude HTTP/2 framing. Completion means final response staging
 into owned output, not client delivery acknowledgement. Client disconnects
 before completion are CANCELLED. Long paths use the existing over-limit marker.
 The source live-log bytes-only writer keeps its existing output format.
+
+Native gRPC upstream sessions with active RPCs send an HTTP/2 PING every five
+minutes after connection establishment or the previous probe. Only an ACK with
+the same eight-byte payload completes a probe. The existing upstream timeout
+(in seconds, checked by the one-second session timer) bounds the ACK wait;
+timeout closes the session and fails unfinished RPCs with UNAVAILABLE without
+replay. Idle pooled sessions, handshakes and GOAWAY-draining sessions do not
+start probes. PING does not implement the protobuf gRPC Health service.
