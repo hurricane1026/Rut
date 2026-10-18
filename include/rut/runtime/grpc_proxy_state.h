@@ -105,6 +105,7 @@ struct GrpcProxyState {
     u64 connected_at_us;
     u64 idle_since_us;
     u64 timer_deadline_us;
+    u64 last_ping_us;
     bool upstream;
     bool connecting;
     bool busy;
@@ -118,7 +119,7 @@ struct GrpcProxyState {
         for (auto& stream : streams) stream = nullptr;
         pool_next = nullptr;
         active = cursor = control_len = pending_cancel_count = 0;
-        connected_at_us = idle_since_us = timer_deadline_us = 0;
+        connected_at_us = idle_since_us = timer_deadline_us = last_ping_us = 0;
         upstream = connecting = busy = preface_sent = session_failure_recorded = false;
     }
 };
