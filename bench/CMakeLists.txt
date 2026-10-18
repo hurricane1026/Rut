@@ -14,6 +14,28 @@ set_target_properties(llhttp PROPERTIES
 target_compile_options(llhttp PRIVATE -O2 -DNDEBUG)
 
 # Benchmark executables
+if(RUT_BUILD_EBPF_PROBE)
+    find_package(Threads REQUIRED)
+    add_executable(bench_sockmap_probe bench_sockmap_probe.cc)
+    target_include_directories(bench_sockmap_probe PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(bench_sockmap_probe PRIVATE Threads::Threads)
+    set_target_properties(bench_sockmap_probe PROPERTIES LINKER_LANGUAGE C)
+    add_executable(bench_ebpf_handoff bench_ebpf_handoff.cc)
+    target_include_directories(bench_ebpf_handoff PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(bench_ebpf_handoff PRIVATE Threads::Threads)
+    set_target_properties(bench_ebpf_handoff PROPERTIES LINKER_LANGUAGE C)
+    target_compile_options(bench_ebpf_handoff PRIVATE -O2)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(bench_kernel_relay bench_kernel_relay.cc ${PROJECT_SOURCE_DIR}/src/placement_new.cc)
+    target_include_directories(bench_kernel_relay PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    set_target_properties(bench_kernel_relay PROPERTIES LINKER_LANGUAGE C)
+    target_link_options(bench_kernel_relay PRIVATE -Wl,--as-needed)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        target_link_options(bench_kernel_relay PRIVATE -nostdlib++)
+    endif()
+endif()
+
 add_executable(bench_http_parser bench_http_parser.cc)
 target_link_libraries(bench_http_parser rut_runtime llhttp)
 target_include_directories(bench_http_parser PRIVATE

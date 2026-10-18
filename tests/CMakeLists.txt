@@ -488,6 +488,23 @@ add_test(NAME test_proxy_benchmark_tools
                  -s ${PROJECT_SOURCE_DIR}/scripts/proxy_benchmark -p "test_*.py")
 set_tests_properties(test_proxy_benchmark_tools PROPERTIES LABELS "unit;benchmark" TIMEOUT 120)
 
+if(RUT_BUILD_EBPF_PROBE)
+    add_test(NAME test_sockmap_probe
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_sockmap_probe.py
+            $<TARGET_FILE:bench_sockmap_probe>)
+    set_tests_properties(test_sockmap_probe PROPERTIES LABELS "unit;network" TIMEOUT 60)
+    add_test(NAME test_ebpf_handoff
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ebpf_handoff.py
+            $<TARGET_FILE:bench_ebpf_handoff>)
+    set_tests_properties(test_ebpf_handoff PROPERTIES LABELS "unit;network" TIMEOUT 90)
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME test_kernel_relay
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_relay.py
+            $<TARGET_FILE:bench_kernel_relay>)
+    set_tests_properties(test_kernel_relay PROPERTIES LABELS "unit;network" TIMEOUT 45)
+endif()
+
 add_test(NAME test_routing_corpus
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py)
 set_tests_properties(test_routing_corpus PROPERTIES LABELS "unit;routing" TIMEOUT 120)
