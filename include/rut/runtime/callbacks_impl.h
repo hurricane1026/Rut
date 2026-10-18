@@ -2237,7 +2237,7 @@ void on_request_complete_with_grpc_status(Loop* loop,
 
 template <typename Loop>
 void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
-    on_request_complete_with_grpc_status(loop, conn, status, resp_size, 0);
+    on_request_complete_with_grpc_status(loop, conn, status, resp_size, 0, UINT32_MAX);
 }
 
 // Every owner the previous request in a pipelined burst held has retired:

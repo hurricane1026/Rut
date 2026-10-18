@@ -8,17 +8,28 @@
 
 namespace {
 
+inline void grpc_web_test_init_raw_request(
+    rut::Connection& conn, u8* storage, u32 cap, const char* request, u32 request_len) {
+    conn.reset();
+    conn.bind_request_receive_buffer(storage, cap);
+    __builtin_memcpy(storage, request, request_len);
+    conn.recv_buf.commit(request_len);
+    for (u32 i = 3; i < request_len; i++) {
+        if (storage[i - 3] == '\r' && storage[i - 2] == '\n' && storage[i - 1] == '\r' &&
+            storage[i] == '\n') {
+            conn.req_header_end = i + 1;
+            return;
+        }
+    }
+}
+
 inline void grpc_web_test_init_request(rut::Connection& conn, u8* storage, u32 cap) {
     static constexpr char kRequest[] =
         "POST /test.Echo/Call HTTP/1.1\r\n"
         "Host: localhost\r\n"
         "Content-Type: application/grpc-web\r\n"
         "Content-Length: 0\r\n\r\n";
-    conn.reset();
-    conn.bind_request_receive_buffer(storage, cap);
-    __builtin_memcpy(storage, kRequest, sizeof(kRequest) - 1);
-    conn.recv_buf.commit(sizeof(kRequest) - 1);
-    conn.req_header_end = sizeof(kRequest) - 1;
+    grpc_web_test_init_raw_request(conn, storage, cap, kRequest, sizeof(kRequest) - 1);
 }
 
 inline std::vector<u8> grpc_web_test_base64(const std::vector<u8>& input) {
@@ -39,8 +50,12 @@ inline std::vector<u8> grpc_web_test_base64(const std::vector<u8>& input) {
     return output;
 }
 
-inline bool grpc_web_test_h1_exchange(
-    u16 port, bool text, bool chunked, const std::vector<u8>& body, std::vector<u8>& response) {
+inline bool grpc_web_test_h1_exchange(u16 port,
+                                      bool text,
+                                      bool chunked,
+                                      const std::vector<u8>& body,
+                                      std::vector<u8>& response,
+                                      bool tls = false) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return false;
     set_socket_timeouts(fd, 5);
@@ -51,6 +66,22 @@ inline bool grpc_web_test_h1_exchange(
     if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
         close(fd);
         return false;
+    }
+    SSL_CTX* tls_context = tls ? SSL_CTX_new(TLS_client_method()) : nullptr;
+    SSL* ssl = nullptr;
+    if (tls) {
+        if (!tls_context) {
+            close(fd);
+            return false;
+        }
+        SSL_CTX_set_verify(tls_context, SSL_VERIFY_NONE, nullptr);
+        ssl = SSL_new(tls_context);
+        if (!ssl || !SSL_set_fd(ssl, fd) || SSL_connect(ssl) != 1) {
+            if (ssl) SSL_free(ssl);
+            SSL_CTX_free(tls_context);
+            close(fd);
+            return false;
+        }
     }
 
     std::vector<u8> wire;
@@ -102,16 +133,36 @@ inline bool grpc_web_test_h1_exchange(
         static constexpr char kEnd[] = "0\r\n\r\n";
         wire.insert(wire.end(), kEnd, kEnd + sizeof(kEnd) - 1);
     }
-    const bool sent = write_all_fd(fd, wire.data(), static_cast<u32>(wire.size()));
+    bool sent = false;
+    if (!tls) {
+        sent = write_all_fd(fd, wire.data(), static_cast<u32>(wire.size()));
+    } else {
+        sent = true;
+        size_t offset = 0;
+        while (offset < wire.size()) {
+            const int n =
+                SSL_write(ssl, wire.data() + offset, static_cast<int>(wire.size() - offset));
+            if (n <= 0) {
+                sent = false;
+                break;
+            }
+            offset += static_cast<size_t>(n);
+        }
+    }
     if (sent) {
         u8 buf[8192];
         for (;;) {
-            const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            const ssize_t n = tls ? SSL_read(ssl, buf, sizeof(buf)) : recv(fd, buf, sizeof(buf), 0);
             if (n == 0) break;
             if (n < 0 && errno == EINTR) continue;
             if (n < 0) {
-                std::fprintf(stderr, "H1 recv error=%d after=%zu\n", errno, response.size());
+                const int ssl_error = tls ? SSL_get_error(ssl, static_cast<int>(n)) : 0;
+                if (tls && (ssl_error == SSL_ERROR_ZERO_RETURN ||
+                            (ssl_error == SSL_ERROR_SYSCALL && errno == 0)))
+                    break;
                 close(fd);
+                if (ssl) SSL_free(ssl);
+                if (tls_context) SSL_CTX_free(tls_context);
                 return false;
             }
             response.insert(response.end(), buf, buf + n);
@@ -121,6 +172,8 @@ inline bool grpc_web_test_h1_exchange(
             }
         }
     }
+    if (ssl) SSL_free(ssl);
+    if (tls_context) SSL_CTX_free(tls_context);
     close(fd);
     return sent;
 }
@@ -237,6 +290,50 @@ void grpc_web_h1_roundtrip_case(rut::test::TestCase* _tc,
     CHECK_EQ(server->requests.load(), 1u);
 }
 
+template <typename Loop>
+void grpc_web_h1_tls_roundtrip_case(rut::test::TestCase* _tc, bool text) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    auto tls_result = create_tls_server_context(
+        RUT_GRPC_FIXTURES "/localhost_cert.pem", RUT_GRPC_FIXTURES "/localhost_key.pem", false);
+    REQUIRE(tls_result);
+    TlsServerContext* tls_server = tls_result.value();
+    shard->loop->tls_server = tls_server;
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const std::vector<u8> rpc_body{0, 0, 0, 0, 1, 0x7f};
+    const std::vector<u8> request_body = text ? grpc_web_test_base64(rpc_body) : rpc_body;
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), text, false, request_body, response, true));
+    CHECK(std::search(response.begin(), response.end(), "HTTP/1.1 200", "HTTP/1.1 200" + 12) !=
+          response.end());
+    CHECK(std::search(response.begin(), response.end(), "grpc-web", "grpc-web" + 8) !=
+          response.end());
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+    destroy_tls_server_context(tls_server);
+    CHECK_EQ(server->requests.load(), 1u);
+}
+
 }  // namespace
 
 TEST(grpc_proxy, h1_content_type_override_fails_closed) {
@@ -245,6 +342,28 @@ TEST(grpc_proxy, h1_content_type_override_fails_closed) {
     grpc_web_test_init_request(conn, storage, sizeof(storage));
     conn.req_header_override_count = 1;
     conn.req_header_overrides[0] = {{"cOnTeNt-TyPe", 12}, {"application/grpc", 16}};
+    CHECK_EQ(static_cast<u32>(grpc_web_h1_start<EpollEventLoop>(nullptr, conn, nullptr, 0, true)),
+             static_cast<u32>(GrpcWebH1Start::Rejected));
+}
+
+TEST(grpc_proxy, h1_http1_policy_fails_closed) {
+    Connection conn;
+    u8 storage[256]{};
+    grpc_web_test_init_request(conn, storage, sizeof(storage));
+    CHECK_EQ(static_cast<u32>(grpc_web_h1_start<EpollEventLoop>(nullptr, conn, nullptr, 0, false)),
+             static_cast<u32>(GrpcWebH1Start::Rejected));
+}
+
+TEST(grpc_proxy, h1_transfer_encoding_chain_fails_closed) {
+    Connection conn;
+    u8 storage[256]{};
+    static constexpr char kRequest[] =
+        "POST /test.Echo/Call HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/grpc-web\r\n"
+        "Transfer-Encoding: chunked, gzip\r\n\r\n"
+        "0\r\n\r\n";
+    grpc_web_test_init_raw_request(conn, storage, sizeof(storage), kRequest, sizeof(kRequest) - 1);
     CHECK_EQ(static_cast<u32>(grpc_web_h1_start<EpollEventLoop>(nullptr, conn, nullptr, 0, true)),
              static_cast<u32>(GrpcWebH1Start::Rejected));
 }
@@ -291,4 +410,10 @@ TEST(grpc_proxy, h1_binary_coalesced_content_length_iouring) {
 }
 TEST(grpc_proxy, h1_text_chunked_large_iouring) {
     grpc_web_h1_roundtrip_case<IoUringEventLoop>(_tc, true, true, 130000);
+}
+TEST(grpc_proxy, h1_binary_tls_epoll) {
+    grpc_web_h1_tls_roundtrip_case<EpollEventLoop>(_tc, false);
+}
+TEST(grpc_proxy, h1_text_tls_epoll) {
+    grpc_web_h1_tls_roundtrip_case<EpollEventLoop>(_tc, true);
 }

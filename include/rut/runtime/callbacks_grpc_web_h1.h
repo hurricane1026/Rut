@@ -450,23 +450,57 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
         u32 wire_amount = 0;
         if (x.web_mode == GrpcWebContentType::Text) {
             u32 consumed = 0, written = 0;
+            const u8 previous_len = x.response_base64.pending_len;
+            u8 previous_native[3]{};
+            for (u8 i = 0; i < previous_len; i++) previous_native[i] = x.response_base64.pending[i];
             const auto status = x.response_base64.feed(x.download,
                                                        amount,
                                                        consumed,
                                                        conn.send_buf.write_ptr(),
                                                        conn.send_buf.write_avail(),
                                                        written);
-            if (status == GrpcWebCodecStatus::Invalid || consumed == 0) {
+            if (status == GrpcWebCodecStatus::Invalid || (!consumed && !written)) {
                 loop->close_conn(conn);
                 return;
             }
             conn.send_buf.commit(written);
+            const u32 native_staged = (written / 4) * 3;
+            const u32 previous_staged = native_staged < previous_len ? native_staged : previous_len;
+            if (previous_staged &&
+                x.staged_response_message.feed(previous_native, previous_staged, false)) {
+                loop->close_conn(conn);
+                return;
+            }
+            const u32 input_staged = native_staged - previous_staged;
+            if (input_staged && x.staged_response_message.feed(x.download, input_staged, false)) {
+                loop->close_conn(conn);
+                return;
+            }
+            const u32 pending = previous_len + consumed - native_staged;
+            if (pending > sizeof(x.web_pending_native)) {
+                loop->close_conn(conn);
+                return;
+            }
+            u32 copied = 0;
+            if (previous_len > native_staged) {
+                copied = previous_len - native_staged;
+                __builtin_memcpy(x.web_pending_native, previous_native + native_staged, copied);
+            }
+            const u32 input_pending = pending - copied;
+            if (input_pending)
+                __builtin_memcpy(
+                    x.web_pending_native + copied, x.download + input_staged, input_pending);
+            x.web_pending_native_len = static_cast<u8>(pending);
             grpc_pop(x.download, x.download_len, consumed);
             amount = consumed;
             wire_amount = written;
         } else {
             if (amount > conn.send_buf.write_avail()) amount = conn.send_buf.write_avail();
             if (amount == 0 || !put(x.download, amount)) return;
+            if (x.staged_response_message.feed(x.download, amount, false)) {
+                loop->close_conn(conn);
+                return;
+            }
             grpc_pop(x.download, x.download_len, amount);
             wire_amount = amount;
         }
@@ -514,6 +548,14 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
                         }
                         x.response_trailers_offset += consumed;
                         conn.send_buf.commit(written);
+                        if (written && x.web_pending_native_len) {
+                            if (x.staged_response_message.feed(
+                                    x.web_pending_native, x.web_pending_native_len, false)) {
+                                loop->close_conn(conn);
+                                return;
+                            }
+                            x.web_pending_native_len = 0;
+                        }
                         if (written) break;
                     } else {
                         u32 written = 0;
