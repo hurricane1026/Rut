@@ -59,7 +59,7 @@ post-load memory.stat is not a peak measurement and includes its exec reader.
 
 The measured shared-netns result supports a kernel data-movement experiment,
 not a production Rut speedup or a claim that per-request userspace dispatch is
-eliminated. Read the [2026-10-03 record](../docs/benchmarks/kernel-relay-sidecar-2026-10-03/README.md)
+eliminated. Read the [2026-10-03 record](https://github.com/hurricane1026/Rut/blob/88e924cacc6aa020138df002e8f0411a815f3851/docs/benchmarks/kernel-relay-sidecar-2026-10-03/README.md)
 for both-order results, failed smoke history and validation limits.
 
 ## Optional L4 eBPF comparison

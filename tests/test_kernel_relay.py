@@ -53,10 +53,15 @@ class RelayTests(unittest.TestCase):
                     break
                 if process.poll() is not None:
                     assert process.returncode == 1, text
-                    assert "eBPF tunnel source_map:" in text, text
-                    match = re.search(r"eBPF tunnel source_map: errno=(\d+):", text)
+                    match = re.search(r"eBPF tunnel ([a-z_]+): errno=(\d+):", text)
                     assert match, text
-                    assert int(match.group(1)) in {
+                    assert match.group(1) in {
+                        "tunnel_attach_type", "source_map", "target_map", "state_map",
+                        "command_map", "ring_size", "ring_map", "ring_consumer",
+                        "ring_producer", "instruction_template", "parser_load",
+                        "verdict_load", "commit_load", "parser_attach", "verdict_attach",
+                    }, text
+                    assert int(match.group(2)) in {
                         errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP
                     }, text
                     cls.ebpf_error = text

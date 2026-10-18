@@ -258,13 +258,23 @@ bool control_selftest(EbpfHandoffKernel& kernel) {
     return kernel.inspect(source_cookie, state) && state.control == 0 &&
            kernel.retire(source_cookie, target_cookie);
 }
+constexpr u32 notification_capacity(u32 ring_size) {
+    return (ring_size - 1u) / 24u;
+}
+static_assert(notification_capacity(4u * 1024u) == 170u);
+static_assert(notification_capacity(16u * 1024u) == 682u);
+static_assert(notification_capacity(64u * 1024u) == 2730u);
+
 bool notification_selftest(EbpfHandoffKernel& kernel) {
     // Reusing connection slots before draining old events can exhaust the ring.
     // Verify that overflow is visible in flow state, and that draining preserves
     // the old cookie/generation rather than confusing it with a reused slot.
-    const u32 kCapacity = (kernel.ring_size - 1u) / 24u;
-    u64 cookies[180]{};
-    if (kCapacity + 3u > 180u) return false;
+    const u32 kCapacity = notification_capacity(kernel.ring_size);
+    // init(16) makes the ring one base page; 64 KiB is the largest supported
+    // Linux base page size. Keep this storage bounded and heap-free.
+    constexpr u32 kMaxCapacity = notification_capacity(64u * 1024u);
+    static u64 cookies[kMaxCapacity + 3u]{};
+    if (kCapacity > kMaxCapacity) return false;
     for (u32 i = 0; i < kCapacity + 3u; ++i) {
         Connection source, target;
         u64 target_cookie = 0;
