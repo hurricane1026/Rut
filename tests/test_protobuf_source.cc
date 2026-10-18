@@ -24,7 +24,7 @@ struct Files {
     bool ok = false;
     Files() { ok = mkdtemp(directory) != nullptr; }
     ~Files() {
-        const char* names[] = {"root.proto", "types.proto", "extra.proto"};
+        const char* names[] = {"root.proto", "types.proto", "extra.proto", "mid.proto"};
         for (const char* name : names) {
             char path[256];
             snprintf(path, sizeof(path), "%s/%s", directory, name);
@@ -232,6 +232,63 @@ TEST(protobuf_source, imported_package_namespace_shadows_outer_type_fallback) {
             CHECK(result.error().kind == SourceError::Kind::Schema);
         } else
             REQUIRE(result.has_value());
+    }
+}
+TEST(protobuf_source, transitive_symbols_do_not_shadow_visible_outer_type) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; package p.x; message A {}"));
+    REQUIRE(files.write_file("extra.proto", "syntax='proto3'; package p.q.x; message A {}"));
+    REQUIRE(files.write_file("mid.proto", "syntax='proto3'; package p.q; import 'extra.proto';"));
+    REQUIRE(files.write_file("root.proto",
+                             "syntax='proto3'; package p.q; import 'types.proto'; import "
+                             "'mid.proto'; message M { x.A value=1; }"));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE(result.has_value());
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; package p.q; import 'mid.proto'; message M { x.A value=1; }"));
+    storage.arena.reset();
+    result = files.load(storage);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Schema);
+}
+TEST(protobuf_source, qualified_name_limit_is_reported_before_join_allocation) {
+    Files files;
+    REQUIRE(files.ok);
+    char source[5000];
+    const char* prefix = "syntax='proto3'; package ";
+    const u32 prefix_len = static_cast<u32>(strlen(prefix));
+    memcpy(source, prefix, prefix_len);
+    u32 offset = prefix_len;
+    for (u32 i = 0; i < 2100; ++i) {
+        source[offset++] = 'a';
+        if (i + 1 < 2100) source[offset++] = '.';
+    }
+    const char* suffix = "; message A {}";
+    memcpy(source + offset, suffix, strlen(suffix) + 1);
+    REQUIRE(files.write_file("root.proto", source));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Limit);
+
+    const u32 lengths[] = {1022, 1023};
+    const char* boundary_suffix = ";";
+    for (u32 length : lengths) {
+        offset = prefix_len;
+        for (u32 i = 0; i < length; ++i) source[offset++] = 'a';
+        memcpy(source + offset, boundary_suffix, strlen(boundary_suffix) + 1);
+        REQUIRE(files.write_file("root.proto", source));
+        storage.arena.reset();
+        result = files.load(storage);
+        if (length == 1022)
+            REQUIRE(result.has_value());
+        else {
+            REQUIRE_FALSE(result.has_value());
+            CHECK(result.error().kind == SourceError::Kind::Limit);
+        }
     }
 }
 TEST(protobuf_source, transitive_import_does_not_grant_type_visibility) {

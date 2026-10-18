@@ -165,6 +165,12 @@ struct Compiler {
     Arena<MmapBackend>& arena;
     SchemaLimits limits;
     SourceError error{};
+    bool visible(const Source* file, const Source* owner) const {
+        if (file == owner) return true;
+        for (const Import* imported = file->imports; imported; imported = imported->next)
+            if (imported->source == owner) return true;
+        return false;
+    }
     Str root_directory{};
     Source* sources = nullptr;
     NamedMessage* messages = nullptr;
@@ -280,17 +286,8 @@ struct Compiler {
                                 item->column,
                                 {});
                 for (const NamedMessage* type = messages; type; type = type->next)
-                    if (type->concrete && type->name.eq(kCandidate)) {
-                        bool visible = type->file == item->file;
-                        for (const Import* imported = item->file->imports; imported;
-                             imported = imported->next)
-                            visible = visible || imported->source == type->file;
-                        if (!visible)
-                            return fail(SourceError::Kind::Schema,
-                                        item->file->name,
-                                        item->line,
-                                        item->column,
-                                        lit_str("message type requires a direct import"));
+                    if (type->concrete && type->name.eq(kCandidate) &&
+                        visible(item->file, type->file)) {
                         found = type->name;
                         break;
                     }
@@ -305,13 +302,14 @@ struct Compiler {
                                 item->column,
                                 {});
                 for (const NamedMessage* symbol = messages; symbol; symbol = symbol->next) {
-                    if (symbol->name.eq(kFirst) ||
-                        (symbol->name.len > kFirst.len && symbol->name.ptr[kFirst.len] == '.' &&
-                         Str{symbol->name.ptr, kFirst.len}.eq(kFirst)))
+                    if (visible(item->file, symbol->file) &&
+                        (symbol->name.eq(kFirst) ||
+                         (symbol->name.len > kFirst.len && symbol->name.ptr[kFirst.len] == '.' &&
+                          Str{symbol->name.ptr, kFirst.len}.eq(kFirst))))
                         shadowed = true;
                 }
                 for (const Source* package = sources; package; package = package->next) {
-                    if (kFirst.len > 1) {
+                    if (visible(item->file, package) && kFirst.len > 1) {
                         const Str kPackagePrefix{kFirst.ptr + 1, kFirst.len - 1};
                         if (package->package.eq(kPackagePrefix) ||
                             (package->package.len > kPackagePrefix.len &&
@@ -410,12 +408,16 @@ bool Parser::name(Str& out, bool qualified) {
     const bool kAbsolute = qualified && take(lit_str("."));
     if (token.kind != Token::Kind::Ident)
         return fail(SourceError::Kind::Syntax, lit_str("identifier"));
+    if (kAbsolute && token.text.len > 1023)
+        return fail(SourceError::Kind::Limit, lit_str("name length"));
     out = token.text;
     advance();
     if (kAbsolute) out = compiler.join({}, '.', out);
     while (qualified && take(lit_str("."))) {
         if (token.kind != Token::Kind::Ident)
             return fail(SourceError::Kind::Syntax, lit_str("type name"));
+        if (out.len >= 1024 || token.text.len > 1023 - out.len)
+            return fail(SourceError::Kind::Limit, lit_str("name length"));
         out = compiler.join(out, '.', token.text);
         if (!out.ptr) return fail(SourceError::Kind::Allocation, {});
         advance();
@@ -572,6 +574,8 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
     advance();
     Str message_name{};
     if (!name(message_name)) return false;
+    if (message_name.len > 1022 || scope.len > 1022 - message_name.len)
+        return fail(SourceError::Kind::Limit, lit_str("name length"));
     const Str kFullName = compiler.join(scope, '.', message_name);
     auto* named = compiler.arena.alloc_t<NamedMessage>();
     auto* descriptor = compiler.arena.alloc_t<Buffer>(compiler.arena);
@@ -676,6 +680,8 @@ bool Parser::file() {
             if (!name(source.package, true)) return false;
             if (source.package.ptr[0] == '.')
                 return fail(SourceError::Kind::Syntax, lit_str("package name"));
+            if (source.package.len > 1022)
+                return fail(SourceError::Kind::Limit, lit_str("name length"));
             if (!expect(lit_str(";"))) return false;
             source.descriptor->text(2, source.package);
         } else if (take(lit_str("import"))) {
