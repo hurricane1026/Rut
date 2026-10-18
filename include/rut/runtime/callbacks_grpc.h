@@ -766,6 +766,26 @@ void grpc_response_headers(
     }
     const bool web =
         response_mode == GrpcWebContentType::Binary || response_mode == GrpcWebContentType::Text;
+    const bool filtered_has_status = grpc_has_status(filtered, filtered_n);
+    const u8 observed_status = end ? grpc_observed_status(filtered, filtered_n) : 2;
+    // Decide before Web trailer encoding or any downstream output staging.
+    if (end && raw_status_count == 1 && content_type_count == 1 && filtered_has_status &&
+        grpc_observed_status(hs, n) == observed_status &&
+        grpc_retry_can_schedule(*x, observed_status)) {
+        const u64 now = monotonic_us();
+        const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
+        if (!x->deadline_us || retry_at < x->deadline_us) {
+            if (x->upstream) grpc_record_rpc_success(dispatch->loop, *x->upstream, now);
+            x->retry_pending = true;
+            x->retry_at_us = retry_at > now ? retry_at : now + 1;
+            x->retry_reason = observed_status;
+            return;
+        }
+        x->failure = 4;
+        x->response_end = true;
+        grpc_detach_upstream_exchange(dispatch->loop, h, *x);
+        return;
+    }
     if (web && backend_terminal) {
         if (const u8 framing_status = x->response_message.feed(nullptr, 0, true)) {
             x->failure = framing_status;
@@ -779,22 +799,6 @@ void grpc_response_headers(
         }
         if (!grpc_web_force_content_type(*x, filtered, &filtered_n, Http2Conn::kMaxHeadersPerReq)) {
             x->failure = 8;
-        }
-    }
-    const bool filtered_has_status = grpc_has_status(filtered, filtered_n);
-    const u8 observed_status = end ? grpc_observed_status(filtered, filtered_n) : 2;
-    // Retry only a syntactically valid, single backend trailers-only status.
-    // Mutations must leave the triggering status unchanged.
-    if (end && raw_status_count == 1 && content_type_count == 1 && filtered_has_status &&
-        grpc_observed_status(hs, n) == observed_status &&
-        grpc_retry_can_schedule(*x, observed_status)) {
-        const u64 now = monotonic_us();
-        const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
-        if (!x->deadline_us || retry_at < x->deadline_us) {
-            x->retry_pending = true;
-            x->retry_at_us = retry_at > now ? retry_at : now + 1;
-            x->retry_reason = observed_status;
-            return;
         }
     }
     if (web && backend_terminal) {
