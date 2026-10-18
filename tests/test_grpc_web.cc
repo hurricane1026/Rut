@@ -1,4 +1,4 @@
-#include "rut/runtime/grpc_web.h"
+#include "rut/runtime/grpc_protocol.h"
 #include "test.h"
 
 #include <string.h>
@@ -18,6 +18,17 @@ TEST(grpc_web, content_type_classification) {
     CHECK_EQ(grpc_web_content_type(lit_str("application/grpc-webish")), GrpcWebContentType::Other);
     CHECK_EQ(grpc_web_content_type(lit_str("application/grpc-web+json")),
              GrpcWebContentType::Other);
+}
+
+TEST(grpc_web, backend_representation_matches_advertised_proto_type) {
+    CHECK(grpc_web_native_proto_content_type(lit_str("application/grpc")));
+    CHECK(grpc_web_native_proto_content_type(lit_str("Application/Grpc+Proto ; charset=UTF-8")));
+    CHECK(!grpc_web_native_proto_content_type(lit_str("application/grpc+json")));
+    CHECK(!grpc_web_native_proto_content_type(lit_str("application/grpc+custom")));
+    CHECK(!grpc_web_native_proto_content_type(lit_str("application/grpc-web+proto")));
+    CHECK(!grpc_web_native_proto_content_type(lit_str("application/grpc+proto-extra")));
+    CHECK(grpc_content_type(lit_str("application/grpc+json")));
+    CHECK(grpc_content_type(lit_str("application/grpc+custom")));
 }
 
 TEST(grpc_web, base64_decoder_handles_arbitrary_splits_and_padded_blocks) {

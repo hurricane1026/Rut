@@ -583,6 +583,8 @@ void grpc_response_headers(
     u32 http_status = 0;
     bool content_type = false;
     bool invalid_content_length = false;
+    const bool web_response =
+        x->web_mode == GrpcWebContentType::Binary || x->web_mode == GrpcWebContentType::Text;
     for (u32 i = 0; i < n; i++) {
         if (hs[i].name.eq({":status", 7})) {
             if (hs[i].value.len == 3 && hs[i].value.ptr[0] == '1') return;
@@ -592,7 +594,9 @@ void grpc_response_headers(
                     static_cast<u32>((hs[i].value.ptr[0] - '0') * 100 +
                                      (hs[i].value.ptr[1] - '0') * 10 + hs[i].value.ptr[2] - '0');
         }
-        if (hs[i].name.eq({"content-type", 12})) content_type = grpc_content_type(hs[i].value);
+        if (hs[i].name.eq({"content-type", 12}))
+            content_type = web_response ? grpc_web_native_proto_content_type(hs[i].value)
+                                        : grpc_content_type(hs[i].value);
         if (hs[i].name.eq({"content-length", 14})) {
             u32 length = 0;
             if (x->has_response_length || !grpc_parse_content_length(hs[i].value, &length))
@@ -628,7 +632,7 @@ void grpc_response_headers(
                 break;
         }
         x->response_end = true;
-        if (invalid_content_length) x->failure = 13;
+        if (invalid_content_length || (web_response && status && !content_type)) x->failure = 13;
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
@@ -836,8 +840,8 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
         x->response_end = true;
         if (x->web_mode == GrpcWebContentType::Binary || x->web_mode == GrpcWebContentType::Text) {
             x->web_response_invalid = !grpc_web_response_boundary(*x);
-            const u32 dropped = x->web_response_invalid ? x->download_len
-                                                        : grpc_web_drop_unstaged_response(*x);
+            const u32 dropped =
+                x->web_response_invalid ? x->download_len : grpc_web_drop_unstaged_response(*x);
             h.consume_data(x->upstream_stream, dropped);
         } else {
             h.consume_data(x->upstream_stream, x->download_len);
@@ -1409,8 +1413,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             }
             const bool web = x->web_mode == GrpcWebContentType::Binary ||
                              x->web_mode == GrpcWebContentType::Text;
-            if (web && x->failure)
-                x->web_response_invalid = !grpc_web_response_boundary(*x);
+            if (web && x->failure) x->web_response_invalid = !grpc_web_response_boundary(*x);
             if (web && x->failure && !x->web_response_invalid) {
                 x->response_end = true;
                 const u32 dropped = grpc_web_drop_unstaged_response(*x);

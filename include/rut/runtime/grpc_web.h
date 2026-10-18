@@ -16,6 +16,17 @@ inline bool grpc_web_token_equal(Str value, Str token) {
     return true;
 }
 
+// The Web bridge advertises protobuf representations only. Native forwarding
+// keeps its broader subtype compatibility separately.
+inline bool grpc_web_native_proto_content_type(Str value) {
+    u32 end = 0;
+    while (end < value.len && value.ptr[end] != ';') end++;
+    while (end && (value.ptr[end - 1] == ' ' || value.ptr[end - 1] == '\t')) end--;
+    const Str media{value.ptr, end};
+    return grpc_web_token_equal(media, {"application/grpc", 16}) ||
+           grpc_web_token_equal(media, {"application/grpc+proto", 22});
+}
+
 inline GrpcWebContentType grpc_web_content_type(Str value) {
     u32 end = 0;
     while (end < value.len && value.ptr[end] != ';') end++;
