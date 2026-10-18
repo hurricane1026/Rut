@@ -415,12 +415,6 @@ inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
     if (current != conn.request_config) return;
     grpc_record_connect_result(conn, true, now_us);
 }
-template <typename Loop>
-inline void grpc_record_handshake_result(Loop* loop, Connection& conn, bool success, u64 now_us) {
-    const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (current != conn.request_config) return;
-    grpc_record_handshake_result(conn, success, now_us);
-}
 inline bool grpc_parse_content_length(Str value, u32* out) {
     if (value.len == 0) return false;
     u32 parsed = 0;
