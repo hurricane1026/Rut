@@ -481,7 +481,9 @@ formats the remaining duration into upstream HEADERS only when they are sent,
 including after connection setup or retry. If the field is absent, it stays
 absent upstream. An expired deadline before send returns DEADLINE_EXCEEDED
 (status 4) without sending request HEADERS. Timers use the existing precise
-mechanism (millisecond granularity); failures use gRPC status trailers. Before any upstream HTTP/2
+mechanism (millisecond granularity). If retry backoff cannot fit strictly
+before the original deadline, the RPC ends with DEADLINE_EXCEEDED (status 4)
+without binding another endpoint. Failures use gRPC status trailers. Before any upstream HTTP/2
 preface or other wire bytes are sent, socket creation, connect submission, and
 TCP connect failures may advance to another distinct configured endpoint, up
 to three endpoints total (or the address count when smaller). This preserves
