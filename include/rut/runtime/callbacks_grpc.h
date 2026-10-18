@@ -1354,11 +1354,15 @@ inline GrpcWebContentType grpc_web_response_mode(const hpack::Header* headers,
         if (candidates[i].present) continue;
         candidates[i] = wildcard;
     }
-    const u16 binary_q = candidates[0].present ? candidates[0].quality : 0;
-    const u16 text_q = candidates[1].present ? candidates[1].quality : 0;
+    const Candidate binary = candidates[0];
+    const Candidate text = candidates[1];
+    const u16 binary_q = binary.present ? binary.quality : 0;
+    const u16 text_q = text.present ? text.quality : 0;
     if (binary_q == 0 && text_q == 0) return GrpcWebContentType::Other;
-    if (binary_q > text_q) return GrpcWebContentType::Binary;
-    if (text_q > binary_q) return GrpcWebContentType::Text;
+    if (binary_q > text_q || (binary_q == text_q && binary.specificity > text.specificity))
+        return GrpcWebContentType::Binary;
+    if (text_q > binary_q || (binary_q == text_q && text.specificity > binary.specificity))
+        return GrpcWebContentType::Text;
     if (request_mode == GrpcWebContentType::Binary && binary_q) return request_mode;
     if (request_mode == GrpcWebContentType::Text && text_q) return request_mode;
     return first_mode == 2 ? GrpcWebContentType::Text : GrpcWebContentType::Binary;

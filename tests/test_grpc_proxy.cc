@@ -2853,11 +2853,19 @@ TEST(grpc_proxy, grpc_web_accept_selects_response_mode_independently) {
          lit_str("application/grpc-web; q=0.8, application/grpc-web-text;q=0.2")}};
     const hpack::Header wildcard_exclusion[] = {
         {lit_str("accept"), lit_str("application/grpc-web-text;q=0, */*;q=1")}};
+    const hpack::Header text_over_binary_wildcard[] = {
+        {lit_str("accept"), lit_str("application/grpc-web-text;q=1, */*;q=1")}};
+    const hpack::Header binary_over_text_wildcard[] = {
+        {lit_str("accept"), lit_str("application/grpc-web;q=1, application/*;q=1")}};
     const hpack::Header duplicate_q[] = {
         {lit_str("accept"), lit_str("application/grpc-web-text;q=1;q=0")}};
     CHECK_EQ(mode_for(GrpcWebContentType::Binary, text_accept, 1), GrpcWebContentType::Text);
     CHECK_EQ(mode_for(GrpcWebContentType::Text, binary_accept, 1), GrpcWebContentType::Binary);
     CHECK_EQ(mode_for(GrpcWebContentType::Text, wildcard_exclusion, 1), GrpcWebContentType::Binary);
+    CHECK_EQ(mode_for(GrpcWebContentType::Binary, text_over_binary_wildcard, 1),
+             GrpcWebContentType::Text);
+    CHECK_EQ(mode_for(GrpcWebContentType::Text, binary_over_text_wildcard, 1),
+             GrpcWebContentType::Binary);
     CHECK_EQ(mode_for(GrpcWebContentType::Binary, duplicate_q, 1), GrpcWebContentType::Other);
     CHECK_EQ(mode_for(GrpcWebContentType::Text, nullptr, 0), GrpcWebContentType::Text);
 
