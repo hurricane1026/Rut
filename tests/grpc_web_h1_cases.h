@@ -795,6 +795,34 @@ TEST(grpc_proxy, h1_content_type_override_fails_closed) {
              static_cast<u32>(GrpcWebH1Start::Rejected));
 }
 
+TEST(grpc_proxy, h1_accept_override_selects_final_response_mode) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, 1));
+    config.upstreams[0].http2 = true;
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    u8 storage[512]{};
+    static constexpr char request[] =
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc-web\r\nAccept: application/grpc-web\r\n"
+        "Content-Length: 0\r\n\r\n";
+    grpc_web_test_init_raw_request(*conn, storage, sizeof(storage), request, sizeof(request) - 1);
+    conn->req_header_override_count = 1;
+    conn->req_header_overrides[0] = {lit_str("Accept"), lit_str("application/grpc-web-text")};
+
+    CHECK_EQ(static_cast<u32>(grpc_web_h1_start<EpollEventLoop>(&loop, *conn, &config, 0, true)),
+             static_cast<u32>(GrpcWebH1Start::Started));
+    REQUIRE(conn->h2 != nullptr);
+    GrpcExchange* exchange = grpc_find(*conn->h2, 1);
+    REQUIRE(exchange != nullptr);
+    CHECK_EQ(exchange->web_mode, GrpcWebContentType::Binary);
+    CHECK_EQ(exchange->web_response_mode, GrpcWebContentType::Text);
+    loop.force_close_all();
+    loop.shutdown();
+}
+
 TEST(grpc_proxy, h1_duplicate_web_family_content_types_fail_closed_in_both_orders) {
     const char* requests[] = {
         "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"

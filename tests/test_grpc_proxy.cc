@@ -2859,6 +2859,25 @@ TEST(grpc_proxy, grpc_web_accept_selects_response_mode_independently) {
         {lit_str("accept"), lit_str("application/grpc-web;q=1, application/*;q=1")}};
     const hpack::Header duplicate_q[] = {
         {lit_str("accept"), lit_str("application/grpc-web-text;q=1;q=0")}};
+    const hpack::Header multiple_physical[] = {
+        {lit_str("accept"), lit_str("application/grpc-web-text;q=0.4")},
+        {lit_str("accept"), lit_str("application/grpc-web;q=0.9")}};
+    const hpack::Header ows[] = {
+        {lit_str("accept"), lit_str(" \t application/grpc-web-text \t; q = 0.7 \t")}};
+    const hpack::Header both_zero[] = {
+        {lit_str("accept"), lit_str("application/grpc-web;q=0, application/grpc-web-text;q=0")}};
+    const hpack::Header unknown_only[] = {
+        {lit_str("accept"), lit_str("application/json, text/plain;q=0.5")}};
+    const hpack::Header same_q_tie[] = {
+        {lit_str("accept"),
+         lit_str("application/grpc-web;q=0.7, application/grpc-web-text;q=0.7")}};
+    const hpack::Header bad_q_values[][1] = {
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=")}},
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=2")}},
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=1.001")}},
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=0.1234")}},
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=-0.1")}},
+    };
     CHECK_EQ(mode_for(GrpcWebContentType::Binary, text_accept, 1), GrpcWebContentType::Text);
     CHECK_EQ(mode_for(GrpcWebContentType::Text, binary_accept, 1), GrpcWebContentType::Binary);
     CHECK_EQ(mode_for(GrpcWebContentType::Text, wildcard_exclusion, 1), GrpcWebContentType::Binary);
@@ -2868,6 +2887,25 @@ TEST(grpc_proxy, grpc_web_accept_selects_response_mode_independently) {
              GrpcWebContentType::Binary);
     CHECK_EQ(mode_for(GrpcWebContentType::Binary, duplicate_q, 1), GrpcWebContentType::Other);
     CHECK_EQ(mode_for(GrpcWebContentType::Text, nullptr, 0), GrpcWebContentType::Text);
+
+    struct AcceptCase {
+        GrpcWebContentType request_mode;
+        const hpack::Header* headers;
+        u32 count;
+        GrpcWebContentType expected;
+    };
+    const AcceptCase cases[] = {
+        {GrpcWebContentType::Binary, multiple_physical, 2, GrpcWebContentType::Binary},
+        {GrpcWebContentType::Binary, ows, 1, GrpcWebContentType::Text},
+        {GrpcWebContentType::Text, both_zero, 1, GrpcWebContentType::Other},
+        {GrpcWebContentType::Text, unknown_only, 1, GrpcWebContentType::Text},
+        {GrpcWebContentType::Binary, same_q_tie, 1, GrpcWebContentType::Binary},
+        {GrpcWebContentType::Text, same_q_tie, 1, GrpcWebContentType::Text},
+    };
+    for (const auto& test : cases)
+        CHECK_EQ(mode_for(test.request_mode, test.headers, test.count), test.expected);
+    for (const auto& bad_q : bad_q_values)
+        CHECK_EQ(mode_for(GrpcWebContentType::Binary, bad_q, 1), GrpcWebContentType::Other);
 
     struct ModeCase {
         GrpcWebContentType request_mode;
