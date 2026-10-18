@@ -1765,6 +1765,19 @@ inline GrpcWebContentType grpc_web_response_mode(const hpack::Header* headers,
     return first_mode == 2 ? GrpcWebContentType::Text : GrpcWebContentType::Binary;
 }
 
+inline u32 grpc_select_retry_backend(u16 upstream_id, u32 backend_count, u8 tried_mask, u64 now) {
+    if (!backend_count) return backend_count;
+    const u32 start = select_backend(upstream_id, backend_count, now);
+    for (u32 step = 0; step < backend_count; step++) {
+        const u32 candidate = (start + step) % backend_count;
+        const u8 bit = static_cast<u8>(1u << candidate);
+        if (!(tried_mask & bit) && !backend_ejected(upstream_id, candidate, now)) {
+            return candidate;
+        }
+    }
+    return start;
+}
+
 template <typename Loop>
 bool grpc_bind_retry_attempt(Loop* loop, GrpcExchange& x, u64 now) {
     if constexpr (!(requires(Loop* l, Connection& c) {
@@ -1780,14 +1793,8 @@ bool grpc_bind_retry_attempt(Loop* loop, GrpcExchange& x, u64 now) {
         if (x.upstream_id >= cfg->upstream_count) return false;
         const auto& target = cfg->upstreams[x.upstream_id];
         if (!target.addr_count) return false;
-        u32 backend = target.addr_count;
-        for (u32 i = 0; i < target.addr_count && i < 8; ++i)
-            if (!(x.retry_tried_mask & (1u << i)) && !backend_ejected(x.upstream_id, i, now)) {
-                backend = i;
-                break;
-            }
-        if (backend == target.addr_count)
-            backend = select_backend(x.upstream_id, target.addr_count, now);
+        const u32 backend =
+            grpc_select_retry_backend(x.upstream_id, target.addr_count, x.retry_tried_mask, now);
         Connection* up = nullptr;
         for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next)
             if (grpc_upstream_reusable(*c, cfg, x.upstream_id, backend)) {
@@ -2822,8 +2829,13 @@ void grpc_tick(Loop* loop, Connection& conn) {
         }
         if (h.grpc.control_len > control_before) grpc_drive_upstream(loop, conn);
     } else {
-        for (auto* x : h.grpc.streams)
-            if (x && x->deadline_us && now >= x->deadline_us) x->failure = 4;
+        for (auto* x : h.grpc.streams) {
+            if (!x || !x->deadline_us || now < x->deadline_us) continue;
+            x->retry_pending = false;
+            x->retry_at_us = 0;
+            x->failure = 4;
+            x->response_end = true;
+        }
         grpc_kick_downstream(loop, conn);
     }
     if (conn.h2) loop->timer.refresh(&conn, 1);
