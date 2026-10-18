@@ -312,11 +312,11 @@ struct Compiler {
                 }
                 for (const Source* package = sources; package; package = package->next) {
                     if (kFirst.len > 1) {
-                        const Str package_prefix{kFirst.ptr + 1, kFirst.len - 1};
-                        if (package->package.eq(package_prefix) ||
-                            (package->package.len > package_prefix.len &&
-                             package->package.ptr[package_prefix.len] == '.' &&
-                             Str{package->package.ptr, package_prefix.len}.eq(package_prefix)))
+                        const Str kPackagePrefix{kFirst.ptr + 1, kFirst.len - 1};
+                        if (package->package.eq(kPackagePrefix) ||
+                            (package->package.len > kPackagePrefix.len &&
+                             package->package.ptr[kPackagePrefix.len] == '.' &&
+                             Str{package->package.ptr, kPackagePrefix.len}.eq(kPackagePrefix)))
                             shadowed = true;
                     }
                 }
@@ -806,10 +806,10 @@ core::Expected<Schema, SourceError> load_proto_source(Arena<MmapBackend>& arena,
         return core::make_unexpected(SourceError{SourceError::Kind::Allocation, {}, 1, 1, {}});
     auto schema = load_descriptor_set(arena, bytes, set.size, limits);
     if (!schema) {
-        const SourceError::Kind kind = schema.error() == SchemaError::Allocation
-                                           ? SourceError::Kind::Allocation
-                                           : SourceError::Kind::Schema;
-        return core::make_unexpected(SourceError{kind,
+        const SourceError::Kind kKind = schema.error() == SchemaError::Allocation
+                                            ? SourceError::Kind::Allocation
+                                            : SourceError::Kind::Schema;
+        return core::make_unexpected(SourceError{kKind,
                                                  compiler.sources ? compiler.sources->name : kName,
                                                  1,
                                                  1,
