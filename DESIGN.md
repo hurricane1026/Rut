@@ -1398,6 +1398,15 @@ timeout closes the session and fails unfinished RPCs with UNAVAILABLE without
 replay. Idle pooled sessions, handshakes and GOAWAY-draining sessions do not
 start probes. PING does not implement the protobuf gRPC Health service.
 
+HTTP/2 parsing reserves room for the next complete receive after compacting
+incomplete input. If the remaining tail space is below 16 KiB, the connection
+promotes its receive buffer to one 256 KiB bulk slice. A legal 16 KiB DATA frame
+can otherwise leave nonzero but insufficient space for the next io_uring
+provided-buffer completion. Complete small requests keep their ordinary receive
+slice. Input buffered while a downstream send is pending uses the same headroom
+guard without parsing or altering that send. Allocation failure closes the
+connection while its original compacted slice remains owned.
+
 Per-RPC queues use the existing bulk SlicePool. Each queue is bounded by the
 65,535-byte stream receive window; window credit returns when bytes move into
 owned send buffers. Kernel sends never borrow an RPC queue, so reset/deadline/

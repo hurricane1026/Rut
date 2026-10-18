@@ -494,6 +494,7 @@ struct Client {
 template <typename Loop>
 void streaming_case(rut::test::TestCase* _tc,
                     bool tls = false,
+                    bool large_first = false,
                     bool upstream_tls = false,
                     bool mutual = false) {
     auto server = std::make_unique<EchoServer>();
@@ -580,7 +581,7 @@ void streaming_case(rut::test::TestCase* _tc,
         const bool connected = a.init(get_port(lfd), tls) && b.init(get_port(lfd), tls);
         CHECK(connected);
         if (connected) {
-            CHECK_EQ(a.request(0, 128, false), 1);
+            CHECK_EQ(a.request(0, large_first ? 200000 : 128, false), 1);
             const bool echoed = a.until(0, false);
             CHECK(echoed);  // response DATA arrives before request END_STREAM
             if (echoed) {
@@ -593,12 +594,12 @@ void streaming_case(rut::test::TestCase* _tc,
                 CHECK_EQ(b.request(0, 64, true), 1);
                 CHECK(b.until(0, true));  // a second downstream shares the same upstream
                 CHECK(b.rpcs[0].ok);
-                a.rpcs[0].size = 100000;
+                a.rpcs[0].size = large_first ? 300000 : 100000;
                 a.rpcs[0].end = true;
                 CHECK_EQ(nghttp2_session_resume_data(a.session, 1), 0);
                 CHECK(a.until(0, true));
                 CHECK(a.rpcs[0].ok && a.rpcs[0].trailer);
-                CHECK_EQ(a.rpcs[0].received, 100000u);
+                CHECK_EQ(a.rpcs[0].received, large_first ? 300000u : 100000u);
                 CHECK_EQ(server->accepts.load(), 1u);
                 CHECK_EQ(server->requests.load(), 3u);
                 CHECK_EQ(a.request(2, 32, false), 5);
@@ -1857,6 +1858,12 @@ TEST(grpc_proxy, streaming_and_pooling_epoll) {
 TEST(grpc_proxy, streaming_and_pooling_iouring) {
     streaming_case<IoUringEventLoop>(_tc);
 }
+TEST(grpc_proxy, first_large_streaming_rpc_epoll) {
+    streaming_case<EpollEventLoop>(_tc, false, true);
+}
+TEST(grpc_proxy, first_large_streaming_rpc_iouring) {
+    streaming_case<IoUringEventLoop>(_tc, false, true);
+}
 TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     GrpcBackendHealthReset health_reset{};
     auto loop = std::make_unique<EventLoop<MockBackend>>();
@@ -3111,16 +3118,16 @@ TEST(grpc_proxy, tls_downstream_jit_iouring) {
     streaming_case<IoUringEventLoop>(_tc, true);
 }
 TEST(grpc_proxy, upstream_tls_epoll) {
-    streaming_case<EpollEventLoop>(_tc, false, true);
+    streaming_case<EpollEventLoop>(_tc, false, false, true);
 }
 TEST(grpc_proxy, upstream_tls_iouring) {
-    streaming_case<IoUringEventLoop>(_tc, false, true);
+    streaming_case<IoUringEventLoop>(_tc, false, false, true);
 }
 TEST(grpc_proxy, upstream_mtls_epoll) {
-    streaming_case<EpollEventLoop>(_tc, true, true, true);
+    streaming_case<EpollEventLoop>(_tc, true, false, true, true);
 }
 TEST(grpc_proxy, upstream_mtls_iouring) {
-    streaming_case<IoUringEventLoop>(_tc, true, true, true);
+    streaming_case<IoUringEventLoop>(_tc, true, false, true, true);
 }
 
 namespace {
