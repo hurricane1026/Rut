@@ -1470,8 +1470,10 @@ The gRPC-Web bridge accepts HTTP/2 and HTTP/1.1 POST requests with binary
 encodes terminal metadata as a final 0x80 trailer envelope in the response
 body. The strict incremental request decoder accepts arbitrary input
 boundaries and independently padded base64 flush blocks, rejecting invalid
-alphabet, padding and non-canonical pad bits. Payloads remain opaque,
-including compressed messages. Web message limits inspect the decoded
+alphabet, padding and non-canonical pad bits. Text responses flush an
+independently padded base64 block at each native message boundary, so a
+long-lived stream delivers a complete message without waiting for later data.
+Payloads remain opaque, including compressed messages. Web message limits inspect the decoded
 five-byte envelope and wire payload; text encoding does not change that limit.
 
 Both Web transports use bounded queues and the existing RPC deadline,
