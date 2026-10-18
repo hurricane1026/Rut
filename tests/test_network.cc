@@ -88548,3 +88548,59 @@ TEST(epoll_splice, relay_read_and_write_tokens_keep_episode_and_independent_fd_s
 }
 
 #endif
+
+TEST(http2, buffered_upload_during_send_preserves_headroom_and_send_owner) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    // The legacy mock loop has no bulk budget; match production pool support.
+    loop->pool.destroy();
+    REQUIRE(loop->pool.init(128, 0, SlicePool::kMaxCachedSlices, 8).has_value());
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE(conn->fd >= 0);
+    conn->protocol = ConnProtocol::Http2;
+    conn->keep_alive = true;
+    auto callback = +[](void*, Connection&, IoEvent) {};
+    conn->transition_to_sending(callback);
+    conn->send_progress = 123;
+    u8 bytes[4096];
+    for (u32 i = 0; i < sizeof(bytes); i++) bytes[i] = static_cast<u8>(i * 17u);
+    REQUIRE_EQ(conn->recv_buf.write(bytes, sizeof(bytes)), sizeof(bytes));
+    loop->backend.clear_ops();
+    loop->handle_unhandled_recv(*conn, make_ev(conn->id, IoEventType::Recv, sizeof(bytes)));
+    REQUIRE(conn->fd >= 0);
+    CHECK(loop->pool.is_bulk(conn->recv_slice));
+    CHECK_EQ(conn->recv_buf.len(), sizeof(bytes));
+    CHECK_EQ(__builtin_memcmp(conn->recv_buf.data(), bytes, sizeof(bytes)), 0);
+    CHECK_EQ(conn->on_send, callback);
+    CHECK_EQ(conn->send_progress, 123u);
+    CHECK_EQ(loop->backend.count_ops(MockOp::Recv), 0u);
+    loop->close_conn(*conn);
+    loop->shutdown();
+}
+
+TEST(http2, buffered_upload_promotion_failure_closes_once) {
+    auto loop = std::make_unique<EventLoop<MockBackend>>();
+    REQUIRE(loop->init(0, -1).has_value());
+    // The legacy mock loop has no bulk budget; match production pool support.
+    loop->pool.destroy();
+    REQUIRE(loop->pool.init(128, 0, SlicePool::kMaxCachedSlices, 8).has_value());
+    Connection* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->fd = dup(STDERR_FILENO);
+    REQUIRE(conn->fd >= 0);
+    conn->protocol = ConnProtocol::Http2;
+    conn->keep_alive = true;
+    conn->transition_to_sending(+[](void*, Connection&, IoEvent) {});
+    conn->recv_buf.commit(1);
+    const u32 free_before = loop->free_top;
+    const u32 bulk_max = loop->pool.bulk_max_count;
+    loop->pool.bulk_max_count = 0;
+    loop->handle_unhandled_recv(*conn, make_ev(conn->id, IoEventType::Recv, 1));
+    loop->pool.bulk_max_count = bulk_max;
+    CHECK(conn->fd < 0);
+    CHECK_EQ(loop->free_top, free_before + 1);
+    CHECK_EQ(loop->pending_free_count, 0u);
+    loop->shutdown();
+}
