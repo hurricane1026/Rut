@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""Three-host HTTP streaming benchmark. Python standard library only."""
+import argparse
+import hashlib
+import http.client
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+
+def save(path, value):
+    path.write_text(json.dumps(value, indent=2) + '\n')
+
+
+def capture(argv):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        return {'command': argv, 'returncode': r.returncode,
+                'stdout': r.stdout, 'stderr': r.stderr}
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {'command': argv, 'error': str(e)}
+
+
+def snapshot(out, binaries=()):
+    data = {'time': time.time(), 'uname': list(os.uname()),
+            'affinity': sorted(os.sched_getaffinity(0)),
+            'network': [capture(c) for c in (
+                ['ip', '-details', 'link'], ['ip', 'route'], ['ss', '-s'])],
+            'binaries': {}}
+    for binary in binaries:
+        p = Path(shutil.which(binary) or binary).resolve()
+        data['binaries'][str(p)] = hashlib.sha256(p.read_bytes()).hexdigest()
+    save(out, data)
+
+
+def positive(s):
+    n = int(s)
+    if n <= 0:
+        raise argparse.ArgumentTypeError('must be positive')
+    return n
+
+
+def payload(size):
+    pattern = bytes(range(256))
+    return (pattern * ((size + 255) // 256))[:size]
+
+
+def config(out, body_size, origin, port, workers):
+    out.mkdir(parents=True, exist_ok=False)
+    (out / 'proxy').write_bytes(payload(body_size))
+    # Paths embedded in nginx syntax must not contain quotes or control chars.
+    root = str(out.resolve())
+    if any(c in root for c in '"\\\n\r'):
+        raise ValueError('unsupported output path characters')
+    common = (f'worker_processes {workers};\ndaemon off;\n'
+              'error_log stderr warn;\npid nginx.pid;\n'
+              'events { worker_connections 65536; }\nhttp {\n'
+              'access_log off; default_type application/octet-stream;\n'
+              'sendfile on; tcp_nopush off; tcp_nodelay on;\n'
+              'keepalive_timeout 60s; keepalive_requests 1000000000;\n')
+    origin_conf = (common + f'server {{ listen 0.0.0.0:{port}; '
+                   f'location = /proxy {{ root "{root}"; }} }}\n}}\n')
+    (out / 'origin.conf').write_text(origin_conf)
+    if origin:
+        host, upstream_port = origin.rsplit(':', 1)
+        ipaddress.IPv4Address(host)
+        if not 1 <= int(upstream_port) <= 65535:
+            raise ValueError('invalid origin port')
+        (out / 'proxy.rut').write_text(
+            f'listen 0.0.0.0:{port}\nupstream backend at "{origin}"\n'
+            'route GET "/proxy" { return forward(backend) }\n')
+        (out / 'proxy.conf').write_text(common +
+            f'upstream backend {{ server {origin}; keepalive 4096; '
+            'keepalive_timeout 60s; keepalive_requests 1000000000; }\n'
+            f'server {{ listen 0.0.0.0:{port}; location = /proxy {{ '
+            'proxy_pass http://backend; proxy_http_version 1.1; '
+            'proxy_set_header Host $http_host; proxy_set_header Connection ""; '
+            'proxy_buffering off; proxy_buffer_size 16k; proxy_busy_buffers_size 16k; '
+            'proxy_read_timeout 60s; } }\n}\n')
+    save(out / 'config.json', dict(body_size=body_size, origin=origin,
+                                 port=port, workers=workers))
+
+
+def serve(a):
+    out = a.config.resolve()
+    c = json.loads((out / 'config.json').read_text())
+    binary = str(Path(shutil.which(a.binary) or a.binary).resolve())
+    snapshot(out / f'{a.engine}-environment.json', [binary])
+    if a.engine == 'rut':
+        if not c['origin']:
+            raise ValueError('rut requires a proxy config with --origin')
+        env = dict(os.environ)
+        env['RUT_STUDY_HTTP_ASYNC_SPLICE'] = 'on'
+        argv = [binary, str(out / 'proxy.rut'), '--shards', str(c['workers']),
+                '--no-pin', '--drain', '1', '--opt', '2', '--backend', 'io_uring']
+    else:
+        env = dict(os.environ)
+        name = 'origin.conf' if a.engine == 'origin' else 'proxy.conf'
+        argv = [binary, '-p', str(out) + '/', '-c', str(out / name)]
+        subprocess.run(argv + ['-t'], check=True)
+    argv = ['taskset', '-c', a.cpus] + argv
+    save(out / f'{a.engine}-command.json', {'argv': argv,
+         'study_environment': {k: v for k, v in env.items() if k.startswith('RUT_STUDY_')}})
+    # Foreground execution: Ctrl-C stops this server, never unrelated processes.
+    os.execvpe(argv[0], argv, env)
+
+
+def preflight(host, port, size):
+    conn = http.client.HTTPConnection(host, port, timeout=15)
+    expected = payload(size)
+    try:
+        for _ in range(3):
+            conn.request('GET', '/proxy')
+            response = conn.getresponse()
+            assert response.status == 200, response.status
+            assert response.getheader('Content-Length') == str(size)
+            assert not response.will_close, 'response closes keepalive connection'
+            sock = conn.sock
+            assert response.read() == expected, 'response payload mismatch'
+            assert conn.sock is sock and sock is not None
+    finally:
+        conn.close()
+
+
+def parse_wrk(text):
+    rps = re.search(r'Requests/sec:\s+([\d.]+)', text)
+    p99 = re.search(r'^\s*99%\s+([\d.]+)(us|ms|s)\s*$', text, re.M)
+    errors = re.search(r'Socket errors: connect (\d+), read (\d+), write (\d+), timeout (\d+)', text)
+    statuses = re.search(r'Non-2xx or 3xx responses:\s*(\d+)', text)
+    if not rps or not p99:
+        raise ValueError('incomplete wrk output; requires --latency')
+    counts = dict(zip(('connect', 'read', 'write', 'timeout'),
+                      map(int, errors.groups() if errors else ('0',) * 4)))
+    counts['status'] = int(statuses[1]) if statuses else 0
+    return {'rps': float(rps[1]), 'p99_us': float(p99[1]) *
+            {'us': 1, 'ms': 1000, 's': 1000000}[p99[2]], 'errors': counts,
+            'valid': not any(counts.values())}
+
+
+def client(a):
+    ipaddress.IPv4Address(a.host)
+    a.output.mkdir(parents=True, exist_ok=False)
+    a.output_created = True
+    snapshot(a.output / 'environment.json', [a.wrk])
+    preflight(a.host, a.port, a.body_size)
+    argv = ['taskset', '-c', a.cpus, a.wrk, '-t', str(a.threads),
+            '-c', str(a.connections), '--latency', '--timeout', '5s']
+    url = f'http://{a.host}:{a.port}/proxy'
+    results = []
+    for name, duration in [('warmup', a.warmup), ('measurement', a.duration)]:
+        command = argv + ['-d', f'{duration}s', url]
+        r = subprocess.run(command, capture_output=True, text=True, timeout=duration + 30)
+        (a.output / f'{name}.txt').write_text(r.stdout + r.stderr)
+        row = parse_wrk(r.stdout)
+        row['valid'] = row['valid'] and r.returncode == 0
+        row.update(phase=name, command=command, returncode=r.returncode)
+        results.append(row)
+    preflight(a.host, a.port, a.body_size)
+    result = dict(engine=a.engine, repetition=a.rep, host=a.host,
+                  body_size=a.body_size, connections=a.connections,
+                  duration=a.duration, warmup=a.warmup, port=a.port, threads=a.threads, results=results,
+                  valid=all(r['valid'] for r in results))
+    save(a.output / 'result.json', result)
+    print(json.dumps(result, indent=2))
+    return 0 if result['valid'] else 1
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    sub = p.add_subparsers(dest='action', required=True)
+    c = sub.add_parser('prepare')
+    c.add_argument('--output', type=Path, required=True)
+    c.add_argument('--body-size', type=positive, default=1048576)
+    c.add_argument('--origin', help='origin IPv4:port; omit on origin host')
+    c.add_argument('--port', type=positive, default=8087)
+    c.add_argument('--workers', type=positive, default=1)
+    s = sub.add_parser('serve')
+    s.add_argument('--config', type=Path, required=True)
+    s.add_argument('--engine', choices=['origin', 'nginx', 'rut'], required=True)
+    s.add_argument('--binary', required=True)
+    s.add_argument('--cpus', required=True)
+    c = sub.add_parser('client')
+    c.add_argument('--host', required=True)
+    c.add_argument('--port', type=positive, default=8087)
+    c.add_argument('--engine', choices=['rut', 'nginx'], required=True)
+    c.add_argument('--rep', type=positive, required=True)
+    c.add_argument('--body-size', type=positive, default=1048576)
+    c.add_argument('--connections', type=positive, default=128)
+    c.add_argument('--threads', type=positive, default=4)
+    c.add_argument('--cpus', required=True)
+    c.add_argument('--wrk', default='wrk')
+    c.add_argument('--warmup', type=positive, default=5)
+    c.add_argument('--duration', type=positive, default=30)
+    c.add_argument('--output', type=Path, required=True)
+    a = p.parse_args()
+    if getattr(a, 'port', 1) > 65535:
+        p.error('port exceeds 65535')
+    if a.action == 'prepare':
+        config(a.output, a.body_size, a.origin, a.port, a.workers)
+    elif a.action == 'serve':
+        serve(a)
+    else:
+        try:
+            return client(a)
+        except (OSError, ValueError, AssertionError, http.client.HTTPException, subprocess.SubprocessError) as e:
+            if getattr(a, 'output_created', False) and not (a.output / 'result.json').exists():
+                save(a.output / 'failure.json', {'valid': False, 'error': str(e)})
+            raise
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
