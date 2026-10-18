@@ -1661,7 +1661,21 @@ TEST(grpc_proxy, timer_resume_forward_uses_http2_exchange_and_replays_buffered_d
 
 struct FailConnectLoop : EpollEventLoop {
     u32 recv_submits = 0;
-    bool submit_connect(Connection&, const void*, u32) { return false; }
+    u32 connect_submits = 0;
+    Connection* last_connect_conn = nullptr;
+    bool submit_connect(Connection& conn, const void*, u32) {
+        connect_submits++;
+        last_connect_conn = &conn;
+        return false;
+    }
+    bool detach_upstream_close(Connection& conn) {
+        if (conn.upstream_fd >= 0) close(conn.upstream_fd);
+        conn.upstream_fd = -1;
+        conn.upstream_connect_armed = false;
+        conn.upstream_recv_armed = false;
+        conn.upstream_send_armed = false;
+        return true;
+    }
     bool submit_recv(Connection& conn) {
         recv_submits++;
         return EpollEventLoop::submit_recv(conn);
@@ -1676,6 +1690,8 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     REQUIRE(loop.init(0, -1).has_value());
     RouteConfig cfg;
     REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, 2));
+    REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, 3));
     cfg.upstreams[0].http2 = true;
     Connection* down = loop.alloc_conn();
     REQUIRE(down != nullptr);
@@ -1716,8 +1732,12 @@ TEST(grpc_proxy, resumed_forward_immediate_connect_failure_emits_without_client_
     CHECK(down->h2->grpc.streams[0] == nullptr);
     CHECK(loop.grpc_upstreams == nullptr);
     CHECK_EQ(loop.recv_submits, 0u);
+    CHECK_EQ(loop.connect_submits, 3u);
     CHECK_EQ(loop.grpc_upstreams, nullptr);
     CHECK_EQ(health->fails, 0u);
+    REQUIRE(loop.last_connect_conn != nullptr);
+    CHECK(loop.last_connect_conn->timer_node.next == &loop.last_connect_conn->timer_node);
+    CHECK(loop.last_connect_conn->timer_node.prev == &loop.last_connect_conn->timer_node);
     loop.force_close_all();
     loop.shutdown();
 }
@@ -2568,6 +2588,91 @@ TEST(grpc_proxy, first_large_streaming_rpc_epoll) {
 }
 TEST(grpc_proxy, first_large_streaming_rpc_iouring) {
     streaming_case<IoUringEventLoop>(_tc, false, false, false, true);
+}
+template <typename Loop>
+void grpc_connect_failover_case(rut::test::TestCase* _tc, bool tls) {
+    (void)_tc;
+    GrpcBackendHealthReset health_reset{};
+    Loop loop;
+    if (!loop.init(0, -1).has_value()) SKIP("event backend unavailable");
+    RouteConfig cfg;
+    int reserved[4];
+    u16 ports[4];
+    for (u32 i = 0; i < 4; i++) {
+        reserved[i] = create_listen_socket(0).value_or(-1);
+        REQUIRE(reserved[i] >= 0);
+        ports[i] = get_port(reserved[i]);
+        close(reserved[i]);
+    }
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, ports[0]).has_value());
+    for (u32 i = 1; i < 4; i++) REQUIRE(cfg.upstreams[0].add_addr(0x7f000001, ports[i]));
+    cfg.upstreams[0].tls.enabled = tls;
+    const RouteConfig* cfg_ptr = &cfg;
+    loop.config_ptr = &cfg_ptr;
+
+    Connection* conn = loop.alloc_conn();
+    REQUIRE(conn != nullptr);
+    REQUIRE(loop.alloc_h2(*conn));
+    conn->h2->init_client();
+    GrpcExchange exchange;
+    exchange.init();
+    exchange.upstream = conn;
+    exchange.upstream_id = 0;
+    conn->request_config = &cfg;
+    conn->upstream_idx = 0;
+    conn->upstream_backend_idx = static_cast<u8>(select_backend(0, 4, monotonic_us()));
+    conn->h2->grpc.upstream = true;
+    conn->h2->grpc.connecting = true;
+    conn->h2->grpc.connected_at_us = 123;
+    conn->h2->grpc.connect_attempts = 1;
+    conn->h2->grpc.connect_tried_mask = static_cast<u8>(1u << conn->upstream_backend_idx);
+    conn->h2->grpc.streams[0] = &exchange;
+    conn->h2->grpc.active = 1;
+    conn->fd = conn->upstream_fd = UpstreamPool::create_socket();
+    REQUIRE(conn->fd >= 0);
+    conn->on_close = &grpc_connection_closed<Loop>;
+    conn->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);
+    REQUIRE(loop.submit_connect(*conn,
+                                &cfg.upstreams[0].addrs[conn->upstream_backend_idx],
+                                sizeof(cfg.upstreams[0].addrs[0])));
+
+    IoEvent events[16];
+    u32 failed_attempts = 1;
+    for (u32 wait = 0; wait < 8 && conn->h2; wait++) {
+        const u8 previous_mask = conn->h2->grpc.connect_tried_mask;
+        const u32 count = loop.backend.wait(events, 16, loop.conns, loop.connection_capacity);
+        REQUIRE(count != 0);
+        loop.dispatch_batch(events, count);
+        if (!conn->h2) break;
+        CHECK_EQ(conn->h2->grpc.connect_attempts, failed_attempts + 1);
+        CHECK_NE(conn->h2->grpc.connect_tried_mask, previous_mask);
+        CHECK_EQ(__builtin_popcount(conn->h2->grpc.connect_tried_mask), failed_attempts + 1);
+        CHECK_EQ(conn->h2->grpc.connected_at_us, 123u);
+        CHECK(conn->h2->grpc.connecting);
+        CHECK_EQ(conn->h2->grpc.streams[0], &exchange);
+        CHECK_EQ(conn->h2->grpc.active, 1u);
+        CHECK(exchange.upstream == conn);
+        CHECK_FALSE(exchange.response_end);
+        failed_attempts++;
+    }
+    CHECK_EQ(failed_attempts, 3u);
+    CHECK(conn->h2 == nullptr);
+    CHECK(exchange.upstream == nullptr);
+    CHECK(exchange.response_end);
+    CHECK_EQ(exchange.failure, 14u);
+    loop.shutdown();
+}
+TEST(grpc_proxy, connect_failover_epoll) {
+    grpc_connect_failover_case<EpollEventLoop>(_tc, false);
+}
+TEST(grpc_proxy, connect_failover_iouring) {
+    grpc_connect_failover_case<IoUringEventLoop>(_tc, false);
+}
+TEST(grpc_proxy, tls_connect_failover_before_handshake_epoll) {
+    grpc_connect_failover_case<EpollEventLoop>(_tc, true);
+}
+TEST(grpc_proxy, tls_connect_failover_before_handshake_iouring) {
+    grpc_connect_failover_case<IoUringEventLoop>(_tc, true);
 }
 TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     GrpcBackendHealthReset health_reset{};

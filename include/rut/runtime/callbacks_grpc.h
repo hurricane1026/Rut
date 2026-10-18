@@ -10,6 +10,7 @@
 
 namespace rut {
 inline u32 select_backend(u16 upstream_id, u32 backend_count, u64 now_us);
+inline bool backend_ejected(u16 upstream_id, u32 backend_idx, u64 now_us);
 inline void record_backend_result(u16 upstream_id, u32 backend_idx, bool success, u64 now_us);
 
 template <typename Loop>
@@ -1121,10 +1122,82 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
 }
 
 template <typename Loop>
+bool grpc_close_failed_connect_socket(Loop* loop, Connection& conn) {
+    if (conn.fd == conn.upstream_fd) conn.fd = -1;
+    if constexpr (requires { loop->detach_upstream_close(conn); }) {
+        return loop->detach_upstream_close(conn);
+    } else if constexpr (requires { loop->close_released_upstream(conn); }) {
+        if (conn.pending_ops != 0 || conn.upstream_connect_armed || conn.upstream_recv_armed ||
+            conn.upstream_send_armed || conn.upstream_recv_cancel_inflight ||
+            conn.upstream_recv_pause_cancel_pending || conn.upstream_retirement_active ||
+            conn.upstream_retirement_target_owned != 0 ||
+            conn.upstream_retirement_cancel_owned != 0 ||
+            conn.upstream_retirement_cancel_retry != 0)
+            return false;
+        loop->close_released_upstream(conn);
+        return conn.upstream_fd < 0 && !conn.upstream_connect_armed && !conn.upstream_recv_armed &&
+               !conn.upstream_send_armed;
+    } else
+        return false;
+}
+
+template <typename Loop>
+bool grpc_submit_next_connect(Loop* loop, Connection& conn) {
+    if (!conn.h2 || !conn.request_config || !conn.h2->grpc.upstream) return false;
+    auto& g = conn.h2->grpc;
+    const auto& target = conn.request_config->upstreams[conn.upstream_idx];
+    if (target.addr_count == 0 ||
+        g.connect_attempts >= (target.addr_count < 3 ? target.addr_count : 3))
+        return false;
+    if (conn.upstream_fd >= 0 && !grpc_close_failed_connect_socket(loop, conn)) return false;
+
+    const u64 now = monotonic_us();
+    const u32 start = select_backend(conn.upstream_idx, target.addr_count, now);
+    const u32 budget = target.addr_count < 3 ? target.addr_count : 3;
+    auto next_backend = [&]() {
+        const u64 selection_time = monotonic_us();
+        // Preserve normal health-aware routing while making the failover scan
+        // bounded even if every remaining endpoint is already ejected.
+        for (u32 step = 0; step < target.addr_count; step++) {
+            const u32 candidate = (start + step) % target.addr_count;
+            if (!(g.connect_tried_mask & static_cast<u8>(1u << candidate)) &&
+                !backend_ejected(conn.upstream_idx, candidate, selection_time))
+                return candidate;
+        }
+        for (u32 step = 0; step < target.addr_count; step++) {
+            const u32 candidate = (start + step) % target.addr_count;
+            if (!(g.connect_tried_mask & static_cast<u8>(1u << candidate))) return candidate;
+        }
+        return target.addr_count;
+    };
+    while (g.connect_attempts < budget) {
+        const u32 backend = next_backend();
+        if (backend >= target.addr_count) break;
+        const u8 bit = static_cast<u8>(1u << backend);
+        g.connect_tried_mask |= bit;
+        g.connect_attempts++;
+        conn.upstream_backend_idx = static_cast<u8>(backend);
+        conn.fd = conn.upstream_fd = UpstreamPool::create_socket();
+        if (conn.upstream_fd < 0) {
+            grpc_record_connect_result(loop, conn, false, monotonic_us());
+            continue;
+        }
+        if (loop->submit_connect(conn, &target.addrs[backend], sizeof(target.addrs[backend])))
+            return true;
+        grpc_record_connect_result(loop, conn, false, monotonic_us());
+        if (!grpc_close_failed_connect_socket(loop, conn)) return false;
+    }
+    return false;
+}
+
+template <typename Loop>
 void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
     auto* loop = static_cast<Loop*>(lp);
     if (ev.result < 0) {
         grpc_record_connect_result(loop, conn, false, monotonic_us());
+        if (conn.h2 && conn.h2->grpc.connecting && !conn.h2->grpc.preface_sent &&
+            grpc_submit_next_connect(loop, conn))
+            return;
         loop->close_conn(conn);
         return;
     }
@@ -1378,12 +1451,28 @@ bool grpc_start_impl(Loop* loop,
         return true;
     }
     if (fresh) {
+        auto& g = up->h2->grpc;
+        g.connect_attempts = 1;
+        g.connect_tried_mask = static_cast<u8>(1u << backend);
         up->fd = up->upstream_fd = UpstreamPool::create_socket();
         up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);
-        if (up->fd < 0 ||
-            !loop->submit_connect(*up, &target.addrs[backend], sizeof(target.addrs[backend]))) {
+        if (up->fd < 0) {
+            grpc_record_connect_result(loop, *up, false, monotonic_us());
+            if (grpc_submit_next_connect(loop, *up)) {
+                loop->timer.refresh(up, 1);
+                loop->timer.refresh(&down, 1);
+                grpc_refresh_timer(loop, down);
+                return true;
+            }
             loop->close_conn(*up);
             return true;
+        }
+        if (!loop->submit_connect(*up, &target.addrs[backend], sizeof(target.addrs[backend]))) {
+            grpc_record_connect_result(loop, *up, false, monotonic_us());
+            if (!grpc_submit_next_connect(loop, *up)) {
+                loop->close_conn(*up);
+                return true;
+            }
         }
     } else
         grpc_drive_upstream(loop, *up);

@@ -1375,7 +1375,15 @@ requires both a certificate chain and a matching private key. CA and identity
 files are loaded on the cold path when a new upstream session is established;
 the resulting OpenSSL context belongs to that session. Pooled sessions retain
 their context and pinned configuration epoch until teardown. Certificate/file/
-handshake/ALPN failures map to UNAVAILABLE without replay. io_uring uses the
+handshake/ALPN failures map to UNAVAILABLE without replay. Before any upstream
+HTTP/2 preface or other wire bytes are sent, socket-creation, connect-submit,
+and TCP-connect failures may try another distinct configured backend, up to
+three endpoints total (or the configured address count when smaller). The
+retry keeps the same upstream session and queued RPC exchanges, deadlines, and
+per-RPC accounting; it does not create or replay RPCs. A TLS-configured target
+can use this TCP connect failover, but once TCP connects, TLS setup, handshake,
+certificate-identity, and ALPN failures terminate the session without another
+endpoint attempt. io_uring uses the
 existing owned ciphertext buffers and client-state TlsEngine; readiness backends
 use the existing socket BIO with `SSL_do_handshake`. An epoll re-arm drains any
 plaintext retained inside OpenSSL after an SSL_write-driven client handshake,

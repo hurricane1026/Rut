@@ -145,6 +145,8 @@ struct GrpcProxyState {
     void (*web_h1_kick)(void*, ConnectionBase&);
     u32 active;
     u32 cursor;
+    u8 connect_attempts;
+    u8 connect_tried_mask;
     u32 control_len;
     u32 pending_cancel_count;
     // At most 64 header-sent streams can be awaiting cancellation.
@@ -168,6 +170,7 @@ struct GrpcProxyState {
         pool_next = nullptr;
         web_h1_kick = nullptr;
         active = cursor = control_len = pending_cancel_count = 0;
+        connect_attempts = connect_tried_mask = 0;
         connected_at_us = idle_since_us = timer_deadline_us = last_ping_us = keepalive_due_us = 0;
         upstream = connecting = busy = preface_sent = session_failure_recorded = false;
     }
