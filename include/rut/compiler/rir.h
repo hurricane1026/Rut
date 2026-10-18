@@ -535,6 +535,8 @@ struct Module {
         // compile→config helper feeds it to set_upstream_health_check). hc_path
         // is a Str copied into UpstreamTarget::hc_path there.
         UpstreamTlsSpec tls{};
+        u32 max_request_message_bytes = 0;
+        u32 max_response_message_bytes = 0;
         bool http2 = false;
         bool hc_enabled = false;
         Str hc_path;

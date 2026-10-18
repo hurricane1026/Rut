@@ -3487,6 +3487,28 @@ struct Parser {
                         return frontend_error(FrontendError::UnsupportedSyntax,
                                               span_from(*value.value()),
                                               value.value()->text);
+                } else if (field_name.eq({"max_request_message_bytes", 25}) ||
+                           field_name.eq({"max_response_message_bytes", 26})) {
+                    u32& limit = field_name.eq({"max_request_message_bytes", 25})
+                                     ? item.upstream.max_request_message_bytes
+                                     : item.upstream.max_response_message_bytes;
+                    if (limit)
+                        return frontend_error(FrontendError::UnexpectedToken,
+                                              span_from(*field.value()));
+                    auto value = expect(TokenType::IntLit);
+                    if (!value) return core::make_unexpected(value.error());
+                    u32 parsed = 0;
+                    for (u32 i = 0; i < value.value()->text.len; i++) {
+                        const u32 digit = static_cast<u32>(value.value()->text.ptr[i] - '0');
+                        if (digit > 9 || parsed > (0xffffffffu - digit) / 10)
+                            return frontend_error(FrontendError::InvalidInteger,
+                                                  span_from(*value.value()));
+                        parsed = parsed * 10 + digit;
+                    }
+                    if (!parsed)
+                        return frontend_error(FrontendError::InvalidInteger,
+                                              span_from(*value.value()));
+                    limit = parsed;
                 } else if (field_name.eq({"tls", 3})) {
                     auto& tls = item.upstream.tls;
                     if (tls.enabled)
