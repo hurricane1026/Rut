@@ -1539,6 +1539,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                     if (budget > h.peer_settings.max_frame_size)
                         budget = h.peer_settings.max_frame_size;
                     u32 batched = 0;
+                    u32 download_consumed = 0;
                     while (batched < budget) {
                         bool progressed = false;
                         if (x->web_pending_output_offset == x->web_pending_output_len) {
@@ -1555,25 +1556,29 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                                     x->web_pending_output, sizeof(x->web_pending_output), written);
                                 if (written == 4) x->web_pending_native_len = native_len;
                                 x->web_encode_boundary_pending = false;
-                            } else if (x->download_len || (!x->web_trailer_encoding &&
-                                                           x->response_base64.pending_len == 3)) {
+                            } else if (x->download_len > download_consumed ||
+                                       (!x->web_trailer_encoding &&
+                                        x->response_base64.pending_len == 3)) {
                                 const u8 previous_len = x->response_base64.pending_len;
                                 u8 native[3]{};
                                 for (u8 i = 0; i < previous_len; i++)
                                     native[i] = x->response_base64.pending[i];
                                 const u32 needed = previous_len < 3 ? 3u - previous_len : 0u;
-                                for (u32 i = 0; i < needed && i < x->download_len; i++)
-                                    native[previous_len + i] = x->download[i];
-                                const u32 source_len =
-                                    x->web_encoded_message.next_span(x->download_len);
-                                (void)x->response_base64.feed(x->download,
+                                for (u32 i = 0;
+                                     i < needed && i < x->download_len - download_consumed;
+                                     i++)
+                                    native[previous_len + i] = x->download[download_consumed + i];
+                                const u32 source_len = x->web_encoded_message.next_span(
+                                    x->download_len - download_consumed);
+                                (void)x->response_base64.feed(x->download + download_consumed,
                                                               source_len,
                                                               consumed,
                                                               x->web_pending_output,
                                                               sizeof(x->web_pending_output),
                                                               written);
                                 if (consumed) {
-                                    (void)x->web_encoded_message.feed(x->download, consumed, false);
+                                    (void)x->web_encoded_message.feed(
+                                        x->download + download_consumed, consumed, false);
                                     if (!x->web_encoded_message.header_bytes &&
                                         !x->web_encoded_message.remaining)
                                         x->web_encode_boundary_pending = true;
@@ -1582,11 +1587,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                                     __builtin_memcpy(x->web_pending_native, native, 3);
                                     x->web_pending_native_len = 3;
                                 }
-                                if (consumed) {
-                                    grpc_pop(x->download, x->download_len, consumed);
-                                    if (x->upstream)
-                                        x->upstream->h2->consume_data(x->upstream_stream, consumed);
-                                }
+                                download_consumed += consumed;
                             } else if (x->response_trailers_offset < x->response_trailers_len ||
                                        (x->web_trailer_encoding &&
                                         x->response_base64.pending_len == 3)) {
@@ -1646,6 +1647,13 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                         } else if (!progressed) {
                             break;
                         }
+                    }
+                    // Compact once per DATA batch, rather than moving the queue
+                    // after every three input bytes.
+                    if (download_consumed) {
+                        grpc_pop(x->download, x->download_len, download_consumed);
+                        if (x->upstream)
+                            x->upstream->h2->consume_data(x->upstream_stream, download_consumed);
                     }
                     if (x->response_end && x->web_body_flushed &&
                         x->web_pending_output_offset == x->web_pending_output_len)
