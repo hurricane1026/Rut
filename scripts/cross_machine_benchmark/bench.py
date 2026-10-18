@@ -264,6 +264,7 @@ def serve(a):
         'config_sha256': config_identity(out / 'config.json'),
         'effective_config_sha256': config_identity(out / effective_name),
         'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
+        'machine_uname': list(os.uname()),
         'command': str(out / f'{run_id}-command.json'),
     }
     if a.engine == 'origin':
@@ -384,6 +385,7 @@ def client(a):
                   server_config_sha256=manifest['config_sha256'],
                   server_effective_config_sha256=manifest['effective_config_sha256'],
                   server_binary_sha256=manifest['binary_sha256'],
+                  server_machine_uname=manifest['machine_uname'],
                   server_manifest=str(a.server_manifest.resolve()), server_listen_port=manifest['listen_port'],
                   server_run_id=manifest['run_id'],
                   server_compiler_sha256=manifest.get('compiler_sha256'),

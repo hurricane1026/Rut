@@ -187,6 +187,7 @@ class Tests(unittest.TestCase):
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus='2',
                         server_workers=1, server_config_sha256='config-a', server_effective_config_sha256='effective-a',
                         server_binary_sha256='binary-a',
+                        server_machine_uname=['Linux', 'proxy', '5.0', 'x86_64', 'proxy'],
                         server_compiler_sha256=('compiler-a' if engine == 'rut' else None),
                         origin_endpoint='192.0.2.30:9087', origin_run_id='origin-1',
                         origin_cpus='6-7', origin_workers=4, origin_listen_port=9087,
@@ -263,6 +264,15 @@ class Tests(unittest.TestCase):
             origin_result.write_text(json.dumps(origin_data))
             with self.assertRaises(ValueError):
                 summarize.summarize(origin_changed)
+            proxy_machine_changed = root / 'proxy-machine-changed'
+            for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
+                shutil.copytree(root / name, proxy_machine_changed / name)
+            proxy_result = proxy_machine_changed / 'rut2' / 'result.json'
+            proxy_data = json.loads(proxy_result.read_text())
+            proxy_data['server_machine_uname'] = ['Linux', 'other-proxy', '5.0', 'x86_64', 'proxy']
+            proxy_result.write_text(json.dumps(proxy_data))
+            with self.assertRaises(ValueError):
+                summarize.summarize(proxy_machine_changed)
             versioned = root / 'versioned-wrk'
             for name in ('rut1', 'rut2', 'rut3', 'nginx1', 'nginx2', 'nginx3'):
                 shutil.copytree(root / name, versioned / name)
@@ -330,6 +340,7 @@ class Tests(unittest.TestCase):
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus=server_cpus,
                         server_workers=1, server_config_sha256='config-a', server_effective_config_sha256='effective-a',
                         server_binary_sha256='binary-a',
+                        server_machine_uname=['Linux', 'proxy', '5.0', 'x86_64', 'proxy'],
                         server_compiler_sha256=('compiler-a' if engine == 'rut' else None),
                         origin_endpoint='192.0.2.30:9087', origin_run_id='origin-1',
                         origin_cpus='6-7', origin_workers=4, origin_listen_port=9087,
@@ -354,6 +365,7 @@ class Tests(unittest.TestCase):
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus='2',
                         server_workers=1, server_config_sha256=config_hash, server_effective_config_sha256='effective-a',
                         server_binary_sha256='binary-a',
+                        server_machine_uname=['Linux', 'proxy', '5.0', 'x86_64', 'proxy'],
                         server_compiler_sha256=('compiler-a' if engine == 'rut' else None),
                         origin_endpoint='192.0.2.30:9087', origin_run_id='origin-1',
                         origin_cpus='6-7', origin_workers=4, origin_listen_port=9087,
