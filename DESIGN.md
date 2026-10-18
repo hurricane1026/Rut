@@ -1421,14 +1421,18 @@ owned send buffers. Kernel sends never borrow an RPC queue, so reset/deadline/
 close can reclaim RPC storage without an outstanding send referencing it.
 Sessions support up to 64 active streams and 16 KiB header blocks; streamed
 message length is independent of queue capacity. Cancellation maps to the
-upstream stream, and `grpc-timeout` uses the existing precise timers with
-millisecond resolution. When a retryable gRPC response arrives but its
-configured backoff cannot fit strictly before the original deadline, the RPC
-ends with `DEADLINE_EXCEEDED` (status 4), without binding another endpoint or
-forwarding the backend status. The logical RPC completion and status metric are
-recorded once. Upstream connection failures map to UNAVAILABLE;
-expired deadlines to DEADLINE_EXCEEDED. Configuration epochs remain pinned by
-active/pooled sessions until teardown.
+upstream stream. A valid incoming `grpc-timeout` is kept as an absolute
+deadline; its remaining duration is formatted into the upstream HEADERS block
+when that block is actually sent, including after connection setup or retry.
+Requests without the field remain without it. If the deadline has expired
+before send, the proxy returns DEADLINE_EXCEEDED (status 4) without sending the
+upstream request headers. Timers retain millisecond resolution. If a retryable
+response arrives but its configured backoff cannot fit strictly before the
+original deadline, the RPC ends with DEADLINE_EXCEEDED (status 4), without
+binding another endpoint or forwarding the backend status. Completion and
+status metrics are recorded once. Upstream connection failures map to
+UNAVAILABLE; expired deadlines map to DEADLINE_EXCEEDED. Configuration epochs
+remain pinned by active/pooled sessions until teardown.
 
 Optional `max_request_message_bytes` and `max_response_message_bytes` upstream
 fields bound the wire payload of each message independently. They are positive

@@ -20,6 +20,8 @@ struct RouteConfig;
 struct GrpcExchange {
     static constexpr u32 kWindow = 65535;
     static constexpr u32 kHeaders = 16384;
+    static constexpr u32 kTimeoutFieldMax = 32;
+    static constexpr u32 kRequestHeadersSlack = 9 + kTimeoutFieldMax;
     static constexpr u32 kMaxResponseMutations = 16;
     struct ResponseMutation {
         u16 name_offset;
@@ -92,7 +94,9 @@ struct GrpcExchange {
     ResponseMutation response_mutations[kMaxResponseMutations];
     u8 upload[kWindow];
     u8 download[kWindow];
-    u8 request_headers[kHeaders];
+    // The normal encoded header block keeps the historical kHeaders admission
+    // cap. Extra bytes hold a late grpc-timeout literal and optional CONTINUATION.
+    u8 request_headers[kHeaders + kRequestHeadersSlack];
     u8 request_trailers[kHeaders];
     u8 response_headers[kHeaders];
     u8 response_trailers[kHeaders];
@@ -110,7 +114,7 @@ struct GrpcExchange {
     u8 retry_reason;
     bool retry_pending;
     bool retry_enabled;
-    bool retry_timeout_present;
+    bool timeout_present;
     bool replaying_attempt;
 
     void init() {
@@ -162,10 +166,12 @@ struct GrpcExchange {
         retry_at_us = 0;
         retry_attempts = retry_tried_mask = 0;
         retry_reason = 0;
-        retry_pending = retry_enabled = retry_timeout_present = false;
+        retry_pending = retry_enabled = timeout_present = false;
         replaying_attempt = false;
     }
 };
+
+static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize - 8192);
 
 static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize - 8192,
               "GrpcExchange must leave bulk-slice spare capacity");
