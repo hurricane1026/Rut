@@ -4336,7 +4336,7 @@ static FrontendResult<HirExpr> analyze_protobuf_call(const AstExpr& expr,
                 value.len >= sizeof(name) - length - static_cast<u32>(prefix))
                 return false;
             length += static_cast<u32>(prefix);
-            __builtin_memcpy(name + length, value.ptr, value.len);
+            if (value.len) __builtin_memcpy(name + length, value.ptr, value.len);
             length += value.len;
             name[length++] = '|';
             return true;
