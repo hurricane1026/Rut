@@ -1220,6 +1220,45 @@ TEST(grpc_proxy, h1_duplicate_web_family_content_types_fail_closed_in_both_order
     }
 }
 
+TEST(grpc_proxy, h1_throttled_grpc_web_route_rejects_before_rpc_admission) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log());
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    config.routes[0].throttle_down_bps = 1;
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), false, false, {}, response));
+    CHECK(std::search(response.begin(), response.end(), "HTTP/1.1 503", "HTTP/1.1 503" + 12) !=
+          response.end());
+    CHECK_EQ(shard->shard_metrics.grpc_started, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(server->requests.load(), 0u);
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 0u);
+    CHECK_EQ(server->requests.load(), 0u);
+}
+
 TEST(grpc_proxy, h1_expect_continue_body_is_rejected_before_rpc) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());

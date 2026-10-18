@@ -1002,7 +1002,7 @@ bool try_start_grpc_web_h1(Loop* loop,
             conn.pending_forward_failure_policy_id != 0 ||
             conn.pending_forward_timeout_failure_policy_id != 0 || conn.response_policy_id != 0 ||
             conn.failure_policy_id != 0 || conn.timeout_failure_policy_id != 0 ||
-            conn.target_transform_recorded ||
+            conn.throttle_down_bps != 0 || conn.target_transform_recorded ||
             conn.response_read_deadline_state != ResponseReadDeadlineState::None ||
             conn.response_read_deadline_profile != ResponseReadDeadlineProfile::None;
         const auto result = grpc_web_h1_start(loop, conn, config, upstream_id, !unsupported_policy);
