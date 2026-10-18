@@ -3727,6 +3727,8 @@ TEST(grpc_proxy, keepalive_tick_queues_ping_behind_split_headers_and_before_othe
     GrpcDriveFixture loop;
     Connection conn;
     conn.reset();
+    u8 recv_slice[64]{};
+    conn.bind_request_receive_buffer(recv_slice, sizeof(recv_slice));
     conn.send_slice = loop.pool.alloc();
     REQUIRE(conn.send_slice != nullptr);
     conn.send_buf.bind(conn.send_slice, SlicePool::kSliceSize);
