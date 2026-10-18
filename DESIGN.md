@@ -1493,6 +1493,9 @@ complete message boundary; partial messages or partially staged quartets force
 stream reset or connection close. Received-but-uncommitted bytes may be dropped
 at a complete staged boundary. Access-log body counts include encoded Web bytes
 and inline trailer envelopes, excluding HTTP headers and transport framing.
+If a local Web failure forces reset/close after partial output, telemetry
+records that local failure status. A client abort before completion otherwise
+remains CANCELLED, including while a safe local-error trailer is still queued.
 
 CORS remains explicit route/middleware configuration, with no implicit origin
 reflection. See [examples/grpc-web.rut](examples/grpc-web.rut) and the browser
