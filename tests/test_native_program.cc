@@ -361,6 +361,10 @@ TEST(native_program, ebpf_body_plan_survives_compiler_exit_and_is_validated) {
     CHECK_EQ(plan.routes[1].request_policy_id, 1u);
     CHECK_EQ(plan.routes[2].reason, ebpf::Reason::NotForward);
     CHECK(validate_ebpf_plan(plan, owner.p->config));
+    owner.p->config.upstreams[0].http2 = true;
+    CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));
+    owner.p->config.upstreams[0].http2 = false;
+    CHECK(validate_ebpf_plan(plan, owner.p->config));
     // Relocation placeholders must remain zero until an actual kernel load.
     plan.bytecode.verdict[ebpf::kSocketMapRelocation].immediate = 99;
     CHECK_FALSE(validate_ebpf_plan(plan, owner.p->config));

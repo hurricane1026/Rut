@@ -24,7 +24,7 @@ or opening access logs. `--emit-ebpf PREFIX` instead creates:
 
 - `PREFIX.parser.bpf`: raw stream-parser instructions, 176 bytes;
 - `PREFIX.verdict.bpf`: raw stream-verdict instructions, 248 bytes;
-- `PREFIX.packet-verdict.bpf`: atomic SK_SKB packet verdict, 1312 bytes;
+- `PREFIX.packet-verdict.bpf`: atomic SK_SKB packet verdict, 1344 bytes;
 - `PREFIX.handoff-commit.bpf`: atomic ownership control program, 248 bytes;
 - `PREFIX.json`: route decisions, required kernel capabilities and relocations.
 
@@ -45,7 +45,8 @@ userspace responsibilities; a candidate is not a proof of whole-request bypass.
 
 The first classifier rejects request-body access, regex, yields/buffered forward,
 rate limits/throttling, policy bundles, unproved branches, other computations or
-side effects, dynamic metadata, TLS listeners and terminate-mode WebSocket routes.
+side effects, dynamic metadata, HTTP/2 upstreams, TLS listeners and terminate-mode
+WebSocket routes.
 It inspects expanded middleware too. Conservative rejection can include programs
 that future proofs could safely accelerate.
 
@@ -123,11 +124,11 @@ by the follow-up [handoff probe change](https://github.com/hurricane1026/Rut/pul
 This compiler-plan change only builds `rut` and `rut-compile`; use the probe
 change's documented build and run commands when validating the exported files.
 
-The [atomic handoff results](benchmarks/ebpf-handoff-2026-10-03/README.md) show
+The [atomic handoff results](https://github.com/hurricane1026/Rut/blob/88e924cacc6aa020138df002e8f0411a815f3851/docs/benchmarks/ebpf-handoff-2026-10-03/README.md) show
 correct transfers and a CPU/latency tradeoff. The current loopback experiment
 does not justify default activation or a Rut throughput improvement claim.
 
-The [follow-up experiments](benchmarks/ebpf-followup-2026-10-03/README.md)
+The [follow-up experiments](https://github.com/hurricane1026/Rut/blob/88e924cacc6aa020138df002e8f0411a815f3851/docs/benchmarks/ebpf-followup-2026-10-03/README.md)
 separate phase/relay/endpoint costs, test 16/64 KiB batches and 512 MiB streams,
 compare a separate L4 sidecar prototype, and measure actual Rut reference runs.
 That L4 prototype admits an entire TCP stream; it is not emitted by the L7 route
@@ -135,7 +136,7 @@ planner and must not be treated as proof of safe whole-request bypass.
 
 ## What remains before live activation
 
-The [mechanism experiments](benchmarks/ebpf-capability-2026-10-03/README.md) found
+The [mechanism experiments](https://github.com/hurricane1026/Rut/blob/88e924cacc6aa020138df002e8f0411a815f3851/docs/benchmarks/ebpf-capability-2026-10-03/README.md) found
 that consuming a header and then attaching sockmap with residual queued body can
 stall. FIONREAD-empty is only a snapshot and does not prove atomic handoff against
 concurrent arrivals. Therefore this increment does not attach business sockets.
@@ -146,5 +147,5 @@ shard ownership and RCU retirement. Both I/O backends need compatible cancellati
 and reclamation semantics. Full buffering, retries, chunked bodies, HTTP/2 and TLS
 need separate proofs. kTLS and sockmap must be probed as separate capabilities.
 
-See the [compiler integration evidence](benchmarks/ebpf-compiler-2026-10-03/README.md)
+See the [compiler integration evidence](https://github.com/hurricane1026/Rut/blob/88e924cacc6aa020138df002e8f0411a815f3851/docs/benchmarks/ebpf-compiler-2026-10-03/README.md)
 for validation and a real `.rut` export loaded by the kernel mechanism probe.

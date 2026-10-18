@@ -17,6 +17,7 @@ inline bool validate_ebpf_plan(const ebpf::Plan& plan, const RouteConfig& config
         if (route.decision == ebpf::Decision::BodyCandidate) {
             const auto& entry = config.routes[i];
             if (route.reason != ebpf::Reason::None || route.upstream_id >= config.upstream_count ||
+                config.upstreams[route.upstream_id].http2 ||
                 entry.action != RouteAction::JitHandler || entry.needs_req_body ||
                 entry.rate_limit.count || entry.throttle_down_bps || entry.ws_terminate ||
                 (route.request_policy_id != 0 &&

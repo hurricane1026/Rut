@@ -61,6 +61,7 @@ ebpf::RoutePlan classify(const rir::Function& fn, const rir::Module& module, boo
         (end->operand_count > 2 && !constant(fn, end->operand(2), response)) || request < 0 ||
         request > 0xffff || response < 0 || response > 0xffff)
         return reject(Reason::DynamicForward);
+    if (module.upstreams[upstream].http2) return reject(Reason::Http2Upstream);
     plan.decision = ebpf::Decision::BodyCandidate;
     plan.reason = Reason::None;
     plan.upstream_id = static_cast<u16>(upstream);

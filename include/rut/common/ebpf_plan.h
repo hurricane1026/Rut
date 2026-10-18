@@ -19,6 +19,7 @@ enum class Reason : u8 {
     PolicyBundle,
     DynamicForward,
     Tls,
+    Http2Upstream,
     WebSocket,
 };
 struct RoutePlan {
@@ -62,6 +63,8 @@ inline const char* reason_name(Reason reason) {
             return "dynamic-forward-metadata";
         case Reason::Tls:
             return "tls-sockmap-incompatible";
+        case Reason::Http2Upstream:
+            return "http2-upstream-framing";
         case Reason::WebSocket:
             return "websocket-frame-processing";
     }

@@ -11,6 +11,11 @@ import tempfile
 
 SOURCE = '''listen 127.0.0.1:0
 upstream b at "127.0.0.1:9000"
+upstream h2 {
+    host: "127.0.0.1"
+    port: 9001
+    protocol: .http2
+}
 let counts = Cache<IP, i64>(capacity: 64)
 func require_path(_ req: i32) -> i32 {
     guard req.path == "/chain" else { respond 403 }
@@ -18,6 +23,7 @@ func require_path(_ req: i32) -> i32 {
 }
 chain gate { before require_path(req) }
 route GET "/plain" { return forward(b) }
+route GET "/h2" { return forward(h2) }
 route GET "/headers" {
     return forward(b, request_policy: { version: .http11, host: .upstream,
         connection: .omit, strip_headers: [.connection, .keepAlive, .te, .expect, .upgrade] })
@@ -102,7 +108,7 @@ def main():
         routes = {route["path"]: route for route in plan["routes"]}
         assert routes["/plain"]["decision"] == "body-candidate", routes
         assert routes["/headers"]["request_policy_id"] == 1, routes
-        reasons = {"/static": "not-a-terminal-forward", "/body": "request-body-access",
+        reasons = {"/h2": "http2-upstream-framing", "/static": "not-a-terminal-forward", "/body": "request-body-access",
                    "/regex": "regex-in-user-space", "/limited": "rate-limit-or-throttle",
                    "/state": "user-computation-or-side-effects", "/chain": "control-flow-not-proven",
                    "/buffered": "forward-policy-bundle"}
