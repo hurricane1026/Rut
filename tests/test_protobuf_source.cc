@@ -274,7 +274,7 @@ TEST(protobuf_source, qualified_name_limit_is_reported_before_join_allocation) {
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().kind == SourceError::Kind::Limit);
 
-    const u32 lengths[] = {1022, 1023};
+    const u32 lengths[] = {1023, 1024};
     const char* boundary_suffix = ";";
     for (u32 length : lengths) {
         offset = prefix_len;
@@ -283,7 +283,7 @@ TEST(protobuf_source, qualified_name_limit_is_reported_before_join_allocation) {
         REQUIRE(files.write_file("root.proto", source));
         storage.arena.reset();
         result = files.load(storage);
-        if (length == 1022)
+        if (length == 1023)
             REQUIRE(result.has_value());
         else {
             REQUIRE_FALSE(result.has_value());

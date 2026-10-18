@@ -574,7 +574,7 @@ bool Parser::message(Buffer& parent, Str scope, u32 depth) {
     advance();
     Str message_name{};
     if (!name(message_name)) return false;
-    if (message_name.len > 1022 || scope.len > 1022 - message_name.len)
+    if (message_name.len > 1023 || scope.len > 1023 - message_name.len)
         return fail(SourceError::Kind::Limit, lit_str("name length"));
     const Str kFullName = compiler.join(scope, '.', message_name);
     auto* named = compiler.arena.alloc_t<NamedMessage>();
@@ -680,7 +680,7 @@ bool Parser::file() {
             if (!name(source.package, true)) return false;
             if (source.package.ptr[0] == '.')
                 return fail(SourceError::Kind::Syntax, lit_str("package name"));
-            if (source.package.len > 1022)
+            if (source.package.len > 1023)
                 return fail(SourceError::Kind::Limit, lit_str("name length"));
             if (!expect(lit_str(";"))) return false;
             source.descriptor->text(2, source.package);
