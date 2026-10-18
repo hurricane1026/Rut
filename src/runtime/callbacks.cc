@@ -21,6 +21,13 @@
 
 namespace rut {
 
+void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
+    if (success) return;
+    if (conn.h2 == nullptr || conn.h2->grpc.session_failure_recorded) return;
+    conn.h2->grpc.session_failure_recorded = true;
+    grpc_record_connect_result(conn, success, now_us);
+}
+
 #ifdef __APPLE__
 using NativeReactorEventLoop = KqueueEventLoop;
 #else

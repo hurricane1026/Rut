@@ -157,7 +157,14 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
     Connection* down = x->downstream;
     Connection* up = x->upstream;
     if (down && down->h2) {
-        down->h2->consume_data(x->downstream_stream, x->upload_len);
+        if (!x->web_h1) {
+            if (x->web_mode == GrpcWebContentType::Text)
+                down->h2->consume_data(x->downstream_stream, x->upload_raw_credit);
+            else
+                down->h2->consume_data(x->downstream_stream, x->upload_len);
+        }
+        x->upload_raw_credit = 0;
+        x->upload_len = 0;
         if (auto* stream = down->h2->find_stream(x->downstream_stream))
             stream->manual_window = false;
         grpc_detach(*down->h2, x);
@@ -385,12 +392,6 @@ inline void grpc_record_connect_result(Loop* loop,
     if (current != conn.request_config) return;
     grpc_record_connect_result(conn, success, now_us);
 }
-inline void grpc_record_handshake_result(Connection& conn, bool success, u64 now_us) {
-    if (success) return;
-    if (conn.h2 == nullptr || conn.h2->grpc.session_failure_recorded) return;
-    conn.h2->grpc.session_failure_recorded = true;
-    grpc_record_connect_result(conn, success, now_us);
-}
 template <typename Loop>
 inline void grpc_record_session_failure(Loop* loop, Connection& conn, u64 now_us) {
     if (!conn.h2 || conn.h2->grpc.session_failure_recorded) return;
@@ -414,12 +415,6 @@ inline void grpc_record_rpc_success(Loop* loop, Connection& conn, u64 now_us) {
     const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
     if (current != conn.request_config) return;
     grpc_record_connect_result(conn, true, now_us);
-}
-template <typename Loop>
-inline void grpc_record_handshake_result(Loop* loop, Connection& conn, bool success, u64 now_us) {
-    const RouteConfig* current = loop->config_ptr ? *loop->config_ptr : nullptr;
-    if (current != conn.request_config) return;
-    grpc_record_handshake_result(conn, success, now_us);
 }
 inline bool grpc_parse_content_length(Str value, u32* out) {
     if (value.len == 0) return false;
@@ -1253,8 +1248,10 @@ void grpc_request_data(
     u32 upload_len = len;
     if (x.web_mode == GrpcWebContentType::Text) {
         if (len > UINT32_MAX - x.upload_raw_credit) {
-            down.h2->consume_data(x.downstream_stream, x.upload_raw_credit + len);
+            down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+            down.h2->consume_data(x.downstream_stream, len);
             x.upload_raw_credit = 0;
+            x.upload_len = 0;
             x.failure = 8;
             grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
             return;
@@ -1270,6 +1267,7 @@ void grpc_request_data(
         if (status == GrpcWebCodecStatus::Invalid || consumed != len) {
             down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
             x.upload_raw_credit = 0;
+            x.upload_len = 0;
             x.failure = status == GrpcWebCodecStatus::Invalid ? 13 : 8;
             grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
             return;
@@ -1277,6 +1275,7 @@ void grpc_request_data(
         if (end && x.request_base64.finish() != GrpcWebCodecStatus::Ok) {
             down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
             x.upload_raw_credit = 0;
+            x.upload_len = 0;
             x.failure = 13;
             grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
             return;
@@ -1288,6 +1287,7 @@ void grpc_request_data(
         down.h2->consume_data(x.downstream_stream,
                               x.web_mode == GrpcWebContentType::Text ? x.upload_raw_credit : len);
         x.upload_raw_credit = 0;
+        if (x.web_mode == GrpcWebContentType::Text) x.upload_len = 0;
         x.failure = framing_status;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
@@ -1298,6 +1298,7 @@ void grpc_request_data(
         down.h2->consume_data(x.downstream_stream,
                               x.web_mode == GrpcWebContentType::Text ? x.upload_raw_credit : len);
         x.upload_raw_credit = 0;
+        if (x.web_mode == GrpcWebContentType::Text) x.upload_len = 0;
         x.failure = 13;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
