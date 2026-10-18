@@ -27,7 +27,8 @@ class Tests(unittest.TestCase):
         manifest = dict(schema=1, engine='rut', cpus='2', workers=1, body_size=1024,
                         listen_port=8087, config_sha256='a' * 64,
                         effective_config_sha256='c' * 64,
-                        binary_sha256='b' * 64, run_id='rut-run')
+                        binary_sha256='b' * 64, run_id='rut-run',
+                        machine_uname=['Linux', 'proxy', '5.0', 'x86_64', 'proxy'])
         self.assertIs(bench.validate_server_manifest(manifest, 'rut', 8087, 1024), manifest)
         with self.assertRaises(ValueError):
             bench.validate_server_manifest(dict(manifest, engine='nginx'), 'rut', 8087, 1024)
@@ -37,6 +38,9 @@ class Tests(unittest.TestCase):
         del missing['binary_sha256']
         with self.assertRaises(ValueError):
             bench.validate_server_manifest(missing, 'rut', 8087, 1024)
+        malformed = dict(manifest, machine_uname='Linux')
+        with self.assertRaises(ValueError):
+            bench.validate_server_manifest(malformed, 'rut', 8087, 1024)
         self.assertIsNone(bench.validate_rut_workers(64))
         with self.assertRaises(ValueError):
             bench.validate_rut_workers(65)

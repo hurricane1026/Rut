@@ -176,7 +176,7 @@ def process_owns_port(pid, port):
 
 def validate_server_manifest(manifest, engine, port, body_size):
     required = ('schema', 'engine', 'cpus', 'workers', 'body_size', 'listen_port',
-                'config_sha256', 'effective_config_sha256', 'binary_sha256', 'run_id')
+                'config_sha256', 'effective_config_sha256', 'binary_sha256', 'run_id', 'machine_uname')
     if any(key not in manifest for key in required):
         raise ValueError('incomplete server manifest')
     if manifest['schema'] != 1 or manifest['engine'] != engine:
@@ -185,6 +185,10 @@ def validate_server_manifest(manifest, engine, port, body_size):
         raise ValueError('incomplete server manifest')
     if manifest['listen_port'] != port or manifest['body_size'] != body_size:
         raise ValueError('server manifest does not match client coordinates')
+    identity = manifest['machine_uname']
+    if (not isinstance(identity, list) or len(identity) != 5
+            or any(not isinstance(value, str) or not value for value in identity)):
+        raise ValueError('malformed server machine identity')
     return manifest
 
 
