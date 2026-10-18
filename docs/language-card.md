@@ -424,6 +424,14 @@ explicit OPTIONS routes and response headers; see [the browser
 example](../examples/grpc-web.rut) and [its
 instructions](../examples/grpc/README.md#browser-grpc-web-example).
 
+The request `Content-Type` selects upload decoding, while `Accept` independently
+selects binary or base64-text response encoding. Supported Web media ranges use
+their q values and specificity; ties prefer the request mode. Missing or
+unrecognized Web ranges retain the request-mode response for compatibility.
+Malformed supported Web ranges, duplicate q parameters, or a selection with no
+acceptable supported representation are rejected. Native gRPC ignores Web
+`Accept` values.
+
 Native gRPC upstream sessions with active RPCs send an HTTP/2 PING every five
 minutes after connection establishment or the previous probe. Only an ACK with
 the same eight-byte payload completes a probe. The existing upstream timeout

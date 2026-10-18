@@ -268,7 +268,7 @@ void grpc_web_h1_resume_upload(Loop* loop, Connection& conn) {
         return;
     }
 
-    for (u32 step = 0; step < 32; step++) {
+    for (;;) {
         const u32 budget = grpc_web_h1_raw_budget(*x);
         if (budget == 0) {
             // io_uring may still deliver one positive CQE for a receive that
@@ -392,7 +392,15 @@ void grpc_web_h1_on_recv(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    const int down_fd = conn.fd;
+    Http2Conn* const down_h2 = conn.h2;
+    const u32 down_epoch = conn.req_metadata_episode;
     grpc_web_h1_resume_upload(loop, conn);
+    if (conn.fd != down_fd || conn.fd < 0 || conn.h2 != down_h2 ||
+        conn.req_metadata_episode != down_epoch || !conn.req_body_streamed)
+        return;
+    if (GrpcExchange* x = grpc_find(*down_h2, 1); x && x->web_h1 && x->failure)
+        grpc_web_h1_kick<Loop>(lp, conn);
 }
 
 template <typename Loop>
@@ -479,9 +487,10 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
         static constexpr char kPrefix[] = "HTTP/1.1 200 OK\r\nConnection: close\r\n";
         static constexpr char kBinaryContentType[] = "Content-Type: application/grpc-web\r\n";
         static constexpr char kTextContentType[] = "Content-Type: application/grpc-web-text\r\n";
+        const auto response_mode = grpc_response_web_mode(x);
         if (!put(kPrefix, sizeof(kPrefix) - 1) ||
             (!x.response_headers_len &&
-             !(x.web_mode == GrpcWebContentType::Text
+             !(response_mode == GrpcWebContentType::Text
                    ? put(kTextContentType, sizeof(kTextContentType) - 1)
                    : put(kBinaryContentType, sizeof(kBinaryContentType) - 1))) ||
             !put(x.response_headers, x.response_headers_len) || !put("\r\n", 2)) {
@@ -490,12 +499,13 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
         }
         x.response_headers_sent = true;
     } else if (x.download_len ||
-               (x.web_mode == GrpcWebContentType::Text && x.web_encode_boundary_pending) ||
-               (x.web_mode == GrpcWebContentType::Text && !x.web_trailer_encoding &&
+               (grpc_response_web_mode(x) == GrpcWebContentType::Text &&
+                x.web_encode_boundary_pending) ||
+               (grpc_response_web_mode(x) == GrpcWebContentType::Text && !x.web_trailer_encoding &&
                 x.response_base64.pending_len == 3)) {
         u32 amount = x.download_len;
         u32 wire_amount = 0;
-        if (x.web_mode == GrpcWebContentType::Text) {
+        if (grpc_response_web_mode(x) == GrpcWebContentType::Text) {
             u32 consumed = 0, written = 0;
             if (x.web_encode_boundary_pending) {
                 const u8 native_len = x.response_base64.pending_len;
@@ -518,6 +528,9 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
                 x.web_pending_native_len = 0;
                 x.web_encode_boundary_pending = false;
                 x.web_pending_output_is_trailer = false;
+                // This branch only flushes bytes already consumed by the
+                // base64 encoder. `download` still owns every queued byte.
+                amount = 0;
             } else {
                 const u8 previous_len = x.response_base64.pending_len;
                 u8 previous_native[3]{};
@@ -595,7 +608,7 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
     } else if (x.response_end) {
         // For text mode the trailer envelope continues the same base64 stream
         // as message data. Flush padding only after the envelope is encoded.
-        if (x.web_mode == GrpcWebContentType::Text) x.web_body_flushed = true;
+        if (grpc_response_web_mode(x) == GrpcWebContentType::Text) x.web_body_flushed = true;
         if (conn.send_buf.len() == 0 && !x.web_trailer_flushed) {
             if (!x.response_trailers_len) {
                 const u8 status_code = x.failure ? x.failure : x.response_status;
@@ -611,7 +624,7 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
                 }
                 x.response_trailers_len = written;
             }
-            if (x.web_mode == GrpcWebContentType::Text) {
+            if (grpc_response_web_mode(x) == GrpcWebContentType::Text) {
                 x.web_trailer_encoding = true;
                 while (conn.send_buf.write_avail()) {
                     if (x.response_trailers_offset < x.response_trailers_len ||
@@ -675,7 +688,8 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
             return;
         }
         if (x.download_len || x.web_encode_boundary_pending ||
-            (x.response_end && x.web_mode == GrpcWebContentType::Text && !x.web_body_flushed))
+            (x.response_end && grpc_response_web_mode(x) == GrpcWebContentType::Text &&
+             !x.web_body_flushed))
             grpc_web_h1_pump_response(loop, conn, x);
         return;
     }

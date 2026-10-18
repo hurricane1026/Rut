@@ -1484,6 +1484,14 @@ long-lived stream delivers a complete message without waiting for later data.
 Payloads remain opaque, including compressed messages. Web message limits inspect the decoded
 five-byte envelope and wire payload; text encoding does not change that limit.
 
+The request `Content-Type` selects upload decoding; the `Accept` header selects
+binary or base64-text response encoding independently. Supported Web media
+ranges use q values and specificity, with ties preferring the request mode.
+Missing or unrecognized Web ranges preserve the request-mode response for
+compatibility. Malformed supported Web ranges, duplicate q parameters, and
+requests with no acceptable supported representation are rejected. Native gRPC
+ignores Web `Accept` values.
+
 Both Web transports use bounded queues and the existing RPC deadline,
 cancellation and configuration ownership. HTTP/2 text upload credit is held
 until decoded bytes leave the upload queue. HTTP/1.1 reads pause when that
