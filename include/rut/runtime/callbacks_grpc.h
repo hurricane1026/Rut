@@ -130,7 +130,12 @@ void grpc_observe(Loop* loop, GrpcExchange& x) {
     if (!x.observed) return;
     x.observed = false;
     const u64 kElapsed = monotonic_us() - x.started_us;
-    const u8 kStatus = x.response_end_sent ? (x.failure ? x.failure : x.response_status) : 1;
+    const bool web_failure_terminated =
+        x.web_failure_prepared && x.web_response_invalid && x.failure;
+    const u8 kStatus =
+        web_failure_terminated
+            ? x.failure
+            : (x.response_end_sent ? (x.failure ? x.failure : x.response_status) : 1);
     if (loop->metrics) loop->metrics->on_grpc_complete(kStatus, kElapsed);
     auto& entry = x.log_entry;
     entry.timestamp_us = realtime_us();

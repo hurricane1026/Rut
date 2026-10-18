@@ -963,8 +963,198 @@ struct SyncCloseGrpcDriveFixture : GrpcDriveFixture {
         closed = true;
     }
 };
+struct HeldSendGrpcDriveFixture : GrpcDriveFixture {
+    CaptureRing* capture_ring = nullptr;
+    const u8* pending_send = nullptr;
+    u32 pending_send_len = 0;
+    u32 epoch_enters = 0;
+    u32 epoch_leaves = 0;
+    void epoch_enter() { epoch_enters++; }
+    void epoch_leave() { epoch_leaves++; }
+    bool submit_send(Connection&, const u8* data, u32 len) {
+        sends++;
+        pending_send = data;
+        pending_send_len = len;
+        return true;
+    }
+    void close_conn(Connection& conn) {
+        if (conn.on_close) {
+            const auto callback = conn.on_close;
+            conn.on_close = nullptr;
+            callback(this, conn);
+        }
+        if (conn.req_start_us || conn.epoch_held) {
+            conn.req_start_us = 0;
+            conn.epoch_held = false;
+            epoch_leave();
+        }
+        conn.h2 = nullptr;
+        conn.handler_gen++;
+        closed = true;
+    }
+};
 void pending_send(void*, Connection&, IoEvent) {}
 }  // namespace
+
+TEST(grpc_proxy, grpc_web_h1_deadline_resolves_held_sends_without_mutating_owned_bytes) {
+    enum class Case : u8 {
+        PartialNative,
+        CommittedTrailer,
+        CompleteNative,
+        ClientFinAfterQueue,
+        OrdinaryFin,
+    };
+    auto run = [&](GrpcWebContentType mode, Case test_case) {
+        HeldSendGrpcDriveFixture loop;
+        ShardMetrics metrics;
+        metrics.init();
+        AccessLogRing log;
+        log.init();
+        loop.metrics = &metrics;
+        loop.access_log = &log;
+
+        Connection conn;
+        conn.reset();
+        u8 send_storage[4096];
+        conn.send_buf.bind(send_storage, sizeof(send_storage));
+        conn.fd = 41;
+        conn.req_start_us = 1;
+        conn.req_body_streamed = true;
+        conn.request_upload_complete = true;
+        conn.req_metadata_episode = 1;
+        Http2Conn h2;
+        h2.init_client();
+        conn.h2 = &h2;
+        REQUIRE(h2.open_stream(1) != nullptr);
+        h2.grpc.web_h1_kick = &grpc_web_h1_kick_thunk<HeldSendGrpcDriveFixture>;
+        conn.on_close = &grpc_connection_closed<HeldSendGrpcDriveFixture>;
+        loop.epoch_enter();
+
+        auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+        REQUIRE(x != nullptr);
+        x->init();
+        x->web_h1 = true;
+        x->web_mode = mode;
+        x->web_h1_kick = &grpc_web_h1_kick_thunk<HeldSendGrpcDriveFixture>;
+        x->downstream = &conn;
+        x->downstream_stream = 1;
+        x->response_headers_sent = true;
+        x->response_status = 0;
+        x->deadline_us = 1;
+        x->started_us = monotonic_us();
+        x->observed = true;
+        x->request_end_sent = true;
+        if (test_case == Case::PartialNative) {
+            const u8 partial[] = {0, 0, 0, 0, 4, 0xaa, 0xbb};
+            memcpy(x->download, partial, sizeof(partial));
+            x->download_len = sizeof(partial);
+        } else if (test_case == Case::CompleteNative || test_case == Case::ClientFinAfterQueue ||
+                   test_case == Case::OrdinaryFin) {
+            const u8 complete[] = {0, 0, 0, 0, 2, 0xaa, 0xbb};
+            memcpy(x->download, complete, sizeof(complete));
+            x->download_len = sizeof(complete);
+        } else {
+            x->response_end = true;
+        }
+        REQUIRE(grpc_attach(h2, x));
+
+        CHECK(conn.h2 == &h2);
+        CHECK(conn.req_body_streamed);
+        CHECK_GE(conn.fd, 0);
+        CHECK_EQ(grpc_find(h2, 1), x);
+        CHECK(x->web_h1);
+        CHECK_GT(x->download_len + static_cast<u32>(x->response_end), 0u);
+        grpc_web_h1_pump_response(&loop, conn, *x);
+        REQUIRE_EQ(loop.sends, 1u);
+        REQUIRE_GT(loop.pending_send_len, 0u);
+        REQUIRE_EQ(loop.pending_send, conn.send_buf.data());
+        u8 owned_bytes[1024];
+        REQUIRE_LE(conn.send_buf.len(), sizeof(owned_bytes));
+        const u32 owned_len = conn.send_buf.len();
+        memcpy(owned_bytes, conn.send_buf.data(), owned_len);
+        if (test_case == Case::CommittedTrailer) {
+            REQUIRE(x->web_trailer_wire_started);
+            if (mode == GrpcWebContentType::Binary) REQUIRE(x->response_end_sent);
+        } else {
+            REQUIRE(!x->response_end_sent);
+        }
+
+        if (test_case == Case::OrdinaryFin) {
+            loop.close_conn(conn);
+            CHECK_EQ(metrics.grpc_completed[1], 1u);
+            CHECK_EQ(metrics.grpc_completed[4], 0u);
+            CHECK_EQ(loop.epoch_leaves, 1u);
+            AccessLogEntry entry{};
+            REQUIRE(log.pop(entry));
+            CHECK_EQ(entry.grpc_status_plus_one, 2u);
+            CHECK(!log.pop(entry));
+            return;
+        }
+
+        grpc_deadline_fired(&loop, conn);
+        if (test_case == Case::PartialNative || test_case == Case::CommittedTrailer) {
+            CHECK(loop.closed);
+            CHECK_EQ(loop.sends, 1u);
+            CHECK_EQ(metrics.grpc_completed[4], 1u);
+            CHECK_EQ(metrics.grpc_completed[1], 0u);
+            CHECK_EQ(loop.epoch_leaves, 1u);
+            AccessLogEntry entry{};
+            REQUIRE(log.pop(entry));
+            CHECK_EQ(entry.grpc_status_plus_one, 5u);
+            CHECK(!log.pop(entry));
+            return;
+        }
+
+        CHECK(!loop.closed);
+        CHECK(x->web_failure_prepared);
+        CHECK(!x->web_response_invalid);
+        CHECK_EQ(x->failure, 4u);
+        CHECK(x->response_end);
+        CHECK_EQ(loop.sends, 1u);
+        CHECK_EQ(conn.send_buf.len(), owned_len);
+        CHECK_EQ(memcmp(conn.send_buf.data(), owned_bytes, owned_len), 0);
+        CHECK_EQ(metrics.grpc_completed[4], 0u);
+        CHECK_EQ(loop.epoch_leaves, 0u);
+
+        if (test_case == Case::ClientFinAfterQueue) {
+            loop.close_conn(conn);
+            CHECK_EQ(metrics.grpc_completed[1], 1u);
+            CHECK_EQ(metrics.grpc_completed[4], 0u);
+            CHECK_EQ(loop.epoch_leaves, 1u);
+            AccessLogEntry entry{};
+            REQUIRE(log.pop(entry));
+            CHECK_EQ(entry.grpc_status_plus_one, 2u);
+            CHECK(!log.pop(entry));
+            return;
+        }
+
+        grpc_web_h1_on_sent<HeldSendGrpcDriveFixture>(
+            &loop, conn, {conn.id, static_cast<i32>(owned_len), 0, 0, IoEventType::Send, 0});
+        REQUIRE_EQ(loop.sends, 2u);
+        CHECK(x->response_end_sent);
+        CHECK(x->web_trailer_wire_started);
+        const u32 trailer_send_len = loop.pending_send_len;
+        REQUIRE_GT(trailer_send_len, 0u);
+        grpc_web_h1_on_sent<HeldSendGrpcDriveFixture>(
+            &loop, conn, {conn.id, static_cast<i32>(trailer_send_len), 0, 0, IoEventType::Send, 0});
+        CHECK(loop.closed);
+        CHECK_EQ(metrics.grpc_completed[4], 1u);
+        CHECK_EQ(metrics.grpc_completed[1], 0u);
+        CHECK_EQ(loop.epoch_leaves, 1u);
+        AccessLogEntry entry{};
+        REQUIRE(log.pop(entry));
+        CHECK_EQ(entry.grpc_status_plus_one, 5u);
+        CHECK(!log.pop(entry));
+    };
+
+    run(GrpcWebContentType::Binary, Case::PartialNative);
+    run(GrpcWebContentType::Text, Case::PartialNative);
+    run(GrpcWebContentType::Binary, Case::CommittedTrailer);
+    run(GrpcWebContentType::Text, Case::CommittedTrailer);
+    run(GrpcWebContentType::Binary, Case::CompleteNative);
+    run(GrpcWebContentType::Binary, Case::ClientFinAfterQueue);
+    run(GrpcWebContentType::Binary, Case::OrdinaryFin);
+}
 
 TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
     GrpcDriveFixture loop;

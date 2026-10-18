@@ -396,11 +396,29 @@ void grpc_web_h1_finish_response(Loop* loop, Connection& conn, GrpcExchange& x) 
 }
 
 template <typename Loop>
+bool grpc_web_h1_prepare_failure(Loop* loop, Connection& conn, GrpcExchange& x) {
+    if (x.failure && !x.web_failure_prepared) {
+        const u32 dropped = grpc_web_prepare_failure(x);
+        if (dropped && x.upstream && x.upstream->h2)
+            x.upstream->h2->consume_data(x.upstream_stream, dropped);
+    }
+    if (!x.web_response_invalid) return true;
+    loop->close_conn(conn);
+    return false;
+}
+
+template <typename Loop>
 void grpc_web_h1_kick(void* lp, Connection& conn) {
     auto* loop = static_cast<Loop*>(lp);
     if (!conn.h2 || !conn.req_body_streamed || conn.fd < 0) return;
     GrpcExchange* x = grpc_find(*conn.h2, 1);
     if (!x || !x->web_h1) return;
+    if (!grpc_web_h1_prepare_failure(loop, conn, *x)) return;
+    if (x->failure) {
+        if (conn.on_send) return;
+        grpc_web_h1_pump_response(loop, conn, *x);
+        return;
+    }
     const int down_fd = conn.fd;
     Http2Conn* const down_h2 = conn.h2;
     const u32 down_epoch = conn.req_metadata_episode;
@@ -467,9 +485,8 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
                 if (native_len) {
                     for (u8 i = 0; i < native_len; i++)
                         x.web_pending_native[i] = x.response_base64.pending[i];
-                    const auto status = x.response_base64.flush(conn.send_buf.write_ptr(),
-                                                                conn.send_buf.write_avail(),
-                                                                written);
+                    const auto status = x.response_base64.flush(
+                        conn.send_buf.write_ptr(), conn.send_buf.write_avail(), written);
                     if (status != GrpcWebCodecStatus::Ok || !written) {
                         loop->close_conn(conn);
                         return;
@@ -508,7 +525,8 @@ void grpc_web_h1_pump_response(Loop* loop, Connection& conn, GrpcExchange& x) {
                     x.web_encode_boundary_pending = true;
                 conn.send_buf.commit(written);
                 const u32 native_staged = (written / 4) * 3;
-                const u32 previous_staged = native_staged < previous_len ? native_staged : previous_len;
+                const u32 previous_staged =
+                    native_staged < previous_len ? native_staged : previous_len;
                 if (previous_staged &&
                     x.staged_response_message.feed(previous_native, previous_staged, false)) {
                     loop->close_conn(conn);
@@ -690,6 +708,7 @@ void grpc_web_h1_on_sent(void* lp, Connection& conn, IoEvent ev) {
         loop->close_conn(conn);
         return;
     }
+    if (!grpc_web_h1_prepare_failure(loop, conn, *x)) return;
     if (x->response_end_sent) {
         grpc_web_h1_finish_response(loop, conn, *x);
         return;
