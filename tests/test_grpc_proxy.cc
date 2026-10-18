@@ -6283,6 +6283,83 @@ TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     loop.force_close_all();
     loop.shutdown();
 }
+TEST(grpc_proxy, h2_web_expect_with_body_is_rejected_before_upstream) {
+    struct Case {
+        Str content_type;
+        Str expect_name;
+        Str expect_value;
+    };
+    const Case cases[] = {
+        {lit_str("application/grpc-web"), lit_str("ExPeCt"), lit_str(" \t100-continue\t ")},
+        {lit_str("application/grpc-web-text"), lit_str("expect"), lit_str("100-continue")},
+    };
+    for (const auto& test_case : cases) {
+        EpollEventLoop loop;
+        REQUIRE(loop.init(0, -1).has_value());
+        RouteConfig cfg;
+        REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+        cfg.upstreams[0].http2 = true;
+        Connection* down = loop.alloc_conn();
+        REQUIRE(down != nullptr);
+        REQUIRE(loop.alloc_h2(*down));
+        down->h2->init_client();
+        REQUIRE(down->h2->open_stream(1));
+        down->request_config = &cfg;
+        ParsedRequest req;
+        req.reset();
+        req.method = HttpMethod::POST;
+        req.headers[0] = {lit_str("content-type"), test_case.content_type};
+        req.header_count = 1;
+        req.has_content_length = true;
+        req.content_length = 5;
+        req.content_length_count = 1;
+        const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                    {{":scheme", 7}, {"http", 4}},
+                                    {{":path", 5}, {"/Echo", 5}},
+                                    {{":authority", 10}, {"x", 1}},
+                                    {{"content-type", 12}, test_case.content_type},
+                                    {test_case.expect_name, test_case.expect_value}};
+        CHECK_FALSE(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 6, req, false));
+        CHECK_EQ(down->h2->grpc.active, 0u);
+        CHECK(down->h2->grpc.streams[0] == nullptr);
+        CHECK(loop.grpc_upstreams == nullptr);
+        CHECK_EQ(down->send_buf.len(), 0u);
+        loop.force_close_all();
+        loop.shutdown();
+    }
+}
+
+TEST(grpc_proxy, h2_web_bodiless_expect_remains_admitted) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init_client();
+    REQUIRE(down->h2->open_stream(1));
+    down->request_config = &cfg;
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    req.headers[0] = {lit_str("content-type"), lit_str("application/grpc-web")};
+    req.header_count = 1;
+    req.has_content_length = true;
+    req.content_length = 0;
+    req.content_length_count = 1;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"content-type", 12}, {"application/grpc-web", 20}},
+                                {{"expect", 6}, {"100-continue", 12}}};
+    CHECK(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 6, req, true));
+    loop.force_close_all();
+    loop.shutdown();
+}
+
 TEST(grpc_proxy, h2_duplicate_web_family_content_types_rejected_before_upstream) {
     EpollEventLoop loop;
     REQUIRE(loop.init(0, -1).has_value());

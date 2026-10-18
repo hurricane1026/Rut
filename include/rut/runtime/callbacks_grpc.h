@@ -624,6 +624,25 @@ inline bool grpc_request_header_allowed(const hpack::Header& h) {
     if (h.name.eq({"te", 2}) && !h.value.eq({"trailers", 8})) return false;
     return true;
 }
+inline bool grpc_web_has_body_expect(const hpack::Header* hs,
+                                     u32 nh,
+                                     GrpcWebContentType web_mode,
+                                     bool end) {
+    if (end || (web_mode != GrpcWebContentType::Binary && web_mode != GrpcWebContentType::Text))
+        return false;
+    for (u32 i = 0; i < nh; i++) {
+        if (!http_header_name_eq_ci(hs[i].name.ptr, hs[i].name.len, "expect", 6)) continue;
+        Str value = hs[i].value;
+        while (value.len && (value.ptr[0] == ' ' || value.ptr[0] == '\t')) {
+            value.ptr++;
+            value.len--;
+        }
+        while (value.len && (value.ptr[value.len - 1] == ' ' || value.ptr[value.len - 1] == '\t'))
+            value.len--;
+        if (value.len) return true;
+    }
+    return false;
+}
 inline bool grpc_response_header_allowed(const hpack::Header& h) {
     return !h.name.eq({"content-length", 14});
 }
@@ -1907,6 +1926,7 @@ bool grpc_start_impl(Loop* loop,
                      const ParsedRequest& req,
                      bool end) {
     const GrpcWebContentType web_mode = grpc_request_mode(req);
+    if (grpc_web_has_body_expect(hs, nh, web_mode, end)) return false;
     const GrpcWebContentType response_mode = grpc_web_response_mode(hs, nh, web_mode);
     if (!cfg || uid >= cfg->upstream_count || !cfg->upstreams[uid].http2 ||
         req.method != HttpMethod::POST ||
