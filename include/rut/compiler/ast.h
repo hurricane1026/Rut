@@ -10,6 +10,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_tls.h"
 #include "rut/compiler/diagnostic.h"
 
 namespace rut {
@@ -374,6 +375,7 @@ struct AstUpstreamDecl {
     //      present; status defaults to 200. Config-only data threaded verbatim
     //      through HIR→MIR→RIR into RouteConfig::set_upstream_health_check; no
     //      runtime probing in this slice.
+    UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
     Str hc_path_lit{};             // raw `path:` string literal

@@ -381,8 +381,8 @@ effects only. Full buffered body/status middleware remains ⏳.
 
 Use the currently implemented upstream declaration below (the upstream binding
 migration shown elsewhere on this card is not required). `protocol: .http2`
-selects **prior-knowledge h2c** to the upstream; omitted / `.http11` retains the
-existing HTTP/1 forwarding path. This field does not enable upstream TLS.
+selects HTTP/2 to the upstream, using **prior-knowledge h2c** by default;
+omitted / `.http11` retains the existing HTTP/1 forwarding path.
 
 ```swift
 upstream greeter {
@@ -412,8 +412,36 @@ trailers including `grpc-status` are preserved. Header-only middleware may run
 before forwarding; body-reading handlers and HTTP/1-specific forward policies
 are outside this streaming path. HTTP/1 requests cannot use an HTTP/2 upstream.
 No `.proto`, protobuf dependency, new route keyword or streaming modifier is
-needed. gRPC-Web, JSON transcoding, upstream TLS/mTLS and gRPC health probes are
+needed. gRPC-Web, JSON transcoding and gRPC health probes are
 not implemented by this option; `health_check` with `.http2` is rejected.
+
+For a TLS upstream, add a `tls` field with explicit trust and identity:
+
+```swift
+upstream secureGreeter {
+    host: "127.0.0.1"
+    port: 5443
+    protocol: .http2
+    tls: {
+        ca: "/certs/ca.pem"
+        server_name: "backend.example.com"
+        cert: "/certs/client.pem"
+        key: "/certs/client.key"
+    }
+}
+```
+
+`ca` and `server_name` are required. Omit both `cert` and `key` for ordinary
+server-authenticated TLS; supply both for mTLS. Keys must be unencrypted PEM;
+encrypted keys are rejected without an interactive password prompt. Certificate-chain validation,
+DNS/IPv4 identity verification and h2 ALPN are mandatory. DNS identities also
+send SNI. There is no insecure verification mode, system-CA fallback or protocol
+downgrade. Paths are literal strings (maximum 255 bytes), relative to the
+process working directory when not absolute. `server_name` is at most 253 ASCII
+letters/digits/dots/hyphens; embedded controls and escaped literals are rejected.
+TLS is currently supported only with `.http2`. Files are loaded when a new
+pooled upstream session is established, and its TLS context remains alive until
+session teardown. TLS/configuration-file failures return UNAVAILABLE.
 
 Upstream connections are shared per shard/config/upstream/backend and multiplex
 RPCs from different downstream clients. Each session is bounded to 64 active
@@ -423,6 +451,19 @@ returns credit as bytes drain. Client cancellation resets only the mapped RPC.
 `grpc-timeout` is enforced with the existing precise timer mechanism (millisecond
 granularity); failures use gRPC status trailers. Calls are never automatically
 replayed. See [the complete example](../examples/grpc.rut).
+
+Native gRPC exposes `rut_grpc_started_total`, `rut_grpc_active`,
+`rut_grpc_completed_total{grpc_status="..."}` and the
+`rut_grpc_duration_seconds` histogram through the existing metrics endpoint.
+The existing access log records each admitted RPC's method path, payload byte
+counts, lifetime and a separate `grpc_status` field (HTTP status remains 200).
+Cancellation/disconnection is recorded as CANCELLED; local deadlines as
+DEADLINE_EXCEEDED. RPC retirement means the final response was staged into owned
+output or the RPC was cancelled, not delivery acknowledgement. Metrics use
+bounded status labels; service/method paths are recorded in logs. Existing
+source live-log bytes-only output remains bytes-only. No protobuf decoding is
+involved.
+
 
 ## I/O
 

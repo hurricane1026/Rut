@@ -9,6 +9,7 @@
 #include "rut/common/response_policy.h"
 #include "rut/common/strict_local_response.h"
 #include "rut/common/types.h"
+#include "rut/common/upstream_tls.h"
 #include "rut/jit/art_jit_codegen.h"  // ArtJitMatchFn typedef (LLVM-free)
 #include "rut/jit/handler_abi.h"
 #include "rut/runtime/error.h"
@@ -78,6 +79,7 @@ struct UpstreamTarget {
     // probing wired up yet). hc_enabled gates the rest; hc_path is the probe
     // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe
     // period, hc_expected_status the status that marks a backend healthy.
+    UpstreamTlsSpec tls{};
     bool http2 = false;
     bool hc_enabled = false;
     char hc_path[64];

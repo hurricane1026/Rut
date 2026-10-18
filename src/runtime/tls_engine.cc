@@ -141,6 +141,30 @@ core::Expected<void, Error> tls_engine_init(TlsEngine& eng, TlsServerContext* ct
     return {};
 }
 
+core::Expected<void, Error> tls_engine_init_client(TlsEngine& eng,
+                                                   TlsClientContext& ctx,
+                                                   const char* server_name) {
+    if (!ctx.ssl_ctx || !ctx.bridge_bio_method)
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    SSL* ssl = SSL_new(ctx.ssl_ctx);
+    if (!ssl) return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    BIO* bio = BIO_new(ctx.bridge_bio_method);
+    if (!bio) {
+        SSL_free(ssl);
+        return core::make_unexpected(Error::make(EIO, Error::Source::Socket));
+    }
+    BIO_set_data(bio, &eng);
+    SSL_set_bio(ssl, bio, bio);
+    if (!configure_tls_client_ssl(ssl, server_name)) {
+        SSL_free(ssl);
+        return core::make_unexpected(Error::make(EINVAL, Error::Source::Socket));
+    }
+    eng.ssl = ssl;
+    eng.handshake_done = false;
+    eng.deferred_session_tickets = 0;
+    return {};
+}
+
 void tls_engine_free(TlsEngine& eng) {
     if (eng.ssl) {
         SSL_free(eng.ssl);  // frees the attached BIO too

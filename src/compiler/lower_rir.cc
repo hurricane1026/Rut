@@ -3642,6 +3642,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         }
         // Active health-check config. hc_path is copied into arena memory (like
         // name) so the RIR module owns it independently of the AST/HIR/MIR.
+        out.module.upstreams[i].tls = mir.upstreams[i].tls;
         out.module.upstreams[i].http2 = mir.upstreams[i].http2;
         out.module.upstreams[i].hc_enabled = mir.upstreams[i].hc_enabled;
         const Str src_hc_path = mir.upstreams[i].hc_path;

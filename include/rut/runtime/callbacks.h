@@ -255,6 +255,8 @@ bool try_prebuilt_strict_read_timeout(Loop* loop, Connection& conn);
 // upstream timeout from the timer tick, 502 on failure) and tear down the
 // upstream side. Defined in callbacks_impl.h.
 template <typename Loop>
+void grpc_tls_ready(Loop* loop, Connection& conn);
+template <typename Loop>
 void grpc_tick(Loop* loop, Connection& conn);
 template <typename Loop>
 void on_h2_data(void* lp, Connection& conn, IoEvent ev);

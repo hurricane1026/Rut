@@ -1184,6 +1184,27 @@ TEST(zstd, stop_completes_frame_under_backpressure) {
     // The existing compressed_output_is_smaller test covers decompression validity.
 }
 
+TEST(access_log, grpc_status_text_and_ring) {
+    AccessLogEntry entry = make_entry(200, 123, 0, "/test.Echo/Call");
+    CHECK(formatted(entry).find("grpc_status=") == std::string::npos);
+    for (u8 status = 0; status <= 16; status++) {
+        entry.grpc_status_plus_one = status + 1;
+        const auto line = formatted(entry);
+        const auto suffix = " grpc_status=" + std::to_string(status) + "\n";
+        CHECK(line.ends_with(suffix));
+        char small[8];
+        memset(small, 'x', sizeof(small));
+        CHECK_EQ(format_access_log_text(entry, small, sizeof(small)), 0u);
+        CHECK_EQ(small[0], 'x');
+    }
+    AccessLogRing ring;
+    ring.init();
+    CHECK(ring.push(entry));
+    AccessLogEntry out{};
+    CHECK(ring.pop(out));
+    CHECK_EQ(out.grpc_status_plus_one, 17u);
+}
+
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
 }
