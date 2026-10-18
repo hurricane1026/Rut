@@ -620,6 +620,8 @@ canonical spelling for common gateway tasks.
 ### M6：gRPC、GraphQL 与 WebSocket 消息治理（清单 1、5、6、7）
 
 - [ ] 补齐 HTTP/2 上下游及 gRPC metadata、trailers、状态、deadline、取消与流式语义。
+- [x] 内部 protobuf wire 基础：有界 varint/fixed32/fixed64/bytes 读写、ZigZag、畸形输入测试；
+  无 Rut API，描述符、JSON 映射及转码尚未实现。
 - [ ] 在通用字节/流能力上实现 Rut protobuf 编解码模块、描述符读取与 HTTP/gRPC 转码；
   不强制用户用其他语言生成或维护插件。
 - [ ] Rut 实现 gRPC-Web 文本/二进制 framing 与 trailers，覆盖浏览器跨域与流式限制。
