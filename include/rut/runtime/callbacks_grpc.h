@@ -1048,11 +1048,10 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.on_send = nullptr;
     if (!continuation_send && g.header_continuation_len) {
         const u32 len = g.header_continuation_len;
-        if (!conn.send_buf.write(g.header_continuation, len)) {
+        if (conn.send_buf.write(g.header_continuation, len) != len) {
             loop->close_conn(conn);
             return;
         }
-        conn.send_buf.commit(len);
         g.header_continuation_len = 0;
         g.header_continuation_sending = true;
         conn.on_send = &grpc_on_upstream_sent<Loop>;
@@ -1125,10 +1124,12 @@ inline GrpcRequestHeaderBuild grpc_build_request_headers_for_send(const GrpcExch
         headers.length != x.request_headers_len - kFrameHeaderSize)
         return GrpcRequestHeaderBuild::NoSpace;
 
-    const bool append_to_headers = headers.length + field_len <= kDefaultMaxFrameSize;
-    const u32 extra = field_len + (append_to_headers ? 0 : kFrameHeaderSize);
     if (x.request_headers_len > cap) return GrpcRequestHeaderBuild::NoSpace;
-    const bool split_continuation = !append_to_headers && extra > cap - x.request_headers_len;
+    const u32 available = cap - x.request_headers_len;
+    const bool append_to_headers =
+        field_len <= kDefaultMaxFrameSize - headers.length && field_len <= available;
+    const u32 extra = field_len + (append_to_headers ? 0 : kFrameHeaderSize);
+    const bool split_continuation = !append_to_headers && extra > available;
     if (split_continuation && kFrameHeaderSize + field_len > continuation_cap)
         return GrpcRequestHeaderBuild::NoSpace;
     __builtin_memcpy(out, x.request_headers, x.request_headers_len);
