@@ -10,10 +10,20 @@ import summarize
 
 
 class Tests(unittest.TestCase):
+    def test_normalize_cpus_and_reject_nginx_variables(self):
+        self.assertEqual(bench.normalize_cpus('5,2-3,4'), '2,3,4,5')
+        with self.assertRaises(ValueError):
+            bench.normalize_cpus('3-2')
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / 'cost$bucket'
+            with self.assertRaises(ValueError):
+                bench.config(bad, 64, None, 8087, 1)
+
     def test_wrk_errors_and_units(self):
         text = '  99% 2.50ms\nRequests/sec: 1000.25\n'
         self.assertEqual(bench.parse_wrk(text)['p99_us'], 2500)
         self.assertFalse(bench.parse_wrk(text + 'Socket errors: connect 0, read 1, write 0, timeout 2\n')['valid'])
+        self.assertFalse(bench.parse_wrk(text + 'Timed non-200 responses: 1\n')['valid'])
         self.assertFalse(bench.parse_wrk(text + 'Non-2xx or 3xx responses: 3\n')['valid'])
         with self.assertRaises(ValueError):
             bench.parse_wrk('Requests/sec: 100\n')
@@ -38,7 +48,7 @@ class Tests(unittest.TestCase):
         try:
             bench.preflight('127.0.0.1', server.server_port, 4096)
             Handler.corrupt = True
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(ValueError):
                 bench.preflight('127.0.0.1', server.server_port, 4096)
         finally:
             server.shutdown()
@@ -63,9 +73,13 @@ class Tests(unittest.TestCase):
                     p.mkdir()
                     bench.save(p / 'result.json', dict(engine=engine, repetition=rep,
                         host='192.0.2.2', body_size=1024, connections=128, duration=30,
-                        warmup=5, port=8087, threads=4, valid=True,
+                        warmup=5, port=8087, threads=4, cpus='2-5', valid=True,
                         results=[dict(phase='measurement', rps=rps, p99_us=100)]))
+            for engine in ('rut', 'nginx'):
+                for rep in range(1, 4):
+                    (root / f'{engine}{rep}' / 'environment.json').write_text('{}')
             self.assertEqual(summarize.summarize(root)[0]['rut_gain_percent'], 100)
+            self.assertEqual(summarize.summarize(root)[0]['cpus'], '2-5')
             bench.save(root / 'failure.json', {'valid': False})
             with self.assertRaises(ValueError):
                 summarize.summarize(root)

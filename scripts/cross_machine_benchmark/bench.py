@@ -13,6 +13,16 @@ import subprocess
 import sys
 import time
 
+STATUS_SCRIPT = '''
+bad = 0
+function response(status, headers, body)
+  if status ~= 200 then bad = bad + 1 end
+end
+function done(summary, latency, requests)
+  print("Timed non-200 responses: " .. bad)
+end
+'''
+
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
@@ -46,6 +56,22 @@ def positive(s):
     return n
 
 
+def normalize_cpus(value):
+    cpus = set()
+    for item in value.split(','):
+        bounds = item.split('-', 1)
+        if len(bounds) == 1:
+            start = end = int(bounds[0])
+        else:
+            start, end = map(int, bounds)
+        if start < 0 or end < start:
+            raise ValueError('invalid CPU set')
+        cpus.update(range(start, end + 1))
+    if not cpus:
+        raise ValueError('empty CPU set')
+    return ','.join(str(cpu) for cpu in sorted(cpus))
+
+
 def payload(size):
     pattern = bytes(range(256))
     return (pattern * ((size + 255) // 256))[:size]
@@ -56,7 +82,7 @@ def config(out, body_size, origin, port, workers):
     (out / 'proxy').write_bytes(payload(body_size))
     # Paths embedded in nginx syntax must not contain quotes or control chars.
     root = str(out.resolve())
-    if any(c in root for c in '"\\\n\r'):
+    if any(c in root for c in '"$\\\n\r'):
         raise ValueError('unsupported output path characters')
     common = (f'worker_processes {workers};\ndaemon off;\n'
               'error_log stderr warn;\npid nginx.pid;\n'
@@ -91,21 +117,22 @@ def serve(a):
     out = a.config.resolve()
     c = json.loads((out / 'config.json').read_text())
     binary = str(Path(shutil.which(a.binary) or a.binary).resolve())
-    snapshot(out / f'{a.engine}-environment.json', [binary])
+    run_id = f'{a.engine}-{time.time_ns()}-{os.getpid()}'
+    snapshot(out / f'{run_id}-environment.json', [binary])
     if a.engine == 'rut':
         if not c['origin']:
             raise ValueError('rut requires a proxy config with --origin')
-        env = dict(os.environ)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('RUT_STUDY_')}
         env['RUT_STUDY_HTTP_ASYNC_SPLICE'] = 'on'
         argv = [binary, str(out / 'proxy.rut'), '--shards', str(c['workers']),
                 '--no-pin', '--drain', '1', '--opt', '2', '--backend', 'io_uring']
     else:
-        env = dict(os.environ)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('RUT_STUDY_')}
         name = 'origin.conf' if a.engine == 'origin' else 'proxy.conf'
         argv = [binary, '-p', str(out) + '/', '-c', str(out / name)]
         subprocess.run(argv + ['-t'], check=True)
     argv = ['taskset', '-c', a.cpus] + argv
-    save(out / f'{a.engine}-command.json', {'argv': argv,
+    save(out / f'{run_id}-command.json', {'argv': argv,
          'study_environment': {k: v for k, v in env.items() if k.startswith('RUT_STUDY_')}})
     # Foreground execution: Ctrl-C stops this server, never unrelated processes.
     os.execvpe(argv[0], argv, env)
@@ -118,12 +145,17 @@ def preflight(host, port, size):
         for _ in range(3):
             conn.request('GET', '/proxy')
             response = conn.getresponse()
-            assert response.status == 200, response.status
-            assert response.getheader('Content-Length') == str(size)
-            assert not response.will_close, 'response closes keepalive connection'
+            if response.status != 200:
+                raise ValueError(f'unexpected HTTP status: {response.status}')
+            if response.getheader('Content-Length') != str(size):
+                raise ValueError('unexpected Content-Length')
+            if response.will_close:
+                raise ValueError('response closes keepalive connection')
             sock = conn.sock
-            assert response.read() == expected, 'response payload mismatch'
-            assert conn.sock is sock and sock is not None
+            if response.read() != expected:
+                raise ValueError('response payload mismatch')
+            if conn.sock is not sock or sock is None:
+                raise ValueError('keepalive socket changed')
     finally:
         conn.close()
 
@@ -133,11 +165,13 @@ def parse_wrk(text):
     p99 = re.search(r'^\s*99%\s+([\d.]+)(us|ms|s)\s*$', text, re.M)
     errors = re.search(r'Socket errors: connect (\d+), read (\d+), write (\d+), timeout (\d+)', text)
     statuses = re.search(r'Non-2xx or 3xx responses:\s*(\d+)', text)
+    timed_statuses = re.search(r'Timed non-200 responses:\s*(\d+)', text)
     if not rps or not p99:
         raise ValueError('incomplete wrk output; requires --latency')
     counts = dict(zip(('connect', 'read', 'write', 'timeout'),
                       map(int, errors.groups() if errors else ('0',) * 4)))
     counts['status'] = int(statuses[1]) if statuses else 0
+    counts['timed_status'] = int(timed_statuses[1]) if timed_statuses else 0
     return {'rps': float(rps[1]), 'p99_us': float(p99[1]) *
             {'us': 1, 'ms': 1000, 's': 1000000}[p99[2]], 'errors': counts,
             'valid': not any(counts.values())}
@@ -148,8 +182,11 @@ def client(a):
     a.output.mkdir(parents=True, exist_ok=False)
     a.output_created = True
     snapshot(a.output / 'environment.json', [a.wrk])
+    cpus = normalize_cpus(a.cpus)
     preflight(a.host, a.port, a.body_size)
-    argv = ['taskset', '-c', a.cpus, a.wrk, '-t', str(a.threads),
+    status_script = a.output / 'status.lua'
+    status_script.write_text(STATUS_SCRIPT)
+    argv = ['taskset', '-c', cpus, a.wrk, '-s', str(status_script), '-t', str(a.threads),
             '-c', str(a.connections), '--latency', '--timeout', '5s']
     url = f'http://{a.host}:{a.port}/proxy'
     results = []
@@ -162,7 +199,7 @@ def client(a):
         row.update(phase=name, command=command, returncode=r.returncode)
         results.append(row)
     preflight(a.host, a.port, a.body_size)
-    result = dict(engine=a.engine, repetition=a.rep, host=a.host,
+    result = dict(engine=a.engine, repetition=a.rep, host=a.host, cpus=cpus,
                   body_size=a.body_size, connections=a.connections,
                   duration=a.duration, warmup=a.warmup, port=a.port, threads=a.threads, results=results,
                   valid=all(r['valid'] for r in results))

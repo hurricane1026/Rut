@@ -66,6 +66,8 @@ python3 bench.py client --host 192.0.2.20 --engine rut --rep 1 --cpus 2-5 --thre
 **顺序：Rut 1 → nginx 1 → nginx 2 → Rut 2 → Rut 3 → nginx 3。**
 每个引擎实例只测一轮，下一轮重启服务，即便引擎没变也重启。
 客户端 `--engine` 是人工标记，务必与 P 当前运行的进程对应；它不会远程切换服务器。
+客户端命令通过 `taskset -c <cpus>` 固定 wrk 的 CPU 集合；代理服务命令也使用同一选项，
+因此比较坐标会记录并校验规范化后的客户端 CPU 集合。
 保存每轮服务端日志（启动命令可用 shell 重定向），不能依赖 HTTP Server 头识别 Rut。
 
 脚本先用同一连接连续校验三次状态码、Content-Length、完整响应体和 keepalive，
