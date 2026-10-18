@@ -3,6 +3,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/grpc_retry_policy.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
@@ -500,6 +501,7 @@ struct MirUpstream {
     u16 extra_ports[kMaxExtraBackends] = {};
     // Active health-check config copied from HIR (data only; no probing yet).
     UpstreamTlsSpec tls{};
+    GrpcRetryPolicy grpc_retry{};
     u32 max_request_message_bytes = 0;
     u32 max_response_message_bytes = 0;
     bool http2 = false;

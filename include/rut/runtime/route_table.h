@@ -4,6 +4,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/grpc_retry_policy.h"
 #include "rut/common/http_header_validation.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
@@ -80,6 +81,7 @@ struct UpstreamTarget {
     // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe
     // period, hc_expected_status the status that marks a backend healthy.
     UpstreamTlsSpec tls{};
+    GrpcRetryPolicy grpc_retry{};
     u32 max_request_message_bytes = 0;
     u32 max_response_message_bytes = 0;
     bool http2 = false;

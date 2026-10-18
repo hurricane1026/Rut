@@ -15925,6 +15925,9 @@ static FrontendResult<HirModule*> analyze_file_internal(
         up.max_response_message_bytes = item.upstream.max_response_message_bytes;
         if ((up.max_request_message_bytes || up.max_response_message_bytes) && !item.upstream.http2)
             return frontend_error(FrontendError::UnsupportedSyntax, item.upstream.addr_span);
+        up.grpc_retry = item.upstream.grpc_retry;
+        if (!up.grpc_retry.valid(item.upstream.http2))
+            return frontend_error(FrontendError::UnsupportedSyntax, item.upstream.addr_span);
         up.tls = item.upstream.tls;
         if (up.tls.enabled && !item.upstream.http2)
             return frontend_error(FrontendError::UnsupportedSyntax, item.upstream.addr_span);

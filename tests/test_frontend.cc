@@ -40150,3 +40150,115 @@ TEST(frontend, upstream_grpc_message_limits_reject_invalid_configuration) {
     REQUIRE(ast);
     CHECK(!analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, upstream_grpc_retry_policy_reaches_runtime_config) {
+    const char* source =
+        "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http2, "
+        "grpc_retry: { max_attempts: 3, max_request_bytes: 1048576, "
+        "statuses: [14, 8,], backoff_ms: 60000 } }\n"
+        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    CHECK_EQ(rir.module.upstreams[0].grpc_retry.max_attempts, 3u);
+    CHECK_EQ(rir.module.upstreams[0].grpc_retry.max_request_bytes, 1048576u);
+    CHECK_EQ(rir.module.upstreams[0].grpc_retry.status_mask, (1u << 14) | (1u << 8));
+    CHECK_EQ(rir.module.upstreams[0].grpc_retry.backoff_ms, 60000u);
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].grpc_retry.max_attempts, 3u);
+    CHECK_EQ(cfg.upstreams[0].grpc_retry.max_request_bytes, 1048576u);
+    CHECK_EQ(cfg.upstreams[0].grpc_retry.status_mask, (1u << 14) | (1u << 8));
+    CHECK_EQ(cfg.upstreams[0].grpc_retry.backoff_ms, 60000u);
+    CHECK_FALSE(cfg.upstreams[0].grpc_retry.valid(false));
+
+    RouteConfig prebound_cfg;
+    REQUIRE(prebound_cfg.add_upstream("grpc", 0x7f000001, 50051).has_value());
+    REQUIRE(populate_route_config(prebound_cfg, rir.module));
+    CHECK_EQ(prebound_cfg.upstreams[0].grpc_retry.max_attempts, 3u);
+    CHECK_EQ(prebound_cfg.upstreams[0].grpc_retry.max_request_bytes, 1048576u);
+    CHECK_EQ(prebound_cfg.upstreams[0].grpc_retry.status_mask, (1u << 14) | (1u << 8));
+    CHECK_EQ(prebound_cfg.upstreams[0].grpc_retry.backoff_ms, 60000u);
+
+    rir.module.upstreams[0].grpc_retry.max_attempts = 255;
+    RouteConfig malformed_cfg;
+    CHECK_FALSE(populate_route_config(malformed_cfg, rir.module));
+    rir.destroy();
+
+    const char* disabled_source =
+        "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http2 }\n"
+        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n";
+    auto disabled_tokens = lex(lit(disabled_source));
+    REQUIRE(disabled_tokens);
+    auto disabled_ast = parse_file_heap(disabled_tokens.value());
+    REQUIRE(disabled_ast);
+    auto disabled_hir = analyze_file_heap(disabled_ast.value());
+    REQUIRE(disabled_hir);
+    auto disabled_mir = build_mir_heap(disabled_hir.value());
+    REQUIRE(disabled_mir);
+    FrontendRirModule disabled_rir{};
+    REQUIRE(lower_to_rir(disabled_mir.value(), disabled_rir));
+    RouteConfig disabled_cfg;
+    REQUIRE(populate_route_config(disabled_cfg, disabled_rir.module));
+    CHECK(!disabled_cfg.upstreams[0].grpc_retry.enabled());
+    CHECK(disabled_cfg.upstreams[0].grpc_retry.valid(true));
+    CHECK(disabled_cfg.upstreams[0].grpc_retry.valid(false));
+    disabled_rir.destroy();
+}
+
+TEST(frontend, upstream_grpc_retry_policy_rejects_invalid_configuration) {
+    const char* fields[] = {
+        "grpc_retry: { max_attempts: 1, max_request_bytes: 1, statuses: [14], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 4, max_request_bytes: 1, statuses: [14], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 256, max_request_bytes: 1, statuses: [14], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 4294967296, max_request_bytes: 1, statuses: [14], backoff_ms: "
+        "0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 0, statuses: [14], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, max_request_bytes: 2, statuses: "
+        "[14], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1048577, statuses: [14], backoff_ms: 0 "
+        "}",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [0], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [17], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14, 14], backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14,], backoff_ms: 60001 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14] }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14], backoff_ms: 0, "
+        "unknown: 1 }",
+        "grpc_retry: { max_attempts: 2, max_attempts: 3, max_request_bytes: 1, statuses: [14], "
+        "backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14], statuses: [8], "
+        "backoff_ms: 0 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14], backoff_ms: 0, "
+        "backoff_ms: 1 }",
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14], backoff_ms: 0 }, "
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14], backoff_ms: 0 }",
+    };
+    for (const char* field : fields) {
+        char source[1024];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http2, %s }",
+                 field);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK(!parse_file_heap(tokens.value()));
+    }
+
+    const char* non_http2 =
+        "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http11, "
+        "grpc_retry: { max_attempts: 2, max_request_bytes: 1, statuses: [14], backoff_ms: 0 } }";
+    auto tokens = lex(lit(non_http2));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(!analyze_file_heap(ast.value()));
+}
