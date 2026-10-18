@@ -54,7 +54,7 @@ void LoadedProgram::destroy() {
     listener = ListenerSpec{};
     access_log = AccessLogSinkSpec{};
     has_ebpf_plan = false;
-    ebpf_plan = {};
+    ebpf_plan = ebpf::Plan{};
 }
 
 namespace {

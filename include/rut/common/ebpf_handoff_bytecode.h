@@ -307,6 +307,7 @@ inline void emit_packet_handoff_bytecode(HandoffCode& out) {
         verdict.add(0x63, 7, 1, 28);  // body prefix that userspace must still send
         verdict.add(0xbc, 3, 8);
         verdict.add(0xb4, 2, 0, 0, static_cast<i32>(kHandoffOwned));
+        verdict.add(0x57, 2, 0, 0, static_cast<i32>(~kHandoffBudgetMask));
         verdict.add(0x67, 2, 0, 0, 32);
         verdict.add(0x4f, 3, 2);
         verdict.add(0xb7, 1, 0, 0, 0);

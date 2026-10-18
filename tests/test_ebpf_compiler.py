@@ -3,6 +3,7 @@
 import argparse
 import json
 import shutil
+import struct
 import sys
 from pathlib import Path
 import subprocess
@@ -45,6 +46,38 @@ route GET "/buffered" {
 
 def run(server, *args):
     return subprocess.run([str(server), *map(str, args)], capture_output=True, text=True, timeout=30)
+
+
+def check_crossing_budget_transition(data):
+    """Execute each emitted crossing transition on a nonzero synthetic state."""
+    instructions = [struct.unpack_from("BBhi", data, offset)
+                    for offset in range(0, len(data), 8)]
+    owned = 0x80000000
+    owned_immediate = -0x80000000
+    budget_mask = 0x3FFFFFFF
+    clear_mask = (-1 << 30) & 0xFFFFFFFF
+    clear_immediate = -0x40000000
+    transitions = 0
+    for index, (opcode, registers, _offset, immediate) in enumerate(instructions[:-3]):
+        dst, src = registers & 0x0F, registers >> 4
+        if (opcode, dst, immediate) != (0xB4, 2, owned_immediate):
+            continue
+        mask = instructions[index + 1]
+        shift = instructions[index + 2]
+        merge = instructions[index + 3]
+        assert mask[:2] == (0x57, 2) and mask[3] == clear_immediate, mask
+        assert shift[:3] == (0x67, 2, 0) and shift[2] == 0, shift
+        assert merge[0] == 0x4F and (merge[1] & 0x0F) == 3 and merge[1] >> 4 == 2, merge
+        control = 123 | owned
+        control &= clear_mask
+        control <<= 32
+        passed = 0x12345678
+        result = control | passed
+        assert result & 0xFFFFFFFF == passed
+        assert (result >> 32) & budget_mask == 0
+        assert result & (owned << 32), result
+        transitions += 1
+    assert transitions == 4, transitions
 
 
 def main():
@@ -95,6 +128,7 @@ def main():
             for name in relocations:
                 index = handoff["relocations"][name]
                 assert data[index * 8 + 4:index * 8 + 8] == bytes(4), name
+        check_crossing_budget_transition(Path(str(prefix) + ".packet-verdict.bpf").read_bytes())
         preserved = {suffix: Path(str(prefix) + suffix).read_bytes()
                      for suffix in (".parser.bpf", ".verdict.bpf", ".packet-verdict.bpf", ".handoff-commit.bpf", ".json")}
         result = run(server, source, "--emit-ebpf", prefix)

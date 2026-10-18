@@ -118,23 +118,10 @@ modified templates. This is a trusted same-build primitive, not arbitrary code
 or a general HTTP parser in BPF. Its body limit is `0x3fffffff` bytes and passed
 counter is 32-bit; it is tested on fresh sockets, not general keep-alive reuse.
 
-Build and run the fixture:
-
-```bash
-cmake -S . -B build -DRUT_ENABLE_EBPF=ON -DRUT_BUILD_EBPF_PROBE=ON
-cmake --build build --target rut rut-compile bench_ebpf_handoff
-build/src/rut app.rut --emit-ebpf /path/to/new/output-prefix
-build/bench/bench_ebpf_handoff required --packet-verdict \
-  --handoff-prefix /path/to/new/output-prefix --coalesced-tail
-build/bench/bench_ebpf_handoff auto --packet-verdict
-build/bench/bench_ebpf_handoff splice --coalesced-tail
-```
-
-`required` fails explicitly without kernel support/permission; `auto` selects
-copy if initialization fails before sockets are enrolled. After possible
-ownership commit, errors fail the flow; they never restart userspace copying.
-`splice` is a separate comparator within the same fixture. Export loading checks
-exact file sizes and template bytes. These modes do not start the Rut server.
+The isolated TCP handoff fixture and its `bench_ebpf_handoff` target are supplied
+by the follow-up [handoff probe change](https://github.com/hurricane1026/Rut/pull/823).
+This compiler-plan change only builds `rut` and `rut-compile`; use the probe
+change's documented build and run commands when validating the exported files.
 
 The [atomic handoff results](benchmarks/ebpf-handoff-2026-10-03/README.md) show
 correct transfers and a CPU/latency tradeoff. The current loopback experiment
