@@ -76,7 +76,7 @@ struct Buffer {
     void child(u32 tag, Buffer& value) {
         const u8* bytes = value.flatten();
         if (!bytes) {
-            error = value.error == Error::Allocation ? Error::Allocation : Error::Limit;
+            if (error == Error::None) error = value.error;
             return;
         }
         add({tag, 2, 0, bytes, value.size});
@@ -713,19 +713,30 @@ bool Parser::file() {
 // Resolve deferred nested buffers bottom-up. Structural depth is bounded by the
 // parser's declaration limit; each buffer owns its list, so no shared mutation.
 bool finish(Buffer& buffer, u32 depth = 0) {
-    if (depth > 36 || buffer.error != Buffer::Error::None) return false;
+    if (depth > 36) {
+        buffer.error = Buffer::Error::Limit;
+        return false;
+    }
+    if (buffer.error != Buffer::Error::None) return false;
     for (Chunk* chunk = buffer.head; chunk; chunk = chunk->next) {
         if (!chunk->child) continue;
         auto* child = chunk->child;
         const u32 kTag = chunk->tag;
-        if (!finish(*child, depth + 1)) return false;
+        if (!finish(*child, depth + 1)) {
+            buffer.error = child->error;
+            return false;
+        }
         const u8* bytes = child->flatten();
-        if (!bytes) return false;
+        if (!bytes) {
+            buffer.error = child->error;
+            return false;
+        }
         Buffer encoded{buffer.arena};
         encoded.add({kTag, 2, 0, bytes, child->size});
         if (encoded.error != Buffer::Error::None || !encoded.head ||
             encoded.head->size > 4 * 1024 * 1024 - buffer.size) {
-            if (encoded.error == Buffer::Error::None) buffer.error = Buffer::Error::Limit;
+            buffer.error =
+                encoded.error == Buffer::Error::None ? Buffer::Error::Limit : encoded.error;
             return false;
         }
         chunk->child = nullptr;

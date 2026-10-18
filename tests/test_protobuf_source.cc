@@ -3,7 +3,6 @@
 #include "rut/compiler/protobuf_source.h"
 #include "rut/runtime/arena.h"
 #include "test.h"
-#include <string>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,6 +167,12 @@ TEST(protobuf_source, source_budgets_and_empty_files) {
     Storage storage;
     CHECK_FALSE(files.load(storage));
 }
+TEST(protobuf_source, uninitialized_arena_reports_allocation_failure) {
+    Arena<MmapBackend> arena;
+    auto result = load_proto_source(arena, lit_str("/tmp/missing.proto"));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Allocation);
+}
 
 TEST(protobuf_source, service_budget_honors_zero_and_boundary) {
     Files files;
@@ -199,10 +204,10 @@ TEST(protobuf_source, inner_type_name_shadows_outer_namespace) {
 TEST(protobuf_source, field_and_nested_message_symbols_collide_in_both_orders) {
     Files files;
     REQUIRE(files.ok);
-    const char* bodies[] = {"message M { string X=1; message X {} }",
-                            "message M { message X {} string X=1; }"};
+    const char* bodies[] = {"syntax='proto3'; message M { string X=1; message X {} }",
+                            "syntax='proto3'; message M { message X {} string X=1; }"};
     for (const char* body : bodies) {
-        REQUIRE(files.write_file("root.proto", (std::string("syntax='proto3'; ") + body).c_str()));
+        REQUIRE(files.write_file("root.proto", body));
         Storage storage;
         auto result = files.load(storage);
         REQUIRE_FALSE(result.has_value());
