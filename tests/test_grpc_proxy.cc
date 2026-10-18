@@ -3294,9 +3294,22 @@ TEST(grpc_proxy, active_session_keepalive_gates_and_timeout) {
     h->peer_goaway = false;
     CHECK(!grpc_keepalive_tick(*h, due, timeout, false));
     CHECK_EQ(g.control_len, 0u);
+    CHECK_EQ(g.keepalive_due_us, due);
+    CHECK(!grpc_keepalive_tick(*h, due + timeout - 1, timeout, false));
+    CHECK(grpc_keepalive_tick(*h, due + timeout, timeout, false));
+    g.keepalive_due_us = 0;
+    const u64 delayed_tick = due + 2 * timeout;
+    CHECK(!grpc_keepalive_tick(*h, delayed_tick, timeout, false));
+    CHECK_EQ(g.keepalive_due_us, delayed_tick);
+    CHECK(!grpc_keepalive_tick(*h, delayed_tick + timeout - 1, timeout, false));
+    CHECK(grpc_keepalive_tick(*h, delayed_tick + timeout, timeout, false));
+    g.keepalive_due_us = 0;
+    g.last_ping_us = 0;
     g.control_len = sizeof(g.control) - 16;
     CHECK(!grpc_keepalive_tick(*h, due, timeout, true));
     CHECK(!h->ping_pending);
+    CHECK(grpc_keepalive_tick(*h, due + timeout, timeout, true));
+    g.keepalive_due_us = 0;
     g.control_len = 0;
     CHECK(!grpc_keepalive_tick(*h, due - 1, timeout, true));
     CHECK(!h->ping_pending);
@@ -3317,6 +3330,53 @@ TEST(grpc_proxy, active_session_keepalive_gates_and_timeout) {
     CHECK_EQ(g.control_len, 0u);
     CHECK(!grpc_keepalive_tick(*h, due + 300000000, timeout, true));
     CHECK(h->ping_pending);
+}
+
+TEST(grpc_proxy, blocked_keepalive_probe_timeout_closes_and_releases_session) {
+    struct ClosingLoop : GrpcDriveFixture {
+        void close_conn(Connection& conn) {
+            grpc_connection_closed<GrpcDriveFixture>(this, conn);
+            closed = true;
+        }
+    } loop;
+    Connection conn;
+    conn.reset();
+    auto h = std::make_unique<Http2Conn>();
+    h->init_client();
+    conn.h2 = h.get();
+    conn.on_send = &pending_send;
+    auto& g = h->grpc;
+    g.upstream = true;
+    g.active = 1;
+    g.preface_sent = true;
+    h->peer_settings_seen = true;
+    g.connected_at_us = monotonic_us() - 300000001;
+    Connection downstream;
+    downstream.reset();
+    auto down_h2 = std::make_unique<Http2Conn>();
+    down_h2->init();
+    downstream.h2 = down_h2.get();
+    auto x = std::make_unique<GrpcExchange>();
+    x->init();
+    x->upstream = &conn;
+    x->downstream = &downstream;
+    x->upstream_stream = x->downstream_stream = 1;
+    x->slot_held = true;
+    REQUIRE(grpc_attach(*h, x.get()));
+    REQUIRE(grpc_attach(*down_h2, x.get()));
+    loop.grpc_upstreams = &conn;
+    grpc_tick(&loop, conn);
+    CHECK(!loop.closed);
+    CHECK_EQ(loop.sends, 0u);
+    CHECK(!h->ping_pending);
+    CHECK(g.keepalive_due_us != 0);
+    g.keepalive_due_us = monotonic_us() - 1000001;
+    grpc_tick(&loop, conn);
+    CHECK(loop.closed);
+    CHECK_EQ(loop.released, 1u);
+    CHECK(x->upstream == nullptr);
+    CHECK(!x->slot_held);
+    CHECK(x->response_end);
 }
 
 TEST(grpc_proxy, keepalive_timer_flushes_probe_and_closes_unresponsive_session) {
