@@ -43,21 +43,23 @@ manifest to C and use it for every proxy repetition.
 ## 2. 代理 P
 
 ```bash
+scp O:/tmp/origin-1m/server-manifest.json P:/tmp/origin-1m-server-manifest.json
 python3 bench.py prepare --output /tmp/proxy-1m --origin 192.0.2.30:9087 --port 8087 --workers 1 --body-size 1048576
-python3 bench.py serve --engine rut --config /tmp/proxy-1m --binary /absolute/path/rut --cpus 2
+python3 bench.py serve --engine rut --config /tmp/proxy-1m --binary /absolute/path/rut --cpus 2 --origin-manifest /tmp/origin-1m-server-manifest.json
 ```
 
 On C, copy the manifest produced on P before starting the client, and repeat this
 after every proxy restart:
 
 ```bash
+scp P:/tmp/origin-1m-server-manifest.json /tmp/origin-1m-server-manifest.json
 scp P:/tmp/proxy-1m/server-manifest.json /tmp/proxy-1m-server-manifest.json
 ```
 
 nginx 对照：先在代理终端 Ctrl-C 停止 Rut，确认端口释放，然后运行：
 
 ```bash
-python3 bench.py serve --engine nginx --config /tmp/proxy-1m --binary /absolute/path/nginx --cpus 2
+python3 bench.py serve --engine nginx --config /tmp/proxy-1m --binary /absolute/path/nginx --cpus 2 --origin-manifest /tmp/origin-1m-server-manifest.json
 ```
 
 两种代理都使用上游 keepalive；nginx 关闭 proxy buffering。上游原文件和代理配置
