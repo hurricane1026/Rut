@@ -5473,6 +5473,96 @@ TEST(grpc_proxy, active_session_keepalive_gates_and_timeout) {
     CHECK(h->ping_pending);
 }
 
+TEST(grpc_proxy, keepalive_probe_queues_behind_progressing_upload_send) {
+    GrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    u8 recv[256]{};
+    u8 send[64]{};
+    upstream.bind_request_receive_buffer(recv, sizeof(recv));
+    upstream.send_slice = send;
+    upstream.send_buf.bind(send, sizeof(send));
+
+    Http2Conn upstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.grpc.preface_sent = true;
+    upstream_h2.grpc.active = 1;
+    upstream_h2.grpc.connected_at_us = monotonic_us() - 300000001;
+    upstream_h2.peer_settings_seen = true;
+    upstream.h2 = &upstream_h2;
+    auto* stream = upstream_h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->state = Http2StreamState::Open;
+
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+
+    GrpcExchange exchange;
+    exchange.init();
+    exchange.upstream = &upstream;
+    exchange.downstream = &downstream;
+    exchange.upstream_stream = exchange.downstream_stream = 1;
+    exchange.request_headers_sent = true;
+    exchange.upload_len = 100;
+    for (u32 i = 0; i < exchange.upload_len; i++) exchange.upload[i] = static_cast<u8>(i);
+    REQUIRE(grpc_attach(upstream_h2, &exchange));
+
+    const u8 first_data[] = {1, 2, 3, 4};
+    const u32 first_len = http2_write_data(send, 1, first_data, sizeof(first_data), false);
+    REQUIRE_GT(first_len, 0u);
+    upstream.send_buf.commit(first_len);
+    upstream.on_send = &grpc_on_upstream_sent<GrpcDriveFixture>;
+    REQUIRE(loop.submit_send(upstream, send, first_len));
+    u8 borrowed_send[sizeof(send)];
+    __builtin_memcpy(borrowed_send, send, first_len);
+
+    grpc_tick(&loop, upstream);
+    CHECK_FALSE(loop.closed);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(upstream.send_buf.len(), first_len);
+    CHECK_EQ(upstream_h2.grpc.control_len, 17u);
+    CHECK(upstream_h2.ping_pending);
+    CHECK_EQ(memcmp(send, borrowed_send, first_len), 0);
+
+    grpc_on_upstream_sent<GrpcDriveFixture>(
+        &loop, upstream, {upstream.id, static_cast<i32>(first_len), 0, 0, IoEventType::Send, 0});
+    CHECK_EQ(loop.sends, 2u);
+    CHECK_EQ(upstream_h2.grpc.control_len, 0u);
+    Http2FrameHeader ping{};
+    REQUIRE_EQ(parse_frame_header(upstream.send_buf.data(), upstream.send_buf.len(), &ping),
+               ParseStatus::Complete);
+    CHECK_EQ(ping.type, static_cast<u8>(Http2FrameType::Ping));
+    CHECK_EQ(upstream.send_buf.len(), 17u);
+    u8 ack[17];
+    __builtin_memcpy(ack, upstream.send_buf.data(), sizeof(ack));
+    ack[4] = http2_flag::kAck;
+
+    grpc_on_upstream_sent<GrpcDriveFixture>(
+        &loop,
+        upstream,
+        {upstream.id, static_cast<i32>(upstream.send_buf.len()), 0, 0, IoEventType::Send, 0});
+    CHECK_EQ(loop.sends, 3u);
+    Http2FrameHeader data{};
+    REQUIRE_EQ(parse_frame_header(upstream.send_buf.data(), upstream.send_buf.len(), &data),
+               ParseStatus::Complete);
+    CHECK_EQ(data.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK_EQ(exchange.upload_len, 45u);
+
+    __builtin_memcpy(upstream.recv_slice, ack, sizeof(ack));
+    upstream.recv_buf.commit(sizeof(ack));
+    grpc_on_upstream_data<GrpcDriveFixture>(
+        &loop, upstream, {upstream.id, static_cast<i32>(sizeof(ack)), 0, 0, IoEventType::Recv, 0});
+    CHECK_FALSE(upstream_h2.ping_pending);
+    upstream_h2.grpc.last_ping_us =
+        monotonic_us() - static_cast<u64>(loop.upstream_timeout) * 1000000 - 1;
+    grpc_tick(&loop, upstream);
+    CHECK_FALSE(loop.closed);
+}
+
 TEST(grpc_proxy, blocked_keepalive_probe_timeout_closes_and_releases_session) {
     struct ClosingLoop : GrpcDriveFixture {
         void close_conn(Connection& conn) {
@@ -5509,9 +5599,12 @@ TEST(grpc_proxy, blocked_keepalive_probe_timeout_closes_and_releases_session) {
     grpc_tick(&loop, conn);
     CHECK(!loop.closed);
     CHECK_EQ(loop.sends, 0u);
-    CHECK(!h->ping_pending);
-    CHECK(g.keepalive_due_us != 0);
-    g.keepalive_due_us = monotonic_us() - 1000001;
+    CHECK(h->ping_pending);
+    CHECK_EQ(g.control_len, 17u);
+    CHECK_EQ(g.keepalive_due_us, 0u);
+    // The probe is queued behind the genuinely blocked send. Its ACK deadline
+    // still closes a session when the queued PING cannot drain.
+    g.last_ping_us = monotonic_us() - 1000001;
     grpc_tick(&loop, conn);
     CHECK(loop.closed);
     CHECK_EQ(loop.released, 1u);
