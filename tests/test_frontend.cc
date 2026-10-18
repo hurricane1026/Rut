@@ -40102,3 +40102,51 @@ TEST(frontend, upstream_tls_rejects_incomplete_duplicate_or_unsafe_options) {
     REQUIRE(ast);
     CHECK(!analyze_file_heap(ast.value()));
 }
+
+TEST(frontend, upstream_grpc_message_limits_reach_runtime_config) {
+    const char* source =
+        "upstream grpc { host: \"127.0.0.1\", port: 50051, protocol: .http2, "
+        "max_request_message_bytes: 1048576, max_response_message_bytes: 4294967295 }\n"
+        "route POST \"/test.Echo/Call\" { return forward(grpc) }\n";
+    auto tokens = lex(lit(source));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    REQUIRE(lower_to_rir(mir.value(), rir));
+    RouteConfig cfg;
+    REQUIRE(populate_route_config(cfg, rir.module));
+    CHECK_EQ(cfg.upstreams[0].max_request_message_bytes, 1048576u);
+    CHECK_EQ(cfg.upstreams[0].max_response_message_bytes, 0xffffffffu);
+    rir.destroy();
+}
+
+TEST(frontend, upstream_grpc_message_limits_reject_invalid_configuration) {
+    const char* fields[] = {"max_request_message_bytes: 0",
+                            "max_request_message_bytes: 4294967296",
+                            "max_request_message_bytes: 999999999999999999999999",
+                            "max_request_message_bytes: -1",
+                            "max_response_message_bytes: \"4096\"",
+                            "max_request_message_bytes: 1, max_request_message_bytes: 2",
+                            "max_response_message_bytes: 1, max_response_message_bytes: 2"};
+    for (const char* field : fields) {
+        char source[512];
+        snprintf(source,
+                 sizeof(source),
+                 "upstream grpc { host: \"127.0.0.1\", port: 80, protocol: .http2, %s }",
+                 field);
+        auto tokens = lex(lit(source));
+        REQUIRE(tokens);
+        CHECK(!parse_file_heap(tokens.value()));
+    }
+    auto tokens =
+        lex(lit("upstream grpc { host: \"127.0.0.1\", port: 80, max_request_message_bytes: 1 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    CHECK(!analyze_file_heap(ast.value()));
+}

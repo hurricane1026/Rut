@@ -3539,3 +3539,157 @@ TEST(grpc_proxy, keepalive_timer_flushes_probe_and_closes_unresponsive_session) 
     grpc_connection_closed<GrpcDriveFixture>(&loop, conn);
     CHECK_EQ(loop.released, 1u);
 }
+
+TEST(grpc_proxy, message_limits_fragmentation_and_opaque_payloads) {
+    const u8 frames[] = {0, 0, 0, 0, 3, 0xff, 0xfe, 0xfd, 1, 0, 0, 0, 2, 0xf0, 0xf1, 0, 0, 0, 0, 0};
+    for (u32 chunk = 1; chunk <= sizeof(frames); chunk++) {
+        GrpcMessageLimit limit;
+        limit.init(3);
+        for (u32 off = 0; off < sizeof(frames);) {
+            const u32 amount = chunk < sizeof(frames) - off ? chunk : sizeof(frames) - off;
+            CHECK_EQ(limit.feed(frames + off, amount, off + amount == sizeof(frames)), 0u);
+            off += amount;
+        }
+        CHECK_EQ(limit.feed(nullptr, 0, true), 0u);
+    }
+    GrpcMessageLimit limit;
+    const u8 oversized[] = {0, 0xff, 0xff, 0xff, 0xff};
+    limit.init(100);
+    CHECK_EQ(limit.feed(oversized, sizeof(oversized), false), 8u);
+    limit.init(0xffffffffu);
+    CHECK_EQ(limit.feed(oversized, sizeof(oversized), false), 0u);
+    CHECK_EQ(limit.remaining, 0xffffffffu);
+    CHECK_EQ(limit.feed(nullptr, 0, true), 13u);
+    const u8 invalid[] = {2, 0, 0, 0, 0};
+    limit.init(3);
+    CHECK_EQ(limit.feed(invalid, sizeof(invalid), true), 13u);
+    for (u32 bytes = 1; bytes < 8; bytes++) {
+        limit.init(3);
+        CHECK_EQ(limit.feed(frames, bytes, true), 13u);
+    }
+    limit.init();
+    CHECK_EQ(limit.feed(invalid, sizeof(invalid), true), 0u);  // omitted limits stay opaque
+}
+
+TEST(grpc_proxy, message_limits_detach_oversized_upload_and_download) {
+    for (bool response : {false, true}) {
+        GrpcDriveFixture loop;
+        Connection up, down;
+        up.reset();
+        down.reset();
+        auto upstream = std::make_unique<Http2Conn>();
+        auto downstream = std::make_unique<Http2Conn>();
+        upstream->init_client();
+        upstream->grpc.upstream = true;
+        downstream->init_client();
+        up.h2 = upstream.get();
+        down.h2 = downstream.get();
+        up.on_send = &pending_send;
+        REQUIRE(upstream->open_stream(1));
+        REQUIRE(downstream->open_stream(1));
+        auto x = std::make_unique<GrpcExchange>();
+        x->init();
+        x->upstream = &up;
+        x->downstream = &down;
+        x->upstream_stream = x->downstream_stream = 1;
+        x->request_headers_sent = true;
+        x->slot_held = true;
+        x->request_message.init(3);
+        x->response_message.init(3);
+        REQUIRE(grpc_attach(*upstream, x.get()));
+        REQUIRE(grpc_attach(*downstream, x.get()));
+        const u8 prefix[] = {0, 0, 0, 0, 4};
+        if (response) {
+            GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &up};
+            grpc_response_data<GrpcDriveFixture>(&dispatch, *upstream, 1, prefix, 5, false);
+            CHECK(x->response_end);
+        } else {
+            grpc_request_data(&loop, down, *x, prefix, 5, false);
+        }
+        CHECK_EQ(x->failure, 8u);
+        CHECK(x->upstream == nullptr);
+        CHECK(!x->slot_held);
+        CHECK_EQ(loop.released, 1u);
+        CHECK_EQ(upstream->grpc.active, 0u);
+        CHECK_EQ(upstream->grpc.control_len, 13u);
+        CHECK_EQ(x->upload_len, 0u);
+        CHECK_EQ(x->download_len, 0u);
+    }
+}
+
+TEST(grpc_proxy, message_limits_reject_response_trailers_inside_payload) {
+    GrpcDriveFixture loop;
+    Connection up;
+    up.reset();
+    auto h = std::make_unique<Http2Conn>();
+    h->init_client();
+    h->grpc.upstream = true;
+    up.h2 = h.get();
+    REQUIRE(h->open_stream(1));
+    auto x = std::make_unique<GrpcExchange>();
+    x->init();
+    x->upstream = &up;
+    x->upstream_stream = x->downstream_stream = 1;
+    x->response_message.init(100);
+    const u8 partial[] = {0, 0, 0, 0, 5, 1};
+    CHECK_EQ(x->response_message.feed(partial, sizeof(partial), false), 0u);
+    REQUIRE(grpc_attach(*h, x.get()));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &up};
+    const hpack::Header trailers[] = {{{"grpc-status", 11}, {"0", 1}}};
+    grpc_response_trailers<GrpcDriveFixture>(&dispatch, *h, 1, trailers, 1, true);
+    CHECK_EQ(x->failure, 13u);
+}
+
+template <typename Loop>
+void message_limit_snapshot_case(rut::test::TestCase* _tc) {
+    auto loop = std::make_unique<Loop>();
+    if (!loop->init(0, -1).has_value()) SKIP("backend unavailable");
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    cfg.upstreams[0].max_request_message_bytes = 100;
+    cfg.upstreams[0].max_response_message_bytes = 200;
+    Connection* up = loop->alloc_conn();
+    Connection* down = loop->alloc_conn();
+    REQUIRE(up && down);
+    REQUIRE(loop->alloc_h2(*up));
+    REQUIRE(loop->alloc_h2(*down));
+    up->h2->init_client();
+    down->h2->init_client();
+    up->h2->grpc.upstream = true;
+    up->h2->grpc.preface_sent = true;
+    up->h2->peer_settings_seen = true;
+    up->upstream_idx = up->upstream_backend_idx = 0;
+    up->request_config = down->request_config = &cfg;
+    up->on_send = down->on_send = &pending_send;
+    up->on_close = &grpc_connection_closed<Loop>;
+    loop->grpc_upstreams = up;
+    REQUIRE(down->h2->open_stream(1));
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    req.headers[0] = {Str{"content-type", 12}, Str{"application/grpc", 16}};
+    req.header_count = 1;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"content-type", 12}, {"application/grpc", 16}}};
+    REQUIRE(grpc_start_impl(loop.get(), *down, 1, &cfg, 0, hs, 5, req, false));
+    auto* x = grpc_find(*down->h2, 1);
+    REQUIRE(x);
+    CHECK_EQ(x->request_message.limit, 100u);
+    CHECK_EQ(x->response_message.limit, 200u);
+    cfg.upstreams[0].max_request_message_bytes = 1;
+    cfg.upstreams[0].max_response_message_bytes = 2;
+    CHECK_EQ(x->request_message.limit, 100u);
+    CHECK_EQ(x->response_message.limit, 200u);
+    loop->force_close_all();
+    loop->shutdown();
+}
+TEST(grpc_proxy, message_limits_snapshot_epoll) {
+    message_limit_snapshot_case<EpollEventLoop>(_tc);
+}
+TEST(grpc_proxy, message_limits_snapshot_iouring) {
+    message_limit_snapshot_case<IoUringEventLoop>(_tc);
+}

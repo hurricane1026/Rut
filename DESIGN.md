@@ -1409,6 +1409,19 @@ millisecond resolution. Upstream connection failures map to UNAVAILABLE;
 expired deadlines to DEADLINE_EXCEEDED. Configuration epochs remain pinned by
 active/pooled sessions until teardown.
 
+Optional `max_request_message_bytes` and `max_response_message_bytes` upstream
+fields bound the wire payload of each message independently. They are positive
+32-bit values and require `.http2`; omission disables envelope inspection in
+that direction. A per-exchange incremental counter reads only the five-byte
+gRPC envelope, skips opaque payloads, and handles split headers, empty and
+multiple messages without buffering whole messages. Compressed payloads are
+bounded in their compressed wire form; no decompression or protobuf decoding
+is performed. An oversized declared payload fails the RPC immediately with
+RESOURCE_EXHAUSTED; invalid flags and premature END_STREAM/trailers fail with
+INTERNAL. Existing queues, cancellation and slot-release paths handle failure.
+Limits are copied into each exchange from its pinned configuration, so reload
+cannot alter limits on an in-flight RPC.
+
 Native gRPC telemetry is per RPC, independent of the connection-level HTTP
 request counters. `rut_grpc_started_total` counts admitted exchanges,
 `rut_grpc_active` tracks exchanges until retirement, and

@@ -80,6 +80,8 @@ struct UpstreamTarget {
     // path (NOT NUL-terminated; use hc_path_len), hc_interval_ms the probe
     // period, hc_expected_status the status that marks a backend healthy.
     UpstreamTlsSpec tls{};
+    u32 max_request_message_bytes = 0;
+    u32 max_response_message_bytes = 0;
     bool http2 = false;
     bool hc_enabled = false;
     char hc_path[64];

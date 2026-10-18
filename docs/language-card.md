@@ -457,6 +457,29 @@ returns credit as bytes drain. Client cancellation resets only the mapped RPC.
 granularity); failures use gRPC status trailers. Calls are never automatically
 replayed. See [the complete example](../examples/grpc.rut).
 
+Optional per-message wire limits are configured on an HTTP/2 upstream:
+
+```swift
+upstream bounded {
+    host: "127.0.0.1"
+    port: 50051
+    protocol: .http2
+    max_request_message_bytes: 1048576
+    max_response_message_bytes: 4194304
+}
+```
+
+Each field is a positive integer through 4,294,967,295. Omission preserves
+opaque forwarding without envelope validation. A configured direction reads
+only the five-byte gRPC envelope, across arbitrary HTTP/2 DATA boundaries;
+payload contents are never decoded. The limit applies to each message's wire
+payload, excluding its envelope. For compressed messages it bounds compressed
+bytes, not the decompressed size. Streaming RPCs may contain arbitrarily many
+messages within the limit; the existing bounded queues and flow control still
+apply. Oversized messages fail that RPC with RESOURCE_EXHAUSTED (8), invalid
+compression flags or truncated envelopes/payloads with INTERNAL (13). Earlier
+streamed bytes may already have reached the peer; requests are never replayed.
+
 Native gRPC exposes `rut_grpc_started_total`, `rut_grpc_active`,
 `rut_grpc_completed_total{grpc_status="..."}` and the
 `rut_grpc_duration_seconds` histogram through the existing metrics endpoint.

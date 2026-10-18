@@ -376,6 +376,8 @@ struct AstUpstreamDecl {
     //      through HIR→MIR→RIR into RouteConfig::set_upstream_health_check; no
     //      runtime probing in this slice.
     UpstreamTlsSpec tls{};
+    u32 max_request_message_bytes = 0;
+    u32 max_response_message_bytes = 0;
     bool http2 = false;
     bool hc_enabled = false;
     Str hc_path_lit{};             // raw `path:` string literal
