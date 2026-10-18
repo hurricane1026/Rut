@@ -438,6 +438,7 @@ void grpc_web_h1_kick(void* lp, Connection& conn) {
     if (!conn.h2 || !conn.req_body_streamed || conn.fd < 0) return;
     GrpcExchange* x = grpc_find(*conn.h2, 1);
     if (!x || !x->web_h1) return;
+    if (x->retry_pending) return;
     if (!grpc_web_h1_prepare_failure(loop, conn, *x)) return;
     if (x->failure) {
         if (conn.on_send) return;

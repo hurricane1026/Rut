@@ -1,13 +1,18 @@
 #pragma once
 
+#include "rut/common/grpc_retry_policy.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/grpc_message.h"
+#include "rut/runtime/grpc_replay_body.h"
+#include "rut/runtime/grpc_replay_headers.h"
 #include "rut/runtime/grpc_web.h"
+#include "rut/runtime/slice_pool.h"
 #include "rut/runtime/tls.h"
 
 namespace rut {
 struct ConnectionBase;
+struct RouteConfig;
 
 // One RPC, allocated from the shard's existing bulk SlicePool. Payloads stay
 // opaque (including compressed protobuf messages and binary metadata). Queue
@@ -93,6 +98,21 @@ struct GrpcExchange {
     u8 response_trailers[kHeaders];
     u8 response_mutation_storage[kHeaders];
 
+    GrpcRetryPolicy retry_policy;
+    GrpcReplayBody replay_body;
+    GrpcReplayHeaders replay_headers;
+    GrpcReplayHeaders replay_trailers;
+    GrpcMessageLimit retry_envelope;
+    const RouteConfig* config_epoch;
+    u64 retry_at_us;
+    u8 retry_attempts;
+    u8 retry_tried_mask;
+    u8 retry_reason;
+    bool retry_pending;
+    bool retry_enabled;
+    bool retry_timeout_present;
+    bool replaying_attempt;
+
     void init() {
         downstream = upstream = nullptr;
         downstream_stream = upstream_stream = 0;
@@ -133,8 +153,22 @@ struct GrpcExchange {
         response_mutation_bytes = 0;
         response_mutation_count = 0;
         response_mutation_overflow = false;
+        retry_policy = {};
+        replay_body = {};
+        replay_headers.clear();
+        replay_trailers.clear();
+        retry_envelope.init();
+        config_epoch = nullptr;
+        retry_at_us = 0;
+        retry_attempts = retry_tried_mask = 0;
+        retry_reason = 0;
+        retry_pending = retry_enabled = retry_timeout_present = false;
+        replaying_attempt = false;
     }
 };
+
+static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize - 8192,
+              "GrpcExchange must leave bulk-slice spare capacity");
 
 // The same bounded index belongs to downstream and upstream HTTP/2 sessions.
 // Only upstream sessions join the shard-local pool; mappings keep stream IDs

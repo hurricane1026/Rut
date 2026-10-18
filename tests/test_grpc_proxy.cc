@@ -998,6 +998,9 @@ struct SyncCloseGrpcDriveFixture : GrpcDriveFixture {
         closed = true;
     }
 };
+struct RetryCloseGrpcDriveFixture : SyncCloseGrpcDriveFixture {
+    bool arm_throttle_timer(Connection&, u64) { return true; }
+};
 struct HeldSendGrpcDriveFixture : GrpcDriveFixture {
     CaptureRing* capture_ring = nullptr;
     const u8* pending_send = nullptr;
@@ -2243,6 +2246,75 @@ TEST(grpc_proxy, trailers_only_status_observes_response_mutations) {
     filtered[0] = response[2];
     REQUIRE(grpc_apply_response_mutations(x, filtered, &filtered_n, 8));
     CHECK_EQ(grpc_observed_status(filtered, filtered_n), 2u);
+}
+
+TEST(grpc_proxy, refused_stream_retry_survives_protocol_close_in_same_process) {
+    RetryCloseGrpcDriveFixture loop;
+    Connection upstream;
+    upstream.reset();
+    u8 up_recv[64]{};
+    upstream.bind_request_receive_buffer(up_recv, sizeof(up_recv));
+    Http2Conn up_h2;
+    up_h2.init_client();
+    up_h2.grpc.upstream = true;
+    up_h2.grpc.preface_sent = true;
+    up_h2.peer_settings_seen = true;
+    upstream.h2 = &up_h2;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn down_h2;
+    down_h2.init_client();
+    downstream.h2 = &down_h2;
+    REQUIRE(up_h2.open_stream(1) != nullptr);
+    REQUIRE(down_h2.open_stream(1) != nullptr);
+    GrpcExchange x;
+    x.init();
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    x.slot_held = true;
+    x.request_headers_sent = true;
+    x.retry_enabled = true;
+    x.retry_policy = {2, 16, 1u << 14, 0};
+    x.retry_attempts = 1;
+    x.retry_tried_mask = 1;
+    REQUIRE(x.replay_body.init(16));
+    REQUIRE(x.replay_body.seal());
+    const hpack::Header request[] = {{{":method", 7}, {"POST", 4}}};
+    REQUIRE(x.replay_headers.capture(request, 1));
+    REQUIRE(x.replay_trailers.capture(nullptr, 0));
+    up_h2.grpc.streams[0] = &x;
+    up_h2.grpc.active = 1;
+    down_h2.grpc.streams[0] = &x;
+    down_h2.grpc.active = 1;
+    upstream.on_close = &grpc_connection_closed<RetryCloseGrpcDriveFixture>;
+    loop.grpc_upstreams = &upstream;
+
+    u32 len = write_rst_stream(up_recv, 1, Http2Error::RefusedStream);
+    // A one-byte SETTINGS payload is a connection protocol error. The parser
+    // must finish dispatching REFUSED_STREAM before close retires the session.
+    u8* bad_settings = up_recv + len;
+    bad_settings[0] = 0;
+    bad_settings[1] = 0;
+    bad_settings[2] = 1;
+    bad_settings[3] = static_cast<u8>(Http2FrameType::Settings);
+    bad_settings[4] = 0;
+    __builtin_memset(bad_settings + 5, 0, 4);
+    bad_settings[9] = 0;
+    len += 10;
+    upstream.recv_buf.commit(len);
+    grpc_on_upstream_data<RetryCloseGrpcDriveFixture>(
+        &loop, upstream, {upstream.id, 1, 0, 0, IoEventType::Recv, 1});
+
+    CHECK(loop.closed);
+    CHECK_EQ(up_h2.grpc.active, 0u);
+    CHECK_EQ(down_h2.grpc.active, 1u);
+    CHECK_EQ(down_h2.grpc.streams[0], &x);
+    CHECK(x.retry_pending);
+    CHECK(x.upstream == nullptr);
+    CHECK(x.slot_held);
+    CHECK_EQ(x.failure, 0u);
+    CHECK_EQ(loop.released, 0u);
 }
 
 TEST(grpc_proxy, parser_failure_records_active_session_once) {

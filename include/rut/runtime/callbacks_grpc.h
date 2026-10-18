@@ -194,8 +194,73 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
         grpc_detach(h, x);
     }
     if (x->slot_held) loop->upstream_release(x->upstream_id);
+    x->replay_body.release();
     loop->pool.free(reinterpret_cast<u8*>(x));
     if (up && up->h2 && !up->h2->grpc.busy) grpc_drive_upstream(loop, *up);
+}
+
+// Idempotently retire one transport attempt while keeping the logical RPC
+// (slot, timer, metadata and captured body) alive for a scheduled retry.
+template <typename Loop>
+void grpc_detach_retry_attempt(Loop*, GrpcExchange& x) {
+    if (!x.upstream || !x.upstream->h2) return;
+    auto& h = *x.upstream->h2;
+    h.consume_data(x.upstream_stream, x.download_len);
+    if (auto* stream = h.find_stream(x.upstream_stream)) {
+        if (x.request_headers_sent) grpc_queue_cancel(h, x.upstream_stream);
+        stream->state = Http2StreamState::Closed;
+    }
+    grpc_detach(h, &x);
+    x.upstream = nullptr;
+    // Return only bytes still retained for the old attempt. Replay bytes have
+    // no corresponding downstream credit and are never charged here.
+    if (x.downstream && x.downstream->h2 && !x.web_h1) {
+        if (x.web_mode == GrpcWebContentType::Text) {
+            x.downstream->h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+            x.upload_raw_credit = 0;
+        } else {
+            x.downstream->h2->consume_data(x.downstream_stream, x.upload_len);
+        }
+    }
+    x.upload_len = x.download_len = 0;
+    x.response_bytes = 0;
+    x.response_end = x.response_headers_sent = x.response_end_sent = false;
+    x.response_headers_len = x.response_trailers_len = x.response_trailers_offset = 0;
+    x.has_response_length = false;
+    x.expected_response_bytes = 0;
+    x.response_status = 2;
+    x.web_trailer_queued = x.web_trailer_encoding = false;
+    x.web_encode_boundary_pending = x.web_failure_prepared = false;
+    x.web_pending_output_is_trailer = x.web_trailer_wire_started = false;
+    x.web_body_flushed = x.web_trailer_flushed = false;
+    x.web_pending_output_len = x.web_pending_output_offset = 0;
+    x.web_pending_native_len = 0;
+    x.web_response_invalid = false;
+    x.response_base64.init();
+    x.response_message.init(x.response_message.limit);
+    x.failure = 0;
+    x.request_headers_sent = x.request_end_sent = false;
+    x.request_end = true;
+}
+
+inline bool grpc_retry_can_schedule(const GrpcExchange& x,
+                                    u8 status,
+                                    bool check_status_mask = true) {
+    return x.retry_enabled && x.retry_policy.enabled() &&
+           x.retry_attempts < x.retry_policy.max_attempts &&
+           (!check_status_mask || (x.retry_policy.status_mask & (1u << status))) &&
+           x.replay_body.replayable && x.replay_body.sealed && x.replay_headers.valid &&
+           x.replay_trailers.valid && !x.response_headers_sent && !x.staged_response_bytes &&
+           !x.response_bytes && !x.response_headers_len && !x.response_trailers_len &&
+           !x.download_len && !x.response_end_sent && !x.failure &&
+           (!x.web_h1 ||
+            (!x.web_trailer_wire_started && !x.web_body_flushed && !x.web_trailer_flushed));
+}
+inline void grpc_disable_retry(GrpcExchange& x) {
+    x.retry_enabled = false;
+    x.replay_body.release();
+    x.replay_headers.clear();
+    x.replay_trailers.clear();
 }
 
 template <typename Loop>
@@ -225,6 +290,10 @@ void grpc_connection_closed(void* lp, Connection& conn) {
         if (*link) *link = g.pool_next;
         for (auto*& x : g.streams) {
             if (!x) continue;
+            if (x->retry_pending) {
+                grpc_detach_retry_attempt(loop, *x);
+                continue;
+            }
             x->upstream = nullptr;
             if (!x->response_end) x->failure = 14;
             x->response_end = true;
@@ -609,6 +678,7 @@ void grpc_response_headers(
     u32 http_status = 0;
     bool content_type = false;
     u32 content_type_count = 0;
+    u32 raw_status_count = 0;
     bool invalid_content_length = false;
     const auto response_mode = grpc_response_web_mode(*x);
     const bool web_response =
@@ -627,6 +697,7 @@ void grpc_response_headers(
             content_type = web_response ? grpc_web_native_proto_content_type(hs[i].value)
                                         : grpc_content_type(hs[i].value);
         }
+        if (hs[i].name.eq({"grpc-status", 11})) raw_status_count++;
         if (hs[i].name.eq({"content-length", 14})) {
             u32 length = 0;
             if (x->has_response_length || !grpc_parse_content_length(hs[i].value, &length))
@@ -699,6 +770,20 @@ void grpc_response_headers(
     }
     const bool filtered_has_status = grpc_has_status(filtered, filtered_n);
     const u8 observed_status = end ? grpc_observed_status(filtered, filtered_n) : 2;
+    // Retry only a syntactically valid, single backend trailers-only status.
+    // Mutations must leave the triggering status unchanged.
+    if (end && raw_status_count == 1 && content_type_count == 1 && filtered_has_status &&
+        grpc_observed_status(hs, n) == observed_status &&
+        grpc_retry_can_schedule(*x, observed_status)) {
+        const u64 now = monotonic_us();
+        const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
+        if (!x->deadline_us || retry_at < x->deadline_us) {
+            x->retry_pending = true;
+            x->retry_at_us = retry_at > now ? retry_at : now + 1;
+            x->retry_reason = observed_status;
+            return;
+        }
+    }
     if (web && backend_terminal) {
         for (u32 i = 0; i < filtered_n;) {
             if (!grpc_web_is_trailer_only(filtered[i])) {
@@ -853,6 +938,16 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
 template <typename Loop>
 void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
     if (auto* x = grpc_find(h, sid); x && !x->response_end) {
+        if (error == Http2Error::RefusedStream && grpc_retry_can_schedule(*x, 14, false)) {
+            const u64 now = monotonic_us();
+            const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
+            if (!x->deadline_us || retry_at < x->deadline_us) {
+                x->retry_pending = true;
+                x->retry_at_us = retry_at > now ? retry_at : now + 1;
+                x->retry_reason = 14;
+                return;
+            }
+        }
         switch (static_cast<u32>(error)) {
             case static_cast<u32>(Http2Error::Cancel):
                 x->failure = 1;
@@ -959,6 +1054,12 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 continue;
             }
             if (x->failure || x->response_end) continue;
+            if (x->replaying_attempt && x->replay_body.remaining &&
+                x->upload_len < sizeof(x->upload)) {
+                const u32 copied = x->replay_body.copy(x->upload + x->upload_len,
+                                                       sizeof(x->upload) - x->upload_len);
+                x->upload_len += copied;
+            }
             if (x->upstream_stream < next_header) next_header = x->upstream_stream;
         }
         for (u32 step = 0; step < 64; step++) {
@@ -988,7 +1089,9 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 grpc_pop(x->upload, x->upload_len, amount);
                 stream->send_window -= static_cast<i32>(amount);
                 h.conn_send_window -= amount;
-                if (x->web_mode == GrpcWebContentType::Text) {
+                if (x->replaying_attempt) {
+                    // Replayed bytes have no downstream receive credit.
+                } else if (x->web_mode == GrpcWebContentType::Text) {
                     if (!x->web_h1 && !x->upload_len && x->upload_raw_credit) {
                         x->downstream->h2->consume_data(x->downstream_stream, x->upload_raw_credit);
                         x->upload_raw_credit = 0;
@@ -1002,6 +1105,7 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 } else
                     n = http2_write_data(out, x->upstream_stream, nullptr, 0, true);
                 x->request_end_sent = true;
+                if (x->replaying_attempt) x->replaying_attempt = false;
                 stream->state = stream->state == Http2StreamState::HalfClosedRemote
                                     ? Http2StreamState::Closed
                                     : Http2StreamState::HalfClosedLocal;
@@ -1091,6 +1195,25 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
                                   sizeof(g.control) - g.control_len,
                                   &written);
     g.control_len += written;
+    for (auto* x : g.streams) {
+        if (!x || x->retry_pending || !grpc_rejected_by_goaway(h, *x)) continue;
+        const u64 now = monotonic_us();
+        const u64 retry_at = now + static_cast<u64>(x->retry_policy.backoff_ms) * 1000;
+        if (grpc_retry_can_schedule(*x, 14, false) &&
+            (!x->deadline_us || retry_at < x->deadline_us)) {
+            x->retry_pending = true;
+            x->retry_at_us = retry_at > now ? retry_at : now + 1;
+            x->retry_reason = 14;
+        } else {
+            x->failure = 14;
+            x->response_end = true;
+            grpc_detach_upstream_exchange(loop, h, *x);
+        }
+    }
+    // Parser callbacks only mark retry intent. Do all stream-map mutation once
+    // the parser has returned, while the old stream is still addressable.
+    for (auto* x : g.streams)
+        if (x && x->retry_pending) grpc_detach_retry_attempt(loop, *x);
     grpc_flush_pending_cancels(h);
     const u32 remaining = conn.recv_buf.len() - result.consumed;
     if (remaining) __builtin_memmove(conn.recv_slice, conn.recv_slice + result.consumed, remaining);
@@ -1099,20 +1222,15 @@ void grpc_on_upstream_data(void* lp, Connection& conn, IoEvent ev) {
     if (result.close) {
         grpc_record_session_failure(loop, conn, monotonic_us());
         g.busy = false;
+        for (u32 i = 0; i < downstream_count; ++i)
+            if (downstreams[i].conn && downstreams[i].conn->h2 == downstreams[i].h2 &&
+                downstreams[i].conn->handler_gen == downstreams[i].handler_gen)
+                grpc_refresh_timer(loop, *downstreams[i].conn);
         loop->close_conn(conn);
         return;
     }
     if (!settings_seen_before && h.peer_settings_seen)
         grpc_record_handshake_result(loop, conn, true, monotonic_us());
-    for (u32 i = 0; i < 64; i++) {
-        auto* x = g.streams[i];
-        if (!x) continue;
-        if (grpc_rejected_by_goaway(h, *x)) {
-            x->failure = 14;
-            x->response_end = true;
-            grpc_detach_upstream_exchange(loop, h, *x);
-        }
-    }
     // RST/GOAWAY callbacks run while the H2 parser is busy. Snapshot
     // downstream connections before parsing because callbacks may detach the
     // exchange, then kick each connection once after releasing busy.
@@ -1439,6 +1557,173 @@ inline GrpcWebContentType grpc_web_response_mode(const hpack::Header* headers,
     return first_mode == 2 ? GrpcWebContentType::Text : GrpcWebContentType::Binary;
 }
 
+inline u32 grpc_retry_timeout_value(char* out, u64 remaining_us) {
+    static constexpr char units[] = {'u', 'm', 'S', 'M', 'H'};
+    static constexpr u64 scales[] = {1, 1000, 1000000, 60000000, 3600000000ull};
+    u64 value = 0;
+    char unit = 'u';
+    for (u32 i = 0; i < 5; ++i) {
+        value = remaining_us / scales[i];
+        if (value && value <= 99999999u) {
+            unit = units[i];
+            break;
+        }
+    }
+    if (!value) return 0;
+    char digits[8];
+    u32 n = 0;
+    while (value) {
+        digits[n++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    }
+    for (u32 i = 0; i < n; ++i) out[i] = digits[n - i - 1];
+    out[n++] = unit;
+    return n;
+}
+
+template <typename Loop>
+bool grpc_bind_retry_attempt(Loop* loop, GrpcExchange& x, u64 now) {
+    if constexpr (!(requires(Loop* l, Connection& c) {
+                      l->alloc_conn();
+                      l->alloc_h2(c);
+                  })) {
+        return false;
+    } else {
+        if (!x.downstream || !x.downstream->h2 || !x.config_epoch ||
+            x.retry_attempts >= x.retry_policy.max_attempts || !x.replay_body.rewind())
+            return false;
+        auto* cfg = x.config_epoch;
+        if (x.upstream_id >= cfg->upstream_count) return false;
+        const auto& target = cfg->upstreams[x.upstream_id];
+        if (!target.addr_count) return false;
+        u32 backend = target.addr_count;
+        for (u32 i = 0; i < target.addr_count && i < 8; ++i)
+            if (!(x.retry_tried_mask & (1u << i)) && !backend_ejected(x.upstream_id, i, now)) {
+                backend = i;
+                break;
+            }
+        if (backend == target.addr_count)
+            backend = select_backend(x.upstream_id, target.addr_count, now);
+        Connection* up = nullptr;
+        for (auto* c = loop->grpc_upstreams; c; c = c->h2->grpc.pool_next)
+            if (grpc_upstream_reusable(*c, cfg, x.upstream_id, backend)) {
+                up = c;
+                break;
+            }
+        bool fresh = false;
+        if (!up) {
+            up = loop->alloc_conn();
+            if (!up) return false;
+            up->set_metrics_client(false);
+            if (!loop->alloc_h2(*up) || !grpc_grow_recv(loop, *up)) {
+                loop->close_conn(*up);
+                return false;
+            }
+            up->h2->init_client();
+            up->protocol = ConnProtocol::Http2;
+            up->state = ConnState::ReadingBody;
+            up->keep_alive = true;
+            up->request_config = cfg;
+            up->upstream_idx = x.upstream_id;
+            up->upstream_backend_idx = static_cast<u8>(backend);
+            up->h2->grpc.upstream = true;
+            up->h2->grpc.connecting = true;
+            grpc_begin_handshake(up->h2->grpc, now);
+            up->h2->grpc.pool_next = loop->grpc_upstreams;
+            loop->grpc_upstreams = up;
+            up->on_close = &grpc_connection_closed<Loop>;
+            h2_async_epoch_enter(loop, *up);
+            fresh = true;
+        }
+        const u32 sid = up->h2->last_stream_id ? up->h2->last_stream_id + 2 : 1;
+        auto* stream = up->h2->open_stream(sid);
+        if (!stream || !grpc_attach(*up->h2, &x)) {
+            if (fresh) loop->close_conn(*up);
+            return false;
+        }
+        hpack::Header hs[GrpcReplayHeaders::kMaxHeaders];
+        u32 nh = 0;
+        if (!x.replay_headers.materialize(hs, GrpcReplayHeaders::kMaxHeaders, nh)) {
+            grpc_detach(*up->h2, &x);
+            stream->state = Http2StreamState::Closed;
+            if (fresh) loop->close_conn(*up);
+            return false;
+        }
+        char timeout[9];
+        if (x.retry_timeout_present) {
+            if (!x.deadline_us || now >= x.deadline_us) return false;
+            const u32 len = grpc_retry_timeout_value(timeout, x.deadline_us - now);
+            if (!len) return false;
+            for (u32 i = 0; i < nh; ++i)
+                if (hs[i].name.eq({"grpc-timeout", 12})) hs[i].value = {timeout, len};
+        }
+        x.request_headers_len =
+            http2_write_headers(x.request_headers, sizeof(x.request_headers), sid, hs, nh, false);
+        hpack::Header trailers[GrpcReplayHeaders::kMaxHeaders];
+        u32 nt = 0;
+        if (!x.request_headers_len ||
+            !x.replay_trailers.materialize(trailers, GrpcReplayHeaders::kMaxHeaders, nt)) {
+            grpc_detach(*up->h2, &x);
+            stream->state = Http2StreamState::Closed;
+            if (fresh) loop->close_conn(*up);
+            return false;
+        }
+        x.request_trailers_len =
+            nt ? http2_write_headers(
+                     x.request_trailers, sizeof(x.request_trailers), sid, trailers, nt, true)
+               : 0;
+        if (nt && !x.request_trailers_len) {
+            grpc_detach(*up->h2, &x);
+            stream->state = Http2StreamState::Closed;
+            if (fresh) loop->close_conn(*up);
+            return false;
+        }
+        x.upstream = up;
+        x.upstream_stream = sid;
+        x.upload_len = 0;
+        x.download_len = 0;
+        x.response_bytes = 0;
+        x.request_headers_sent = x.request_end_sent = false;
+        x.response_end = x.response_headers_sent = x.response_end_sent = false;
+        x.response_headers_len = x.response_trailers_len = x.response_trailers_offset = 0;
+        x.has_response_length = false;
+        x.expected_response_bytes = 0;
+        x.response_status = 2;
+        x.web_trailer_queued = x.web_trailer_encoding = false;
+        x.web_encode_boundary_pending = x.web_failure_prepared = false;
+        x.web_pending_output_is_trailer = x.web_trailer_wire_started = false;
+        x.web_body_flushed = x.web_trailer_flushed = false;
+        x.web_pending_output_len = x.web_pending_output_offset = 0;
+        x.web_pending_native_len = 0;
+        x.web_response_invalid = false;
+        x.response_base64.init();
+        x.failure = 0;
+        x.retry_pending = false;
+        x.retry_at_us = 0;
+        ++x.retry_attempts;
+        x.retry_tried_mask |= static_cast<u8>(1u << backend);
+        x.replay_body.rewind();
+        x.replaying_attempt = true;
+        stream->manual_window = true;
+        x.request_end = true;
+        if (fresh) {
+            auto& g = up->h2->grpc;
+            g.connect_attempts = 1;
+            g.connect_tried_mask = static_cast<u8>(1u << backend);
+            up->fd = up->upstream_fd = UpstreamPool::create_socket();
+            up->set_slots(nullptr, nullptr, nullptr, &grpc_connected<Loop>);
+            if (up->fd < 0 ||
+                !loop->submit_connect(*up, &target.addrs[backend], sizeof(target.addrs[backend]))) {
+                loop->close_conn(*up);
+                return false;
+            }
+        } else {
+            grpc_drive_upstream(loop, *up);
+        }
+        return true;
+    }
+}
+
 template <typename Loop>
 bool grpc_start_impl(Loop* loop,
                      Connection& down,
@@ -1491,6 +1776,14 @@ bool grpc_start_impl(Loop* loop,
     x->web_h1_kick = down.h2->grpc.web_h1_kick;
     x->web_mode = web_mode;
     x->web_response_mode = response_mode;
+    x->config_epoch = cfg;
+    x->retry_policy = target.grpc_retry;
+    x->retry_attempts = 1;
+    x->retry_enabled = target.grpc_retry.enabled();
+    if (x->retry_enabled) {
+        x->retry_envelope.init(0xffffffffu);
+        if (!x->replay_body.init(target.grpc_retry.max_request_bytes)) x->retry_enabled = false;
+    }
     constexpr u32 kWebFramingLimit = 0xffffffffu;
     const u32 request_message_limit =
         target.max_request_message_bytes
@@ -1582,6 +1875,12 @@ bool grpc_start_impl(Loop* loop,
         if (fresh) loop->close_conn(*up);
         return false;
     }
+    if (x->retry_enabled && !x->replay_headers.capture(filtered, filtered_n))
+        grpc_disable_retry(*x);
+    if (x->retry_enabled) {
+        x->replay_trailers.capture(nullptr, 0);
+        if (end && !x->replay_body.seal()) grpc_disable_retry(*x);
+    }
     x->downstream = &down;
     x->upstream = up;
     x->downstream_stream = sid;
@@ -1590,7 +1889,10 @@ bool grpc_start_impl(Loop* loop,
     x->has_request_length = req.has_content_length;
     x->expected_request_bytes = req.content_length;
     x->request_end = end;
+    for (u32 i = 0; i < nh; i++)
+        if (hs[i].name.eq({"grpc-timeout", 12})) x->retry_timeout_present = true;
     x->upstream_id = uid;
+    x->retry_tried_mask = static_cast<u8>(1u << backend);
     if (target.max_inflight) {
         if (!loop->upstream_acquire(uid, target.max_inflight)) {
             stream->state = Http2StreamState::Closed;
@@ -1703,6 +2005,7 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
             const u32 i = (h.grpc.cursor + step) % 64;
             auto* x = h.grpc.streams[i];
             if (!x) continue;
+            if (x->retry_pending) continue;
             auto* stream = h.find_stream(x->downstream_stream);
             if (!stream) {
                 grpc_release(loop, x, true);
@@ -2002,6 +2305,7 @@ void grpc_request_data(
     Loop* loop, Connection& down, GrpcExchange& x, const u8* data, u32 len, bool end) {
     x.request_bytes += len;
     if (x.failure || !x.upstream) {
+        if (x.retry_enabled) grpc_disable_retry(x);
         if (!x.web_h1) down.h2->consume_data(x.downstream_stream, len);
         return;
     }
@@ -2017,6 +2321,7 @@ void grpc_request_data(
             x.upload_raw_credit = 0;
             x.upload_len = 0;
             x.failure = 8;
+            grpc_disable_retry(x);
             grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
             return;
         }
@@ -2033,6 +2338,7 @@ void grpc_request_data(
             x.upload_raw_credit = 0;
             x.upload_len = 0;
             x.failure = status == GrpcWebCodecStatus::Invalid ? 13 : 8;
+            grpc_disable_retry(x);
             grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
             return;
         }
@@ -2041,6 +2347,7 @@ void grpc_request_data(
             x.upload_raw_credit = 0;
             x.upload_len = 0;
             x.failure = 13;
+            grpc_disable_retry(x);
             grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
             return;
         }
@@ -2055,8 +2362,15 @@ void grpc_request_data(
         x.upload_raw_credit = 0;
         if (x.web_mode == GrpcWebContentType::Text) x.upload_len = 0;
         x.failure = framing_status;
+        grpc_disable_retry(x);
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
+    }
+    if (x.retry_enabled) {
+        const u8 envelope_status = x.retry_envelope.feed(upload_data, upload_len, end);
+        if (envelope_status || !x.replay_body.append(loop->pool, upload_data, upload_len))
+            grpc_disable_retry(x);
+        if (end && x.retry_enabled && !x.replay_body.seal()) grpc_disable_retry(x);
     }
     if ((x.web_mode != GrpcWebContentType::Text && len > sizeof(x.upload) - x.upload_len) ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
@@ -2068,6 +2382,7 @@ void grpc_request_data(
         x.upload_raw_credit = 0;
         if (x.web_mode == GrpcWebContentType::Text) x.upload_len = 0;
         x.failure = 13;
+        grpc_disable_retry(x);
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
@@ -2093,8 +2408,10 @@ void grpc_request_trailers(void* ctx, Http2Conn& h, u32 sid, const hpack::Header
         if (!x || !x->upstream) return;
         x->request_trailers_len = http2_write_headers(
             x->request_trailers, sizeof(x->request_trailers), x->upstream_stream, hs, n, true);
+        if (x->retry_enabled && !x->replay_trailers.capture(hs, n)) grpc_disable_retry(*x);
         if (!x->request_trailers_len) {
             x->failure = 8;
+            grpc_disable_retry(*x);
             grpc_detach_upstream_exchange(d->loop, *x->upstream->h2, *x);
             return;
         }
@@ -2108,8 +2425,12 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
     if (g.upstream) return;
     u64 earliest = 0;
     for (auto* x : g.streams)
-        if (x && !x->failure && x->deadline_us && (!earliest || x->deadline_us < earliest))
-            earliest = x->deadline_us;
+        if (x && !x->failure) {
+            if (x->deadline_us && (!earliest || x->deadline_us < earliest))
+                earliest = x->deadline_us;
+            if (x->retry_pending && x->retry_at_us && (!earliest || x->retry_at_us < earliest))
+                earliest = x->retry_at_us;
+        }
     if (earliest == g.timer_deadline_us) return;
     if (g.timer_deadline_us) {
         if constexpr (requires { loop->disarm_yield_timer(conn); }) loop->disarm_yield_timer(conn);
@@ -2146,10 +2467,16 @@ void grpc_refresh_timer(Loop* loop, Connection& conn) {
                     x->downstream, x->downstream->h2, x->downstream->handler_gen};
         }
         for (auto* x : g.streams) {
-            if (!x || !x->deadline_us) continue;
+            if (!x || (!x->deadline_us && !x->retry_pending)) continue;
+            x->retry_pending = false;
+            x->retry_at_us = 0;
             x->failure = 8;
+            x->response_end = true;
             Connection* up = x->upstream;
-            if (!up || !up->h2) continue;
+            if (!up || !up->h2) {
+                grpc_release_slot(loop, *x);
+                continue;
+            }
             auto& uh = *up->h2;
             uh.consume_data(x->upstream_stream, x->download_len);
             if (auto* stream = uh.find_stream(x->upstream_stream)) {
@@ -2200,10 +2527,25 @@ void grpc_deadline_fired(Loop* loop, Connection& conn) {
     } upstreams[64];
     u32 upstream_count = 0;
     for (auto* x : conn.h2->grpc.streams) {
-        if (!x || !x->deadline_us || now < x->deadline_us) continue;
-        x->failure = 4;
+        if (!x) continue;
+        // The logical deadline always wins, even if retry backoff expired.
+        if (x->deadline_us && now >= x->deadline_us) {
+            x->retry_pending = false;
+            x->failure = 4;
+            x->response_end = true;
+        } else if (x->retry_pending && x->retry_at_us && now >= x->retry_at_us) {
+            if (grpc_bind_retry_attempt(loop, *x, now)) continue;
+            x->retry_pending = false;
+            x->failure = 14;
+            x->response_end = true;
+        } else {
+            continue;
+        }
         Connection* up = x->upstream;
-        if (!up || !up->h2) continue;
+        if (!up || !up->h2) {
+            grpc_release_slot(loop, *x);
+            continue;
+        }
         auto& uh = *up->h2;
         uh.consume_data(x->upstream_stream, x->download_len);
         if (auto* stream = uh.find_stream(x->upstream_stream)) {
