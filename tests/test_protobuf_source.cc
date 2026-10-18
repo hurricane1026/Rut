@@ -167,6 +167,21 @@ TEST(protobuf_source, source_budgets_and_empty_files) {
     Storage storage;
     CHECK_FALSE(files.load(storage));
 }
+TEST(protobuf_source, source_budget_excludes_descriptor_overhead_until_finalization) {
+    Files files;
+    REQUIRE(files.ok);
+    const char* source = "syntax='proto3';";
+    REQUIRE(files.write_file("root.proto", source));
+    Storage storage;
+    SchemaLimits limits{};
+    limits.bytes = static_cast<u32>(strlen(source));
+    auto result = files.load(storage, limits);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Limit);
+    storage.arena.reset();
+    result = files.load(storage);
+    REQUIRE(result.has_value());
+}
 TEST(protobuf_source, uninitialized_arena_reports_allocation_failure) {
     Arena<MmapBackend> arena;
     auto result = load_proto_source(arena, lit_str("/tmp/missing.proto"));
