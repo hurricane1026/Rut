@@ -47,6 +47,13 @@ python3 bench.py prepare --output /tmp/proxy-1m --origin 192.0.2.30:9087 --port 
 python3 bench.py serve --engine rut --config /tmp/proxy-1m --binary /absolute/path/rut --cpus 2
 ```
 
+On C, copy the manifest produced on P before starting the client, and repeat this
+after every proxy restart:
+
+```bash
+scp P:/tmp/proxy-1m/server-manifest.json /tmp/proxy-1m-server-manifest.json
+```
+
 nginx 对照：先在代理终端 Ctrl-C 停止 Rut，确认端口释放，然后运行：
 
 ```bash
@@ -62,7 +69,7 @@ python3 bench.py serve --engine nginx --config /tmp/proxy-1m --binary /absolute/
 先等待代理启动，再执行一轮：
 
 ```bash
-python3 bench.py client --host 192.0.2.20 --engine rut --rep 1 --cpus 2-5 --threads 4 --connections 128 --body-size 1048576 --warmup 5 --duration 30 --wrk /absolute/path/wrk --server-manifest /tmp/proxy-1m/server-manifest.json --output results/1m/rut-1
+python3 bench.py client --host 192.0.2.20 --engine rut --rep 1 --cpus 2-5 --threads 4 --connections 128 --body-size 1048576 --warmup 5 --duration 30 --wrk /absolute/path/wrk --server-manifest /tmp/proxy-1m-server-manifest.json --output results/1m/rut-1
 ```
 
 每次换代理后执行同样命令，只改 `--engine`、`--rep` 和 `--output`。

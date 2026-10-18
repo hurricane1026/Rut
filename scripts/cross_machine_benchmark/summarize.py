@@ -21,7 +21,7 @@ def summarize(root):
         if not d['valid']:
             raise ValueError(f'invalid run: {p}; do not discard failed runs')
         key = (d['host'], d['body_size'], d['connections'], d['duration'], d['threads'], d['warmup'], d['port'], d['cpus'],
-               d['server_cpus'], d['server_workers'])
+               d['server_cpus'], d['server_workers'], d['server_config_sha256'])
         rows = groups.setdefault(key, {'rut': {}, 'nginx': {}})[d['engine']]
         if d['repetition'] in rows:
             raise ValueError(f'duplicate engine/repetition: {p}')
@@ -33,7 +33,7 @@ def summarize(root):
         if set(engines['rut']) != set(engines['nginx']) or len(engines['rut']) < 3:
             raise ValueError(f'need at least three matching repetitions for both engines: {key}')
         item = dict(zip(('host', 'body_size', 'connections', 'duration', 'threads', 'warmup', 'port', 'cpus',
-                         'server_cpus', 'server_workers'), key))
+                         'server_cpus', 'server_workers', 'server_config_sha256'), key))
         for engine, runs in engines.items():
             rps = [r['rps'] for r in runs.values()]
             item[engine] = {'rps': rps, 'median_rps': statistics.median(rps),

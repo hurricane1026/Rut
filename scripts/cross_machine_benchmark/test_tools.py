@@ -35,6 +35,9 @@ class Tests(unittest.TestCase):
         del missing['binary_sha256']
         with self.assertRaises(ValueError):
             bench.validate_server_manifest(missing, 'rut', 8087, 1024)
+        self.assertIsNone(bench.validate_rut_workers(64))
+        with self.assertRaises(ValueError):
+            bench.validate_rut_workers(65)
 
     def test_wrk_errors_and_units(self):
         text = ('  99% 2.50ms\nRequests/sec: 1000.25\n'
@@ -166,6 +169,20 @@ class Tests(unittest.TestCase):
                         host='192.0.2.2', body_size=1024, connections=128, duration=30,
                         warmup=5, port=8087, threads=4, cpus='2-5', server_cpus=server_cpus,
                         server_workers=1, server_config_sha256='config-a', server_binary_sha256='binary-a',
+                        server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
+                        server_run_id=f'{engine}-{rep}', valid=True,
+                        results=[dict(phase='measurement', rps=100, p99_us=100)]))
+            with self.assertRaises(ValueError):
+                summarize.summarize(root)
+            config_mismatch = root / 'config-mismatch'
+            for engine, config_hash in [('rut', 'config-a'), ('nginx', 'config-b')]:
+                for rep in range(1, 4):
+                    p = config_mismatch / f'{engine}{rep}'
+                    p.mkdir(parents=True)
+                    bench.save(p / 'result.json', dict(engine=engine, repetition=rep,
+                        host='192.0.2.2', body_size=1024, connections=128, duration=30,
+                        warmup=5, port=8087, threads=4, cpus='2-5', server_cpus='2',
+                        server_workers=1, server_config_sha256=config_hash, server_binary_sha256='binary-a',
                         server_manifest='/tmp/server-manifest.json', server_listen_port=8087,
                         server_run_id=f'{engine}-{rep}', valid=True,
                         results=[dict(phase='measurement', rps=100, p99_us=100)]))

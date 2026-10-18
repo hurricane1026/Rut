@@ -31,6 +31,8 @@ function done(summary, latency, requests)
 end
 '''
 
+MAX_RUT_WORKERS = 64  # Keep in sync with include/rut/common/shard_limits.h.
+
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
@@ -139,10 +141,17 @@ def validate_server_manifest(manifest, engine, port, body_size):
     return manifest
 
 
+def validate_rut_workers(workers):
+    if workers > MAX_RUT_WORKERS:
+        raise ValueError(f'Rut supports at most {MAX_RUT_WORKERS} workers')
+
+
 def serve(a):
     out = a.config.resolve()
     c = json.loads((out / 'config.json').read_text())
     binary = str(Path(shutil.which(a.binary) or a.binary).resolve())
+    if a.engine == 'rut':
+        validate_rut_workers(c['workers'])
     run_id = f'{a.engine}-{time.time_ns()}-{os.getpid()}'
     snapshot(out / f'{run_id}-environment.json', [binary])
     if a.engine == 'rut':
