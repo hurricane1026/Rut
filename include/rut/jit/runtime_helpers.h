@@ -230,6 +230,23 @@ void rut_helper_time_unlatch();
 
 }  // extern "C"
 
+// Field-specialized protobuf operation ABI. Field tags/types are compile-time
+// immediates; no schema or descriptor is retained on the request path. Outputs
+// own their bytes in the request SliceArena; failure clears every output.
+extern "C" void rut_helper_protobuf(void* conn,
+                                    void* arena,
+                                    rut::u64 op,
+                                    const char* a,
+                                    rut::u32 a_len,
+                                    const char* b,
+                                    rut::u32 b_len,
+                                    const char* c,
+                                    rut::u32 c_len,
+                                    rut::i64 number,
+                                    rut::u8* has_value,
+                                    const char** out_ptr,
+                                    rut::u32* out_len,
+                                    rut::i64* out_number);
 // Bounded JSON operation ABI. Json uses an opaque validated text view internally;
 // the language type is distinct from str. Output bytes are copied into the
 // request SliceArena, never borrowed from shared workspace. Failure clears all

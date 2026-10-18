@@ -209,7 +209,8 @@ enum class HirExprKind : u8 {
     // `time.nowMicros()` — monotonic microseconds, type I64, nullary.
     TimeNowMicros,
     JsonOp,
-    JsonDecode,
+    StructDecode,
+    ProtoOp,
     // `max(a, b)` / `min(a, b)` builtins — same-width {I32,I64} binary,
     // signed; single evaluation (real opcodes, not an IfElse desugar).
     MaxInt,
@@ -404,6 +405,8 @@ struct HirStruct {
     using TypeArgRef = HirVariant::TypeArgRef;
     struct FieldDecl {
         Str name{};
+        u32 protobuf_number = 0;
+        u8 protobuf_type = 0;
         Str type_name{};
         HirTypeKind type = HirTypeKind::Unknown;
         bool is_error_type = false;
@@ -429,6 +432,7 @@ struct HirStruct {
 
     Span span{};
     Str name{};
+    Str protobuf_name{};
     bool conforms_error = false;
     FixedVec<Str, kMaxTypeParams> type_params;
     u32 template_struct_index = 0xffffffffu;

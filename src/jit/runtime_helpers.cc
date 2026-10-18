@@ -7,6 +7,7 @@
 #include "rut/runtime/cache_table.h"
 #include "rut/runtime/connection.h"
 #include "rut/runtime/http_parser.h"
+#include "rut/runtime/protobuf_value.h"
 
 #include <hs.h>
 #include <openssl/crypto.h>
@@ -1687,6 +1688,50 @@ bool jwt_decode_claims(
 }
 
 }  // namespace
+
+extern "C" void rut_helper_protobuf(void* conn,
+                                    void* arena,
+                                    u64 op,
+                                    const char* a,
+                                    u32 a_len,
+                                    const char* b,
+                                    u32 b_len,
+                                    const char*,
+                                    u32,
+                                    i64 number,
+                                    u8* has_value,
+                                    const char** out_ptr,
+                                    u32* out_len,
+                                    i64* out_number) {
+    *has_value = 0;
+    *out_ptr = nullptr;
+    *out_len = 0;
+    *out_number = 0;
+    u8 scratch[protobuf::kMaxMessageBytes];
+    Str view{};
+    i64 scalar = 0;
+    if (!protobuf::apply(
+            op, {a, a_len}, {b, b_len}, number, scratch, sizeof(scratch), view, scalar))
+        return;
+    if (view.len) {
+        if (!arena && conn) {
+            auto& owned = static_cast<ConnectionBase*>(conn)->json_arena;
+            if (!owned.backend.pool) return;
+            if (!owned.current && !owned.init(owned.backend.pool)) return;
+            arena = &owned;
+        }
+        if (!arena || static_cast<SliceArena*>(arena)->space_used() > 262144 - view.len) return;
+        auto* storage = static_cast<char*>(static_cast<SliceArena*>(arena)->alloc(view.len));
+        if (!storage) return;
+        __builtin_memcpy(storage, view.ptr, view.len);
+        view.ptr = storage;
+    } else
+        view.ptr = "";
+    *has_value = 1;
+    *out_ptr = view.ptr;
+    *out_len = view.len;
+    *out_number = scalar;
+}
 
 extern "C" void rut_helper_json(void* conn,
                                 void* arena,

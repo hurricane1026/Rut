@@ -1373,8 +1373,8 @@ buffer release. It resolves fully qualified message references across included
 files, nested/recursive messages and RPC request/response types, retaining the
 client/server streaming flags. Fields retain protobuf scalar types, numbers,
 JSON names and repeated/packed semantics (including proto3 default packing).
-This schema is intended as input for later specialized decoder/encoder IR;
-it is not interpreted per request and is not yet wired into `rut-compile`.
+This schema is a compile-time input for specialized decoder/encoder IR;
+it is not interpreted per request. The source compiler below uses it internally.
 
 The initial subset accepts explicit `proto3` files, scalar and message fields,
 repeated fields and ordinary service signatures. Names and JSON names must be
@@ -1387,9 +1387,53 @@ symbols, invalid packing and unresolved message references are errors.
 Limits can tighten the hard ceilings: 4 MiB input, 128 files, 1,024 messages,
 16,384 fields, 1,024 methods/services, 32 nested declarations and 1,024-byte
 qualified names. A failed load consumes Arena space; discard/reset that compile
-Arena before retrying. This adds no `.proto` text parser, Rut type binding,
-codec IR/native code generation, protobuf JSON mapping or HTTP/gRPC transcoding;
-those remain separate follow-up work.
+Arena before retrying. The source compiler below supplies text parsing, inferred
+type binding and codec IR/native generation for its executable subset; protobuf JSON mapping and
+HTTP/gRPC transcoding remain pending.
+
+**Built-in protobuf source-to-codec compilation:** `protobuf.decode(protoPath,
+messageName, bytes)` reads a literal `.proto` path relative to the importing Rut
+source and infers an internal message struct. `protobuf.encode(protoPath,
+messageName, value)` returns serialized bytes; both operations return optionals.
+An explicit `protobuf.decode(Type, protoPath, messageName, bytes)` overload can
+bind an existing concrete scalar struct with exactly matching field names/types.
+Neither operation requires protoc, generated bindings or a protobuf library.
+The built-in proto3 parser follows imports under the root proto directory,
+resolves relative/absolute type names with lexical shadowing, and feeds the same
+bounded schema validator used for descriptor sets. Source strings and diagnostics
+live in the compile Arena. Cycles, unsafe import spellings and unsupported
+semantics fail compilation with file/line/column details where available.
+
+The analyzer creates/caches nominal internal message types from fully qualified
+names and exact field identities. This permits inferred i64 message fields
+without enabling user i64 annotations. It emits field-specific RIR operations
+with constant field tags/types, and LLVM compiles those operations into handlers
+for both ORC JIT and native artifacts. Shared wire/scalar helpers have no schema
+pointer, descriptors or filesystem access on the request path. The initial decoder
+uses bounded per-field wire scans (at most eight fields); it is not yet a single
+pass generated tag dispatcher. JSON and protobuf share optional struct assembly
+and the helper ABI lowering, while retaining distinct operations/semantics.
+
+The executable subset supports up to eight singular `string`/`bytes`, `bool`,
+`int32`/`sint32`/`sfixed32`, `int64`/`sint64`/`sfixed64` and
+`uint32`/`fixed32` fields; unsigned 32-bit values infer i64 and encode with a
+range check. Inputs/outputs cap at 8 KiB and request-owned intermediate bytes at
+256 KiB, using the existing SliceArena. Returned strings own their bytes across
+input-buffer reuse. Proto3 defaults are synthesized for absent scalars, the last
+correctly typed duplicate wins, and unknown/wrong-wire fields are skipped.
+Deprecated group wire types, malformed framing and invalid string UTF-8 fail decode. Encoding omits default
+values; inferred types emit fields by increasing tag. Unknown fields are not
+retained. These are protobuf payload codecs, not gRPC framing or protobuf JSON
+mapping.
+
+Repeated/embedded shapes remain schema-only; executable codecs for those shapes,
+floating point, uint64/fixed64, enums, oneof/optional presence, maps, proto2 and
+editions remain pending. Proto2 must implement explicit presence, defaults and
+required-field validation before being enabled. The source parser rejects custom
+options, public/weak imports, reserved/default/extension declarations and string
+escapes beyond quotes/backslashes; packages must precede declarations. Schema
+sources are read during compilation/reload, not watched or opened per request.
+See [the runnable codec example](examples/protobuf/README.md).
 
 **Implemented native gRPC gateway path:** the current frontend accepts
 `upstream greeter { host: "127.0.0.1", port: 50051, protocol: .http2 }` and

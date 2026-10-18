@@ -22332,3 +22332,141 @@ TEST(jit, gateway_access_module_import_and_policy_order) {
         rir.destroy();
     }
 }
+
+TEST(jit, protobuf_source_specializes_decode_encode_roundtrip) {
+    const char* src =
+        "route POST \"/codec\" {\n"
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.CodecMessage\", req.body) else { return 422 }\n"
+        "guard let bytes = protobuf.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.CodecMessage\", value) else { return 500 }\n"
+        "return response(200, body: bytes)\n}\n"
+        "route POST \"/high\" {\n"
+        "guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.HighTag\", req.body) else { return 422 }\n"
+        "guard let bytes = protobuf.encode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.HighTag\", value) else { return 500 }\n"
+        "return response(200, body: bytes)\n}\n";
+    auto tokens = lex(lit(src));
+    REQUIRE(tokens);
+    auto ast = parse_file_heap(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    if (!hir)
+        fprintf(stderr, "protobuf analyze: %.*s\n", hir.error().detail.len, hir.error().detail.ptr);
+    REQUIRE(hir);
+    auto mir = build_mir_heap(hir.value());
+    REQUIRE(mir);
+    FrontendRirModule rir{};
+    auto lowered = lower_to_rir(mir.value(), rir);
+    if (!lowered)
+        fprintf(stderr,
+                "protobuf lower: %.*s\n",
+                lowered.error().detail.len,
+                lowered.error().detail.ptr);
+    REQUIRE(lowered);
+    auto cg = codegen(rir.module);
+    REQUIRE(cg.ok);
+    JitEngine engine;
+    REQUIRE(engine.init());
+    REQUIRE(engine.compile(cg.mod, cg.ctx));
+    auto handler = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_0"));
+    REQUIRE(handler);
+    SlicePool pool;
+    REQUIRE(pool.init(64));
+    MappedArray<Connection> connections;
+    REQUIRE(connections.init(1));
+    auto& conn = connections[0];
+    conn.reset();
+    conn.json_arena.backend.pool = &pool;
+#include "protobuf/codec_message.inc"
+    for (u32 pass = 0; pass < 3; ++pass) {
+        char request[512];
+        const u32 size = pass == 0 ? sizeof(kCodecMessage) : pass == 1 ? 2 : 0;
+        const int header = snprintf(
+            request, sizeof(request), "POST /codec HTTP/1.1\r\nContent-Length: %u\r\n\r\n", size);
+        if (!pass)
+            memcpy(request + header, kCodecMessage, size);
+        else if (pass == 1) {
+            request[header] = 8;
+            request[header + 1] = static_cast<char>(128);
+        }
+        const auto result = HandlerResult::unpack(handler(&conn,
+                                                          nullptr,
+                                                          reinterpret_cast<const u8*>(request),
+                                                          static_cast<u32>(header) + size,
+                                                          nullptr));
+        CHECK_EQ(result.status_code, pass == 1 ? 422u : 200u);
+        if (pass != 1) {
+            CHECK(conn.jit_response_body_valid);
+            CHECK_EQ(conn.jit_response_body.len, size);
+            if (size && conn.jit_response_body.len == size)
+                CHECK_EQ(memcmp(conn.jit_response_body.ptr, kCodecMessage, size), 0);
+        }
+        conn.reset();
+    }
+    auto high = reinterpret_cast<HandlerFn>(engine.lookup("handler_route_1"));
+    REQUIRE(high);
+    const u8 kHigh[] = {0xfa, 0xff, 0xff, 0xff, 0x0f, 1, 'x'};
+    char high_request[128];
+    const int header = snprintf(high_request,
+                                sizeof(high_request),
+                                "POST /high HTTP/1.1\r\nContent-Length: %u\r\n\r\n",
+                                static_cast<u32>(sizeof(kHigh)));
+    memcpy(high_request + header, kHigh, sizeof(kHigh));
+    const auto result = HandlerResult::unpack(high(&conn,
+                                                   nullptr,
+                                                   reinterpret_cast<const u8*>(high_request),
+                                                   static_cast<u32>(header) + sizeof(kHigh),
+                                                   nullptr));
+    CHECK_EQ(result.status_code, 200u);
+    CHECK(conn.jit_response_body_valid);
+    REQUIRE_EQ(conn.jit_response_body.len, sizeof(kHigh));
+    CHECK_EQ(memcmp(conn.jit_response_body.ptr, kHigh, sizeof(kHigh)), 0);
+    conn.reset();
+    connections.destroy();
+    pool.destroy();
+    engine.shutdown();
+    rir.destroy();
+}
+
+TEST(jit, protobuf_helper_owns_output_and_preserves_arena_on_allocation_failure) {
+    SlicePool pool;
+    REQUIRE(pool.init(1, 0, 0));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+    char input[] = {0x0a, 3, 'R', 'u', 't'};
+    u8 has = 99;
+    const char* bytes = nullptr;
+    u32 size = 99;
+    i64 number = 99;
+    rut_helper_protobuf(nullptr,
+                        &arena,
+                        (1u << 8) | 9u,
+                        input,
+                        sizeof(input),
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &bytes,
+                        &size,
+                        &number);
+    REQUIRE_EQ(has, 1u);
+    CHECK_EQ(size, 3u);
+    memset(input, 0, sizeof(input));
+    CHECK((Str{bytes, size}.eq(lit_str("Rut"))));
+    REQUIRE(arena.alloc(arena.current->remaining()));
+    rut_helper_protobuf(
+        nullptr, &arena, 2, "Rut", 3, nullptr, 0, nullptr, 0, 0, &has, &bytes, &size, &number);
+    CHECK_EQ(has, 0u);
+    CHECK(bytes == nullptr);
+    CHECK_EQ(size, 0u);
+    CHECK_EQ(number, 0);
+    CHECK_EQ(pool.in_use(), 1u);
+    arena.destroy();
+    CHECK_EQ(pool.in_use(), 0u);
+    pool.destroy();
+}
