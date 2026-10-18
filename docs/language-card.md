@@ -485,7 +485,9 @@ upstream bounded {
 ```
 
 Each field is a positive integer through 4,294,967,295. Omission preserves
-opaque forwarding without envelope validation. A configured direction reads
+native opaque forwarding without envelope validation. Web always validates
+framing, with an implicit unsigned 32-bit payload ceiling when omitted.
+A configured direction reads
 only the five-byte gRPC envelope, across arbitrary HTTP/2 DATA boundaries;
 payload contents are never decoded. The limit applies to each message's wire
 payload, excluding its envelope. For compressed messages it bounds compressed

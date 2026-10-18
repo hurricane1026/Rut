@@ -3990,7 +3990,7 @@ Evaluation of how our DSL covers features from the OpenResty ecosystem (Kong, AP
 |---------|------------|
 | Native gRPC proxy | Implemented over h2c or TLS/mTLS upstream; see §3.4.1 |
 | gRPC-REST transcoding | HTTP/2 + protobuf definitions |
-| gRPC-Web | HTTP/2 + gRPC-Web protocol |
+| gRPC-Web | Implemented binary/text over HTTP/1.1 or HTTP/2; see §3.4.1 |
 | HTTP/2 upstream | Implemented for native gRPC over h2c or TLS/mTLS |
 | mTLS (client certs) | OpenSSL client cert validation |
 | Dynamic SSL / ACME | ACME protocol + cert management |
