@@ -73,8 +73,8 @@ The listener is selected on the CLI; the shared route file deliberately omits a
 source `listen` declaration (which selects cleartext transport).
 
 The backend command stays the same: Rut terminates TLS and forwards over h2c.
-Use your own certificate and key for deployment. gRPC-Web, JSON transcoding
-and gRPC health probes are outside this implementation.
+Use your own certificate and key for deployment. JSON transcoding and gRPC
+health probes are outside this implementation.
 Body-reading middleware and HTTP/1-specific forwarding policies are not
 supported on this streaming path.
 
@@ -140,3 +140,33 @@ count payload wire bytes per message (compressed bytes when compressed), not
 whole-stream totals or decompressed size. Oversize fails the RPC with status 8;
 malformed or truncated gRPC envelopes fail with status 13. No protobuf fields
 are decoded and no replay occurs.
+
+## Browser gRPC-Web example
+
+The same opaque messages can use binary or base64-text gRPC-Web through
+[grpc-web.rut](../grpc-web.rut). Run the Python backend from the setup above,
+then start Rut with that route file:
+
+```bash
+build/src/rut 50052 examples/grpc-web.rut --shards 1 --no-pin
+```
+
+Serve the browser client in another terminal:
+
+```bash
+python3 -m http.server 8080 --bind 127.0.0.1 --directory examples/grpc
+```
+
+Open <http://127.0.0.1:8080/web_client.html>. The default hex bytes encode the
+example protobuf message with text `hello`. Select binary or text, then send.
+The page displays each response message as hex and the final inline trailers.
+Change the RPC URL to `/example.Echo/ServerStream` to see streamed responses;
+Cancel aborts the fetch. The page is a wire-format example, not a generated
+protobuf client. A typed application can generate its own gRPC-Web SDK from
+`echo.proto`; Rut still does not load that file.
+
+The example explicitly allows only the demo origin `http://127.0.0.1:8080`.
+Change both the preflight route and response headers for your application's
+origin and request headers. CORS is configured through ordinary routes and
+response middleware; the gateway does not automatically reflect origins.
+The HTTP/1.1 bridge closes its downstream connection after each response.

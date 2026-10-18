@@ -1457,18 +1457,41 @@ rejections retain the existing HTTP error path and are not counted as admitted
 RPCs. The source live-log writer retains its configured bytes-only output.
 
 Header-only route handlers can forward gRPC. Body-dependent handlers,
-HTTP/1-specific forwarding policies, gRPC-Web, JSON transcoding and gRPC
-health checks remain outside this path. The frontend rejects
+HTTP/1-specific forwarding policies, JSON transcoding and gRPC health checks
+remain outside this path. The frontend rejects
 `.http2` combined with the HTTP/1 health-check configuration. See
 [examples/grpc.rut](examples/grpc.rut) and the language card.
 
-The gRPC-Web protocol primitives provide strict incremental base64 encoding
-and decoding, gRPC-Web content-type classification, and bounded trailer-frame
-encoding without protobuf decoding. The decoder accepts arbitrary input chunk
-boundaries and multiple independently padded flush blocks, and rejects invalid
-alphabet, padding, and non-canonical pad bits. These helpers do not by
-themselves enable HTTP/1 or HTTP/2 gRPC-Web forwarding; the runtime bridge,
-flow-control accounting, and browser-facing CORS policy remain separate work.
+The gRPC-Web bridge accepts HTTP/2 and HTTP/1.1 POST requests with binary
+`application/grpc-web` or base64 `application/grpc-web-text`, with optional
+`+proto`. JSON variants are rejected. It forwards native gRPC upstream and
+encodes terminal metadata as a final 0x80 trailer envelope in the response
+body. Strict incremental base64 accepts arbitrary input boundaries and
+independently padded flush blocks, rejecting invalid alphabet, padding and
+non-canonical pad bits. Payloads remain opaque, including compressed messages.
+Web message limits inspect the decoded five-byte envelope and wire payload;
+text encoding does not change that limit.
+
+Both Web transports use bounded queues and the existing RPC deadline,
+cancellation and configuration ownership. HTTP/2 text upload credit is held
+until decoded bytes leave the upload queue. HTTP/1.1 reads pause when that queue
+fills and resume when upstream capacity returns, including while a response
+send is pending. Its private stream index never emits HTTP/2 frames downstream
+or grants HTTP/2 flow-control credit. Content-Length and exactly chunked
+uploads are supported; responses are connection-delimited and close after the
+last body bytes, without downstream keep-alive or pipelining.
+
+A separate tracker follows native message bytes staged in downstream-owned
+output. Text output commits native bytes only after their entire encoded
+quartet has been staged. A local failure can append an error trailer only at a
+complete message boundary; partial messages or partially staged quartets force
+stream reset or connection close. Received-but-uncommitted bytes may be dropped
+at a complete staged boundary. Access-log body counts include encoded Web bytes
+and inline trailer envelopes, excluding HTTP headers and transport framing.
+
+CORS remains explicit route/middleware configuration, with no implicit origin
+reflection. See [examples/grpc-web.rut](examples/grpc-web.rut) and the browser
+wire client in [examples/grpc/README.md](examples/grpc/README.md).
 
 **Load balancing algorithms:**
 
