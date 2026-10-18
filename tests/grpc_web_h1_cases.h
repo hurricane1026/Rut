@@ -55,7 +55,8 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                                       bool chunked,
                                       const std::vector<u8>& body,
                                       std::vector<u8>& response,
-                                      bool tls = false) {
+                                      bool tls = false,
+                                      const std::vector<u8>* expected_body = nullptr) {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return false;
     set_socket_timeouts(fd, 5);
@@ -166,6 +167,10 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                 return false;
             }
             response.insert(response.end(), buf, buf + n);
+            if (expected_body &&
+                std::search(response.begin(), response.end(), expected_body->begin(),
+                            expected_body->end()) != response.end())
+                break;
             if (response.size() > 256 * 1024) {
                 close(fd);
                 return false;
@@ -176,6 +181,56 @@ inline bool grpc_web_test_h1_exchange(u16 port,
     if (tls_context) SSL_CTX_free(tls_context);
     close(fd);
     return sent;
+}
+
+template <typename Loop>
+void grpc_web_h1_streaming_text_message_case(rut::test::TestCase* _tc,
+                                             u32 native_len,
+                                             bool partial_next) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->stream_response_len = native_len;
+    server->stream_response_partial_next = partial_next;
+    server->reply_mode = 5;
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    std::vector<u8> message(native_len);
+    message[0] = 0;
+    const u32 payload_len = native_len - 5;
+    message[1] = static_cast<u8>(payload_len >> 24);
+    message[2] = static_cast<u8>(payload_len >> 16);
+    message[3] = static_cast<u8>(payload_len >> 8);
+    message[4] = static_cast<u8>(payload_len);
+    for (u32 i = 5; i < native_len; i++) message[i] = static_cast<u8>(0xa0 + i);
+    const auto expected = grpc_web_test_base64(message);
+    const std::vector<u8> empty;
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(
+        get_port(listener), true, false, empty, response, false, &expected));
+    CHECK(std::search(response.begin(), response.end(), expected.begin(), expected.end()) !=
+          response.end());
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+    CHECK_EQ(server->requests.load(), 1u);
 }
 
 template <typename Loop>
@@ -416,4 +471,16 @@ TEST(grpc_proxy, h1_binary_tls_epoll) {
 }
 TEST(grpc_proxy, h1_text_tls_epoll) {
     grpc_web_h1_tls_roundtrip_case<EpollEventLoop>(_tc, true);
+}
+TEST(grpc_proxy, h1_text_streaming_message_mod3_zero) {
+    grpc_web_h1_streaming_text_message_case<EpollEventLoop>(_tc, 6, false);
+}
+TEST(grpc_proxy, h1_text_streaming_message_mod3_one) {
+    grpc_web_h1_streaming_text_message_case<EpollEventLoop>(_tc, 7, false);
+}
+TEST(grpc_proxy, h1_text_streaming_message_mod3_two) {
+    grpc_web_h1_streaming_text_message_case<EpollEventLoop>(_tc, 8, false);
+}
+TEST(grpc_proxy, h1_text_streaming_message_then_partial_next_same_data) {
+    grpc_web_h1_streaming_text_message_case<EpollEventLoop>(_tc, 7, true);
 }

@@ -118,6 +118,8 @@ struct EchoServer {
     std::atomic<u32> resets{0};
     std::atomic<u32> accepts{0};
     std::atomic<u32> reply_mode{0};
+    std::atomic<u32> stream_response_len{0};
+    std::atomic<bool> stream_response_partial_next{false};
     std::atomic<u32> request_trailers{0};
     std::atomic<u32> grpc_content_type_requests{0};
     std::atomic<u32> te_trailers_requests{0};
@@ -177,6 +179,21 @@ struct EchoServer {
                 self->bad_web_request_headers++;
             const u32 mode = self->reply_mode.exchange(0);
             if (mode == 2) return NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (mode == 5) {
+                const u32 message_len = self->stream_response_len.load();
+                if (message_len < 5 || message_len > sizeof(s->data))
+                    return NGHTTP2_ERR_CALLBACK_FAILURE;
+                s->data[0] = 0;
+                const u32 payload_len = message_len - 5;
+                s->data[1] = static_cast<u8>(payload_len >> 24);
+                s->data[2] = static_cast<u8>(payload_len >> 16);
+                s->data[3] = static_cast<u8>(payload_len >> 8);
+                s->data[4] = static_cast<u8>(payload_len);
+                for (u32 i = 5; i < message_len; i++) s->data[i] = static_cast<u8>(0xa0 + i);
+                s->len = message_len;
+                if (self->stream_response_partial_next.load())
+                    s->data[s->len++] = 0;
+            }
             if (mode == 1) {
                 nghttp2_nv error[] = {nv(":status", "200"),
                                       nv("content-type", "application/grpc"),
