@@ -1,13 +1,18 @@
 #pragma once
 
+#include "rut/common/grpc_retry_policy.h"
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/grpc_message.h"
+#include "rut/runtime/grpc_replay_body.h"
+#include "rut/runtime/grpc_replay_headers.h"
 #include "rut/runtime/grpc_web.h"
+#include "rut/runtime/slice_pool.h"
 #include "rut/runtime/tls.h"
 
 namespace rut {
 struct ConnectionBase;
+struct RouteConfig;
 
 // One RPC, allocated from the shard's existing bulk SlicePool. Payloads stay
 // opaque (including compressed protobuf messages and binary metadata). Queue
@@ -15,6 +20,8 @@ struct ConnectionBase;
 struct GrpcExchange {
     static constexpr u32 kWindow = 65535;
     static constexpr u32 kHeaders = 16384;
+    static constexpr u32 kTimeoutFieldMax = 32;
+    static constexpr u32 kRequestHeadersSlack = 9 + kTimeoutFieldMax;
     static constexpr u32 kMaxResponseMutations = 16;
     struct ResponseMutation {
         u16 name_offset;
@@ -87,11 +94,28 @@ struct GrpcExchange {
     ResponseMutation response_mutations[kMaxResponseMutations];
     u8 upload[kWindow];
     u8 download[kWindow];
-    u8 request_headers[kHeaders];
+    // The normal encoded header block keeps the historical kHeaders admission
+    // cap. Extra bytes hold a late grpc-timeout literal and optional CONTINUATION.
+    u8 request_headers[kHeaders + kRequestHeadersSlack];
     u8 request_trailers[kHeaders];
     u8 response_headers[kHeaders];
     u8 response_trailers[kHeaders];
     u8 response_mutation_storage[kHeaders];
+
+    GrpcRetryPolicy retry_policy;
+    GrpcReplayBody replay_body;
+    GrpcReplayHeaders replay_headers;
+    GrpcReplayHeaders replay_trailers;
+    GrpcMessageLimit retry_envelope;
+    const RouteConfig* config_epoch;
+    u64 retry_at_us;
+    u8 retry_attempts;
+    u8 retry_tried_mask;
+    u8 retry_reason;
+    bool retry_pending;
+    bool retry_enabled;
+    bool timeout_present;
+    bool replaying_attempt;
 
     void init() {
         downstream = upstream = nullptr;
@@ -133,8 +157,24 @@ struct GrpcExchange {
         response_mutation_bytes = 0;
         response_mutation_count = 0;
         response_mutation_overflow = false;
+        retry_policy = {};
+        replay_body = {};
+        replay_headers.clear();
+        replay_trailers.clear();
+        retry_envelope.init();
+        config_epoch = nullptr;
+        retry_at_us = 0;
+        retry_attempts = retry_tried_mask = 0;
+        retry_reason = 0;
+        retry_pending = retry_enabled = timeout_present = false;
+        replaying_attempt = false;
     }
 };
+
+static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize - 8192);
+
+static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize - 8192,
+              "GrpcExchange must leave bulk-slice spare capacity");
 
 // The same bounded index belongs to downstream and upstream HTTP/2 sessions.
 // Only upstream sessions join the shard-local pool; mappings keep stream IDs
@@ -162,9 +202,13 @@ struct GrpcProxyState {
     bool connecting;
     bool connect_retry_pending;
     bool busy;
+    bool c5_exhausted;
     bool preface_sent;
     bool session_failure_recorded;
     u8 control[4096];
+    u8 header_continuation[GrpcExchange::kRequestHeadersSlack];
+    u32 header_continuation_len;
+    bool header_continuation_sending;
 
     void init() {
         client_tls = {};
@@ -175,8 +219,10 @@ struct GrpcProxyState {
         active = cursor = control_len = pending_cancel_count = 0;
         connect_attempts = connect_tried_mask = 0;
         connected_at_us = idle_since_us = timer_deadline_us = last_ping_us = keepalive_due_us = 0;
-        upstream = connecting = connect_retry_pending = busy = preface_sent =
-            session_failure_recorded = false;
+        upstream = connecting = busy = c5_exhausted = preface_sent = session_failure_recorded =
+            connect_retry_pending = false;
+        header_continuation_len = 0;
+        header_continuation_sending = false;
     }
 };
 }  // namespace rut

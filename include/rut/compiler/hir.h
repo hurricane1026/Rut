@@ -4,6 +4,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/grpc_retry_policy.h"
 #include "rut/common/listener_address.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/request_policy.h"
@@ -55,6 +56,7 @@ struct HirUpstream {
     // status defaults to 200. hc_path is a Str (like name) copied into a char
     // buffer at populate_route_config via set_upstream_health_check.
     UpstreamTlsSpec tls{};
+    GrpcRetryPolicy grpc_retry{};
     u32 max_request_message_bytes = 0;
     u32 max_response_message_bytes = 0;
     bool http2 = false;

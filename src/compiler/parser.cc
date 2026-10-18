@@ -186,7 +186,10 @@ struct Parser {
         u32 value = 0;
         for (u32 i = 0; i < token.text.len; i++) {
             const u32 digit = static_cast<u32>(token.text.ptr[i] - '0');
-            if (value > (maximum - digit) / 10u)
+            // Check the digit before subtracting: when digit > maximum,
+            // unsigned `maximum - digit` wraps and can admit out-of-range
+            // values (for example max_attempts: 4 with maximum == 3).
+            if (digit > maximum || value > (maximum - digit) / 10u)
                 return frontend_error(FrontendError::InvalidInteger, span_from(token), token.text);
             value = value * 10u + digit;
         }
@@ -3457,6 +3460,7 @@ struct Parser {
             bool seen_protocol = false;
             bool seen_host = false;
             bool seen_port = false;
+            bool seen_grpc_retry = false;
             // Empty dict (`upstream foo {}`) is a parse error — omit
             // the braces entirely if no address is being declared.
             if (cur().type == TokenType::RBrace) {
@@ -3509,6 +3513,111 @@ struct Parser {
                         return frontend_error(FrontendError::InvalidInteger,
                                               span_from(*value.value()));
                     limit = parsed;
+                } else if (field_name.eq({"grpc_retry", 10})) {
+                    if (seen_grpc_retry)
+                        return frontend_error(
+                            FrontendError::UnexpectedToken, span_from(*field.value()), field_name);
+                    seen_grpc_retry = true;
+                    auto retry_lbrace = expect(TokenType::LBrace);
+                    if (!retry_lbrace) return core::make_unexpected(retry_lbrace.error());
+                    bool seen_attempts = false;
+                    bool seen_request_bytes = false;
+                    bool seen_statuses = false;
+                    bool seen_backoff = false;
+                    GrpcRetryPolicy policy{};
+                    while (true) {
+                        auto retry_field = expect(TokenType::Ident);
+                        if (!retry_field) return core::make_unexpected(retry_field.error());
+                        const Str retry_key = retry_field.value()->text;
+                        auto retry_colon = expect(TokenType::Colon);
+                        if (!retry_colon) return core::make_unexpected(retry_colon.error());
+                        if (retry_key.eq({"max_attempts", 12})) {
+                            if (seen_attempts)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*retry_field.value()),
+                                                      retry_key);
+                            auto value = expect(TokenType::IntLit);
+                            if (!value) return core::make_unexpected(value.error());
+                            auto parsed = parse_bounded_decimal(
+                                *value.value(), GrpcRetryPolicy::kMaxAttempts, false);
+                            if (!parsed || parsed.value() < GrpcRetryPolicy::kMinAttempts)
+                                return frontend_error(FrontendError::InvalidInteger,
+                                                      span_from(*value.value()),
+                                                      value.value()->text);
+                            policy.max_attempts = static_cast<u8>(parsed.value());
+                            seen_attempts = true;
+                        } else if (retry_key.eq({"max_request_bytes", 17})) {
+                            if (seen_request_bytes)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*retry_field.value()),
+                                                      retry_key);
+                            auto value = expect(TokenType::IntLit);
+                            if (!value) return core::make_unexpected(value.error());
+                            auto parsed = parse_bounded_decimal(
+                                *value.value(), GrpcRetryPolicy::kMaxRequestBytes, false);
+                            if (!parsed || parsed.value() < GrpcRetryPolicy::kMinRequestBytes)
+                                return frontend_error(FrontendError::InvalidInteger,
+                                                      span_from(*value.value()),
+                                                      value.value()->text);
+                            policy.max_request_bytes = parsed.value();
+                            seen_request_bytes = true;
+                        } else if (retry_key.eq({"statuses", 8})) {
+                            if (seen_statuses)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*retry_field.value()),
+                                                      retry_key);
+                            auto lbracket = expect(TokenType::LBracket);
+                            if (!lbracket) return core::make_unexpected(lbracket.error());
+                            while (true) {
+                                auto value = expect(TokenType::IntLit);
+                                if (!value) return core::make_unexpected(value.error());
+                                auto parsed = parse_bounded_decimal(*value.value(), 16, false);
+                                if (!parsed || parsed.value() == 0)
+                                    return frontend_error(FrontendError::InvalidInteger,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                const u32 bit = 1u << parsed.value();
+                                if (policy.status_mask & bit)
+                                    return frontend_error(FrontendError::UnexpectedToken,
+                                                          span_from(*value.value()),
+                                                          value.value()->text);
+                                policy.status_mask |= bit;
+                                if (!take(TokenType::Comma)) break;
+                                if (cur().type == TokenType::RBracket) break;
+                            }
+                            auto rbracket = expect(TokenType::RBracket);
+                            if (!rbracket) return core::make_unexpected(rbracket.error());
+                            seen_statuses = true;
+                        } else if (retry_key.eq({"backoff_ms", 10})) {
+                            if (seen_backoff)
+                                return frontend_error(FrontendError::UnexpectedToken,
+                                                      span_from(*retry_field.value()),
+                                                      retry_key);
+                            auto value = expect(TokenType::IntLit);
+                            if (!value) return core::make_unexpected(value.error());
+                            auto parsed = parse_bounded_decimal(
+                                *value.value(), GrpcRetryPolicy::kMaxBackoffMs, false);
+                            if (!parsed)
+                                return frontend_error(FrontendError::InvalidInteger,
+                                                      span_from(*value.value()),
+                                                      value.value()->text);
+                            policy.backoff_ms = parsed.value();
+                            seen_backoff = true;
+                        } else {
+                            return frontend_error(FrontendError::UnexpectedToken,
+                                                  span_from(*retry_field.value()),
+                                                  retry_key);
+                        }
+                        (void)take(TokenType::Comma);
+                        if (cur().type == TokenType::RBrace) break;
+                    }
+                    auto retry_rbrace = expect(TokenType::RBrace);
+                    if (!retry_rbrace) return core::make_unexpected(retry_rbrace.error());
+                    if (!seen_attempts || !seen_request_bytes || !seen_statuses || !seen_backoff)
+                        return frontend_error(FrontendError::UnsupportedSyntax,
+                                              span_from(*retry_lbrace.value()),
+                                              {"grpc_retry requires all four fields", 35});
+                    item.upstream.grpc_retry = policy;
                 } else if (field_name.eq({"tls", 3})) {
                     auto& tls = item.upstream.tls;
                     if (tls.enabled)

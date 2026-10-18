@@ -564,8 +564,10 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             if (!valid_upstream_tls(up.tls) || (up.tls.enabled && !up.http2)) return false;
             if ((up.max_request_message_bytes || up.max_response_message_bytes) && !up.http2)
                 return false;
+            if (!up.grpc_retry.valid(up.http2)) return false;
             cfg.upstreams[i].max_request_message_bytes = up.max_request_message_bytes;
             cfg.upstreams[i].max_response_message_bytes = up.max_response_message_bytes;
+            cfg.upstreams[i].grpc_retry = up.grpc_retry;
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
             if (up.hc_enabled) {
@@ -610,8 +612,10 @@ inline bool populate_verified_route_config(RouteConfig& cfg,
             if (!valid_upstream_tls(up.tls) || (up.tls.enabled && !up.http2)) return false;
             if ((up.max_request_message_bytes || up.max_response_message_bytes) && !up.http2)
                 return false;
+            if (!up.grpc_retry.valid(up.http2)) return false;
             cfg.upstreams[i].max_request_message_bytes = up.max_request_message_bytes;
             cfg.upstreams[i].max_response_message_bytes = up.max_response_message_bytes;
+            cfg.upstreams[i].grpc_retry = up.grpc_retry;
             cfg.upstreams[i].tls = up.tls;
             cfg.upstreams[i].http2 = up.http2;
             if (up.hc_enabled) {

@@ -4,6 +4,7 @@
 #include "rut/common/failure_policy.h"
 #include "rut/common/forward_preflight.h"
 #include "rut/common/forward_target_transform.h"
+#include "rut/common/grpc_retry_policy.h"
 #include "rut/common/rate_limit_key_spec.h"
 #include "rut/common/redirect_policy.h"
 #include "rut/common/response_policy.h"
@@ -534,6 +535,7 @@ struct Module {
         // compile→config helper feeds it to set_upstream_health_check). hc_path
         // is a Str copied into UpstreamTarget::hc_path there.
         UpstreamTlsSpec tls{};
+        GrpcRetryPolicy grpc_retry{};
         u32 max_request_message_bytes = 0;
         u32 max_response_message_bytes = 0;
         bool http2 = false;

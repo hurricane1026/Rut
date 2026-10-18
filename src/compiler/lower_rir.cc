@@ -3637,6 +3637,7 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
         // Active health-check config. hc_path is copied into arena memory (like
         // name) so the RIR module owns it independently of the AST/HIR/MIR.
         out.module.upstreams[i].tls = mir.upstreams[i].tls;
+        out.module.upstreams[i].grpc_retry = mir.upstreams[i].grpc_retry;
         out.module.upstreams[i].max_request_message_bytes =
             mir.upstreams[i].max_request_message_bytes;
         out.module.upstreams[i].max_response_message_bytes =
