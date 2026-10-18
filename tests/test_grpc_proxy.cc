@@ -3383,3 +3383,106 @@ int main(int argc, char** argv) {
     signal(SIGPIPE, SIG_IGN);
     return rut::test::run_all(argc, argv);
 }
+
+TEST(grpc_proxy, active_session_keepalive_gates_and_timeout) {
+    auto h = std::make_unique<Http2Conn>();
+    h->init_client();
+    auto& g = h->grpc;
+    g.connected_at_us = 100;
+    constexpr u64 due = 300000100;
+    constexpr u64 timeout = 20000000;
+    CHECK(!grpc_keepalive_tick(*h, due, timeout, true));
+    CHECK_EQ(g.control_len, 0u);  // idle sessions are not probed
+    g.active = 1;
+    CHECK(!grpc_keepalive_tick(*h, due, timeout, true));
+    CHECK_EQ(g.control_len, 0u);  // SETTINGS not received
+    h->peer_settings_seen = true;
+    g.connecting = true;
+    CHECK(!grpc_keepalive_tick(*h, due, timeout, true));
+    g.connecting = false;
+    h->peer_goaway = true;
+    CHECK(!grpc_keepalive_tick(*h, due, timeout, true));
+    h->peer_goaway = false;
+    CHECK(!grpc_keepalive_tick(*h, due, timeout, false));
+    CHECK_EQ(g.control_len, 0u);
+    g.control_len = sizeof(g.control) - 16;
+    CHECK(!grpc_keepalive_tick(*h, due, timeout, true));
+    CHECK(!h->ping_pending);
+    g.control_len = 0;
+    CHECK(!grpc_keepalive_tick(*h, due - 1, timeout, true));
+    CHECK(!h->ping_pending);
+    CHECK(!grpc_keepalive_tick(*h, due, timeout, true));
+    CHECK(h->ping_pending);
+    CHECK_EQ(g.control_len, 17u);
+    CHECK(!grpc_keepalive_tick(*h, due + timeout - 1, timeout, true));
+    CHECK(grpc_keepalive_tick(*h, due + timeout, timeout, true));
+    // Receive the matching ACK through the real HTTP/2 parser.
+    g.control[4] = http2_flag::kAck;
+    u8 out[256];
+    u32 written = 0;
+    auto result = h->process(g.control, 17, out, sizeof(out), &written);
+    CHECK(!result.close);
+    CHECK(!h->ping_pending);
+    g.control_len = 0;
+    CHECK(!grpc_keepalive_tick(*h, due + timeout, timeout, true));
+    CHECK_EQ(g.control_len, 0u);
+    CHECK(!grpc_keepalive_tick(*h, due + 300000000, timeout, true));
+    CHECK(h->ping_pending);
+}
+
+TEST(grpc_proxy, keepalive_timer_flushes_probe_and_closes_unresponsive_session) {
+    struct ClosingLoop : GrpcDriveFixture {
+        void close_conn(Connection& conn) {
+            grpc_connection_closed<GrpcDriveFixture>(this, conn);
+            closed = true;
+        }
+    } loop;
+    Connection conn;
+    conn.reset();
+    auto h = std::make_unique<Http2Conn>();
+    h->init_client();
+    conn.h2 = h.get();
+    u8 send[SlicePool::kSliceSize];
+    conn.send_buf.bind(send, sizeof(send));
+    auto& g = h->grpc;
+    g.upstream = true;
+    Connection downstream;
+    downstream.reset();
+    auto down_h2 = std::make_unique<Http2Conn>();
+    down_h2->init();
+    downstream.h2 = down_h2.get();
+    downstream.on_send = &pending_send;
+    auto x = std::make_unique<GrpcExchange>();
+    x->init();
+    x->upstream = &conn;
+    x->downstream = &downstream;
+    x->upstream_stream = x->downstream_stream = 1;
+    x->slot_held = true;
+    REQUIRE(grpc_attach(*h, x.get()));
+    REQUIRE(grpc_attach(*down_h2, x.get()));
+    loop.grpc_upstreams = &conn;
+    g.preface_sent = true;
+    h->peer_settings_seen = true;
+    g.connected_at_us = monotonic_us() - 300000001;
+    grpc_tick(&loop, conn);
+    CHECK(!loop.closed);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(loop.last_send_len, 17u);
+    CHECK_EQ(send[3], static_cast<u8>(Http2FrameType::Ping));
+    CHECK(h->ping_pending);
+    CHECK_EQ(g.control_len, 0u);
+    // No wall-clock sleep: move the recorded send time beyond the ACK deadline.
+    g.last_ping_us = monotonic_us() - 1000001;
+    grpc_tick(&loop, conn);
+    CHECK(loop.closed);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK(loop.grpc_upstreams == nullptr);
+    CHECK_EQ(g.active, 0u);
+    CHECK_EQ(loop.released, 1u);
+    CHECK(x->upstream == nullptr);
+    CHECK(!x->slot_held);
+    CHECK(x->response_end);
+    CHECK_EQ(x->failure, 14u);
+    grpc_connection_closed<GrpcDriveFixture>(&loop, conn);
+    CHECK_EQ(loop.released, 1u);
+}

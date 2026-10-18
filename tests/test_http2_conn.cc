@@ -355,6 +355,39 @@ TEST(http2_conn, ping_is_acked) {
     CHECK(has_frame(out, ow, Http2FrameType::Ping, http2_flag::kAck, http2_flag::kAck));
 }
 
+TEST(http2_conn, local_ping_requires_matching_ack_and_bounded_output) {
+    Http2Conn c;
+    Capture cap;
+    setup(c, cap);
+    c.preface_seen = true;
+    c.peer_settings_seen = true;
+    u8 ping[17], out[256];
+    CHECK_EQ(c.write_ping(ping, 16, 0x0102030405060708ull), 0u);
+    CHECK(!c.ping_pending);
+    CHECK_EQ(c.write_ping(ping, sizeof(ping), 0x0102030405060708ull), 17u);
+    CHECK_EQ(ping[9], 1u);
+    CHECK_EQ(ping[16], 8u);
+    CHECK_EQ(c.write_ping(out, sizeof(out), 123), 0u);
+    u32 written = 0;
+    // A peer probe must still receive an ACK while our own probe is pending.
+    auto result = c.process(ping, sizeof(ping), out, sizeof(out), &written);
+    CHECK(!result.close);
+    CHECK(c.ping_pending);
+    CHECK(has_frame(out, written, Http2FrameType::Ping, http2_flag::kAck, http2_flag::kAck));
+    ping[4] = http2_flag::kAck;
+    ping[16] ^= 1;
+    result = c.process(ping, sizeof(ping), out, sizeof(out), &written);
+    CHECK(!result.close);
+    CHECK(c.ping_pending);
+    ping[16] ^= 1;
+    result = c.process(ping, sizeof(ping), out, sizeof(out), &written);
+    CHECK(!result.close);
+    CHECK(!c.ping_pending);
+    CHECK_EQ(c.write_ping(ping, sizeof(ping), 123), 17u);
+    c.init();
+    CHECK(!c.ping_pending);
+}
+
 TEST(http2_conn, window_update_grows_send_window) {
     Http2Conn c;
     Capture cap;
