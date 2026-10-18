@@ -207,7 +207,7 @@ struct Compiler {
     }
     Str join_scratch(char* bytes, u32 capacity, Str left, char separator, Str right) const {
         const u64 kSize = static_cast<u64>(left.len) + right.len + 1;
-        if (kSize > capacity - 1) return {};
+        if (kSize >= capacity) return {};
         if (left.len) __builtin_memcpy(bytes, left.ptr, left.len);
         bytes[left.len] = separator;
         if (right.len) __builtin_memcpy(bytes + left.len + 1, right.ptr, right.len);

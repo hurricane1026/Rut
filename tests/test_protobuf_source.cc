@@ -303,13 +303,22 @@ TEST(protobuf_source, deep_relative_references_do_not_materialize_probe_names) {
     REQUIRE(files.write_file("types.proto", "syntax='proto3'; message A {}"));
     char source[20000];
     u32 offset = 0;
-    const char* prefix = "syntax='proto3'; import 'types.proto';";
+    const char* prefix = "syntax='proto3'; package ";
     memcpy(source + offset, prefix, strlen(prefix));
     offset += static_cast<u32>(strlen(prefix));
+    for (u32 component = 0; component < 200; ++component) {
+        source[offset++] = 'a';
+        if (component + 1 < 200) source[offset++] = '.';
+    }
+    memcpy(source + offset, "; import 'types.proto';", 23);
+    offset += 23;
     for (u32 depth = 0; depth < 20; ++depth) {
-        source[offset++] = ' ';
-        memcpy(source + offset, "message M { A field=1;", 22);
-        offset += 22;
+        offset += static_cast<u32>(
+            snprintf(source + offset, sizeof(source) - offset, " message M%u {", depth));
+    }
+    for (u32 field = 0; field < 512; ++field) {
+        offset += static_cast<u32>(
+            snprintf(source + offset, sizeof(source) - offset, " A f%u=%u;", field, field + 1));
     }
     for (u32 depth = 0; depth < 20; ++depth) source[offset++] = '}';
     source[offset] = 0;
@@ -317,7 +326,7 @@ TEST(protobuf_source, deep_relative_references_do_not_materialize_probe_names) {
     Storage storage;
     auto result = files.load(storage);
     REQUIRE(result.has_value());
-    CHECK(storage.arena.space_allocated() < 1024 * 1024);
+    CHECK(storage.arena.space_allocated() < 4 * 1024 * 1024);
 }
 TEST(protobuf_source, qualified_name_limit_is_reported_before_join_allocation) {
     Files files;
