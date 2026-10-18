@@ -39,4 +39,10 @@
 
 ## 证据与复现
 
-原始证据目录 `/home/hurricane/private/code/rut-bounded-evidence-20261006/` 保存配置、命令、原始 wrk 日志、预检、逐核与进程 CPU、二进制 SHA-256、源差异、构建与验证日志、功能测试脚本及测量封装。不包含可执行文件或 TLS 私钥。`origin-reuse-provenance.json` 提供代码提交与二进制 SHA-256；封装调用仓库 `scripts/nginx_benchmark/run.py`，复测时需要调整绝对路径、CPU 与端口。
+本节测量所依据的原始配置、命令、wrk 日志、预检、逐核与进程 CPU、二进制 SHA-256、源差异、构建
+与验证日志及测量封装只保存在作者的本地证据目录，未随本公开归档提交。因此本 checkout 无法
+独立复核下述吞吐、p99 和超时数字；它们保留为历史记录，不能作为从本归档直接复现的结果。
+本地 provenance 记录实现提交 `576ae9ff7111bd473b921d082abc7268b114e5bc`、构建说明
+`Clang22 Release O2, JIT ON, IPO OFF` 和二进制 SHA-256
+`0c19508d26c7f249138695a2bc96ababc303a484c19cbeeac22e043b3d7fe75f`。
+复测需重新准备证据、调整路径、CPU 与端口；封装调用仓库 `scripts/nginx_benchmark/run.py`。

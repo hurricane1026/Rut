@@ -10,7 +10,8 @@
 
 ## 实现与产物
 
-- [探针](../../../bench/bench_sockmap_probe.cc) 直接构造 eBPF 指令，用 `bpf()`
+- [探针源码](https://github.com/hurricane1026/Rut/blob/6d6ec6c5149044a24ca6d7812c7f43eddb6c1460/bench/bench_sockmap_probe.cc)
+  直接构造 eBPF 指令，用 `bpf()`
   加载 parser/verdict、创建 sockmap、挂入两个已经建立的 TCP socket。
   不经过外部 C/BPF 编译器；不新增 libbpf、ELF loader 或 LLVM 运行时依赖。
   可先离线 `emit`，再在另一进程用 `--bytecode` 读取这些文件并重定位加载。
@@ -22,9 +23,11 @@
 - 原始文件使用构建机器的 eBPF instruction ABI；尚无通用版本化包格式。
   两种模板都只接受本探针生成的固定指令。加载前校验完整内容，加载后经过 verifier。
   产物不包含进程 FD；端口和 map FD 在加载时填入。
-- [控制脚本](../../../scripts/ebpf_capability_probe.py) 保存命令、退出码、stderr、
-  逐次 JSON、内核版本、Docker 镜像 ID 和探针/bytecode/动态库哈希。
-  [黑盒测试](../../../tests/test_sockmap_probe.py) 注册至 CTest 和 `check`。
+- [控制脚本](https://github.com/hurricane1026/Rut/blob/6d6ec6c5149044a24ca6d7812c7f43eddb6c1460/scripts/ebpf_capability_probe.py)
+  保存命令、退出码、stderr、逐次 JSON、内核版本、Docker 镜像 ID 和探针/bytecode/动态库哈希。
+  [黑盒测试](https://github.com/hurricane1026/Rut/blob/6d6ec6c5149044a24ca6d7812c7f43eddb6c1460/tests/test_sockmap_probe.py)
+  注册至 CTest 和 `check`。上述源码、脚本和测试来自后续 PR #823 的历史提交；它们不在本归档
+  checkout 中，链接固定到该提交以保留当时的实现。
 
 普通 TCP 模板：parser 16 B、verdict 80 B。限定 body 模板：parser 176 B、
 verdict 248 B；socket map 与两方向独立的预算 map 分开。
@@ -111,6 +114,9 @@ chunked、完整缓冲、重试与 HTTP/2 的语义证明分别处理。
 这轮不新增 DSL keyword，不把尚未实现的 compiler flag 写成现有能力。
 
 ## 复现与检查
+
+下面的构建目标和命令属于后续 PR #823 的历史实验环境；本归档 checkout 没有这些目标，不能在此处
+直接复现。相关背景说明见 [eBPF 设计记录](https://github.com/hurricane1026/Rut/blob/6d6ec6c5149044a24ca6d7812c7f43eddb6c1460/docs/ebpf.md)。
 
 ```bash
 cmake -S . -B build -DRUT_BUILD_EBPF_PROBE=ON
