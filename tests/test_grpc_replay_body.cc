@@ -1,4 +1,5 @@
 #include "rut/runtime/grpc_replay_body.h"
+#include "rut/runtime/grpc_replay_headers.h"
 #include "test.h"
 
 #include <string.h>
@@ -140,6 +141,84 @@ TEST(grpc_replay_body, reset_invalidates_the_previous_read_cursor) {
     body.release();
     CHECK_EQ(body.copy(output, sizeof(output)), 0u);
     pool.destroy();
+}
+
+TEST(grpc_replay_headers, owns_ordered_duplicate_and_opaque_metadata) {
+    GrpcReplayHeaders headers{};
+    char name[] = "x-bin";
+    char value[] = {'a', 0, 'b'};
+    const hpack::Header input[] = {
+        {{":path", 5}, {"/echo.Call", 10}}, {{name, 5}, {value, 3}}, {{name, 5}, {"", 0}}};
+    REQUIRE(headers.capture(input, 3));
+    memset(name, 'q', 5);
+    memset(value, 'z', 3);
+    hpack::Header out[3]{};
+    u32 count = 99;
+    REQUIRE(headers.materialize(out, 3, count));
+    CHECK_EQ(count, 3u);
+    CHECK(out[0].name.eq(lit_str(":path")));
+    CHECK(out[0].value.eq(lit_str("/echo.Call")));
+    CHECK(out[1].name.eq(lit_str("x-bin")));
+    CHECK_EQ(out[1].value.len, 3u);
+    CHECK(memcmp(out[1].value.ptr, "a\0b", 3) == 0);
+    CHECK(out[2].name.eq(lit_str("x-bin")));
+    CHECK_EQ(out[2].value.len, 0u);
+    headers.clear();
+    CHECK_FALSE(headers.materialize(out, 3, count));
+    CHECK_EQ(count, 0u);
+}
+
+TEST(grpc_replay_headers, checks_exact_byte_and_field_budgets) {
+    GrpcReplayHeaders headers{};
+    static char value[GrpcReplayHeaders::kBytes]{};
+    hpack::Header input{{"x", 1}, {value, sizeof(value) - 1}};
+    REQUIRE(headers.capture(&input, 1));
+    CHECK_EQ(headers.size, GrpcReplayHeaders::kBytes);
+    hpack::Header out[GrpcReplayHeaders::kMaxHeaders]{};
+    u32 count = 0;
+    REQUIRE(headers.materialize(out, GrpcReplayHeaders::kMaxHeaders, count));
+    CHECK_EQ(out[0].value.len, sizeof(value) - 1);
+    input.value.len++;
+    CHECK_FALSE(headers.capture(&input, 1));
+    CHECK_FALSE(headers.valid);
+    CHECK_EQ(headers.count, 0u);
+    CHECK_EQ(headers.size, 0u);
+    CHECK_FALSE(headers.materialize(out, GrpcReplayHeaders::kMaxHeaders, count));
+
+    hpack::Header many[GrpcReplayHeaders::kMaxHeaders + 1];
+    for (auto& h : many) h = {{"x", 1}, {"y", 1}};
+    REQUIRE(headers.capture(many, GrpcReplayHeaders::kMaxHeaders));
+    CHECK_FALSE(headers.materialize(out, GrpcReplayHeaders::kMaxHeaders - 1, count));
+    CHECK_EQ(count, 0u);
+    REQUIRE(headers.materialize(out, GrpcReplayHeaders::kMaxHeaders, count));
+    CHECK_EQ(count, GrpcReplayHeaders::kMaxHeaders);
+    CHECK_FALSE(headers.capture(many, GrpcReplayHeaders::kMaxHeaders + 1));
+    CHECK_FALSE(headers.valid);
+    // Empty trailer metadata needs no special allocation or sentinel field.
+    REQUIRE(headers.capture(nullptr, 0));
+    CHECK(headers.materialize(nullptr, 0, count));
+    CHECK_EQ(count, 0u);
+}
+
+TEST(grpc_replay_headers, malformed_snapshot_publishes_no_views) {
+    GrpcReplayHeaders headers{};
+    const hpack::Header input[] = {{{"first", 5}, {"a", 1}}, {{"last", 4}, {"b", 1}}};
+    REQUIRE(headers.capture(input, 2));
+    headers.fields[1].value_offset = 65535;
+    hpack::Header out[2]{{{"sentinel", 8}, {"", 0}}, {}};
+    u32 count = 99;
+    CHECK_FALSE(headers.materialize(out, 2, count));
+    CHECK_EQ(count, 0u);
+    CHECK(out[0].name.eq(lit_str("sentinel")));
+    REQUIRE(headers.capture(input, 2));
+    headers.fields[1].name_len = 65535;
+    CHECK_FALSE(headers.materialize(out, 2, count));
+    REQUIRE(headers.capture(input, 2));
+    headers.size = GrpcReplayHeaders::kBytes + 1;
+    CHECK_FALSE(headers.materialize(out, 2, count));
+    REQUIRE(headers.capture(input, 2));
+    headers.count = GrpcReplayHeaders::kMaxHeaders + 1;
+    CHECK_FALSE(headers.materialize(out, 2, count));
 }
 
 int main(int argc, char** argv) {
