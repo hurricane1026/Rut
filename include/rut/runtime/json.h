@@ -33,6 +33,10 @@ enum class Op : u8 {
     AsI32,
     RequireObject,
     Stringify,
+    // jwtDecode(token, secret): verifies an HS256/384/512 JWT and yields the
+    // decoded claims object. Kept in the JSON op family so the existing
+    // optional-Json carrier and arena lifetime apply unchanged.
+    JwtDecode,
 };
 inline constexpr u32 kMaxBytes = 8192;
 inline constexpr u32 kMaxNodes = 2048;
@@ -41,17 +45,18 @@ inline constexpr u32 kNone = 0xffffffffu;
 
 struct Writer {
     char* data;
+    u32 cap = kMaxBytes;
     u32 len = 0;
     bool ok = true;
     void put(char c) {
-        if (len == kMaxBytes) {
+        if (len == cap) {
             ok = false;
             return;
         }
         data[len++] = c;
     }
     void text(Str s) {
-        if (s.len > kMaxBytes - len) {
+        if (s.len > cap - len) {
             ok = false;
             return;
         }

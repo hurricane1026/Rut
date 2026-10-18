@@ -1,0 +1,7 @@
+[0/2] Re-checking globbed directories...
+[1/2] cd /home/hurricane/private/code/Rut/build/tests && /usr/bin/python3.14 /home/hurricane/private/code/Rut/tests/test_sockmap_probe.py /home/hurricane/private/code/Rut/build/bench/bench_sockmap_probe
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 1.294s
+
+OK

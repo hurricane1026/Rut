@@ -1,5 +1,8 @@
 #include "rut/native_artifact.h"
 #include "rut/serve_loader.h"
+#if RUT_ENABLE_EBPF
+#include "rut/compiler/ebpf_plan.h"
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,13 +26,20 @@ bool write_all(const void* bytes, rut::u64 size) {
 }
 }  // namespace
 int main(int argc, char** argv) {
-    if (argc != 3 || strlen(argv[2]) != 1 || argv[2][0] < '0' || argv[2][0] > '3' ||
+    const bool kEbpfPlan = argc == 4 && strcmp(argv[3], "--ebpf-plan") == 0;
+    if ((argc != 3 && !kEbpfPlan) || strlen(argv[2]) != 1 || argv[2][0] < '0' || argv[2][0] > '3' ||
         isatty(STDOUT_FILENO)) {
-        fprintf(
-            stderr,
-            "Internal helper: rut-compile SOURCE OPT_LEVEL(0..3); binary output requires a pipe\n");
+        fprintf(stderr,
+                "Internal helper: rut-compile SOURCE OPT_LEVEL(0..3); [--ebpf-plan]; binary output "
+                "requires a pipe\n");
         return 2;
     }
+#if !RUT_ENABLE_EBPF
+    if (kEbpfPlan) {
+        fprintf(stderr, "eBPF plans require RUT_ENABLE_EBPF=ON\n");
+        return 2;
+    }
+#endif
     char directory[] = "/tmp/rut-compile-XXXXXX";
     if (!mkdtemp(directory)) {
         perror("rut-compile directory");
@@ -57,7 +67,19 @@ int main(int argc, char** argv) {
         char message[512];
         rut::format_load_error(error, message, sizeof(message));
         fprintf(stderr, "%s: %s\n", argv[1], message);
-    } else {
+    }
+#if RUT_ENABLE_EBPF
+    if (ok && kEbpfPlan) {
+        ok = rut::build_ebpf_plan(
+            program.rir.module,
+            program.config,
+            program.has_listener && program.listener.transport == rut::ListenerTransport::Tls,
+            program.ebpf_plan);
+        program.has_ebpf_plan = ok;
+        if (!ok) fprintf(stderr, "Failed to build verified eBPF body plan\n");
+    }
+#endif
+    if (ok) {
         ok = rut::write_native_program(program, artifact);
         if (!ok) fprintf(stderr, "Failed to emit native artifact\n");
     }

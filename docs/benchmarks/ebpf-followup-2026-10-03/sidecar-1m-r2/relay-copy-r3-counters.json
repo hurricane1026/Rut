@@ -1,0 +1,13 @@
+{
+  "accepts": 72,
+  "reads": 751070,
+  "writes": 587922,
+  "read_bytes": 34199801619,
+  "written_bytes": 34197212780,
+  "waits": 51782,
+  "events": 97972,
+  "setup_failures": 0,
+  "io_failures": 41,
+  "kernel_bytes": 0,
+  "retirement_failures": 0
+}

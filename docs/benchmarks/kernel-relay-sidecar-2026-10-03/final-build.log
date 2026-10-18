@@ -1,0 +1,4 @@
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/3] Building CXX object bench/CMakeFiles/bench_kernel_relay.dir/bench_kernel_relay.cc.o
+[2/3] Linking CXX executable bench/bench_kernel_relay

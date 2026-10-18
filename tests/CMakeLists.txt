@@ -490,6 +490,14 @@ set_tests_properties(test_proxy_benchmark_tools PROPERTIES LABELS "unit;benchmar
 
 add_test(NAME test_routing_corpus
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_routing_corpus.py)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME test_cross_machine_benchmark
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/cross_machine_benchmark/test_tools.py)
+    set_tests_properties(test_cross_machine_benchmark PROPERTIES
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/scripts/cross_machine_benchmark
+        LABELS "unit")
+endif()
 set_tests_properties(test_routing_corpus PROPERTIES LABELS "unit;routing" TIMEOUT 120)
 
 # Verify the shipped runtime does not import a C++ standard/ABI library.
@@ -3571,6 +3579,10 @@ if(RUT_ENABLE_JIT)
         target_link_options(test_native_program PRIVATE -Wl,-export_dynamic)
     endif()
     add_dependencies(test_native_program rut-compile)
+    add_test(NAME test_ebpf_compiler
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_ebpf_compiler.py
+            --server $<TARGET_FILE:rut> --enabled $<BOOL:${RUT_ENABLE_EBPF}>)
+    set_tests_properties(test_ebpf_compiler PROPERTIES LABELS "unit;jit" TIMEOUT 90)
     add_test(NAME test_native_program COMMAND test_native_program)
     set_tests_properties(test_native_program PROPERTIES LABELS "unit;jit")
 

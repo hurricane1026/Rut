@@ -1,0 +1,13 @@
+import "../modules/gateway/access.rut"
+
+chain ingress {
+    before maintenance(false) else 503
+    before requireHost(req.header("Host").or(""), "api.example.com") else 403
+    before requireHeader(req.header("X-Client-Version").or("")) else 400
+}
+
+listen :8080
+
+route GET "/api" use chain ingress { return 200 }
+// Explicit fallback: the runtime default must not admit unmatched traffic.
+route "/" { return 404 }

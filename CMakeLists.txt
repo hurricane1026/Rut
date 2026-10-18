@@ -26,6 +26,14 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
 option(RUT_ENABLE_IPO "Enable interprocedural optimization/LTO for Release builds" OFF)
 option(RUT_ENABLE_JIT "Build LLVM/Vectorscan JIT targets" ON)
+option(RUT_ENABLE_EBPF "Build experimental compiler eBPF body plans (no live offload)" OFF)
+if(RUT_ENABLE_EBPF AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT RUT_ENABLE_JIT))
+    message(FATAL_ERROR "RUT_ENABLE_EBPF requires Linux and RUT_ENABLE_JIT=ON")
+endif()
+add_library(rut_ebpf_settings INTERFACE)
+target_compile_definitions(rut_ebpf_settings INTERFACE
+    RUT_ENABLE_EBPF=$<BOOL:${RUT_ENABLE_EBPF}>)
+
 # WebSocket/Upgrade passthrough tunnel. ON by default; turn OFF for a minimal
 # build (e.g. a k8s mesh sidecar that never proxies WebSocket) to compile out the
 # 101 tunnel path entirely.

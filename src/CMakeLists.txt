@@ -332,7 +332,7 @@ if(RUT_ENABLE_JIT)
         "${PROJECT_SOURCE_DIR}/src/CMakeLists.txt")
     list(SORT _RUT_NATIVE_ABI_FILES)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_RUT_NATIVE_ABI_FILES})
-    set(_RUT_NATIVE_ABI_INPUT "${CMAKE_SYSTEM_PROCESSOR};${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_BUILD_TYPE};${CMAKE_CXX_FLAGS};${LLVM_PACKAGE_VERSION};${RUT_ENABLE_WEBSOCKET}")
+    set(_RUT_NATIVE_ABI_INPUT "${CMAKE_SYSTEM_PROCESSOR};${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${CMAKE_BUILD_TYPE};${CMAKE_CXX_FLAGS};${LLVM_PACKAGE_VERSION};${RUT_ENABLE_WEBSOCKET};${RUT_ENABLE_EBPF}")
     foreach(_RUT_NATIVE_ABI_FILE IN LISTS _RUT_NATIVE_ABI_FILES)
         file(SHA256 "${_RUT_NATIVE_ABI_FILE}" _RUT_NATIVE_ABI_HASH)
         string(APPEND _RUT_NATIVE_ABI_INPUT "${_RUT_NATIVE_ABI_HASH};")
@@ -419,12 +419,16 @@ if(RUT_ENABLE_JIT)
         rut_jit
     )
 
+    target_link_libraries(rut_compiler PUBLIC rut_ebpf_settings)
+    if(RUT_ENABLE_EBPF)
+        target_sources(rut_compiler PRIVATE compiler/ebpf_plan.cc)
+    endif()
     add_executable(rut-compile compile_main.cc)
     target_link_libraries(rut-compile rut_loader)
-    add_library(rut_native_loader STATIC native_program.cc)
+    add_library(rut_native_loader STATIC native_program.cc ebpf_plan_export.cc)
     target_include_directories(rut_native_loader PUBLIC ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_BINARY_DIR}/generated)
-    target_link_libraries(rut_native_loader PUBLIC rut_native_helpers ${CMAKE_DL_LIBS})
+    target_link_libraries(rut_native_loader PUBLIC rut_native_helpers rut_ebpf_settings ${CMAKE_DL_LIBS})
 
     add_library(rut_harness_runtime STATIC
         harness/connection_execution.cc

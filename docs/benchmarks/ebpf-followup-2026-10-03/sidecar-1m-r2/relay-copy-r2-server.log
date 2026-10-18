@@ -1,0 +1,2 @@
+READY mode=copy batch=65536 capacity=512 tcp_nodelay=1
+COUNTERS {"accepts":72,"reads":765920,"writes":602143,"read_bytes":34302190115,"written_bytes":34299863587,"waits":49837,"events":98327,"setup_failures":0,"io_failures":36,"kernel_bytes":0,"retirement_failures":0}

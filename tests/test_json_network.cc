@@ -10,10 +10,15 @@
 #include "rut/runtime/compile_to_config.h"
 #include "rut/runtime/hpack.h"
 #include "rut/runtime/http2_frame.h"
+#include "rut/runtime/json.h"
 #include "test.h"
 #include "test_helpers.h"
 #include <memory>
 #include <string>
+#include <utility>
+
+#include <openssl/hmac.h>
+#include <stdlib.h>
 
 using namespace rut;
 
@@ -588,4 +593,226 @@ route GET "/custom" {
 
 int main(int argc, char** argv) {
     return rut::test::run_all(argc, argv);
+}
+
+TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
+    const char* token =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ."
+        "AL_nmexgcwawKDK5uJ0RtfAxT1GguksdPuaahEACpHc";
+    const char* payload = "{\"sub\":\"1234567890\",\"name\":\"John Doe\",\"iat\":1516239022}";
+    SlicePool pool;
+    REQUIRE(pool.init(8));
+    SliceArena arena;
+    REQUIRE(arena.init(&pool));
+
+    auto decode = [&](const char* secret, const char* jwt = nullptr) {
+        if (jwt == nullptr) jwt = token;
+        u8 has = 0;
+        const char* out = nullptr;
+        u32 len = 0;
+        i64 number = 0;
+        rut_helper_json(nullptr,
+                        &arena,
+                        static_cast<u32>(json::Op::JwtDecode),
+                        jwt,
+                        static_cast<u32>(__builtin_strlen(jwt)),
+                        secret,
+                        static_cast<u32>(__builtin_strlen(secret)),
+                        nullptr,
+                        0,
+                        0,
+                        &has,
+                        &out,
+                        &len,
+                        &number);
+        return std::pair<bool, Str>{has != 0, Str{out, len}};
+    };
+
+    const auto ok = decode("01234567890123456789012345678901");
+    CHECK(ok.first);
+    CHECK(ok.second.eq({payload, static_cast<u32>(__builtin_strlen(payload))}));
+    CHECK_FALSE(decode("wrong-secret").first);
+    CHECK_FALSE(decode(std::string(32, 'y').c_str()).first);
+    CHECK_FALSE(decode("").first);
+
+    const char* hs384 =
+        "eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiJvayJ9."
+        "cZs_Wk2VoNrX8sTen4A9Yq6gOB4YtDtIxbe_uxxEgP6uvDdDJNJ1kNRtlF7Lbq0C";
+    const char* hs512 =
+        "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJvayJ9."
+        "p_rhc57EpVQ9_ZGxlTT895mw-_gpUswNyGkwXVkzD4zD0TctOZPa3wahaqakkp3-rteIrBsD3UiLrk36-2J8GA";
+    const std::string hs256_key(32, 'x');
+    const std::string hs384_key(48, 'x');
+    const std::string hs512_key(64, 'x');
+    CHECK(
+        decode(hs256_key.c_str(),
+               "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U")
+            .first);
+    CHECK(decode(hs384_key.c_str(), hs384).first);
+    CHECK(decode(hs512_key.c_str(), hs512).first);
+    CHECK(
+        decode(std::string(65, 'x').c_str(),
+               "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.mtYtHuqIBzRucu6RKwhPy5qdCUlENvY0xsz9zqTioKg")
+            .first);
+    CHECK(decode(std::string(129, 'x').c_str(),
+                 "eyJhbGciOiJIUzM4NCJ9.eyJzdWIiOiJvayJ9.JRV-"
+                 "gATamPa5fRjGEIMaLLqBGezuBB5nCsxYJFM1SiEpDUb17YaAUCajN55mCnSA")
+              .first);
+    CHECK(decode(std::string(129, 'x').c_str(),
+                 "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJvayJ9.akk8BrpagvgRV-0SJjwW2ASRv-"
+                 "ZvqJe9wRRTW3cbMjxKsQxDwIxj_UlSjGwoyJmqHyE9UxSq-50dIEKM8loUAA")
+              .first);
+    CHECK_FALSE(decode(std::string(31, 'x').c_str()).first);
+    CHECK_FALSE(decode(std::string(47, 'x').c_str(), hs384).first);
+    CHECK_FALSE(decode(std::string(63, 'x').c_str(), hs512).first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsInh4eHh4eHh4eHh4eHh4eHh4IjoxfQ.e30.AA")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), "eyJhbGciOiJYWFhYWFhYWFhYWFhYWFhYWCJ9.eyJzdWIiOiJvayJ9.AA")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsImFsZyI6IkhTMjU2In0.eyJzdWIiOiJvayJ9.AA")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsImFsZyI6IkhTNTEyIn0.eyJzdWIiOiJvayJ9.AA")
+            .first);
+    CHECK_FALSE(decode(hs256_key.c_str(), "eyJhbGciOiJIUzI1NiIsImNyaXQiOlsiZXhwIl19.e30.AA").first);
+    CHECK_FALSE(decode(hs256_key.c_str(), "eyJjcml0IjpbImV4cCJdLCJhbGciOiJIUzI1NiJ9.e30.AA").first);
+    CHECK(decode(std::string(32, 'x').c_str(),
+                 "eyJodHRwczovL2V4YW1wbGUuY29tL3ZlcnktbG9uZy1wdWJsaWMtbmFtZSI6IngiLCJhbGciOiJIUzI1N"
+                 "iJ9.eyJzdWIiOiJvayJ9.GFhV-6WnIYxQ9t8-jqQFJ_9okmYFm8xj2_1F18Nchtk")
+              .first);
+    CHECK(decode(std::string(32, 'x').c_str(),
+                 "eyJhbGciOiJIUzI1NiIsImh0dHBzOi8vZXhhbXBsZS5jb20vdmVyeS1sb25nLXB1YmxpYy1uYW1lIjoie"
+                 "CJ9.eyJzdWIiOiJvayJ9.wDDSJKjj8zlcKW0-S4XMpfl10_xTTxWVWtCfZRaaO_I")
+              .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(),
+               "eyJhbGciOiJIUzI1NiJ9=.eyJzdWIiOiJvayJ9.GFhV-6WnIYxQ9t8-jqQFJ_9okmYFm8xj2_1F18Nchtk")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(),
+               "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9=.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(),
+               "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U=")
+            .first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(),
+               "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvayJ9.IfR5W5USO_w4xSkuH-3bkLY-rSj9vIYL4V9jUdcNv4U!")
+            .first);
+    auto b64url = [](const std::string& input) {
+        static constexpr char alphabet[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        std::string out;
+        for (size_t i = 0; i < input.size(); i += 3) {
+            const u32 left = static_cast<unsigned char>(input[i]);
+            const u32 middle = i + 1 < input.size() ? static_cast<unsigned char>(input[i + 1]) : 0;
+            const u32 right = i + 2 < input.size() ? static_cast<unsigned char>(input[i + 2]) : 0;
+            out += alphabet[left >> 2];
+            out += alphabet[((left & 3) << 4) | (middle >> 4)];
+            if (i + 1 < input.size()) out += alphabet[((middle & 15) << 2) | (right >> 6)];
+            if (i + 2 < input.size()) out += alphabet[right & 63];
+        }
+        return out;
+    };
+    auto sign_header = [&](const std::string& header) {
+        const std::string encoded_header = b64url(header);
+        const std::string signing_input = encoded_header + ".e30";
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int digest_len = 0;
+        HMAC(EVP_sha256(),
+             hs256_key.data(),
+             static_cast<int>(hs256_key.size()),
+             reinterpret_cast<const unsigned char*>(signing_input.data()),
+             signing_input.size(),
+             digest,
+             &digest_len);
+        return signing_input + "." +
+               b64url(std::string(reinterpret_cast<const char*>(digest), digest_len));
+    };
+    auto signed_header = [&](size_t target_size) {
+        std::string header = R"({"alg":"HS256","x":""})";
+        header.insert(header.size() - 2, target_size - header.size(), 'x');
+        return sign_header(header);
+    };
+    CHECK(decode(hs256_key.c_str(), signed_header(1024).c_str()).first);
+    CHECK_FALSE(decode(hs256_key.c_str(), signed_header(1025).c_str()).first);
+    CHECK(decode(hs256_key.c_str(), sign_header(R"({"alg":"HS256","b64":true})").c_str()).first);
+    CHECK_FALSE(
+        decode(hs256_key.c_str(), sign_header(R"({"alg":"HS256","b64":false})").c_str()).first);
+    CHECK_FALSE(decode(hs256_key.c_str(),
+                       sign_header(R"({"alg":"HS256","b64":false,"crit":["b64"]})").c_str())
+                    .first);
+    std::string flood = R"({"alg":"HS256")";
+    for (u32 i = 0; i < 700; ++i) flood += ",\"x" + std::to_string(i) + "\":0";
+    flood += '}';
+    CHECK(flood.size() > 5000);
+    const std::string flood_token = sign_header(flood);
+    CHECK_FALSE(decode(hs256_key.c_str(), flood_token.c_str()).first);
+    std::string oversized = R"({"alg":"HS256","x":")" + std::string(1010, 'x') + "\"}";
+    CHECK(oversized.size() > 1024);
+    const std::string oversized_token = b64url(oversized) + ".e30.AA";
+    CHECK_FALSE(decode(hs256_key.c_str(), oversized_token.c_str()).first);
+
+    arena.destroy();
+    pool.destroy();
+}
+
+TEST(json_network, jit_jwt_decode_returns_claims_subject) {
+    REQUIRE_EQ(setenv("RUT_TEST_JWT_SECRET", "01234567890123456789012345678901", 1), 0);
+    JsonProgram program;
+    REQUIRE(program.init(R"rut(
+route POST "/jwt" {
+    guard let token = req.header("Authorization") else { return 401 }
+    guard let claims = jwtDecode(token, env("RUT_TEST_JWT_SECRET")) else { return 401 }
+    guard let sub_json = json.get(claims, "/sub") else { return 400 }
+    guard let sub = json.string(sub_json) else { return 400 }
+    return response(200, body: sub)
+}
+)rut"));
+    unsetenv("RUT_TEST_JWT_SECRET");
+    const char* token =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ."
+        "AL_nmexgcwawKDK5uJ0RtfAxT1GguksdPuaahEACpHc";
+    auto loop = std::make_unique<SmallLoop>();
+    loop->setup();
+    SlicePool pool;
+    REQUIRE(pool.init(32));
+    auto* conn = loop->alloc_conn();
+    REQUIRE(conn);
+    conn->json_arena.backend.pool = &pool;
+
+    auto run = [&](const char* auth, u32 expected_status) {
+        const std::string request = std::string(
+                                        "POST /jwt HTTP/1.1\r\nHost: test\r\n"
+                                        "Authorization: ") +
+                                    auth + "\r\nContent-Length: 0\r\n\r\n";
+        conn->recv_buf.reset();
+        conn->send_buf.reset();
+        CHECK_EQ(conn->recv_buf.write(reinterpret_cast<const u8*>(request.data()), request.size()),
+                 request.size());
+        capture_request_metadata(*conn);
+        conn->request_config = program.config.get();
+        auto* ctx = conn->reset_jit_ctx();
+        auto outcome = invoke_jit_handler(
+            program.handler(), conn, *ctx, conn->recv_buf.data(), conn->recv_buf.len(), nullptr);
+        CHECK_EQ(outcome.status_code, expected_status);
+        handle_jit_outcome(loop.get(), *conn, outcome, program.handler(), true);
+        return std::string(reinterpret_cast<const char*>(conn->send_buf.data()),
+                           conn->send_buf.len());
+    };
+
+    const std::string good = run(token, 200);
+    CHECK(good.find("HTTP/1.1 200") == 0);
+    CHECK(good.ends_with("1234567890"));
+    const std::string bad = run("not-a-jwt", 401);
+    CHECK(bad.find("HTTP/1.1 401") == 0);
+
+    loop->free_conn(*conn);
+    pool.destroy();
 }
