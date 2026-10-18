@@ -222,6 +222,9 @@ struct EchoServer {
                                       nv("grpc-message", "denied")};
                 return nghttp2_submit_response(session, s->id, error, 4, nullptr);
             }
+            if (mode == 10)
+                return nghttp2_submit_rst_stream(
+                    session, NGHTTP2_FLAG_NONE, s->id, NGHTTP2_REFUSED_STREAM);
             if (mode == 3) {
                 static char large_value[12000];
                 static bool initialized = false;
@@ -3075,6 +3078,204 @@ TEST(grpc_proxy, grpc_retry_web_text_epoll) {
 }
 TEST(grpc_proxy, grpc_retry_web_text_iouring) {
     grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 1, true, true);
+}
+
+TEST(grpc_proxy, grpc_retry_single_endpoint_refused_then_recovers) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = 10;
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd)) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    cfg.upstreams[0].http2 = true;
+    cfg.upstreams[0].grpc_retry = {2, 1024, 1u << 14, 20};
+    REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &cfg;
+    REQUIRE(shard->spawn(-1));
+    {
+        Client client;
+        CHECK(client.init(get_port(lfd)));
+        if (client.fd >= 0) {
+            CHECK_EQ(client.request(0, 16, true), 1);
+            CHECK(client.until(0, true));
+            CHECK(client.rpcs[0].ok);
+            CHECK_EQ(server->requests.load(), 2u);
+            CHECK_EQ(server->accepts.load(), 1u);
+        }
+    }
+    shard->stop();
+    shard->join();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[0], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 1u);
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+TEST(grpc_proxy, grpc_retry_deadline_expires_during_backoff) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = 1;
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd)) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    cfg.upstreams[0].http2 = true;
+    cfg.upstreams[0].grpc_retry = {2, 1024, 1u << 7, 500};
+    REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &cfg;
+    REQUIRE(shard->spawn(-1));
+    {
+        Client client;
+        CHECK(client.init(get_port(lfd)));
+        if (client.fd >= 0) {
+            const u64 started = monotonic_us();
+            CHECK_EQ(client.request(0, 16, true, "50m"), 1);
+            CHECK(client.until(0, true));
+            CHECK_EQ(client.rpcs[0].status, 4u);
+            CHECK_GE(monotonic_us() - started, 20000u);
+            CHECK_EQ(server->requests.load(), 1u);
+        }
+    }
+    shard->stop();
+    shard->join();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[4], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 1u);
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+TEST(grpc_proxy, grpc_retry_cancel_during_backoff_releases_logical_rpc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = 1;
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd)) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    cfg.upstreams[0].http2 = true;
+    cfg.upstreams[0].grpc_retry = {2, 1024, 1u << 7, 250};
+    REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &cfg;
+    REQUIRE(shard->spawn(-1));
+    {
+        Client client;
+        CHECK(client.init(get_port(lfd)));
+        if (client.fd >= 0) {
+            CHECK_EQ(client.request(0, 1024, false), 1);
+            const u64 first_attempt_deadline = monotonic_us() + 1000000;
+            while (!server->requests.load() && monotonic_us() < first_attempt_deadline)
+                usleep(1000);
+            CHECK_EQ(server->requests.load(), 1u);
+            usleep(50000);  // Allow the trailers-only failure to enter backoff.
+            CHECK_EQ(
+                nghttp2_submit_rst_stream(client.session, NGHTTP2_FLAG_NONE, 1, NGHTTP2_CANCEL), 0);
+            CHECK(flush_session(client.session, client.fd, client.ssl));
+            usleep(350000);
+            CHECK_EQ(server->requests.load(), 1u);
+            CHECK_EQ(client.request(1, 16, true), 3);
+            CHECK(client.until(1, true));
+            CHECK(client.rpcs[1].ok);
+            CHECK_EQ(server->requests.load(), 2u);
+        }
+    }
+    shard->stop();
+    shard->join();
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[0], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 2u);
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+TEST(grpc_proxy, grpc_retry_uses_admission_config_after_reload) {
+    auto original_server = std::make_unique<EchoServer>();
+    auto reloaded_server = std::make_unique<EchoServer>();
+    REQUIRE(original_server->start());
+    REQUIRE(reloaded_server->start());
+    original_server->reply_mode = 1;
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd)) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    RouteConfig original_cfg;
+    REQUIRE(original_cfg.add_upstream("grpc", 0x7f000001, get_port(original_server->listen_fd)));
+    original_cfg.upstreams[0].http2 = true;
+    original_cfg.upstreams[0].grpc_retry = {2, 1024, 1u << 7, 250};
+    REQUIRE(original_cfg.add_proxy("/test.Echo/", 'P', 0));
+    RouteConfig reloaded_cfg;
+    REQUIRE(reloaded_cfg.add_upstream("grpc", 0x7f000001, get_port(reloaded_server->listen_fd)));
+    reloaded_cfg.upstreams[0].http2 = true;
+    reloaded_cfg.upstreams[0].grpc_retry = {2, 1024, 1u << 7, 250};
+    REQUIRE(reloaded_cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &original_cfg;
+    REQUIRE(shard->spawn(-1));
+    {
+        Client client;
+        CHECK(client.init(get_port(lfd)));
+        if (client.fd >= 0) {
+            CHECK_EQ(client.request(0, 16, true), 1);
+            const u64 first_attempt_deadline = monotonic_us() + 1000000;
+            while (!original_server->requests.load() && monotonic_us() < first_attempt_deadline)
+                usleep(1000);
+            CHECK_EQ(original_server->requests.load(), 1u);
+            CHECK(shard->reload_config(&reloaded_cfg, 1));
+            CHECK(client.until(0, true));
+            CHECK(client.rpcs[0].ok);
+            CHECK_EQ(original_server->requests.load(), 2u);
+            CHECK_EQ(reloaded_server->requests.load(), 0u);
+            CHECK_EQ(client.request(1, 16, true), 3);
+            CHECK(client.until(1, true));
+            CHECK(client.rpcs[1].ok);
+            CHECK_EQ(reloaded_server->requests.load(), 1u);
+        }
+    }
+    shard->stop();
+    shard->join();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 2u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[0], 2u);
+    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 2u);
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
 }
 
 TEST(grpc_proxy, streaming_and_pooling_epoll) {
