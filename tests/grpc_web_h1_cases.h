@@ -456,6 +456,7 @@ inline bool grpc_web_test_h1_exchange(u16 port,
         }
     }
     u8 buf[8192];
+    bool tls_eof = false;
     for (;;) {
         ssize_t n = 0;
         if (!tls) {
@@ -481,7 +482,10 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                                        tls_retry_count,
                                        [&] { return SSL_read(ssl, buf, sizeof(buf)); });
             if (!read_ok) {
-                if (ssl_error == SSL_ERROR_ZERO_RETURN) break;
+                if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+                    tls_eof = true;
+                    break;
+                }
                 if ((ssl_error == SSL_ERROR_SSL &&
 #ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
                      ERR_GET_REASON(openssl_error) == SSL_R_UNEXPECTED_EOF_WHILE_READING
@@ -493,11 +497,10 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                     const auto framing =
                         grpc_web_test_response_framing(response.data(), response.size());
                     if (framing.headers_complete && framing.valid && framing.web &&
-                        !framing.has_content_length && response.size() >= framing.body_offset &&
-                        grpc_web_test_complete_envelope(response.data() + framing.body_offset,
-                                                        response.size() - framing.body_offset,
-                                                        framing.text))
+                        !framing.has_content_length) {
+                        tls_eof = true;
                         break;
+                    }
                 }
                 return fail("read", error_number, result, ssl_error, openssl_error);
             }
@@ -524,6 +527,16 @@ inline bool grpc_web_test_h1_exchange(u16 port,
         }
     }
     const auto final_framing = grpc_web_test_response_framing(response.data(), response.size());
+    if (tls && tls_eof) {
+        if (!final_framing.headers_complete || !final_framing.valid)
+            return fail("response_truncated", 0, static_cast<int>(response.size()), 0, 0);
+        if (final_framing.web && !final_framing.has_content_length &&
+            (response.size() < final_framing.body_offset ||
+             !grpc_web_test_complete_envelope(response.data() + final_framing.body_offset,
+                                              response.size() - final_framing.body_offset,
+                                              final_framing.text)))
+            return fail("response_truncated", 0, static_cast<int>(response.size()), 0, 0);
+    }
     if (final_framing.headers_complete && final_framing.valid && final_framing.has_content_length &&
         response.size() - final_framing.body_offset != final_framing.content_length)
         return fail("response_truncated", 0, static_cast<int>(response.size()), 0, 0);
@@ -542,6 +555,7 @@ struct GrpcWebTlsGateServer {
     std::atomic<bool> client_hello_waiting{false};
     std::atomic<bool> served{false};
     bool truncate_response = false;
+    bool clean_close_truncated_response = false;
     bool started = false;
 
     static void* run(void* ptr) {
@@ -586,12 +600,18 @@ struct GrpcWebTlsGateServer {
                                               0,   16,  'g', 'r', 'p', 'c',  '-',  's',  't',
                                               'a', 't', 'u', 's', ':', ' ',  '0',  '\r', '\n'};
                 char headers[160];
-                const int header_len = snprintf(headers,
-                                                sizeof(headers),
-                                                "HTTP/1.1 200 OK\r\nConnection: close\r\n"
-                                                "Content-Type: application/grpc-web\r\n"
-                                                "Content-Length: %zu\r\n\r\n",
-                                                sizeof(body) + (self->truncate_response ? 7 : 0));
+                const int header_len =
+                    self->clean_close_truncated_response
+                        ? snprintf(headers,
+                                   sizeof(headers),
+                                   "HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                                   "Content-Type: application/grpc-web\r\n\r\n")
+                        : snprintf(headers,
+                                   sizeof(headers),
+                                   "HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                                   "Content-Type: application/grpc-web\r\n"
+                                   "Content-Length: %zu\r\n\r\n",
+                                   sizeof(body) + (self->truncate_response ? 7 : 0));
                 bool ok = header_len > 0 && static_cast<size_t>(header_len) < sizeof(headers);
                 for (size_t offset = 0; ok && offset < static_cast<size_t>(header_len);) {
                     const int n = SSL_write(ssl, headers + offset, header_len - offset);
@@ -610,7 +630,8 @@ struct GrpcWebTlsGateServer {
                         offset += static_cast<size_t>(n);
                 }
                 self->served.store(ok, std::memory_order_release);
-                if (!self->truncate_response) SSL_shutdown(ssl);
+                if (!self->truncate_response || self->clean_close_truncated_response)
+                    SSL_shutdown(ssl);
             }
         }
         if (ssl) SSL_free(ssl);
@@ -1466,6 +1487,16 @@ TEST(grpc_proxy, h1_binary_tls_handshake_retries_eintr) {
 TEST(grpc_proxy, h1_binary_tls_truncated_content_length_fails) {
     GrpcWebTlsGateServer server;
     server.truncate_response = true;
+    REQUIRE(server.start());
+    const std::vector<u8> body{0, 0, 0, 0, 1, 0};
+    std::vector<u8> response;
+    CHECK(!grpc_web_test_h1_exchange(server.port, false, false, body, response, true));
+    CHECK(server.served.load(std::memory_order_acquire));
+}
+TEST(grpc_proxy, h1_binary_tls_clean_close_missing_terminal_trailer_fails) {
+    GrpcWebTlsGateServer server;
+    server.truncate_response = true;
+    server.clean_close_truncated_response = true;
     REQUIRE(server.start());
     const std::vector<u8> body{0, 0, 0, 0, 1, 0};
     std::vector<u8> response;
