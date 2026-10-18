@@ -1434,6 +1434,37 @@ status metrics are recorded once. Upstream connection failures map to
 UNAVAILABLE; expired deadlines map to DEADLINE_EXCEEDED. Configuration epochs
 remain pinned by active/pooled sessions until teardown.
 
+Remaining `grpc-timeout` values are rounded down when encoded in a coarser
+unit, so the forwarded budget never exceeds the proxy's remaining deadline and
+may expire earlier by less than one selected unit. Retries are opt-in on
+`.http2` upstreams using this accepted form:
+
+```swift
+upstream greeter {
+    host: "127.0.0.1"
+    port: 50051
+    protocol: .http2
+    grpc_retry: {
+        max_attempts: 3
+        max_request_bytes: 1048576
+        statuses: [14, 8]
+        backoff_ms: 100
+    }
+}
+```
+
+All four fields are required when `grpc_retry` is present. `max_attempts` is
+the total number of attempts including the first (2 or 3);
+`max_request_bytes` is 1 through 1,048,576 retained native gRPC body bytes,
+including each message's five-byte envelope. For grpc-web text requests, text
+decoding happens before these bytes are counted. Metadata is excluded from this
+limit and is retained separately under its own snapshot bounds. `statuses` is
+a nonempty list of distinct gRPC status codes 1 through 16, and `backoff_ms` is
+0 through 60,000. Omission disables retries. Replay requires the complete
+request body to fit the configured byte limit, a separately retained metadata
+snapshot, no committed response, and enough time for the backoff before the
+original deadline.
+
 Optional `max_request_message_bytes` and `max_response_message_bytes` upstream
 fields bound the wire payload of each message independently. They are positive
 32-bit values and require `.http2`; omission disables native gRPC envelope

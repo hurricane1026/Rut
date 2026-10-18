@@ -205,6 +205,9 @@ struct GrpcProxyState {
     bool preface_sent;
     bool session_failure_recorded;
     u8 control[4096];
+    u8 header_continuation[GrpcExchange::kRequestHeadersSlack];
+    u32 header_continuation_len;
+    bool header_continuation_sending;
 
     void init() {
         client_tls = {};
@@ -217,6 +220,8 @@ struct GrpcProxyState {
         connected_at_us = idle_since_us = timer_deadline_us = last_ping_us = keepalive_due_us = 0;
         upstream = connecting = busy = c5_exhausted = preface_sent = session_failure_recorded =
             false;
+        header_continuation_len = 0;
+        header_continuation_sending = false;
     }
 };
 }  // namespace rut

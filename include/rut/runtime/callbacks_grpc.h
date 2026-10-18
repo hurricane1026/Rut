@@ -1033,6 +1033,8 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
         }
         conn.h2->grpc.tls_verified = true;
     }
+    auto& g = conn.h2->grpc;
+    const bool continuation_send = g.header_continuation_sending;
     conn.send_progress += static_cast<u32>(ev.result);
     if (conn.send_progress < conn.send_buf.len()) {
         if (!loop->submit_send(conn,
@@ -1044,6 +1046,21 @@ void grpc_on_upstream_sent(void* lp, Connection& conn, IoEvent ev) {
     conn.send_progress = 0;
     conn.send_buf.reset();
     conn.on_send = nullptr;
+    if (!continuation_send && g.header_continuation_len) {
+        const u32 len = g.header_continuation_len;
+        if (!conn.send_buf.write(g.header_continuation, len)) {
+            loop->close_conn(conn);
+            return;
+        }
+        conn.send_buf.commit(len);
+        g.header_continuation_len = 0;
+        g.header_continuation_sending = true;
+        conn.on_send = &grpc_on_upstream_sent<Loop>;
+        if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len()))
+            loop->close_conn(conn);
+        return;
+    }
+    if (continuation_send) g.header_continuation_sending = false;
     grpc_on_upstream_data<Loop>(lp, conn, {conn.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
@@ -1073,9 +1090,16 @@ inline u32 grpc_retry_timeout_value(char* out, u64 remaining_us) {
 
 enum class GrpcRequestHeaderBuild : u8 { Ready, Expired, NoSpace };
 
-inline GrpcRequestHeaderBuild grpc_build_request_headers_for_send(
-    const GrpcExchange& x, u64 now, u8* out, u32 cap, u32& written) {
+inline GrpcRequestHeaderBuild grpc_build_request_headers_for_send(const GrpcExchange& x,
+                                                                  u64 now,
+                                                                  u8* out,
+                                                                  u32 cap,
+                                                                  u32& written,
+                                                                  u8* continuation,
+                                                                  u32 continuation_cap,
+                                                                  u32& continuation_len) {
     written = 0;
+    continuation_len = 0;
     if (x.request_headers_len < kFrameHeaderSize || x.request_headers_len > GrpcExchange::kHeaders)
         return GrpcRequestHeaderBuild::NoSpace;
     if (!x.timeout_present) {
@@ -1103,7 +1127,9 @@ inline GrpcRequestHeaderBuild grpc_build_request_headers_for_send(
 
     const bool append_to_headers = headers.length + field_len <= kDefaultMaxFrameSize;
     const u32 extra = field_len + (append_to_headers ? 0 : kFrameHeaderSize);
-    if (x.request_headers_len > cap || extra > cap - x.request_headers_len)
+    if (x.request_headers_len > cap) return GrpcRequestHeaderBuild::NoSpace;
+    const bool split_continuation = !append_to_headers && extra > cap - x.request_headers_len;
+    if (split_continuation && kFrameHeaderSize + field_len > continuation_cap)
         return GrpcRequestHeaderBuild::NoSpace;
     __builtin_memcpy(out, x.request_headers, x.request_headers_len);
     if (append_to_headers) {
@@ -1116,15 +1142,35 @@ inline GrpcRequestHeaderBuild grpc_build_request_headers_for_send(
 
     headers.flags &= static_cast<u8>(~http2_flag::kEndHeaders);
     write_frame_header(out, headers);
-    Http2FrameHeader continuation{};
-    continuation.length = field_len;
-    continuation.stream_id = headers.stream_id;
-    continuation.type = static_cast<u8>(Http2FrameType::Continuation);
-    continuation.flags = http2_flag::kEndHeaders;
-    write_frame_header(out + x.request_headers_len, continuation);
-    __builtin_memcpy(out + x.request_headers_len + kFrameHeaderSize, field, field_len);
-    written = x.request_headers_len + kFrameHeaderSize + field_len;
+    Http2FrameHeader continuation_header{};
+    continuation_header.length = field_len;
+    continuation_header.stream_id = headers.stream_id;
+    continuation_header.type = static_cast<u8>(Http2FrameType::Continuation);
+    continuation_header.flags = http2_flag::kEndHeaders;
+    if (split_continuation) {
+        write_frame_header(continuation, continuation_header);
+        __builtin_memcpy(continuation + kFrameHeaderSize, field, field_len);
+        continuation_len = kFrameHeaderSize + field_len;
+        written = x.request_headers_len;
+    } else {
+        write_frame_header(out + x.request_headers_len, continuation_header);
+        __builtin_memcpy(out + x.request_headers_len + kFrameHeaderSize, field, field_len);
+        written = x.request_headers_len + extra;
+    }
     return GrpcRequestHeaderBuild::Ready;
+}
+
+inline GrpcRequestHeaderBuild grpc_build_request_headers_for_send(
+    const GrpcExchange& x, u64 now, u8* out, u32 cap, u32& written) {
+    u8 continuation[GrpcExchange::kRequestHeadersSlack];
+    u32 continuation_len = 0;
+    const auto result = grpc_build_request_headers_for_send(
+        x, now, out, cap, written, continuation, sizeof(continuation), continuation_len);
+    if (continuation_len) {
+        written = 0;
+        return GrpcRequestHeaderBuild::NoSpace;
+    }
+    return result;
 }
 
 template <typename Loop>
@@ -1190,8 +1236,15 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 if (!h.peer_settings_seen || (h.peer_settings.has_max_concurrent_streams &&
                                               opened >= h.peer_settings.max_concurrent_streams))
                     continue;
-                const auto build = grpc_build_request_headers_for_send(
-                    *x, send_now, out, conn.send_buf.write_avail(), n);
+                const auto build =
+                    grpc_build_request_headers_for_send(*x,
+                                                        send_now,
+                                                        out,
+                                                        conn.send_buf.write_avail(),
+                                                        n,
+                                                        g.header_continuation,
+                                                        sizeof(g.header_continuation),
+                                                        g.header_continuation_len);
                 if (build == GrpcRequestHeaderBuild::Expired) {
                     x->failure = 4;
                     x->response_end = true;
@@ -1231,7 +1284,10 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 } else
                     n = http2_write_data(out, x->upstream_stream, nullptr, 0, true);
                 x->request_end_sent = true;
-                if (x->replaying_attempt) x->replaying_attempt = false;
+                if (x->replaying_attempt) {
+                    x->replaying_attempt = false;
+                    if (x->retry_attempts >= x->retry_policy.max_attempts) grpc_disable_retry(*x);
+                }
                 stream->state = stream->state == Http2StreamState::HalfClosedRemote
                                     ? Http2StreamState::Closed
                                     : Http2StreamState::HalfClosedLocal;
@@ -1465,6 +1521,11 @@ void grpc_connected(void* lp, Connection& conn, IoEvent ev) {
         conn.fd = fd;
     } else
         conn.upstream_fd = -1;
+    // A C5 fallback may have tried more endpoints than the one recorded when
+    // this exchange was first bound. Those endpoints count as tried for any
+    // later status-triggered retry too.
+    for (auto* x : conn.h2->grpc.streams)
+        if (x) x->retry_tried_mask |= conn.h2->grpc.connect_tried_mask;
     const auto& target = conn.request_config->upstreams[conn.upstream_idx];
     if (target.tls.enabled) {
         auto& context = conn.h2->grpc.client_tls;
@@ -1817,6 +1878,13 @@ bool grpc_bind_retry_attempt(Loop* loop, GrpcExchange& x, u64 now) {
             }
             if (!submitted) {
                 g.c5_exhausted = true;
+                // close_conn may synchronously run grpc_connection_closed and
+                // kick the downstream timer. Keep this caller as the sole
+                // owner of terminal completion after binding has failed.
+                if (auto* failed_stream = up->h2->find_stream(x.upstream_stream))
+                    failed_stream->state = Http2StreamState::Closed;
+                grpc_detach(*up->h2, &x);
+                x.upstream = nullptr;
                 loop->close_conn(*up);
                 return false;
             }

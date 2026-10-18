@@ -481,7 +481,10 @@ formats the remaining duration into upstream HEADERS only when they are sent,
 including after connection setup or retry. If the field is absent, it stays
 absent upstream. An expired deadline before send returns DEADLINE_EXCEEDED
 (status 4) without sending request HEADERS. Timers use the existing precise
-mechanism (millisecond granularity). If a retryable response arrives but its
+mechanism (millisecond granularity). Timeout values are rounded down when
+encoded in a coarser gRPC unit, so the forwarded budget never exceeds the
+remaining proxy deadline and can expire slightly earlier by less than one
+selected unit. If a retryable response arrives but its
 configured backoff cannot fit strictly before the original deadline, the RPC
 ends with DEADLINE_EXCEEDED (status 4), without binding another endpoint or
 forwarding the backend status; completion is counted once. Failures use gRPC
@@ -492,7 +495,36 @@ to three endpoints total (or the address count when smaller). This preserves
 the same session, queued exchanges, deadlines, and per-RPC accounting; no RPC
 is replayed. TLS-configured upstreams can use this TCP-stage failover, but TLS
 setup, handshake, certificate-identity, and ALPN failures after TCP connects
-end the session without trying another endpoint. See [the complete example](../examples/grpc.rut).
+end the session without trying another endpoint.
+
+Retries are opt-in on `.http2` upstreams:
+
+```swift
+upstream greeter {
+    host: "127.0.0.1"
+    port: 50051
+    protocol: .http2
+    grpc_retry: {
+        max_attempts: 3
+        max_request_bytes: 1048576
+        statuses: [14, 8]
+        backoff_ms: 100
+    }
+}
+```
+
+All four fields are required when `grpc_retry` is present. `max_attempts` is
+the total number of attempts, including the first, and is 2 or 3;
+`max_request_bytes` is 1 through 1,048,576 retained native gRPC body bytes,
+including each message's five-byte envelope. For grpc-web text requests, text
+decoding happens before these bytes are counted. Metadata is excluded from this
+limit and is retained separately under its own snapshot bounds. `statuses` is
+a nonempty list of distinct gRPC codes 1 through 16 (OK is not retryable), and
+`backoff_ms` is 0 through 60,000. Omission disables retries. Replay requires the
+complete request body to fit the configured byte limit, a separately retained
+metadata snapshot, no committed response, and enough time for the backoff
+before the original deadline.
+See [the complete example](../examples/grpc.rut).
 
 Optional per-message wire limits are configured on an HTTP/2 upstream:
 
