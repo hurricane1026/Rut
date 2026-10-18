@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include <openssl/err.h>
+
 namespace {
 
 inline void grpc_web_test_init_raw_request(
@@ -112,30 +114,83 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                                       const std::vector<u8>* expected_body = nullptr,
                                       const char* extra_headers = "") {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+    if (fd < 0) {
+        fprintf(stderr,
+                "grpc_web_test_h1_exchange failed stage=socket errno=%d rc=%d ssl_error=%d "
+                "openssl_error=%lu wrote=0 read=0\n",
+                errno,
+                fd,
+                0,
+                0ul);
+        return false;
+    }
+    SSL_CTX* tls_context = nullptr;
+    SSL* ssl = nullptr;
+    size_t bytes_written = 0;
+    size_t bytes_read = 0;
+    auto fail = [&](const char* stage,
+                    int error_number,
+                    int result,
+                    int ssl_error,
+                    unsigned long openssl_error) {
+        fprintf(stderr,
+                "grpc_web_test_h1_exchange failed stage=%s errno=%d rc=%d ssl_error=%d "
+                "openssl_error=%lu wrote=%zu read=%zu\n",
+                stage,
+                error_number,
+                result,
+                ssl_error,
+                openssl_error,
+                bytes_written,
+                bytes_read);
+        if (ssl) SSL_free(ssl);
+        if (tls_context) SSL_CTX_free(tls_context);
+        close(fd);
+        return false;
+    };
     set_socket_timeouts(fd, 5);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
+    errno = 0;
     if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        close(fd);
-        return false;
+        const int error_number = errno;
+        return fail("connect", error_number, -1, 0, 0);
     }
-    SSL_CTX* tls_context = tls ? SSL_CTX_new(TLS_client_method()) : nullptr;
-    SSL* ssl = nullptr;
     if (tls) {
+        ERR_clear_error();
+        errno = 0;
+        tls_context = SSL_CTX_new(TLS_client_method());
         if (!tls_context) {
-            close(fd);
-            return false;
+            const int error_number = errno;
+            const unsigned long openssl_error = ERR_peek_error();
+            return fail("ctx", error_number, 0, 0, openssl_error);
         }
         SSL_CTX_set_verify(tls_context, SSL_VERIFY_NONE, nullptr);
+        ERR_clear_error();
+        errno = 0;
         ssl = SSL_new(tls_context);
-        if (!ssl || !SSL_set_fd(ssl, fd) || SSL_connect(ssl) != 1) {
-            if (ssl) SSL_free(ssl);
-            SSL_CTX_free(tls_context);
-            close(fd);
-            return false;
+        if (!ssl) {
+            const int error_number = errno;
+            const unsigned long openssl_error = ERR_peek_error();
+            return fail("new", error_number, 0, 0, openssl_error);
+        }
+        ERR_clear_error();
+        errno = 0;
+        if (!SSL_set_fd(ssl, fd)) {
+            const int error_number = errno;
+            const unsigned long openssl_error = ERR_peek_error();
+            return fail("setfd", error_number, 0, 0, openssl_error);
+        }
+        ERR_clear_error();
+        errno = 0;
+        const int connect_result = SSL_connect(ssl);
+        if (connect_result != 1) {
+            const int error_number = errno;
+            const int ssl_error = SSL_get_error(ssl, connect_result);
+            const unsigned long openssl_error = ERR_peek_error();
+            return fail("SSL_connect", error_number, connect_result, ssl_error, openssl_error);
         }
     }
 
@@ -155,8 +210,7 @@ inline bool grpc_web_test_h1_exchange(u16 port,
                  content_type,
                  chunked ? "Transfer-Encoding: chunked\r\n" : "Content-Length: 0\r\n");
     if (header_len <= 0 || static_cast<size_t>(header_len) >= sizeof(header)) {
-        close(fd);
-        return false;
+        return fail("request_format", 0, header_len, 0, 0);
     }
     wire.insert(wire.end(), header, header + header_len);
     if (!chunked) {
@@ -165,8 +219,7 @@ inline bool grpc_web_test_h1_exchange(u16 port,
         const auto found = std::search(
             wire.begin(), wire.end(), kPlaceholder, kPlaceholder + sizeof(kPlaceholder) - 1);
         if (found == wire.end()) {
-            close(fd);
-            return false;
+            return fail("request_format", 0, -1, 0, 0);
         }
         const size_t offset = static_cast<size_t>(found - wire.begin());
         char actual[48];
@@ -190,54 +243,65 @@ inline bool grpc_web_test_h1_exchange(u16 port,
         static constexpr char kEnd[] = "0\r\n\r\n";
         wire.insert(wire.end(), kEnd, kEnd + sizeof(kEnd) - 1);
     }
-    bool sent = false;
     if (!tls) {
-        sent = write_all_fd(fd, wire.data(), static_cast<u32>(wire.size()));
-    } else {
-        sent = true;
-        size_t offset = 0;
-        while (offset < wire.size()) {
-            const int n =
-                SSL_write(ssl, wire.data() + offset, static_cast<int>(wire.size() - offset));
+        while (bytes_written < wire.size()) {
+            const ssize_t n =
+                send(fd, wire.data() + bytes_written, wire.size() - bytes_written, MSG_NOSIGNAL);
+            if (n < 0 && errno == EINTR) continue;
             if (n <= 0) {
-                sent = false;
-                break;
+                const int error_number = errno;
+                return fail("write", error_number, static_cast<int>(n), 0, 0);
             }
-            offset += static_cast<size_t>(n);
+            bytes_written += static_cast<size_t>(n);
+        }
+    } else {
+        while (bytes_written < wire.size()) {
+            ERR_clear_error();
+            errno = 0;
+            const int n = SSL_write(
+                ssl, wire.data() + bytes_written, static_cast<int>(wire.size() - bytes_written));
+            if (n <= 0) {
+                const int error_number = errno;
+                const int ssl_error = SSL_get_error(ssl, n);
+                const unsigned long openssl_error = ERR_peek_error();
+                return fail("write", error_number, n, ssl_error, openssl_error);
+            }
+            bytes_written += static_cast<size_t>(n);
         }
     }
-    if (sent) {
-        u8 buf[8192];
-        for (;;) {
-            const ssize_t n = tls ? SSL_read(ssl, buf, sizeof(buf)) : recv(fd, buf, sizeof(buf), 0);
-            if (n == 0) break;
-            if (n < 0 && errno == EINTR) continue;
-            if (n < 0) {
-                const int ssl_error = tls ? SSL_get_error(ssl, static_cast<int>(n)) : 0;
-                if (tls && (ssl_error == SSL_ERROR_ZERO_RETURN ||
-                            (ssl_error == SSL_ERROR_SYSCALL && errno == 0)))
-                    break;
-                close(fd);
-                if (ssl) SSL_free(ssl);
-                if (tls_context) SSL_CTX_free(tls_context);
-                return false;
-            }
-            response.insert(response.end(), buf, buf + n);
-            if (expected_body && std::search(response.begin(),
-                                             response.end(),
-                                             expected_body->begin(),
-                                             expected_body->end()) != response.end())
+    u8 buf[8192];
+    for (;;) {
+        if (tls) {
+            ERR_clear_error();
+            errno = 0;
+        }
+        const ssize_t n = tls ? SSL_read(ssl, buf, sizeof(buf)) : recv(fd, buf, sizeof(buf), 0);
+        if (n == 0) break;
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            const int error_number = errno;
+            const int ssl_error = tls ? SSL_get_error(ssl, static_cast<int>(n)) : 0;
+            const unsigned long openssl_error = tls ? ERR_peek_error() : 0;
+            if (tls && (ssl_error == SSL_ERROR_ZERO_RETURN ||
+                        (ssl_error == SSL_ERROR_SYSCALL && error_number == 0)))
                 break;
-            if (response.size() > 256 * 1024) {
-                close(fd);
-                return false;
-            }
+            return fail("read", error_number, static_cast<int>(n), ssl_error, openssl_error);
+        }
+        response.insert(response.end(), buf, buf + n);
+        bytes_read += static_cast<size_t>(n);
+        if (expected_body && std::search(response.begin(),
+                                         response.end(),
+                                         expected_body->begin(),
+                                         expected_body->end()) != response.end())
+            break;
+        if (response.size() > 256 * 1024) {
+            return fail("sizecap", 0, static_cast<int>(response.size()), 0, 0);
         }
     }
     if (ssl) SSL_free(ssl);
     if (tls_context) SSL_CTX_free(tls_context);
     close(fd);
-    return sent;
+    return true;
 }
 
 template <typename Loop>
@@ -723,6 +787,92 @@ TEST(grpc_proxy, h1_content_type_override_fails_closed) {
     conn.req_header_overrides[0] = {{"cOnTeNt-TyPe", 12}, {"application/grpc", 16}};
     CHECK_EQ(static_cast<u32>(grpc_web_h1_start<EpollEventLoop>(nullptr, conn, nullptr, 0, true)),
              static_cast<u32>(GrpcWebH1Start::Rejected));
+}
+
+TEST(grpc_proxy, h1_duplicate_web_family_content_types_fail_closed_in_both_orders) {
+    const char* requests[] = {
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc-web\r\nContent-Type: application/grpc\r\n"
+        "Content-Length: 0\r\n\r\n",
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc\r\nContent-Type: application/grpc-web\r\n"
+        "Content-Length: 0\r\n\r\n",
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc-web+json\r\n"
+        "Content-Type: application/grpc-web-text\r\nContent-Length: 0\r\n\r\n",
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc-web-text\r\n"
+        "Content-Type: application/grpc-web+json\r\nContent-Length: 0\r\n\r\n",
+    };
+    for (const char* request : requests) {
+        Connection conn;
+        u8 storage[512]{};
+        grpc_web_test_init_raw_request(
+            conn, storage, sizeof(storage), request, static_cast<u32>(strlen(request)));
+        CHECK_EQ(
+            static_cast<u32>(grpc_web_h1_start<EpollEventLoop>(nullptr, conn, nullptr, 0, true)),
+            static_cast<u32>(GrpcWebH1Start::Rejected));
+    }
+}
+
+TEST(grpc_proxy, h1_expect_continue_body_is_rejected_before_rpc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log());
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    set_socket_timeouts(fd, 5);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(get_port(listener));
+    REQUIRE(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    static constexpr char kHeaders[] =
+        "POST /test.Echo/Call HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/grpc-web\r\n"
+        "Content-Length: 5\r\n"
+        "Expect: 100-continue\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE(write_all_fd(fd, reinterpret_cast<const u8*>(kHeaders), sizeof(kHeaders) - 1));
+    u8 response[1024]{};
+    const ssize_t received = recv(fd, response, sizeof(response), 0);
+    CHECK_GT(received, 0);
+    if (received > 0) {
+        CHECK(std::search(response, response + received, "HTTP/1.1 503", "HTTP/1.1 503" + 12) !=
+              response + received);
+        CHECK(std::search(response, response + received, "100 Continue", "100 Continue" + 12) ==
+              response + received);
+    }
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+
+    CHECK_EQ(shard->shard_metrics.grpc_started, 0u);
+    CHECK_EQ(server->requests.load(), 0u);
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 0u);
+    CHECK_EQ(server->requests.load(), 0u);
 }
 
 TEST(grpc_proxy, h1_http1_policy_fails_closed) {

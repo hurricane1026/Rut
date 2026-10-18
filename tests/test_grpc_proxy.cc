@@ -2852,6 +2852,40 @@ TEST(grpc_proxy, request_classifier_accepts_web_modes_for_body_dispatch) {
     req.headers[0].value = lit_str("application/grpcx");
     CHECK(!grpc_request(req));
 }
+TEST(grpc_proxy, request_classifier_rejects_ambiguous_web_content_types) {
+    auto classify = [&](Str first, Str second) {
+        ParsedRequest req{};
+        req.headers[0] = {lit_str("content-type"), first};
+        req.headers[1] = {lit_str("content-type"), second};
+        req.header_count = 2;
+        bool ambiguous = false;
+        CHECK_EQ(grpc_request_mode(req, &ambiguous), GrpcWebContentType::Other);
+        CHECK(ambiguous);
+        CHECK(grpc_request(req));
+    };
+    classify(lit_str("application/grpc-web"), lit_str("application/grpc"));
+    classify(lit_str("application/grpc"), lit_str("application/grpc-web"));
+    classify(lit_str("application/grpc-web-text"), lit_str("application/grpc-web"));
+    classify(lit_str("application/grpc-web"), lit_str("application/grpc-web+json"));
+    classify(lit_str("application/grpc-web+json"), lit_str("application/grpc-web-text"));
+
+    ParsedRequest native{};
+    native.headers[0] = {lit_str("content-type"), lit_str("application/grpc+proto")};
+    native.headers[1] = {lit_str("content-type"), lit_str("application/grpc+json")};
+    native.header_count = 2;
+    bool ambiguous = true;
+    CHECK_EQ(grpc_request_mode(native, &ambiguous), GrpcWebContentType::Native);
+    CHECK_FALSE(ambiguous);
+    CHECK(grpc_request(native));
+
+    ParsedRequest unsupported_web{};
+    unsupported_web.headers[0] = {lit_str("content-type"), lit_str("application/grpc-web+json")};
+    unsupported_web.header_count = 1;
+    ambiguous = false;
+    CHECK_EQ(grpc_request_mode(unsupported_web, &ambiguous), GrpcWebContentType::Other);
+    CHECK(ambiguous);
+    CHECK(grpc_request(unsupported_web));
+}
 TEST(grpc_proxy, response_header_filter_strips_content_length_only) {
     const hpack::Header headers[] = {{Str{"content-length", 14}, Str{"0", 1}},
                                      {Str{"grpc-status", 11}, Str{"0", 1}},
@@ -3820,6 +3854,37 @@ TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     loop.force_close_all();
     loop.shutdown();
 }
+TEST(grpc_proxy, h2_duplicate_web_family_content_types_rejected_before_upstream) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init_client();
+    REQUIRE(down->h2->open_stream(1));
+    down->request_config = &cfg;
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    req.headers[0] = {lit_str("content-type"), lit_str("application/grpc-web+json")};
+    req.headers[1] = {lit_str("content-type"), lit_str("application/grpc")};
+    req.header_count = 2;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"content-type", 12}, {"application/grpc-web+json", 25}},
+                                {{"content-type", 12}, {"application/grpc", 16}}};
+    CHECK_FALSE(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 6, req, true));
+    CHECK_EQ(down->h2->grpc.active, 0u);
+    CHECK(down->h2->grpc.streams[0] == nullptr);
+    CHECK(loop.grpc_upstreams == nullptr);
+    loop.force_close_all();
+    loop.shutdown();
+}
 TEST(grpc_proxy, grpc_response_mutations_snapshot_per_exchange) {
     Connection downstream;
     downstream.reset();
@@ -4018,6 +4083,66 @@ TEST(grpc_proxy, grpc_web_incomplete_unstaged_message_becomes_status_trailer) {
     REQUIRE(grpc_web_queue_status_trailer(expected, 13));
     CHECK_EQ(x.response_trailers_len, expected.response_trailers_len);
     CHECK_EQ(memcmp(x.response_trailers, expected.response_trailers, x.response_trailers_len), 0);
+}
+
+TEST(grpc_proxy, grpc_web_removed_trailers_only_status_becomes_unknown_trailer) {
+    GrpcDriveFixture loop;
+    ShardMetrics metrics{};
+    loop.metrics = &metrics;
+    Connection upstream, downstream;
+    upstream.reset();
+    downstream.reset();
+    Http2Conn upstream_h2, downstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    downstream_h2.init_client();
+    upstream.h2 = &upstream_h2;
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1));
+    REQUIRE(downstream_h2.open_stream(1));
+    auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(x != nullptr);
+    x->init();
+    x->web_mode = GrpcWebContentType::Binary;
+    x->upstream = &upstream;
+    x->downstream = &downstream;
+    x->upstream_stream = x->downstream_stream = 1;
+    x->started_us = monotonic_us();
+    x->observed = true;
+    metrics.on_grpc_start();
+    downstream.resp_header_mutations[0] = {
+        {"grpc-status", 11}, {nullptr, 0}, Connection::RespHeaderMutationMode::Remove};
+    downstream.resp_header_mutation_count = 1;
+    REQUIRE(grpc_snapshot_response_mutations(downstream, *x));
+    REQUIRE(grpc_attach(upstream_h2, x));
+    REQUIRE(grpc_attach(downstream_h2, x));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const hpack::Header response[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"grpc-status", 11}, {"0", 1}},
+    };
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, response, 3, true);
+    CHECK_EQ(x->failure, 2u);
+    CHECK_EQ(x->response_status, 2u);
+    CHECK(x->response_end);
+    CHECK_EQ(metrics.grpc_active, 1u);
+
+    CHECK_EQ(grpc_web_prepare_failure(*x), 0u);
+    CHECK(x->web_trailer_queued);
+    GrpcExchange expected;
+    expected.init();
+    REQUIRE(grpc_web_queue_status_trailer(expected, 2));
+    CHECK_EQ(x->response_trailers_len, expected.response_trailers_len);
+    CHECK_EQ(memcmp(x->response_trailers, expected.response_trailers, x->response_trailers_len), 0);
+
+    x->response_end_sent = true;
+    grpc_observe(&loop, *x);
+    CHECK_EQ(metrics.grpc_completed[2], 1u);
+    CHECK_EQ(metrics.grpc_active, 0u);
+    grpc_observe(&loop, *x);
+    CHECK_EQ(metrics.grpc_completed[2], 1u);
+    loop.pool.free(reinterpret_cast<u8*>(x));
 }
 
 TEST(grpc_proxy, grpc_web_text_batches_independently_padded_messages) {

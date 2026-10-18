@@ -10,6 +10,18 @@ inline bool snapshot_response_mutations_before_request_rewrite(Connection& conn)
 
 enum class GrpcWebH1Start : u8 { NotWeb, Started, Rejected };
 
+inline bool grpc_web_h1_has_unsupported_expect(const ParsedRequest& req) {
+    const bool body_bearing = req.chunked || (req.has_content_length && req.content_length != 0);
+    if (!body_bearing) return false;
+    for (u32 i = 0; i < req.header_count; i++) {
+        const auto& header = req.headers[i];
+        if (http_header_name_eq_ci(header.name.ptr, header.name.len, "expect", 6) &&
+            header.value.len != 0)
+            return true;
+    }
+    return false;
+}
+
 template <typename Loop>
 void grpc_web_h1_on_recv(void* lp, Connection& conn, IoEvent ev);
 template <typename Loop>
@@ -38,10 +50,13 @@ GrpcWebH1Start grpc_web_h1_start(
     if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req) != ParseStatus::Complete) {
         return GrpcWebH1Start::NotWeb;
     }
-    const GrpcWebContentType mode = grpc_request_mode(req);
+    bool ambiguous_web_type = false;
+    const GrpcWebContentType mode = grpc_request_mode(req, &ambiguous_web_type);
+    if (ambiguous_web_type) return GrpcWebH1Start::Rejected;
     if (mode != GrpcWebContentType::Binary && mode != GrpcWebContentType::Text) {
         return GrpcWebH1Start::NotWeb;
     }
+    if (grpc_web_h1_has_unsupported_expect(req)) return GrpcWebH1Start::Rejected;
     if (!policy_free) {
         return GrpcWebH1Start::Rejected;
     }
@@ -67,7 +82,9 @@ GrpcWebH1Start grpc_web_h1_start(
     if (parser.parse(conn.recv_buf.data(), conn.recv_buf.len(), &req) != ParseStatus::Complete) {
         return GrpcWebH1Start::Rejected;
     }
-    if (grpc_request_mode(req) != mode) {
+    ambiguous_web_type = false;
+    if (grpc_request_mode(req, &ambiguous_web_type) != mode || ambiguous_web_type ||
+        grpc_web_h1_has_unsupported_expect(req)) {
         return GrpcWebH1Start::Rejected;
     }
     if (req.method != HttpMethod::POST || req.version != HttpVersion::Http11 ||

@@ -66,12 +66,33 @@ inline GrpcWebContentType grpc_web_content_type(Str value) {
     return GrpcWebContentType::Other;
 }
 
+// A Web-family token remains a bridge candidate even when its suffix is not
+// supported (for example, application/grpc-web+json). This lets request
+// admission reject ambiguity instead of letting an earlier native value hide
+// a later Web value.
+inline bool grpc_web_content_type_candidate(Str value) {
+    u32 end = 0;
+    while (end < value.len && value.ptr[end] != ';') end++;
+    while (end && (value.ptr[end - 1] == ' ' || value.ptr[end - 1] == '\t')) end--;
+    const Str media{value.ptr, end};
+    auto family = [media](Str base) {
+        if (media.len < base.len) return false;
+        for (u32 i = 0; i < base.len; i++) {
+            char c = media.ptr[i];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != base.ptr[i]) return false;
+        }
+        return media.len == base.len || media.ptr[base.len] == '+';
+    };
+    return family({"application/grpc-web", 20}) || family({"application/grpc-web-text", 25});
+}
+
 enum class GrpcWebCodecStatus : u8 { Ok, NeedOutput, Invalid, Incomplete };
 
 inline i16 grpc_web_base64_value(u8 c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c >= 'A' && c <= 'Z') return static_cast<i16>(c - 'A');
+    if (c >= 'a' && c <= 'z') return static_cast<i16>(c - 'a' + 26);
+    if (c >= '0' && c <= '9') return static_cast<i16>(c - '0' + 52);
     if (c == '+') return 62;
     if (c == '/') return 63;
     return -1;
