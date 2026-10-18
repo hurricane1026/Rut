@@ -73,6 +73,35 @@ inline bool grpc_web_test_decode_text_response(const std::vector<u8>& response,
     return true;
 }
 
+inline bool grpc_web_test_h1_abort_partial_upload(EchoServer& server, u16 port) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    set_socket_timeouts(fd, 5);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        close(fd);
+        return false;
+    }
+    static constexpr char kRequest[] =
+        "POST /test.Echo/Call HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/grpc-web\r\n"
+        "Content-Length: 12\r\n"
+        "Connection: close\r\n\r\n";
+    static constexpr u8 kPartialBody[] = {0, 0, 0, 0, 7, 0xaa};
+    const bool sent = write_all_fd(fd, reinterpret_cast<const u8*>(kRequest), sizeof(kRequest) - 1) &&
+                      write_all_fd(fd, kPartialBody, sizeof(kPartialBody));
+    const u64 deadline = monotonic_us() + 3000000;
+    while (sent && !server.requests.load() && monotonic_us() < deadline) usleep(1000);
+    const bool reached_backend = server.requests.load() != 0;
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+    return sent && reached_backend;
+}
+
 inline bool grpc_web_test_h1_exchange(u16 port,
                                       bool text,
                                       bool chunked,
@@ -476,6 +505,45 @@ void grpc_web_h1_json_response_rejected_case(rut::test::TestCase* _tc, u32 respo
     shard->shutdown();
 }
 
+void grpc_web_h1_abort_case(rut::test::TestCase* _tc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = 6;
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log());
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    CHECK(grpc_web_test_h1_abort_partial_upload(*server, get_port(listener)));
+    const u64 deadline = monotonic_us() + 3000000;
+    while (!server->resets.load() && monotonic_us() < deadline) usleep(1000);
+    CHECK_GT(server->resets.load(), 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    AccessLogEntry entry{};
+    CHECK(shard->log_ring->pop(entry));
+    CHECK_EQ(entry.grpc_status_plus_one, 2u);
+    CHECK(!shard->log_ring->pop(entry));
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
 template <typename Loop>
 void grpc_web_h1_roundtrip_case(rut::test::TestCase* _tc,
                                 bool text,
@@ -738,6 +806,9 @@ TEST(grpc_proxy, h1_duplicate_json_proto_response_rejected) {
 }
 TEST(grpc_proxy, h1_duplicate_proto_json_response_rejected) {
     grpc_web_h1_json_response_rejected_case(_tc, 9);
+}
+TEST(grpc_proxy, h1_client_abort_cancels_upstream_once) {
+    grpc_web_h1_abort_case(_tc);
 }
 
 TEST(grpc_proxy, h1_path_and_safe_header_overrides_remain_supported) {
