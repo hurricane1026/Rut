@@ -1435,10 +1435,12 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             LLVMBuildCall2(c.builder, ft, fn, args, 5, "");
             break;
         }
-        case rir::Opcode::JsonOp: {
+        case rir::Opcode::JsonOp:
+        case rir::Opcode::ProtoOp: {
+            const bool kProto = inst.op == rir::Opcode::ProtoOp;
             LLVMTypeRef params[] = {c.ptr_ty,
                                     c.ptr_ty,
-                                    c.i32_ty,
+                                    kProto ? c.i64_ty : c.i32_ty,
                                     c.ptr_ty,
                                     c.i32_ty,
                                     c.ptr_ty,
@@ -1451,15 +1453,19 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
                                     c.ptr_ty,
                                     c.ptr_ty};
             LLVMTypeRef ft = LLVMFunctionType(c.void_ty, params, 14, 0);
-            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, "rut_helper_json");
-            if (!fn) fn = LLVMAddFunction(c.llvm_mod, "rut_helper_json", ft);
+            const char* helper_name = kProto ? "rut_helper_protobuf" : "rut_helper_json";
+            LLVMValueRef fn = LLVMGetNamedFunction(c.llvm_mod, helper_name);
+            if (!fn) fn = LLVMAddFunction(c.llvm_mod, helper_name, ft);
             LLVMValueRef out_has = LLVMBuildAlloca(c.builder, c.i8_ty, "json.has");
             LLVMValueRef out_ptr = LLVMBuildAlloca(c.builder, c.ptr_ty, "json.ptr");
             LLVMValueRef out_len = LLVMBuildAlloca(c.builder, c.i32_ty, "json.len");
             LLVMValueRef out_num = LLVMBuildAlloca(c.builder, c.i64_ty, "json.num");
             LLVMValueRef args[] = {c.param_conn,
                                    c.param_arena,
-                                   LLVMConstInt(c.i32_ty, static_cast<u32>(inst.imm.i32_val), 0),
+                                   LLVMConstInt(kProto ? c.i64_ty : c.i32_ty,
+                                                kProto ? static_cast<u64>(inst.imm.i64_val)
+                                                       : static_cast<u32>(inst.imm.i32_val),
+                                                0),
                                    LLVMConstNull(c.ptr_ty),
                                    LLVMConstInt(c.i32_ty, 0, 0),
                                    LLVMConstNull(c.ptr_ty),
@@ -1530,6 +1536,7 @@ static void emit_instruction(Ctx& c, const rir::Instruction& inst) {
             c.set_value(inst.result, result);
             break;
         }
+
         case rir::Opcode::TimeNowMicros: {
             LLVMValueRef v = LLVMBuildCall2(c.builder,
                                             LLVMGlobalGetValueType(c.get_time_now_micros()),

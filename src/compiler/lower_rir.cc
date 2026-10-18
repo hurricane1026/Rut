@@ -1358,8 +1358,8 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!created) return frontend_error(FrontendError::OutOfMemory, span);
         return created.value();
     }
-    if (value.kind == MirValueKind::StructInit || value.kind == MirValueKind::JsonDecode) {
-        const bool decoding = value.kind == MirValueKind::JsonDecode;
+    if (value.kind == MirValueKind::StructInit || value.kind == MirValueKind::StructDecode) {
+        const bool decoding = value.kind == MirValueKind::StructDecode;
         rir::ValueId missing = rir::kNoValue;
         if (decoding) {
             auto object = materialize_value(*value.lhs,
@@ -1646,7 +1646,7 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
         if (!v) return frontend_error(FrontendError::OutOfMemory, span);
         return v.value();
     }
-    if (value.kind == MirValueKind::JsonOp) {
+    if (value.kind == MirValueKind::JsonOp || value.kind == MirValueKind::ProtoOp) {
         rir::ValueId args[3]{};
         for (u32 i = 0; i < value.args.len; ++i) {
             auto child = materialize_value(*value.args[i],
@@ -1669,12 +1669,19 @@ static FrontendResult<rir::ValueId> materialize_value(const MirValue& value,
                           : value.type == MirTypeKind::I64 ? rir::TypeKind::I64
                           : value.type == MirTypeKind::I32 ? rir::TypeKind::I32
                                                            : rir::TypeKind::Str;
-        auto result = b.emit_json(static_cast<u32>(value.int_value),
-                                  type,
-                                  value.may_nil,
-                                  args,
-                                  value.args.len,
-                                  {span.line, span.col});
+        auto result = value.kind == MirValueKind::ProtoOp
+                          ? b.emit_proto(static_cast<u64>(value.int_value),
+                                         type,
+                                         value.may_nil,
+                                         args,
+                                         value.args.len,
+                                         {span.line, span.col})
+                          : b.emit_json(static_cast<u32>(value.int_value),
+                                        type,
+                                        value.may_nil,
+                                        args,
+                                        value.args.len,
+                                        {span.line, span.col});
         if (!result) return frontend_error(FrontendError::OutOfMemory, span);
         return result.value();
     }
@@ -3946,6 +3953,11 @@ static FrontendResult<void> lower_to_rir_impl(const MirModule& mir,
                     field_ty = ty.value();
                 } else if (field_shape.type == MirTypeKind::I32) {
                     field_ty = i32_ty.value();
+                } else if (field_shape.type == MirTypeKind::I64) {
+                    auto ty = b.make_type(rir::TypeKind::I64);
+                    if (!ty)
+                        return frontend_error(FrontendError::OutOfMemory, mir.structs[si].span);
+                    field_ty = ty.value();
                 } else if (field_shape.type == MirTypeKind::Str) {
                     field_ty = str_ty.value();
                 } else if (field_shape.type == MirTypeKind::Variant) {

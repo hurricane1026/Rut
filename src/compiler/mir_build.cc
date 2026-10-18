@@ -530,10 +530,10 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         }
         return v;
     }
-    if (expr.kind == HirExprKind::StructInit || expr.kind == HirExprKind::JsonDecode) {
-        v.kind = expr.kind == HirExprKind::JsonDecode ? MirValueKind::JsonDecode
-                                                      : MirValueKind::StructInit;
-        if (expr.kind == HirExprKind::JsonDecode) {
+    if (expr.kind == HirExprKind::StructInit || expr.kind == HirExprKind::StructDecode) {
+        v.kind = expr.kind == HirExprKind::StructDecode ? MirValueKind::StructDecode
+                                                        : MirValueKind::StructInit;
+        if (expr.kind == HirExprKind::StructDecode) {
             auto object = mir_value(*expr.lhs, module, fn, ctx);
             if (!object) return core::make_unexpected(object.error());
             if (!fn->values.push(object.value()))
@@ -737,8 +737,8 @@ static FrontendResult<MirValue> mir_value(const HirExpr& expr,
         v.type = MirTypeKind::ByteSize;
         return v;
     }
-    if (expr.kind == HirExprKind::JsonOp) {
-        v.kind = MirValueKind::JsonOp;
+    if (expr.kind == HirExprKind::JsonOp || expr.kind == HirExprKind::ProtoOp) {
+        v.kind = expr.kind == HirExprKind::ProtoOp ? MirValueKind::ProtoOp : MirValueKind::JsonOp;
         v.int_value = expr.int_value;
         v.type = mir_type_kind(expr.type);
         for (u32 ai = 0; ai < expr.args.len; ++ai) {

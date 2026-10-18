@@ -288,6 +288,7 @@ enum class Opcode : u8 {
     YieldHttpPost,  // %r = yield.http_post url, headers, body
     YieldForward,   // %r = yield.forward upstream
     JsonOp,
+    ProtoOp,
     RespBody,
 };
 

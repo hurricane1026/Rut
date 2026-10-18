@@ -40366,3 +40366,53 @@ TEST(frontend, env_decodes_literal_name_before_lookup) {
     CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("decoded")));
     unsetenv("RUT_TEST_ENV_SECRET");
 }
+
+TEST(frontend, protobuf_inferred_type_reuse_and_schema_errors) {
+    const char* sources[] = {
+        "route POST \"/x\" { guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.CodecMessage\", req.body) else { return 400 } "
+        "guard let again = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec\\u{2e}proto\", \"example\\u{2e}CodecMessage\", req.body) else { "
+        "return 400 } if "
+        "value.id == again.id { return 200 } else { return 409 } }",
+        "route POST \"/x\" { let path = \"missing.proto\" guard let value = protobuf.decode(path, "
+        "\"X\", req.body) else { return 400 } return 200 }",
+        "route POST \"/x\" { guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/codec.proto\", \"example.Missing\", req.body) else { return 400 } return "
+        "200 }",
+        "route POST \"/x\" { guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+        "/tests/protobuf/schema.proto\", \"test.gateway.Request\", req.body) else { return 400 } "
+        "return 200 }"};
+    for (u32 i = 0; i < 4; ++i) {
+        auto tokens = lex(lit(sources[i]));
+        REQUIRE(tokens);
+        auto ast = parse_file(tokens.value());
+        REQUIRE(ast);
+        auto hir = analyze_file(*ast.value());
+        if (!i) {
+            REQUIRE(hir);
+            CHECK_EQ(hir.value()->structs.len, 1u);
+            CHECK(hir.value()->structs[0].protobuf_name.eq(lit_str(".example.CodecMessage")));
+        } else
+            CHECK_FALSE(hir.has_value());
+        if (hir) delete hir.value();
+        delete ast.value();
+    }
+}
+
+TEST(frontend, protobuf_missing_source_diagnostic_survives_failed_analysis) {
+    auto tokens =
+        lex(lit("route POST \"/x\" { guard let value = protobuf.decode(\"" RUT_PROTO_TEST_ROOT
+                "/tests/protobuf/__missing_schema_7c10b.proto\", \"X\", req.body) else { return "
+                "400 } return 200 }"));
+    REQUIRE(tokens);
+    auto ast = parse_file(tokens.value());
+    REQUIRE(ast);
+    auto hir = analyze_file(*ast.value());
+    REQUIRE_FALSE(hir.has_value());
+    const Diagnostic diagnostic = hir.error();
+    delete ast.value();
+    CHECK(diagnostic.detail.len > 0);
+    CHECK(strstr(diagnostic.detail.ptr, "cannot open proto source") != nullptr);
+    CHECK(strstr(diagnostic.detail.ptr, "__missing_schema_7c10b.proto:1:1") != nullptr);
+}

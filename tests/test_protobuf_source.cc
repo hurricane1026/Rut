@@ -1,0 +1,201 @@
+#include "rut/common/types.h"
+#include "rut/compiler/protobuf_schema.h"
+#include "rut/compiler/protobuf_source.h"
+#include "rut/runtime/arena.h"
+#include "test.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+using namespace rut;
+using namespace rut::protobuf;
+#include "protobuf/schema_descriptor.inc"
+
+namespace {
+struct Storage {
+    MmapArena arena;
+    Storage() { (void)arena.init(4096); }
+    ~Storage() { arena.destroy(); }
+};
+struct Files {
+    char directory[128] = "/tmp/rut-proto-source-XXXXXX";
+    bool ok = false;
+    Files() { ok = mkdtemp(directory) != nullptr; }
+    ~Files() {
+        const char* names[] = {"root.proto", "types.proto", "extra.proto"};
+        for (const char* name : names) {
+            char path[256];
+            snprintf(path, sizeof(path), "%s/%s", directory, name);
+            unlink(path);
+        }
+        rmdir(directory);
+    }
+    bool write_file(const char* name, const char* text) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", directory, name);
+        FILE* f = fopen(path, "wb");
+        if (!f) return false;
+        const size_t kSize = strlen(text);
+        const bool kSuccess = fwrite(text, 1, kSize, f) == kSize;
+        return fclose(f) == 0 && kSuccess;
+    }
+    auto load(Storage& storage, SchemaLimits limits = {}) {
+        char path[256];
+        snprintf(path, sizeof(path), "%s/root.proto", directory);
+        return load_proto_source(storage.arena, {path, static_cast<u32>(strlen(path))}, limits);
+    }
+};
+}  // namespace
+TEST(protobuf_source, native_parser_matches_protoc_schema) {
+    Storage source, descriptor;
+    auto parsed =
+        load_proto_source(source.arena, lit_str(RUT_SOURCE_DIR "/tests/protobuf/schema.proto"));
+    auto golden = load_descriptor_set(descriptor.arena, kDescriptor, sizeof(kDescriptor));
+    REQUIRE(parsed.has_value());
+    REQUIRE(golden.has_value());
+    CHECK_EQ(parsed->message_count, golden->message_count);
+    CHECK_EQ(parsed->field_count, golden->field_count);
+    CHECK_EQ(parsed->method_count, golden->method_count);
+    for (const auto* message = golden->messages; message; message = message->next) {
+        const auto* actual = parsed->find_message(message->full_name);
+        REQUIRE(actual);
+        for (const auto* field = message->fields; field; field = field->next) {
+            const auto* match = actual->fields;
+            while (match && !match->name.eq(field->name)) match = match->next;
+            REQUIRE(match);
+            CHECK_EQ(match->number, field->number);
+            CHECK(match->type == field->type);
+            CHECK_EQ(match->packed, field->packed);
+            CHECK_EQ(match->repeated, field->repeated);
+            CHECK(match->json_name.eq(field->json_name));
+            CHECK(match->type_name.eq(field->type_name));
+        }
+    }
+    for (const auto* method = golden->methods; method; method = method->next) {
+        const auto* actual = parsed->find_method(method->path);
+        REQUIRE(actual);
+        CHECK(actual->input_name.eq(method->input_name));
+        CHECK(actual->output_name.eq(method->output_name));
+        CHECK_EQ(actual->client_streaming, method->client_streaming);
+        CHECK_EQ(actual->server_streaming, method->server_streaming);
+    }
+}
+TEST(protobuf_source, comments_scopes_forward_references_and_integer_bases) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax = 'proto3'; package example /*x*/ . gateway; message Outer { Inner child = 0x10; "
+        "message Inner { .example /*hello*/ . gateway.Outer parent = 021; } } service S { rpc "
+        "Call(Outer.Inner) returns (Outer) {} } //done\n"));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE(result.has_value());
+    const auto* outer = result->find_message(lit_str(".example.gateway.Outer"));
+    const auto* inner = result->find_message(lit_str(".example.gateway.Outer.Inner"));
+    REQUIRE(outer && inner);
+    REQUIRE(outer->fields && inner->fields);
+    CHECK(outer->fields->message == inner);
+    CHECK(inner->fields->message == outer);
+    CHECK_EQ(outer->fields->number, 16u);
+    CHECK_EQ(inner->fields->number, 17u);
+}
+TEST(protobuf_source, import_deduplication_cycle_and_missing_file) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; import 'types.proto'; import 'types.proto'; message A { B other=1; }"));
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; message B { string text=1; }"));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE(result.has_value());
+    CHECK_EQ(result->message_count, 2u);
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; import 'root.proto'; message B {}"));
+    result = files.load(storage);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Syntax);
+    REQUIRE(files.write_file("root.proto", "syntax='proto3'; import 'missing.proto';"));
+    result = files.load(storage);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Io);
+}
+TEST(protobuf_source, syntax_and_unsupported_semantics_are_explicit) {
+    const char* cases[] = {"syntax='proto2'; message A {}",
+                           "syntax='proto3'; enum E { A=0; }",
+                           "syntax='proto3'; message A { optional string a=1; }",
+                           "syntax='proto3'; message A { map<string,string> a=1; }",
+                           "syntax='proto3'; message A { oneof a { string s=1; } }",
+                           "syntax='proto3'; message A { string a=1 [default='x']; }",
+                           "syntax='proto3'; import '../x.proto';",
+                           "syntax='proto3'; /*unterminated",
+                           "syntax='proto3'; message A { string a=0; }",
+                           "syntax='proto3'; message A { string a=1; string b=1; }",
+                           "syntax='proto3'; message A { Missing a=1; }",
+                           "syntax='proto3'; message A { string a=09; }",
+                           "syntax='proto3'; message A { string a=429496729600; }",
+                           "syntax='proto3'; import public 'x.proto';",
+                           "\"syntax\"='proto3';"};
+    for (const char* text : cases) {
+        Files files;
+        REQUIRE(files.ok);
+        REQUIRE(files.write_file("root.proto", text));
+        Storage storage;
+        auto result = files.load(storage);
+        CHECK_FALSE(result.has_value());
+        if (!result) {
+            CHECK(result.error().line > 0);
+            CHECK(result.error().column > 0);
+        }
+    }
+}
+TEST(protobuf_source, source_budgets_and_empty_files) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("root.proto", "syntax='proto3'; message A { string text=1; }"));
+    const SchemaLimits kLimits[] = {
+        {8}, {4096, 0}, {4096, 1, 0}, {4096, 1, 1, 0}, {4096, 1, 1, 1, 1, 0}};
+    for (const auto& limit : kLimits) {
+        Storage storage;
+        auto result = files.load(storage, limit);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().kind == SourceError::Kind::Limit);
+    }
+    REQUIRE(files.write_file("root.proto", ""));
+    Storage storage;
+    CHECK_FALSE(files.load(storage));
+}
+TEST(protobuf_source, inner_type_name_shadows_outer_namespace) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; message A { message B {} } message Outer { message A {} A.B wrong=1; }"));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Schema);
+}
+TEST(protobuf_source, transitive_import_does_not_grant_type_visibility) {
+    Files files;
+    REQUIRE(files.ok);
+    REQUIRE(files.write_file("root.proto",
+                             "syntax='proto3'; import 'types.proto'; message A { C c=1; }"));
+    REQUIRE(files.write_file("types.proto", "syntax='proto3'; import 'extra.proto'; message B {}"));
+    REQUIRE(files.write_file("extra.proto", "syntax='proto3'; message C {}"));
+    Storage storage;
+    auto result = files.load(storage);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == SourceError::Kind::Schema);
+    REQUIRE(files.write_file(
+        "root.proto",
+        "syntax='proto3'; import 'types.proto'; import 'extra.proto'; message A { C c=1; }"));
+    result = files.load(storage);
+    REQUIRE(result.has_value());
+    CHECK_EQ(result->message_count, 3u);
+}
+int main(int argc, char** argv) {
+    return rut::test::run_all(argc, argv);
+}
