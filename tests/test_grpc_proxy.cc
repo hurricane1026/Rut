@@ -2945,7 +2945,9 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
     RouteConfig cfg;
     REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)).has_value());
     cfg.upstreams[0].http2 = true;
-    if (mode != 0) cfg.upstreams[0].grpc_retry = {2, 1024, mode == 1 ? (1u << 7) : (1u << 14), 0};
+    if (mode != 0)
+        cfg.upstreams[0].grpc_retry = {
+            2, mode == 4 ? 1u : 1024u, mode == 2 ? (1u << 14) : (1u << 7), 0};
     REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
     shard->route_config = &cfg;
     REQUIRE(shard->spawn(-1).has_value());
@@ -2953,16 +2955,19 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
         Client client;
         CHECK(client.init(get_port(lfd)));
         if (client.fd >= 0) {
-            const u8 request[] = {0, 0, 0, 0, 3, 0xfa, 0xfb, 0xfc};
+            const u8 valid_request[] = {0, 0, 0, 0, 3, 0xfa, 0xfb, 0xfc};
+            const u8 malformed_request[] = {2, 0, 0, 0, 3, 0xfa, 0xfb, 0xfc};
+            const u8* request = mode == 3 ? malformed_request : valid_request;
+            const u32 request_len = sizeof(valid_request);
             u8 text_request[32];
             const u8* body = request;
-            u32 body_len = sizeof(request);
+            u32 body_len = request_len;
             if (web && text) {
                 GrpcWebBase64Encoder encoder{};
                 encoder.init();
                 u32 consumed = 0, written = 0, flushed = 0;
                 CHECK_EQ(encoder.feed(request,
-                                      sizeof(request),
+                                      request_len,
                                       consumed,
                                       text_request,
                                       sizeof(text_request),
@@ -3013,10 +3018,10 @@ void grpc_retry_trailers_only_case(rut::test::TestCase* _tc,
                 u32 expected_len = 0;
                 REQUIRE(grpc_web_encode_trailer_envelope(
                     trailers, 2, expected, sizeof(expected), expected_len));
-                CHECK_EQ(decoded_len, sizeof(request) + expected_len);
-                if (decoded_len == sizeof(request) + expected_len) {
-                    CHECK(memcmp(decoded, request, sizeof(request)) == 0);
-                    CHECK(memcmp(decoded + sizeof(request), expected, expected_len) == 0);
+                CHECK_EQ(decoded_len, request_len + expected_len);
+                if (decoded_len == request_len + expected_len) {
+                    CHECK(memcmp(decoded, request, request_len) == 0);
+                    CHECK(memcmp(decoded + request_len, expected, expected_len) == 0);
                 }
             }
         }
@@ -3052,6 +3057,12 @@ TEST(grpc_proxy, grpc_retry_nonlisted_status_epoll) {
 }
 TEST(grpc_proxy, grpc_retry_nonlisted_status_iouring) {
     grpc_retry_trailers_only_case<IoUringEventLoop>(_tc, 2);
+}
+TEST(grpc_proxy, grpc_retry_malformed_native_is_transparent) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 3);
+}
+TEST(grpc_proxy, grpc_retry_retention_overflow_is_transparent) {
+    grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 4);
 }
 TEST(grpc_proxy, grpc_retry_web_binary_epoll) {
     grpc_retry_trailers_only_case<EpollEventLoop>(_tc, 1, true, false);

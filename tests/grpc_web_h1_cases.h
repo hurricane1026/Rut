@@ -773,6 +773,66 @@ void grpc_web_h1_trailers_only_case(rut::test::TestCase* _tc) {
     shard->shutdown();
 }
 
+template <typename Loop>
+void grpc_web_h1_retry_case(rut::test::TestCase* _tc, bool text) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    server->reply_mode = 1;
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    config.upstreams[0].grpc_retry = {2, 1024, 1u << 7, 0};
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const std::vector<u8> native_request{0, 0, 0, 0, 1, 0};
+    const auto request_body = text ? grpc_web_test_base64(native_request) : native_request;
+    std::vector<u8> response;
+    CHECK(grpc_web_test_h1_exchange(get_port(listener), text, false, request_body, response));
+    std::vector<u8> decoded;
+    if (text) {
+        CHECK(grpc_web_test_decode_text_response(response, decoded));
+    } else {
+        static constexpr char kBoundary[] = "\r\n\r\n";
+        const auto boundary = std::search(
+            response.begin(), response.end(), kBoundary, kBoundary + sizeof(kBoundary) - 1);
+        CHECK(boundary != response.end());
+        if (boundary != response.end())
+            decoded.assign(boundary + sizeof(kBoundary) - 1, response.end());
+    }
+    u8 expected_trailers[128];
+    u32 expected_trailers_len = 0;
+    GrpcWebTrailer trailers[] = {{{"grpc-status", 11}, {"0", 1}},
+                                 {{"x-trailer", 9}, {"present", 7}}};
+    REQUIRE(grpc_web_encode_trailer_envelope(
+        trailers, 2, expected_trailers, sizeof(expected_trailers), expected_trailers_len));
+    CHECK_EQ(server->requests.load(), 2u);
+    CHECK_EQ(decoded.size(), native_request.size() + expected_trailers_len);
+    if (decoded.size() == native_request.size() + expected_trailers_len) {
+        CHECK(memcmp(decoded.data(), native_request.data(), native_request.size()) == 0);
+        CHECK(memcmp(decoded.data() + native_request.size(),
+                     expected_trailers,
+                     expected_trailers_len) == 0);
+    }
+
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
 void grpc_web_h1_decoded_request_limit_case(rut::test::TestCase* _tc) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start());
@@ -1557,6 +1617,12 @@ TEST(grpc_proxy, h1_binary_tls_clean_close_missing_terminal_trailer_fails) {
 }
 TEST(grpc_proxy, h1_text_tls_epoll) {
     grpc_web_h1_tls_roundtrip_case<EpollEventLoop>(_tc, true);
+}
+TEST(grpc_proxy, h1_binary_retry_epoll) {
+    grpc_web_h1_retry_case<EpollEventLoop>(_tc, false);
+}
+TEST(grpc_proxy, h1_text_retry_epoll) {
+    grpc_web_h1_retry_case<EpollEventLoop>(_tc, true);
 }
 TEST(grpc_proxy, h1_text_streaming_message_mod3_zero) {
     grpc_web_h1_streaming_text_message_case<EpollEventLoop>(_tc, 6, false);
