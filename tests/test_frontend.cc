@@ -40133,3 +40133,17 @@ TEST(frontend, env_requires_a_literal_name_and_a_set_variable) {
         CHECK(!hir);
     }
 }
+
+TEST(frontend, env_decodes_literal_name_before_lookup) {
+    REQUIRE_EQ(setenv("RUT_TEST_ENV_SECRET", "decoded", 1), 0);
+    const char* source =
+        "route GET \"/x\" { let s = env(\"RUT_TEST\\u{5f}ENV\\u{5f}SECRET\") return 200 }";
+    auto lexed = lex(lit(source));
+    REQUIRE(lexed);
+    auto ast = parse_file_heap(lexed.value());
+    REQUIRE(ast);
+    auto hir = analyze_file_heap(ast.value());
+    REQUIRE(hir);
+    CHECK(hir->routes[0].locals[0].init.str_value.eq(lit_str("decoded")));
+    unsetenv("RUT_TEST_ENV_SECRET");
+}

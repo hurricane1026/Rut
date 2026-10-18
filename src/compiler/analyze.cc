@@ -9105,7 +9105,10 @@ static FrontendResult<HirExpr> analyze_call_expr(const AstExpr& expr,
             return frontend_error(FrontendError::UnsupportedSyntax,
                                   expr.span,
                                   lit_str("env requires one literal string name"));
-        const Str name = expr.args[0]->str_value;
+        auto decoded_name =
+            decoded_expression_string(expr.args[0]->str_value, mod, expr.args[0]->span);
+        if (!decoded_name) return core::make_unexpected(decoded_name.error());
+        const Str name = decoded_name.value();
         if (name.len == 0 || name.len > 255)
             return frontend_error(
                 FrontendError::UnsupportedSyntax, expr.span, lit_str("invalid environment name"));

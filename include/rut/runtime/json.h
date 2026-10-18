@@ -45,17 +45,18 @@ inline constexpr u32 kNone = 0xffffffffu;
 
 struct Writer {
     char* data;
+    u32 cap = kMaxBytes;
     u32 len = 0;
     bool ok = true;
     void put(char c) {
-        if (len == kMaxBytes) {
+        if (len == cap) {
             ok = false;
             return;
         }
         data[len++] = c;
     }
     void text(Str s) {
-        if (s.len > kMaxBytes - len) {
+        if (s.len > cap - len) {
             ok = false;
             return;
         }

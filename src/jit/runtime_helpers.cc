@@ -1542,17 +1542,24 @@ bool jwt_decode_claims(
     Str alg{};
     char key_bytes[16];
     char value_bytes[16];
+    bool has_crit = false;
     for (u32 node = document.nodes[0].child; node != json::kNone;
          node = document.nodes[node].next) {
-        json::Writer key_writer{key_bytes};
+        json::Writer key_writer{key_bytes, sizeof(key_bytes)};
         if (!document.string(document.nodes[node].key, key_writer) || !key_writer.ok) return false;
-        if (!Str{key_bytes, key_writer.len}.eq(lit_str("alg"))) continue;
+        const Str key{key_bytes, key_writer.len};
+        if (key.eq(lit_str("crit"))) {
+            has_crit = true;
+            continue;
+        }
+        if (!key.eq(lit_str("alg"))) continue;
         if (document.nodes[node].kind != json::Kind::String) return false;
-        json::Writer value_writer{value_bytes};
+        json::Writer value_writer{value_bytes, sizeof(value_bytes)};
         if (!document.string(node, value_writer) || !value_writer.ok) return false;
         alg = {value_bytes, value_writer.len};
         break;
     }
+    if (has_crit) return false;
     const EVP_MD* digest = nullptr;
     if (alg.eq(lit_str("HS256")))
         digest = EVP_sha256();
@@ -1562,6 +1569,10 @@ bool jwt_decode_claims(
         digest = EVP_sha512();
     else
         return false;
+    const u32 min_secret_len = alg.eq(lit_str("HS256"))   ? 32u
+                               : alg.eq(lit_str("HS384")) ? 48u
+                                                          : 64u;
+    if (secret.len < min_secret_len) return false;
 
     char signature[EVP_MAX_MD_SIZE];
     u32 signature_len = 0;

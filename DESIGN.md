@@ -1566,6 +1566,8 @@ Two types of middleware, distinguished by whether the signature contains `Respon
 `guard ... else { respond ... }` is the idiomatic way to express "check or reject".
 
 ```swift
+struct Claims { sub: string, role: string }
+
 func auth(_ req: Request, role: string) -> User {
     let token = req.authorization.or("")
     guard token.hasPrefix("Bearer ") else { respond 401 }
@@ -3683,6 +3685,11 @@ struct Ctx {
 
 struct User {
     id: string
+    role: string
+}
+
+struct Claims {
+    sub: string
     role: string
 }
 

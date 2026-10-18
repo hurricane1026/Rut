@@ -598,7 +598,7 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
     const char* token =
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
         "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ."
-        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        "AL_nmexgcwawKDK5uJ0RtfAxT1GguksdPuaahEACpHc";
     const char* payload = "{\"sub\":\"1234567890\",\"name\":\"John Doe\",\"iat\":1516239022}";
     SlicePool pool;
     REQUIRE(pool.init(8));
@@ -627,7 +627,7 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
         return std::pair<bool, Str>{has != 0, Str{out, len}};
     };
 
-    const auto ok = decode("your-256-bit-secret");
+    const auto ok = decode("01234567890123456789012345678901");
     CHECK(ok.first);
     CHECK(ok.second.eq({payload, static_cast<u32>(__builtin_strlen(payload))}));
     CHECK_FALSE(decode("wrong-secret").first);
@@ -638,7 +638,7 @@ TEST(json_network, jwt_decode_verifies_hs256_and_returns_claims) {
 }
 
 TEST(json_network, jit_jwt_decode_returns_claims_subject) {
-    REQUIRE_EQ(setenv("RUT_TEST_JWT_SECRET", "your-256-bit-secret", 1), 0);
+    REQUIRE_EQ(setenv("RUT_TEST_JWT_SECRET", "01234567890123456789012345678901", 1), 0);
     JsonProgram program;
     REQUIRE(program.init(R"rut(
 route POST "/jwt" {
@@ -653,7 +653,7 @@ route POST "/jwt" {
     const char* token =
         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
         "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ."
-        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        "AL_nmexgcwawKDK5uJ0RtfAxT1GguksdPuaahEACpHc";
     auto loop = std::make_unique<SmallLoop>();
     loop->setup();
     SlicePool pool;
