@@ -725,6 +725,92 @@ TEST(grpc_proxy, h1_content_type_override_fails_closed) {
              static_cast<u32>(GrpcWebH1Start::Rejected));
 }
 
+TEST(grpc_proxy, h1_duplicate_web_family_content_types_fail_closed_in_both_orders) {
+    const char* requests[] = {
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc-web\r\nContent-Type: application/grpc\r\n"
+        "Content-Length: 0\r\n\r\n",
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc\r\nContent-Type: application/grpc-web\r\n"
+        "Content-Length: 0\r\n\r\n",
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc-web+json\r\n"
+        "Content-Type: application/grpc-web-text\r\nContent-Length: 0\r\n\r\n",
+        "POST /test.Echo/Call HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Type: application/grpc-web-text\r\n"
+        "Content-Type: application/grpc-web+json\r\nContent-Length: 0\r\n\r\n",
+    };
+    for (const char* request : requests) {
+        Connection conn;
+        u8 storage[512]{};
+        grpc_web_test_init_raw_request(
+            conn, storage, sizeof(storage), request, static_cast<u32>(strlen(request)));
+        CHECK_EQ(
+            static_cast<u32>(grpc_web_h1_start<EpollEventLoop>(nullptr, conn, nullptr, 0, true)),
+            static_cast<u32>(GrpcWebH1Start::Rejected));
+    }
+}
+
+TEST(grpc_proxy, h1_expect_continue_body_is_rejected_before_rpc) {
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<EpollEventLoop>>();
+    const int listener = create_listen_socket(0).value_or(-1);
+    REQUIRE(listener >= 0);
+    if (!shard->init(0, listener)) {
+        close(listener);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log());
+    RouteConfig config;
+    REQUIRE(config.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)));
+    config.upstreams[0].http2 = true;
+    REQUIRE(config.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &config;
+    REQUIRE(shard->spawn(-1));
+
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(fd >= 0);
+    set_socket_timeouts(fd, 5);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(get_port(listener));
+    REQUIRE(connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    static constexpr char kHeaders[] =
+        "POST /test.Echo/Call HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/grpc-web\r\n"
+        "Content-Length: 5\r\n"
+        "Expect: 100-continue\r\n"
+        "Connection: close\r\n\r\n";
+    REQUIRE(write_all_fd(fd, reinterpret_cast<const u8*>(kHeaders), sizeof(kHeaders) - 1));
+    u8 response[1024]{};
+    const ssize_t received = recv(fd, response, sizeof(response), 0);
+    CHECK_GT(received, 0);
+    if (received > 0) {
+        CHECK(std::search(response, response + received, "HTTP/1.1 503", "HTTP/1.1 503" + 12) !=
+              response + received);
+        CHECK(std::search(response, response + received, "100 Continue", "100 Continue" + 12) ==
+              response + received);
+    }
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+
+    CHECK_EQ(shard->shard_metrics.grpc_started, 0u);
+    CHECK_EQ(server->requests.load(), 0u);
+    shard->stop();
+    shard->join();
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 0u);
+    CHECK_EQ(server->requests.load(), 0u);
+}
+
 TEST(grpc_proxy, h1_http1_policy_fails_closed) {
     Connection conn;
     u8 storage[256]{};
