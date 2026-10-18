@@ -23,6 +23,11 @@
 using namespace rut;
 
 namespace {
+volatile sig_atomic_t grpc_test_signal_count = 0;
+void grpc_test_signal_handler(int) {
+    grpc_test_signal_count = grpc_test_signal_count + 1;
+}
+
 u64 grpc_jit_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_forward(0).pack();
 }
