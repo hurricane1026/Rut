@@ -3787,6 +3787,7 @@ TEST(grpc_proxy, keepalive_tick_queues_ping_behind_split_headers_and_before_othe
     other.upstream = &conn;
     other.upstream_stream = 3;
     other.request_headers_sent = true;
+    other.replaying_attempt = true;
     other.upload_len = 3;
     other.upload[0] = 0;
     other.upload[1] = 0;
