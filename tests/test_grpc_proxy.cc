@@ -23,6 +23,11 @@
 using namespace rut;
 
 namespace {
+volatile sig_atomic_t grpc_test_signal_count = 0;
+void grpc_test_signal_handler(int) {
+    grpc_test_signal_count = grpc_test_signal_count + 1;
+}
+
 u64 grpc_jit_forward(void*, jit::HandlerCtx*, const u8*, u32, void*) {
     return jit::HandlerResult::make_forward(0).pack();
 }
@@ -102,8 +107,17 @@ struct EchoServer {
         int id;
         u32 len;
         bool end;
+        bool response_hold_open;
         bool trailer;
-        u8 data[65535];
+        bool saw_grpc_content_type;
+        bool saw_te_trailers;
+        u8 te_count;
+        bool saw_text_test_marker;
+        u8 content_length_count;
+        u32 content_length_value;
+        u64 request_hash;
+        u32 received_len;
+        u8 data[256 * 1024];
     } streams[64]{};
     int listen_fd = -1;
     int fd = -1;
@@ -113,7 +127,20 @@ struct EchoServer {
     std::atomic<u32> resets{0};
     std::atomic<u32> accepts{0};
     std::atomic<u32> reply_mode{0};
+    std::atomic<u32> stream_response_len{0};
+    std::atomic<bool> stream_response_partial_next{false};
+    std::atomic<bool> json_response{false};
+    std::atomic<u32> duplicate_content_type_order{0};
     std::atomic<u32> request_trailers{0};
+    std::atomic<u32> grpc_content_type_requests{0};
+    std::atomic<u32> te_trailers_requests{0};
+    std::atomic<u32> bad_web_request_headers{0};
+    std::atomic<u32> text_marker_requests{0};
+    std::atomic<u32> text_content_length_requests{0};
+    std::atomic<u32> window_updates{0};
+    std::atomic<u32> last_completed_request_size{0};
+    std::atomic<u32> last_completed_content_length{0};
+    std::atomic<u64> last_completed_request_hash{0};
     bool started = false;
     TlsServerContext* tls_context = nullptr;
     std::atomic<u32> handshake_failures{0};
@@ -126,6 +153,7 @@ struct EchoServer {
         for (auto& s : streams)
             if (!s.id) {
                 s.id = id;
+                s.request_hash = 14695981039346656037ull;
                 return &s;
             }
         return nullptr;
@@ -139,11 +167,11 @@ struct EchoServer {
                              void*) {
         auto* s = static_cast<Stream*>(source->ptr);
         const u32 n = s->len < len ? s->len : static_cast<u32>(len);
-        if (!n && !s->end) return NGHTTP2_ERR_DEFERRED;
+        if (!n && (!s->end || s->response_hold_open)) return NGHTTP2_ERR_DEFERRED;
         memcpy(buf, s->data, n);
         s->len -= n;
         memmove(s->data, s->data + n, s->len);
-        if (!s->len && s->end) {
+        if (!s->len && s->end && !s->response_hold_open) {
             *flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
             nghttp2_nv trailers[] = {nv("grpc-status", "0"), nv("x-trailer", "present")};
             if (nghttp2_submit_trailer(session, id, trailers, 2) != 0)
@@ -154,13 +182,39 @@ struct EchoServer {
     }
     static int frame(nghttp2_session* session, const nghttp2_frame* f, void* user) {
         auto* self = static_cast<EchoServer*>(user);
+        if (f->hd.type == NGHTTP2_WINDOW_UPDATE) self->window_updates++;
         if (!f->hd.stream_id) return 0;
         auto* s = self->get(f->hd.stream_id);
         if (!s) return NGHTTP2_ERR_CALLBACK_FAILURE;
         if (f->hd.type == NGHTTP2_HEADERS && f->headers.cat == NGHTTP2_HCAT_REQUEST) {
             self->requests++;
+            if (s->saw_text_test_marker) {
+                self->text_marker_requests++;
+                if (s->content_length_count) self->text_content_length_requests++;
+            }
+            if (s->saw_grpc_content_type && (!s->saw_te_trailers || s->te_count != 1))
+                self->bad_web_request_headers++;
             const u32 mode = self->reply_mode.exchange(0);
             if (mode == 2) return NGHTTP2_ERR_CALLBACK_FAILURE;
+            if (mode == 6) return 0;
+            if (mode == 7) self->json_response = true;
+            if (mode == 8) self->duplicate_content_type_order = 1;
+            if (mode == 9) self->duplicate_content_type_order = 2;
+            if (mode == 5) {
+                s->response_hold_open = true;
+                const u32 message_len = self->stream_response_len.load();
+                if (message_len < 5 || message_len > sizeof(s->data))
+                    return NGHTTP2_ERR_CALLBACK_FAILURE;
+                s->data[0] = 0;
+                const u32 payload_len = message_len - 5;
+                s->data[1] = static_cast<u8>(payload_len >> 24);
+                s->data[2] = static_cast<u8>(payload_len >> 16);
+                s->data[3] = static_cast<u8>(payload_len >> 8);
+                s->data[4] = static_cast<u8>(payload_len);
+                for (u32 i = 5; i < message_len; i++) s->data[i] = static_cast<u8>(0xa0 + i);
+                s->len = message_len;
+                if (self->stream_response_partial_next.load()) s->data[s->len++] = 0;
+            }
             if (mode == 1) {
                 nghttp2_nv error[] = {nv(":status", "200"),
                                       nv("content-type", "application/grpc"),
@@ -187,13 +241,28 @@ struct EchoServer {
                 return nghttp2_submit_response(session, s->id, large, 4, nullptr);
             }
             if (mode == 4) nghttp2_submit_goaway(session, 0, s->id, NGHTTP2_NO_ERROR, nullptr, 0);
-            nghttp2_nv headers[] = {nv(":status", "200"),
-                                    nv("content-type", "application/grpc"),
-                                    nv("x-meta-bin", "AAEC/w==")};
+            const u32 duplicate_ct = self->duplicate_content_type_order.load();
+            nghttp2_nv headers[4];
+            headers[0] = nv(":status", "200");
+            u32 header_count = 0;
+            if (duplicate_ct) {
+                headers[1] = duplicate_ct == 2 ? nv("content-type", "application/grpc+json")
+                                               : nv("content-type", "application/grpc");
+                headers[2] = duplicate_ct == 1 ? nv("content-type", "application/grpc+json")
+                                               : nv("content-type", "application/grpc");
+                headers[3] = nv("x-meta-bin", "AAEC/w==");
+                header_count = 4;
+            } else {
+                headers[1] = self->json_response.load()
+                                 ? nv("content-type", "application/grpc+json")
+                                 : nv("content-type", "application/grpc");
+                headers[2] = nv("x-meta-bin", "AAEC/w==");
+                header_count = 3;
+            }
             nghttp2_data_provider provider{};
             provider.source.ptr = s;
             provider.read_callback = &read_data;
-            if (nghttp2_submit_response(session, s->id, headers, 3, &provider) != 0)
+            if (nghttp2_submit_response(session, s->id, headers, header_count, &provider) != 0)
                 return NGHTTP2_ERR_CALLBACK_FAILURE;
         }
         if (f->hd.type == NGHTTP2_RST_STREAM) self->resets++;
@@ -202,20 +271,47 @@ struct EchoServer {
         if ((f->hd.type == NGHTTP2_HEADERS || f->hd.type == NGHTTP2_DATA) &&
             (f->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
             s->end = true;
+            self->last_completed_request_size = s->received_len;
+            self->last_completed_content_length = s->content_length_value;
+            self->last_completed_request_hash = s->request_hash;
             nghttp2_session_resume_data(session, s->id);
         }
         return 0;
     }
     static int header(nghttp2_session*,
-                      const nghttp2_frame*,
+                      const nghttp2_frame* frame,
                       const uint8_t* name,
                       size_t name_len,
                       const uint8_t* value,
                       size_t value_len,
                       uint8_t,
                       void* user) {
-        if (name_len != 7 || memcmp(name, ":scheme", 7) != 0) return 0;
         auto* server = static_cast<EchoServer*>(user);
+        auto* stream = frame && frame->hd.stream_id ? server->get(frame->hd.stream_id) : nullptr;
+        if (stream && name_len == 12 && memcmp(name, "content-type", 12) == 0 && value_len == 16 &&
+            memcmp(value, "application/grpc", 16) == 0) {
+            stream->saw_grpc_content_type = true;
+            server->grpc_content_type_requests++;
+        }
+        if (stream && name_len == 2 && memcmp(name, "te", 2) == 0 && value_len == 8 &&
+            memcmp(value, "trailers", 8) == 0) {
+            stream->saw_te_trailers = true;
+            stream->te_count++;
+            server->te_trailers_requests++;
+        }
+        if (stream && name_len == 15 && memcmp(name, "x-test-web-mode", 15) == 0 &&
+            value_len == 4 && memcmp(value, "text", 4) == 0)
+            stream->saw_text_test_marker = true;
+        if (stream && name_len == 14 && memcmp(name, "content-length", 14) == 0) {
+            stream->content_length_count++;
+            u32 parsed = 0;
+            for (size_t i = 0; i < value_len; i++) {
+                if (value[i] < '0' || value[i] > '9' || parsed > (0xffffffffu / 10)) return 0;
+                parsed = parsed * 10 + value[i] - '0';
+            }
+            stream->content_length_value = parsed;
+        }
+        if (name_len != 7 || memcmp(name, ":scheme", 7) != 0) return 0;
         const char* expected = server->tls_context ? "https" : "http";
         if (value_len != strlen(expected) || memcmp(value, expected, value_len) != 0)
             server->bad_schemes++;
@@ -230,6 +326,11 @@ struct EchoServer {
         auto* s = static_cast<EchoServer*>(user)->get(id);
         if (!s || len > sizeof(s->data) - s->len) return NGHTTP2_ERR_CALLBACK_FAILURE;
         memcpy(s->data + s->len, data, len);
+        s->received_len += static_cast<u32>(len);
+        for (size_t i = 0; i < len; i++) {
+            s->request_hash ^= data[i];
+            s->request_hash *= 1099511628211ull;
+        }
         s->len += static_cast<u32>(len);
         nghttp2_session_resume_data(session, id);
         return 0;
@@ -321,13 +422,19 @@ struct Client {
     SSL_CTX* tls_context = nullptr;
     SSL* ssl = nullptr;
     struct Rpc {
+        static constexpr u32 kWebBufferCap = 262144;
         u32 sent = 0, received = 0, size = 0;
         u32 status = 99;
+        u32 raw_len = 0, max_chunk = 0, response_len = 0;
         bool request_trailer = false, end = true, response_end = false, closed = false, ok = false,
-             meta = false, trailer = false;
+             meta = false, trailer = false, raw_request = false, compare_pattern = true,
+             web_content_type = false;
+        std::unique_ptr<u8[]> raw;
+        std::unique_ptr<u8[]> response;
     } rpcs[17];
     nghttp2_session* session = nullptr;
     bool goaway = false;
+    u32 window_updates = 0;
     int fd = -1;
     static u8 byte_at(u32 i) { return static_cast<u8>((i * 17 + i / 256) & 255); }
     static ssize_t data(nghttp2_session* session,
@@ -338,12 +445,16 @@ struct Client {
                         nghttp2_data_source* source,
                         void*) {
         auto* rpc = static_cast<Rpc*>(source->ptr);
-        u32 n = rpc->size - rpc->sent;
+        u32 n = rpc->raw_request ? rpc->raw_len - rpc->sent : rpc->size - rpc->sent;
         if (n > cap) n = static_cast<u32>(cap);
+        if (rpc->max_chunk && n > rpc->max_chunk) n = rpc->max_chunk;
         if (!n && !rpc->end) return NGHTTP2_ERR_DEFERRED;
-        for (u32 i = 0; i < n; i++) out[i] = byte_at(rpc->sent + i);
+        if (rpc->raw_request)
+            memcpy(out, rpc->raw.get() + rpc->sent, n);
+        else
+            for (u32 i = 0; i < n; i++) out[i] = byte_at(rpc->sent + i);
         rpc->sent += n;
-        if (rpc->sent == rpc->size && rpc->end) {
+        if (rpc->sent == (rpc->raw_request ? rpc->raw_len : rpc->size) && rpc->end) {
             *flags |= NGHTTP2_DATA_FLAG_EOF;
             if (rpc->request_trailer) {
                 *flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
@@ -357,8 +468,16 @@ struct Client {
     static int receive(
         nghttp2_session*, uint8_t, int32_t sid, const uint8_t* data, size_t len, void* ctx) {
         auto& rpc = static_cast<Client*>(ctx)->rpcs[(sid - 1) / 2];
-        for (u32 i = 0; i < len; i++)
-            if (data[i] != byte_at(rpc.received + i)) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        if (rpc.compare_pattern) {
+            for (u32 i = 0; i < len; i++)
+                if (data[i] != byte_at(rpc.received + i)) return NGHTTP2_ERR_CALLBACK_FAILURE;
+        } else if (len > Rpc::kWebBufferCap - rpc.response_len) {
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
+        } else {
+            if (!rpc.response) rpc.response = std::make_unique<u8[]>(Rpc::kWebBufferCap);
+            memcpy(rpc.response.get() + rpc.response_len, data, len);
+            rpc.response_len += static_cast<u32>(len);
+        }
         rpc.received += static_cast<u32>(len);
         return 0;
     }
@@ -380,6 +499,8 @@ struct Client {
             rpc.meta = v == 8 && memcmp(value, "AAEC/w==", 8) == 0;
         if (n == 9 && memcmp(name, "x-trailer", n) == 0)
             rpc.trailer = v == 7 && memcmp(value, "present", 7) == 0;
+        if (n == 12 && memcmp(name, "content-type", n) == 0)
+            rpc.web_content_type = (v >= 20 && memcmp(value, "application/grpc-web", 20) == 0);
         return 0;
     }
     static int frame(nghttp2_session*, const nghttp2_frame* f, void* ctx) {
@@ -387,6 +508,10 @@ struct Client {
         if ((f->hd.type == NGHTTP2_HEADERS || f->hd.type == NGHTTP2_DATA) &&
             (f->hd.flags & NGHTTP2_FLAG_END_STREAM))
             static_cast<Client*>(ctx)->rpcs[(f->hd.stream_id - 1) / 2].response_end = true;
+        return 0;
+    }
+    static int frame_send(nghttp2_session*, const nghttp2_frame* f, void* ctx) {
+        if (f->hd.type == NGHTTP2_WINDOW_UPDATE) static_cast<Client*>(ctx)->window_updates++;
         return 0;
     }
     static int closed(nghttp2_session*, int32_t sid, uint32_t, void* ctx) {
@@ -412,6 +537,7 @@ struct Client {
         nghttp2_session_callbacks_set_on_header_callback(cb, &header);
         nghttp2_session_callbacks_set_on_stream_close_callback(cb, &closed);
         nghttp2_session_callbacks_set_on_frame_recv_callback(cb, &frame);
+        nghttp2_session_callbacks_set_on_frame_send_callback(cb, &frame_send);
         const int rc = nghttp2_session_client_new(&session, cb, this);
         nghttp2_session_callbacks_del(cb);
         nghttp2_submit_settings(session, 0, nullptr, 0);
@@ -444,6 +570,40 @@ struct Client {
         provider.source.ptr = &rpcs[index];
         provider.read_callback = &data;
         return nghttp2_submit_request(session, nullptr, headers, 7, &provider, nullptr);
+    }
+    int request_web(u32 index,
+                    const u8* body,
+                    u32 body_len,
+                    bool text,
+                    u32 chunk,
+                    bool content_length = false) {
+        auto& rpc = rpcs[index];
+        if (body_len > Rpc::kWebBufferCap) return -1;
+        if (!rpc.raw) rpc.raw = std::make_unique<u8[]>(Rpc::kWebBufferCap);
+        memcpy(rpc.raw.get(), body, body_len);
+        rpc.raw_len = body_len;
+        rpc.raw_request = true;
+        rpc.compare_pattern = false;
+        rpc.end = true;
+        rpc.max_chunk = chunk;
+        static thread_local char content_length_value[16];
+        nghttp2_nv headers[8] = {
+            nv(":method", "POST"),
+            nv(":scheme", "http"),
+            nv(":authority", "grpc.test"),
+            nv(":path", "/test.Echo/Call"),
+            nv("content-type", text ? "application/grpc-web-text" : "application/grpc-web"),
+            nv("grpc-timeout", "1H")};
+        size_t count = 6;
+        if (text) headers[count++] = nv("x-test-web-mode", "text");
+        if (content_length) {
+            snprintf(content_length_value, sizeof(content_length_value), "%u", body_len);
+            headers[count++] = nv("content-length", content_length_value);
+        }
+        nghttp2_data_provider provider{};
+        provider.source.ptr = &rpc;
+        provider.read_callback = &data;
+        return nghttp2_submit_request(session, nullptr, headers, count, &provider, nullptr);
     }
     bool step() {
         if (!flush_session(session, fd, ssl)) return false;
@@ -494,9 +654,9 @@ struct Client {
 template <typename Loop>
 void streaming_case(rut::test::TestCase* _tc,
                     bool tls = false,
-                    bool large_first = false,
                     bool upstream_tls = false,
-                    bool mutual = false) {
+                    bool mutual = false,
+                    bool large_first = false) {
     auto server = std::make_unique<EchoServer>();
     REQUIRE(server->start(upstream_tls, mutual));
     auto shard = std::make_unique<Shard<Loop>>();
@@ -838,8 +998,366 @@ struct SyncCloseGrpcDriveFixture : GrpcDriveFixture {
         closed = true;
     }
 };
+struct HeldSendGrpcDriveFixture : GrpcDriveFixture {
+    CaptureRing* capture_ring = nullptr;
+    const u8* pending_send = nullptr;
+    u32 pending_send_len = 0;
+    u32 epoch_enters = 0;
+    u32 epoch_leaves = 0;
+    void epoch_enter() { epoch_enters++; }
+    void epoch_leave() { epoch_leaves++; }
+    bool submit_send(Connection&, const u8* data, u32 len) {
+        sends++;
+        pending_send = data;
+        pending_send_len = len;
+        return true;
+    }
+    void close_conn(Connection& conn) {
+        if (conn.on_close) {
+            const auto callback = conn.on_close;
+            conn.on_close = nullptr;
+            callback(this, conn);
+        }
+        if (conn.req_start_us || conn.epoch_held) {
+            conn.req_start_us = 0;
+            conn.epoch_held = false;
+            epoch_leave();
+        }
+        conn.h2 = nullptr;
+        conn.handler_gen++;
+        closed = true;
+    }
+};
 void pending_send(void*, Connection&, IoEvent) {}
 }  // namespace
+
+TEST(grpc_proxy, grpc_web_h1_deadline_resolves_held_sends_without_mutating_owned_bytes) {
+    enum class Case : u8 {
+        PartialNative,
+        CommittedTrailer,
+        CompleteNative,
+        ClientFinAfterQueue,
+        OrdinaryFin,
+    };
+    auto run = [&](GrpcWebContentType mode, Case test_case) {
+        HeldSendGrpcDriveFixture loop;
+        ShardMetrics metrics;
+        metrics.init();
+        AccessLogRing log;
+        log.init();
+        loop.metrics = &metrics;
+        loop.access_log = &log;
+
+        Connection conn;
+        conn.reset();
+        u8 send_storage[4096];
+        conn.send_buf.bind(send_storage, sizeof(send_storage));
+        conn.fd = 41;
+        conn.req_start_us = 1;
+        conn.req_body_streamed = true;
+        conn.request_upload_complete = true;
+        conn.req_metadata_episode = 1;
+        Http2Conn h2;
+        h2.init_client();
+        conn.h2 = &h2;
+        REQUIRE(h2.open_stream(1) != nullptr);
+        h2.grpc.web_h1_kick = &grpc_web_h1_kick_thunk<HeldSendGrpcDriveFixture>;
+        conn.on_close = &grpc_connection_closed<HeldSendGrpcDriveFixture>;
+        loop.epoch_enter();
+
+        auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+        REQUIRE(x != nullptr);
+        x->init();
+        x->web_h1 = true;
+        x->web_mode = mode;
+        x->web_h1_kick = &grpc_web_h1_kick_thunk<HeldSendGrpcDriveFixture>;
+        x->downstream = &conn;
+        x->downstream_stream = 1;
+        x->response_headers_sent = true;
+        x->response_status = 0;
+        x->deadline_us = 1;
+        x->started_us = monotonic_us();
+        x->observed = true;
+        x->request_end_sent = true;
+        if (test_case == Case::PartialNative) {
+            const u8 partial[] = {0, 0, 0, 0, 4, 0xaa, 0xbb};
+            memcpy(x->download, partial, sizeof(partial));
+            x->download_len = sizeof(partial);
+        } else if (test_case == Case::CompleteNative || test_case == Case::ClientFinAfterQueue ||
+                   test_case == Case::OrdinaryFin) {
+            const u8 complete[] = {0, 0, 0, 0, 2, 0xaa, 0xbb};
+            memcpy(x->download, complete, sizeof(complete));
+            x->download_len = sizeof(complete);
+        } else {
+            x->response_end = true;
+        }
+        REQUIRE(grpc_attach(h2, x));
+
+        CHECK(conn.h2 == &h2);
+        CHECK(conn.req_body_streamed);
+        CHECK_GE(conn.fd, 0);
+        CHECK_EQ(grpc_find(h2, 1), x);
+        CHECK(x->web_h1);
+        CHECK_GT(x->download_len + static_cast<u32>(x->response_end), 0u);
+        grpc_web_h1_pump_response(&loop, conn, *x);
+        REQUIRE_EQ(loop.sends, 1u);
+        REQUIRE_GT(loop.pending_send_len, 0u);
+        REQUIRE_EQ(loop.pending_send, conn.send_buf.data());
+        u8 owned_bytes[1024];
+        REQUIRE_LE(conn.send_buf.len(), sizeof(owned_bytes));
+        const u32 owned_len = conn.send_buf.len();
+        memcpy(owned_bytes, conn.send_buf.data(), owned_len);
+        if (test_case == Case::CommittedTrailer) {
+            REQUIRE(x->web_trailer_wire_started);
+            if (mode == GrpcWebContentType::Binary) REQUIRE(x->response_end_sent);
+        } else {
+            REQUIRE(!x->response_end_sent);
+        }
+
+        if (test_case == Case::OrdinaryFin) {
+            loop.close_conn(conn);
+            CHECK_EQ(metrics.grpc_completed[1], 1u);
+            CHECK_EQ(metrics.grpc_completed[4], 0u);
+            CHECK_EQ(loop.epoch_leaves, 1u);
+            AccessLogEntry entry{};
+            REQUIRE(log.pop(entry));
+            CHECK_EQ(entry.grpc_status_plus_one, 2u);
+            CHECK(!log.pop(entry));
+            return;
+        }
+
+        grpc_deadline_fired(&loop, conn);
+        if (test_case == Case::PartialNative || test_case == Case::CommittedTrailer) {
+            CHECK(loop.closed);
+            CHECK_EQ(loop.sends, 1u);
+            CHECK_EQ(metrics.grpc_completed[4], 1u);
+            CHECK_EQ(metrics.grpc_completed[1], 0u);
+            CHECK_EQ(loop.epoch_leaves, 1u);
+            AccessLogEntry entry{};
+            REQUIRE(log.pop(entry));
+            CHECK_EQ(entry.grpc_status_plus_one, 5u);
+            CHECK(!log.pop(entry));
+            return;
+        }
+
+        CHECK(!loop.closed);
+        CHECK(x->web_failure_prepared);
+        CHECK(!x->web_response_invalid);
+        CHECK_EQ(x->failure, 4u);
+        CHECK(x->response_end);
+        CHECK_EQ(loop.sends, 1u);
+        CHECK_EQ(conn.send_buf.len(), owned_len);
+        CHECK_EQ(memcmp(conn.send_buf.data(), owned_bytes, owned_len), 0);
+        CHECK_EQ(metrics.grpc_completed[4], 0u);
+        CHECK_EQ(loop.epoch_leaves, 0u);
+
+        if (test_case == Case::ClientFinAfterQueue) {
+            loop.close_conn(conn);
+            CHECK_EQ(metrics.grpc_completed[1], 1u);
+            CHECK_EQ(metrics.grpc_completed[4], 0u);
+            CHECK_EQ(loop.epoch_leaves, 1u);
+            AccessLogEntry entry{};
+            REQUIRE(log.pop(entry));
+            CHECK_EQ(entry.grpc_status_plus_one, 2u);
+            CHECK(!log.pop(entry));
+            return;
+        }
+
+        grpc_web_h1_on_sent<HeldSendGrpcDriveFixture>(
+            &loop, conn, {conn.id, static_cast<i32>(owned_len), 0, 0, IoEventType::Send, 0});
+        REQUIRE_EQ(loop.sends, 2u);
+        CHECK(x->response_end_sent);
+        CHECK(x->web_trailer_wire_started);
+        const u32 trailer_send_len = loop.pending_send_len;
+        REQUIRE_GT(trailer_send_len, 0u);
+        grpc_web_h1_on_sent<HeldSendGrpcDriveFixture>(
+            &loop, conn, {conn.id, static_cast<i32>(trailer_send_len), 0, 0, IoEventType::Send, 0});
+        CHECK(loop.closed);
+        CHECK_EQ(metrics.grpc_completed[4], 1u);
+        CHECK_EQ(metrics.grpc_completed[1], 0u);
+        CHECK_EQ(loop.epoch_leaves, 1u);
+        AccessLogEntry entry{};
+        REQUIRE(log.pop(entry));
+        CHECK_EQ(entry.grpc_status_plus_one, 5u);
+        CHECK(!log.pop(entry));
+    };
+
+    run(GrpcWebContentType::Binary, Case::PartialNative);
+    run(GrpcWebContentType::Text, Case::PartialNative);
+    run(GrpcWebContentType::Binary, Case::CommittedTrailer);
+    run(GrpcWebContentType::Text, Case::CommittedTrailer);
+    run(GrpcWebContentType::Binary, Case::CompleteNative);
+    run(GrpcWebContentType::Binary, Case::ClientFinAfterQueue);
+    run(GrpcWebContentType::Binary, Case::OrdinaryFin);
+}
+
+TEST(grpc_proxy, grpc_web_h1_text_boundary_flush_does_not_credit_queued_next_message) {
+    HeldSendGrpcDriveFixture loop;
+    Connection downstream, upstream;
+    downstream.reset();
+    upstream.reset();
+    u8 send_storage[4096];
+    downstream.send_buf.bind(send_storage, sizeof(send_storage));
+    downstream.fd = 41;
+    downstream.req_body_streamed = true;
+    downstream.req_metadata_episode = 1;
+    Http2Conn downstream_h2, upstream_h2;
+    downstream_h2.init_client();
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    downstream.h2 = &downstream_h2;
+    upstream.h2 = &upstream_h2;
+    downstream_h2.grpc.web_h1_kick = &grpc_web_h1_kick_thunk<HeldSendGrpcDriveFixture>;
+    REQUIRE(downstream_h2.open_stream(1));
+    auto* up_stream = upstream_h2.open_stream(1);
+    REQUIRE(up_stream);
+    up_stream->manual_window = true;
+    up_stream->recv_unconsumed = 5;
+
+    GrpcExchange x;
+    x.init();
+    x.web_h1 = true;
+    x.web_mode = GrpcWebContentType::Binary;
+    x.web_response_mode = GrpcWebContentType::Text;
+    x.downstream = &downstream;
+    x.upstream = &upstream;
+    x.downstream_stream = x.upstream_stream = 1;
+    x.response_headers_sent = true;
+    x.web_encode_boundary_pending = true;
+    x.response_base64.pending[0] = 0xaa;
+    x.response_base64.pending_len = 1;
+    const u8 first_message[] = {0, 0, 0, 0, 2, 0xbb};
+    REQUIRE_EQ(x.staged_response_message.feed(first_message, sizeof(first_message), false), 0u);
+    const u8 next_message[] = {0, 0, 0, 0, 0};
+    memcpy(x.download, next_message, sizeof(next_message));
+    x.download_len = sizeof(next_message);
+    REQUIRE(grpc_attach(downstream_h2, &x));
+
+    grpc_web_h1_pump_response(&loop, downstream, x);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(up_stream->recv_unconsumed, sizeof(next_message));
+    CHECK_EQ(up_stream->recv_credit, 0u);
+    CHECK_EQ(upstream_h2.conn_recv_credit, 0u);
+    CHECK_EQ(x.download_len, sizeof(next_message));
+    grpc_detach(downstream_h2, &x);
+}
+
+TEST(grpc_proxy, grpc_web_h1_drains_more_than_32_coalesced_chunks) {
+    HeldSendGrpcDriveFixture loop;
+    Connection downstream, upstream;
+    downstream.reset();
+    upstream.reset();
+    u8 downstream_send[SlicePool::kSliceSize];
+    u8 downstream_recv[SlicePool::kSliceSize];
+    u8 upstream_send[SlicePool::kSliceSize];
+    downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+    downstream.bind_request_receive_buffer(downstream_recv, sizeof(downstream_recv));
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    downstream.fd = 41;
+    downstream.req_body_streamed = true;
+    downstream.req_body_mode = BodyMode::Chunked;
+    downstream.req_metadata_episode = 1;
+    downstream.req_chunk_parser.reset();
+    downstream.request_upload_complete = false;
+    Http2Conn downstream_h2, upstream_h2;
+    downstream_h2.init_client();
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.grpc.connecting = true;
+    downstream.h2 = &downstream_h2;
+    upstream.h2 = &upstream_h2;
+    downstream_h2.grpc.web_h1_kick = &grpc_web_h1_kick_thunk<HeldSendGrpcDriveFixture>;
+    REQUIRE(downstream_h2.open_stream(1));
+    REQUIRE(upstream_h2.open_stream(1));
+    GrpcExchange x;
+    x.init();
+    x.web_h1 = true;
+    x.web_mode = GrpcWebContentType::Binary;
+    x.web_response_mode = GrpcWebContentType::Binary;
+    x.downstream = &downstream;
+    x.upstream = &upstream;
+    x.downstream_stream = x.upstream_stream = 1;
+    x.request_message.init(1024);
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    REQUIRE(grpc_attach(upstream_h2, &x));
+
+    u8 body[405];
+    u32 offset = 0;
+    for (u32 i = 0; i < 40; i++) {
+        memcpy(body + offset, "5\r\n", 3);
+        offset += 3;
+        const u8 empty_message[] = {0, 0, 0, 0, 0};
+        memcpy(body + offset, empty_message, sizeof(empty_message));
+        offset += sizeof(empty_message);
+        memcpy(body + offset, "\r\n", 2);
+        offset += 2;
+    }
+    memcpy(body + offset, "0\r\n\r\n", 5);
+    offset += 5;
+    REQUIRE_EQ(offset, sizeof(body));
+    memcpy(downstream_recv, body, sizeof(body));
+    downstream.recv_buf.commit(sizeof(body));
+
+    grpc_web_h1_resume_upload(&loop, downstream);
+    CHECK(downstream.request_upload_complete);
+    CHECK_EQ(downstream.recv_buf.len(), 0u);
+    CHECK(x.request_end);
+    CHECK_EQ(x.failure, 0u);
+    CHECK_EQ(x.upload_len, 200u);
+    grpc_detach(downstream_h2, &x);
+    grpc_detach(upstream_h2, &x);
+}
+
+TEST(grpc_proxy, grpc_web_h1_later_receive_validation_failure_kicks_response) {
+    HeldSendGrpcDriveFixture loop;
+    Connection downstream, upstream;
+    downstream.reset();
+    upstream.reset();
+    u8 downstream_send[SlicePool::kSliceSize];
+    u8 downstream_recv[SlicePool::kSliceSize];
+    u8 upstream_send[SlicePool::kSliceSize];
+    downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+    downstream.bind_request_receive_buffer(downstream_recv, sizeof(downstream_recv));
+    upstream.send_buf.bind(upstream_send, sizeof(upstream_send));
+    downstream.fd = 41;
+    downstream.req_body_streamed = true;
+    downstream.req_body_mode = BodyMode::ContentLength;
+    downstream.req_body_remaining = 1;
+    downstream.req_metadata_episode = 1;
+    downstream.request_upload_complete = false;
+    Http2Conn downstream_h2, upstream_h2;
+    downstream_h2.init_client();
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    upstream_h2.grpc.connecting = true;
+    downstream.h2 = &downstream_h2;
+    upstream.h2 = &upstream_h2;
+    downstream_h2.grpc.web_h1_kick = &grpc_web_h1_kick_thunk<HeldSendGrpcDriveFixture>;
+    REQUIRE(downstream_h2.open_stream(1));
+    REQUIRE(upstream_h2.open_stream(1));
+    GrpcExchange x;
+    x.init();
+    x.web_h1 = true;
+    x.web_mode = GrpcWebContentType::Binary;
+    x.web_response_mode = GrpcWebContentType::Binary;
+    x.downstream = &downstream;
+    x.upstream = &upstream;
+    x.downstream_stream = x.upstream_stream = 1;
+    x.request_message.init(1024);
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    downstream_recv[0] = 0x80;  // invalid gRPC compression flag
+    downstream.recv_buf.commit(1);
+
+    grpc_web_h1_on_recv<HeldSendGrpcDriveFixture>(
+        &loop, downstream, {downstream.id, 1, 0, 0, IoEventType::Recv, 1});
+    CHECK_EQ(x.failure, 13u);
+    CHECK(x.upstream == nullptr);
+    CHECK_GT(loop.sends, 0u);
+    CHECK_GT(loop.pending_send_len, 0u);
+    CHECK(downstream.on_send != nullptr);
+    grpc_detach(downstream_h2, &x);
+}
 
 TEST(grpc_proxy, deadline_releases_upstream_while_downstream_send_is_pending) {
     GrpcDriveFixture loop;
@@ -1852,6 +2370,366 @@ TEST(grpc_proxy, h2_receive_promotion_replaces_full_ordinary_slice) {
     loop.shutdown();
 }
 
+template <typename Loop>
+void grpc_web_h2_case(rut::test::TestCase* _tc) {
+    (void)_tc;
+    auto server = std::make_unique<EchoServer>();
+    REQUIRE(server->start());
+    auto shard = std::make_unique<Shard<Loop>>();
+    const int lfd = create_listen_socket(0).value_or(-1);
+    REQUIRE(lfd >= 0);
+    if (!shard->init(0, lfd).has_value()) {
+        close(lfd);
+        SKIP("backend unavailable");
+    }
+    REQUIRE(shard->init_access_log().has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, get_port(server->listen_fd)).has_value());
+    cfg.upstreams[0].http2 = true;
+    REQUIRE(cfg.add_proxy("/test.Echo/", 'P', 0));
+    shard->route_config = &cfg;
+    REQUIRE(shard->spawn(-1).has_value());
+    u32 expected_trailer_size = 0;
+    {
+        Client client;
+        const bool connected = client.init(get_port(lfd));
+        CHECK(connected);
+        if (connected) {
+            const u8 grpc_body[] = {0, 0, 0, 0, 3, 0xff, 0xfe, 0xfd};
+            u8 text_body[64];
+            GrpcWebBase64Encoder encoder{};
+            encoder.init();
+            u32 consumed = 0, written = 0, flush_written = 0;
+            CHECK_EQ(
+                encoder.feed(
+                    grpc_body, sizeof(grpc_body), consumed, text_body, sizeof(text_body), written),
+                GrpcWebCodecStatus::Ok);
+            CHECK_EQ(consumed, sizeof(grpc_body));
+            CHECK_EQ(encoder.flush(text_body + written, sizeof(text_body) - written, flush_written),
+                     GrpcWebCodecStatus::Ok);
+            const u32 text_len = written + flush_written;
+            GrpcWebTrailer trailers[] = {{{"grpc-status", 11}, {"0", 1}},
+                                         {{"x-trailer", 9}, {"present", 7}}};
+            u8 expected_trailer[128];
+            u32 expected_trailer_len = 0;
+            REQUIRE(grpc_web_encode_trailer_envelope(
+                trailers, 2, expected_trailer, sizeof(expected_trailer), expected_trailer_len));
+            expected_trailer_size = expected_trailer_len;
+            for (u32 i = 0; i < 6; i++) {
+                const bool text = i >= 3;
+                const u32 window_size = (i % 3) + 1;
+                nghttp2_settings_entry window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, window_size};
+                CHECK_EQ(nghttp2_submit_settings(client.session, 0, &window, 1), 0);
+                const u8* request_body = text ? text_body : grpc_body;
+                const u32 request_len = text ? text_len : sizeof(grpc_body);
+                CHECK_EQ(
+                    client.request_web(i, request_body, request_len, text, i % 2 ? 1 : 2, true),
+                    static_cast<int>(i * 2 + 1));
+                CHECK(client.until(i, true));
+                const auto& rpc = client.rpcs[i];
+                CHECK(rpc.web_content_type);
+                CHECK(rpc.meta);
+                u8 decoded[256];
+                u32 decoded_len = 0;
+                if (text) {
+                    GrpcWebBase64Decoder decoder{};
+                    decoder.init();
+                    u32 input_consumed = 0, output_written = 0;
+                    CHECK_EQ(decoder.feed(rpc.response.get(),
+                                          rpc.response_len,
+                                          input_consumed,
+                                          decoded,
+                                          sizeof(decoded),
+                                          output_written),
+                             GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(input_consumed, rpc.response_len);
+                    CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+                    decoded_len = output_written;
+                } else {
+                    CHECK_LE(rpc.response_len, sizeof(decoded));
+                    decoded_len = rpc.response_len;
+                    memcpy(decoded, rpc.response.get(), decoded_len);
+                }
+                CHECK_EQ(decoded_len, sizeof(grpc_body) + expected_trailer_len);
+                if (decoded_len == sizeof(grpc_body) + expected_trailer_len) {
+                    CHECK(memcmp(decoded, grpc_body, sizeof(grpc_body)) == 0);
+                    CHECK(memcmp(decoded + sizeof(grpc_body),
+                                 expected_trailer,
+                                 expected_trailer_len) == 0);
+                }
+            }
+            auto decode_text = [](const Client::Rpc& rpc, u8* output, u32 capacity) {
+                GrpcWebBase64Decoder decoder{};
+                decoder.init();
+                u32 consumed = 0, written = 0;
+                if (decoder.feed(rpc.response.get(),
+                                 rpc.response_len,
+                                 consumed,
+                                 output,
+                                 capacity,
+                                 written) != GrpcWebCodecStatus::Ok ||
+                    consumed != rpc.response_len || decoder.finish() != GrpcWebCodecStatus::Ok)
+                    return 0u;
+                return written;
+            };
+            auto contains = [](const u8* bytes, u32 size, const char* value, u32 value_len) {
+                if (value_len > size) return false;
+                for (u32 i = 0; i <= size - value_len; i++)
+                    if (memcmp(bytes + i, value, value_len) == 0) return true;
+                return false;
+            };
+            u8 multi_frames[14] = {0, 0, 0, 0, 2, 0xaa, 0xbb, 0, 0, 0, 0, 2, 0xcc, 0xdd};
+            u8 multi_text[32];
+            u32 multi_text_len = 0;
+            for (u32 offset = 0; offset < sizeof(multi_frames); offset += 7) {
+                GrpcWebBase64Encoder block{};
+                block.init();
+                u32 block_consumed = 0, block_written = 0, block_flush = 0;
+                CHECK_EQ(block.feed(multi_frames + offset,
+                                    7,
+                                    block_consumed,
+                                    multi_text + multi_text_len,
+                                    sizeof(multi_text) - multi_text_len,
+                                    block_written),
+                         GrpcWebCodecStatus::Ok);
+                CHECK_EQ(block_consumed, 7u);
+                CHECK_EQ(block.flush(multi_text + multi_text_len + block_written,
+                                     sizeof(multi_text) - multi_text_len - block_written,
+                                     block_flush),
+                         GrpcWebCodecStatus::Ok);
+                multi_text_len += block_written + block_flush;
+            }
+            CHECK_EQ(multi_text_len, 24u);
+            CHECK_EQ(client.request_web(6, multi_text, multi_text_len, true, 1, true), 13);
+            CHECK(client.until(6, true));
+            u8 multi_decoded[256];
+            const u32 multi_decoded_len =
+                decode_text(client.rpcs[6], multi_decoded, sizeof(multi_decoded));
+            CHECK_EQ(multi_decoded_len, sizeof(multi_frames) + expected_trailer_len);
+            if (multi_decoded_len == sizeof(multi_frames) + expected_trailer_len) {
+                CHECK(memcmp(multi_decoded, multi_frames, sizeof(multi_frames)) == 0);
+                CHECK(memcmp(multi_decoded + sizeof(multi_frames),
+                             expected_trailer,
+                             expected_trailer_len) == 0);
+            }
+            server->reply_mode = 1;
+            CHECK_EQ(client.request_web(7, grpc_body, sizeof(grpc_body), false, 2), 15);
+            CHECK(client.until(7, true));
+            u8 error_envelope[256];
+            u32 error_len = client.rpcs[7].response_len;
+            CHECK(error_len <= sizeof(error_envelope));
+            if (error_len <= sizeof(error_envelope))
+                memcpy(error_envelope, client.rpcs[7].response.get(), error_len);
+            CHECK(error_len >= 5);
+            if (error_len >= 5) {
+                CHECK_EQ(error_envelope[0], 0x80u);
+                const u32 payload_len = (static_cast<u32>(error_envelope[1]) << 24) |
+                                        (static_cast<u32>(error_envelope[2]) << 16) |
+                                        (static_cast<u32>(error_envelope[3]) << 8) |
+                                        error_envelope[4];
+                CHECK_EQ(payload_len, error_len - 5);
+                CHECK(contains(error_envelope + 5, payload_len, "grpc-status: 7", 14));
+            }
+            server->reply_mode = 2;
+            CHECK_EQ(client.request_web(8, grpc_body, sizeof(grpc_body), false, 2), 17);
+            CHECK(client.until(8, true));
+            CHECK(client.rpcs[8].response_len >= 5);
+            if (client.rpcs[8].response_len >= 5) {
+                CHECK_EQ(client.rpcs[8].response[0], 0x80u);
+                CHECK(contains(client.rpcs[8].response.get() + 5,
+                               client.rpcs[8].response_len - 5,
+                               "grpc-status: 14",
+                               15));
+            }
+            CHECK_EQ(server->grpc_content_type_requests.load(), 9u);
+            CHECK_EQ(server->te_trailers_requests.load(), 9u);
+            CHECK_EQ(server->bad_web_request_headers.load(), 0u);
+            CHECK_EQ(server->text_marker_requests.load(), 4u);
+            CHECK_EQ(server->text_content_length_requests.load(), 0u);
+            const u8 invalid_base64[] = {'A', 'B', '=', 'C'};
+            CHECK_EQ(client.request_web(9, invalid_base64, sizeof(invalid_base64), true, 1, true),
+                     19);
+            CHECK(client.until(9, true));
+            u8 invalid_response[256];
+            const u32 invalid_response_len =
+                decode_text(client.rpcs[9], invalid_response, sizeof(invalid_response));
+            CHECK(invalid_response_len >= 5);
+            if (invalid_response_len >= 5) {
+                CHECK_EQ(invalid_response[0], 0x80u);
+                CHECK(contains(
+                    invalid_response + 5, invalid_response_len - 5, "grpc-status: 13", 15));
+            }
+            nghttp2_settings_entry full_window{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 65535};
+            CHECK_EQ(nghttp2_submit_settings(client.session, 0, &full_window, 1), 0);
+            u8 large_request[70005] = {0, 0, 1, 0x11, 0x70};
+            for (u32 i = 5; i < sizeof(large_request); i++)
+                large_request[i] = static_cast<u8>((i * 31u + i / 251u) & 255u);
+            CHECK_EQ(
+                client.request_web(10, large_request, sizeof(large_request), false, 16384, true),
+                21);
+            CHECK(client.until(10, true));
+            CHECK_EQ(client.rpcs[10].response_len, sizeof(large_request) + expected_trailer_len);
+            if (client.rpcs[10].response_len == sizeof(large_request) + expected_trailer_len) {
+                CHECK(memcmp(client.rpcs[10].response.get(),
+                             large_request,
+                             sizeof(large_request)) == 0);
+                CHECK(memcmp(client.rpcs[10].response.get() + sizeof(large_request),
+                             expected_trailer,
+                             expected_trailer_len) == 0);
+            }
+            constexpr u32 kPayloadLen = 130000;
+            constexpr u32 kNativeLen = kPayloadLen + 5;
+            auto native = std::make_unique<u8[]>(kNativeLen);
+            native[0] = 0;
+            native[1] = static_cast<u8>(kPayloadLen >> 24);
+            native[2] = static_cast<u8>(kPayloadLen >> 16);
+            native[3] = static_cast<u8>(kPayloadLen >> 8);
+            native[4] = static_cast<u8>(kPayloadLen);
+            for (u32 i = 5; i < kNativeLen; i++)
+                native[i] = static_cast<u8>((i * 73u + i / 127u + 19u) & 255u);
+            u64 native_hash = 14695981039346656037ull;
+            for (u32 i = 0; i < kNativeLen; i++) {
+                native_hash ^= native[i];
+                native_hash *= 1099511628211ull;
+            }
+            auto native_to_text = [&](u8* output, u32 capacity) {
+                GrpcWebBase64Encoder large_encoder{};
+                large_encoder.init();
+                u32 native_consumed = 0, encoded = 0, padding = 0;
+                CHECK_EQ(large_encoder.feed(
+                             native.get(), kNativeLen, native_consumed, output, capacity, encoded),
+                         GrpcWebCodecStatus::Ok);
+                CHECK_EQ(native_consumed, kNativeLen);
+                CHECK_EQ(large_encoder.flush(output + encoded, capacity - encoded, padding),
+                         GrpcWebCodecStatus::Ok);
+                return encoded + padding;
+            };
+            auto base64_wire_size = [](u32 len) { return ((len + 2) / 3) * 4; };
+            const u32 content_types_before = server->grpc_content_type_requests.load();
+            const u32 te_trailers_before = server->te_trailers_requests.load();
+            const u32 text_markers_before = server->text_marker_requests.load();
+            u32 text_cases_completed = 0;
+            for (u32 case_index = 0; case_index < 4; case_index++) {
+                const bool text = (case_index & 1) != 0;
+                const u32 rpc_index = 11 + case_index;
+                std::unique_ptr<u8[]> text_body;
+                u32 request_len = kNativeLen;
+                const u8* request_body = native.get();
+                if (text) {
+                    text_body = std::make_unique<u8[]>(base64_wire_size(kNativeLen));
+                    request_len = native_to_text(text_body.get(), base64_wire_size(kNativeLen));
+                    request_body = text_body.get();
+                }
+                const u32 client_updates_before = client.window_updates;
+                const u32 server_updates_before = server->window_updates.load();
+                CHECK_EQ(
+                    client.request_web(rpc_index, request_body, request_len, text, 16384, text),
+                    static_cast<int>(rpc_index * 2 + 1));
+                CHECK(client.until(rpc_index, true));
+                const auto& large_rpc = client.rpcs[rpc_index];
+                CHECK(large_rpc.web_content_type);
+                CHECK(large_rpc.meta);
+                CHECK_EQ(large_rpc.sent, request_len);
+                CHECK(large_rpc.response_end);
+                const u32 decoded_size = kNativeLen + expected_trailer_len;
+                if (text) {
+                    CHECK_EQ(large_rpc.response_len,
+                             base64_wire_size(kNativeLen) + base64_wire_size(expected_trailer_len));
+                    auto decoded = std::make_unique<u8[]>(decoded_size);
+                    GrpcWebBase64Decoder large_decoder{};
+                    large_decoder.init();
+                    u32 raw_consumed = 0, raw_written = 0;
+                    CHECK_EQ(large_decoder.feed(large_rpc.response.get(),
+                                                large_rpc.response_len,
+                                                raw_consumed,
+                                                decoded.get(),
+                                                decoded_size,
+                                                raw_written),
+                             GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(raw_consumed, large_rpc.response_len);
+                    CHECK_EQ(large_decoder.finish(), GrpcWebCodecStatus::Ok);
+                    CHECK_EQ(raw_written, decoded_size);
+                    if (raw_written == decoded_size) {
+                        CHECK_EQ(memcmp(decoded.get(), native.get(), kNativeLen), 0);
+                        CHECK_EQ(
+                            memcmp(
+                                decoded.get() + kNativeLen, expected_trailer, expected_trailer_len),
+                            0);
+                    }
+                } else {
+                    CHECK_EQ(large_rpc.response_len, decoded_size);
+                    if (large_rpc.response_len == decoded_size) {
+                        CHECK_EQ(memcmp(large_rpc.response.get(), native.get(), kNativeLen), 0);
+                        CHECK_EQ(memcmp(large_rpc.response.get() + kNativeLen,
+                                        expected_trailer,
+                                        expected_trailer_len),
+                                 0);
+                    }
+                }
+                CHECK_EQ(server->last_completed_request_size.load(), kNativeLen);
+                CHECK_EQ(server->last_completed_request_hash.load(), native_hash);
+                CHECK_EQ(server->last_completed_content_length.load(), 0u);
+                if (text) text_cases_completed++;
+                CHECK_EQ(server->grpc_content_type_requests.load(),
+                         content_types_before + case_index + 1);
+                CHECK_EQ(server->te_trailers_requests.load(), te_trailers_before + case_index + 1);
+                CHECK_EQ(server->text_marker_requests.load(),
+                         text_markers_before + text_cases_completed);
+                CHECK_GE(client.window_updates - client_updates_before, 2u);
+                CHECK_GE(server->window_updates.load() - server_updates_before, 2u);
+            }
+            CHECK_EQ(server->grpc_content_type_requests.load(), content_types_before + 4);
+            CHECK_EQ(server->te_trailers_requests.load(), te_trailers_before + 4);
+            CHECK_EQ(server->bad_web_request_headers.load(), 0u);
+            CHECK_EQ(server->text_marker_requests.load(), text_markers_before + 2);
+            CHECK_EQ(server->text_content_length_requests.load(), 0u);
+        }
+    }
+    shard->stop();
+    shard->join();
+    CHECK_EQ(shard->shard_metrics.grpc_started, 15u);
+    CHECK_EQ(shard->shard_metrics.grpc_active, 0u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[0], 12u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[7], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[13], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_completed[14], 1u);
+    CHECK_EQ(shard->shard_metrics.grpc_latency.count, 15u);
+    AccessLogEntry log_entry{};
+    u32 large_70k_logs = 0, large_binary_logs = 0, large_text_logs = 0;
+    while (shard->log_ring->pop(log_entry)) {
+        if (log_entry.req_size == 70005u) {
+            large_70k_logs++;
+            CHECK_EQ(log_entry.resp_size, 70005u + expected_trailer_size);
+        }
+        if (log_entry.req_size == 130005u) {
+            large_binary_logs++;
+            CHECK_EQ(log_entry.resp_size, 130005u + expected_trailer_size);
+            CHECK_EQ(log_entry.grpc_status_plus_one, 1u);
+        }
+        if (log_entry.req_size == 173340u) {
+            large_text_logs++;
+            CHECK_EQ(log_entry.resp_size, 173396u);
+            CHECK_EQ(log_entry.grpc_status_plus_one, 1u);
+        }
+    }
+    CHECK_EQ(large_70k_logs, 1u);
+    CHECK_EQ(large_binary_logs, 2u);
+    CHECK_EQ(large_text_logs, 2u);
+    shard->loop->force_close_all();
+    if (shard->loop->listen_fd >= 0) {
+        close(shard->loop->listen_fd);
+        shard->loop->listen_fd = -1;
+    }
+    shard->shutdown();
+}
+
+TEST(grpc_proxy, grpc_web_h2_epoll) {
+    grpc_web_h2_case<EpollEventLoop>(_tc);
+}
+TEST(grpc_proxy, grpc_web_h2_iouring) {
+    grpc_web_h2_case<IoUringEventLoop>(_tc);
+}
+
 TEST(grpc_proxy, streaming_and_pooling_epoll) {
     streaming_case<EpollEventLoop>(_tc);
 }
@@ -1859,10 +2737,10 @@ TEST(grpc_proxy, streaming_and_pooling_iouring) {
     streaming_case<IoUringEventLoop>(_tc);
 }
 TEST(grpc_proxy, first_large_streaming_rpc_epoll) {
-    streaming_case<EpollEventLoop>(_tc, false, true);
+    streaming_case<EpollEventLoop>(_tc, false, false, false, true);
 }
 TEST(grpc_proxy, first_large_streaming_rpc_iouring) {
-    streaming_case<IoUringEventLoop>(_tc, false, true);
+    streaming_case<IoUringEventLoop>(_tc, false, false, false, true);
 }
 TEST(grpc_proxy, failed_connect_ejects_selected_backend) {
     GrpcBackendHealthReset health_reset{};
@@ -1956,6 +2834,176 @@ TEST(grpc_proxy, content_type_prefix_is_ascii_case_insensitive) {
     CHECK(grpc_content_type({"APPLICATION/grpc+proto", 22}));
     CHECK(grpc_content_type({"application/grpc; charset=utf-8", 32}));
     CHECK(!grpc_content_type({"application/grpcx", 17}));
+}
+TEST(grpc_proxy, request_classifier_accepts_web_modes_for_body_dispatch) {
+    ParsedRequest req{};
+    req.headers[0] = {lit_str("content-type"), lit_str("application/grpc-web")};
+    req.header_count = 1;
+    CHECK(grpc_request(req));
+    CHECK_EQ(grpc_request_mode(req), GrpcWebContentType::Binary);
+    req.headers[0].value = lit_str("application/grpc-web-text+proto");
+    CHECK(grpc_request(req));
+    CHECK_EQ(grpc_request_mode(req), GrpcWebContentType::Text);
+    req.headers[0].value = lit_str("application/grpcx");
+    CHECK(!grpc_request(req));
+}
+TEST(grpc_proxy, grpc_web_accept_selects_response_mode_independently) {
+    auto mode_for = [](GrpcWebContentType request_mode, const hpack::Header* headers, u32 count) {
+        return grpc_web_response_mode(headers, count, request_mode);
+    };
+    const hpack::Header text_accept[] = {
+        {lit_str("accept"), lit_str("Application/Grpc-Web-Text+proto; q=1.000")}};
+    const hpack::Header binary_accept[] = {
+        {lit_str("accept"),
+         lit_str("application/grpc-web; q=0.8, application/grpc-web-text;q=0.2")}};
+    const hpack::Header wildcard_exclusion[] = {
+        {lit_str("accept"), lit_str("application/grpc-web-text;q=0, */*;q=1")}};
+    const hpack::Header text_over_binary_wildcard[] = {
+        {lit_str("accept"), lit_str("application/grpc-web-text;q=1, */*;q=1")}};
+    const hpack::Header binary_over_text_wildcard[] = {
+        {lit_str("accept"), lit_str("application/grpc-web;q=1, application/*;q=1")}};
+    const hpack::Header duplicate_q[] = {
+        {lit_str("accept"), lit_str("application/grpc-web-text;q=1;q=0")}};
+    const hpack::Header multiple_physical[] = {
+        {lit_str("accept"), lit_str("application/grpc-web-text;q=0.4")},
+        {lit_str("accept"), lit_str("application/grpc-web;q=0.9")}};
+    const hpack::Header ows[] = {
+        {lit_str("accept"), lit_str(" \t application/grpc-web-text \t; q = 0.7 \t")}};
+    const hpack::Header both_zero[] = {
+        {lit_str("accept"), lit_str("application/grpc-web;q=0, application/grpc-web-text;q=0")}};
+    const hpack::Header unknown_only[] = {
+        {lit_str("accept"), lit_str("application/json, text/plain;q=0.5")}};
+    const hpack::Header same_q_tie[] = {
+        {lit_str("accept"),
+         lit_str("application/grpc-web;q=0.7, application/grpc-web-text;q=0.7")}};
+    const hpack::Header bad_q_values[][1] = {
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=")}},
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=2")}},
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=1.001")}},
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=0.1234")}},
+        {{lit_str("accept"), lit_str("application/grpc-web-text;q=-0.1")}},
+    };
+    CHECK_EQ(mode_for(GrpcWebContentType::Binary, text_accept, 1), GrpcWebContentType::Text);
+    CHECK_EQ(mode_for(GrpcWebContentType::Text, binary_accept, 1), GrpcWebContentType::Binary);
+    CHECK_EQ(mode_for(GrpcWebContentType::Text, wildcard_exclusion, 1), GrpcWebContentType::Binary);
+    CHECK_EQ(mode_for(GrpcWebContentType::Binary, text_over_binary_wildcard, 1),
+             GrpcWebContentType::Text);
+    CHECK_EQ(mode_for(GrpcWebContentType::Text, binary_over_text_wildcard, 1),
+             GrpcWebContentType::Binary);
+    CHECK_EQ(mode_for(GrpcWebContentType::Binary, duplicate_q, 1), GrpcWebContentType::Other);
+    CHECK_EQ(mode_for(GrpcWebContentType::Text, nullptr, 0), GrpcWebContentType::Text);
+
+    struct AcceptCase {
+        GrpcWebContentType request_mode;
+        const hpack::Header* headers;
+        u32 count;
+        GrpcWebContentType expected;
+    };
+    const AcceptCase cases[] = {
+        {GrpcWebContentType::Binary, multiple_physical, 2, GrpcWebContentType::Binary},
+        {GrpcWebContentType::Binary, ows, 1, GrpcWebContentType::Text},
+        {GrpcWebContentType::Text, both_zero, 1, GrpcWebContentType::Other},
+        {GrpcWebContentType::Text, unknown_only, 1, GrpcWebContentType::Text},
+        {GrpcWebContentType::Binary, same_q_tie, 1, GrpcWebContentType::Binary},
+        {GrpcWebContentType::Text, same_q_tie, 1, GrpcWebContentType::Text},
+    };
+    for (const auto& test : cases)
+        CHECK_EQ(mode_for(test.request_mode, test.headers, test.count), test.expected);
+    for (const auto& bad_q : bad_q_values)
+        CHECK_EQ(mode_for(GrpcWebContentType::Binary, bad_q, 1), GrpcWebContentType::Other);
+
+    struct ModeCase {
+        GrpcWebContentType request_mode;
+        const hpack::Header* headers;
+        GrpcWebContentType expected;
+    };
+    const ModeCase mode_cases[] = {
+        {GrpcWebContentType::Binary, text_accept, GrpcWebContentType::Text},
+        {GrpcWebContentType::Text, binary_accept, GrpcWebContentType::Binary}};
+    for (const auto& mode_case : mode_cases) {
+        GrpcDriveFixture loop;
+        Connection downstream;
+        downstream.reset();
+        Http2Conn downstream_h2;
+        downstream_h2.init_client();
+        downstream.h2 = &downstream_h2;
+        auto* stream = downstream_h2.open_stream(1);
+        REQUIRE(stream);
+        GrpcExchange x;
+        x.init();
+        x.web_mode = mode_case.request_mode;
+        x.web_response_mode = mode_for(mode_case.request_mode, mode_case.headers, 1);
+        CHECK_EQ(x.web_response_mode, mode_case.expected);
+        x.downstream = &downstream;
+        x.downstream_stream = 1;
+        x.response_headers_sent = true;
+        const u8 native[] = {0, 0, 0, 0, 0};
+        memcpy(x.download, native, sizeof(native));
+        x.download_len = sizeof(native);
+        REQUIRE(grpc_attach(downstream_h2, &x));
+
+        u8 output[128];
+        const u32 output_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+        REQUIRE_GT(output_len, 0u);
+        REQUIRE_EQ(output[3], static_cast<u8>(Http2FrameType::Data));
+        const u32 payload_len =
+            (static_cast<u32>(output[0]) << 16) | (static_cast<u32>(output[1]) << 8) | output[2];
+        if (mode_case.expected == GrpcWebContentType::Text) {
+            u8 decoded[16];
+            u32 consumed = 0, written = 0;
+            GrpcWebBase64Decoder decoder;
+            decoder.init();
+            REQUIRE_EQ(decoder.feed(output + kFrameHeaderSize,
+                                    payload_len,
+                                    consumed,
+                                    decoded,
+                                    sizeof(decoded),
+                                    written),
+                       GrpcWebCodecStatus::Ok);
+            CHECK_EQ(consumed, payload_len);
+            CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+            CHECK_EQ(written, sizeof(native));
+            CHECK_EQ(memcmp(decoded, native, sizeof(native)), 0);
+        } else {
+            CHECK_EQ(payload_len, sizeof(native));
+            CHECK_EQ(memcmp(output + kFrameHeaderSize, native, sizeof(native)), 0);
+        }
+        grpc_detach(downstream_h2, &x);
+    }
+}
+TEST(grpc_proxy, request_classifier_rejects_ambiguous_web_content_types) {
+    auto classify = [&](Str first, Str second) {
+        ParsedRequest req{};
+        req.headers[0] = {lit_str("content-type"), first};
+        req.headers[1] = {lit_str("content-type"), second};
+        req.header_count = 2;
+        bool ambiguous = false;
+        CHECK_EQ(grpc_request_mode(req, &ambiguous), GrpcWebContentType::Other);
+        CHECK(ambiguous);
+        CHECK(grpc_request(req));
+    };
+    classify(lit_str("application/grpc-web"), lit_str("application/grpc"));
+    classify(lit_str("application/grpc"), lit_str("application/grpc-web"));
+    classify(lit_str("application/grpc-web-text"), lit_str("application/grpc-web"));
+    classify(lit_str("application/grpc-web"), lit_str("application/grpc-web+json"));
+    classify(lit_str("application/grpc-web+json"), lit_str("application/grpc-web-text"));
+
+    ParsedRequest native{};
+    native.headers[0] = {lit_str("content-type"), lit_str("application/grpc+proto")};
+    native.headers[1] = {lit_str("content-type"), lit_str("application/grpc+json")};
+    native.header_count = 2;
+    bool ambiguous = true;
+    CHECK_EQ(grpc_request_mode(native, &ambiguous), GrpcWebContentType::Native);
+    CHECK_FALSE(ambiguous);
+    CHECK(grpc_request(native));
+
+    ParsedRequest unsupported_web{};
+    unsupported_web.headers[0] = {lit_str("content-type"), lit_str("application/grpc-web+json")};
+    unsupported_web.header_count = 1;
+    ambiguous = false;
+    CHECK_EQ(grpc_request_mode(unsupported_web, &ambiguous), GrpcWebContentType::Other);
+    CHECK(ambiguous);
+    CHECK(grpc_request(unsupported_web));
 }
 TEST(grpc_proxy, response_header_filter_strips_content_length_only) {
     const hpack::Header headers[] = {{Str{"content-length", 14}, Str{"0", 1}},
@@ -2925,6 +3973,114 @@ TEST(grpc_proxy, header_ended_positive_content_length_stays_local_failure) {
     loop.force_close_all();
     loop.shutdown();
 }
+TEST(grpc_proxy, h2_web_expect_with_body_is_rejected_before_upstream) {
+    struct Case {
+        Str content_type;
+        Str expect_name;
+        Str expect_value;
+    };
+    const Case cases[] = {
+        {lit_str("application/grpc-web"), lit_str("ExPeCt"), lit_str(" \t100-continue\t ")},
+        {lit_str("application/grpc-web-text"), lit_str("expect"), lit_str("100-continue")},
+    };
+    for (const auto& test_case : cases) {
+        EpollEventLoop loop;
+        REQUIRE(loop.init(0, -1).has_value());
+        RouteConfig cfg;
+        REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+        cfg.upstreams[0].http2 = true;
+        Connection* down = loop.alloc_conn();
+        REQUIRE(down != nullptr);
+        REQUIRE(loop.alloc_h2(*down));
+        down->h2->init_client();
+        REQUIRE(down->h2->open_stream(1));
+        down->request_config = &cfg;
+        ParsedRequest req;
+        req.reset();
+        req.method = HttpMethod::POST;
+        req.headers[0] = {lit_str("content-type"), test_case.content_type};
+        req.header_count = 1;
+        req.has_content_length = true;
+        req.content_length = 5;
+        req.content_length_count = 1;
+        const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                    {{":scheme", 7}, {"http", 4}},
+                                    {{":path", 5}, {"/Echo", 5}},
+                                    {{":authority", 10}, {"x", 1}},
+                                    {{"content-type", 12}, test_case.content_type},
+                                    {test_case.expect_name, test_case.expect_value}};
+        CHECK_FALSE(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 6, req, false));
+        CHECK_EQ(down->h2->grpc.active, 0u);
+        CHECK(down->h2->grpc.streams[0] == nullptr);
+        CHECK(loop.grpc_upstreams == nullptr);
+        CHECK_EQ(down->send_buf.len(), 0u);
+        loop.force_close_all();
+        loop.shutdown();
+    }
+}
+
+TEST(grpc_proxy, h2_web_bodiless_expect_remains_admitted) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init_client();
+    REQUIRE(down->h2->open_stream(1));
+    down->request_config = &cfg;
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    req.headers[0] = {lit_str("content-type"), lit_str("application/grpc-web")};
+    req.header_count = 1;
+    req.has_content_length = true;
+    req.content_length = 0;
+    req.content_length_count = 1;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"content-type", 12}, {"application/grpc-web", 20}},
+                                {{"expect", 6}, {"100-continue", 12}}};
+    CHECK(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 6, req, true));
+    loop.force_close_all();
+    loop.shutdown();
+}
+
+TEST(grpc_proxy, h2_duplicate_web_family_content_types_rejected_before_upstream) {
+    EpollEventLoop loop;
+    REQUIRE(loop.init(0, -1).has_value());
+    RouteConfig cfg;
+    REQUIRE(cfg.add_upstream("grpc", 0x7f000001, 1).has_value());
+    cfg.upstreams[0].http2 = true;
+    Connection* down = loop.alloc_conn();
+    REQUIRE(down != nullptr);
+    REQUIRE(loop.alloc_h2(*down));
+    down->h2->init_client();
+    REQUIRE(down->h2->open_stream(1));
+    down->request_config = &cfg;
+    ParsedRequest req;
+    req.reset();
+    req.method = HttpMethod::POST;
+    req.headers[0] = {lit_str("content-type"), lit_str("application/grpc-web+json")};
+    req.headers[1] = {lit_str("content-type"), lit_str("application/grpc")};
+    req.header_count = 2;
+    const hpack::Header hs[] = {{{":method", 7}, {"POST", 4}},
+                                {{":scheme", 7}, {"http", 4}},
+                                {{":path", 5}, {"/Echo", 5}},
+                                {{":authority", 10}, {"x", 1}},
+                                {{"content-type", 12}, {"application/grpc-web+json", 25}},
+                                {{"content-type", 12}, {"application/grpc", 16}}};
+    CHECK_FALSE(grpc_start_impl(&loop, *down, 1, &cfg, 0, hs, 6, req, true));
+    CHECK_EQ(down->h2->grpc.active, 0u);
+    CHECK(down->h2->grpc.streams[0] == nullptr);
+    CHECK(loop.grpc_upstreams == nullptr);
+    loop.force_close_all();
+    loop.shutdown();
+}
 TEST(grpc_proxy, grpc_response_mutations_snapshot_per_exchange) {
     Connection downstream;
     downstream.reset();
@@ -2969,6 +4125,868 @@ TEST(grpc_proxy, grpc_response_mutations_snapshot_per_exchange) {
     first.init();
     CHECK_FALSE(grpc_snapshot_response_mutations(downstream, first));
     CHECK(first.response_mutation_overflow);
+}
+
+TEST(grpc_proxy, grpc_web_response_mutations_survive_content_type_rewrite) {
+    GrpcDriveFixture loop;
+    Connection upstream, downstream;
+    upstream.reset();
+    downstream.reset();
+    Http2Conn upstream_h2, downstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    downstream_h2.init_client();
+    upstream.h2 = &upstream_h2;
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1));
+    REQUIRE(downstream_h2.open_stream(1));
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    downstream.resp_header_mutations[0] = {{"access-control-allow-origin", 27},
+                                           {"https://example.test", 20},
+                                           Connection::RespHeaderMutationMode::Set};
+    downstream.resp_header_mutation_count = 1;
+    REQUIRE(grpc_snapshot_response_mutations(downstream, x));
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    const hpack::Header headers[] = {{{":status", 7}, {"200", 3}},
+                                     {{"content-type", 12}, {"application/grpc", 16}}};
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, headers, 2, false);
+    CHECK_GT(x.response_headers_len, 9u);
+    if (x.response_headers_len > 9) {
+        hpack::DynamicTable dynamic;
+        dynamic.init(0);
+        u8 decoded_storage[1024];
+        hpack::Header decoded[8];
+        u32 decoded_count = 0;
+        const u32 block_len = x.response_headers_len - 9;
+        CHECK(hpack::decode_header_block(dynamic,
+                                         x.response_headers + 9,
+                                         block_len,
+                                         decoded_storage,
+                                         sizeof(decoded_storage),
+                                         decoded,
+                                         8,
+                                         &decoded_count));
+        bool web_type = false, cors = false;
+        for (u32 i = 0; i < decoded_count; i++) {
+            if (decoded[i].name.eq({"content-type", 12}))
+                web_type = decoded[i].value.eq({"application/grpc-web", 20});
+            if (decoded[i].name.eq({"access-control-allow-origin", 27}))
+                cors = decoded[i].value.eq({"https://example.test", 20});
+        }
+        CHECK(web_type);
+        CHECK(cors);
+    }
+}
+
+TEST(grpc_proxy, grpc_web_backend_content_type_admission_is_order_independent) {
+    auto run =
+        [&](GrpcWebContentType mode, const hpack::Header* headers, u32 count, bool expect_failure) {
+            GrpcDriveFixture loop;
+            Connection upstream, downstream;
+            upstream.reset();
+            downstream.reset();
+            Http2Conn upstream_h2, downstream_h2;
+            upstream_h2.init_client();
+            upstream_h2.grpc.upstream = true;
+            downstream_h2.init_client();
+            upstream.h2 = &upstream_h2;
+            downstream.h2 = &downstream_h2;
+            REQUIRE(upstream_h2.open_stream(1) != nullptr);
+            REQUIRE(downstream_h2.open_stream(1) != nullptr);
+            GrpcExchange x;
+            x.init();
+            x.web_mode = mode;
+            x.upstream = &upstream;
+            x.downstream = &downstream;
+            x.upstream_stream = x.downstream_stream = 1;
+            REQUIRE(grpc_attach(upstream_h2, &x));
+            REQUIRE(grpc_attach(downstream_h2, &x));
+            GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+            grpc_response_headers<GrpcDriveFixture>(
+                &dispatch, upstream_h2, 1, headers, count, false);
+            CHECK_EQ(x.failure != 0, expect_failure);
+            if (expect_failure) {
+                CHECK_EQ(x.failure, 13u);
+                CHECK(x.response_end);
+            } else {
+                CHECK(x.response_headers_len > 9);
+                CHECK(x.upstream == &upstream);
+            }
+            grpc_detach(downstream_h2, &x);
+        };
+
+    const hpack::Header json[] = {{{":status", 7}, {"200", 3}},
+                                  {{"content-type", 12}, {"application/grpc+json", 21}}};
+    run(GrpcWebContentType::Binary, json, 2, true);
+
+    const hpack::Header json_then_proto[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc+json", 21}},
+        {{"content-type", 12}, {"application/grpc+proto", 22}},
+    };
+    const hpack::Header proto_then_json[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc+proto", 22}},
+        {{"content-type", 12}, {"application/grpc+json", 21}},
+    };
+    run(GrpcWebContentType::Binary, json_then_proto, 3, true);
+    run(GrpcWebContentType::Binary, proto_then_json, 3, true);
+    run(GrpcWebContentType::Native, json, 2, false);
+}
+
+TEST(grpc_proxy, grpc_web_incomplete_unstaged_message_becomes_status_trailer) {
+    GrpcDriveFixture loop;
+    Connection upstream, downstream;
+    upstream.reset();
+    downstream.reset();
+    Http2Conn upstream_h2, downstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    downstream_h2.init_client();
+    upstream.h2 = &upstream_h2;
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1));
+    REQUIRE(downstream_h2.open_stream(1));
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    x.upstream = &upstream;
+    x.downstream = &downstream;
+    x.upstream_stream = x.downstream_stream = 1;
+    x.response_headers_sent = true;
+    x.response_message.init(0xffffffffu);
+    REQUIRE(grpc_attach(upstream_h2, &x));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const u8 partial[] = {0, 0, 0, 0, 4, 0xaa, 0xbb};
+    grpc_response_data<GrpcDriveFixture>(&dispatch, upstream_h2, 1, partial, sizeof(partial), true);
+    CHECK_EQ(x.failure, 13u);
+    CHECK(!x.web_response_invalid);
+    CHECK(x.response_end);
+    CHECK_EQ(x.download_len, 0u);
+    CHECK_EQ(grpc_web_prepare_failure(x), 0u);
+    CHECK(x.web_failure_prepared);
+    CHECK(x.web_trailer_queued);
+    GrpcExchange expected;
+    expected.init();
+    REQUIRE(grpc_web_queue_status_trailer(expected, 13));
+    CHECK_EQ(x.response_trailers_len, expected.response_trailers_len);
+    CHECK_EQ(memcmp(x.response_trailers, expected.response_trailers, x.response_trailers_len), 0);
+}
+
+TEST(grpc_proxy, grpc_web_removed_trailers_only_status_becomes_unknown_trailer) {
+    GrpcDriveFixture loop;
+    ShardMetrics metrics{};
+    loop.metrics = &metrics;
+    Connection upstream, downstream;
+    upstream.reset();
+    downstream.reset();
+    Http2Conn upstream_h2, downstream_h2;
+    upstream_h2.init_client();
+    upstream_h2.grpc.upstream = true;
+    downstream_h2.init_client();
+    upstream.h2 = &upstream_h2;
+    downstream.h2 = &downstream_h2;
+    REQUIRE(upstream_h2.open_stream(1));
+    REQUIRE(downstream_h2.open_stream(1));
+    auto* x = reinterpret_cast<GrpcExchange*>(loop.pool.alloc_bulk());
+    REQUIRE(x != nullptr);
+    x->init();
+    x->web_mode = GrpcWebContentType::Binary;
+    x->upstream = &upstream;
+    x->downstream = &downstream;
+    x->upstream_stream = x->downstream_stream = 1;
+    x->started_us = monotonic_us();
+    x->observed = true;
+    metrics.on_grpc_start();
+    downstream.resp_header_mutations[0] = {
+        {"grpc-status", 11}, {nullptr, 0}, Connection::RespHeaderMutationMode::Remove};
+    downstream.resp_header_mutation_count = 1;
+    REQUIRE(grpc_snapshot_response_mutations(downstream, *x));
+    REQUIRE(grpc_attach(upstream_h2, x));
+    REQUIRE(grpc_attach(downstream_h2, x));
+    GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+    const hpack::Header response[] = {
+        {{":status", 7}, {"200", 3}},
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{"grpc-status", 11}, {"0", 1}},
+    };
+    grpc_response_headers<GrpcDriveFixture>(&dispatch, upstream_h2, 1, response, 3, true);
+    CHECK_EQ(x->failure, 2u);
+    CHECK_EQ(x->response_status, 2u);
+    CHECK(x->response_end);
+    CHECK_EQ(metrics.grpc_active, 1u);
+
+    CHECK_EQ(grpc_web_prepare_failure(*x), 0u);
+    CHECK(x->web_trailer_queued);
+    GrpcExchange expected;
+    expected.init();
+    REQUIRE(grpc_web_queue_status_trailer(expected, 2));
+    CHECK_EQ(x->response_trailers_len, expected.response_trailers_len);
+    CHECK_EQ(memcmp(x->response_trailers, expected.response_trailers, x->response_trailers_len), 0);
+
+    x->response_end_sent = true;
+    grpc_observe(&loop, *x);
+    CHECK_EQ(metrics.grpc_completed[2], 1u);
+    CHECK_EQ(metrics.grpc_active, 0u);
+    grpc_observe(&loop, *x);
+    CHECK_EQ(metrics.grpc_completed[2], 1u);
+    loop.pool.free(reinterpret_cast<u8*>(x));
+}
+
+TEST(grpc_proxy, grpc_web_text_batches_independently_padded_messages) {
+    GrpcDriveFixture loop;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn h;
+    h.init_client();
+    downstream.h2 = &h;
+    REQUIRE(h.open_stream(1) != nullptr);
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Text;
+    x.downstream = &downstream;
+    x.downstream_stream = 1;
+    x.response_headers_sent = true;
+    REQUIRE(grpc_attach(h, &x));
+    constexpr u32 messages = 128;
+    constexpr u32 native_size = 7;
+    for (u32 j = 0; j < messages; j++) {
+        const u8 message[] = {0, 0, 0, 0, 2, static_cast<u8>(j), 0xaa};
+        memcpy(x.download + j * native_size, message, sizeof(message));
+    }
+    x.download_len = messages * native_size;
+    u8 expected[messages * native_size];
+    memcpy(expected, x.download, sizeof(expected));
+    u8 output[kDefaultMaxFrameSize + kFrameHeaderSize];
+    const u32 n = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+    Http2FrameHeader frame;
+    REQUIRE(parse_frame_header(output, n, &frame) == ParseStatus::Complete);
+    CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Data));
+    CHECK_EQ(frame.length, messages * 12u);
+    CHECK_EQ(n, kFrameHeaderSize + frame.length);
+    CHECK_EQ(x.download_len, 0u);
+    CHECK_EQ(x.response_base64.pending_len, 0u);
+    u8 decoded[sizeof(expected)];
+    GrpcWebBase64Decoder decoder;
+    decoder.init();
+    u32 consumed = 0, written = 0;
+    CHECK_EQ(
+        decoder.feed(
+            output + kFrameHeaderSize, frame.length, consumed, decoded, sizeof(decoded), written),
+        GrpcWebCodecStatus::Ok);
+    CHECK_EQ(consumed, frame.length);
+    CHECK_EQ(written, sizeof(expected));
+    CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+    CHECK(memcmp(expected, decoded, sizeof(expected)) == 0);
+    CHECK_EQ(x.staged_response_message.header_bytes, 0u);
+    CHECK_EQ(x.staged_response_message.remaining, 0u);
+    grpc_detach(h, &x);
+}
+
+TEST(grpc_proxy, grpc_web_h1_headers_fit_framing_at_exact_slice_capacity) {
+    HeldSendGrpcDriveFixture loop;
+    Connection conn;
+    conn.reset();
+    conn.fd = 41;
+    u8 send_storage[SlicePool::kSliceSize];
+    conn.send_buf.bind(send_storage, sizeof(send_storage));
+
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    static constexpr char kName[] = "x";
+    static constexpr u32 kMaxMetadata = GrpcExchange::kHeaders - 38;
+    static constexpr u32 kContentTypeWire = 12 + 2 + 20 + 2;
+    static constexpr u32 kLargeValueLen = kMaxMetadata - kContentTypeWire - 5;
+    u8 large_value[kLargeValueLen + 1]{};
+    hpack::Header exact[] = {
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{kName, 1}, {reinterpret_cast<const char*>(large_value), kLargeValueLen}}};
+    REQUIRE(grpc_web_queue_h1_headers(x, exact, 2, false));
+    CHECK_EQ(x.response_headers_len, kMaxMetadata);
+
+    x.init();
+    hpack::Header oversized[] = {
+        {{"content-type", 12}, {"application/grpc", 16}},
+        {{kName, 1}, {reinterpret_cast<const char*>(large_value), kLargeValueLen + 1}}};
+    CHECK_FALSE(grpc_web_queue_h1_headers(x, oversized, 2, false));
+
+    // The exact accepted metadata size plus the bridge framing occupies the
+    // full downstream send slice without truncation.
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    REQUIRE(grpc_web_queue_h1_headers(x, exact, 2, false));
+    grpc_web_h1_pump_response(&loop, conn, x);
+    CHECK_EQ(loop.sends, 1u);
+    CHECK_EQ(loop.pending_send_len, SlicePool::kSliceSize);
+    CHECK_FALSE(loop.closed);
+}
+
+TEST(grpc_proxy, grpc_web_terminal_data_can_end_with_zero_flow_control_credit) {
+    for (const auto mode : {GrpcWebContentType::Binary, GrpcWebContentType::Text}) {
+        GrpcDriveFixture loop;
+        Connection downstream;
+        downstream.reset();
+        Http2Conn h;
+        h.init_client();
+        downstream.h2 = &h;
+        auto* stream = h.open_stream(1);
+        REQUIRE(stream != nullptr);
+        stream->send_window = 0;
+        h.conn_send_window = 0;
+        GrpcExchange x;
+        x.init();
+        x.web_mode = mode;
+        x.downstream = &downstream;
+        x.downstream_stream = 1;
+        x.response_headers_sent = true;
+        x.response_end = true;
+        x.web_body_flushed = true;
+        REQUIRE(grpc_attach(h, &x));
+
+        u8 output[9];
+        CHECK_EQ(grpc_pump_downstream(&loop, downstream, output, sizeof(output)), 9u);
+        CHECK_EQ(output[3], static_cast<u8>(Http2FrameType::Data));
+        CHECK_EQ(output[4], http2_flag::kEndStream);
+        CHECK_EQ(output[0] | output[1] | output[2], 0u);
+        CHECK_EQ(stream->send_window, 0);
+        CHECK_EQ(h.conn_send_window, 0u);
+    }
+
+    GrpcDriveFixture loop;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn h;
+    h.init_client();
+    downstream.h2 = &h;
+    auto* stream = h.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->send_window = 0;
+    h.conn_send_window = 0;
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Binary;
+    x.downstream = &downstream;
+    x.downstream_stream = 1;
+    x.response_headers_sent = true;
+    x.response_end = true;
+    x.download[0] = 1;
+    x.download_len = 1;
+    REQUIRE(grpc_attach(h, &x));
+    u8 output[9];
+    CHECK_EQ(grpc_pump_downstream(&loop, downstream, output, sizeof(output)), 0u);
+    CHECK_EQ(x.download_len, 1u);
+}
+
+TEST(grpc_proxy, grpc_web_text_large_message_batches_data_frames) {
+    GrpcDriveFixture loop;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn h;
+    h.init_client();
+    downstream.h2 = &h;
+    auto* stream = h.open_stream(1);
+    REQUIRE(stream != nullptr);
+    stream->send_window = 1 << 20;
+    h.conn_send_window = 1 << 20;
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Text;
+    x.downstream = &downstream;
+    x.downstream_stream = 1;
+    x.response_headers_sent = true;
+    REQUIRE(grpc_attach(h, &x));
+    constexpr u32 payload_size = 131072;
+    constexpr u32 message_size = payload_size + 5;
+    auto message = std::make_unique<u8[]>(message_size);
+    auto decoded = std::make_unique<u8[]>(message_size);
+    message[0] = 0;
+    message[1] = static_cast<u8>(payload_size >> 24);
+    message[2] = static_cast<u8>(payload_size >> 16);
+    message[3] = static_cast<u8>(payload_size >> 8);
+    message[4] = static_cast<u8>(payload_size);
+    for (u32 j = 5; j < message_size; j++) message[j] = static_cast<u8>(j);
+    GrpcWebBase64Decoder decoder;
+    decoder.init();
+    u32 supplied = 0, decoded_size = 0, frames = 0;
+    u8 output[kDefaultMaxFrameSize + kFrameHeaderSize];
+    for (u32 turn = 0; turn < 64; turn++) {
+        if (!x.download_len && supplied < message_size) {
+            u32 chunk = message_size - supplied;
+            if (chunk > sizeof(x.download)) chunk = sizeof(x.download);
+            memcpy(x.download, message.get() + supplied, chunk);
+            x.download_len = chunk;
+            supplied += chunk;
+        }
+        const u32 n = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+        if (n) {
+            frames++;
+            Http2FrameHeader frame;
+            REQUIRE(parse_frame_header(output, n, &frame) == ParseStatus::Complete);
+            CHECK_EQ(frame.type, static_cast<u8>(Http2FrameType::Data));
+            CHECK_EQ(n, kFrameHeaderSize + frame.length);
+            CHECK_LE(frame.length, kDefaultMaxFrameSize);
+            u32 consumed = 0, written = 0;
+            CHECK_EQ(decoder.feed(output + kFrameHeaderSize,
+                                  frame.length,
+                                  consumed,
+                                  decoded.get() + decoded_size,
+                                  message_size - decoded_size,
+                                  written),
+                     GrpcWebCodecStatus::Ok);
+            CHECK_EQ(consumed, frame.length);
+            decoded_size += written;
+        }
+        if (supplied == message_size && !x.download_len && !x.response_base64.pending_len &&
+            !x.web_encode_boundary_pending &&
+            x.web_pending_output_offset == x.web_pending_output_len)
+            break;
+    }
+    CHECK_EQ(supplied, message_size);
+    CHECK_EQ(decoded_size, message_size);
+    CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+    CHECK(memcmp(message.get(), decoded.get(), message_size) == 0);
+    CHECK_LE(frames, 16u);
+    CHECK_GT(frames, 1u);
+    CHECK_EQ(x.staged_response_message.header_bytes, 0u);
+    CHECK_EQ(x.staged_response_message.remaining, 0u);
+    grpc_detach(h, &x);
+}
+
+TEST(grpc_proxy, grpc_web_reset_uses_downstream_staged_message_boundary) {
+    auto run = [=](const u8* staged,
+                   u32 staged_len,
+                   u32 send_window,
+                   GrpcWebContentType mode,
+                   const u8* received,
+                   u32 received_len,
+                   Http2Error reset_error,
+                   bool size_failure,
+                   bool expect_invalid) {
+        GrpcDriveFixture loop;
+        Connection upstream, downstream;
+        upstream.reset();
+        downstream.reset();
+        u8 upstream_recv[SlicePool::kSliceSize];
+        upstream.bind_request_receive_buffer(upstream_recv, sizeof(upstream_recv));
+        u8 downstream_send[SlicePool::kSliceSize];
+        downstream.send_slice = downstream_send;
+        downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+        downstream.on_send = &pending_send;
+        Http2Conn upstream_h2, downstream_h2;
+        upstream_h2.init_client();
+        upstream_h2.grpc.upstream = true;
+        downstream_h2.init_client();
+        upstream.h2 = &upstream_h2;
+        downstream.h2 = &downstream_h2;
+        auto* up_stream = upstream_h2.open_stream(1);
+        auto* down_stream = downstream_h2.open_stream(1);
+        REQUIRE(up_stream != nullptr);
+        REQUIRE(down_stream != nullptr);
+        down_stream->send_window = static_cast<i32>(send_window);
+        GrpcExchange x;
+        x.init();
+        x.web_mode = mode;
+        x.upstream = &upstream;
+        x.downstream = &downstream;
+        x.upstream_stream = x.downstream_stream = 1;
+        x.response_headers_sent = true;
+        x.response_headers_len = 0;
+        if (staged_len) {
+            memcpy(x.download, staged, staged_len);
+            x.download_len = staged_len;
+        }
+        if (size_failure) x.response_message.init(2);
+        REQUIRE(grpc_attach(upstream_h2, &x));
+        REQUIRE(grpc_attach(downstream_h2, &x));
+        u8 output[128];
+        if (staged_len) {
+            x.upstream = nullptr;
+            const u32 staged_output =
+                grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+            CHECK_GT(staged_output, 0u);
+            for (u32 i = 0; mode == GrpcWebContentType::Text && i < 3 &&
+                            (x.download_len || x.response_base64.pending_len == 3);
+                 i++)
+                (void)grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+            x.upstream = &upstream;
+        }
+        if (received_len) {
+            memcpy(x.download + x.download_len, received, received_len);
+            x.download_len += received_len;
+            (void)x.response_message.feed(received, received_len, false);
+        }
+        up_stream->manual_window = true;
+        up_stream->recv_unconsumed = x.download_len;
+        const u32 expected_reset_credit = x.download_len;
+        GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+        if (size_failure) {
+            const u8 too_large[] = {0, 0, 0, 0, 3};
+            grpc_response_data<GrpcDriveFixture>(&dispatch, upstream_h2, 1, too_large, 5, false);
+            CHECK_EQ(x.failure, 8u);
+        } else {
+            grpc_response_reset<GrpcDriveFixture>(&dispatch, upstream_h2, 1, reset_error);
+        }
+        CHECK_EQ(x.web_response_invalid, expect_invalid);
+        if (!size_failure) {
+            CHECK_EQ(up_stream->recv_unconsumed, 0u);
+            CHECK_EQ(upstream_h2.conn_recv_credit, expected_reset_credit);
+        }
+        if (expect_invalid && mode == GrpcWebContentType::Binary) {
+            CHECK_EQ(x.download_len, staged_len > send_window ? staged_len - send_window : 0u);
+        } else if (!expect_invalid) {
+            CHECK_EQ(x.download_len, 0u);
+        }
+        const u32 output_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+        CHECK_GT(output_len, 0u);
+        if (output_len >= 9) {
+            CHECK_EQ(output[3],
+                     expect_invalid ? static_cast<u8>(Http2FrameType::RstStream)
+                                    : static_cast<u8>(Http2FrameType::Data));
+        }
+        grpc_detach(downstream_h2, &x);
+    };
+    const u8 message[] = {0, 0, 0, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd};
+    run(message,
+        sizeof(message),
+        6,
+        GrpcWebContentType::Binary,
+        nullptr,
+        0,
+        Http2Error::Cancel,
+        false,
+        true);
+    run(message,
+        sizeof(message),
+        1000,
+        GrpcWebContentType::Binary,
+        nullptr,
+        0,
+        Http2Error::Cancel,
+        false,
+        false);
+    run(nullptr, 0, 65535, GrpcWebContentType::Binary, nullptr, 0, Http2Error::Cancel, true, false);
+    run(nullptr,
+        0,
+        65535,
+        GrpcWebContentType::Binary,
+        message,
+        7,
+        Http2Error::Cancel,
+        false,
+        false);
+    run(message,
+        sizeof(message),
+        2,
+        GrpcWebContentType::Text,
+        nullptr,
+        0,
+        Http2Error::Cancel,
+        false,
+        true);
+    run(message,
+        sizeof(message),
+        1000,
+        GrpcWebContentType::Text,
+        nullptr,
+        0,
+        Http2Error::Cancel,
+        false,
+        false);
+    const u8 next_message_partial[] = {0, 0, 0, 0, 3, 0x11, 0x22};
+    run(message,
+        sizeof(message),
+        1000,
+        GrpcWebContentType::Binary,
+        next_message_partial,
+        sizeof(next_message_partial),
+        Http2Error::Cancel,
+        false,
+        false);
+    run(message,
+        sizeof(message),
+        1000,
+        GrpcWebContentType::Text,
+        next_message_partial,
+        sizeof(next_message_partial),
+        Http2Error::Cancel,
+        false,
+        false);
+}
+
+TEST(grpc_proxy, grpc_web_local_failure_trailer_survives_tiny_windows) {
+    auto run = [&](bool backend_trailer_queued) {
+        GrpcDriveFixture loop;
+        Connection downstream;
+        downstream.reset();
+        Http2Conn downstream_h2;
+        downstream_h2.init_client();
+        downstream.h2 = &downstream_h2;
+        auto* stream = downstream_h2.open_stream(1);
+        REQUIRE(stream != nullptr);
+
+        GrpcExchange x;
+        x.init();
+        x.web_mode = GrpcWebContentType::Text;
+        x.downstream = &downstream;
+        x.downstream_stream = 1;
+        x.response_headers_sent = true;
+        if (backend_trailer_queued) REQUIRE(grpc_web_queue_status_trailer(x, 0));
+        x.failure = 4;
+        REQUIRE(grpc_attach(downstream_h2, &x));
+
+        GrpcExchange expected;
+        expected.init();
+        REQUIRE(grpc_web_queue_status_trailer(expected, x.failure));
+
+        GrpcWebBase64Decoder decoder;
+        decoder.init();
+        u8 decoded[256];
+        u32 decoded_len = 0;
+        u8 output[64];
+        bool ended = false;
+        for (u32 i = 0; i < 256 && !ended; i++) {
+            stream->send_window = 1;
+            downstream_h2.conn_send_window = 1;
+            const u32 output_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+            REQUIRE_GT(output_len, 0u);
+            CHECK_EQ(output[3], static_cast<u8>(Http2FrameType::Data));
+            const u32 payload_len = (static_cast<u32>(output[0]) << 16) |
+                                    (static_cast<u32>(output[1]) << 8) | output[2];
+            CHECK_LE(payload_len, 1u);
+            u32 consumed = 0, written = 0;
+            REQUIRE_EQ(decoder.feed(output + 9,
+                                    payload_len,
+                                    consumed,
+                                    decoded + decoded_len,
+                                    sizeof(decoded) - decoded_len,
+                                    written),
+                       GrpcWebCodecStatus::Ok);
+            CHECK_EQ(consumed, payload_len);
+            decoded_len += written;
+            ended = (output[4] & 1) != 0;
+            CHECK(x.web_failure_prepared);
+        }
+        CHECK(ended);
+        CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+        CHECK_EQ(decoded_len, expected.response_trailers_len);
+        CHECK_EQ(memcmp(decoded, expected.response_trailers, decoded_len), 0);
+        CHECK_EQ(x.staged_response_message.header_bytes, 0u);
+        CHECK_EQ(x.staged_response_message.remaining, 0u);
+        grpc_detach(downstream_h2, &x);
+    };
+    run(false);
+    run(true);
+}
+
+TEST(grpc_proxy, grpc_web_text_flushes_each_open_stream_message) {
+    auto check_message = [&](u32 payload_len, bool append_next_prefix) {
+        GrpcDriveFixture loop;
+        Connection downstream;
+        downstream.reset();
+        Http2Conn downstream_h2;
+        downstream_h2.init_client();
+        downstream.h2 = &downstream_h2;
+        auto* stream = downstream_h2.open_stream(1);
+        REQUIRE(stream != nullptr);
+
+        GrpcExchange x;
+        x.init();
+        x.web_mode = GrpcWebContentType::Text;
+        x.downstream = &downstream;
+        x.downstream_stream = 1;
+        x.response_headers_sent = true;
+        u8 message[] = {0, 0, 0, 0, 0, 0xaa, 0xbb, 0xcc};
+        message[4] = static_cast<u8>(payload_len);
+        const u32 message_len = 5 + payload_len;
+        memcpy(x.download, message, message_len);
+        x.download_len = message_len;
+        if (append_next_prefix) x.download[x.download_len++] = 0;
+        REQUIRE(grpc_attach(downstream_h2, &x));
+
+        GrpcWebBase64Decoder decoder;
+        decoder.init();
+        u8 decoded[64];
+        u32 decoded_len = 0;
+        u8 output[64];
+        bool staged = false;
+        for (u32 i = 0; i < 32 && !staged; i++) {
+            const u32 output_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+            if (output_len) {
+                REQUIRE_EQ(output[3], static_cast<u8>(Http2FrameType::Data));
+                const u32 payload_bytes = (static_cast<u32>(output[0]) << 16) |
+                                          (static_cast<u32>(output[1]) << 8) | output[2];
+                u32 consumed = 0, written = 0;
+                REQUIRE_EQ(decoder.feed(output + 9,
+                                        payload_bytes,
+                                        consumed,
+                                        decoded + decoded_len,
+                                        sizeof(decoded) - decoded_len,
+                                        written),
+                           GrpcWebCodecStatus::Ok);
+                REQUIRE_EQ(consumed, payload_bytes);
+                decoded_len += written;
+            }
+            staged = decoded_len == message_len && !x.staged_response_message.header_bytes &&
+                     !x.staged_response_message.remaining;
+        }
+        CHECK(staged);
+        CHECK_EQ(decoded_len, message_len);
+        CHECK_EQ(memcmp(decoded, message, message_len), 0);
+        CHECK_EQ(decoder.finish(), GrpcWebCodecStatus::Ok);
+        CHECK_EQ(x.download_len + x.response_base64.pending_len, append_next_prefix ? 1u : 0u);
+        grpc_detach(downstream_h2, &x);
+    };
+
+    check_message(0, false);
+    check_message(1, false);
+    check_message(2, false);
+    check_message(3, false);
+    check_message(2, true);
+}
+
+TEST(grpc_proxy, grpc_web_local_failure_after_partial_trailer_resets) {
+    GrpcDriveFixture loop;
+    Connection downstream;
+    downstream.reset();
+    Http2Conn downstream_h2;
+    downstream_h2.init_client();
+    downstream.h2 = &downstream_h2;
+    auto* stream = downstream_h2.open_stream(1);
+    REQUIRE(stream != nullptr);
+
+    GrpcExchange x;
+    x.init();
+    x.web_mode = GrpcWebContentType::Text;
+    x.downstream = &downstream;
+    x.downstream_stream = 1;
+    x.response_headers_sent = true;
+    x.response_end = true;
+    REQUIRE(grpc_web_queue_status_trailer(x, 0));
+    REQUIRE(grpc_attach(downstream_h2, &x));
+
+    stream->send_window = 1;
+    downstream_h2.conn_send_window = 1;
+    u8 output[64];
+    const u32 first_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+    REQUIRE_GT(first_len, 0u);
+    CHECK_EQ(output[3], static_cast<u8>(Http2FrameType::Data));
+    CHECK_EQ((static_cast<u32>(output[0]) << 16) | (static_cast<u32>(output[1]) << 8) | output[2],
+             1u);
+    CHECK(x.web_trailer_wire_started);
+
+    x.failure = 4;
+    stream->send_window = 1;
+    downstream_h2.conn_send_window = 1;
+    const u32 reset_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+    REQUIRE_GT(reset_len, 0u);
+    CHECK(x.web_response_invalid);
+    CHECK_EQ(output[3], static_cast<u8>(Http2FrameType::RstStream));
+    grpc_detach(downstream_h2, &x);
+}
+
+TEST(grpc_proxy, grpc_web_upstream_reset_after_partial_trailer_resets_downstream) {
+    for (const auto mode : {GrpcWebContentType::Binary, GrpcWebContentType::Text}) {
+        GrpcDriveFixture loop;
+        Connection upstream, downstream;
+        upstream.reset();
+        downstream.reset();
+        u8 downstream_send[SlicePool::kSliceSize];
+        downstream.send_slice = downstream_send;
+        downstream.send_buf.bind(downstream_send, sizeof(downstream_send));
+        downstream.on_send = &pending_send;
+        Http2Conn upstream_h2, downstream_h2;
+        upstream_h2.init_client();
+        upstream_h2.grpc.upstream = true;
+        downstream_h2.init_client();
+        upstream.h2 = &upstream_h2;
+        downstream.h2 = &downstream_h2;
+        auto* up_stream = upstream_h2.open_stream(1);
+        auto* down_stream = downstream_h2.open_stream(1);
+        REQUIRE(up_stream != nullptr);
+        REQUIRE(down_stream != nullptr);
+        up_stream->manual_window = true;
+        down_stream->send_window = 1;
+
+        GrpcExchange x;
+        x.init();
+        x.web_mode = mode;
+        x.upstream = &upstream;
+        x.downstream = &downstream;
+        x.upstream_stream = x.downstream_stream = 1;
+        x.response_headers_sent = true;
+        REQUIRE(grpc_web_queue_status_trailer(x, 0));
+        REQUIRE(grpc_attach(upstream_h2, &x));
+        REQUIRE(grpc_attach(downstream_h2, &x));
+
+        u8 output[64];
+        downstream_h2.conn_send_window = 1;
+        Connection* upstream_connection = x.upstream;
+        x.upstream = nullptr;
+        const u32 first_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+        x.upstream = upstream_connection;
+        REQUIRE_GT(first_len, 0u);
+        CHECK(x.web_trailer_wire_started);
+
+        GrpcClientDispatch<GrpcDriveFixture> dispatch{&loop, &upstream};
+        x.downstream = nullptr;
+        upstream_h2.grpc.busy = true;
+        grpc_response_reset<GrpcDriveFixture>(&dispatch, upstream_h2, 1, Http2Error::Cancel);
+        upstream_h2.grpc.busy = false;
+        x.downstream = &downstream;
+        CHECK(x.web_response_invalid);
+        CHECK(x.web_failure_prepared);
+        CHECK_EQ(x.web_trailer_queued, true);
+        down_stream->send_window = 16;
+        downstream_h2.conn_send_window = 16;
+        const u32 reset_len = grpc_pump_downstream(&loop, downstream, output, sizeof(output));
+        REQUIRE_GT(reset_len, 0u);
+        CHECK_EQ(output[3], static_cast<u8>(Http2FrameType::RstStream));
+        grpc_detach(downstream_h2, &x);
+    }
+}
+
+TEST(grpc_proxy, grpc_web_message_limit_applies_after_text_decode) {
+    for (const bool text : {false, true}) {
+        GrpcDriveFixture loop;
+        Connection upstream, downstream;
+        upstream.reset();
+        downstream.reset();
+        Http2Conn upstream_h2, downstream_h2;
+        upstream_h2.init_client();
+        upstream_h2.grpc.upstream = true;
+        downstream_h2.init_client();
+        upstream.h2 = &upstream_h2;
+        downstream.h2 = &downstream_h2;
+        REQUIRE(upstream_h2.open_stream(1));
+        REQUIRE(downstream_h2.open_stream(1));
+        GrpcExchange x;
+        x.init();
+        x.web_mode = text ? GrpcWebContentType::Text : GrpcWebContentType::Binary;
+        x.upstream = &upstream;
+        x.downstream = &downstream;
+        x.upstream_stream = x.downstream_stream = 1;
+        x.request_headers_sent = true;
+        x.request_message.init(2);
+        REQUIRE(grpc_attach(upstream_h2, &x));
+        REQUIRE(grpc_attach(downstream_h2, &x));
+        const u8 binary[] = {0, 0, 0, 0, 3, 0xaa, 0xbb, 0xcc};
+        const u8 base64[] = {'A', 'A', 'A', 'A', 'A', 'A', 'O', 'q', 'u', '8', 'w', '='};
+        const u8* input = text ? base64 : binary;
+        const u32 input_len = text ? sizeof(base64) : sizeof(binary);
+        grpc_request_data(&loop, downstream, x, input, input_len, true);
+        CHECK_EQ(x.failure, 8u);
+        CHECK(x.upstream == nullptr);
+        CHECK_EQ(x.upload_len, 0u);
+    }
 }
 
 TEST(grpc_proxy, expired_headers_deadline_is_cancelled_before_upstream_headers) {
@@ -3118,16 +5136,16 @@ TEST(grpc_proxy, tls_downstream_jit_iouring) {
     streaming_case<IoUringEventLoop>(_tc, true);
 }
 TEST(grpc_proxy, upstream_tls_epoll) {
-    streaming_case<EpollEventLoop>(_tc, false, false, true);
+    streaming_case<EpollEventLoop>(_tc, false, true);
 }
 TEST(grpc_proxy, upstream_tls_iouring) {
-    streaming_case<IoUringEventLoop>(_tc, false, false, true);
+    streaming_case<IoUringEventLoop>(_tc, false, true);
 }
 TEST(grpc_proxy, upstream_mtls_epoll) {
-    streaming_case<EpollEventLoop>(_tc, true, false, true, true);
+    streaming_case<EpollEventLoop>(_tc, true, true, true);
 }
 TEST(grpc_proxy, upstream_mtls_iouring) {
-    streaming_case<IoUringEventLoop>(_tc, true, false, true, true);
+    streaming_case<IoUringEventLoop>(_tc, true, true, true);
 }
 
 namespace {
@@ -3793,3 +5811,5 @@ TEST(grpc_proxy, message_limits_snapshot_epoll) {
 TEST(grpc_proxy, message_limits_snapshot_iouring) {
     message_limit_snapshot_case<IoUringEventLoop>(_tc);
 }
+
+#include "grpc_web_h1_cases.h"

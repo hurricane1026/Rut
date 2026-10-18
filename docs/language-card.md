@@ -410,10 +410,32 @@ Unary, client-streaming, server-streaming and bidirectional RPCs use the same
 `forward`. Bodies (including compressed messages) and metadata are opaque;
 trailers including `grpc-status` are preserved. Header-only middleware may run
 before forwarding; body-reading handlers and HTTP/1-specific forward policies
-are outside this streaming path. HTTP/1 requests cannot use an HTTP/2 upstream.
+are outside this streaming path. Native gRPC over HTTP/1 is rejected.
 No `.proto`, protobuf dependency, new route keyword or streaming modifier is
-needed. gRPC-Web, JSON transcoding and gRPC health probes are
-not implemented by this option; `health_check` with `.http2` is rejected.
+needed. JSON transcoding and gRPC health probes are not implemented by this
+option; `health_check` with `.http2` is rejected.
+
+Binary and base64-text gRPC-Web can use the same `.http2` upstream through
+HTTP/2 or HTTP/1.1 POST requests. Content types are `application/grpc-web` and
+`application/grpc-web-text`, optionally suffixed with `+proto`; `+json` is not
+supported. The bridge preserves opaque protobuf payloads and converts backend
+trailers into the final gRPC-Web body envelope. The incremental base64 request
+decoder accepts independently padded flush blocks. HTTP/1.1 accepts
+Content-Length or chunked uploads and closes after the response; it does not
+provide keep-alive or pipelining for these RPCs. The HTTP/1.1 bridge rejects
+routes configured with downstream `throttle` until response pacing is integrated
+with the bridge. Browser CORS requires
+explicit OPTIONS routes and response headers; see [the browser
+example](../examples/grpc-web.rut) and [its
+instructions](../examples/grpc/README.md#browser-grpc-web-example).
+
+The request `Content-Type` selects upload decoding, while `Accept` independently
+selects binary or base64-text response encoding. Supported Web media ranges use
+their q values and specificity; ties prefer the request mode. Missing or
+unrecognized Web ranges retain the request-mode response for compatibility.
+Malformed supported Web ranges, duplicate q parameters, or a selection with no
+acceptable supported representation are rejected. Native gRPC ignores Web
+`Accept` values.
 
 Native gRPC upstream sessions with active RPCs send an HTTP/2 PING every five
 minutes after connection establishment or the previous probe. Only an ACK with
@@ -476,7 +498,9 @@ upstream bounded {
 ```
 
 Each field is a positive integer through 4,294,967,295. Omission preserves
-opaque forwarding without envelope validation. A configured direction reads
+native opaque forwarding without envelope validation. Web always validates
+framing, with an implicit unsigned 32-bit payload ceiling when omitted.
+A configured direction reads
 only the five-byte gRPC envelope, across arbitrary HTTP/2 DATA boundaries;
 payload contents are never decoded. The limit applies to each message's wire
 payload, excluding its envelope. For compressed messages it bounds compressed

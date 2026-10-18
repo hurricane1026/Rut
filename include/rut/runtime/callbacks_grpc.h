@@ -130,7 +130,12 @@ void grpc_observe(Loop* loop, GrpcExchange& x) {
     if (!x.observed) return;
     x.observed = false;
     const u64 kElapsed = monotonic_us() - x.started_us;
-    const u8 kStatus = x.response_end_sent ? (x.failure ? x.failure : x.response_status) : 1;
+    const bool web_failure_terminated =
+        x.web_failure_prepared && x.web_response_invalid && x.failure;
+    const u8 kStatus =
+        web_failure_terminated
+            ? x.failure
+            : (x.response_end_sent ? (x.failure ? x.failure : x.response_status) : 1);
     if (loop->metrics) loop->metrics->on_grpc_complete(kStatus, kElapsed);
     auto& entry = x.log_entry;
     entry.timestamp_us = realtime_us();
@@ -142,6 +147,7 @@ void grpc_observe(Loop* loop, GrpcExchange& x) {
                           ? 0xffffffffu
                           : static_cast<u32>(x.staged_response_bytes);
     entry.grpc_status_plus_one = kStatus + 1;
+    if (x.skip_rpc_log) return;
     if (loop->access_log && loop->live_access_log)
         loop->live_access_log->fail_protocol(EINVAL);
     else if (loop->live_access_log)
@@ -158,7 +164,14 @@ void grpc_release(Loop* loop, GrpcExchange* x, bool cancel) {
     Connection* down = x->downstream;
     Connection* up = x->upstream;
     if (down && down->h2) {
-        down->h2->consume_data(x->downstream_stream, x->upload_len);
+        if (!x->web_h1) {
+            if (x->web_mode == GrpcWebContentType::Text)
+                down->h2->consume_data(x->downstream_stream, x->upload_raw_credit);
+            else
+                down->h2->consume_data(x->downstream_stream, x->upload_len);
+        }
+        x->upload_raw_credit = 0;
+        x->upload_len = 0;
         if (auto* stream = down->h2->find_stream(x->downstream_stream))
             stream->manual_window = false;
         grpc_detach(*down->h2, x);
@@ -344,6 +357,167 @@ inline u8 grpc_observed_status(const hpack::Header* hs, u32 n) {
     }
     return status;
 }
+inline bool grpc_web_trailer_metadata(const hpack::Header& h) {
+    return !h.name.eq({":status", 7}) && !h.name.eq({"content-type", 12}) &&
+           !h.name.eq({"content-length", 14});
+}
+inline bool grpc_web_queue_trailers(GrpcExchange& x, const hpack::Header* hs, u32 n) {
+    GrpcWebTrailer trailers[Http2Conn::kMaxHeadersPerReq];
+    u32 count = 0;
+    for (u32 i = 0; i < n; i++) {
+        if (!grpc_web_trailer_metadata(hs[i])) continue;
+        if (count >= Http2Conn::kMaxHeadersPerReq) return false;
+        trailers[count++] = {hs[i].name, hs[i].value};
+    }
+    if (!grpc_web_encode_trailer_envelope(trailers,
+                                          count,
+                                          x.response_trailers,
+                                          sizeof(x.response_trailers),
+                                          x.response_trailers_len))
+        return false;
+    x.response_trailers_offset = 0;
+    x.web_trailer_queued = true;
+    x.web_body_flushed = false;
+    x.web_trailer_flushed = false;
+    return true;
+}
+inline bool grpc_web_queue_status_trailer(GrpcExchange& x, u8 code) {
+    char digits[2] = {static_cast<char>('0' + code / 10), static_cast<char>('0' + code % 10)};
+    const Str value = code >= 10 ? Str{digits, 2} : Str{digits + 1, 1};
+    const hpack::Header status{{"grpc-status", 11}, value};
+    return grpc_web_queue_trailers(x, &status, 1);
+}
+template <typename Loop>
+inline void grpc_web_kick_h1(Loop* loop, GrpcExchange& x) {
+    if (x.web_h1 && x.web_h1_kick && x.downstream)
+        x.web_h1_kick(loop, static_cast<ConnectionBase&>(*x.downstream));
+}
+inline GrpcWebContentType grpc_response_web_mode(const GrpcExchange& x) {
+    return x.web_response_mode == GrpcWebContentType::Native ? x.web_mode : x.web_response_mode;
+}
+inline bool grpc_web_force_content_type(GrpcExchange& x,
+                                        hpack::Header* headers,
+                                        u32* count,
+                                        u32 capacity) {
+    const auto mode =
+        x.web_response_mode == GrpcWebContentType::Native ? x.web_mode : x.web_response_mode;
+    const Str value = mode == GrpcWebContentType::Text ? Str{"application/grpc-web-text", 25}
+                                                       : Str{"application/grpc-web", 20};
+    bool found = false;
+    for (u32 i = 0; i < *count;) {
+        if (headers[i].name.eq({"content-length", 14})) {
+            for (u32 move = i + 1; move < *count; move++) headers[move - 1] = headers[move];
+            (*count)--;
+            continue;
+        }
+        if (!headers[i].name.eq({"content-type", 12})) {
+            i++;
+            continue;
+        }
+        if (!found) {
+            headers[i].value = value;
+            found = true;
+            i++;
+        } else {
+            for (u32 move = i + 1; move < *count; move++) headers[move - 1] = headers[move];
+            (*count)--;
+        }
+    }
+    if (found) return true;
+    if (*count >= capacity) return false;
+    headers[*count] = {{"content-type", 12}, value};
+    (*count)++;
+    return true;
+}
+inline bool grpc_web_is_trailer_only(const hpack::Header& h) {
+    return h.name.eq({"grpc-status", 11}) || h.name.eq({"grpc-message", 12}) ||
+           h.name.eq({"grpc-status-details-bin", 23});
+}
+inline bool grpc_web_response_boundary(const GrpcExchange& x) {
+    if (x.staged_response_message.header_bytes || x.staged_response_message.remaining) return false;
+    return grpc_response_web_mode(x) != GrpcWebContentType::Text || !x.web_pending_output_offset ||
+           x.web_pending_output_offset == x.web_pending_output_len;
+}
+inline u32 grpc_web_drop_unstaged_response(GrpcExchange& x) {
+    const u32 dropped = x.download_len;
+    x.download_len = 0;
+    x.response_trailers_len = x.response_trailers_offset = 0;
+    x.web_trailer_queued = false;
+    x.web_trailer_encoding = false;
+    x.web_trailer_wire_started = false;
+    if (grpc_response_web_mode(x) == GrpcWebContentType::Text) {
+        x.response_base64.init();
+        x.web_encoded_message.init(0xffffffffu);
+        x.web_encode_boundary_pending = false;
+        x.web_pending_output_offset = x.web_pending_output_len = 0;
+        x.web_pending_native_len = 0;
+        x.web_pending_output_is_trailer = false;
+        x.web_body_flushed = false;
+    }
+    return dropped;
+}
+inline u32 grpc_web_prepare_failure(GrpcExchange& x) {
+    if (!x.failure || x.web_failure_prepared) return 0;
+    x.web_failure_prepared = true;
+    x.web_response_invalid =
+        x.web_response_invalid || x.web_trailer_wire_started || !grpc_web_response_boundary(x);
+    if (x.web_response_invalid) return 0;
+    x.response_end = true;
+    const u32 dropped = grpc_web_drop_unstaged_response(x);
+    if (!grpc_web_queue_status_trailer(x, x.failure)) x.web_response_invalid = true;
+    return dropped;
+}
+inline bool grpc_web_queue_h1_headers(GrpcExchange& x,
+                                      const hpack::Header* headers,
+                                      u32 count,
+                                      bool seed_error,
+                                      bool mutations_applied = false) {
+    hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
+    u32 filtered_count = 0;
+    if (seed_error) {
+        filtered[filtered_count++] = {{":status", 7}, {"200", 3}};
+        filtered[filtered_count++] = {{"content-type", 12}, {"application/grpc", 16}};
+    } else {
+        for (u32 i = 0; i < count; i++) {
+            if (!headers[i].name.len || headers[i].name.ptr[0] == ':' ||
+                headers[i].name.eq({"content-length", 14}) ||
+                headers[i].name.eq({"transfer-encoding", 17}) ||
+                headers[i].name.eq({"connection", 10}))
+                continue;
+            if (filtered_count >= Http2Conn::kMaxHeadersPerReq) return false;
+            filtered[filtered_count++] = headers[i];
+        }
+    }
+    if ((!mutations_applied && !grpc_apply_response_mutations(
+                                   x, filtered, &filtered_count, Http2Conn::kMaxHeadersPerReq)) ||
+        !grpc_web_force_content_type(x, filtered, &filtered_count, Http2Conn::kMaxHeadersPerReq))
+        return false;
+    u32 offset = 0;
+    for (u32 i = 0; i < filtered_count; i++) {
+        const auto& header = filtered[i];
+        if (!header.name.len || header.name.ptr[0] == ':' ||
+            header.name.eq({"content-length", 14}) || header.name.eq({"transfer-encoding", 17}) ||
+            header.name.eq({"connection", 10}))
+            continue;
+        const u32 needed = header.name.len + 2 + header.value.len + 2;
+        // The H1 bridge prepends the fixed status/Connection lines and appends
+        // the terminating CRLF in the same send slice as this metadata.
+        constexpr u32 kH1FramingBytes = sizeof("HTTP/1.1 200 OK\r\nConnection: close\r\n") - 1 + 2;
+        static_assert(kH1FramingBytes == 38);
+        if (needed > sizeof(x.response_headers) - kH1FramingBytes - offset) return false;
+        __builtin_memcpy(x.response_headers + offset, header.name.ptr, header.name.len);
+        offset += header.name.len;
+        x.response_headers[offset++] = ':';
+        x.response_headers[offset++] = ' ';
+        if (header.value.len)
+            __builtin_memcpy(x.response_headers + offset, header.value.ptr, header.value.len);
+        offset += header.value.len;
+        x.response_headers[offset++] = '\r';
+        x.response_headers[offset++] = '\n';
+    }
+    x.response_headers_len = offset;
+    return true;
+}
 template <typename Loop>
 inline void grpc_release_slot(Loop* loop, GrpcExchange& x) {
     if (!x.slot_held) return;
@@ -357,6 +531,25 @@ inline bool grpc_request_header_allowed(const hpack::Header& h) {
         return false;
     if (h.name.eq({"te", 2}) && !h.value.eq({"trailers", 8})) return false;
     return true;
+}
+inline bool grpc_web_has_body_expect(const hpack::Header* hs,
+                                     u32 nh,
+                                     GrpcWebContentType web_mode,
+                                     bool end) {
+    if (end || (web_mode != GrpcWebContentType::Binary && web_mode != GrpcWebContentType::Text))
+        return false;
+    for (u32 i = 0; i < nh; i++) {
+        if (!http_header_name_eq_ci(hs[i].name.ptr, hs[i].name.len, "expect", 6)) continue;
+        Str value = hs[i].value;
+        while (value.len && (value.ptr[0] == ' ' || value.ptr[0] == '\t')) {
+            value.ptr++;
+            value.len--;
+        }
+        while (value.len && (value.ptr[value.len - 1] == ' ' || value.ptr[value.len - 1] == '\t'))
+            value.len--;
+        if (value.len) return true;
+    }
+    return false;
 }
 inline bool grpc_response_header_allowed(const hpack::Header& h) {
     return !h.name.eq({"content-length", 14});
@@ -437,7 +630,11 @@ void grpc_response_headers(
     bool status = false;
     u32 http_status = 0;
     bool content_type = false;
+    u32 content_type_count = 0;
     bool invalid_content_length = false;
+    const auto response_mode = grpc_response_web_mode(*x);
+    const bool web_response =
+        response_mode == GrpcWebContentType::Binary || response_mode == GrpcWebContentType::Text;
     for (u32 i = 0; i < n; i++) {
         if (hs[i].name.eq({":status", 7})) {
             if (hs[i].value.len == 3 && hs[i].value.ptr[0] == '1') return;
@@ -447,7 +644,11 @@ void grpc_response_headers(
                     static_cast<u32>((hs[i].value.ptr[0] - '0') * 100 +
                                      (hs[i].value.ptr[1] - '0') * 10 + hs[i].value.ptr[2] - '0');
         }
-        if (hs[i].name.eq({"content-type", 12})) content_type = grpc_content_type(hs[i].value);
+        if (hs[i].name.eq({"content-type", 12})) {
+            content_type_count++;
+            content_type = web_response ? grpc_web_native_proto_content_type(hs[i].value)
+                                        : grpc_content_type(hs[i].value);
+        }
         if (hs[i].name.eq({"content-length", 14})) {
             u32 length = 0;
             if (x->has_response_length || !grpc_parse_content_length(hs[i].value, &length))
@@ -458,6 +659,7 @@ void grpc_response_headers(
             }
         }
     }
+    if (web_response && content_type_count != 1) content_type = false;
     if (!status || !content_type || invalid_content_length) {
         switch (http_status) {
             case 400:
@@ -483,7 +685,7 @@ void grpc_response_headers(
                 break;
         }
         x->response_end = true;
-        if (invalid_content_length) x->failure = 13;
+        if (invalid_content_length || (web_response && status && !content_type)) x->failure = 13;
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
@@ -500,12 +702,45 @@ void grpc_response_headers(
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
-    x->response_headers_len = http2_write_headers(x->response_headers,
-                                                  sizeof(x->response_headers),
-                                                  x->downstream_stream,
-                                                  filtered,
-                                                  filtered_n,
-                                                  backend_terminal);
+    const bool web =
+        response_mode == GrpcWebContentType::Binary || response_mode == GrpcWebContentType::Text;
+    if (web && backend_terminal) {
+        if (const u8 framing_status = x->response_message.feed(nullptr, 0, true)) {
+            x->failure = framing_status;
+            x->web_response_invalid = !grpc_web_response_boundary(*x);
+        }
+    }
+    if (web) {
+        if (backend_terminal && !grpc_web_queue_trailers(*x, filtered, filtered_n)) {
+            x->failure = 13;
+            x->web_response_invalid = !grpc_web_response_boundary(*x);
+        }
+        if (!grpc_web_force_content_type(*x, filtered, &filtered_n, Http2Conn::kMaxHeadersPerReq)) {
+            x->failure = 8;
+        }
+    }
+    const bool filtered_has_status = grpc_has_status(filtered, filtered_n);
+    const u8 observed_status = end ? grpc_observed_status(filtered, filtered_n) : 2;
+    if (web && backend_terminal) {
+        for (u32 i = 0; i < filtered_n;) {
+            if (!grpc_web_is_trailer_only(filtered[i])) {
+                i++;
+                continue;
+            }
+            for (u32 move = i + 1; move < filtered_n; move++) filtered[move - 1] = filtered[move];
+            filtered_n--;
+        }
+    }
+    if (x->web_h1 && web) {
+        if (!grpc_web_queue_h1_headers(*x, filtered, filtered_n, false, true)) x->failure = 8;
+    } else {
+        x->response_headers_len = http2_write_headers(x->response_headers,
+                                                      sizeof(x->response_headers),
+                                                      x->downstream_stream,
+                                                      filtered,
+                                                      filtered_n,
+                                                      web ? false : backend_terminal);
+    }
     if (!x->response_headers_len) {
         x->failure = 8;
         x->response_end = true;
@@ -516,13 +751,15 @@ void grpc_response_headers(
     // END_STREAM on the initial headers is a trailers-only response. Response
     // mutations apply to those headers, so telemetry must observe the same
     // filtered grpc-status that the downstream receives.
-    if (end) x->response_status = grpc_observed_status(filtered, filtered_n);
-    if (end && (!grpc_has_status(hs, n) || !grpc_has_status(filtered, filtered_n))) x->failure = 2;
+    if (end) x->response_status = observed_status;
+    if (end && (!grpc_has_status(hs, n) || !filtered_has_status)) x->failure = 2;
+    if (web && end && !backend_terminal && !x->failure) x->failure = 2;
     if (end && x->has_response_length && x->expected_response_bytes != x->response_bytes)
         x->failure = 13;
     if (x->response_end && !x->failure && x->upstream && grpc_has_status(hs, n))
         grpc_record_rpc_success(dispatch->loop, *x->upstream, monotonic_us());
     if (x->response_end) grpc_release_slot(dispatch->loop, *x);
+    grpc_web_kick_h1(dispatch->loop, *x);
 }
 template <typename Loop>
 void grpc_response_trailers(
@@ -530,6 +767,31 @@ void grpc_response_trailers(
     auto* dispatch = static_cast<GrpcClientDispatch<Loop>*>(ctx);
     auto* x = grpc_find(h, sid);
     if (!x) return;
+    const auto response_mode = grpc_response_web_mode(*x);
+    const bool web =
+        response_mode == GrpcWebContentType::Binary || response_mode == GrpcWebContentType::Text;
+    if (web) {
+        for (u32 i = 0; i < n; i++)
+            if (hs[i].name.eq({"content-length", 14})) x->failure = 13;
+        if (!grpc_has_status(hs, n)) x->failure = 2;
+        if (const u8 framing_status = x->response_message.feed(nullptr, 0, true)) {
+            x->failure = framing_status;
+            x->web_response_invalid = !grpc_web_response_boundary(*x);
+        }
+        if (x->has_response_length && x->expected_response_bytes != x->response_bytes)
+            x->failure = 13;
+        x->response_status = grpc_observed_status(hs, n);
+        if (!x->failure && !grpc_web_queue_trailers(*x, hs, n)) {
+            x->failure = 13;
+            x->web_response_invalid = !grpc_web_response_boundary(*x);
+        }
+        x->response_end = true;
+        if (!x->failure && x->upstream && grpc_has_status(hs, n))
+            grpc_record_rpc_success(dispatch->loop, *x->upstream, monotonic_us());
+        grpc_release_slot(dispatch->loop, *x);
+        grpc_web_kick_h1(dispatch->loop, *x);
+        return;
+    }
     hpack::Header filtered[Http2Conn::kMaxHeadersPerReq];
     u32 filtered_n = 0;
     for (u32 i = 0; i < n; i++) {
@@ -569,9 +831,13 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
         h.consume_data(sid, len);
         return;
     }
+    const auto response_mode = grpc_response_web_mode(*x);
+    const bool web =
+        response_mode == GrpcWebContentType::Binary || response_mode == GrpcWebContentType::Text;
     const u8 framing_status = x->response_message.feed(data, len, end);
     if (framing_status) {
         x->failure = framing_status;
+        if (web) x->web_response_invalid = !grpc_web_response_boundary(*x);
         x->response_end = true;
         h.consume_data(sid, len);
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
@@ -580,6 +846,8 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     if (len > sizeof(x->download) - x->download_len) {
         x->failure = 8;
         x->response_end = true;
+        if (web) x->web_response_invalid = !grpc_web_response_boundary(*x);
+        h.consume_data(sid, len);
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
@@ -589,6 +857,7 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
     if (x->has_response_length && x->response_bytes > x->expected_response_bytes) x->failure = 13;
     if (x->failure == 13) {
         x->response_end = true;
+        if (web) x->web_response_invalid = !grpc_web_response_boundary(*x);
         grpc_detach_upstream_exchange(dispatch->loop, h, *x);
         return;
     }
@@ -598,8 +867,10 @@ void grpc_response_data(void* ctx, Http2Conn& h, u32 sid, const u8* data, u32 le
         else if (!x->failure)
             x->failure = 2;
         x->response_end = true;
+        if (web && x->failure) x->web_response_invalid = !grpc_web_response_boundary(*x);
         grpc_release_slot(dispatch->loop, *x);
     }  // gRPC requires status trailers.
+    grpc_web_kick_h1(dispatch->loop, *x);
 }
 template <typename Loop>
 void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
@@ -621,9 +892,17 @@ void grpc_response_reset(void* ctx, Http2Conn& h, u32 sid, Http2Error error) {
                 x->failure = 13;
                 break;
         }
-        x->response_end = true;
+        if (grpc_response_web_mode(*x) == GrpcWebContentType::Binary ||
+            grpc_response_web_mode(*x) == GrpcWebContentType::Text) {
+            const u32 outstanding = x->download_len;
+            (void)grpc_web_prepare_failure(*x);
+            x->response_end = true;
+            h.consume_data(x->upstream_stream, outstanding);
+        } else {
+            x->response_end = true;
+            h.consume_data(x->upstream_stream, x->download_len);
+        }
         auto* d = static_cast<GrpcClientDispatch<Loop>*>(ctx);
-        h.consume_data(x->upstream_stream, x->download_len);
         Connection* down = x->downstream;
         if (auto* stream = h.find_stream(x->upstream_stream))
             stream->state = Http2StreamState::Closed;
@@ -731,7 +1010,13 @@ void grpc_drive_upstream(Loop* loop, Connection& conn) {
                 grpc_pop(x->upload, x->upload_len, amount);
                 stream->send_window -= static_cast<i32>(amount);
                 h.conn_send_window -= amount;
-                x->downstream->h2->consume_data(x->downstream_stream, amount);
+                if (x->web_mode == GrpcWebContentType::Text) {
+                    if (!x->web_h1 && !x->upload_len && x->upload_raw_credit) {
+                        x->downstream->h2->consume_data(x->downstream_stream, x->upload_raw_credit);
+                        x->upload_raw_credit = 0;
+                    }
+                } else if (!x->web_h1)
+                    x->downstream->h2->consume_data(x->downstream_stream, amount);
             } else if (!x->upload_len && x->request_end && !x->request_end_sent) {
                 if (x->request_trailers_len) {
                     n = x->request_trailers_len;
@@ -932,6 +1217,180 @@ inline bool grpc_upstream_reusable(const Connection& conn,
            conn.h2->grpc.active < 64 && conn.h2->last_stream_id < 0x7ffffffdu;
 }
 
+inline Str grpc_trim_accept_ows(Str value) {
+    while (value.len && (value.ptr[0] == ' ' || value.ptr[0] == '\t')) {
+        value.ptr++;
+        value.len--;
+    }
+    while (value.len && (value.ptr[value.len - 1] == ' ' || value.ptr[value.len - 1] == '\t'))
+        value.len--;
+    return value;
+}
+
+inline bool grpc_accept_quality(Str value, u16* quality) {
+    value = grpc_trim_accept_ows(value);
+    if (!value.len) return false;
+    if (value.ptr[0] == '1') {
+        if (value.len == 1) {
+            *quality = 1000;
+            return true;
+        }
+        if (value.ptr[1] != '.') return false;
+        u16 q = 1000;
+        u16 scale = 100;
+        for (u32 i = 2; i < value.len; i++) {
+            const char c = value.ptr[i];
+            if (c < '0' || c > '9' || i > 4 || c != '0') return false;
+            scale = static_cast<u16>(scale / 10);
+        }
+        (void)scale;
+        *quality = q;
+        return true;
+    }
+    if (value.ptr[0] != '0') return false;
+    if (value.len == 1) {
+        *quality = 0;
+        return true;
+    }
+    if (value.ptr[1] != '.' || value.len > 5) return false;
+    u16 q = 0;
+    u16 scale = 100;
+    for (u32 i = 2; i < value.len; i++) {
+        const char c = value.ptr[i];
+        if (c < '0' || c > '9') return false;
+        q = static_cast<u16>(q + static_cast<u16>(c - '0') * scale);
+        scale = static_cast<u16>(scale / 10);
+    }
+    *quality = q;
+    return true;
+}
+
+// The Content-Type describes the request representation. Accept controls the
+// response representation. Supported explicit Web media ranges use normal
+// q-value and specificity rules; if the header has no recognized Web range,
+// retain the historical request-mode fallback for existing clients.
+inline GrpcWebContentType grpc_web_response_mode(const hpack::Header* headers,
+                                                 u32 count,
+                                                 GrpcWebContentType request_mode) {
+    if (request_mode != GrpcWebContentType::Binary && request_mode != GrpcWebContentType::Text)
+        return request_mode;
+
+    struct Candidate {
+        u16 quality = 0;
+        u8 specificity = 0;
+        bool present = false;
+        bool malformed = false;
+    } candidates[2]{};  // binary, text
+    Candidate app_wildcard{};
+    Candidate any_wildcard{};
+    bool recognized = false;
+    u8 first_mode = 0;
+    for (u32 i = 0; i < count; i++) {
+        if (!headers[i].name.eq({"accept", 6})) continue;
+        const Str value = headers[i].value;
+        u32 offset = 0;
+        while (offset < value.len) {
+            while (offset < value.len && (value.ptr[offset] == ' ' || value.ptr[offset] == '\t' ||
+                                          value.ptr[offset] == ','))
+                offset++;
+            if (offset == value.len) break;
+            const u32 start = offset;
+            while (offset < value.len && value.ptr[offset] != ',' && value.ptr[offset] != ';')
+                offset++;
+            const Str media = grpc_trim_accept_ows({value.ptr + start, offset - start});
+            const auto web_mode = grpc_web_content_type(media);
+            const bool web_family = grpc_web_content_type_candidate(media);
+            const bool is_any_wildcard = media.eq({"*/*", 3});
+            const bool is_app_wildcard = grpc_web_token_equal(media, {"application/*", 13});
+            u8 mode_index = web_mode == GrpcWebContentType::Binary
+                                ? 0
+                                : (web_mode == GrpcWebContentType::Text ? 1 : 0xff);
+            if (web_family && mode_index == 0xff) return GrpcWebContentType::Other;
+            if (mode_index != 0xff || is_any_wildcard || is_app_wildcard) {
+                u16 quality = 1000;
+                bool seen_q = false;
+                bool bad_q = false;
+                while (offset < value.len && value.ptr[offset] != ',') {
+                    if (value.ptr[offset] != ';') {
+                        bad_q = true;
+                        break;
+                    }
+                    offset++;
+                    while (offset < value.len &&
+                           (value.ptr[offset] == ' ' || value.ptr[offset] == '\t'))
+                        offset++;
+                    const u32 key_start = offset;
+                    while (offset < value.len && value.ptr[offset] != '=' &&
+                           value.ptr[offset] != ';' && value.ptr[offset] != ',')
+                        offset++;
+                    const Str key =
+                        grpc_trim_accept_ows({value.ptr + key_start, offset - key_start});
+                    if (offset == value.len || value.ptr[offset] != '=') {
+                        bad_q = true;
+                        break;
+                    }
+                    offset++;
+                    const u32 value_start = offset;
+                    while (offset < value.len && value.ptr[offset] != ';' &&
+                           value.ptr[offset] != ',')
+                        offset++;
+                    const Str parameter =
+                        grpc_trim_accept_ows({value.ptr + value_start, offset - value_start});
+                    if (key.eq({"q", 1}) || key.eq({"Q", 1})) {
+                        if (seen_q || !grpc_accept_quality(parameter, &quality)) {
+                            bad_q = true;
+                            break;
+                        }
+                        seen_q = true;
+                    }
+                }
+                if (bad_q) return GrpcWebContentType::Other;
+                if (mode_index != 0xff) {
+                    recognized = true;
+                    if (!first_mode) first_mode = static_cast<u8>(mode_index + 1);
+                    auto& candidate = candidates[mode_index];
+                    if (!candidate.present || quality > candidate.quality) {
+                        candidate.present = true;
+                        candidate.quality = quality;
+                        candidate.specificity = 2;
+                    }
+                } else {
+                    auto& candidate = is_any_wildcard ? any_wildcard : app_wildcard;
+                    if (!candidate.present || quality > candidate.quality) {
+                        candidate.present = true;
+                        candidate.quality = quality;
+                        candidate.specificity = is_any_wildcard ? 0 : 1;
+                    }
+                }
+            } else {
+                while (offset < value.len && value.ptr[offset] != ',') offset++;
+            }
+            if (offset < value.len && value.ptr[offset] == ',') offset++;
+        }
+    }
+    const Candidate wildcard = app_wildcard.present ? app_wildcard : any_wildcard;
+    if (!recognized && !wildcard.present) return request_mode;
+
+    // A more-specific q=0 explicitly excludes that representation; a
+    // wildcard cannot re-authorize it. Wildcards fill only absent candidates.
+    for (u8 i = 0; i < 2; i++) {
+        if (candidates[i].present) continue;
+        candidates[i] = wildcard;
+    }
+    const Candidate binary = candidates[0];
+    const Candidate text = candidates[1];
+    const u16 binary_q = binary.present ? binary.quality : 0;
+    const u16 text_q = text.present ? text.quality : 0;
+    if (binary_q == 0 && text_q == 0) return GrpcWebContentType::Other;
+    if (binary_q > text_q || (binary_q == text_q && binary.specificity > text.specificity))
+        return GrpcWebContentType::Binary;
+    if (text_q > binary_q || (binary_q == text_q && text.specificity > binary.specificity))
+        return GrpcWebContentType::Text;
+    if (request_mode == GrpcWebContentType::Binary && binary_q) return request_mode;
+    if (request_mode == GrpcWebContentType::Text && text_q) return request_mode;
+    return first_mode == 2 ? GrpcWebContentType::Text : GrpcWebContentType::Binary;
+}
+
 template <typename Loop>
 bool grpc_start_impl(Loop* loop,
                      Connection& down,
@@ -942,8 +1401,17 @@ bool grpc_start_impl(Loop* loop,
                      u32 nh,
                      const ParsedRequest& req,
                      bool end) {
+    const GrpcWebContentType web_mode = grpc_request_mode(req);
+    if (grpc_web_has_body_expect(hs, nh, web_mode, end)) return false;
+    const GrpcWebContentType response_mode = grpc_web_response_mode(hs, nh, web_mode);
     if (!cfg || uid >= cfg->upstream_count || !cfg->upstreams[uid].http2 ||
-        req.method != HttpMethod::POST || !grpc_request(req) || down.h2->grpc.active >= 64)
+        req.method != HttpMethod::POST ||
+        (web_mode != GrpcWebContentType::Native && web_mode != GrpcWebContentType::Binary &&
+         web_mode != GrpcWebContentType::Text) ||
+        (response_mode != GrpcWebContentType::Native &&
+         response_mode != GrpcWebContentType::Binary &&
+         response_mode != GrpcWebContentType::Text) ||
+        down.h2->grpc.active >= 64)
         return false;
     const auto& target = cfg->upstreams[uid];
     if (!target.addr_count) return false;
@@ -972,8 +1440,21 @@ bool grpc_start_impl(Loop* loop,
     if (!x) return false;
     static_assert(sizeof(GrpcExchange) <= SlicePool::kBulkSliceSize);
     x->init();
-    x->request_message.init(target.max_request_message_bytes);
-    x->response_message.init(target.max_response_message_bytes);
+    x->web_h1 = down.h2->grpc.web_h1_kick != nullptr;
+    x->web_h1_kick = down.h2->grpc.web_h1_kick;
+    x->web_mode = web_mode;
+    x->web_response_mode = response_mode;
+    constexpr u32 kWebFramingLimit = 0xffffffffu;
+    const u32 request_message_limit =
+        target.max_request_message_bytes
+            ? target.max_request_message_bytes
+            : (web_mode == GrpcWebContentType::Native ? 0 : kWebFramingLimit);
+    const u32 response_message_limit =
+        target.max_response_message_bytes
+            ? target.max_response_message_bytes
+            : (web_mode == GrpcWebContentType::Native ? 0 : kWebFramingLimit);
+    x->request_message.init(request_message_limit);
+    x->response_message.init(response_message_limit);
     if (!grpc_snapshot_response_mutations(down, *x)) {
         loop->pool.free(reinterpret_cast<u8*>(x));
         return false;
@@ -1021,10 +1502,30 @@ bool grpc_start_impl(Loop* loop,
     for (u32 i = 0; i < nh; i++) {
         if (!grpc_request_header_allowed(hs[i]) || filtered_n >= Http2Conn::kMaxHeadersPerReq)
             continue;
+        if (web_mode == GrpcWebContentType::Text && hs[i].name.eq({"content-length", 14})) continue;
         filtered[filtered_n] = hs[i];
         if (hs[i].name.eq({":scheme", 7}))
             filtered[filtered_n].value = target.tls.enabled ? Str{"https", 5} : Str{"http", 4};
+        if (web_mode != GrpcWebContentType::Native && hs[i].name.eq({"content-type", 12}))
+            filtered[filtered_n].value = {"application/grpc", 16};
         filtered_n++;
+    }
+    if (web_mode != GrpcWebContentType::Native) {
+        for (u32 i = 0; i < filtered_n;) {
+            if (!filtered[i].name.eq({"te", 2})) {
+                i++;
+                continue;
+            }
+            for (u32 move = i + 1; move < filtered_n; move++) filtered[move - 1] = filtered[move];
+            filtered_n--;
+        }
+        if (filtered_n >= Http2Conn::kMaxHeadersPerReq) {
+            stream->state = Http2StreamState::Closed;
+            loop->pool.free(reinterpret_cast<u8*>(x));
+            if (fresh) loop->close_conn(*up);
+            return false;
+        }
+        filtered[filtered_n++] = {{"te", 2}, {"trailers", 8}};
     }
     x->request_headers_len = http2_write_headers(
         x->request_headers, sizeof(x->request_headers), usid, filtered, filtered_n, false);
@@ -1146,21 +1647,248 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
                 grpc_release(loop, x, true);
                 continue;
             }
+            const auto response_mode = grpc_response_web_mode(*x);
+            const bool web = response_mode == GrpcWebContentType::Binary ||
+                             response_mode == GrpcWebContentType::Text;
+            if (web && x->failure && !x->web_failure_prepared) {
+                const u32 dropped = grpc_web_prepare_failure(*x);
+                if (dropped && x->upstream)
+                    x->upstream->h2->consume_data(x->upstream_stream, dropped);
+            }
+            if (web && x->failure && !x->web_response_invalid && !x->response_headers_len &&
+                !x->response_headers_sent) {
+                hpack::Header error_headers[Http2Conn::kMaxHeadersPerReq];
+                u32 error_count = 2;
+                error_headers[0] = {{":status", 7}, {"200", 3}};
+                error_headers[1] = {{"content-type", 12}, {"application/grpc", 16}};
+                if (!grpc_apply_response_mutations(
+                        *x, error_headers, &error_count, Http2Conn::kMaxHeadersPerReq) ||
+                    !grpc_web_force_content_type(
+                        *x, error_headers, &error_count, Http2Conn::kMaxHeadersPerReq)) {
+                    x->web_response_invalid = true;
+                } else {
+                    x->response_headers_len = http2_write_headers(x->response_headers,
+                                                                  sizeof(x->response_headers),
+                                                                  x->downstream_stream,
+                                                                  error_headers,
+                                                                  error_count,
+                                                                  false);
+                }
+            }
             u32 n = 0;
             bool done = false;
-            if (x->failure) {
-                n = grpc_error_headers(out + total,
-                                       cap - total,
-                                       x->downstream_stream,
-                                       x->failure,
-                                       x->response_headers_sent);
-                done = n != 0;
+            if (x->failure && (!web || x->web_response_invalid)) {
+                if (web && cap - total < 13) continue;
+                if (web) {
+                    n = write_rst_stream(
+                        out + total, x->downstream_stream, Http2Error::InternalError);
+                    done = n != 0;
+                } else {
+                    n = grpc_error_headers(out + total,
+                                           cap - total,
+                                           x->downstream_stream,
+                                           x->failure,
+                                           x->response_headers_sent);
+                    done = n != 0;
+                }
             } else if (!x->response_headers_sent && x->response_headers_len) {
                 if (x->response_headers_len > cap - total) continue;
                 n = x->response_headers_len;
                 __builtin_memcpy(out + total, x->response_headers, n);
                 x->response_headers_sent = true;
                 done = x->response_end && !x->download_len && !x->response_trailers_len;
+            } else if (x->response_headers_sent &&
+                       (grpc_response_web_mode(*x) == GrpcWebContentType::Binary ||
+                        grpc_response_web_mode(*x) == GrpcWebContentType::Text)) {
+                const bool text = grpc_response_web_mode(*x) == GrpcWebContentType::Text;
+                const u32 window = stream->send_window > 0 && h.conn_send_window > 0
+                                       ? (stream->send_window < static_cast<i32>(h.conn_send_window)
+                                              ? static_cast<u32>(stream->send_window)
+                                              : static_cast<u32>(h.conn_send_window))
+                                       : 0;
+                const bool empty_terminal_ready =
+                    !x->download_len && x->response_trailers_offset >= x->response_trailers_len &&
+                    x->response_end &&
+                    (!text || (x->web_body_flushed &&
+                               x->web_pending_output_offset == x->web_pending_output_len));
+                if (cap - total < 9 || (!window && !empty_terminal_ready)) continue;
+                u32 amount = 0;
+                const u8* payload = nullptr;
+                bool final = false;
+                bool consume_download = false;
+                if (!text) {
+                    if (x->download_len) {
+                        amount = x->download_len;
+                        if (amount > cap - total - 9) amount = cap - total - 9;
+                        if (amount > h.peer_settings.max_frame_size)
+                            amount = h.peer_settings.max_frame_size;
+                        if (amount > window) amount = window;
+                        payload = x->download;
+                        consume_download = true;
+                    } else if (x->response_trailers_offset < x->response_trailers_len) {
+                        amount = x->response_trailers_len - x->response_trailers_offset;
+                        if (amount > cap - total - 9) amount = cap - total - 9;
+                        if (amount > h.peer_settings.max_frame_size)
+                            amount = h.peer_settings.max_frame_size;
+                        if (amount > window) amount = window;
+                        payload = x->response_trailers + x->response_trailers_offset;
+                        x->response_trailers_offset += amount;
+                        x->web_trailer_wire_started = true;
+                    } else if (x->response_end) {
+                        final = true;
+                    }
+                    if (!amount && !final) continue;
+                    n = http2_write_data(out + total, x->downstream_stream, payload, amount, final);
+                    if (amount) {
+                        if (consume_download) {
+                            (void)x->staged_response_message.feed(payload, amount, false);
+                            grpc_pop(x->download, x->download_len, amount);
+                            if (x->upstream)
+                                x->upstream->h2->consume_data(x->upstream_stream, amount);
+                        }
+                        x->staged_response_bytes += amount;
+                        stream->send_window -= static_cast<i32>(amount);
+                        h.conn_send_window -= amount;
+                    }
+                    if (final) done = true;
+                } else {
+                    // Assemble one DATA payload in owned output. The small pending
+                    // quartet only retains bytes across a flow-control/window tail.
+                    u32 budget = cap - total - kFrameHeaderSize;
+                    if (budget > window) budget = window;
+                    if (budget > h.peer_settings.max_frame_size)
+                        budget = h.peer_settings.max_frame_size;
+                    u32 batched = 0;
+                    u32 download_consumed = 0;
+                    while (batched < budget) {
+                        bool progressed = false;
+                        if (x->web_pending_output_offset == x->web_pending_output_len) {
+                            x->web_pending_output_offset = x->web_pending_output_len = 0;
+                            x->web_pending_output_is_trailer = false;
+                            const bool had_boundary = x->web_encode_boundary_pending;
+                            const bool was_flushed = x->web_body_flushed;
+                            u32 consumed = 0, written = 0;
+                            if (x->web_encode_boundary_pending) {
+                                const u8 native_len = x->response_base64.pending_len;
+                                for (u8 i = 0; i < native_len; i++)
+                                    x->web_pending_native[i] = x->response_base64.pending[i];
+                                (void)x->response_base64.flush(
+                                    x->web_pending_output, sizeof(x->web_pending_output), written);
+                                if (written == 4) x->web_pending_native_len = native_len;
+                                x->web_encode_boundary_pending = false;
+                            } else if (x->download_len > download_consumed ||
+                                       (!x->web_trailer_encoding &&
+                                        x->response_base64.pending_len == 3)) {
+                                const u8 previous_len = x->response_base64.pending_len;
+                                u8 native[3]{};
+                                for (u8 i = 0; i < previous_len; i++)
+                                    native[i] = x->response_base64.pending[i];
+                                const u32 needed = previous_len < 3 ? 3u - previous_len : 0u;
+                                for (u32 i = 0;
+                                     i < needed && i < x->download_len - download_consumed;
+                                     i++)
+                                    native[previous_len + i] = x->download[download_consumed + i];
+                                const u32 source_len = x->web_encoded_message.next_span(
+                                    x->download_len - download_consumed);
+                                (void)x->response_base64.feed(x->download + download_consumed,
+                                                              source_len,
+                                                              consumed,
+                                                              x->web_pending_output,
+                                                              sizeof(x->web_pending_output),
+                                                              written);
+                                if (consumed) {
+                                    (void)x->web_encoded_message.feed(
+                                        x->download + download_consumed, consumed, false);
+                                    if (!x->web_encoded_message.header_bytes &&
+                                        !x->web_encoded_message.remaining)
+                                        x->web_encode_boundary_pending = true;
+                                }
+                                if (written == 4) {
+                                    __builtin_memcpy(x->web_pending_native, native, 3);
+                                    x->web_pending_native_len = 3;
+                                }
+                                download_consumed += consumed;
+                            } else if (x->response_trailers_offset < x->response_trailers_len ||
+                                       (x->web_trailer_encoding &&
+                                        x->response_base64.pending_len == 3)) {
+                                const u32 left =
+                                    x->response_trailers_len - x->response_trailers_offset;
+                                if (!x->web_trailer_encoding) {
+                                    x->web_pending_native_len = x->response_base64.pending_len;
+                                    for (u8 i = 0; i < x->web_pending_native_len; i++)
+                                        x->web_pending_native[i] = x->response_base64.pending[i];
+                                }
+                                (void)x->response_base64.feed(
+                                    x->response_trailers + x->response_trailers_offset,
+                                    left,
+                                    consumed,
+                                    x->web_pending_output,
+                                    sizeof(x->web_pending_output),
+                                    written);
+                                x->response_trailers_offset += consumed;
+                                if (consumed || written) x->web_trailer_encoding = true;
+                                if (written) x->web_pending_output_is_trailer = true;
+                            } else if (x->response_end) {
+                                const u8 native_len =
+                                    x->web_trailer_encoding ? 0 : x->response_base64.pending_len;
+                                for (u8 i = 0; i < native_len; i++)
+                                    x->web_pending_native[i] = x->response_base64.pending[i];
+                                (void)x->response_base64.flush(
+                                    x->web_pending_output, sizeof(x->web_pending_output), written);
+                                if (written == 4) x->web_pending_native_len = native_len;
+                                x->web_pending_output_is_trailer = x->web_trailer_encoding;
+                                x->web_body_flushed = true;
+                            }
+                            x->web_pending_output_len = static_cast<u8>(written);
+                            progressed = consumed || written || had_boundary ||
+                                         was_flushed != x->web_body_flushed;
+                        }
+                        if (x->web_pending_output_offset < x->web_pending_output_len) {
+                            u32 chunk = x->web_pending_output_len - x->web_pending_output_offset;
+                            if (chunk > budget - batched) chunk = budget - batched;
+                            __builtin_memcpy(out + total + kFrameHeaderSize + batched,
+                                             x->web_pending_output + x->web_pending_output_offset,
+                                             chunk);
+                            x->web_pending_output_offset += static_cast<u8>(chunk);
+                            batched += chunk;
+                            if (x->web_pending_output_is_trailer)
+                                x->web_trailer_wire_started = true;
+                            if (x->web_pending_output_offset == x->web_pending_output_len &&
+                                x->web_pending_native_len) {
+                                (void)x->staged_response_message.feed(
+                                    x->web_pending_native, x->web_pending_native_len, false);
+                                x->web_pending_native_len = 0;
+                            }
+                            if (x->web_pending_output_offset == x->web_pending_output_len)
+                                x->web_pending_output_is_trailer = false;
+                        } else if (x->response_end && x->web_body_flushed) {
+                            final = true;
+                            break;
+                        } else if (!progressed) {
+                            break;
+                        }
+                    }
+                    // Compact once per DATA batch, rather than moving the queue
+                    // after every three input bytes.
+                    if (download_consumed) {
+                        grpc_pop(x->download, x->download_len, download_consumed);
+                        if (x->upstream)
+                            x->upstream->h2->consume_data(x->upstream_stream, download_consumed);
+                    }
+                    if (x->response_end && x->web_body_flushed &&
+                        x->web_pending_output_offset == x->web_pending_output_len)
+                        final = true;
+                    if (!batched && !final) continue;
+                    const Http2FrameHeader header{batched,
+                                                  x->downstream_stream,
+                                                  static_cast<u8>(Http2FrameType::Data),
+                                                  final ? http2_flag::kEndStream : u8{0}};
+                    n = write_frame_header(out + total, header) + batched;
+                    x->staged_response_bytes += batched;
+                    stream->send_window -= static_cast<i32>(batched);
+                    h.conn_send_window -= batched;
+                    if (final) done = true;
+                }
             } else if (x->response_headers_sent && x->download_len && stream->send_window > 0 &&
                        h.conn_send_window > 0 && cap - total > 9) {
                 u32 amount = x->download_len;
@@ -1204,7 +1932,12 @@ u32 grpc_pump_downstream(Loop* loop, Connection& down, u8* out, u32 cap) {
 
 template <typename Loop>
 void grpc_kick_downstream(Loop* loop, Connection& down) {
-    if (!down.h2 || down.h2->grpc.busy || down.on_send || down.h2->async_stream) return;
+    if (!down.h2) return;
+    if (down.h2->grpc.web_h1_kick) {
+        down.h2->grpc.web_h1_kick(loop, static_cast<ConnectionBase&>(down));
+        return;
+    }
+    if (down.h2->grpc.busy || down.on_send || down.h2->async_stream) return;
     on_h2_data<Loop>(static_cast<void*>(loop), down, {down.id, 1, 0, 0, IoEventType::Recv, 0});
 }
 
@@ -1213,27 +1946,83 @@ void grpc_request_data(
     Loop* loop, Connection& down, GrpcExchange& x, const u8* data, u32 len, bool end) {
     x.request_bytes += len;
     if (x.failure || !x.upstream) {
-        down.h2->consume_data(x.downstream_stream, len);
+        if (!x.web_h1) down.h2->consume_data(x.downstream_stream, len);
         return;
     }
-    const u8 framing_status = x.request_message.feed(data, len, end);
+    const u32 upload_before = x.upload_len;
+    const u8* upload_data = data;
+    u32 upload_len = len;
+    if (x.web_mode == GrpcWebContentType::Text) {
+        if (!x.web_h1 && len > UINT32_MAX - x.upload_raw_credit) {
+            if (!x.web_h1) {
+                down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+                down.h2->consume_data(x.downstream_stream, len);
+            }
+            x.upload_raw_credit = 0;
+            x.upload_len = 0;
+            x.failure = 8;
+            grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
+            return;
+        }
+        if (!x.web_h1) x.upload_raw_credit += len;
+        u32 consumed = 0;
+        const auto status = x.request_base64.feed(data,
+                                                  len,
+                                                  consumed,
+                                                  x.upload + x.upload_len,
+                                                  sizeof(x.upload) - x.upload_len,
+                                                  upload_len);
+        if (status == GrpcWebCodecStatus::Invalid || consumed != len) {
+            if (!x.web_h1) down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+            x.upload_raw_credit = 0;
+            x.upload_len = 0;
+            x.failure = status == GrpcWebCodecStatus::Invalid ? 13 : 8;
+            grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
+            return;
+        }
+        if (end && x.request_base64.finish() != GrpcWebCodecStatus::Ok) {
+            if (!x.web_h1) down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+            x.upload_raw_credit = 0;
+            x.upload_len = 0;
+            x.failure = 13;
+            grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
+            return;
+        }
+        upload_data = x.upload + upload_before;
+    }
+    const u8 framing_status = x.request_message.feed(upload_data, upload_len, end);
     if (framing_status) {
-        down.h2->consume_data(x.downstream_stream, len);
+        if (!x.web_h1)
+            down.h2->consume_data(
+                x.downstream_stream,
+                x.web_mode == GrpcWebContentType::Text ? x.upload_raw_credit : len);
+        x.upload_raw_credit = 0;
+        if (x.web_mode == GrpcWebContentType::Text) x.upload_len = 0;
         x.failure = framing_status;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
-    if (len > sizeof(x.upload) - x.upload_len ||
+    if ((x.web_mode != GrpcWebContentType::Text && len > sizeof(x.upload) - x.upload_len) ||
         (x.has_request_length && (x.request_bytes > x.expected_request_bytes ||
                                   (end && x.request_bytes != x.expected_request_bytes)))) {
-        down.h2->consume_data(x.downstream_stream, len);
+        if (!x.web_h1)
+            down.h2->consume_data(
+                x.downstream_stream,
+                x.web_mode == GrpcWebContentType::Text ? x.upload_raw_credit : len);
+        x.upload_raw_credit = 0;
+        if (x.web_mode == GrpcWebContentType::Text) x.upload_len = 0;
         x.failure = 13;
         grpc_detach_upstream_exchange(loop, *x.upstream->h2, x);
         return;
     }
-    if (len) __builtin_memcpy(x.upload + x.upload_len, data, len);
-    x.upload_len += len;
+    if (x.web_mode != GrpcWebContentType::Text && len)
+        __builtin_memcpy(x.upload + x.upload_len, data, len);
+    x.upload_len += upload_len;
     x.request_end = end;
+    if (x.web_mode == GrpcWebContentType::Text && !x.upload_len && x.upload_raw_credit) {
+        if (!x.web_h1) down.h2->consume_data(x.downstream_stream, x.upload_raw_credit);
+        x.upload_raw_credit = 0;
+    }
     grpc_drive_upstream(loop, *x.upstream);
 }
 

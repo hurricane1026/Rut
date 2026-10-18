@@ -71,7 +71,17 @@ template <typename Loop>
 void on_response_sent(void* lp, Connection& conn, IoEvent ev);
 
 template <typename Loop>
+void grpc_web_h1_kick(void* lp, Connection& conn);
+
+template <typename Loop>
 void on_request_complete(Loop* lp, Connection& conn, u16 status, u32 resp_size);
+template <typename Loop>
+void on_request_complete_with_grpc_status(Loop* lp,
+                                          Connection& conn,
+                                          u16 status,
+                                          u32 resp_size,
+                                          u8 grpc_status_plus_one,
+                                          u32 req_size = UINT32_MAX);
 
 template <typename Loop>
 void on_jit_wait_send_sent(void* lp, Connection& conn, IoEvent ev);

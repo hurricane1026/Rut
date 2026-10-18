@@ -3,6 +3,7 @@
 #include "rut/common/types.h"
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/grpc_message.h"
+#include "rut/runtime/grpc_web.h"
 #include "rut/runtime/tls.h"
 
 namespace rut {
@@ -35,6 +36,10 @@ struct GrpcExchange {
     u64 request_bytes;
     GrpcMessageLimit request_message;
     GrpcMessageLimit response_message;
+    GrpcMessageLimit web_encoded_message;
+    GrpcMessageLimit staged_response_message;
+    GrpcWebBase64Decoder request_base64;
+    GrpcWebBase64Encoder response_base64;
     u32 expected_request_bytes;
     bool has_request_length;
     bool request_end;
@@ -44,6 +49,7 @@ struct GrpcExchange {
     bool response_headers_sent;
     bool response_end_sent;
     u8 failure;
+    GrpcWebContentType web_mode;
     bool slot_held;
     u16 upstream_id;
     u32 upload_len;
@@ -54,6 +60,26 @@ struct GrpcExchange {
     u32 request_trailers_len;
     u32 response_headers_len;
     u32 response_trailers_len;
+    u32 response_trailers_offset;
+    u32 upload_raw_credit;
+    bool web_trailer_queued;
+    bool web_trailer_encoding;
+    bool web_encode_boundary_pending;
+    bool web_failure_prepared;
+    bool web_pending_output_is_trailer;
+    bool web_trailer_wire_started;
+    bool web_body_flushed;
+    bool web_trailer_flushed;
+    bool web_h1;
+    bool web_response_invalid;
+    GrpcWebContentType web_response_mode;
+    bool skip_rpc_log;
+    void (*web_h1_kick)(void*, ConnectionBase&);
+    u8 web_pending_output[4];
+    u8 web_pending_output_len;
+    u8 web_pending_output_offset;
+    u8 web_pending_native[3];
+    u8 web_pending_native_len;
     bool has_response_length;
     u32 response_mutation_bytes;
     u8 response_mutation_count;
@@ -77,15 +103,32 @@ struct GrpcExchange {
         deadline_us = request_bytes = 0;
         request_message.init();
         response_message.init();
+        web_encoded_message.init(0xffffffffu);
+        staged_response_message.init(0xffffffffu);
+        request_base64.init();
+        response_base64.init();
         expected_request_bytes = 0;
         has_request_length = request_end = request_headers_sent = request_end_sent = false;
         response_end = response_headers_sent = response_end_sent = false;
         failure = 0;
+        web_mode = GrpcWebContentType::Native;
         slot_held = false;
         upstream_id = 0;
         upload_len = download_len = response_bytes = expected_response_bytes = 0;
         request_headers_len = request_trailers_len = 0;
         response_headers_len = response_trailers_len = 0;
+        response_trailers_offset = upload_raw_credit = 0;
+        web_trailer_queued = web_trailer_encoding = web_encode_boundary_pending = false;
+        web_failure_prepared = false;
+        web_pending_output_is_trailer = web_trailer_wire_started = false;
+        web_body_flushed = web_trailer_flushed = false;
+        web_h1 = false;
+        web_response_invalid = false;
+        web_response_mode = GrpcWebContentType::Native;
+        skip_rpc_log = false;
+        web_h1_kick = nullptr;
+        web_pending_output_len = web_pending_output_offset = 0;
+        web_pending_native_len = 0;
         has_response_length = false;
         response_mutation_bytes = 0;
         response_mutation_count = 0;
@@ -101,6 +144,7 @@ struct GrpcProxyState {
     bool tls_verified;
     GrpcExchange* streams[64];
     ConnectionBase* pool_next;
+    void (*web_h1_kick)(void*, ConnectionBase&);
     u32 active;
     u32 cursor;
     u32 control_len;
@@ -124,6 +168,7 @@ struct GrpcProxyState {
         tls_verified = false;
         for (auto& stream : streams) stream = nullptr;
         pool_next = nullptr;
+        web_h1_kick = nullptr;
         active = cursor = control_len = pending_cancel_count = 0;
         connected_at_us = idle_since_us = timer_deadline_us = last_ping_us = keepalive_due_us = 0;
         upstream = connecting = busy = preface_sent = session_failure_recorded = false;

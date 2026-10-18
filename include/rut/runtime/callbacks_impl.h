@@ -4,6 +4,7 @@
 #include "rut/runtime/access_log.h"
 #include "rut/runtime/access_log_live_producer.h"
 #include "rut/runtime/callbacks.h"
+#include "rut/runtime/callbacks_grpc_web_h1.h"
 #include "rut/runtime/callbacks_h2.h"
 #include "rut/runtime/chunked_parser.h"
 #include "rut/runtime/connection.h"
@@ -972,6 +973,50 @@ void format_static_response(Connection& conn,
                             HttpVersion response_version = HttpVersion::Http11);
 inline bool http1_request_is_head(const Connection& conn) {
     return conn.req_method == static_cast<u8>(LogHttpMethod::Head);
+}
+
+template <typename Loop>
+bool try_start_grpc_web_h1(Loop* loop,
+                           Connection& conn,
+                           const RouteConfig* config,
+                           u16 upstream_id,
+                           bool outcome_policy_free = true) {
+    if constexpr (!requires(Loop* candidate) {
+                      candidate->grpc_upstreams;
+                      candidate->pool.alloc_bulk();
+                      candidate->alloc_conn();
+                      candidate->disarm_yield_timer(conn);
+                      candidate->arm_throttle_timer(conn, u64{1});
+                  }) {
+        (void)loop;
+        (void)conn;
+        (void)config;
+        (void)upstream_id;
+        (void)outcome_policy_free;
+        return false;
+    } else {
+        const bool unsupported_policy =
+            !outcome_policy_free || conn.request_policy_id != 0 ||
+            conn.request_policy_body_pending || conn.pending_forward_request_policy_id != 0 ||
+            conn.pending_forward_response_policy_id != 0 ||
+            conn.pending_forward_failure_policy_id != 0 ||
+            conn.pending_forward_timeout_failure_policy_id != 0 || conn.response_policy_id != 0 ||
+            conn.failure_policy_id != 0 || conn.timeout_failure_policy_id != 0 ||
+            conn.throttle_down_bps != 0 || conn.target_transform_recorded ||
+            conn.response_read_deadline_state != ResponseReadDeadlineState::None ||
+            conn.response_read_deadline_profile != ResponseReadDeadlineProfile::None;
+        const auto result = grpc_web_h1_start(loop, conn, config, upstream_id, !unsupported_policy);
+        if (result == GrpcWebH1Start::NotWeb) return false;
+        if (result == GrpcWebH1Start::Rejected) {
+            conn.resp_status = 503;
+            conn.keep_alive = false;
+            format_static_response(conn, 503, false);
+            conn.transition_to_sending(&on_response_sent<Loop>);
+            if (!loop->submit_send(conn, conn.send_buf.data(), conn.send_buf.len()))
+                loop->close_conn(conn);
+        }
+        return true;
+    }
 }
 // Custom-body variant: writes status line + Content-Length matching
 // body_len + default Content-Type (text/plain; charset=utf-8) + body
@@ -2079,7 +2124,12 @@ template <typename Loop>
 void handle_early_upstream_recv(Loop* loop, Connection& conn, IoEvent ev, bool send_in_flight);
 
 template <typename Loop>
-void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
+void on_request_complete_with_grpc_status(Loop* loop,
+                                          Connection& conn,
+                                          u16 status,
+                                          u32 resp_size,
+                                          u8 grpc_status_plus_one,
+                                          u32 req_size) {
     const bool kOwnsRequestCompletion = conn.req_start_us != 0;
     const u32 kDurationUs = static_cast<u32>(monotonic_us() - conn.req_start_us);
 
@@ -2103,7 +2153,8 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         entry.method = conn.req_method;
         entry.shard_id = conn.shard_id;
         entry.resp_size = resp_size;
-        entry.req_size = conn.downstream_req_size;
+        entry.grpc_status_plus_one = grpc_status_plus_one;
+        entry.req_size = req_size == UINT32_MAX ? conn.downstream_req_size : req_size;
         entry.addr = conn.peer_addr;
         entry.upstream_us = conn.upstream_us;
         // Every access-enabled production entry uses an explicit state. A snapshot must belong
@@ -2182,6 +2233,11 @@ void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size
         __builtin_memcpy(cap->raw_headers, conn.capture_buf, conn.capture_header_len);
         loop->capture_ring->commit_push(expected_wp);
     }
+}
+
+template <typename Loop>
+void on_request_complete(Loop* loop, Connection& conn, u16 status, u32 resp_size) {
+    on_request_complete_with_grpc_status(loop, conn, status, resp_size, 0, UINT32_MAX);
 }
 
 // Every owner the previous request in a pipelined burst held has retired:
@@ -2775,6 +2831,7 @@ void on_header_received(void* lp, Connection& conn, IoEvent ev) {
         conn.state = ConnState::Proxying;
         auto& target = config->upstreams[route->upstream_id];
         if (target.http2) {
+            if (try_start_grpc_web_h1(loop, conn, config, route->upstream_id)) return;
             conn.pending_handler_fn = nullptr;
             conn.resp_status = 503;
             format_static_response(conn,
@@ -3970,6 +4027,12 @@ void handle_jit_outcome(Loop* loop,
                 }
                 auto& target = config->upstreams[upstream_id];
                 if (target.http2) {
+                    const bool policy_free =
+                        outcome.request_policy_id == 0 && outcome.response_policy_id == 0 &&
+                        outcome.policy_bundle_id == 0 && outcome.failure_policy_id == 0 &&
+                        outcome.timeout_failure_policy_id == 0 &&
+                        outcome.response_read_timeout_seconds == 0;
+                    if (try_start_grpc_web_h1(loop, conn, config, upstream_id, policy_free)) return;
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
                     format_static_response(conn,
@@ -4482,6 +4545,8 @@ void handle_jit_outcome(Loop* loop,
                 }
                 const auto& target = config->upstreams[outcome.upstream_id];
                 if (target.http2) {
+                    if (try_start_grpc_web_h1(loop, conn, config, outcome.upstream_id, false))
+                        return;
                     conn.pending_handler_fn = nullptr;
                     conn.resp_status = 503;
                     format_static_response(conn,
@@ -4617,6 +4682,12 @@ void handle_jit_outcome(Loop* loop,
             }
             auto& target = config->upstreams[outcome.upstream_id];
             if (target.http2) {
+                const bool policy_free =
+                    outcome.request_policy_id == 0 && forward_response_policy_id == 0 &&
+                    forward_failure_policy_id == 0 && forward_timeout_failure_policy_id == 0 &&
+                    outcome.policy_bundle_id == 0 && outcome.response_read_timeout_seconds == 0;
+                if (try_start_grpc_web_h1(loop, conn, config, outcome.upstream_id, policy_free))
+                    return;
                 conn.pending_handler_fn = nullptr;
                 conn.resp_status = 503;
                 format_static_response(conn,
