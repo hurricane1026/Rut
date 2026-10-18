@@ -242,8 +242,12 @@ int main(int argc, char** argv) {
     if (use_ebpf) {
         const char* stage = kernel.init(kConnections, true, nullptr, true);
         if (stage) {
-            fprintf(stderr, "eBPF tunnel %s: errno=%d: %s\n%s\n", stage, errno,
-                    strerror(errno), kernel.verifier);
+            fprintf(stderr,
+                    "eBPF tunnel %s: errno=%d: %s\n%s\n",
+                    stage,
+                    errno,
+                    strerror(errno),
+                    kernel.verifier);
             return 1;
         }
     }
