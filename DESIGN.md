@@ -1353,6 +1353,20 @@ let internalService = upstream {
 let orders = upstream { "10.0.1.1:8080" }
 ```
 
+**Protobuf wire foundation (internal C++ API):** `runtime/protobuf_wire.h`
+provides allocation-free complete-message readers and bounded writers for varint,
+fixed64, length-delimited and fixed32 fields, plus signed ZigZag conversion.
+Readers expose borrowed byte views and preserve duplicate/unknown fields in wire
+order. Input must remain alive and immutable while views are used. A field-count
+budget bounds iteration; lengths are checked against the supplied message and
+64-bit varint overflow is rejected. Deprecated groups and wire types 6/7 fail
+closed. Malformed input is terminal and leaves the output field unchanged.
+Writes check the whole field before modifying output; payloads must not overlap
+the destination. This layer does not interpret schemas, validate UTF-8, unpack
+packed scalar fields or recurse into embedded messages. Descriptor loading,
+protobuf JSON mapping and HTTP/gRPC transcoding remain pending; no Rut language
+API or automatic body decoding is added.
+
 **Implemented native gRPC gateway path:** the current frontend accepts
 `upstream greeter { host: "127.0.0.1", port: 50051, protocol: .http2 }` and
 `route POST "/package.Service/Method" { return forward(greeter) }`.
